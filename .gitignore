@@ -1,0 +1,36 @@
+.venv/
+models/
+hf_cache/
+.kv_spill/
+.kv_prompts/
+.hot_kv_persist/
+.pytest_cache/
+tests/oracle/
+tests/_hot_kv_persist_scratch/
+logs/
+__pycache__/
+*.pyc
+.disktest
+.DS_Store
+
+# Machine-local config (NAS/storage paths); see voom.local.example.yaml
+voom.local.yaml
+
+# Research journal / in-progress investigation notes -- not the shipped
+# runtime. See README.md for the curated, public-facing docs.
+STATUS.md
+FRIDAY_CHECKLIST.md
+docs/benchmark_results.md
+docs/future_lossless_techniques.md
+docs/future_sidequest_techniques.md
+docs/implementation_briefs.md
+docs/ops_runbook.md
+experiments/
+CLAUDE.md
+AGENTS.md
+.claude/
+
+# These tests only validate the excluded experiments/ research modules above.
+tests/test_f75_tiled_topk_pure.py
+tests/test_f76_splitzip.py
+tests/test_strict_archive_comparator.py

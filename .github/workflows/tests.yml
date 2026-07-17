@@ -1,0 +1,66 @@
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch: {}
+
+jobs:
+  pytest:
+    # MLX requires Apple Silicon + Metal, so this must run on a macOS runner.
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          # formats/packed.py uses the compression.zstd stdlib module, new in 3.14.
+          python-version: "3.14"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install mlx safetensors huggingface_hub tokenizers psutil pyyaml numpy ml_dtypes
+          pip install pytest pytest-randomly hypothesis
+          # Optional: lets the HF-reference cross-check tests run instead of skipping.
+          # transformers is pinned (not just torch) -- see the mlx_lm install below.
+          pip install torch transformers==5.13.0
+          # Real SDK clients used by the protocol-integration tests (they spin up
+          # a real server subprocess and talk to it through these clients).
+          pip install openai anthropic
+          # Pillow: vision-message tests build a real test image.
+          pip install Pillow
+          # jsonschema: structured/schema-constrained tool-argument validation
+          # (runtime/structured.py) fails closed with a clear error if this is
+          # missing, but the protocol-integration tests need it actually
+          # installed to exercise the real path instead of the error path.
+          # xgrammar: token-level grammar constraints for required/specific
+          # tool choice and JSON-schema structured outputs (runtime/structured.py).
+          # av (PyAV): video-input tests decode a real short clip.
+          pip install jsonschema xgrammar av
+          # mlx_lm: tests/test_mlx_lm_shim.py pins a known mlx_lm/transformers
+          # incompatibility and its shim -- it needs mlx_lm actually installed
+          # to reproduce the bug it's guarding against, not just importable.
+          # Both mlx_lm AND transformers are pinned to the exact combo
+          # confirmed locally to reproduce it -- installing mlx_lm alone
+          # (transformers left unpinned) let pip's resolver silently land on
+          # a transformers version where the bug doesn't reproduce. If a
+          # future bump of either stops reproducing the bug, that test is
+          # designed to fail loudly (see its own docstring) rather than
+          # silently pass for the wrong reason -- update the pins (or retire
+          # the shim) at that point.
+          pip install mlx_lm==0.31.3 transformers==5.13.0
+
+      - name: Fetch the small real model several tests exercise
+        run: |
+          python -c "
+          from huggingface_hub import snapshot_download
+          snapshot_download('HuggingFaceTB/SmolLM2-135M',
+              allow_patterns=['*.json', '*.safetensors', 'tokenizer*'],
+              local_dir='models/SmolLM2-135M')
+          "
+
+      - name: Run tests
+        run: python -m pytest tests/ -q

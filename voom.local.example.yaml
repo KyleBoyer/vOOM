@@ -1,0 +1,15 @@
+# Copy this file to voom.local.yaml (gitignored) and fill in your own
+# values if you keep models on extra storage beyond this repo's own models/
+# directory -- a NAS share, a second SSD, a USB drive, etc. If every model
+# you use lives under models/, you don't need this file at all: with no
+# voom.local.yaml present, no extra storage locations are configured and
+# every path is treated as ordinary local storage.
+volumes_root: /Volumes
+model_stores:
+  - name: YourShareName  # the mountpoint's base name under volumes_root
+                         # (macOS cycles SMB shares YourShareName -> -1 -> -2 ... on remount)
+    models_subdir: models  # subdirectory under the mount where model dirs live, if any
+    # Optional: a shell command that (re)mounts this location if a read fails,
+    # e.g. after macOS drops an SMB share. Leave blank ("") if not applicable.
+    remount_command: >-
+      osascript -e 'mount volume "smb://youruser@yournas._smb._tcp.local/YourShareName"' >/dev/null 2>&1
