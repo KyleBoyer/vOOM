@@ -43,13 +43,20 @@ def _mla_attention(
     n_h = cfg.num_attention_heads
     dn, dr, dv = cfg.qk_nope_head_dim, cfg.qk_rope_head_dim, cfg.v_head_dim
 
-    q_a = _linear(h, w, f"{prefix}.self_attn.q_a_proj")
-    q_a = mx.fast.rms_norm(
-        q_a,
-        w[f"{prefix}.self_attn.q_a_layernorm.weight"],
-        cfg.mla_latent_norm_eps,
-    )
-    q = _linear(q_a, w, f"{prefix}.self_attn.q_b_proj").reshape(B, L, n_h, dn + dr).transpose(0, 2, 1, 3)
+    if cfg.q_lora_rank:
+        q_a = _linear(h, w, f"{prefix}.self_attn.q_a_proj")
+        q_a = mx.fast.rms_norm(
+            q_a,
+            w[f"{prefix}.self_attn.q_a_layernorm.weight"],
+            cfg.mla_latent_norm_eps,
+        )
+        q = _linear(q_a, w, f"{prefix}.self_attn.q_b_proj")
+    else:
+        # F92: Kimi Linear's MLA layers have q_lora_rank=null -- no Q
+        # low-rank compression, a single q_proj straight from hidden_states.
+        # Everything downstream (nope/rope split, RoPE, concat) is identical.
+        q = _linear(h, w, f"{prefix}.self_attn.q_proj")
+    q = q.reshape(B, L, n_h, dn + dr).transpose(0, 2, 1, 3)
     q_nope, q_rope = q[..., :dn], q[..., dn:]
 
     kv_a = _linear(h, w, f"{prefix}.self_attn.kv_a_proj_with_mqa")
@@ -61,10 +68,13 @@ def _mla_attention(
     )
 
     k_rope = k_rope.reshape(B, L, 1, dr).transpose(0, 2, 1, 3)  # single MQA rope head
-    q_rope = mx.fast.rope(q_rope, dr, traditional=cfg.rope_interleave, base=cfg.rope_theta,
-                          scale=1.0, offset=offset)
-    k_rope = mx.fast.rope(k_rope, dr, traditional=cfg.rope_interleave, base=cfg.rope_theta,
-                          scale=1.0, offset=offset)
+    if not cfg.mla_use_nope:
+        q_rope = mx.fast.rope(q_rope, dr, traditional=cfg.rope_interleave, base=cfg.rope_theta,
+                              scale=1.0, offset=offset)
+        k_rope = mx.fast.rope(k_rope, dr, traditional=cfg.rope_interleave, base=cfg.rope_theta,
+                              scale=1.0, offset=offset)
+    # else: F92 -- Kimi Linear's MLA is NoPE, the "rope" head-dim split is
+    # carried through unrotated; position info comes only from KDA layers.
     queries = mx.concatenate([q_nope, q_rope], axis=-1)
 
     if getattr(kv, "compressed_mla", False):

@@ -100,6 +100,26 @@ class ModelConfig:
     # video_preprocessor_config.json overrides them when present.
     video_min_pixels: int = 4_096
     video_max_pixels: int = 25_165_824
+    # Kimi Linear (KDA) hybrid attention layout — see docs/future_lossless_techniques.md F92.
+    # Both tuples are 0-indexed layer numbers; a layer must appear in exactly one.
+    kda_layers: tuple[int, ...] = ()
+    full_attn_layers: tuple[int, ...] = ()
+    kda_head_dim: int = 0
+    kda_num_heads: int = 0
+    kda_conv_kernel_size: int = 4
+    moe_layer_freq: int = 1
+    # F92/F93: expert tensor prefix under each layer. GLM/gpt-oss/OLMoE/
+    # generic Mixtral-style checkpoints use "mlp.experts"; Kimi's MoE module
+    # is named "block_sparse_moe" instead. Every expert-fetch call site in
+    # engine.py must use this, not a hardcoded ".mlp.experts." substring, or
+    # MoE paging silently finds zero matching tensors for Kimi models.
+    moe_expert_prefix: str = "mlp.experts"
+    # F92: Kimi Linear's MLA layers are NoPE -- config.json's mla_use_nope=true
+    # means RoPE is never applied to the "rope" head-dim split at all (real
+    # modeling_kimi.py has no apply_rotary_emb call anywhere; position info
+    # comes only from the KDA layers' inherent sequential recurrence). GLM-5.2
+    # always applies real RoPE; default False preserves that unchanged.
+    mla_use_nope: bool = False
 
     @classmethod
     def from_dir(cls, model_dir: str | Path) -> "ModelConfig":
@@ -175,6 +195,20 @@ class ModelConfig:
                 if k in raw:
                     t[k] = raw[k]
             raw = t
+        elif "text_config" in raw and raw.get("model_type", "") == "kimi_k25":
+            # F93: Kimi K2.5's language model (text_config.model_type="kimi_k2")
+            # is DeepSeek-style MLA+MoE, same field names GLM-5.2 already uses
+            # (q_lora_rank, kv_lora_rank, n_routed_experts, ...) -- only the
+            # nesting differs. Preserve the OUTER "kimi_k25" as model_type so
+            # engine.py can dispatch on it distinctly from bare "kimi_k2".
+            # Checkpoint tensor names are additionally prefixed
+            # "language_model.model.layers.N...." (vision wrapper) instead of
+            # "model.layers.N...." -- a WeightStore/loader-side concern, not
+            # handled here.
+            t = dict(raw["text_config"])
+            t["model_type"] = raw["model_type"]
+            t.setdefault("tie_word_embeddings", raw.get("tie_word_embeddings", False))
+            raw = t
 
         vocab_size = raw["vocab_size"]
         eos = list(_validated_token_ids(
@@ -191,6 +225,24 @@ class ModelConfig:
                 if token_id not in eos:
                     eos.append(token_id)
         n_heads = raw["num_attention_heads"]
+
+        linear_attn_config = raw.get("linear_attn_config")
+        kda_layers: tuple[int, ...] = ()
+        full_attn_layers: tuple[int, ...] = ()
+        kda_head_dim = 0
+        kda_num_heads = 0
+        kda_conv_kernel_size = 4
+        if linear_attn_config is not None:
+            # F92: config.json lists are 1-indexed layer numbers; the rest of
+            # this codebase (mlp_layer_types, indexer_types, ...) is 0-indexed.
+            kda_layers = tuple(sorted(
+                entry - 1 for entry in linear_attn_config.get("kda_layers", ())))
+            full_attn_layers = tuple(sorted(
+                entry - 1 for entry in linear_attn_config.get("full_attn_layers", ())))
+            kda_head_dim = linear_attn_config.get("head_dim", 0)
+            kda_num_heads = linear_attn_config.get("num_heads", 0)
+            kda_conv_kernel_size = linear_attn_config.get("short_conv_kernel_size", 4)
+
         return cls(
             model_type=raw.get("model_type", "llama"),
             hidden_size=raw["hidden_size"],
@@ -209,8 +261,9 @@ class ModelConfig:
             eos_token_ids=tuple(eos),
             torch_dtype=raw.get("torch_dtype", raw.get("dtype", "bfloat16")),
             num_experts=raw.get("num_experts", raw.get("n_routed_experts", raw.get("num_local_experts", 0))),
-            num_experts_per_tok=raw.get("num_experts_per_tok", raw.get("experts_per_token", 0)),
-            norm_topk_prob=raw.get("norm_topk_prob", False),
+            num_experts_per_tok=raw.get("num_experts_per_tok", raw.get(
+                "experts_per_token", raw.get("num_experts_per_token", 0))),
+            norm_topk_prob=raw.get("norm_topk_prob", raw.get("moe_renormalize", False)),
             layer_types=tuple(raw.get("layer_types", ())),
             sliding_window=raw.get("sliding_window") or 0,
             swiglu_limit=raw.get("swiglu_limit", 7.0),
@@ -219,10 +272,13 @@ class ModelConfig:
             qk_nope_head_dim=raw.get("qk_nope_head_dim", 0),
             qk_rope_head_dim=raw.get("qk_rope_head_dim", 0),
             v_head_dim=raw.get("v_head_dim", 0),
-            q_lora_rank=raw.get("q_lora_rank", 0),
+            # F92: Kimi Linear's config.json has an explicit "q_lora_rank": null
+            # (no Q compression) -- raw.get(key, default) returns the JSON null,
+            # not the default, when the key is present. Coerce None -> 0.
+            q_lora_rank=raw.get("q_lora_rank") or 0,
             kv_lora_rank=raw.get("kv_lora_rank", 0),
-            n_shared_experts=raw.get("n_shared_experts", 0),
-            n_group=raw.get("n_group", 1),
+            n_shared_experts=raw.get("n_shared_experts", raw.get("num_shared_experts", 0)),
+            n_group=raw.get("n_group", raw.get("num_expert_group", 1)),
             topk_group=raw.get("topk_group", 1),
             routed_scaling_factor=raw.get("routed_scaling_factor", 1.0),
             mlp_layer_types=tuple(raw.get("mlp_layer_types", ())),
@@ -243,6 +299,18 @@ class ModelConfig:
             index_topk_freq=raw.get("index_topk_freq", 1),
             index_skip_topk_offset=raw.get("index_skip_topk_offset", 2),
             index_share_for_mtp_iteration=raw.get("index_share_for_mtp_iteration", False),
+            kda_layers=kda_layers,
+            full_attn_layers=full_attn_layers,
+            kda_head_dim=kda_head_dim,
+            kda_num_heads=kda_num_heads,
+            kda_conv_kernel_size=kda_conv_kernel_size,
+            moe_layer_freq=raw.get("moe_layer_freq", 1),
+            mla_use_nope=raw.get("mla_use_nope", False),
+            moe_expert_prefix=(
+                "block_sparse_moe.experts"
+                if raw.get("model_type") in ("kimi_linear", "kimi_k25", "kimi_k2")
+                else "mlp.experts"
+            ),
         )
 
 

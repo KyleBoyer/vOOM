@@ -171,6 +171,60 @@ class QuantPolicy:
             self.bits, self.group_size, self.mode)
 
 
+def dequantize_compressed_tensors_int4(
+    packed: mx.array, scale: mx.array, shape: tuple[int, int], packed_dim: int = 1,
+) -> mx.array:
+    """Dequantize a vllm-project/compressed-tensors "pack-quantized" INT4 weight.
+
+    F93 (docs/future_lossless_techniques.md): this is Kimi K2.5's AS-RELEASED
+    expert-weight format on Hugging Face (`.weight_packed`/`.weight_scale`/
+    `.weight_shape` tensor triples in place of an ordinary `.weight`) --
+    NOT the same scheme as this project's own QTensor/mx.quantize (different
+    library, different bit layout/scale convention; do not conflate them).
+    Only the MoE expert FFN weights use this format in K2.5's checkpoint;
+    attention and router weights are ordinary bf16 `.weight` tensors.
+
+    Algorithm verified bit-exact (2026-07-18) against the real
+    `compressed_tensors.compressors.pack_quantized.helpers.unpack_from_int32`
+    source (num_bits=4, which divides 32 evenly, so no value ever crosses an
+    int32 word boundary -- the general cross-word-overflow case in the real
+    function is dead code for this specific bit width and is not
+    reimplemented here): 8 signed int4 values per int32 word, value i at bit
+    offset `i*4`, stored with a +8 offset (i.e. raw nibble `0..15` encodes
+    signed `-8..7`); symmetric groupwise scale (no zero-point tensor in this
+    checkpoint), one BF16 scale per `group_size` consecutive elements along
+    `packed_dim`.
+
+    :param packed: int32 tensor, the `.weight_packed` tensor as loaded
+    :param scale: BF16 tensor, the `.weight_scale` tensor as loaded --
+        shape (rows, cols // group_size) for packed_dim=1
+    :param shape: the true logical (pre-pack) shape, from `.weight_shape`
+    :param packed_dim: which logical axis was packed (0 or 1); K2.5 uses 1
+    :returns: dequantized weight, shape `shape`, dtype matching `scale`
+    """
+    if packed_dim != 1:
+        raise NotImplementedError("F93: only packed_dim=1 verified/needed for K2.5 so far")
+    rows, cols = shape
+    if packed.shape != (rows, -(-cols // 8)):
+        raise ValueError(
+            f"packed shape {packed.shape} inconsistent with logical shape {shape} "
+            "for 8-values-per-int32 (num_bits=4) packing")
+    num_words = packed.shape[1]
+    shifts = mx.arange(8, dtype=mx.uint32) * 4
+    p = packed.astype(mx.uint32)
+    nibbles = (p[:, :, None] >> shifts[None, None, :]) & mx.array(0xF, dtype=mx.uint32)
+    nibbles = nibbles.reshape(rows, num_words * 8)[:, :cols]
+    signed = nibbles.astype(mx.int32) - 8  # F93: +8-offset-encoded, see docstring
+
+    group_size = cols // scale.shape[1]
+    if group_size * scale.shape[1] != cols:
+        raise ValueError(
+            f"weight_scale shape {scale.shape} does not evenly divide "
+            f"logical cols {cols} (implied group_size {cols / scale.shape[1]})")
+    scale_expanded = mx.repeat(scale.astype(mx.float32), group_size, axis=1)
+    return (signed.astype(mx.float32) * scale_expanded).astype(scale.dtype)
+
+
 def matmul(x: mx.array, w) -> mx.array:
     """x @ w.T for a plain, quantized, or candidate-reranked weight."""
     if isinstance(w, RerankedQHead):

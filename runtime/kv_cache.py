@@ -649,7 +649,11 @@ class SteppedKVCache(KVCache):
         for layer, key in enumerate(result.keys):
             if key is not None:
                 result._lengths[layer] = key.shape[2]
-        for attribute in ("dsa", "mla_absorbed"):
+        # F92: kda_cache is a KDAStateCache (Kimi Linear), structurally
+        # unrelated to the token-indexed key/value arrays this method
+        # rebuilds -- must be carried over unchanged or it's silently
+        # dropped, leaving KDA layers stateless with no error.
+        for attribute in ("dsa", "mla_absorbed", "kda_cache"):
             if hasattr(cache, attribute):
                 setattr(result, attribute, getattr(cache, attribute))
         return result

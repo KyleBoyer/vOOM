@@ -73,6 +73,11 @@ def _runtime_config(rms_norm_eps: float) -> ModelConfig:
         max_position_embeddings=128, tie_word_embeddings=False, attention_bias=False,
         head_dim=DN + DR, eos_token_ids=(0,), torch_dtype="float32",
         qk_nope_head_dim=DN, qk_rope_head_dim=DR, v_head_dim=DV,
+        # F92: _mla_attention now branches on q_lora_rank (0 -> single q_proj,
+        # Kimi Linear's shape; nonzero -> q_a/q_b lora split, GLM's shape).
+        # This fixture's weight dict is q_a/q_b-shaped (matches hf_cfg below),
+        # so q_lora_rank must be set here too or the branch picks the wrong path.
+        q_lora_rank=32,
         rope_interleave=True, index_topk=0,  # 0: skip DSA entirely on this side too
     )
 

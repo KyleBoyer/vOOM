@@ -549,16 +549,34 @@ class StreamingEngine:
                     "GLM indexer_types must describe every trunk layer: "
                     f"{len(self.cfg.indexer_types)} != {self.cfg.num_hidden_layers}"
                 )
-        if self.cfg.model_type == "glm_moe_dsa" and self.rc.expert_fetch_batch <= 0:
+        if (self.cfg.model_type in ("glm_moe_dsa", "kimi_linear", "kimi_k25")
+                and self.rc.expert_fetch_batch <= 0):
             # F74-v2 is a safety default for every construction path, including
             # direct experiments and YAML. Leaving zero as "unbounded" silently
             # bypassed the server's GLM-specific protection and recreated the
             # 16-22 GB union lifetime. q=1 is the fail-closed default until the
             # q=2/8 lazy-graph peak and arithmetic-order gates exist; explicit
             # validation scripts may request those larger batches. Other
-            # architectures retain zero semantics.
+            # architectures retain zero semantics. F92: Kimi Linear/K2.5 have
+            # 256/384 experts each, the same "prefill floods the union" risk
+            # GLM was fixed for here (measured 2026-07-18: an unbounded fetch
+            # on a 15-token prompt requested ~2.8GB in one shot and was
+            # correctly refused by the governor) -- same fix applies.
             self.rc.expert_fetch_batch = 1
-        self.tokenizer = Tokenizer.from_file(str(self._model_dir / "tokenizer.json"))
+        tokenizer_json = self._model_dir / "tokenizer.json"
+        if tokenizer_json.exists():
+            self.tokenizer = Tokenizer.from_file(str(tokenizer_json))
+        else:
+            # F92/F93: Kimi checkpoints ship a tiktoken vocab + a custom slow
+            # tokenizer class instead of a fast tokenizer.json.
+            from .tiktoken_convert import build_kimi_fast_tokenizer, has_tiktoken_tokenizer
+
+            if not has_tiktoken_tokenizer(self._model_dir):
+                raise FileNotFoundError(
+                    f"no tokenizer.json in {self._model_dir} and it does not "
+                    "look like a tiktoken-based checkpoint (need tiktoken.model "
+                    "+ tokenization_kimi.py) -- unsupported tokenizer format")
+            self.tokenizer = build_kimi_fast_tokenizer(self._model_dir)
         self._suffix_cache = None
         if self.rc.suffix_decoding:
             from .suffix_decoding import (
@@ -865,7 +883,8 @@ class StreamingEngine:
                 if l < self.cfg.num_hidden_layers:
                     self.prefetcher.schedule(
                         f"layer.{l}.expert.{e}",
-                        self.store.names_with_prefix(f"model.layers.{l}.mlp.experts.{e}."),
+                        self.store.names_with_prefix(
+                            f"model.layers.{l}.{self.cfg.moe_expert_prefix}.{e}."),
                     )
 
         # F16: memory-pressure governor — sheds prefetch, MLX scratch, then cache
@@ -925,7 +944,8 @@ class StreamingEngine:
         attention + norms + router — experts page separately, after routing."""
         names = self.store.layer_param_names(i)
         if self.cfg.num_experts:
-            names = [n for n in names if ".mlp.experts." not in n]
+            expert_marker = f".{self.cfg.moe_expert_prefix}."
+            names = [n for n in names if expert_marker not in n]
         if self._dsa_elided:
             # F43: with S bounded <= index_topk the indexer selects every position
             # by construction — its weights can never affect output. Skip the bytes.
@@ -1077,7 +1097,8 @@ class StreamingEngine:
                 for e in self.predictor.predict(layer, expert_ids, top_m=self.cfg.num_experts_per_tok):
                     self.prefetcher.schedule(
                         f"layer.{layer + 1}.expert.{e}",
-                        self.store.names_with_prefix(f"model.layers.{layer + 1}.mlp.experts.{e}."),
+                        self.store.names_with_prefix(
+                            f"model.layers.{layer + 1}.{self.cfg.moe_expert_prefix}.{e}."),
                     )
 
     def _fetch_experts(self, layer: int, expert_ids: list[int]) -> dict[int, dict]:
@@ -1093,7 +1114,8 @@ class StreamingEngine:
                 n_missing += 1
             items.append((
                 key,
-                self.store.names_with_prefix(f"model.layers.{layer}.mlp.experts.{e}."),
+                self.store.names_with_prefix(
+                    f"model.layers.{layer}.{self.cfg.moe_expert_prefix}.{e}."),
             ))
         if self.governor is not None and n_missing:
             # Reserve only the pages that can coexist in THIS compute batch.
@@ -1179,7 +1201,8 @@ class StreamingEngine:
         for e in sorted({int(i) for i in idx.reshape(-1).tolist()}):
             self.prefetcher.schedule(
                 f"layer.{nxt}.expert.{e}",
-                self.store.names_with_prefix(f"model.layers.{nxt}.mlp.experts.{e}."),
+                self.store.names_with_prefix(
+                    f"model.layers.{nxt}.{self.cfg.moe_expert_prefix}.{e}."),
             )
 
     def _estimate_layer_bytes(self) -> int:
@@ -1341,6 +1364,14 @@ class StreamingEngine:
                 from .glm import run_glm_block
 
                 x = run_glm_block(
+                    x, w, f"model.layers.{i}", self.cfg, kv, i, offset, self._get_experts,
+                    mlp_last_only=last_only,
+                    iter_expert_batches=self._iter_expert_batches,
+                )
+            elif self.cfg.model_type == "kimi_linear":
+                from .kimi_linear import run_kimi_linear_block
+
+                x = run_kimi_linear_block(
                     x, w, f"model.layers.{i}", self.cfg, kv, i, offset, self._get_experts,
                     mlp_last_only=last_only,
                     iter_expert_batches=self._iter_expert_batches,
@@ -1572,6 +1603,16 @@ class StreamingEngine:
                 from .glm_dsa import DSAState
 
                 kv.dsa = DSAState(self.cfg)
+        if self.cfg.model_type == "kimi_linear":
+            # F92/F94: KDA's recurrent state is not token-indexed and cannot
+            # be trimmed/rewound like the KVCache it rides alongside -- see
+            # the hot_eligible gate below, which keeps this model type off
+            # the hot-prompt-KV-reuse and disk-persistence paths entirely
+            # (neither is wired to save/restore kda_cache) until F94 designs
+            # an exact-match reuse mechanism for it specifically.
+            from .kda_state import KDAStateCache
+
+            kv.kda_cache = KDAStateCache(self.cfg.num_hidden_layers)
         return kv
 
     def generate(self, prompt: str, max_tokens: int = 64, on_token=None, stop=None,
@@ -1721,7 +1762,15 @@ class StreamingEngine:
         # all three cases: endpoint/branch/repeat), 0 when cold. MUST be
         # passed to save() explicitly rather than re-derived, since a
         # "repeat" parent chain's last segment is not chunk-sized.
-        hot_eligible = self.rc.hot_prompt_kv and not self.rc.max_kv_mb
+        # F92: KDA's recurrent state is a running fold, not a token-indexed
+        # array -- there is no way to "trim to a shared prefix length" the
+        # way hot-prompt-KV reuse does for ordinary KV, so partial reuse
+        # would silently produce wrong (understated) state. kv_store.py/
+        # hot_kv_persist.py also have no kda_cache save/restore code at all
+        # yet. Keep this model type on the always-cold path until an
+        # exact-match (not prefix-trim) reuse design exists for it.
+        hot_eligible = (self.rc.hot_prompt_kv and not self.rc.max_kv_mb
+                        and self.cfg.model_type != "kimi_linear")
         if hot_eligible:
             hot_t0 = time.perf_counter()
             # `last_kv` normally aliases the winning slot's KV; clear it even if
