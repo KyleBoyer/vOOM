@@ -306,9 +306,15 @@ class ModelConfig:
             kda_conv_kernel_size=kda_conv_kernel_size,
             moe_layer_freq=raw.get("moe_layer_freq", 1),
             mla_use_nope=raw.get("mla_use_nope", False),
+            # F93 correction (2026-07-19): only Kimi Linear's MoE module is
+            # actually named "block_sparse_moe" -- confirmed against the
+            # real Kimi-K2.5 checkpoint that it uses the standard
+            # ".mlp.experts.<id>.<proj>.weight" layout instead (this
+            # field's own default). An earlier version of this code wrongly
+            # applied Kimi Linear's naming to kimi_k25/kimi_k2 as well.
             moe_expert_prefix=(
                 "block_sparse_moe.experts"
-                if raw.get("model_type") in ("kimi_linear", "kimi_k25", "kimi_k2")
+                if raw.get("model_type") == "kimi_linear"
                 else "mlp.experts"
             ),
         )

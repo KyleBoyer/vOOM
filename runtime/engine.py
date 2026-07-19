@@ -535,13 +535,15 @@ class StreamingEngine:
         # the engine lifetime instead of rebuilding every segment index on each
         # request. It is initialized lazily only after the admission threshold.
         self._prompt_kv_store = None
-        if self.cfg.model_type == "glm_moe_dsa":
+        if self.cfg.model_type in ("glm_moe_dsa", "kimi_k25"):
             # This runtime currently implements the released target's n_group=1
             # router. Silently ignoring group-restricted routing on another GLM
-            # checkpoint would change the discontinuous expert choice.
+            # checkpoint would change the discontinuous expert choice. Kimi
+            # K2.5 shares this exact noaux_tc routing math (run_glm_block
+            # reused unmodified, F93) so the same guard applies.
             if self.cfg.n_group != 1 or self.cfg.topk_group != 1:
                 raise NotImplementedError(
-                    "group-restricted GLM routing is unsupported: "
+                    "group-restricted GLM-family routing is unsupported: "
                     f"n_group={self.cfg.n_group}, topk_group={self.cfg.topk_group}"
                 )
             if self.cfg.index_topk and len(self.cfg.indexer_types) != self.cfg.num_hidden_layers:
@@ -1208,7 +1210,7 @@ class StreamingEngine:
                 logits = logits + bias
             idx = mx.argpartition(-logits, kth=k - 1, axis=-1)[..., :k]
         elif gate_w is not None:
-            if self.cfg.model_type == "glm_moe_dsa":
+            if self.cfg.model_type in ("glm_moe_dsa", "kimi_k25"):
                 scores = h.astype(mx.float32) @ gate_w.astype(mx.float32).T
             else:
                 scores = (h @ gate_w.T).astype(mx.float32)
@@ -1381,7 +1383,14 @@ class StreamingEngine:
                     self._get_experts, self._rope_freqs, self._mscale,
                     mlp_last_only=last_only,
                 )
-            elif self.cfg.model_type == "glm_moe_dsa":
+            elif self.cfg.model_type in ("glm_moe_dsa", "kimi_k25"):
+                # F93: Kimi K2.5's language model is architecturally identical
+                # to GLM's MLA+noaux_tc-MoE block (real q_lora MLA, real RoPE
+                # -- no NoPE, no DSA, standard .mlp.experts.<id>.gate_proj/
+                # up_proj/down_proj naming, confirmed against the real
+                # checkpoint) -- run_glm_block applies unmodified. index_topk
+                # is 0 for this checkpoint so the DSA-only code paths inside
+                # it are dead code here, not actually exercised.
                 from .glm import run_glm_block
 
                 x = run_glm_block(

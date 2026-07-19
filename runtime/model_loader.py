@@ -34,6 +34,20 @@ class _QuantAux:
     mode: str
 
 
+@dataclass(frozen=True)
+class _CTInt4Aux:
+    """F93: a vllm-project/compressed-tensors "pack-quantized" INT4 triplet
+    (.weight_packed/.weight_scale/.weight_shape in place of a plain
+    .weight). Distinct scheme from this project's own QTensor/mx.quantize
+    format above -- different library, different bit layout, dequantized
+    eagerly to a dense bf16 array at fetch time (see WeightStore.fetch),
+    not lazily matmul'd via mx.quantized_matmul like a QTensor."""
+
+    packed: str
+    scale: str
+    shape: str
+
+
 def _quant_params(value) -> tuple[int, int, str] | None:
     """Normalize one standard-MLX quantization descriptor."""
     if not isinstance(value, dict):
@@ -196,6 +210,28 @@ class WeightStore:
                     if bias_name is not None:
                         quant_aux_names.add(bias_name)
 
+        # F93: vllm-project/compressed-tensors "pack-quantized" INT4 --
+        # confirmed on Kimi K2.5's real checkpoint, MoE expert weights only
+        # (attention/router stay plain bf16 .weight tensors). Expose only
+        # the logical "<stem>.weight" name; fetch() dequantizes the
+        # packed/scale/shape triplet to a dense array (see _CTInt4Aux).
+        self._ct_int4_aux: dict[str, _CTInt4Aux] = {}
+        if not self.packed:
+            for name in list(self.weight_map):
+                if not name.endswith(".weight_packed"):
+                    continue
+                stem = name[:-len(".weight_packed")]
+                scale = f"{stem}.weight_scale"
+                shape = f"{stem}.weight_shape"
+                if scale not in self.weight_map or shape not in self.weight_map:
+                    continue
+                logical = f"{stem}.weight"
+                self._ct_int4_aux[logical] = _CTInt4Aux(name, scale, shape)
+                self.weight_map[logical] = self.weight_map[name]
+                quant_aux_names.add(name)
+                quant_aux_names.add(scale)
+                quant_aux_names.add(shape)
+
         packed_triplets = any(
             name.endswith(".weight")
             and f"{name[:-len('.weight')]}.scales" in self.weight_map
@@ -228,7 +264,17 @@ class WeightStore:
                 )
                 for aux in self._quant_aux.values()
             )
-        elif self.quantization and self.config.model_type != "gpt_oss":
+        elif (self.quantization and self.config.model_type != "gpt_oss"
+                and not (self.quantization.get("quant_method") == "compressed-tensors"
+                         and self.quantization.get("format") == "pack-quantized"
+                         and self._ct_int4_aux)):
+            # F93: vllm-project/compressed-tensors pack-quantized INT4 is now
+            # a supported on-disk layout (see _ct_int4_aux above and
+            # fetch()'s dequantize_compressed_tensors_int4 call) -- only
+            # reaches this branch, and still raises, if the declared
+            # quantization method ISN'T that exact one, or claims to be but
+            # no matching .weight_packed/.weight_scale/.weight_shape
+            # triplets were actually found (config/checkpoint mismatch).
             method = self.quantization.get("quant_method", "unknown")
             standard_declared = (
                 _quant_params(self.quantization) is not None
@@ -334,8 +380,16 @@ class WeightStore:
         physical_names: list[str] = []
         seen: set[str] = set()
         for n in names:
-            aux = self._quant_aux.get(n)
-            expanded = ((n, aux.scales, aux.biases) if aux is not None else (n,))
+            ct_aux = self._ct_int4_aux.get(n)
+            if ct_aux is not None:
+                # F93: the logical "<stem>.weight" name has NO physical
+                # tensor of its own here (unlike _quant_aux, where the
+                # logical name IS a real quantized weight tensor plus
+                # sidecars) -- only packed/scale/shape physically exist.
+                expanded = (ct_aux.packed, ct_aux.scale, ct_aux.shape)
+            else:
+                aux = self._quant_aux.get(n)
+                expanded = ((n, aux.scales, aux.biases) if aux is not None else (n,))
             for physical in expanded:
                 if physical is not None and physical not in seen:
                     physical_names.append(physical)
@@ -358,11 +412,17 @@ class WeightStore:
                         out[n] = lazy[self._real_name.get(n, n)]
                 mx.eval(list(out.values()))
                 nbytes = sum(a.nbytes for a in out.values())
-                if self._quant_aux:
-                    from .quant import QTensor
+                if self._quant_aux or self._ct_int4_aux:
+                    from .quant import QTensor, dequantize_compressed_tensors_int4
 
                     logical: dict = {}
                     for name in names:
+                        ct_aux = self._ct_int4_aux.get(name)
+                        if ct_aux is not None:
+                            shape = tuple(int(v) for v in out[ct_aux.shape].tolist())
+                            logical[name] = dequantize_compressed_tensors_int4(
+                                out[ct_aux.packed], out[ct_aux.scale], shape)
+                            continue
                         aux = self._quant_aux.get(name)
                         if aux is None:
                             logical[name] = out[name]

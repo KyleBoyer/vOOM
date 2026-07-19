@@ -131,3 +131,35 @@ def test_int4_dequant_matches_oracle_on_real_k25_expert_weight():
     # bf16 round-trip noise only (scale/output both pass through bf16); the
     # integer unpack itself is exact, verified separately above.
     assert max_diff < 1e-3, f"real-weight dequant mismatch vs oracle: {max_diff}"
+
+
+@_model_skip
+def test_weightstore_fetch_dequantizes_int4_experts_transparently():
+    """2026-07-19: the two tests above validate the dequant MATH in
+    isolation. This validates the actual WeightStore.fetch() integration --
+    language_model.model.* prefix canonicalization, .weight_packed/
+    .weight_scale/.weight_shape triplet detection, and the on-disk-
+    quantization guard's compressed-tensors exemption -- all through the
+    real production code path a live request actually uses, not a
+    hand-rolled shortcut."""
+    from runtime.model_loader import WeightStore
+
+    store = WeightStore(str(MODEL_DIR))
+    logical_name = "model.layers.4.mlp.experts.0.down_proj.weight"
+    assert store.has(logical_name)
+    out, _secs, nbytes = store.fetch([logical_name])
+    w = out[logical_name]
+    assert nbytes > 0
+    assert w.shape == (7168, 2048)
+    assert w.dtype == mx.bfloat16
+    assert not bool(mx.any(mx.isnan(w)).item())
+
+    # Cross-check against the standalone-verified dequant path (previous
+    # test in this file) on the exact same tensor -- must match exactly,
+    # not just "look reasonable".
+    packed = mx.load(str(MODEL_DIR / "model-00005-of-000064.safetensors"))
+    prefix = "language_model.model.layers.4.mlp.experts.0.down_proj"
+    direct = dequantize_compressed_tensors_int4(
+        packed[f"{prefix}.weight_packed"], packed[f"{prefix}.weight_scale"], (7168, 2048))
+    mx.eval(direct)
+    assert bool(mx.array_equal(w, direct).item())

@@ -1868,15 +1868,20 @@ PACKS = PackManager()
 @lru_cache(maxsize=32)
 def _compiled_template(template_text: str, compact_json: bool):
     """Compile each immutable checkpoint template/profile once per process."""
+    # 2026-07-19: Kimi K2.5's real chat_template.jinja uses {% break %}
+    # (a for-loop early-exit), which needs jinja2's loopcontrols extension
+    # enabled -- without it, Environment/Template can't even PARSE the
+    # template (not just fail to render it). Harmless for every other
+    # checkpoint's template, which simply doesn't use the tag.
     if not compact_json:
         from jinja2 import Template
 
-        return Template(template_text)
+        return Template(template_text, extensions=["jinja2.ext.loopcontrols"])
 
     from jinja2 import Environment
     from jinja2.utils import htmlsafe_json_dumps
 
-    env = Environment(autoescape=False)
+    env = Environment(autoescape=False, extensions=["jinja2.ext.loopcontrols"])
     # Preserve Jinja's tojson escaping contract while changing only key order
     # and insignificant JSON whitespace. Raw json.dumps would allow strings
     # such as ``</tools>`` to escape a template's tool delimiter.
@@ -1963,7 +1968,7 @@ def _template_consumes_tools(template_text: str) -> bool:
     from jinja2 import Environment, meta
 
     return "tools" in meta.find_undeclared_variables(
-        Environment().parse(template_text))
+        Environment(extensions=["jinja2.ext.loopcontrols"]).parse(template_text))
 
 
 def _tools_system_preamble(tools: list[dict], *, compact_json: bool) -> str:
