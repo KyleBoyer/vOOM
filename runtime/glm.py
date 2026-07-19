@@ -30,10 +30,49 @@ from __future__ import annotations
 
 import mlx.core as mx
 
+import math
+
 from . import quant
 from .config import ModelConfig
 from .expert_batching import consume_expert_batches
 from .layer_runner import _linear, _swiglu
+
+
+def _yarn_get_mscale(scale: float, mscale: float) -> float:
+    """Verbatim from the real modeling_deepseek.py (F93, 2026-07-19)."""
+    if scale <= 1:
+        return 1.0
+    return 0.1 * mscale * math.log(scale) + 1.0
+
+
+def _yarn_rope_params(cfg: ModelConfig, dr: int) -> tuple[mx.array, float, float]:
+    """DeepSeek-V3-style YaRN (F93, 2026-07-19): the frequency-ramp math and
+    the cos/sin scale are algebraically identical to runtime.rope's
+    Qwen/MLX-LM-lineage yarn_parameters (verified by direct derivation
+    against the real DeepseekV3YarnRotaryEmbedding._set_cos_sin_cache), so
+    that function is reused directly for both. The extra softmax_scale
+    multiplier (applied only when mscale_all_dim is truthy) is NOT present
+    in runtime.rope at all -- it is a separate mechanism in the real
+    DeepseekV3Attention.__init__ (`softmax_scale *= yarn_get_mscale(factor,
+    mscale_all_dim) ** 2`), computed here to match exactly. Do not conflate
+    the two mscale effects: for K2.5's own config (mscale == mscale_all_dim
+    == 1.0) the cos/sin-scale ratio is a no-op (1.0) while the softmax
+    multiplier is NOT (~2.0) -- they diverge for other mscale values too.
+    """
+    from .rope import yarn_parameters
+
+    scaling = cfg.rope_scaling
+    denominators, cos_sin_scale = yarn_parameters(
+        dr, cfg.rope_theta, scaling["factor"], scaling["original_max_position_embeddings"],
+        beta_fast=scaling.get("beta_fast", 32.0), beta_slow=scaling.get("beta_slow", 1.0),
+        mscale=scaling.get("mscale", 1.0), mscale_all_dim=scaling.get("mscale_all_dim", 0.0),
+    )
+    mscale_all_dim = scaling.get("mscale_all_dim", 0.0)
+    softmax_scale_mult = (
+        _yarn_get_mscale(scaling["factor"], mscale_all_dim) ** 2 if mscale_all_dim else 1.0
+    )
+    freqs = mx.array(denominators, dtype=mx.float32)
+    return freqs, cos_sin_scale, softmax_scale_mult
 
 
 def _mla_attention(
@@ -68,11 +107,22 @@ def _mla_attention(
     )
 
     k_rope = k_rope.reshape(B, L, 1, dr).transpose(0, 2, 1, 3)  # single MQA rope head
+    softmax_scale_mult = 1.0
+    yarn_active = (cfg.rope_scaling is not None
+                   and cfg.rope_scaling.get("type") == "yarn")
     if not cfg.mla_use_nope:
-        q_rope = mx.fast.rope(q_rope, dr, traditional=cfg.rope_interleave, base=cfg.rope_theta,
-                              scale=1.0, offset=offset)
-        k_rope = mx.fast.rope(k_rope, dr, traditional=cfg.rope_interleave, base=cfg.rope_theta,
-                              scale=1.0, offset=offset)
+        if yarn_active:
+            # F93: DeepSeek-V3-style YaRN (Kimi K2.5) -- see _yarn_rope_params.
+            freqs, cos_sin_scale, softmax_scale_mult = _yarn_rope_params(cfg, dr)
+            q_rope = mx.fast.rope(q_rope, dr, traditional=cfg.rope_interleave, base=None,
+                                  freqs=freqs, scale=1.0, offset=offset) * cos_sin_scale
+            k_rope = mx.fast.rope(k_rope, dr, traditional=cfg.rope_interleave, base=None,
+                                  freqs=freqs, scale=1.0, offset=offset) * cos_sin_scale
+        else:
+            q_rope = mx.fast.rope(q_rope, dr, traditional=cfg.rope_interleave, base=cfg.rope_theta,
+                                  scale=1.0, offset=offset)
+            k_rope = mx.fast.rope(k_rope, dr, traditional=cfg.rope_interleave, base=cfg.rope_theta,
+                                  scale=1.0, offset=offset)
     # else: F92 -- Kimi Linear's MLA is NoPE, the "rope" head-dim split is
     # carried through unrotated; position info comes only from KDA layers.
     queries = mx.concatenate([q_nope, q_rope], axis=-1)
@@ -156,7 +206,7 @@ def _mla_attention(
         mask = mx.where(k_pos <= q_pos, 0.0, float("-inf")).astype(queries.dtype)
 
     attn = mx.fast.scaled_dot_product_attention(
-        queries, keys, values, scale=(dn + dr) ** -0.5, mask=mask
+        queries, keys, values, scale=(dn + dr) ** -0.5 * softmax_scale_mult, mask=mask
     )
     attn = attn.transpose(0, 2, 1, 3).reshape(B, L, n_h * dv)
     return _linear(attn, w, f"{prefix}.self_attn.o_proj")

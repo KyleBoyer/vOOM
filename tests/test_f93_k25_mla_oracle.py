@@ -2,29 +2,22 @@
 run against the REAL modeling_deepseek.py (no fla-core stubbing needed --
 unlike Kimi Linear, K2.5's language model has no Triton-only dependencies).
 
-2026-07-19 finding: K2.5's real config.json declares YaRN RoPE scaling
-(type=yarn, factor=64, beta_fast=32, beta_slow=1, mscale=1.0,
-mscale_all_dim=1.0, original_max_position_embeddings=4096) -- but
-runtime/glm.py's _mla_attention (reused unmodified for kimi_k25, see F93)
-only ever applies plain RoPE with no YaRN scaling at all, and no YaRN
-wiring exists for glm_moe_dsa/kimi_k25 in engine.py (only qwen2 and
-gpt_oss have YaRN support today). This is expected to make the MLA oracle
-test below FAIL/mismatch -- that failure is the point: it quantifies a
-real, previously undiscovered correctness gap rather than leaving it as an
-unverified assumption. Do not "fix" this test to pass by disabling YaRN in
-the real reference -- that would hide the gap instead of proving it.
-
-Also confirmed by reading the real DeepseekV3Attention.__init__: its YaRN
-mscale application (`softmax_scale *= yarn_get_mscale(factor,
-mscale_all_dim) ** 2`) is NOT the same formula as runtime/rope.py's
-existing yarn_parameters() (which computes a mscale/mscale_all_dim RATIO,
-tuned for a different lineage -- MLX-LM/Qwen-style YaRN). For K2.5's own
-config values (mscale == mscale_all_dim == 1.0) the two formulas diverge
-concretely: runtime/rope.py's ratio gives attention_scale=1.0 (no-op),
-while DeepSeek's real formula gives softmax_scale *= ~2.0. Reusing
-runtime/rope.py's yarn_parameters() as-is for K2.5 would be WRONG, not a
-shortcut -- a correct fix needs a DeepSeek-V3-specific mscale formula, not
-attempted here.
+2026-07-19 finding (later fixed same day): K2.5's real config.json declares
+YaRN RoPE scaling (type=yarn, factor=64, beta_fast=32, beta_slow=1,
+mscale=1.0, mscale_all_dim=1.0, original_max_position_embeddings=4096) --
+runtime/glm.py's _mla_attention originally applied only plain RoPE, no
+YaRN at all, which this file's tests first caught at 0.59-0.81 max abs
+diff. YaRN support was then added (glm.py::_yarn_rope_params): the
+frequency-ramp math and cos/sin scale turned out to be algebraically
+identical to runtime/rope.py's existing yarn_parameters() (verified by
+direct derivation against the real DeepseekV3YarnRotaryEmbedding, reused
+directly) -- but a SEPARATE softmax_scale multiplier
+(`yarn_get_mscale(factor, mscale_all_dim) ** 2`, applied in the real
+DeepseekV3Attention.__init__) is NOT covered by runtime/rope.py at all and
+needed new code. For K2.5's own config values (mscale == mscale_all_dim ==
+1.0) the cos/sin-scale ratio is a no-op (1.0) while the softmax multiplier
+is not (~2.0) -- both are exercised correctly below (test now expects a
+close match, not a mismatch).
 """
 
 from __future__ import annotations
@@ -190,13 +183,12 @@ def test_mla_matches_real_deepseek_when_no_yarn_is_configured():
 
 
 @_model_skip
-def test_mla_yarn_gap_is_real_and_quantified():
+def test_mla_matches_real_deepseek_with_yarn_implemented():
     """K2.5's ACTUAL config (rope_scaling=yarn) vs runtime/glm.py's
-    _mla_attention, which applies no YaRN. Documents the real gap found
-    2026-07-19 rather than leaving it as an unverified assumption -- this
-    is EXPECTED to fail/mismatch. If this ever starts passing without
-    YaRN being added to _mla_attention, something else changed and needs
-    investigating (not a silent green light)."""
+    _mla_attention. 2026-07-19: YaRN support was added to _mla_attention
+    (_yarn_rope_params in glm.py) after this test first proved the gap at
+    0.59 max abs diff with no YaRN applied -- this now exercises the real
+    implementation via cfg.rope_scaling and expects it to match closely."""
     model_mod, cfg_mod = _load_real_modeling_deepseek()
     cfg = _tiny_config(cfg_mod, with_yarn=True)
 
@@ -213,17 +205,12 @@ def test_mla_yarn_gap_is_real_and_quantified():
     prefix = "layer0"
     w = {f"{prefix}.self_attn.{k}": mx.array(v.numpy()) for k, v in sd.items()}
 
-    rcfg = _runtime_cfg()  # no YaRN fields -- matches _mla_attention's actual capability
+    rcfg = _runtime_cfg()
+    rcfg.rope_scaling = YARN_SCALING
     kv = KVCache(num_layers=1)
     h_mx = mx.array(h_torch.numpy())
     runtime_out = _mla_attention(h_mx, w, prefix, rcfg, kv, layer=0, offset=0)
     mx.eval(runtime_out)
 
     max_diff = np.max(np.abs(hf_out.detach().numpy() - np.array(runtime_out)))
-    print(f"\nF93 YaRN gap: real-vs-plain-RoPE max abs diff = {max_diff:.6f} "
-          "(expected large -- quantifies the missing-YaRN gap, see module docstring)")
-    assert max_diff > 1e-2, (
-        "expected a large mismatch quantifying the missing-YaRN gap; got "
-        f"{max_diff} -- if this is now small, re-investigate before assuming "
-        "the gap is fixed (it isn't, per this file's docstring)"
-    )
+    assert max_diff < 1e-3, f"K2.5 YaRN MLA oracle mismatch: max abs diff {max_diff}"
