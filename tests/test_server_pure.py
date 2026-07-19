@@ -634,6 +634,36 @@ def test_glm_fast_mode_enables_quantized_cache_pages():
     assert captured[0].max_weight_cache_mb == 5000
 
 
+def test_k25_lossless_uses_demand_paging_without_speculative_prefetch():
+    from unittest.mock import patch
+
+    from runtime.server import EngineManager
+
+    captured = []
+
+    class FakeEngine:
+        def __init__(self, _path, rc):
+            captured.append(rc)
+
+        def close(self):
+            pass
+
+    cfg = SimpleNamespace(
+        model_type="kimi_k25", tie_word_embeddings=False,
+        index_topk=0, vision_config=None)
+    with patch("runtime.config.ModelConfig.from_dir", return_value=cfg), \
+         patch("runtime.path_resolver.resolve_model_dir", side_effect=lambda path: path), \
+         patch("runtime.engine.StreamingEngine", FakeEngine):
+        EngineManager().get(Path("/tmp/fake-k25"), "lossless")
+
+    rc = captured[0]
+    assert rc.max_weight_cache_mb == 1500
+    assert rc.prefetch_depth == 0
+    assert rc.stream_lm_head
+    assert not rc.pin_lm_head
+    assert rc.quant_bits == 0
+
+
 def test_dense_fast_mode_uses_validated_mxfp4_and_pipelined_decode():
     from unittest.mock import patch
 

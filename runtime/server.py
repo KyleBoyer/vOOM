@@ -986,7 +986,18 @@ class EngineManager:
                 # its much smaller hidden_size keeps its lm_head modest.
                 rc.pin_lm_head = False
                 rc.stream_lm_head = True
-                rc.max_weight_cache_mb = 4000
+                # A 4 GB cache still admitted enough concurrent demand/prefetch
+                # growth to trigger real swap-outs before F42 reached its next
+                # large reservation. Lossless K2.5 already computes experts at
+                # the minimum q=1 lifetime, so the remaining exact paging lever
+                # is lower residency, not a fictional q<1. Keep 1.5 GB of LRU
+                # pages (with pre-fetch eviction before known-size trunk pages)
+                # and disable speculative prefetch; demand misses still
+                # stream the same released tensors and preserve arithmetic.
+                # The live governor may shrink this further toward its 1.5 GB
+                # floor when system headroom requires it.
+                rc.max_weight_cache_mb = 1500
+                rc.prefetch_depth = 0
             else:
                 rc.max_weight_cache_mb = 6000
                 if mode in ("fast", "fast-long"):  # side-quest: lossy 4-bit resident cache

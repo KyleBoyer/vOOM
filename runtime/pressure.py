@@ -21,6 +21,7 @@ sufficient for how fast our allocations move and keeps this dependency-free.
 
 from __future__ import annotations
 
+import math
 import threading
 import time
 
@@ -113,6 +114,47 @@ class MemoryGovernor:
             mx.get_active_memory(), psutil.virtual_memory().available
         )
 
+    def admissible_units(
+        self,
+        unit_bytes: int,
+        fixed_bytes: int,
+        max_units: int,
+        margin: int = int(0.4e9),
+        gamma: float = 1.25,
+    ) -> int:
+        """Choose a live-headroom-bounded batch size without allocating.
+
+        ``max_units`` is an independently validated arithmetic/lifetime cap;
+        this method may only shrink it.  ``unit_bytes`` describes the caller's
+        peak per-unit load estimate (resident representation plus any distinct
+        decode/quantize staging), so a directly loadable Q4 page may be smaller
+        than BF16 while quantize-on-load still accounts for its BF16 source.
+        ``fixed_bytes`` covers learned compute scratch shared by the batch and
+        ``gamma`` pads remaining per-unit staging/model error.
+
+        A result of one is deliberately fail-closed, not an admission decision:
+        the caller must still call :meth:`reserve`, which will reclaim cache or
+        refuse before allocation if even one unit cannot fit.
+        """
+        unit_bytes = int(unit_bytes)
+        fixed_bytes = max(0, int(fixed_bytes))
+        max_units = int(max_units)
+        if unit_bytes <= 0:
+            raise ValueError("unit_bytes must be positive")
+        if max_units <= 0:
+            raise ValueError("max_units must be positive")
+        if gamma < 1.0:
+            raise ValueError("gamma must be >= 1")
+
+        active = mx.get_active_memory()
+        ceiling = self._metal_ceiling(
+            active, psutil.virtual_memory().available)
+        available_for_units = max(
+            0, ceiling - active - fixed_bytes - int(margin))
+        padded_unit = max(1, math.ceil(unit_bytes * gamma))
+        live_units = available_for_units // padded_unit
+        return max(1, min(max_units, int(live_units)))
+
     # ---- actions ------------------------------------------------------
 
     def _set_cache_max(self, nbytes: int):
@@ -135,10 +177,17 @@ class MemoryGovernor:
         shrinks."""
         # cache_memory is deliberately NOT counted: MLX reuses those buffers as
         # the very scratch being declared, so counting both double-books it.
-        active = mx.get_active_memory()
-        available = psutil.virtual_memory().available
-        ceiling = self._metal_ceiling(active, available)
-        projected = active + incoming_bytes + margin
+        incoming_bytes = int(incoming_bytes)
+        margin = int(margin)
+
+        def sample():
+            active = mx.get_active_memory()
+            available = psutil.virtual_memory().available
+            ceiling = self._metal_ceiling(active, available)
+            projected = active + incoming_bytes + margin
+            return active, available, ceiling, projected
+
+        active, available, ceiling, projected = sample()
         if projected <= ceiling:
             return
         # Stop admitting speculative work while we try to make room. A running
@@ -146,29 +195,36 @@ class MemoryGovernor:
         # reservation and consume the space being reclaimed.
         self._pause_prefetch(True)
         mx.clear_cache()
-        active = mx.get_active_memory()
-        available = psutil.virtual_memory().available
-        ceiling = self._metal_ceiling(active, available)
-        projected = active + incoming_bytes + margin
+        active, available, ceiling, projected = sample()
         if projected <= ceiling:
             return
-        overshoot = projected - ceiling
-        new_max = max(self.floor, self.cache.max_bytes - overshoot)
-        if new_max < self.cache.max_bytes:
+
+        # One exact-overshoot shrink is not sufficient on unified memory:
+        # eviction can release less Metal memory than the cache-accounted bytes,
+        # allocator/system availability can move between samples, and lazy graphs
+        # may briefly retain a page.  The old one-shot path reproducibly refused
+        # K2.5 requests only 20-80 MB over the ceiling while gigabytes of
+        # reclaimable cache remained.  Shrink by at least the ordinary governor
+        # step, re-measure, and continue until the live projection fits or the
+        # configured floor proves that the allocation is genuinely unsafe.
+        while projected > ceiling and self.cache.max_bytes > self.floor:
+            overshoot = projected - ceiling
+            step = max(
+                int(overshoot),
+                int(self.cache.max_bytes * self.shrink_step),
+                1,
+            )
+            new_max = max(self.floor, self.cache.max_bytes - step)
             self._set_cache_max(new_max)
             self.reservations += 1
             print(f"[governor] RESERVE {incoming_bytes / 1e9:.2f}GB incoming -> "
                   f"cache budget {new_max / 1e9:.1f}GB", flush=True)
-        # Eviction may be insufficient because pinned/current tensors and the
-        # operation's own scratch are not reclaimable cache pages. The old path
-        # continued anyway after reaching the cache floor—the exact fail-open
-        # behavior that let known transients run past the sampled safe ceiling.
-        # Re-measure after reclamation and reject before the allocation.
-        mx.clear_cache()
-        active = mx.get_active_memory()
-        available = psutil.virtual_memory().available
-        ceiling = self._metal_ceiling(active, available)
-        projected = active + incoming_bytes + margin
+            mx.clear_cache()
+            active, available, ceiling, projected = sample()
+
+        # Eviction may still be insufficient because pinned/current tensors and
+        # the operation's own scratch are not reclaimable cache pages. Refuse at
+        # the floor instead of weakening the reserve or continuing fail-open.
         if projected > ceiling:
             self.reservation_failures += 1
             raise MemoryError(

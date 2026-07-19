@@ -475,6 +475,16 @@ or stateful Responses controls fail explicitly rather than being ignored.
 .venv/bin/python -m pytest tests/ -q
 ```
 
+On low-memory unified-memory hosts, use the serial process-sharded runner. It
+starts each test module in a fresh Python process so MLX allocator state cannot
+accumulate across modules, and terminates a shard (including child servers) if
+system-available memory falls below 4 GB or swap occupancy grows by more than
+16 MB:
+
+```bash
+.venv/bin/python tests/run_pytest_sharded.py
+```
+
 The suite is designed to run without any large model checkpoint or external
 storage: it uses tiny synthetic fixtures (built on the fly) and, where
 useful, cross-checks this runtime's math against the `transformers` library's

@@ -47,6 +47,76 @@ def test_decode_only_expert_batch_can_be_larger_than_prefill_batch():
     assert [len(ids) for ids, _pages in prefill] == [1] * 8
 
 
+def test_governor_clamps_validated_decode_cap_using_live_headroom():
+    """Adaptive scheduling may shrink the mode's cap, never grow it."""
+    from types import SimpleNamespace
+
+    from runtime.engine import StreamingEngine
+
+    class FakeGovernor:
+        def admissible_units(self, *, unit_bytes, fixed_bytes, max_units):
+            assert unit_bytes == 100
+            assert fixed_bytes == 200
+            return min(3, max_units)
+
+    class FakeEngine:
+        rc = SimpleNamespace(expert_fetch_batch=1, decode_expert_fetch_batch=8)
+        governor = FakeGovernor()
+        _expert_page_bytes = 100
+        _expert_fetch_page_bytes = 100
+        _layer_transient = 200
+        _expert_compute_batches = 0
+        _max_experts_per_compute_batch = 0
+        _adaptive_expert_batch_clamps = 0
+        _min_adaptive_expert_batch = 0
+
+        def _record_expert_route(self, *_args, **_kwargs):
+            pass
+
+        def _fetch_experts(self, _layer, expert_ids):
+            return {expert: object() for expert in expert_ids}
+
+    engine = FakeEngine()
+    expert_ids = list(range(8))
+    decode = list(StreamingEngine._iter_expert_batches(
+        engine, 4, expert_ids,
+        positions={expert: [0] for expert in expert_ids}))
+
+    assert [len(ids) for ids, _pages in decode] == [3, 3, 2]
+    assert engine._adaptive_expert_batch_clamps == 2
+    assert engine._min_adaptive_expert_batch == 2
+
+
+def test_k25_layer_page_estimate_distinguishes_dense_and_sparse_pages():
+    from types import SimpleNamespace
+
+    from runtime.engine import StreamingEngine
+
+    engine = SimpleNamespace(cfg=SimpleNamespace(
+        model_type="kimi_k25",
+        hidden_size=7168,
+        num_attention_heads=64,
+        qk_nope_head_dim=128,
+        qk_rope_head_dim=64,
+        v_head_dim=128,
+        q_lora_rank=1536,
+        kv_lora_rank=512,
+        mlp_layer_types=("dense", "sparse"),
+        first_k_dense_replace=1,
+        intermediate_size=18432,
+        num_experts=384,
+        moe_intermediate_size=2048,
+        n_shared_experts=1,
+    ))
+
+    dense = StreamingEngine._layer_fetch_bytes_estimate(engine, 0)
+    sparse = StreamingEngine._layer_fetch_bytes_estimate(engine, 1)
+
+    assert 900_000_000 < dense < 1_200_000_000
+    assert 250_000_000 < sparse < 400_000_000
+    assert dense > sparse * 3
+
+
 class _WeakrefableDict(dict):
     """Plain dict can't hold a weakref; a bare subclass can (gains
     __weakref__), letting the test observe when the mapping is actually

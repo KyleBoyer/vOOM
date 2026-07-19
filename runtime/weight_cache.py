@@ -276,6 +276,22 @@ class WeightCache:
         with self._lock:
             return self._reserved_bytes + nbytes <= self.max_bytes
 
+    def prepare_for(self, incoming_bytes: int) -> None:
+        """Evict before a known-size demand fetch instead of after allocation.
+
+        Ordinary ``get()`` cannot know a page's materialized size until the
+        store returns it, so its historical budget enforcement necessarily
+        happens after fetch. Callers with a conservative size estimate can use
+        this method to keep ``old cache + incoming page`` within the residency
+        budget and avoid delegating that overlap to macOS swap/compression.
+        Pinned pages remain non-evictable; the governor separately decides
+        whether the resulting allocation is safe.
+        """
+        incoming_bytes = max(0, int(incoming_bytes))
+        with self._lock:
+            target = max(0, self.max_bytes - incoming_bytes)
+            self._evict_to_locked(target)
+
     # ---- internals --------------------------------------------------------
 
     @staticmethod
@@ -307,6 +323,9 @@ class WeightCache:
             self._reserved_bytes -= page.nbytes
 
     def _evict_locked(self):
+        self._evict_to_locked(self.max_bytes)
+
+    def _evict_to_locked(self, target_bytes: int):
         """Evict by the exact historical policy with one selection/clear cycle.
 
         Unconsumed prefetch pages remain protected until every ordinary unpinned
@@ -314,7 +333,8 @@ class WeightCache:
         position supplies the age tie-break, exactly matching the former repeated
         ``min`` loop.
         """
-        if self._total_bytes <= self.max_bytes:
+        target_bytes = max(0, int(target_bytes))
+        if self._total_bytes <= target_bytes:
             return
         ordinary = []
         prefetched = []
@@ -328,7 +348,7 @@ class WeightCache:
         evicted = False
         try:
             for _frequency, _age, key in victims:
-                if self._total_bytes <= self.max_bytes:
+                if self._total_bytes <= target_bytes:
                     break
                 page = self._pages[key]
                 if self.warm is not None:

@@ -203,6 +203,24 @@ def test_consumer_exception_closes_producer_and_releases_payload():
     assert state["payload"]() is None, "failed batch payload survived unwind"
 
 
+def test_prepare_for_evicts_old_pages_before_known_size_fetch():
+    original_clear = weight_cache_module._clear_device_cache
+    weight_cache_module._clear_device_cache = lambda: None
+    try:
+        store = FakeStore()
+        cache = WeightCache(store, max_bytes=12_000)
+        cache.get("expert.0", ["expert.0.w"])
+        cache.get("expert.1", ["expert.1.w"])
+        assert cache.total_bytes == 8192
+
+        cache.prepare_for(8000)
+
+        assert cache.total_bytes <= 4000
+        assert cache.stats.evictions == 2
+    finally:
+        weight_cache_module._clear_device_cache = original_clear
+
+
 def _run_all():
     tests = [v for k, v in sorted(globals().items())
              if k.startswith("test_") and callable(v)]

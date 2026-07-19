@@ -651,8 +651,22 @@ class StreamingEngine:
         else:
             resident_bytes_per_weight = (
                 0.6 if self.cfg.model_type == "gpt_oss" else 2)
+        dense_expert_page_bytes = int(
+            3 * self.cfg.hidden_size * inter * 2)
         self._expert_page_bytes = int(
             3 * self.cfg.hidden_size * inter * resident_bytes_per_weight)
+        # Admission must cover peak load representation, not only the object
+        # that survives in WeightCache. A standard pre-quantized checkpoint
+        # loads its compact QTensor directly. Runtime quantize-on-load first
+        # materializes every BF16 source tensor and retains it while building
+        # the compact result, so count both. K2.5's released compressed-tensors
+        # INT4 path dequantizes to a dense BF16 expert and therefore naturally
+        # lands on the dense resident estimate here.
+        self._expert_fetch_page_bytes = (
+            self._expert_page_bytes
+            if self.store.on_disk_quantized or not self.rc.quant_bits
+            else dense_expert_page_bytes + self._expert_page_bytes
+        )
         self._layer_transient = 0  # F42: measured compute-scratch high-water mark
         self._token_transient = 0  # F42: whole-token transient (greedy sync point)
         # 2026-07-13: F42's own per-layer/per-token mx.reset_peak_memory() calls
@@ -766,6 +780,8 @@ class StreamingEngine:
         self.expert_trace: list[tuple[int, tuple[int, ...]]] = []  # (layer, routed ids) per fetch, in sweep order
         self._expert_compute_batches = 0
         self._max_experts_per_compute_batch = 0
+        self._adaptive_expert_batch_clamps = 0
+        self._min_adaptive_expert_batch = 0
         self._resident_fast_decode_sweeps = 0
         self._resident_fast_prefill_sweeps = 0
         self._resident_fast_layers = None
@@ -977,6 +993,44 @@ class StreamingEngine:
             names = [n for n in names if ".self_attn.indexer." not in n]
         return names
 
+    def _layer_fetch_bytes_estimate(self, layer: int) -> int:
+        """Conservative materialized trunk-page estimate for pre-fetch eviction.
+
+        K2.5's checkpoint stores its trunk/router/shared-expert tensors as BF16;
+        only routed experts use compressed-tensors INT4 and they have their own
+        lifetime-bounded fetch path. Keeping this architecture-specific avoids
+        inventing unsafe generic estimates for packed/fused formats whose load
+        representation differs from their logical shapes.
+        """
+        if self.cfg.model_type != "kimi_k25":
+            return 0
+        c = self.cfg
+        h = c.hidden_size
+        heads = c.num_attention_heads
+        q_width = heads * (c.qk_nope_head_dim + c.qk_rope_head_dim)
+        kv_width = heads * (c.qk_nope_head_dim + c.v_head_dim)
+        params = (
+            h * c.q_lora_rank
+            + c.q_lora_rank * q_width
+            + h * (c.kv_lora_rank + c.qk_rope_head_dim)
+            + c.kv_lora_rank * kv_width
+            + heads * c.v_head_dim * h
+            + c.q_lora_rank + c.kv_lora_rank
+            + 2 * h
+        )
+        is_dense = (
+            c.mlp_layer_types[layer] == "dense"
+            if layer < len(c.mlp_layer_types)
+            else layer < c.first_k_dense_replace
+        )
+        if is_dense:
+            params += 3 * h * c.intermediate_size
+        else:
+            params += c.num_experts * h + c.num_experts
+            params += 3 * h * c.moe_intermediate_size * max(1, c.n_shared_experts)
+        # BF16 plus 5% for small architecture tensors/metadata omitted above.
+        return math.ceil(params * 2 * 1.05)
+
     def _checkpoint_payload_bytes(self) -> int:
         """Conservative physical payload estimate for resident qualification."""
         index_path = self._model_dir / "model.safetensors.index.json"
@@ -1147,7 +1201,7 @@ class StreamingEngine:
             # Reserving the full routed union recreates the 16-22 GB false demand
             # even when fetch and compute lifetimes are correctly bounded.
             self.governor.reserve(
-                n_missing * self._expert_page_bytes + self._layer_transient)
+                n_missing * self._expert_fetch_page_bytes + self._layer_transient)
 
         t0 = time.perf_counter()
         pages = self.cache.get_many(items)
@@ -1175,18 +1229,35 @@ class StreamingEngine:
             for position in expert_positions
         }
         single_position = bool(positions) and len(position_union) == 1
-        batch_size = (
+        configured_batch_size = (
             self.rc.decode_expert_fetch_batch
             if single_position and self.rc.decode_expert_fetch_batch > 0
             else self.rc.expert_fetch_batch
         ) or len(expert_ids) or 1
-        for start in range(0, len(expert_ids), batch_size):
+        start = 0
+        governor = getattr(self, "governor", None)
+        while start < len(expert_ids):
+            batch_size = min(configured_batch_size, len(expert_ids) - start)
+            if governor is not None and batch_size > 1:
+                admitted = governor.admissible_units(
+                    unit_bytes=self._expert_fetch_page_bytes,
+                    fixed_bytes=self._layer_transient,
+                    max_units=batch_size,
+                )
+                if admitted < batch_size:
+                    self._adaptive_expert_batch_clamps += 1
+                batch_size = admitted
+                self._min_adaptive_expert_batch = (
+                    batch_size if self._min_adaptive_expert_batch == 0
+                    else min(self._min_adaptive_expert_batch, batch_size)
+                )
             batch_ids = expert_ids[start:start + batch_size]
             self._expert_compute_batches += 1
             self._max_experts_per_compute_batch = max(
                 self._max_experts_per_compute_batch, len(batch_ids)
             )
             yield batch_ids, self._fetch_experts(layer, batch_ids)
+            start += batch_size
 
     def _router_lookahead(self, x: mx.array, nxt: int) -> None:
         """F45 (MoE-SpeQ class; lossless — prefetch is only a cache hint):
@@ -1354,7 +1425,15 @@ class StreamingEngine:
                     self.prefetcher.schedule(self._layer_key(j), self._layer_names(j))
 
             t0 = time.perf_counter()
-            w = self.cache.get(self._layer_key(i), self._layer_names(i))
+            layer_key = self._layer_key(i)
+            layer_names = self._layer_names(i)
+            if not self.cache.contains(layer_key):
+                incoming_page = self._layer_fetch_bytes_estimate(i)
+                if incoming_page:
+                    self.cache.prepare_for(incoming_page)
+                    if self.governor is not None:
+                        self.governor.reserve(incoming_page)
+            w = self.cache.get(layer_key, layer_names)
             self.timer.add("weights_wait", time.perf_counter() - t0)
 
             # 2026-07-13: F42's proactive reserve() was only ever called from
@@ -1674,6 +1753,8 @@ class StreamingEngine:
             self.governor.reset_request_peak(self._true_peak_metal_bytes)
         self._expert_compute_batches = 0
         self._max_experts_per_compute_batch = 0
+        self._adaptive_expert_batch_clamps = 0
+        self._min_adaptive_expert_batch = 0
         # F69 proof-carrying execution telemetry: validation harnesses can assert
         # that the feature under test actually ran instead of inferring it from a
         # config flag (a short prompt with chunk_size=4096 is a no-op).
@@ -2623,6 +2704,10 @@ class StreamingEngine:
             path_stats["dsa_shared_reuses"] = dsa_state.stats["shared_reuses"]
         path_stats["expert_compute_batches"] = self._expert_compute_batches
         path_stats["max_experts_per_compute_batch"] = self._max_experts_per_compute_batch
+        path_stats["adaptive_expert_batch_clamps"] = self._adaptive_expert_batch_clamps
+        path_stats["min_adaptive_expert_batch"] = self._min_adaptive_expert_batch
+        path_stats["expert_resident_page_bytes_estimate"] = self._expert_page_bytes
+        path_stats["expert_fetch_page_bytes_estimate"] = self._expert_fetch_page_bytes
         path_stats["resident_fast_decode_sweeps"] = self._resident_fast_decode_sweeps
         path_stats["resident_fast_prefill_sweeps"] = self._resident_fast_prefill_sweeps
         path_stats["resident_moe_sweeps"] = self._resident_moe_sweeps

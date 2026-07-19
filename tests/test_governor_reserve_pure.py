@@ -82,6 +82,7 @@ def make_governor(module, fake_mx, *, cache_max: int, floor: int,
     gov.cache = FakeCache(fake_mx, cache_max, active_after_evict)
     gov.prefetcher = FakePrefetcher()
     gov.floor = floor
+    gov.shrink_step = 0.15
     gov.critical = int(1.2e9)
     gov.metal_limit = int(10e9)
     gov.reservations = 0
@@ -114,6 +115,58 @@ def test_reservation_reclaims_then_allows():
     assert gov.prefetcher.paused
 
 
+def test_reservation_remeasures_and_keeps_reclaiming_until_safe():
+    module, mx = load_pressure(int(9.8e9))
+    gov = make_governor(
+        module, mx, cache_max=int(5e9), floor=int(1.5e9))
+
+    # Simulate cache-accounted eviction releasing less active Metal than the
+    # requested budget reduction. The old one-shot reserve failed here even
+    # though plenty of reclaimable cache remained.
+    def release_gradually():
+        mx.active = max(int(9.0e9), mx.active - int(0.2e9))
+
+    gov.cache._evict_locked = release_gradually
+    gov.reserve(int(0.3e9), margin=int(0.4e9))
+
+    assert mx.active <= int(9.2e9)
+    assert gov.reservations >= 2
+    assert gov.reservation_failures == 0
+    assert gov.cache.max_bytes > gov.floor
+
+
+def test_admissible_units_uses_live_headroom_and_representation_size():
+    module, mx = load_pressure(int(5e9))
+    gov = make_governor(module, mx, cache_max=int(4e9), floor=int(1.5e9))
+    gov.metal_limit = int(40e9)
+    original_virtual_memory = module.psutil.virtual_memory
+    try:
+        module.psutil.virtual_memory = lambda: types.SimpleNamespace(
+            available=int(4e9))
+        # ceiling=7.8GB; after active=5, fixed=.4, margin=.4, 2.0GB remains.
+        # A BF16-sized 1GB page admits two; a Q4-sized .25GB page admits eight.
+        assert gov.admissible_units(
+            int(1e9), int(0.4e9), 8, gamma=1.0) == 2
+        assert gov.admissible_units(
+            int(0.25e9), int(0.4e9), 8, gamma=1.0) == 8
+    finally:
+        module.psutil.virtual_memory = original_virtual_memory
+
+
+def test_admissible_units_falls_back_to_one_for_reserve_to_decide():
+    module, mx = load_pressure(int(5e9))
+    gov = make_governor(module, mx, cache_max=int(4e9), floor=int(1.5e9))
+    gov.metal_limit = int(40e9)
+    original_virtual_memory = module.psutil.virtual_memory
+    try:
+        module.psutil.virtual_memory = lambda: types.SimpleNamespace(
+            available=int(1.3e9))
+        assert gov.admissible_units(
+            int(1e9), int(0.4e9), 8) == 1
+    finally:
+        module.psutil.virtual_memory = original_virtual_memory
+
+
 def test_unreclaimable_projection_fails_before_allocation():
     module, mx = load_pressure(int(9.9e9))
     gov = make_governor(module, mx, cache_max=int(1.5e9), floor=int(1.5e9))
@@ -126,6 +179,23 @@ def test_unreclaimable_projection_fails_before_allocation():
         raise AssertionError("unsafe reservation was allowed to continue")
     assert gov.reservation_failures == 1
     assert gov.prefetcher.paused
+
+
+def test_reclaim_stops_at_floor_and_refuses_when_memory_does_not_release():
+    module, mx = load_pressure(int(9.9e9))
+    gov = make_governor(
+        module, mx, cache_max=int(5e9), floor=int(1.5e9))
+
+    try:
+        gov.reserve(int(1e9), margin=int(0.4e9))
+    except MemoryError as exc:
+        assert "refused before allocation" in str(exc)
+    else:
+        raise AssertionError("unreclaimable cache was allowed to continue")
+
+    assert gov.cache.max_bytes == gov.floor
+    assert gov.reservations > 1
+    assert gov.reservation_failures == 1
 
 
 def test_live_ceiling_uses_device_limit_and_sampled_system_headroom():
