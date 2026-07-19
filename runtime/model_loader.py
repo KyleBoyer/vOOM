@@ -435,8 +435,27 @@ class WeightStore:
                         ct_aux = self._ct_int4_aux.get(name)
                         if ct_aux is not None:
                             shape = tuple(int(v) for v in out[ct_aux.shape].tolist())
-                            logical[name] = dequantize_compressed_tensors_int4(
+                            dequant = dequantize_compressed_tensors_int4(
                                 out[ct_aux.packed], out[ct_aux.scale], shape)
+                            # 2026-07-19: MLX >=0.31.2 binds ops to their
+                            # creation thread's stream (streams are now
+                            # thread-local). dequantize_compressed_tensors_int4
+                            # returns a LAZY graph (arange/shift/mask/reshape/
+                            # cast, never eval'd internally) -- unlike the raw
+                            # `out` tensors just above, which were eval'd on
+                            # THIS thread at line 428. Left lazy, this graph is
+                            # first materialized wherever the caller (the main
+                            # thread, via matmul) eventually evals it -- but
+                            # when this fetch runs on the prefetch thread
+                            # (K2.5's compressed-tensors INT4 experts are the
+                            # only checkpoint format that takes this branch),
+                            # that is a DIFFERENT thread than the one the ops
+                            # were constructed on, and its stream is not
+                            # registered there: "RuntimeError: There is no
+                            # Stream(gpu, N) in current thread." Force eval
+                            # here, on the thread that built the graph.
+                            mx.eval(dequant)
+                            logical[name] = dequant
                             continue
                         aux = self._quant_aux.get(name)
                         if aux is None:
