@@ -283,7 +283,21 @@ class ModelConfig:
             routed_scaling_factor=raw.get("routed_scaling_factor", 1.0),
             mlp_layer_types=tuple(raw.get("mlp_layer_types", ())),
             num_nextn_predict_layers=raw.get("num_nextn_predict_layers", 0),
-            rope_interleave=raw.get("rope_interleave", False),
+            # F93 (2026-07-19, real-oracle-verified): DeepSeek-V3-family
+            # checkpoints (Kimi K2.5's language model) unconditionally
+            # de-interleave their q/k rope-partition weights before a
+            # rotate_half-style rotation (see modeling_deepseek.py's real
+            # apply_rotary_pos_emb: a view/transpose/reshape pair-permute
+            # precedes rotate_half) -- mathematically equivalent to MLX's
+            # traditional=True applied directly to the raw checkpoint
+            # weights, i.e. rope_interleave=True. GLM's own config.json
+            # declares this field explicitly (True); K2.5's does not, so
+            # the naive raw.get(..., False) default silently picked the
+            # WRONG value -- verified via a real oracle test
+            # (tests/test_f93_k25_mla_oracle.py): False gave max abs diff
+            # 0.81 against the real modeling_deepseek.py, True gave 9.5e-7.
+            rope_interleave=raw.get(
+                "rope_interleave", raw.get("model_type") == "kimi_k25"),
             mla_latent_norm_eps=raw.get("mla_latent_norm_eps", 1e-6),
             vision_config=vision_config,
             image_token_id=raw.get("image_token_id", 0),
