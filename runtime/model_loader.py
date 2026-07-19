@@ -166,12 +166,27 @@ class WeightStore:
         # against the real downloaded checkpoint's model.safetensors.index.json.
         # Both prefixes canonicalize to the same "model.*" the rest of the
         # engine already expects.
+        #
+        # 2026-07-19 (later): K2.5's lm_head is NOT nested under
+        # language_model.model.* at all -- it's a sibling at
+        # language_model.lm_head.weight (the wrapper's own top-level
+        # attribute, not inside the inner text-model submodule). The two
+        # branches above never matched it, so store.has("lm_head.weight")
+        # was silently False for K2.5 -- engine.py's _lm_head_weight()
+        # fallback (self.cache.get("lm_head", ["lm_head.weight"])) would
+        # have raised a KeyError the first time a real request reached
+        # final-logit computation (never yet exercised: every K2.5 test so
+        # far failed on a memory-governor rejection during layer streaming,
+        # long before logits). Generalized: strip "language_model." for ANY
+        # top-level key under it, not just the ".model." submodule case.
         self._real_name: dict[str, str] = {}
         for n in list(self.weight_map):
             if n.startswith("model.language_model."):
                 canon = "model." + n[len("model.language_model."):]
             elif n.startswith("language_model.model."):
                 canon = "model." + n[len("language_model.model."):]
+            elif n.startswith("language_model."):
+                canon = n[len("language_model."):]
             else:
                 continue
             self._real_name[canon] = n
