@@ -147,12 +147,21 @@ class WeightStore:
         # model.language_model.*: expose canonical model.* aliases so the
         # dense engine runs unchanged. visual.* names pass through untouched
         # (the vision tower addresses them explicitly).
+        # F93 (2026-07-19): Kimi K2.5 uses the OPPOSITE order,
+        # language_model.model.*, not model.language_model.* -- confirmed
+        # against the real downloaded checkpoint's model.safetensors.index.json.
+        # Both prefixes canonicalize to the same "model.*" the rest of the
+        # engine already expects.
         self._real_name: dict[str, str] = {}
         for n in list(self.weight_map):
             if n.startswith("model.language_model."):
                 canon = "model." + n[len("model.language_model."):]
-                self._real_name[canon] = n
-                self.weight_map[canon] = self.weight_map.pop(n)
+            elif n.startswith("language_model.model."):
+                canon = "model." + n[len("language_model.model."):]
+            else:
+                continue
+            self._real_name[canon] = n
+            self.weight_map[canon] = self.weight_map.pop(n)
 
         # Standard MLX quantized checkpoints store one logical matrix as
         # ``name.weight`` plus row/group metadata in ``name.scales`` and,

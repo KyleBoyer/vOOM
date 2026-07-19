@@ -149,9 +149,20 @@ class QuantPolicy:
             return False
         if ".self_attn." in name:
             return self.quantize_attention
-        if name.endswith(".mlp.gate.weight") and not self.quantize_router:
+        # 2026-07-19 (benchmark-sweep follow-up): Kimi's MoE module is named
+        # "block_sparse_moe", not "mlp" -- without this OR, NONE of its
+        # expert weights (the dominant byte mass across 26 of 27 layers)
+        # ever matched ".mlp." below, so "lossy" mode silently left them at
+        # full bf16 precision. Measured effect: Kimi-Linear-48B-A3B-Instruct
+        # showed IDENTICAL tok/s in lossless vs lossy mode before this fix.
+        # Preserves the exact pre-existing control flow/quirk below
+        # (a gate weight only short-circuits to `False` when quantize_router
+        # is False; otherwise it falls through and is actually governed by
+        # quantize_mlp, not quantize_router -- not touched here).
+        if ((name.endswith(".mlp.gate.weight") or name.endswith(".block_sparse_moe.gate.weight"))
+                and not self.quantize_router):
             return False
-        if ".mlp." in name:
+        if ".mlp." in name or ".block_sparse_moe." in name:
             return self.quantize_mlp
         return self.quantize_lm_head and "lm_head" in name
 

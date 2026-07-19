@@ -827,6 +827,27 @@ class StreamingEngine:
                     "gpt-oss requires a packed store (fused expert tensors must be "
                     "unfused): run formats.packed.pack_model first"
                 )
+        if self.cfg.num_experts and not self.store.packed:
+            # 2026-07-19 (benchmark-sweep follow-up): some checkpoints ship
+            # experts as ONE fused tensor per projection (e.g. Qwen3-VL-235B's
+            # real weight_map has "...mlp.experts.gate_up_proj" / "...down_proj",
+            # not per-expert "...experts.{e}.gate_proj.weight") -- the engine's
+            # expert-fetch path only understands the per-expert-indexed layout
+            # and previously failed deep inside a request with a raw, confusing
+            # KeyError instead of a clear diagnostic at load time.
+            probe_layer = self.cfg.first_k_dense_replace
+            if not self.store.names_with_prefix(
+                    f"model.layers.{probe_layer}.{self.cfg.moe_expert_prefix}.0."):
+                raise RuntimeError(
+                    f"{self._model_dir.name}: MoE experts are not in the "
+                    f"per-expert-indexed layout this engine expects under "
+                    f"'{self.cfg.moe_expert_prefix}.<id>.*' (checked layer "
+                    f"{probe_layer}) -- this checkpoint likely ships fused "
+                    "per-projection expert tensors instead. Run "
+                    "formats.packed.pack_model first, matching gpt-oss's "
+                    "checkpoints (this project's own EXPERT unfuse/pack step, "
+                    "not a fla-core/compressed-tensors concept)."
+                )
             from .gptoss import yarn_params
 
             self._rope_freqs, self._mscale = yarn_params(self.cfg)
