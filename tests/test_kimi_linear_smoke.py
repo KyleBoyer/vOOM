@@ -180,3 +180,49 @@ def _expert_loader(w: dict, model_dir: Path):
             }
         return out
     return load
+
+
+@_model_skip
+def test_kda_sequential_scan_is_not_a_bottleneck():
+    """F92 follow-up (2026-07-19): the original F92 plan worried the
+    correctness-first Python-level sequential KDA scan might be "too slow
+    even for a correctness smoke test," making chunked-parallel KDA a
+    prerequisite rather than a follow-up. Measured directly on real
+    downloaded weights: a single KDA layer processes a 2048-token sequence
+    in well under a second (>3000 tok/s), several orders of magnitude
+    faster than this project's actual bottleneck (disk-bound MoE expert
+    paging, measured elsewhere at fractions of a token per second for
+    large models). This is a generous regression guard (10s budget for
+    what actually takes well under 1s), not a tight performance
+    benchmark -- it exists to catch a severe accidental slowdown (e.g. a
+    lost mx.eval() checkpoint reintroducing unbounded lazy-graph growth),
+    not to enforce a specific throughput number. Do NOT build
+    chunked-parallel KDA on the assumption this scan is slow -- it isn't."""
+    import time
+
+    from runtime.config import ModelConfig
+    from runtime.kda_state import KDAStateCache
+    from runtime.kimi_linear import _kda_attention
+
+    cfg = ModelConfig.from_dir(MODEL_DIR)
+    shard = mx.load(str(MODEL_DIR / "model-00001-of-00020.safetensors"))
+
+    mx.random.seed(0)
+    L = 2048
+    x = (mx.random.normal((1, L, cfg.hidden_size)).astype(mx.bfloat16) * 0.02)
+    kda_cache = KDAStateCache(num_layers=cfg.num_hidden_layers)
+
+    t0 = time.perf_counter()
+    out = _kda_attention(x, shard, "model.layers.0", cfg, kda_cache, 0)
+    mx.eval(out)
+    elapsed = time.perf_counter() - t0
+
+    assert not bool(mx.any(mx.isnan(out)).item())
+    assert elapsed < 10.0, (
+        f"KDA sequential scan took {elapsed:.2f}s for L={L} -- expected "
+        "well under 1s based on 2026-07-19 measurements; if this is "
+        "genuinely regressed, chunked-parallel KDA may now be warranted "
+        "(re-read the F92 note in docs/future_lossless_techniques.md "
+        "before assuming that, though -- confirm this isn't a one-off "
+        "system-load artifact first)"
+    )
