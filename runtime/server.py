@@ -971,6 +971,22 @@ class EngineManager:
                 # fallback. Fast-mode single-position decode has a separately
                 # bounded q=8 path above; lossless keeps q=1 everywhere.
                 rc.expert_fetch_batch = 1
+            elif mtype == "kimi_k25":
+                # 2026-07-19: K2.5's vocab_size (163840) x hidden_size (7168)
+                # combination makes its untied lm_head unusually large
+                # (~2.35 GB bf16) -- confirmed via direct measurement to be
+                # the dominant contributor to the memory-governor rejections
+                # every real K2.5 request hit that day (the pinned
+                # "incoming" reserve of ~4.7GB closely matched embed_tokens
+                # + lm_head both bf16-resident). Stream the lm_head instead
+                # of pinning it (F02's StreamedLMHead -- bit-identical, not
+                # an approximation, see runtime/lm_head_stream.py); embed_rows
+                # already streams the embedding table via the untied-model
+                # default above. Kimi Linear does NOT need this override --
+                # its much smaller hidden_size keeps its lm_head modest.
+                rc.pin_lm_head = False
+                rc.stream_lm_head = True
+                rc.max_weight_cache_mb = 4000
             else:
                 rc.max_weight_cache_mb = 6000
                 if mode in ("fast", "fast-long"):  # side-quest: lossy 4-bit resident cache

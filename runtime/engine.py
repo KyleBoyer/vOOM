@@ -697,7 +697,9 @@ class StreamingEngine:
                 and not self.store.vpack2 and not self.store.packed):
             from .lm_head_stream import StreamedLMHead
 
-            self._streamed_lm_head = StreamedLMHead(self.store.dir, self.store.weight_map)
+            self._streamed_lm_head = StreamedLMHead(
+                self.store.dir, self.store.weight_map,
+                real_name=self.store._real_name.get("lm_head.weight", "lm_head.weight"))
 
         pin_names = ["model.norm.weight"]
         if self.rc.pin_embeddings and self._embed_rows is None:

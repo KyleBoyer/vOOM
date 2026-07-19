@@ -52,10 +52,19 @@ class StreamedLMHead:
     instead of a single `quant.matmul`."""
 
     def __init__(self, model_dir, weight_map: dict, name: str = "lm_head.weight",
-                 block_rows: int = 16384):
+                 block_rows: int = 16384, real_name: str | None = None):
         self.model_dir = Path(model_dir)
         self.weight_map = weight_map
         self.name = name
+        # 2026-07-19: `name` is the CANONICAL key (used to find the shard
+        # FILE via weight_map, which is keyed by canonical names -- see
+        # WeightStore's language_model.* prefix remap in model_loader.py).
+        # The tensor's actual key WITHIN that shard's own safetensors
+        # header can differ (e.g. Kimi K2.5's real on-disk name is
+        # "language_model.lm_head.weight", not "lm_head.weight") -- that
+        # remap lives in WeightStore._real_name, not in this store-agnostic
+        # utility, so the caller must pass it through explicitly.
+        self.real_name = real_name or name
         self.block_rows = block_rows
         self._open()
 
@@ -64,7 +73,7 @@ class StreamedLMHead:
         with open(path, "rb") as f:
             n = struct.unpack("<Q", f.read(8))[0]
             header = json.loads(f.read(n))
-        meta = header[self.name]
+        meta = header[self.real_name]
         self.vocab, self.hidden = meta["shape"]
         self.dtype = meta["dtype"]
         self.row_bytes = self.hidden * _DTYPE_BYTES[self.dtype]
