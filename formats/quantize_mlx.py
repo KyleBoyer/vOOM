@@ -17,6 +17,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import shutil
 from pathlib import Path
 
@@ -28,6 +29,7 @@ _METADATA_FILES = {
     "added_tokens.json",
     "chat_template.json",
     "chat_template.jinja",
+    "configuration.json",
     "generation_config.json",
     "merges.txt",
     "preprocessor_config.json",
@@ -36,8 +38,11 @@ _METADATA_FILES = {
     "tokenizer.json",
     "tokenizer.model",
     "tokenizer_config.json",
+    "video_preprocessor_config.json",
     "vocab.json",
 }
+_FUSED_QWEN_EXPERT = re.compile(
+    r"^(.*\.mlp\.experts)\.(gate_up_proj|down_proj)$")
 
 
 def _write_json_atomic(path: Path, value: dict) -> None:
@@ -125,21 +130,50 @@ def _convert_shard(source_shard: Path, output_shard: Path, *, profile: str,
     output_tensors: dict[str, mx.array] = {}
     quantized_tensors = 0
 
-    for name in sorted(tuple(lazy)):
-        value = lazy.pop(name)
-        if not _should_quantize(name, value, profile, group_size):
-            output_tensors[name] = value
-            continue
+    def add_quantized(name: str, value: mx.array) -> None:
+        nonlocal quantized_tensors
         packed = mx.quantize(
             value, group_size=group_size, bits=bits, mode=mode)
         mx.eval(packed)
         output_tensors[name] = packed[0]
         stem = name[:-len(".weight")]
-        scales_name = f"{stem}.scales"
-        output_tensors[scales_name] = packed[1]
+        output_tensors[f"{stem}.scales"] = packed[1]
         if len(packed) > 2:
             output_tensors[f"{stem}.biases"] = packed[2]
         quantized_tensors += 1
+
+    for name in sorted(tuple(lazy)):
+        value = lazy.pop(name)
+        fused = _FUSED_QWEN_EXPERT.match(name)
+        if (fused is not None and profile in ("experts", "all")
+                and value.ndim == 3):
+            experts = int(value.shape[0])
+            if fused.group(2) == "gate_up_proj":
+                if value.shape[1] % 2:
+                    raise ValueError(
+                        f"fused gate/up width must be even: {name}")
+                middle = value.shape[1] // 2
+                projections = (
+                    ("gate_proj", value[:, :middle, :]),
+                    ("up_proj", value[:, middle:, :]),
+                )
+            else:
+                projections = (("down_proj", value),)
+            for expert in range(experts):
+                for projection, values in projections:
+                    logical = (
+                        f"{fused.group(1)}.{expert}.{projection}.weight")
+                    matrix = values[expert]
+                    if matrix.shape[-1] % group_size:
+                        raise ValueError(
+                            f"fused expert {logical} is not divisible by "
+                            f"group_size={group_size}")
+                    add_quantized(logical, matrix)
+            continue
+        if not _should_quantize(name, value, profile, group_size):
+            output_tensors[name] = value
+            continue
+        add_quantized(name, value)
 
     tmp = output_shard.with_name(output_shard.stem + ".tmp.safetensors")
     mx.save_safetensors(str(tmp), output_tensors)

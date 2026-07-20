@@ -330,7 +330,7 @@ def _derived_artifacts_for(source: Path) -> list[Path]:
 
 
 def _preferred_fast_artifact(source: Path) -> Path:
-    """Use validated expert-MXFP4 when a base OLMoE has a derived sibling."""
+    """Use a complete expert-MXFP4 sibling for supported MoE sources."""
     if _is_voom_lossy_checkpoint(source):
         return source
     for candidate in _derived_artifacts_for(source):
@@ -344,7 +344,7 @@ def _preferred_fast_artifact(source: Path) -> Path:
             bits = int(quant.get("bits", 0))
         except (TypeError, ValueError):
             continue
-        if (config.get("model_type") == "olmoe"
+        if (config.get("model_type") in ("olmoe", "qwen3_5_moe")
                 and marker.get("profile") == "experts"
                 and quant.get("mode") == "mxfp4"
                 and bits == 4):

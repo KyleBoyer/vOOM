@@ -114,3 +114,67 @@ def test_resume_rejects_changed_conversion_parameters(tmp_path):
         assert "resume state mismatch" in str(error)
     else:
         raise AssertionError("changed parameters were accepted for a resumed conversion")
+
+
+def test_qwen_fused_experts_are_split_and_prequantized(tmp_path):
+    source, output = tmp_path / "qwen-source", tmp_path / "qwen-output"
+    source.mkdir()
+    gate_up = mx.arange(2 * 64 * 64, dtype=mx.float32).reshape(
+        2, 64, 64).astype(mx.bfloat16) / 100
+    down = mx.arange(2 * 64 * 32, dtype=mx.float32).reshape(
+        2, 64, 32).astype(mx.bfloat16) / 100
+    tensors = {
+        "model.language_model.embed_tokens.weight": mx.ones((128, 64)),
+        "model.language_model.layers.0.mlp.experts.gate_up_proj": gate_up,
+        "model.language_model.layers.0.mlp.experts.down_proj": down,
+        "model.language_model.norm.weight": mx.ones((64,)),
+        "lm_head.weight": mx.ones((128, 64)),
+    }
+    mx.save_safetensors(str(source / "model.safetensors"), tensors)
+    (source / "config.json").write_text(json.dumps({
+        "model_type": "qwen3_5_moe",
+        "tie_word_embeddings": False,
+        "vision_config": {"depth": 1},
+        "text_config": {
+            "model_type": "qwen3_5_moe_text",
+            "hidden_size": 64,
+            "moe_intermediate_size": 32,
+            "shared_expert_intermediate_size": 32,
+            "num_hidden_layers": 1,
+            "num_attention_heads": 2,
+            "num_key_value_heads": 1,
+            "head_dim": 32,
+            "vocab_size": 128,
+            "eos_token_id": 127,
+            "num_experts": 2,
+            "num_experts_per_tok": 1,
+            "layer_types": ["full_attention"],
+            "partial_rotary_factor": 1.0,
+            "rope_parameters": {"rope_theta": 10_000.0},
+        },
+    }))
+    (source / "configuration.json").write_text("custom configuration\n")
+    (source / "video_preprocessor_config.json").write_text(
+        json.dumps({"video_fps": 2}))
+
+    convert_model(source, output)
+    assert (output / "configuration.json").read_text() == "custom configuration\n"
+    assert json.loads((output / "video_preprocessor_config.json").read_text()) == {
+        "video_fps": 2}
+    index = json.loads(
+        (output / "model.safetensors.index.json").read_text())["weight_map"]
+    physical = "model.language_model.layers.0.mlp.experts"
+    assert f"{physical}.gate_up_proj" not in index
+    assert f"{physical}.down_proj" not in index
+    for expert in range(2):
+        for projection in ("gate_proj", "up_proj", "down_proj"):
+            stem = f"{physical}.{expert}.{projection}"
+            assert f"{stem}.weight" in index
+            assert f"{stem}.scales" in index
+
+    store = WeightStore(output)
+    values, _seconds, _bytes = store.fetch([
+        "model.layers.0.mlp.experts.0.gate_proj.weight",
+        "model.layers.0.mlp.experts.1.down_proj.weight",
+    ])
+    assert all(isinstance(value, QTensor) for value in values.values())

@@ -2079,6 +2079,22 @@ def test_base_olmoe_prefers_complete_expert_mxfp4_sibling(tmp_path):
     assert _preferred_fast_artifact(q8) == q8
 
 
+def test_base_qwen36_prefers_complete_expert_mxfp4_sibling(tmp_path):
+    source = tmp_path / "Qwen3.6-35B-A3B"
+    q4 = tmp_path / "Qwen3.6-35B-A3B-mlx-expert-mxfp4"
+    source.mkdir()
+    q4.mkdir()
+    (q4 / "config.json").write_text(json.dumps({
+        "model_type": "qwen3_5_moe",
+        "quantization": {"mode": "mxfp4", "bits": 4, "group_size": 32},
+        "voom_quantization": {
+            "profile": "experts", "source": str(source.resolve())},
+    }))
+    (q4 / "model.safetensors.index.json").write_text("{}")
+
+    assert _preferred_fast_artifact(source) == q4
+
+
 def test_execution_profile_discloses_effective_derived_artifact(tmp_path):
     (tmp_path / "config.json").write_text(json.dumps({
         "quantization": {"mode": "mxfp4", "bits": 4, "group_size": 32},
