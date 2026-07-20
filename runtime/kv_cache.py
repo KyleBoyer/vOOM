@@ -30,7 +30,11 @@ class KVCache:
         return first.shape[1] if self.compressed_mla else first.shape[2]
 
     def nbytes(self) -> int:
-        return sum(a.nbytes for a in (*self.keys, *self.values) if a is not None)
+        total = sum(a.nbytes for a in (*self.keys, *self.values) if a is not None)
+        recurrent = getattr(self, "kda_cache", None)
+        if recurrent is not None:
+            total += recurrent.nbytes()
+        return total
 
     def allocated_nbytes(self) -> int:
         return self.nbytes()
@@ -707,10 +711,17 @@ class SteppedKVCache(KVCache):
             length = self._layer_length(layer)
             total += key[..., :length, :].nbytes
             total += self.values[layer][..., :length, :].nbytes
+        recurrent = getattr(self, "kda_cache", None)
+        if recurrent is not None:
+            total += recurrent.nbytes()
         return total
 
     def allocated_nbytes(self) -> int:
-        return sum(a.nbytes for a in (*self.keys, *self.values) if a is not None)
+        total = sum(a.nbytes for a in (*self.keys, *self.values) if a is not None)
+        recurrent = getattr(self, "kda_cache", None)
+        if recurrent is not None:
+            total += recurrent.nbytes()
+        return total
 
     def trim(self, length: int):
         pending = []

@@ -15,6 +15,7 @@ measured sequential KDA path.
 from __future__ import annotations
 
 import mlx.core as mx
+import numpy as np
 
 from . import quant
 from .config import ModelConfig, effective_expert_top_k
@@ -53,6 +54,7 @@ def _rotate_half(x: mx.array) -> mx.array:
 
 def _apply_partial_rope(
     q: mx.array, k: mx.array, offset: int, cfg: ModelConfig,
+    positions3: np.ndarray | mx.array | None = None,
 ) -> tuple[mx.array, mx.array]:
     """Apply released rotate-half RoPE to the leading partial head width.
 
@@ -66,10 +68,34 @@ def _apply_partial_rope(
         raise ValueError(
             f"invalid Qwen3.5 partial rotary width {rotary_dim} "
             f"for head_dim={cfg.head_dim}")
-    positions = mx.arange(offset, offset + q.shape[2], dtype=mx.float32)
     dims = mx.arange(0, rotary_dim, 2, dtype=mx.float32)
     inv_freq = 1.0 / (cfg.rope_theta ** (dims / rotary_dim))
-    freqs = positions[:, None] * inv_freq[None, :]
+    if positions3 is None:
+        positions = mx.arange(offset, offset + q.shape[2], dtype=mx.float32)
+        freqs = positions[:, None] * inv_freq[None, :]
+    else:
+        positions = mx.array(positions3).astype(mx.float32)
+        if positions.ndim != 2 or positions.shape != (3, q.shape[2]):
+            raise ValueError(
+                "Qwen3.5 multimodal positions must have shape "
+                f"(3, {q.shape[2]}), got {positions.shape}")
+        sections = (cfg.rope_scaling or {}).get("mrope_section")
+        if (not isinstance(sections, (list, tuple)) or len(sections) != 3
+                or any(not isinstance(value, int) or value < 0
+                       for value in sections)
+                or sum(sections) != rotary_dim // 2):
+            raise ValueError(
+                "Qwen3.5 mrope_section must contain three non-negative "
+                f"integers summing to {rotary_dim // 2}")
+        # Official apply_interleaved_mrope starts with temporal positions and
+        # replaces frequency indices 1,4,... with H and 2,5,... with W up to
+        # their declared section lengths. This is partial RoPE: the remaining
+        # 192 head dimensions in Qwen3.6 pass through untouched.
+        components = np.zeros(rotary_dim // 2, dtype=np.int32)
+        components[1:3 * sections[1]:3] = 1
+        components[2:3 * sections[2]:3] = 2
+        selected = positions[mx.array(components)]
+        freqs = selected.T * inv_freq[None, :]
     embedding = mx.concatenate([freqs, freqs], axis=-1)
     cos = mx.cos(embedding).astype(q.dtype)[None, None, :, :]
     sin = mx.sin(embedding).astype(q.dtype)[None, None, :, :]
@@ -85,6 +111,7 @@ def _apply_partial_rope(
 def _full_attention(
     h: mx.array, w: dict, prefix: str, cfg: ModelConfig, kv,
     layer: int, offset: int,
+    positions3: np.ndarray | mx.array | None = None,
 ) -> mx.array:
     batch, length, _ = h.shape
     heads = cfg.num_attention_heads
@@ -108,7 +135,7 @@ def _full_attention(
     q = q.transpose(0, 2, 1, 3)
     k = k.transpose(0, 2, 1, 3)
     v = v.transpose(0, 2, 1, 3)
-    q, k = _apply_partial_rope(q, k, offset, cfg)
+    q, k = _apply_partial_rope(q, k, offset, cfg, positions3)
     keys, values = kv.update(layer, k, v)
 
     mask = None
@@ -266,6 +293,7 @@ def run_qwen35_block(
     x: mx.array, w: dict, prefix: str, cfg: ModelConfig, kv,
     layer: int, offset: int, get_experts, mlp_last_only: bool = False,
     iter_expert_batches=None,
+    positions3: np.ndarray | mx.array | None = None,
 ) -> mx.array:
     residual = x
     h = qwen35_rms_norm(
@@ -275,7 +303,8 @@ def run_qwen35_block(
         mixed = _gated_delta_net(
             h, w, prefix, cfg, getattr(kv, "kda_cache", None), layer)
     elif layer_type == "full_attention":
-        mixed = _full_attention(h, w, prefix, cfg, kv, layer, offset)
+        mixed = _full_attention(
+            h, w, prefix, cfg, kv, layer, offset, positions3)
     else:
         raise ValueError(f"unsupported Qwen3.5 layer type {layer_type!r}")
     x = residual + mixed
@@ -287,6 +316,88 @@ def run_qwen35_block(
     return x + _moe(
         h, w, prefix, cfg, layer, get_experts,
         iter_expert_batches=iter_expert_batches)
+
+
+def multimodal_prefill(
+    engine, tokens: list[int], image_embeds: mx.array,
+    positions3: np.ndarray, kv,
+) -> mx.array:
+    """Exact Qwen3.5/3.6 hybrid prefill with vision embeddings spliced in.
+
+    DeltaNet layers consume the sequence in ordinary causal order and carry no
+    RoPE. Full-attention layers receive the released 3D partial/interleaved
+    positions. Qwen3.6 declares no DeepStack injection points, so the vision
+    tower contributes only its final merged embeddings.
+    """
+    cfg = engine.cfg
+    vision_tokens = {cfg.image_token_id, cfg.video_token_id} - {0}
+    is_vision = np.isin(np.asarray(tokens), list(vision_tokens))
+    x = engine._embed(list(tokens))
+    if is_vision.any():
+        indexes = mx.array(np.nonzero(is_vision)[0])
+        if image_embeds is None or image_embeds.shape[0] != indexes.shape[0]:
+            raise ValueError(
+                "Qwen3.5 vision embedding count does not match expanded "
+                "placeholder tokens")
+        copied = mx.zeros_like(x) + x
+        copied[0, indexes, :] = image_embeds.astype(x.dtype)
+        x = copied
+
+    offset = kv.offset
+    for layer in range(cfg.num_hidden_layers):
+        weights = engine.cache.get(
+            engine._layer_key(layer), engine._layer_names(layer))
+        x = run_qwen35_block(
+            x, weights, f"model.layers.{layer}", cfg, kv, layer, offset,
+            engine._get_experts,
+            iter_expert_batches=engine._iter_expert_batches,
+            positions3=positions3,
+        )
+        mx.eval(x)
+    logits = engine._final_logits(x)
+    mx.eval(logits)
+    return logits
+
+
+def multimodal_suffix_prefill(
+    engine, tokens: list[int], positions3: np.ndarray, kv, prefix_tokens: int,
+) -> mx.array:
+    """Extend an exact hybrid multimodal endpoint with text-only tokens.
+
+    The full-attention quarter uses the suffix's released M-RoPE positions,
+    while the DeltaNet layers advance their exact recurrent matrices and conv
+    histories from the retained prompt endpoint.  Neither state kind is
+    rewound or approximated.
+    """
+    suffix = tokens[prefix_tokens:]
+    if not suffix:
+        raise ValueError("Qwen3.5 vision prompt-cache suffix must not be empty")
+    cfg = engine.cfg
+    vision_tokens = {cfg.image_token_id, cfg.video_token_id} - {0}
+    if any(token in vision_tokens for token in suffix):
+        raise ValueError("Qwen3.5 vision prompt-cache suffix must be text-only")
+    suffix_positions = np.asarray(positions3)[:, prefix_tokens:]
+    if suffix_positions.shape != (3, len(suffix)):
+        raise ValueError("Qwen3.5 vision suffix position metadata mismatch")
+
+    x = engine._embed(suffix)
+    offset = kv.offset
+    if offset != prefix_tokens:
+        raise ValueError(
+            f"Qwen3.5 vision endpoint offset {offset} != prefix {prefix_tokens}")
+    for layer in range(cfg.num_hidden_layers):
+        weights = engine.cache.get(
+            engine._layer_key(layer), engine._layer_names(layer))
+        x = run_qwen35_block(
+            x, weights, f"model.layers.{layer}", cfg, kv, layer, offset,
+            engine._get_experts,
+            iter_expert_batches=engine._iter_expert_batches,
+            positions3=suffix_positions,
+        )
+        mx.eval(x)
+    logits = engine._final_logits(x)
+    mx.eval(logits)
+    return logits
 
 
 def final_logits(

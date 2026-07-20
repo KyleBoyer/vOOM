@@ -303,7 +303,10 @@ class ModelConfig:
             layer_types=tuple(raw.get("layer_types", ())),
             sliding_window=raw.get("sliding_window") or 0,
             swiglu_limit=raw.get("swiglu_limit", 7.0),
-            rope_scaling=raw.get("rope_scaling"),
+            # Qwen3.5/3.6 names the same multimodal RoPE payload
+            # ``rope_parameters``. Preserve it under the runtime's historical
+            # rope_scaling field so vision/text position code has one source.
+            rope_scaling=raw.get("rope_scaling", raw.get("rope_parameters")),
             first_k_dense_replace=raw.get("first_k_dense_replace", 0),
             qk_nope_head_dim=raw.get("qk_nope_head_dim", 0),
             qk_rope_head_dim=raw.get("qk_rope_head_dim", 0),

@@ -208,16 +208,19 @@ curl ... -d '{"model":"lossy-long-<local-model-name>", ...}'
 `Qwen/Qwen3.6-35B-A3B` is supported losslessly for text generation and tool
 calling through the official hybrid text architecture: three recurrent Gated
 DeltaNet layers followed by one gated full-attention layer, repeating across
-40 layers. The loader accepts the multimodal checkpoint wrapper but rejects
-image input explicitly; its vision tower is not interchangeable with the
-Qwen3-VL implementation. The checkpoint's MTP layer is preserved in the packed
-store but is not yet used for speculative decoding.
+40 layers. Image and video input use the released Qwen3.6 vision tower plus its
+partial, interleaved 3D M-RoPE text path. Repeated identical image prompts reuse
+the exact prompt endpoint, skipping both the vision tower and language prefill;
+same-media text continuations reuse the image endpoint and prefill only the new
+text. The checkpoint's MTP layer is preserved in the packed store but is not
+yet used for speculative decoding.
 
-The recurrent state is request-local today. Hot prompt-KV retention is disabled
-for this model until the cache can preserve both DeltaNet convolution/matrix
-state and attention KV exactly. This makes the first implementation correct but
-means follow-up turns still prefill their full prompt. Use the bare model ID for
-released BF16 weights:
+Hot conversation retention carries both DeltaNet convolution/matrix state and
+attention KV. Only exact endpoints and strict extensions are eligible because a
+recurrent fold cannot be trimmed to an arbitrary branch. Endpoints are also
+checkpointed under `.kv_hybrid` by default, so a process restart can restore a
+warm conversation; set `VMODEL_QWEN35_HOT_KV_PERSIST_DIR` to relocate it. Use
+the bare model ID for released BF16 weights:
 
 ```bash
 curl -s -X POST http://127.0.0.1:8077/v1/responses \

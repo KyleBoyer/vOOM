@@ -1015,13 +1015,32 @@ class EngineManager:
                 # Qwen3.6-35B-A3B retains Qwen3.5's architecture id. Thirty
                 # DeltaNet layers carry fixed recurrent+conv state that the
                 # token-indexed prompt-KV journal cannot serialize or trim.
-                # Keep prefix caches off until that composite state has its own
-                # exact checkpoint format; otherwise a nominal KV hit would
-                # resume with empty DeltaNet memory and silently change tokens.
+                # F37's token-indexed prompt journal cannot represent the
+                # recurrent half. The in-memory hot endpoint can: it transfers
+                # the complete KVCache + KDAStateCache object and only accepts
+                # exact endpoints/extensions (never a trimmed branch).
                 rc.prompt_kv_dir = ""
-                rc.hot_prompt_kv = False
+                rc.hot_prompt_kv = True
+                try:
+                    rc.hot_prompt_kv_slots = int(os.environ.get(
+                        "VMODEL_QWEN35_HOT_KV_SLOTS", "2"))
+                    rc.hot_prompt_kv_min_tokens = int(os.environ.get(
+                        "VMODEL_QWEN35_HOT_KV_MIN_TOKENS", "16"))
+                except ValueError as error:
+                    raise ValueError(
+                        "VMODEL_QWEN35_HOT_KV settings must be integers") from error
+                if rc.hot_prompt_kv_slots <= 0:
+                    raise ValueError(
+                        "VMODEL_QWEN35_HOT_KV_SLOTS must be positive")
+                if rc.hot_prompt_kv_min_tokens < 0:
+                    raise ValueError(
+                        "VMODEL_QWEN35_HOT_KV_MIN_TOKENS must be non-negative")
+                rc.hot_prompt_kv_persist_dir = os.environ.get(
+                    "VMODEL_QWEN35_HOT_KV_PERSIST_DIR",
+                    str(ROOT / ".kv_hybrid"))
                 rc.max_weight_cache_mb = 5000
                 rc.prefill_chunk_size = 512
+                rc.hot_prompt_kv_chunk_size = rc.prefill_chunk_size
                 rc.expert_fetch_batch = 1
                 # One decode position activates exactly eight ~6.3 MB experts
                 # per layer. Fetching them as one archive-coalesced batch is
@@ -2274,6 +2293,15 @@ def _chat_prompt(engine, model_dir: Path, messages: list[dict], reasoning: str,
         }
         if enable_thinking is not None:
             context["enable_thinking"] = enable_thinking
+        if (engine.cfg.model_type == "qwen3_5_moe"
+                and enable_thinking is False):
+            # The released template inserts an explicit empty
+            # <think></think> prefix before a no-thinking answer, but normally
+            # removes it when that answer is rendered as history. That makes a
+            # follow-up token stream diverge immediately before the assistant
+            # content and defeats exact recurrent endpoint reuse. Preserve the
+            # marker that was genuinely part of the previous model input.
+            context["preserve_thinking"] = True
         if engine.cfg.model_type == "gpt_oss":
             import datetime
 
@@ -2779,14 +2807,6 @@ def _validate_context_budget(engine, prompt_tokens: int, max_output_tokens: int,
 
 def _prepare_vision_prompt(engine, prompt: str, images):
     """Run allocation-free vision preflight and expose failures as HTTP 400."""
-    if engine.cfg.model_type == "qwen3_5_moe":
-        # Qwen3.6's text trunk is supported independently. Its new learned
-        # absolute vision positions/merger differ from Qwen3-VL's M-RoPE tower;
-        # never route image input through the older tower merely because the
-        # outer checkpoint advertises a vision_config.
-        raise RequestValidationError(
-            "Qwen3.5/Qwen3.6 image input is not implemented yet; text and "
-            "tool-calling requests are supported")
     from .qwen3vl import prepare_vl_prompt
 
     try:

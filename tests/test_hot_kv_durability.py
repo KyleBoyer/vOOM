@@ -6,11 +6,13 @@ import json
 from pathlib import Path
 
 import mlx.core as mx
+import numpy as np
 import pytest
 
 import runtime.hot_kv_persist as persist_module
 from runtime.hot_kv_persist import HotPromptKVPersistence
 from runtime.kv_cache import KVCache
+from runtime.kda_state import KDAStateCache
 
 
 def _state(tokens: list[int]):
@@ -50,6 +52,46 @@ def _flip_one_byte_same_size(path: Path) -> None:
 def _checkpoint_ids(path: Path) -> set[str]:
     return {item.name[:-len(".ckpt.json")]
             for item in path.glob("*.ckpt.json")}
+
+
+def test_hybrid_recurrent_endpoint_survives_disk_round_trip(tmp_path):
+    from types import SimpleNamespace
+
+    config = SimpleNamespace(
+        layer_types=("linear_attention", "full_attention"), kda_layers=())
+    journal = HotPromptKVPersistence(
+        tmp_path, "hybrid-test", 2, config=config,
+        require_recurrent=True)
+    tokens = [10, 11, 12, 13]
+    kv = KVCache(2)
+    kv.keys[1] = mx.arange(8, dtype=mx.float32).reshape(1, 1, 4, 2)
+    kv.values[1] = kv.keys[1] + 100
+    recurrent = KDAStateCache(2)
+    recurrent.set_state(
+        0, mx.arange(12, dtype=mx.float32).reshape(1, 1, 3, 4))
+    recurrent.set_conv_history(
+        0, (mx.arange(6, dtype=mx.float32).reshape(1, 2, 3),))
+    kv.kda_cache = recurrent
+    logits = mx.array([[1.0, 2.0]], dtype=mx.float32)
+    mx.eval(kv.keys[1], kv.values[1], logits)
+    chain = journal.save(
+        (), 0, tokens, kv, logits, logits,
+        prompt_length=3, reusable_prefix=2)
+
+    match = journal.find_best_match(tokens + [14, 15], 2)
+    assert match is not None and match["case"] == "extension"
+    loaded = journal.load_matched_chain(match, 2)
+    assert loaded is not None
+    loaded_tokens, restored, exact_logits = loaded
+    assert loaded_tokens == tuple(tokens)
+    assert exact_logits is None
+    assert np.array_equal(
+        np.array(restored.kda_cache.state(0)),
+        np.array(recurrent.state(0)))
+    assert np.array_equal(
+        np.array(restored.kda_cache.conv_history(0)[0]),
+        np.array(recurrent.conv_history(0)[0]))
+    assert tuple(chain) == tuple(match["chain"])
 
 
 def test_same_size_segment_corruption_is_rejected_and_repaired(tmp_path):

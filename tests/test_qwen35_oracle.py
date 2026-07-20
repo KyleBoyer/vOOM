@@ -20,6 +20,7 @@ from runtime.qwen35 import (
 
 from transformers.models.qwen3_5_moe.configuration_qwen3_5_moe import (
     Qwen3_5MoeTextConfig,
+    Qwen3_5MoeVisionConfig,
 )
 from transformers.models.qwen3_5_moe.modeling_qwen3_5_moe import (
     Qwen3_5MoeAttention,
@@ -27,6 +28,7 @@ from transformers.models.qwen3_5_moe.modeling_qwen3_5_moe import (
     Qwen3_5MoeRMSNorm,
     Qwen3_5MoeSparseMoeBlock,
     Qwen3_5MoeTextRotaryEmbedding,
+    Qwen3_5MoeVisionModel,
 )
 
 
@@ -105,6 +107,12 @@ def _runtime_config() -> ModelConfig:
         shared_expert_intermediate_size=MOE_DIM,
         partial_rotary_factor=0.5,
         attn_output_gate=True,
+        rope_scaling={
+            "rope_theta": 10000.0,
+            "partial_rotary_factor": 0.5,
+            "mrope_section": [1, 1, 0],
+            "mrope_interleaved": True,
+        },
     )
 
 
@@ -165,6 +173,37 @@ def test_gated_delta_net_matches_reference():
     _assert_close(actual, expected, tolerance=2e-4)
 
 
+def test_gated_delta_net_exact_endpoint_continuation_matches_one_shot():
+    config = _hf_config()
+    real = Qwen3_5MoeGatedDeltaNet(config, layer_idx=0)
+    _randomize(real, 31)
+    with torch.no_grad():
+        real.A_log.copy_(torch.log(
+            torch.empty_like(real.A_log).uniform_(1.0, 8.0)))
+    torch.manual_seed(32)
+    hidden = torch.randn(1, LENGTH, HIDDEN)
+    prefix = "model.layers.0"
+    weights = _mx_state(real, f"{prefix}.linear_attn")
+
+    full_cache = KDAStateCache(2)
+    full = _gated_delta_net(
+        mx.array(hidden.numpy()), weights, prefix, _runtime_config(),
+        full_cache, 0)
+
+    split_cache = KDAStateCache(2)
+    left = _gated_delta_net(
+        mx.array(hidden[:, :4].numpy()), weights, prefix, _runtime_config(),
+        split_cache, 0)
+    retained = split_cache.fork()
+    right = _gated_delta_net(
+        mx.array(hidden[:, 4:].numpy()), weights, prefix, _runtime_config(),
+        retained, 0)
+    split = mx.concatenate((left, right), axis=1)
+    mx.eval(split, full)
+    assert np.array_equal(np.array(split), np.array(full))
+    assert retained.nbytes() > 0
+
+
 def test_gated_full_attention_matches_reference():
     config = _hf_config()
     real = Qwen3_5MoeAttention(config, layer_idx=1)
@@ -188,6 +227,90 @@ def test_gated_full_attention_matches_reference():
         mx.array(hidden.numpy()), weights, prefix, _runtime_config(),
         KVCache(2), 1, 0)
     _assert_close(actual, expected, tolerance=1e-3)
+
+
+def test_multimodal_partial_interleaved_attention_matches_reference():
+    config = _hf_config()
+    real = Qwen3_5MoeAttention(config, layer_idx=1)
+    _randomize(real, 51)
+    torch.manual_seed(52)
+    hidden = torch.randn(1, LENGTH, HIDDEN)
+    positions3 = torch.stack((
+        torch.arange(LENGTH),
+        torch.tensor([0, 1, 2, 2, 3, 4, 5]),
+        torch.tensor([0, 1, 1, 2, 3, 4, 5]),
+    ))[:, None, :]
+    rope = Qwen3_5MoeTextRotaryEmbedding(config)
+    embeddings = rope(hidden, positions3)
+    causal = torch.where(
+        torch.arange(LENGTH)[None, :] <= torch.arange(LENGTH)[:, None],
+        0.0, float("-inf"),
+    )[None, None, :, :]
+    with torch.no_grad():
+        expected, _ = real(
+            hidden, position_embeddings=embeddings,
+            attention_mask=causal, past_key_values=None)
+    prefix = "model.layers.1"
+    weights = _mx_state(real, f"{prefix}.self_attn")
+    actual = _full_attention(
+        mx.array(hidden.numpy()), weights, prefix, _runtime_config(),
+        KVCache(2), 1, 0, positions3[:, 0].numpy())
+    _assert_close(actual, expected, tolerance=1e-3)
+
+
+def test_qwen36_vision_tower_matches_official_reference():
+    from runtime.qwen3vl import vision_forward
+
+    config = Qwen3_5MoeVisionConfig(
+        depth=2,
+        hidden_size=32,
+        intermediate_size=64,
+        num_heads=4,
+        in_channels=3,
+        patch_size=4,
+        temporal_patch_size=2,
+        spatial_merge_size=2,
+        num_position_embeddings=16,
+        out_hidden_size=32,
+        deepstack_visual_indexes=[],
+    )
+    config._attn_implementation = "eager"
+    real = Qwen3_5MoeVisionModel(config).to(torch.bfloat16).eval()
+    _randomize(real, 61)
+    real = real.to(torch.bfloat16)
+    torch.manual_seed(62)
+    pixels = torch.randn(16, 3 * 2 * 4 * 4, dtype=torch.bfloat16)
+    grid = torch.tensor([[1, 4, 4]], dtype=torch.long)
+    with torch.no_grad():
+        expected = real(pixels, grid_thw=grid).pooler_output.float()
+    weights = {
+        f"model.visual.{name}": mx.array(value.float().detach().numpy()).astype(
+            mx.bfloat16)
+        for name, value in real.state_dict().items()
+    }
+    actual, deepstack = vision_forward(
+        None, pixels.float().numpy(), 4, 4, {
+            "depth": 2,
+            "hidden_size": 32,
+            "intermediate_size": 64,
+            "num_heads": 4,
+            "patch_size": 4,
+            "temporal_patch_size": 2,
+            "spatial_merge_size": 2,
+            "num_position_embeddings": 16,
+            "out_hidden_size": 32,
+            "deepstack_visual_indexes": [],
+        }, weights=weights)
+    assert deepstack == []
+    mx.eval(actual)
+    actual_np = np.array(actual.astype(mx.float32))
+    expected_np = expected.numpy()
+    max_abs = float(np.max(np.abs(actual_np - expected_np)))
+    cosine = float(
+        np.dot(actual_np.ravel(), expected_np.ravel())
+        / (np.linalg.norm(actual_np) * np.linalg.norm(expected_np)))
+    assert max_abs < 6e-2
+    assert cosine > 0.9999
 
 
 def test_routed_and_shared_moe_matches_reference():
@@ -268,3 +391,4 @@ def test_released_wrapper_config_is_lifted(tmp_path):
     assert parsed.shared_expert_intermediate_size == 12
     assert parsed.image_token_id == 56
     assert parsed.vision_config == {"depth": 2}
+    assert parsed.rope_scaling == {"rope_theta": 10000.0}

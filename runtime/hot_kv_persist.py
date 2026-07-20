@@ -289,18 +289,21 @@ def _slice_kv(kv: KVCache, start: int, end: int) -> dict[str, mx.array]:
 class HotPromptKVPersistence:
     def __init__(self, dir: str | Path, fingerprint: str, chunk_size: int,
                  max_checkpoints: int = 64, *, config=None,
-                 require_dsa: bool = False, max_bytes: int = 0):
+                 require_dsa: bool = False, require_recurrent: bool = False,
+                 max_bytes: int = 0):
         self.dir = Path(dir)
         self.dir.mkdir(parents=True, exist_ok=True)
         # v3 makes every tensor payload and manifest an immutable, checksummed
         # generation. The identity bump prevents a v2 entry (whose semantic id
         # did not cover tensor bytes) from entering the verified journal.
-        self.fp = fingerprint + "|hot-kv-v3-durable-dsa"
+        self.fp = (fingerprint + "|hot-kv-v3-durable-dsa"
+                   + ("|hybrid-recurrent-v1" if require_recurrent else ""))
         self.chunk_size = chunk_size
         self.max_checkpoints = max_checkpoints
         self.max_bytes = max(0, int(max_bytes))
         self.config = config
         self.require_dsa = require_dsa
+        self.require_recurrent = require_recurrent
         self._thread_lock = threading.RLock()
         self._lock_path = self.dir / ".journal.lock"
         self._lock_path.touch(exist_ok=True)
@@ -308,6 +311,47 @@ class HotPromptKVPersistence:
         self._leases_dir.mkdir(exist_ok=True)
         self._segment_index: dict[tuple, list[str]] = {}
         self._rebuild_segment_index()
+
+    def _recurrent_layers(self) -> tuple[int, ...]:
+        if self.config is None:
+            return ()
+        layer_types = tuple(getattr(self.config, "layer_types", ()))
+        if layer_types:
+            return tuple(
+                index for index, kind in enumerate(layer_types)
+                if kind == "linear_attention")
+        return tuple(getattr(self.config, "kda_layers", ()))
+
+    def _checkpoint_arrays(
+        self, kv: KVCache, logits: mx.array, prompt_logits: mx.array,
+    ) -> dict[str, mx.array]:
+        arrays = {"logits": logits, "prompt_logits": prompt_logits}
+        recurrent = getattr(kv, "kda_cache", None)
+        if recurrent is not None:
+            arrays.update(recurrent.export_arrays())
+        if self.require_recurrent and recurrent is None:
+            raise ValueError("hybrid checkpoint is missing recurrent state")
+        return arrays
+
+    def _attach_recurrent(self, kv: KVCache, arrays: dict[str, mx.array]) -> bool:
+        recurrent_arrays = {
+            name: value for name, value in arrays.items()
+            if name.startswith("kda_state_") or name.startswith("kda_conv_")
+        }
+        if not recurrent_arrays:
+            return not self.require_recurrent
+        try:
+            from .kda_state import KDAStateCache
+
+            kv.kda_cache = KDAStateCache.from_arrays(
+                len(kv.keys), recurrent_arrays,
+                expected_layers=self._recurrent_layers())
+        except (TypeError, ValueError, RuntimeError) as error:
+            print(
+                f"[hot-kv-persist] recurrent checkpoint rejected: "
+                f"{type(error).__name__}: {error}", flush=True)
+            return False
+        return True
 
     @contextmanager
     def _locked(self, *, exclusive: bool):
@@ -617,8 +661,12 @@ class HotPromptKVPersistence:
             # in practice (hot_prompt_kv_min_tokens gates tiny prompts), but
             # there is no leaf to checkpoint.
             return tuple(chain)
+        checkpoint_arrays = self._checkpoint_arrays(
+            kv, logits, prompt_logits)
+        has_recurrent = any(
+            name.startswith("kda_state_") for name in checkpoint_arrays)
         tmp_payload, payload_sha256, payload_bytes = _write_safetensors_temp(
-            self.dir, {"logits": logits, "prompt_logits": prompt_logits})
+            self.dir, checkpoint_arrays)
         core = {
             "fp": self.fp,
             "leaf": leaf,
@@ -627,6 +675,7 @@ class HotPromptKVPersistence:
             "approximate": bool(approximate),
             "cache_namespace": cache_namespace,
             "tool_capsules": [list(span) for span in tool_capsules],
+            "recurrent_state": bool(has_recurrent),
             "payload_sha256": payload_sha256,
             "payload_bytes": payload_bytes,
         }
@@ -656,7 +705,7 @@ class HotPromptKVPersistence:
                 **core,
             }
             tmp_payload, retry_sha256, retry_bytes = _write_safetensors_temp(
-                self.dir, {"logits": logits, "prompt_logits": prompt_logits})
+                self.dir, checkpoint_arrays)
             if (retry_sha256 != payload_sha256
                     or retry_bytes != payload_bytes):
                 tmp_payload.unlink(missing_ok=True)
@@ -742,6 +791,10 @@ class HotPromptKVPersistence:
             if scored is None:
                 continue
             case, matched, watermark, n_segments, lcp = scored
+            if self.require_recurrent and (
+                    not meta.get("recurrent_state", False)
+                    or case not in ("endpoint", "extension")):
+                continue
             try:
                 mtime = j.stat().st_mtime
             except OSError:
@@ -916,7 +969,9 @@ class HotPromptKVPersistence:
                   f"{match['matched']}, refusing to use", flush=True)
             return None
         exact_logits = None
-        if match["case"] in ("repeat", "endpoint"):
+        ck = None
+        if (self.require_recurrent
+                or match["case"] in ("repeat", "endpoint")):
             checkpoint_id = match["checkpoint_id"]
             checkpoint_paths = (
                 self._checkpoint_meta_path(checkpoint_id),
@@ -941,6 +996,9 @@ class HotPromptKVPersistence:
                       f"checkpoint payload load failed: {type(e).__name__}: "
                       f"{e}", flush=True)
                 return None
+            if not self._attach_recurrent(kv, ck):
+                return None
+        if match["case"] in ("repeat", "endpoint"):
             exact_logits = ck["prompt_logits"] if match["case"] == "repeat" else ck["logits"]
         checkpoint_id = match["checkpoint_id"]
         with self._locked(exclusive=False):
@@ -1005,6 +1063,8 @@ class HotPromptKVPersistence:
                       f"chain (leaf={leaf})", flush=True)
                 continue
             tokens, kv = loaded
+            if not self._attach_recurrent(kv, ck):
+                continue
             tool_capsules = _normalize_tool_capsules(
                 meta.get("tool_capsules", ()), int(meta["prompt_length"]),
                 strict=False)

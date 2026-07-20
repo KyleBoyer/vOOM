@@ -34,6 +34,19 @@ from .sampler import SamplingParams, sample
 from .weight_cache import WeightCache
 
 
+def _resident_adjusted_transient(
+    start_active: int, end_active: int, peak_active: int,
+) -> int:
+    """Scratch high-water above both resident endpoints.
+
+    Weight/expert cache growth is persistent and has its own admission path.
+    Counting that growth as scratch makes the governor reserve it a second time
+    on every following layer/token, evicting the very pages just admitted.
+    """
+    return max(0, int(peak_active) - max(
+        int(start_active), int(end_active)))
+
+
 def _quantization_cache_identity(rc: "RuntimeConfig", store) -> str:
     """Fingerprint physical packing plus any load-time transformation."""
     runtime = (
@@ -1064,6 +1077,8 @@ class StreamingEngine:
                     self.cfg.model_type == "glm_moe_dsa"
                     and bool(self.cfg.index_topk)
                     and not self._dsa_elided),
+                require_recurrent=(
+                    self.cfg.model_type in ("kimi_linear", "qwen3_5_moe")),
             )
             if not self._defer_persisted_kv_until_bootstrap:
                 for (tokens, kv, logits, prompt_length, prompt_logits,
@@ -1143,6 +1158,30 @@ class StreamingEngine:
         }
 
     def _project_dense_text_kv_bytes(self, positions: int) -> int:
+        if self.cfg.model_type == "qwen3_5_moe":
+            full_layers = sum(
+                layer_type == "full_attention"
+                for layer_type in self.cfg.layer_types)
+            attention = (
+                positions * full_layers * 2
+                * int(self.cfg.num_key_value_heads)
+                * int(self.cfg.head_dim) * 2)
+            linear_layers = max(
+                0, int(self.cfg.num_hidden_layers) - full_layers)
+            recurrent = (
+                linear_layers * int(self.cfg.linear_num_value_heads)
+                * int(self.cfg.linear_key_head_dim)
+                * int(self.cfg.linear_value_head_dim) * 4)
+            conv_width = (
+                2 * int(self.cfg.linear_num_key_heads)
+                * int(self.cfg.linear_key_head_dim)
+                + int(self.cfg.linear_num_value_heads)
+                * int(self.cfg.linear_value_head_dim))
+            conv = (
+                linear_layers
+                * max(0, int(self.cfg.linear_conv_kernel_dim) - 1)
+                * conv_width * 2)
+            return attention + recurrent + conv
         if (self.cfg.model_type not in ("qwen2", "qwen3")
                 or self.cfg.vision_config or self.cfg.num_experts):
             return 0
@@ -1876,7 +1915,10 @@ class StreamingEngine:
                                            fused_swiglu=self.rc.fused_swiglu)
             mx.eval(x)
             self._layer_transient = max(
-                self._layer_transient, mx.get_peak_memory() - active_before)
+                self._layer_transient,
+                _resident_adjusted_transient(
+                    active_before, mx.get_active_memory(),
+                    mx.get_peak_memory()))
             self._note_true_peak()
             self.timer.add("layer_compute", time.perf_counter() - t0)
             if tap_layers is not None and i in tap_layers:
@@ -1967,7 +2009,10 @@ class StreamingEngine:
                 # (1, positions, hidden) context tensor per requested layer.
                 self._tap_hidden[layer] = mx.concatenate(positions, axis=1)
             self._layer_transient = max(
-                self._layer_transient, mx.get_peak_memory() - active_before)
+                self._layer_transient,
+                _resident_adjusted_transient(
+                    active_before, mx.get_active_memory(),
+                    mx.get_peak_memory()))
             self._note_true_peak()
             del weights
 
@@ -2088,12 +2133,10 @@ class StreamingEngine:
 
                 kv.dsa = DSAState(self.cfg)
         if self.cfg.model_type in ("kimi_linear", "qwen3_5_moe"):
-            # F92/F94: KDA's recurrent state is not token-indexed and cannot
-            # be trimmed/rewound like the KVCache it rides alongside -- see
-            # the hot_eligible gate below, which keeps this model type off
-            # the hot-prompt-KV-reuse and disk-persistence paths entirely
-            # (neither is wired to save/restore kda_cache) until F94 designs
-            # an exact-match reuse mechanism for it specifically.
+            # KDA's recurrent state is fixed-size and not token-indexed. Exact
+            # endpoint/extension retention and durable restore carry this
+            # companion cache alongside attention KV; arbitrary prefix trims
+            # remain forbidden by the candidate-selection gate in generate().
             from .kda_state import KDAStateCache
 
             kv.kda_cache = KDAStateCache(self.cfg.num_hidden_layers)
@@ -2276,17 +2319,15 @@ class StreamingEngine:
         # all three cases: endpoint/branch/repeat), 0 when cold. MUST be
         # passed to save() explicitly rather than re-derived, since a
         # "repeat" parent chain's last segment is not chunk-sized.
-        # F92: KDA's recurrent state is a running fold, not a token-indexed
-        # array -- there is no way to "trim to a shared prefix length" the
-        # way hot-prompt-KV reuse does for ordinary KV, so partial reuse
-        # would silently produce wrong (understated) state. kv_store.py/
-        # hot_kv_persist.py also have no kda_cache save/restore code at all
-        # yet. Keep this model type on the always-cold path until an
-        # exact-match (not prefix-trim) reuse design exists for it.
+        # Recurrent state cannot be trimmed to an arbitrary common prefix.
+        # It can, however, be transferred exactly at a complete retained
+        # endpoint and extended with a suffix. Candidate selection below
+        # limits hybrid models to those two no-trim cases.
+        recurrent_exact_only = self.cfg.model_type in (
+            "kimi_linear", "qwen3_5_moe")
         hot_eligible = (self.rc.hot_prompt_kv and not self.rc.max_kv_mb
                         and not force_adaptive_paged
-                        and self.cfg.model_type not in (
-                            "kimi_linear", "qwen3_5_moe"))
+                        and not self.rc.tool_pic_shared_pages)
         resident_prompt_kv_bytes = self._project_dense_text_kv_bytes(len(tokens))
         configured_paged_mb = int(self.rc.max_kv_mb or 0)
         initial_paged_mb = (
@@ -2423,6 +2464,38 @@ class StreamingEngine:
                     if old != new:
                         break
                     lcp += 1
+
+                if recurrent_exact_only:
+                    # A complete endpoint carries exactly the recurrent fold
+                    # represented by slot.tokens. Extending that endpoint is
+                    # exact; repeating/branching would require rewinding the
+                    # fold and is therefore deliberately ineligible.
+                    if (len(tokens) == len(slot.tokens)
+                            and lcp == len(tokens)
+                            and slot.logits is not None):
+                        candidate_matched = len(tokens)
+                        candidate_exact_logits = slot.logits
+                        candidate_watermark = 0
+                        candidate_trim_to = None
+                        candidate_case = "endpoint"
+                    elif (len(tokens) > len(slot.tokens)
+                          and lcp == len(slot.tokens)):
+                        candidate_matched = len(slot.tokens)
+                        candidate_exact_logits = None
+                        candidate_watermark = 0
+                        candidate_trim_to = None
+                        candidate_case = "extension"
+                    else:
+                        continue
+                    if candidate_matched > best_matched:
+                        best_idx = idx
+                        best_matched = candidate_matched
+                        best_exact_logits = candidate_exact_logits
+                        best_reusable_watermark = candidate_watermark
+                        best_lcp = lcp
+                        best_needs_trim_to = candidate_trim_to
+                        best_case = candidate_case
+                    continue
 
                 if (len(tokens) == slot.prompt_length and lcp >= len(tokens)
                         and slot.prompt_logits is not None):
@@ -3214,7 +3287,9 @@ class StreamingEngine:
 
             mx.eval(logits)
             self._token_transient = max(
-                self._token_transient, mx.get_peak_memory() - boundary)
+                self._token_transient,
+                _resident_adjusted_transient(
+                    boundary, mx.get_active_memory(), mx.get_peak_memory()))
             self._note_true_peak()
             decode_elapsed = time.perf_counter() - decode_t0
             tok_times = [decode_elapsed / pipelined_decode_steps] * pipelined_decode_steps
@@ -3240,7 +3315,10 @@ class StreamingEngine:
                     constraint.accept_token(next_tok)
                     grammar_completed = bool(constraint.completed)
                 self._token_transient = max(
-                    self._token_transient, mx.get_peak_memory() - boundary)
+                    self._token_transient,
+                    _resident_adjusted_transient(
+                        boundary, mx.get_active_memory(),
+                        mx.get_peak_memory()))
                 self._note_true_peak()
                 tok_times.append(time.perf_counter() - t0)
                 generated.append(next_tok)
@@ -3357,6 +3435,9 @@ class StreamingEngine:
             # branchable prefix.  Retain the SAME object -- never a cloned KV.
             mx.eval(logits)
             mx.eval(prompt_endpoint_logits)
+            recurrent_state = getattr(kv, "kda_cache", None)
+            if recurrent_state is not None:
+                recurrent_state.synchronize()
             full_tokens = tuple(tokens + generated[:-1])
             segment_chain: tuple[str, ...] = ()
             if self._hot_kv_persist is not None:

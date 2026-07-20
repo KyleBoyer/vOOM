@@ -955,7 +955,7 @@ def test_k25_lossless_uses_demand_paging_without_speculative_prefetch():
     assert rc.quant_bits == 0
 
 
-def test_qwen36_profiles_bound_experts_and_disable_incomplete_prompt_kv():
+def test_qwen36_profiles_bound_experts_and_use_hybrid_endpoint_cache():
     from unittest.mock import patch
 
     from runtime.server import EngineManager
@@ -981,8 +981,11 @@ def test_qwen36_profiles_bound_experts_and_disable_incomplete_prompt_kv():
     lossless, fast = captured
     for rc in captured:
         assert rc.prompt_kv_dir == ""
-        assert not rc.hot_prompt_kv
+        assert rc.hot_prompt_kv
+        assert rc.hot_prompt_kv_slots == 2
+        assert rc.hot_prompt_kv_min_tokens == 16
         assert rc.prefill_chunk_size == 512
+        assert rc.hot_prompt_kv_chunk_size == rc.prefill_chunk_size
         assert rc.expert_fetch_batch == 1
         assert rc.decode_expert_fetch_batch == 8
     assert lossless.quant_bits == 0
@@ -2399,6 +2402,14 @@ def test_hidden_decision_handles_harmony_spacing_and_final_channel():
     direct.finish_direct("<|channel|>final")
     assert direct.branch == "direct"
     assert "".join(emitted) == "<|channel|>final"
+
+
+def test_resident_adjusted_transient_excludes_persistent_cache_growth():
+    from runtime.engine import _resident_adjusted_transient
+
+    assert _resident_adjusted_transient(1_000, 2_500, 2_500) == 0
+    assert _resident_adjusted_transient(1_000, 2_500, 2_900) == 400
+    assert _resident_adjusted_transient(2_500, 1_000, 2_900) == 400
 
 
 def _run_all():

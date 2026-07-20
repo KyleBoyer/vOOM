@@ -383,6 +383,35 @@ def _store_vision_prompt_cache(engine, key, kv, logits, prompt_tokens: int, *,
     return True
 
 
+def _fork_hybrid_prompt_endpoint(kv: KVCache) -> KVCache:
+    """Share an evaluated Qwen3.6 prompt endpoint before decode advances it.
+
+    Plain KVCache updates replace attention arrays with concatenations, and
+    KDAStateCache updates replace recurrent arrays, so the evaluated prompt
+    buffers are immutable under subsequent decode.  SteppedKVCache writes into
+    spare capacity in place and is deliberately rejected until it has a
+    dedicated copy-on-write snapshot operation.
+    """
+    if type(kv) is not KVCache:
+        raise TypeError("hybrid vision endpoint snapshots require plain KVCache")
+    recurrent = getattr(kv, "kda_cache", None)
+    if recurrent is None:
+        raise ValueError("hybrid vision endpoint is missing recurrent state")
+    snapshot = KVCache(len(kv.keys))
+    snapshot.keys = list(kv.keys)
+    snapshot.values = list(kv.values)
+    snapshot.compressed_mla = kv.compressed_mla
+    snapshot.kda_cache = recurrent.fork()
+    arrays = [
+        value for value in (*snapshot.keys, *snapshot.values)
+        if value is not None
+    ]
+    if arrays:
+        mx.eval(*arrays)
+    snapshot.kda_cache.synchronize()
+    return snapshot
+
+
 def _vision_prompt_cache_mode(cached_prompt, tokens, cfg) -> str | None:
     """Whether retained multimodal KV can serve this prompt without the tower."""
     if cached_prompt is None:
@@ -518,6 +547,12 @@ def vl_prefill(engine, tokens: list[int], image_embeds, deepstack, pos3, kv: KVC
     """Prefill with image embeddings spliced at image_token positions,
     interleaved M-RoPE, and DeepStack adds after the first LLM layers."""
     cfg = engine.cfg
+    if cfg.model_type == "qwen3_5_moe":
+        from .qwen35 import multimodal_prefill
+
+        if deepstack:
+            raise ValueError("Qwen3.5/Qwen3.6 does not support DeepStack inputs")
+        return multimodal_prefill(engine, tokens, image_embeds, pos3, kv)
     vision_tokens = {cfg.image_token_id, cfg.video_token_id} - {0}
     is_img = np.isin(np.array(tokens), list(vision_tokens))
     x = engine._embed(list(tokens))
@@ -546,8 +581,7 @@ def vl_prefill(engine, tokens: list[int], image_embeds, deepstack, pos3, kv: KVC
             add[img_idx, :] = deepstack[i].astype(x.dtype)
             x = x + add[None]
         mx.eval(x)
-    logits = layer_runner.final_logits(
-        x, engine._norm_w, engine._lm_head_weight(), cfg.rms_norm_eps)
+    logits = engine._final_logits(x)
     mx.eval(logits)
     return logits
 
@@ -555,6 +589,11 @@ def vl_prefill(engine, tokens: list[int], image_embeds, deepstack, pos3, kv: KVC
 def vl_prefill_suffix(engine, tokens: list[int], pos3: np.ndarray, kv: KVCache,
                       prefix_tokens: int):
     """Extend an exact cached multimodal prefix with a text-only suffix."""
+    if engine.cfg.model_type == "qwen3_5_moe":
+        from .qwen35 import multimodal_suffix_prefill
+
+        return multimodal_suffix_prefill(
+            engine, tokens, pos3, kv, prefix_tokens)
     suffix = tokens[prefix_tokens:]
     if not suffix:
         raise ValueError("vision prompt-cache suffix must not be empty")
@@ -906,8 +945,7 @@ def _lazy_vl_resident_decode_step(engine, token: mx.array, kv: KVCache,
     """Build one resident text-trunk step at the compressed M-RoPE offset."""
     x = layer_runner.embed(token.reshape(-1), engine._embed_weight())
     x = engine._sweep(x, kv, offset=rope_position)
-    logits = layer_runner.final_logits(
-        x, engine._norm_w, engine._lm_head_weight(), engine.cfg.rms_norm_eps)
+    logits = engine._final_logits(x)
     return mx.argmax(logits), logits
 
 
@@ -1038,6 +1076,7 @@ def generate_vl(engine, prompt_text: str, images, max_tokens: int = 64,
     # old KV immediately; a match keeps one local owner until suffix/full-prefill
     # dispatch below.
     cache_lookup_t0 = time.perf_counter()
+    hybrid_recurrent = cfg.model_type == "qwen3_5_moe"
     cached_prompt = _take_vision_prompt_cache(
         engine, prompt_cache_key, len(tokens))
     prompt_cache_lookup_s = time.perf_counter() - cache_lookup_t0
@@ -1211,7 +1250,7 @@ def generate_vl(engine, prompt_text: str, images, max_tokens: int = 64,
             cached_prompt = None
             pic_source = None
             mx.clear_cache()
-            kv = KVCache(cfg.num_hidden_layers)
+            kv = engine.new_kv()
             t0 = time.perf_counter()
             logits = vl_prefill(
                 engine, tokens, image_embeds, deepstack, pos3, kv)
@@ -1220,7 +1259,7 @@ def generate_vl(engine, prompt_text: str, images, max_tokens: int = 64,
         cached_prompt = None
         pic_source = None
         mx.clear_cache()
-        kv = KVCache(cfg.num_hidden_layers)
+        kv = engine.new_kv()
         t0 = time.perf_counter()
         if on_progress is not None:
             on_progress({"phase": "prefill", "completed_tokens": 0,
@@ -1231,6 +1270,12 @@ def generate_vl(engine, prompt_text: str, images, max_tokens: int = 64,
                          "total_tokens": len(tokens)})
         prefill_s = time.perf_counter() - t0
     prompt_logits = logits
+    # Recurrent state cannot be trimmed back after generation. Capture the
+    # exact prompt endpoint now; attention and DeltaNet updates are both
+    # replacement-based for this plain-cache path, so decode advances only the
+    # live owner. The retained copy can serve an exact repeat or text suffix.
+    hybrid_prompt_kv = (
+        _fork_hybrid_prompt_endpoint(kv) if hybrid_recurrent else None)
     decode_t0 = time.perf_counter()
     sampled_logits = constraint.mask_logits(logits) if constraint is not None else logits
     next_tok = sample(sampled_logits, sampling)
@@ -1304,8 +1349,12 @@ def generate_vl(engine, prompt_text: str, images, max_tokens: int = 64,
             current_token, current_logits = future_token, future_logits
 
         mx.eval(logits)
+        from .engine import _resident_adjusted_transient
+
         engine._token_transient = max(
-            engine._token_transient, mx.get_peak_memory() - boundary)
+            engine._token_transient,
+            _resident_adjusted_transient(
+                boundary, mx.get_active_memory(), mx.get_peak_memory()))
         engine._note_true_peak()
     elif stop_text is None:
         for _ in range(remaining_decode):
@@ -1313,8 +1362,7 @@ def generate_vl(engine, prompt_text: str, images, max_tokens: int = 64,
                 break
             x = engine._embed([next_tok])
             x = engine._sweep(x, kv, offset=pos)  # equal t/h/w == standard rope
-            logits = layer_runner.final_logits(
-                x, engine._norm_w, engine._lm_head_weight(), cfg.rms_norm_eps)
+            logits = engine._final_logits(x)
             sampled_logits = (
                 constraint.mask_logits(logits)
                 if constraint is not None else logits)
@@ -1339,7 +1387,9 @@ def generate_vl(engine, prompt_text: str, images, max_tokens: int = 64,
         on_token(final_delta)
     decode_s = time.perf_counter() - decode_t0
     vision_prompt_cache_stored = _store_vision_prompt_cache(
-        engine, prompt_cache_key, kv, prompt_logits, len(tokens),
+        engine, prompt_cache_key,
+        hybrid_prompt_kv if hybrid_prompt_kv is not None else kv,
+        prompt_logits, len(tokens),
         tool_capsules=prepared.get("tool_capsules", ()), pos3=pos3,
         approximate=prompt_state_approximate)
     engine._note_true_peak()

@@ -4,6 +4,7 @@ hf_cache/
 .kv_spill/
 .kv_prompts/
 .hot_kv_persist/
+.kv_hybrid/
 .tool_embeddings/
 .pytest_cache/
 tests/oracle/

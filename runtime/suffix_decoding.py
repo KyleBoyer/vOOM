@@ -610,8 +610,12 @@ def run_shared_prefill_suffix_decode(
         endpoint = prompt_length + len(generated) - 1
         if kv.offset > endpoint:
             kv.trim(endpoint)
+        from .engine import _resident_adjusted_transient
+
         engine._token_transient = max(
-            engine._token_transient, mx.get_peak_memory() - boundary)
+            engine._token_transient,
+            _resident_adjusted_transient(
+                boundary, mx.get_active_memory(), mx.get_peak_memory()))
         engine._note_true_peak()
         elapsed = time.perf_counter() - round_started
         if emitted_this_round:
