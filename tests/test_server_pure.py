@@ -1058,7 +1058,15 @@ def test_qwen36_skips_trunk_pinning_under_low_available_memory():
     pre-pinning failures ever reached, because the pinned trunk could no
     longer be shed to make room the way a fully-evictable one could
     (2026-07-20). Pinning must therefore be a one-time, memory-aware
-    decision at engine-construction time, not unconditional."""
+    decision at engine-construction time, not unconditional.
+
+    Same reasoning applies to prefill_chunk_size: every real
+    governor.reserve() failure this session traced back to _layer_transient
+    (the measured per-chunk compute-scratch high-water mark, which scales
+    with chunk size), not expert-fetch bytes. hot_prompt_kv requires FIXED
+    chunks (rules out GLM's live adaptive_chunk_size resampling), but a
+    smaller fixed chunk is still fixed -- so low memory should also pick a
+    smaller constant instead of the generous-memory default."""
     from unittest.mock import patch
 
     from runtime.server import EngineManager
@@ -1087,6 +1095,8 @@ def test_qwen36_skips_trunk_pinning_under_low_available_memory():
     # when there isn't room to also pin the trunk.
     assert not captured[0].pin_lm_head
     assert captured[0].stream_lm_head
+    assert captured[0].prefill_chunk_size == 128
+    assert captured[0].hot_prompt_kv_chunk_size == 128
 
 
 def test_qwen36_fast_mode_respects_configured_weight_cache_budget():

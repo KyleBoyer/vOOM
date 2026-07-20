@@ -40,15 +40,6 @@ def _wait_for_server(proc, timeout=30):
     raise TimeoutError("server did not become ready in time")
 
 
-def _start_server():
-    proc = subprocess.Popen(
-        [sys.executable, "-m", "runtime.server", "--port", str(PORT)],
-        cwd=str(ROOT), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
-    )
-    _wait_for_server(proc)
-    return proc
-
-
 def _stop_server(proc):
     proc.terminate()
     try:
@@ -56,6 +47,33 @@ def _stop_server(proc):
     except subprocess.TimeoutExpired:
         proc.kill()
         proc.wait(timeout=10)
+
+
+def _start_server():
+    proc = subprocess.Popen(
+        [sys.executable, "-m", "runtime.server", "--port", str(PORT)],
+        cwd=str(ROOT), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+    )
+    # 2026-07-20: every caller does `proc = _start_server(); try: ... finally:
+    # _stop_server(proc)`, but that try/finally only wraps code AFTER this
+    # function returns. _wait_for_server raising (a slow model load past its
+    # 30s readiness timeout, or the process exiting early) propagated out of
+    # HERE, before proc ever reached the caller's try/finally -- orphaning an
+    # already-Popen'd live server with nothing left holding a reference to
+    # kill it. Same bug as tests/test_protocol_features.py's identical
+    # helper, fixed there first; a real orphaned --port 8099 process from
+    # this file is the likely cause of a later full-suite run hanging for
+    # 8+ minutes with zero CPU activity, consistent with a fresh test's
+    # server subprocess failing to bind an already-occupied port and
+    # something downstream blocking on that instead of failing fast. Clean
+    # up here on any failure, then re-raise so the test still reports the
+    # original error.
+    try:
+        _wait_for_server(proc)
+    except Exception:
+        _stop_server(proc)
+        raise
+    return proc
 
 
 def test_chat_completions_non_streaming():

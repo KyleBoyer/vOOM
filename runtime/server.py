@@ -1104,11 +1104,37 @@ class EngineManager:
                 # actually-useful expert-LRU headroom -- pinning while
                 # leaving less than that would likely thrash almost as much
                 # as not pinning, for none of the benefit.
-                if psutil.virtual_memory().available >= 4_000_000_000:
+                qwen35_available_bytes = psutil.virtual_memory().available
+                if qwen35_available_bytes >= 4_000_000_000:
                     rc.pin_first_layers = cfg_probe.num_hidden_layers
                 rc.fast_dirs = (str(
                     Path.home() / "vmodel_fast_tier" / model_dir.name),)
-                rc.prefill_chunk_size = 512
+                # 2026-07-20: every governor.reserve() failure this session
+                # traced back to the SAME dominant term -- not expert weight
+                # bytes (~1.7MB each quantized), but _layer_transient, the
+                # measured Metal active-memory delta from running ONE
+                # chunk's positions through ONE layer (engine.py's
+                # _resident_adjusted_transient call after mx.eval(x), where
+                # x carries the whole chunk's token dimension). That scales
+                # with prefill_chunk_size, and every failed request's
+                # "incoming" reservation (~1.2-1.3GB) was consistent with
+                # this, not with expert-fetch size. GLM already has a live,
+                # memory-adaptive fix for exactly this (F68's
+                # adaptive_chunk_size, resampling the governor's ceiling
+                # every chunk) -- but engine.py hard-rejects combining it
+                # with hot_prompt_kv ("hot_prompt_kv requires fixed chunks
+                # and no persistent prefill checkpoints"), because hot-KV
+                # reuse across conversation turns needs a deterministic,
+                # matching chunk boundary to resume from, which a resampled
+                # chunk size can't guarantee. A smaller FIXED chunk is still
+                # a fixed chunk, though -- compatible with hot_prompt_kv,
+                # and directly shrinks the same per-chunk compute-scratch
+                # that every failure traced back to, trading more chunks
+                # (more round trips, slower) for a much smaller peak
+                # footprint per chunk. Reuse the same live-memory read
+                # already taken for the pinning decision above rather than
+                # sampling twice.
+                rc.prefill_chunk_size = 512 if qwen35_available_bytes >= 4_000_000_000 else 128
                 rc.hot_prompt_kv_chunk_size = rc.prefill_chunk_size
                 # 2026-07-20: this was q=1 (one expert fetched at a time,
                 # serially) copied from GLM-5.2's fail-closed prefill

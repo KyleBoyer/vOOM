@@ -43,7 +43,20 @@ def _start_server():
         [sys.executable, "-m", "runtime.server", "--port", str(PORT)],
         cwd=str(ROOT), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
     )
-    _wait_for_server(proc)
+    # 2026-07-20: _wait_for_server raising (a slow model load past its 30s
+    # readiness timeout, or the process exiting early) propagated out of
+    # HERE, before proc ever reached the caller's `try: ... finally:
+    # _stop_server(proc)` -- orphaning an already-Popen'd live server with
+    # nothing left holding a reference to kill it. Same bug fixed in
+    # tests/test_protocol_features.py and
+    # tests/test_openai_client_integration.py's identical helpers; a real
+    # orphaned server process from one of these files is the likely cause
+    # of a full-suite run hanging for 8+ minutes with zero CPU activity.
+    try:
+        _wait_for_server(proc)
+    except Exception:
+        _stop_server(proc)
+        raise
     return proc
 
 
