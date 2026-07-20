@@ -25,7 +25,7 @@ def test_glm_planner_matches_actual_fixture_trunk_tensor_bytes():
     from runtime.model_loader import WeightStore
 
     store = WeightStore(FIXTURE)
-    planner = MemoryPlanner(store, budget_mb=200)
+    planner = MemoryPlanner(store, budget_mb=200, disk_mb_per_s=300)
     actual = 0
     for layer in range(store.config.num_hidden_layers):
         tensors, _seconds, _read_bytes = store.fetch(store.layer_param_names(layer))
@@ -64,7 +64,7 @@ def test_released_scale_glm_no_longer_looks_like_one_dense_mlp_per_layer():
         tie_word_embeddings=False,
     )
     store = SimpleNamespace(config=released_scale, on_disk_quantized=False)
-    planner = MemoryPlanner(store, budget_mb=8_000)
+    planner = MemoryPlanner(store, budget_mb=8_000, disk_mb_per_s=300)
     plan = planner.plan("latency")
 
     # A routed layer owns all 256 expert pages (~19 GB BF16), even though one
@@ -90,11 +90,11 @@ def test_fully_prequantized_plan_uses_packed_layer_and_traffic_bytes():
         uniform_quantization_ratio=lambda fragment: (
             packed_ratio if fragment in (".self_attn.", ".mlp.") else 1.0),
     )
-    planner = MemoryPlanner(store, budget_mb=200)
+    planner = MemoryPlanner(store, budget_mb=200, disk_mb_per_s=300)
     plan = planner.plan("lru")
     raw = MemoryPlanner(
         SimpleNamespace(config=config, on_disk_quantized=False),
-        budget_mb=200,
+        budget_mb=200, disk_mb_per_s=300,
     )
 
     assert plan.rc.quant_bits == 0

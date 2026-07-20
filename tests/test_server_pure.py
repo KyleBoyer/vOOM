@@ -1031,7 +1031,7 @@ def test_qwen36_profiles_bound_experts_and_use_hybrid_endpoint_cache():
         assert rc.hot_prompt_kv_min_tokens == 16
         assert rc.prefill_chunk_size == 512
         assert rc.hot_prompt_kv_chunk_size == rc.prefill_chunk_size
-        assert rc.expert_fetch_batch == 1
+        assert rc.expert_fetch_batch == 8
         assert rc.decode_expert_fetch_batch == 8
         assert rc.fast_dirs[0].endswith("vmodel_fast_tier/fake-qwen36")
     assert lossless.quant_bits == 0
@@ -1042,6 +1042,42 @@ def test_qwen36_profiles_bound_experts_and_use_hybrid_endpoint_cache():
     assert not fast.quant_router
     assert not fast.quant_lm_head
     assert fast.max_weight_cache_mb == 6000
+
+
+def test_qwen36_fast_mode_respects_configured_weight_cache_budget():
+    """fast/fast-long mode's quantization block used to unconditionally
+    reset max_weight_cache_mb to a literal 6000 right after the env-var
+    read above it, silently discarding whatever an operator configured via
+    VMODEL_QWEN35_WEIGHT_CACHE_MB (2026-07-20, live-confirmed: a real
+    tool-heavy request needed a smaller resident budget to leave headroom
+    for the expert-fetch reserve, and this exact mode -- the one a large
+    tool count routes to -- ignored the knob meant to free that room)."""
+    from unittest.mock import patch
+
+    from runtime.server import EngineManager
+
+    captured = []
+
+    class FakeEngine:
+        def __init__(self, _path, rc):
+            captured.append(rc)
+
+        def close(self):
+            pass
+
+    cfg = SimpleNamespace(
+        model_type="qwen3_5_moe", tie_word_embeddings=False,
+        index_topk=0, vision_config={"depth": 27})
+    with patch("runtime.config.ModelConfig.from_dir", return_value=cfg), \
+         patch("runtime.path_resolver.resolve_model_dir", side_effect=lambda path: path), \
+         patch("runtime.engine.StreamingEngine", FakeEngine), \
+         patch.dict(os.environ, {"VMODEL_QWEN35_WEIGHT_CACHE_MB": "2500"}):
+        EngineManager().get(Path("/tmp/fake-qwen36-budget"), "lossless")
+        EngineManager().get(Path("/tmp/fake-qwen36-budget"), "fast")
+
+    lossless, fast = captured
+    assert lossless.max_weight_cache_mb == 2500
+    assert fast.max_weight_cache_mb == 2500
 
 
 def test_dense_fast_mode_uses_validated_mxfp4_and_pipelined_decode():

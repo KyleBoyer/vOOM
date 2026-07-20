@@ -1059,11 +1059,37 @@ class EngineManager:
                     Path.home() / "vmodel_fast_tier" / model_dir.name),)
                 rc.prefill_chunk_size = 512
                 rc.hot_prompt_kv_chunk_size = rc.prefill_chunk_size
-                rc.expert_fetch_batch = 1
+                # 2026-07-20: this was q=1 (one expert fetched at a time,
+                # serially) copied from GLM-5.2's fail-closed prefill
+                # fallback -- but that caution was calibrated to GLM's
+                # ~75.5MB-per-expert danger zone (a real 16-22GB reservation
+                # incident, see the glm_moe_dsa block above), not
+                # re-evaluated for this model. Qwen3.6's routed experts are
+                # ~6.3MB each (same figure the decode comment below already
+                # relies on) -- even a full 256-expert worst-case union is
+                # ~1.6GB, nowhere near GLM's regime. q=1 also serialized one
+                # governor-reservation-plus-lock round trip per expert, which
+                # is cheap next to a slow USB drive's own per-read latency
+                # but became the dominant cost once this repo's storage
+                # moved to a real NVMe (~3 GB/s measured, see
+                # runtime/disk_bench.py) -- live-confirmed: a 134-tool,
+                # ~30K-token prompt prefilled at ~13 tok/s, and process
+                # sampling showed real time going to thread-sync waits
+                # around each single-expert fetch, not to disk reads
+                # themselves. Raised to 8 to match decode's already-proven
+                # value below and let get_many's shard-grouped batching
+                # actually engage during prefill too. This does NOT bypass
+                # memory safety: governor.admissible_units() (called inside
+                # _iter_expert_batches) still adaptively clamps the live
+                # batch size down to whatever current headroom allows,
+                # exactly as it already does for decode's batch=8 -- this
+                # only raises the ceiling attempted when there's room, never
+                # forces a bigger batch under pressure.
+                rc.expert_fetch_batch = 8
                 # One decode position activates exactly eight ~6.3 MB experts
                 # per layer. Fetching them as one archive-coalesced batch is
                 # comfortably bounded and avoids eight serialized disk waits;
-                # multi-position prefill retains q=1 above.
+                # multi-position prefill now batches the same width above.
                 rc.decode_expert_fetch_batch = 8
                 if mode in ("fast", "fast-long"):
                     # Initial side-quest profile: quantize only expert MLP
@@ -1078,7 +1104,14 @@ class EngineManager:
                     rc.quant_attention = False
                     rc.quant_router = False
                     rc.quant_lm_head = False
-                    rc.max_weight_cache_mb = 6000
+                    # NOT rc.max_weight_cache_mb = 6000 here: that stomped the
+                    # VMODEL_QWEN35_WEIGHT_CACHE_MB-configured value set above
+                    # right before every fast/fast-long request regardless of
+                    # what an operator asked for (2026-07-20, live-confirmed --
+                    # a tool-heavy real request needed a smaller resident
+                    # budget to leave headroom for the expert-fetch reserve,
+                    # and this line silently overrode that knob back to 6000
+                    # every time).
             else:
                 rc.max_weight_cache_mb = 6000
                 if mtype == "kimi_linear":

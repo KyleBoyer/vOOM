@@ -63,12 +63,25 @@ class MemoryPlanner:
         self,
         store: WeightStore,
         budget_mb: int,
-        disk_mb_per_s: float = 300.0,  # measured ~315 MB/s on this machine's USB SSD
+        disk_mb_per_s: float | None = None,  # None -> measure store.dir now
         compute_s_per_layer: float = 0.003,
     ):
         self.store = store
         self.cfg = store.config
         self.budget = budget_mb * 1_000_000
+        if disk_mb_per_s is None:
+            # 2026-07-20: this used to default to a hardcoded 300.0 ("measured
+            # ~315 MB/s on this machine's USB SSD"). That number went stale
+            # the moment storage changed (a real PCIe NVMe now measures
+            # ~3.0 GB/s here) and nothing re-validated it -- it would have
+            # silently made every est_token_s in Plan.summary() ~10x too
+            # pessimistic. Measure the actual current device instead of
+            # trusting any fixed constant.
+            from .disk_bench import measure_sequential_mb_per_s
+
+            disk_mb_per_s = measure_sequential_mb_per_s(store.dir)
+            print(f"[planner] measured disk throughput: "
+                  f"{disk_mb_per_s:.0f} MB/s ({store.dir})", flush=True)
         # Measured on the 16GB M4: Metal working sets beyond ~55% of physical RAM
         # get compressed/paged by macOS ("resident" becomes swap-thrash — layer
         # compute went 2ms -> 1.1s on Qwen2.5-14B q4 at 9.4GB). Clamp unless the

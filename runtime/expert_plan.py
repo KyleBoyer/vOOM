@@ -516,7 +516,13 @@ def main() -> None:
     parser.add_argument("--trace", required=True)
     parser.add_argument("--num-experts", type=int, default=0)
     parser.add_argument("--expert-page-bytes", type=int, default=0)
-    parser.add_argument("--bandwidth-mbps", type=float, default=315.0)
+    parser.add_argument(
+        "--bandwidth-mbps", type=float, default=None,
+        help="disk MB/s to score candidate layouts against; omit to measure "
+             "the trace's own recorded model path for real, right now, "
+             "instead of trusting a fixed number that can go stale the "
+             "moment storage changes",
+    )
     parser.add_argument("--request-overhead-ms", type=float, default=3.0)
     parser.add_argument("--coalesce-gap-pages", type=int, default=0)
     parser.add_argument(
@@ -540,6 +546,17 @@ def main() -> None:
     args = parser.parse_args()
 
     document, sweeps = load_trace(args.trace)
+    if args.bandwidth_mbps is None:
+        model_path = document.get("model", "")
+        if not model_path or not Path(model_path).exists():
+            parser.error(
+                "trace has no resolvable model path to measure disk "
+                "throughput from; pass --bandwidth-mbps explicitly")
+        from .disk_bench import measure_sequential_mb_per_s
+
+        args.bandwidth_mbps = measure_sequential_mb_per_s(Path(model_path))
+        print(f"measured disk throughput: {args.bandwidth_mbps:.0f} MB/s "
+              f"({model_path})", flush=True)
     num_experts = args.num_experts or int(document.get("num_experts", 0))
     if num_experts <= 0:
         num_experts = _infer_num_experts(sweeps)
