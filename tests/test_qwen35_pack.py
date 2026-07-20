@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import shutil
 
 import mlx.core as mx
 import numpy as np
@@ -107,6 +108,47 @@ def test_fused_bf16_experts_split_bit_exact_and_canonicalize(tmp_path):
         "model.layers.0.mlp.experts.0.gate_proj.weight",
         "model.layers.0.mlp.experts.1.down_proj.weight",
     ])
+    np.testing.assert_array_equal(
+        np.array(fetched[
+            "model.layers.0.mlp.experts.0.gate_proj.weight"].astype(mx.float32)),
+        np.array(gate_up[0, :3].astype(mx.float32)),
+    )
+    np.testing.assert_array_equal(
+        np.array(fetched[
+            "model.layers.0.mlp.experts.1.down_proj.weight"].astype(mx.float32)),
+        np.array(down[1].astype(mx.float32)),
+    )
+
+
+def test_vpack2_can_authenticate_hot_tensor_copies_from_fast_tier(
+        tmp_path, monkeypatch):
+    gate_up, down = _fixture(tmp_path)
+    vpack = pack_model(tmp_path, verify_shards=True)
+    build_from_vpack(tmp_path)
+    manifest = json.loads((vpack / "manifest.json").read_text())
+    base = "model.language_model.layers.0.mlp.experts"
+    physical = [
+        f"{base}.0.gate_proj.weight",
+        f"{base}.1.down_proj.weight",
+    ]
+    fast = tmp_path / "fast"
+    fast.mkdir()
+    for name in physical:
+        shutil.copy2(vpack / manifest[name], fast / manifest[name])
+
+    store = WeightStore(
+        tmp_path, fast_dirs=[fast], require_vpack_hashes=True)
+    monkeypatch.setattr(
+        store.vpack2, "fetch",
+        lambda _names: (_ for _ in ()).throw(
+            AssertionError("archive should not serve staged tensors")),
+    )
+    fetched, _seconds, nbytes = store.fetch([
+        "model.layers.0.mlp.experts.0.gate_proj.weight",
+        "model.layers.0.mlp.experts.1.down_proj.weight",
+    ])
+
+    assert nbytes > 0
     np.testing.assert_array_equal(
         np.array(fetched[
             "model.layers.0.mlp.experts.0.gate_proj.weight"].astype(mx.float32)),

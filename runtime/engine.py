@@ -47,6 +47,43 @@ def _resident_adjusted_transient(
         int(start_active), int(end_active)))
 
 
+def _cache_io_snapshot(engine) -> tuple[int, ...]:
+    """Cumulative counters used to derive one request's physical work."""
+    stats = engine.cache.stats
+    governor = getattr(engine, "governor", None)
+    return (
+        int(stats.hits), int(stats.misses), int(stats.evictions),
+        int(stats.bytes_read), int(engine.expert_hits),
+        int(engine.expert_misses),
+        int(getattr(governor, "reservations", 0) or 0),
+        int(getattr(governor, "reservation_failures", 0) or 0),
+        int(getattr(engine.store, "fast_tier_bytes", 0) or 0),
+        int(getattr(engine.store, "archive_bytes", 0) or 0),
+    )
+
+
+def _record_cache_io_delta(
+    engine, before: tuple[int, ...], stats: dict, *,
+    prefix: str = "", after: tuple[int, ...] | None = None,
+) -> None:
+    """Expose cache/I/O evidence without confusing cumulative engine totals."""
+    after = _cache_io_snapshot(engine) if after is None else after
+    keys = (
+        "weight_cache_hits", "weight_cache_misses",
+        "weight_cache_evictions", "weight_store_bytes_read",
+        "expert_cache_hits", "expert_cache_misses",
+        "governor_reservations", "governor_reservation_failures",
+        "weight_fast_tier_bytes", "weight_archive_bytes",
+    )
+    for key, start, end in zip(keys, before, after, strict=True):
+        stats[prefix + key] = max(0, end - start)
+    if not prefix:
+        stats["weight_cache_resident_bytes"] = int(engine.cache.total_bytes)
+        stats["weight_cache_budget_bytes"] = int(engine.cache.max_bytes)
+        stats["layer_transient_bytes"] = int(engine._layer_transient)
+        stats["token_transient_bytes"] = int(engine._token_transient)
+
+
 def _quantization_cache_identity(rc: "RuntimeConfig", store) -> str:
     """Fingerprint physical packing plus any load-time transformation."""
     runtime = (
@@ -2172,6 +2209,7 @@ class StreamingEngine:
         self._max_experts_per_compute_batch = 0
         self._adaptive_expert_batch_clamps = 0
         self._min_adaptive_expert_batch = 0
+        request_cache_before = _cache_io_snapshot(self)
         # F69 proof-carrying execution telemetry: validation harnesses can assert
         # that the feature under test actually ran instead of inferring it from a
         # config flag (a short prompt with chunk_size=4096 is a no-op).
@@ -2395,7 +2433,19 @@ class StreamingEngine:
             return not force_adaptive_paged
 
         def reserve_decode_step(active_kv):
-            if (self._disable_resident_fast_for_request
+            # A whole-token lazy graph exists only for fully resident dense/MoE
+            # execution. Ordinary streamed MoE synchronizes and reserves each
+            # trunk/expert page independently; reserving its historical
+            # *whole-sweep* peak again double-counts sequential cache turnover,
+            # repeatedly evicts useful pages, and still cannot protect any one
+            # allocation more precisely than the per-page reservations do.
+            resident_graph = (
+                self._resident_moe_layers is not None
+                or (self.rc.resident_fast_decode
+                    and not self.cfg.num_experts
+                    and all(self.cache.contains(self._layer_key(layer))
+                            for layer in range(self.cfg.num_hidden_layers))))
+            if (not resident_graph or self._disable_resident_fast_for_request
                     or self.governor is None or not self._token_transient):
                 return
             try:
@@ -3081,6 +3131,7 @@ class StreamingEngine:
         grammar_completed = bool(
             constraint is not None and constraint.completed)
         prompt_endpoint_logits = logits
+        prefill_cache_after = _cache_io_snapshot(self)
         prefill_s = (time.perf_counter() - t0
                      + path_stats["tool_pic_prefill_s"])
         if (kv_store is not None and exact_logits is None
@@ -3485,6 +3536,15 @@ class StreamingEngine:
                 self.governor.request_peak(),
                 mx.get_active_memory(),
             )
+        request_cache_after = _cache_io_snapshot(self)
+        _record_cache_io_delta(
+            self, request_cache_before, path_stats, after=request_cache_after)
+        _record_cache_io_delta(
+            self, request_cache_before, path_stats, prefix="prefill_",
+            after=prefill_cache_after)
+        _record_cache_io_delta(
+            self, prefill_cache_after, path_stats, prefix="decode_",
+            after=request_cache_after)
         result = {
             "text": final_text,
             "tokens": generated,

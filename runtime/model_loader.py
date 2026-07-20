@@ -99,6 +99,9 @@ class WeightStore:
         bytes served from a fast tier leave the slow disk's critical path."""
         self.dir = get_storage_config().resolve(model_dir)
         self.fast_dirs = [Path(d).expanduser() for d in (fast_dirs or [])]
+        self.fast_tier_bytes = 0
+        self.fast_tier_tensors = 0
+        self.archive_bytes = 0
         self.config = ModelConfig.from_dir(self.dir)
         raw_config = json.loads(_read_text_retry(self.dir / "config.json"))
         text_config = raw_config.get("text_config", {})
@@ -125,6 +128,7 @@ class WeightStore:
         # (per-tensor files) over raw safetensors. Both packed forms are bit-exact.
         self.vpack2 = None
         self.vpack = self.dir / "weights.vpack"
+        self._vpack_overlay_manifest: dict[str, str] = {}
         if (self.dir / "weights.vpack2.index.json").exists() or (self.dir / "vpack2.CURRENT").exists():
             import sys
 
@@ -134,6 +138,10 @@ class WeightStore:
             from formats.packed2 import Vpack2Reader
 
             self.vpack2 = Vpack2Reader(self.dir, require_hashes=require_vpack_hashes)
+            overlay_manifest = self.vpack / "manifest.json"
+            if overlay_manifest.exists():
+                self._vpack_overlay_manifest = json.loads(
+                    _read_text_retry(overlay_manifest))
         self.require_vpack_hashes = require_vpack_hashes
         self.packed = self.vpack2 is not None or (self.vpack / "manifest.json").exists()
         if self.vpack2 is not None:
@@ -425,6 +433,76 @@ class WeightStore:
 
     # ---- fetching -----------------------------------------------------
 
+    def _fetch_vpack2_fast_overlay(
+        self, physical_names: list[str],
+    ) -> tuple[dict[str, mx.array], list[str], int]:
+        """Read exact vpack tensor copies from faster disks before the archive.
+
+        A vpack2 archive is ideal for the external drive's sequential floor,
+        while a small internal tier benefits from independently copied hot
+        tensors. The copied `.vt` body is authenticated against vpack2's source
+        hash on the same read that decodes it, so tiering cannot weaken the
+        released-byte correctness contract.
+        """
+        if (not self.fast_dirs or not self._vpack_overlay_manifest
+                or self.vpack2 is None):
+            return {}, list(physical_names), 0
+        selected: list[tuple[str, Path]] = []
+        remaining: list[str] = []
+        for name in physical_names:
+            filename = self._vpack_overlay_manifest.get(name)
+            path = next(
+                (root / filename for root in self.fast_dirs
+                 if filename and (root / filename).is_file()),
+                None,
+            )
+            if path is None:
+                remaining.append(name)
+            else:
+                selected.append((name, path))
+        if not selected:
+            return {}, remaining, 0
+
+        import concurrent.futures as cf
+        import struct
+
+        from formats.packed import to_mx
+        from formats.packed2 import decode_body
+
+        def read_one(item):
+            name, path = item
+            payload = path.read_bytes()
+            if len(payload) < 8:
+                raise IOError(f"truncated fast-tier tensor: {path}")
+            header_len = struct.unpack("<Q", payload[:8])[0]
+            header_end = 8 + header_len
+            if header_end > len(payload):
+                raise IOError(f"truncated fast-tier header: {path}")
+            try:
+                header = json.loads(payload[8:header_end])
+            except (UnicodeDecodeError, json.JSONDecodeError) as error:
+                raise IOError(f"invalid fast-tier header: {path}") from error
+            entry = self.vpack2.index[name]
+            if header != entry["head"]:
+                raise IOError(f"fast-tier tensor metadata mismatch: {name}")
+            body = self.vpack2._checked_body(name, entry, payload[header_end:])
+            if len(body) != int(entry["len"]):
+                raise IOError(f"fast-tier tensor extent mismatch: {name}")
+            return name, header, decode_body(header, body), len(body)
+
+        workers = min(4, len(selected))
+        if workers == 1:
+            decoded = [read_one(selected[0])]
+        else:
+            with cf.ThreadPoolExecutor(max_workers=workers) as pool:
+                decoded = list(pool.map(read_one, selected))
+        output = {
+            name: to_mx(header, raw)
+            for name, header, raw, _length in decoded
+        }
+        mx.eval(list(output.values()))
+        return output, remaining, sum(value[3] for value in decoded)
+
     def fetch(self, names: list[str]) -> tuple[dict[str, mx.array], float, int]:
         """Materialize tensors; return arrays, wall seconds, store-accounted bytes.
 
@@ -449,7 +527,16 @@ class WeightStore:
                         # physical-name index otherwise raises a late KeyError.
                         physical = [self._real_name.get(name, name)
                                     for name in names]
-                        fetched, _, nbytes = self.vpack2.fetch(physical)
+                        fetched, remaining, fast_bytes = (
+                            self._fetch_vpack2_fast_overlay(physical))
+                        nbytes = fast_bytes
+                        self.fast_tier_bytes += fast_bytes
+                        self.fast_tier_tensors += len(fetched)
+                        if remaining:
+                            archive, _, archive_bytes = self.vpack2.fetch(remaining)
+                            fetched.update(archive)
+                            nbytes += archive_bytes
+                            self.archive_bytes += archive_bytes
                         out = {
                             logical: fetched[stored]
                             for logical, stored in zip(names, physical)

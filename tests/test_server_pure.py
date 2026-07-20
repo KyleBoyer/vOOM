@@ -988,8 +988,9 @@ def test_qwen36_profiles_bound_experts_and_use_hybrid_endpoint_cache():
         assert rc.hot_prompt_kv_chunk_size == rc.prefill_chunk_size
         assert rc.expert_fetch_batch == 1
         assert rc.decode_expert_fetch_batch == 8
+        assert rc.fast_dirs[0].endswith("vmodel_fast_tier/fake-qwen36")
     assert lossless.quant_bits == 0
-    assert lossless.max_weight_cache_mb == 5000
+    assert lossless.max_weight_cache_mb == 6000
     assert fast.quant_bits == 4
     assert fast.quant_mode == "mxfp4"
     assert not fast.quant_attention
@@ -2410,6 +2411,47 @@ def test_resident_adjusted_transient_excludes_persistent_cache_growth():
     assert _resident_adjusted_transient(1_000, 2_500, 2_500) == 0
     assert _resident_adjusted_transient(1_000, 2_500, 2_900) == 400
     assert _resident_adjusted_transient(2_500, 1_000, 2_900) == 400
+
+
+def test_cache_io_delta_reports_only_current_request():
+    from types import SimpleNamespace
+
+    from runtime.engine import _cache_io_snapshot, _record_cache_io_delta
+
+    cache_stats = SimpleNamespace(
+        hits=10, misses=20, evictions=3, bytes_read=1_000)
+    engine = SimpleNamespace(
+        cache=SimpleNamespace(
+            stats=cache_stats, total_bytes=400, max_bytes=800),
+        store=SimpleNamespace(fast_tier_bytes=100, archive_bytes=900),
+        governor=SimpleNamespace(reservations=2, reservation_failures=1),
+        expert_hits=4, expert_misses=5,
+        _layer_transient=60, _token_transient=70,
+    )
+    before = _cache_io_snapshot(engine)
+    cache_stats.hits += 2
+    cache_stats.misses += 3
+    cache_stats.evictions += 4
+    cache_stats.bytes_read += 5_000
+    engine.expert_hits += 6
+    engine.expert_misses += 7
+    engine.governor.reservations += 8
+    engine.store.fast_tier_bytes += 9
+    engine.store.archive_bytes += 10
+    stats = {}
+    _record_cache_io_delta(engine, before, stats)
+
+    assert stats["weight_cache_hits"] == 2
+    assert stats["weight_cache_misses"] == 3
+    assert stats["weight_cache_evictions"] == 4
+    assert stats["weight_store_bytes_read"] == 5_000
+    assert stats["expert_cache_hits"] == 6
+    assert stats["expert_cache_misses"] == 7
+    assert stats["governor_reservations"] == 8
+    assert stats["weight_fast_tier_bytes"] == 9
+    assert stats["weight_archive_bytes"] == 10
+    assert stats["weight_cache_resident_bytes"] == 400
+    assert stats["layer_transient_bytes"] == 60
 
 
 def _run_all():

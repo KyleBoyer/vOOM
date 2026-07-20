@@ -823,6 +823,14 @@ class EngineManager:
         self._engine = None
         self._lock = threading.Lock()
 
+    def close(self):
+        """Release the resident engine and flush its durable learned state."""
+        with self._lock:
+            if self._engine is not None:
+                self._engine.close()
+                self._engine = None
+                self._key = None
+
     def get(self, model_dir: Path, mode: str):
         import mlx.core as mx
 
@@ -1038,7 +1046,17 @@ class EngineManager:
                 rc.hot_prompt_kv_persist_dir = os.environ.get(
                     "VMODEL_QWEN35_HOT_KV_PERSIST_DIR",
                     str(ROOT / ".kv_hybrid"))
-                rc.max_weight_cache_mb = 5000
+                try:
+                    rc.max_weight_cache_mb = int(os.environ.get(
+                        "VMODEL_QWEN35_WEIGHT_CACHE_MB", "6000"))
+                except ValueError as error:
+                    raise ValueError(
+                        "VMODEL_QWEN35_WEIGHT_CACHE_MB must be an integer") from error
+                if not 1500 <= rc.max_weight_cache_mb <= 7000:
+                    raise ValueError(
+                        "VMODEL_QWEN35_WEIGHT_CACHE_MB must be in [1500, 7000]")
+                rc.fast_dirs = (str(
+                    Path.home() / "vmodel_fast_tier" / model_dir.name),)
                 rc.prefill_chunk_size = 512
                 rc.hot_prompt_kv_chunk_size = rc.prefill_chunk_size
                 rc.expert_fetch_batch = 1
@@ -3846,6 +3864,27 @@ def _log_path_stats(result: dict, prompt_tokens: int) -> None:
             f"{admission_bytes / 1e9:.2f}GB resident KV",
             flush=True,
         )
+    cache_hits = int(stats.get("expert_cache_hits", 0) or 0)
+    cache_misses = int(stats.get("expert_cache_misses", 0) or 0)
+    if cache_hits or cache_misses:
+        total = cache_hits + cache_misses
+        print(
+            f"[server] expert-I/O: {cache_hits}/{total} resident hits "
+            f"({100.0 * cache_hits / total:.0f}%), "
+            f"store={int(stats.get('weight_store_bytes_read', 0) or 0) / 1e9:.2f}GB "
+            f"(prefill={int(stats.get('prefill_weight_store_bytes_read', 0) or 0) / 1e9:.2f}, "
+            f"decode={int(stats.get('decode_weight_store_bytes_read', 0) or 0) / 1e9:.2f}; "
+            f"fast-tier={int(stats.get('weight_fast_tier_bytes', 0) or 0) / 1e9:.2f}), "
+            f"evictions={int(stats.get('weight_cache_evictions', 0) or 0)}, "
+            f"resident={int(stats.get('weight_cache_resident_bytes', 0) or 0) / 1e9:.2f}/"
+            f"{int(stats.get('weight_cache_budget_bytes', 0) or 0) / 1e9:.2f}GB, "
+            f"transient(layer/token)="
+            f"{int(stats.get('layer_transient_bytes', 0) or 0) / 1e9:.2f}/"
+            f"{int(stats.get('token_transient_bytes', 0) or 0) / 1e9:.2f}GB, "
+            f"governor_reservations="
+            f"{int(stats.get('governor_reservations', 0) or 0)}",
+            flush=True,
+        )
 
 
 def _vision_protocol_timing(result: dict) -> dict:
@@ -5743,7 +5782,13 @@ def main():
     ap.add_argument("--port", type=int, default=8077)
     args = ap.parse_args()
     print(f"[server] vOOM endpoint on http://127.0.0.1:{args.port}  models: {list(_registry())}", flush=True)
-    ThreadingHTTPServer(("127.0.0.1", args.port), Handler).serve_forever()
+    server = ThreadingHTTPServer(("127.0.0.1", args.port), Handler)
+    try:
+        server.serve_forever()
+    finally:
+        server.server_close()
+        with INFER_LOCK:
+            MANAGER.close()
 
 
 if __name__ == "__main__":

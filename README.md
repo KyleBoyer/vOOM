@@ -228,6 +228,15 @@ curl -s -X POST http://127.0.0.1:8077/v1/responses \
   -d '{"model":"Qwen3.6-35B-A3B","input":"Reply with READY.","reasoning":{"effort":"none"},"max_output_tokens":8}'
 ```
 
+After representative requests have produced `expert_transitions.json`, stage
+the hottest exact expert pages on the bounded internal fast tier. The primary
+vpack2 archive remains complete and authoritative; staged bodies are verified
+against its hashes on every cache miss:
+
+```bash
+.venv/bin/python -m formats.fast_tier models/Qwen3.6-35B-A3B
+```
+
 For a fully resident OLMoE side-quest artifact, convert beside the source
 checkpoint (one source shard is processed at a time, and interrupted runs
 resume at a committed shard boundary):
