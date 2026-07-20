@@ -186,6 +186,23 @@ def test_compact_json_accepts_standard_indent_argument_but_stays_canonical():
     assert rendered == '{"a":2,"z":1}'
 
 
+def test_raise_exception_global_surfaces_as_request_validation_error():
+    """Real chat templates (Qwen's included) call raise_exception(msg) to
+    reject malformed conversations. Without a registered global, Jinja
+    raised its own opaque UndefinedError instead of the template's actual
+    message, which crashed as an unhandled 500 (2026-07-20,
+    live-confirmed against a real Codex/Kai request with two leading
+    system messages). It must surface as a clean, catchable
+    RequestValidationError with the template's own message."""
+    import pytest
+
+    template = "{{ raise_exception('boom') }}"
+    with pytest.raises(RequestValidationError, match="boom"):
+        _render_template(template)
+    with pytest.raises(RequestValidationError, match="boom"):
+        _render_template(template, compact_json=True)
+
+
 def test_template_compilation_is_cached_by_text_and_render_profile():
     _compiled_template.cache_clear()
     template = "{{ value | tojson }}"

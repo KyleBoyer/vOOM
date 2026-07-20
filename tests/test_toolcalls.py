@@ -12,7 +12,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from runtime.toolcalls import (anthropic_messages_to_canonical,
                                canonical_tool_indices, canonicalize_tool_history,
                                compact_tool_schema, expand_image_pad_tokens,
-                               load_image, normalize_messages, parse_tool_calls, pinned_tool_indices,
+                               load_image, merge_leading_system_messages,
+                               normalize_messages, parse_tool_calls, pinned_tool_indices,
                                rank_tool_indices, responses_input_to_messages, tools_preamble)
 
 
@@ -351,6 +352,49 @@ def test_responses_mixed_text_and_calls_rehydrate_as_one_assistant_turn():
     assert assistant["tool_calls"][0]["function"]["name"] == "weather"
     assert tool == {"role": "tool", "tool_call_id": "call_weather",
                     "content": "Sunny"}
+
+
+def test_merge_leading_system_messages_collapses_two_in_band_system_turns():
+    """Live-confirmed shape from a real Codex/Kai client: no top-level
+    `instructions`, but two separate role="system" items inside `input` --
+    a main system prompt and a distinct working-memory instruction. Every
+    Qwen chat template rejects a non-leading system message, so these must
+    collapse into exactly one before rendering."""
+    canonical = responses_input_to_messages([
+        {"role": "system", "content": "You are Kai."},
+        {"role": "system", "content": "WORKING_MEMORY_SYSTEM_INSTRUCTION: ..."},
+        {"role": "user", "content": "hi"},
+    ])
+    msgs, _ = normalize_messages(canonical)
+    merged = merge_leading_system_messages(msgs)
+    assert [m["role"] for m in merged] == ["system", "user"]
+    assert merged[0]["content"] == (
+        "You are Kai.\n\nWORKING_MEMORY_SYSTEM_INSTRUCTION: ...")
+
+
+def test_merge_leading_system_messages_merges_instructions_with_in_band_system():
+    """The other real shape: top-level `instructions` PLUS an explicit
+    system item in `input` -- also must not yield two leading system
+    messages."""
+    canonical = responses_input_to_messages(
+        [{"role": "system", "content": "Be extra concise."},
+         {"role": "user", "content": "hi"}],
+        instructions="You are a helpful assistant.")
+    msgs, _ = normalize_messages(canonical)
+    merged = merge_leading_system_messages(msgs)
+    assert [m["role"] for m in merged] == ["system", "user"]
+    assert merged[0]["content"] == (
+        "You are a helpful assistant.\n\nBe extra concise.")
+
+
+def test_merge_leading_system_messages_is_noop_for_single_system_message():
+    msgs = [{"role": "system", "content": "hi"}, {"role": "user", "content": "hey"}]
+    assert merge_leading_system_messages(msgs) == msgs
+
+
+def test_merge_leading_system_messages_is_noop_without_leading_system():
+    msgs = [{"role": "user", "content": "hey"}]
+    assert merge_leading_system_messages(msgs) == msgs
 
 
 def test_parallel_tool_results_follow_declared_call_order():

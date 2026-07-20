@@ -646,6 +646,41 @@ def responses_input_to_messages(input_val, instructions: str | None = None) -> l
     return msgs
 
 
+def merge_leading_system_messages(messages: list[dict]) -> list[dict]:
+    """Collapse a leading run of role="system" messages into one.
+
+    Real chat templates (Qwen's included) hard-reject any system message
+    that isn't first in the conversation
+    (`raise_exception('System message must be at the beginning.')`), but
+    real clients routinely produce more than one leading system turn:
+    a Responses API caller combining top-level `instructions` with an
+    explicit system item in `input`, or an agent harness appending a
+    second system turn for separate instructions (2026-07-20,
+    live-confirmed with a real Codex/Kai request -- two leading system
+    items, a main system prompt and a distinct "WORKING_MEMORY_SYSTEM_
+    INSTRUCTION" turn, no top-level `instructions` involved at all).
+    Applied once, uniformly, after building canonical messages for any
+    of the three protocols, rather than special-cased per producer."""
+    if not messages or messages[0].get("role") != "system":
+        return messages
+    end = 1
+    while end < len(messages) and messages[end].get("role") == "system":
+        end += 1
+    if end == 1:
+        return messages
+    merged_content = None
+    for message in messages[:end]:
+        content = message.get("content")
+        parts = content if isinstance(content, list) else (
+            [{"type": "text", "text": content}] if content else [])
+        merged_content = parts if merged_content is None else merged_content + parts
+    if merged_content and all(
+            isinstance(part, dict) and part.get("type") == "text"
+            for part in merged_content):
+        merged_content = "\n\n".join(part["text"] for part in merged_content)
+    return [{**messages[0], "content": merged_content}] + messages[end:]
+
+
 def anthropic_messages_to_canonical(messages: list[dict], system=None) -> list[dict]:
     """Anthropic Messages API `messages` (each message's `content` may be a
     plain string OR a list mixing text/image/tool_use/tool_result blocks) ->

@@ -2128,15 +2128,31 @@ def _compiled_template(template_text: str, compact_json: bool):
     # enabled -- without it, Environment/Template can't even PARSE the
     # template (not just fail to render it). Harmless for every other
     # checkpoint's template, which simply doesn't use the tag.
+    # Real chat templates (Qwen's included) call a `raise_exception(msg)`
+    # global to reject malformed conversations (e.g. a non-leading system
+    # message) -- this is the same global name HF's own
+    # `apply_chat_template` injects. Leaving it undefined doesn't skip
+    # those checks; Jinja still evaluates the call and raises its own
+    # opaque `UndefinedError: 'raise_exception' is undefined`, which hid
+    # the template's actual, informative message behind a 500 traceback
+    # (2026-07-20, live-confirmed). Routing it through
+    # RequestValidationError surfaces the template's real message as a
+    # clean 400 instead.
+    def _raise_exception(msg):
+        raise RequestValidationError(str(msg))
+
     if not compact_json:
         from jinja2 import Template
 
-        return Template(template_text, extensions=["jinja2.ext.loopcontrols"])
+        tmpl = Template(template_text, extensions=["jinja2.ext.loopcontrols"])
+        tmpl.globals["raise_exception"] = _raise_exception
+        return tmpl
 
     from jinja2 import Environment
     from jinja2.utils import htmlsafe_json_dumps
 
     env = Environment(autoescape=False, extensions=["jinja2.ext.loopcontrols"])
+    env.globals["raise_exception"] = _raise_exception
     # Preserve Jinja's tojson escaping contract while changing only key order
     # and insignificant JSON whitespace. Raw json.dumps would allow strings
     # such as ``</tools>`` to escape a template's tool delimiter.
@@ -4164,6 +4180,7 @@ class Handler(BaseHTTPRequestHandler):
         """Validate nested protocol items and fetch images outside INFER_LOCK."""
         from .toolcalls import (anthropic_messages_to_canonical,
                                 canonicalize_tool_history,
+                                merge_leading_system_messages,
                                 normalize_messages,
                                 responses_input_to_messages)
 
@@ -4182,6 +4199,7 @@ class Handler(BaseHTTPRequestHandler):
                 messages, image_sources = normalize_messages(messages)
             else:
                 messages, image_sources = [], []
+            messages = merge_leading_system_messages(messages)
             messages = canonicalize_tool_history(messages)
         except ValueError as error:
             raise RequestValidationError(str(error)) from error
