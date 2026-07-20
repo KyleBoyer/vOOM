@@ -1,8 +1,9 @@
 """Bounded hot-expert staging for a second, faster local disk.
 
 The primary vpack2 archive remains authoritative and complete.  This module
-copies whole, lossless `.vt` expert pages from its sibling vpack store into a
-small cache directory, ranked by the model's learned routing heat.  WeightStore
+copies whole, lossless `.vt` expert pages from its sibling vpack store, or
+reconstructs them from the verified vpack2 archive after intermediate cleanup,
+into a small cache directory ranked by learned routing heat. WeightStore
 authenticates each staged body against the vpack2 index before using it.
 """
 
@@ -13,6 +14,7 @@ import json
 import os
 import re
 import shutil
+import struct
 import tempfile
 import time
 from collections import defaultdict
@@ -36,16 +38,30 @@ def _routing_heat(path: Path) -> dict[tuple[int, int], int]:
 
 
 def _expert_files(manifest: dict[str, str]) -> dict[tuple[int, int], list[str]]:
-    groups: dict[tuple[int, int], list[str]] = defaultdict(list)
+    groups: dict[tuple[int, int], list[tuple[str, str]]] = defaultdict(list)
     for name, filename in manifest.items():
         match = _EXPERT.match(name)
         if match is not None:
-            groups[(int(match.group(1)), int(match.group(2)))].append(filename)
-    return {
-        key: sorted(files)
-        for key, files in groups.items()
-        if len(files) == 3
-    }
+            groups[(int(match.group(1)), int(match.group(2)))].append(
+                (name, filename))
+
+    complete = {}
+    projections = ("gate_proj", "up_proj", "down_proj")
+    for key, entries in groups.items():
+        names = {name for name, _filename in entries}
+        if not all(any(name.endswith(f".{projection}.weight")
+                       for name in names) for projection in projections):
+            continue
+        # Standard MLX checkpoints add a scales tensor (and sometimes biases)
+        # beside every quantized projection. A hot expert must be atomic: never
+        # stage only its packed weight and force the sidecars back to USB.
+        quantized = any(name.endswith(".scales") for name in names)
+        if quantized and not all(any(name.endswith(f".{projection}.scales")
+                                     for name in names)
+                                 for projection in projections):
+            continue
+        complete[key] = sorted(filename for _name, filename in entries)
+    return complete
 
 
 def _atomic_copy(source: Path, destination: Path) -> None:
@@ -56,6 +72,26 @@ def _atomic_copy(source: Path, destination: Path) -> None:
     try:
         with handle, source.open("rb") as incoming:
             shutil.copyfileobj(incoming, handle, length=8 * 1024 * 1024)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, destination)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _atomic_extract(reader, name: str, destination: Path) -> None:
+    """Recreate one ordinary vpack file from an authenticated vpack2 body."""
+    header, body = reader.read_body(name)
+    encoded = json.dumps(header).encode()
+    handle = tempfile.NamedTemporaryFile(
+        dir=destination.parent, prefix=destination.name + ".",
+        suffix=".tmp", delete=False)
+    temporary = Path(handle.name)
+    try:
+        with handle:
+            handle.write(struct.pack("<Q", len(encoded)))
+            handle.write(encoded)
+            handle.write(body)
             handle.flush()
             os.fsync(handle.fileno())
         os.replace(temporary, destination)
@@ -91,8 +127,28 @@ def stage_hot_experts(
     if not heat_path.exists():
         raise FileNotFoundError("expert routing heat is not available yet")
     manifest = json.loads(manifest_path.read_text())
+    names_by_file = {filename: name for name, filename in manifest.items()}
     groups = _expert_files(manifest)
     heat = _routing_heat(heat_path)
+    archive_reader = None
+
+    def archived_reader():
+        nonlocal archive_reader
+        if archive_reader is None:
+            from .packed2 import Vpack2Reader
+
+            archive_reader = Vpack2Reader(model_dir, require_hashes=True)
+        return archive_reader
+
+    def staged_size(filename: str) -> int:
+        source = vpack / filename
+        if source.is_file():
+            return source.stat().st_size
+        name = names_by_file[filename]
+        entry = archived_reader().index[name]
+        encoded = json.dumps(entry["head"]).encode()
+        return 8 + len(encoded) + int(entry["len"])
+
     ranked = sorted(
         groups, key=lambda key: (-heat.get(key, 0), key[0], key[1]))
 
@@ -105,7 +161,7 @@ def stage_hot_experts(
         if heat.get(key, 0) <= 0:
             continue
         files = groups[key]
-        page_bytes = sum((vpack / filename).stat().st_size for filename in files)
+        page_bytes = sum(staged_size(filename) for filename in files)
         if desired_bytes + page_bytes > budget_bytes:
             continue
         desired.update(files)
@@ -127,7 +183,7 @@ def stage_hot_experts(
         for path in target.glob("*.vt") if path.name in desired
     }
     missing_bytes = sum(
-        (vpack / filename).stat().st_size
+        staged_size(filename)
         for filename in desired if filename not in existing_desired)
     current_files = [
         path for path in fast_root.rglob("*.vt") if path.is_file()
@@ -155,10 +211,15 @@ def stage_hot_experts(
     for filename in sorted(desired):
         destination = target / filename
         source = vpack / filename
-        if destination.exists() and destination.stat().st_size == source.stat().st_size:
+        expected_size = staged_size(filename)
+        if destination.exists() and destination.stat().st_size == expected_size:
             os.utime(destination, None)
             continue
-        _atomic_copy(source, destination)
+        if source.is_file():
+            _atomic_copy(source, destination)
+        else:
+            _atomic_extract(
+                archived_reader(), names_by_file[filename], destination)
         copied_files += 1
         copied_bytes += destination.stat().st_size
 

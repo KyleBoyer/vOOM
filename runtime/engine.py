@@ -2364,8 +2364,7 @@ class StreamingEngine:
         recurrent_exact_only = self.cfg.model_type in (
             "kimi_linear", "qwen3_5_moe")
         hot_eligible = (self.rc.hot_prompt_kv and not self.rc.max_kv_mb
-                        and not force_adaptive_paged
-                        and not self.rc.tool_pic_shared_pages)
+                        and not force_adaptive_paged)
         resident_prompt_kv_bytes = self._project_dense_text_kv_bytes(len(tokens))
         configured_paged_mb = int(self.rc.max_kv_mb or 0)
         initial_paged_mb = (

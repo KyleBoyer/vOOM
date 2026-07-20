@@ -185,10 +185,18 @@ def _compiler(engine):
 
 
 def _required_tool_grammar(schema: dict, allow_parallel: bool):
-    """Wrap a JSON-schema grammar in required Hermes tool-call markers."""
+    """Wrap canonical JSON in deterministic Hermes tool-call markers.
+
+    The previous grammar allowed arbitrary whitespace before/inside/after a
+    call.  Its parsed API object was canonical, but the retained KV represented
+    the model's arbitrary original spacing, so the next request's structured
+    history often diverged.  XGrammar's no-whitespace profile is actually its
+    canonical JSON profile (`, ` and `: ` separators); make the wrapper exact
+    as well so a structured round trip is token-identical.
+    """
     xgr = _xgrammar()
     grammar = str(xgr.Grammar.from_json_schema(
-        schema, any_whitespace=True, strict_mode=True))
+        schema, any_whitespace=False, strict_mode=True))
     replaced, count = re.subn(
         r"^root ::= (.+)$", r"tool_json ::= \1", grammar,
         count=1, flags=re.MULTILINE)
@@ -196,13 +204,11 @@ def _required_tool_grammar(schema: dict, allow_parallel: bool):
         raise StructuredDecodingUnavailable(
             "XGrammar JSON schema did not expose a root rule")
     suffix = (
-        '\ntool_call ::= (("<tool_call>" [ \\n\\t]* tool_json '
-        '[ \\n\\t]* "</tool_call>"))\n'
+        '\ntool_call ::= (("<tool_call>" tool_json "</tool_call>"))\n'
     )
     if allow_parallel:
         suffix += (
-            "tool_calls ::= ((tool_call) | "
-            "(tool_call [ \\n\\t]* tool_calls))\n"
+            "tool_calls ::= ((tool_call) | (tool_call tool_calls))\n"
             "root ::= ((tool_calls))\n"
         )
     else:

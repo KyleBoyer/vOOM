@@ -213,31 +213,30 @@ class WeightStore:
         # fetched together to reconstruct a QTensor.
         self._quant_aux: dict[str, _QuantAux] = {}
         quant_aux_names: set[str] = set()
-        if not self.packed:
-            global_params = _quant_params(self.quantization)
-            for name in list(self.weight_map):
-                if not name.endswith(".weight"):
-                    continue
-                stem = name[:-len(".weight")]
-                scales = f"{stem}.scales"
-                biases = f"{stem}.biases"
-                if scales in self.weight_map:
-                    real_stem = self._real_name.get(name, name)[:-len(".weight")]
-                    configured = self.quantization.get(
-                        stem, self.quantization.get(real_stem, None))
-                    params = _quant_params(configured) or global_params
-                    if params is None:
-                        raise ValueError(
-                            f"standard MLX quantized tensor {name!r} has scales but "
-                            "no usable bits/group_size descriptor in config.json"
-                        )
-                    bits, group_size, mode = params
-                    bias_name = biases if biases in self.weight_map else None
-                    self._quant_aux[name] = _QuantAux(
-                        scales, bias_name, bits, group_size, mode)
-                    quant_aux_names.add(scales)
-                    if bias_name is not None:
-                        quant_aux_names.add(bias_name)
+        global_params = _quant_params(self.quantization)
+        for name in list(self.weight_map):
+            if not name.endswith(".weight"):
+                continue
+            stem = name[:-len(".weight")]
+            scales = f"{stem}.scales"
+            biases = f"{stem}.biases"
+            if scales in self.weight_map:
+                real_stem = self._real_name.get(name, name)[:-len(".weight")]
+                configured = self.quantization.get(
+                    stem, self.quantization.get(real_stem, None))
+                params = _quant_params(configured) or global_params
+                if params is None:
+                    raise ValueError(
+                        f"standard MLX quantized tensor {name!r} has scales but "
+                        "no usable bits/group_size descriptor in config.json"
+                    )
+                bits, group_size, mode = params
+                bias_name = biases if biases in self.weight_map else None
+                self._quant_aux[name] = _QuantAux(
+                    scales, bias_name, bits, group_size, mode)
+                quant_aux_names.add(scales)
+                if bias_name is not None:
+                    quant_aux_names.add(bias_name)
 
         # F93: vllm-project/compressed-tensors "pack-quantized" INT4 --
         # confirmed on Kimi K2.5's real checkpoint, MoE expert weights only
@@ -260,17 +259,6 @@ class WeightStore:
                 quant_aux_names.add(name)
                 quant_aux_names.add(scale)
                 quant_aux_names.add(shape)
-
-        packed_triplets = any(
-            name.endswith(".weight")
-            and f"{name[:-len('.weight')]}.scales" in self.weight_map
-            for name in self.weight_map
-        )
-        if self.packed and packed_triplets:
-            raise NotImplementedError(
-                "packing standard MLX weight/scales/biases triplets is not yet "
-                "supported; use the original safetensors checkpoint"
-            )
 
         self.on_disk_quantized = bool(self._quant_aux)
         if self.on_disk_quantized:
@@ -390,11 +378,22 @@ class WeightStore:
                 expert = int(suffix.split(".", 1)[0])
             except ValueError:
                 continue
-            physical_name = self._real_name.get(logical_name, logical_name)
-            entry = self.vpack2.index.get(physical_name)
-            if entry is None:
-                continue
-            page_bytes[(layer_prefix, expert)] += int(entry["len"])
+            aux = getattr(self, "_quant_aux", {}).get(logical_name)
+            physical_names = (
+                (logical_name, aux.scales, aux.biases)
+                if aux is not None else (logical_name,))
+            found = False
+            for physical in physical_names:
+                if physical is None:
+                    continue
+                stored = self._real_name.get(physical, physical)
+                entry = self.vpack2.index.get(stored)
+                if entry is None:
+                    continue
+                page_bytes[(layer_prefix, expert)] += int(entry["len"])
+                found = True
+            if not found:
+                page_bytes.pop((layer_prefix, expert), None)
         if not page_bytes:
             return fallback
         return round(sum(page_bytes.values()) / len(page_bytes))
@@ -518,6 +517,18 @@ class WeightStore:
             t0 = time.perf_counter()
             for attempt in range(4):
                 try:
+                    physical_names: list[str] = []
+                    seen: set[str] = set()
+                    for name in names:
+                        aux = self._quant_aux.get(name)
+                        expanded = (
+                            (name, aux.scales, aux.biases)
+                            if aux is not None else (name,))
+                        for physical_name in expanded:
+                            if (physical_name is not None
+                                    and physical_name not in seen):
+                                physical_names.append(physical_name)
+                                seen.add(physical_name)
                     if self.vpack2 is not None:
                         # The archive index retains released physical names,
                         # while multimodal wrappers are exposed to the engine
@@ -526,7 +537,7 @@ class WeightStore:
                         # canonical Qwen3-VL/Qwen3.6/K2.5 names directly into a
                         # physical-name index otherwise raises a late KeyError.
                         physical = [self._real_name.get(name, name)
-                                    for name in names]
+                                    for name in physical_names]
                         fetched, remaining, fast_bytes = (
                             self._fetch_vpack2_fast_overlay(physical))
                         nbytes = fast_bytes
@@ -539,10 +550,26 @@ class WeightStore:
                             self.archive_bytes += archive_bytes
                         out = {
                             logical: fetched[stored]
-                            for logical, stored in zip(names, physical)
+                            for logical, stored in zip(physical_names, physical)
                         }
                     else:
-                        out, _, nbytes = self._fetch_packed(names)
+                        out, _, nbytes = self._fetch_packed(physical_names)
+                    if self._quant_aux:
+                        from .quant import QTensor
+
+                        logical = {}
+                        for name in names:
+                            aux = self._quant_aux.get(name)
+                            if aux is None:
+                                logical[name] = out[name]
+                                continue
+                            logical[name] = QTensor(
+                                out[name], out[aux.scales],
+                                (out[aux.biases]
+                                 if aux.biases is not None else None),
+                                aux.bits, aux.group_size, aux.mode,
+                            )
+                        out = logical
                     return out, time.perf_counter() - t0, nbytes
                 except (OSError, RuntimeError, EOFError):
                     mx.clear_cache()

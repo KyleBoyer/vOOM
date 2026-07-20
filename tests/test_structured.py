@@ -8,7 +8,8 @@ import mlx.core as mx
 import pytest
 
 from runtime.structured import (GrammarConstraint, JSONSchemaValidationError,
-                                effective_tool_schema, tool_call_json_schema,
+                                _required_tool_grammar, effective_tool_schema,
+                                tool_call_json_schema,
                                 validate_json_schema)
 
 
@@ -43,6 +44,18 @@ def test_tool_call_union_binds_name_to_its_own_argument_schema():
     with pytest.raises(JSONSchemaValidationError):
         validate_json_schema(
             {"name": "weather", "arguments": {"tz": "UTC"}}, schema)
+
+
+def test_required_tool_grammar_has_canonical_json_and_exact_markers():
+    grammar = str(_required_tool_grammar(
+        tool_call_json_schema([WEATHER]), allow_parallel=True))
+    tool_rule = next(
+        line for line in grammar.splitlines() if line.startswith("tool_call ::="))
+    calls_rule = next(
+        line for line in grammar.splitlines() if line.startswith("tool_calls ::="))
+    assert '[ \\n\\t]*' not in tool_rule
+    assert '"<tool_call>" tool_json "</tool_call>"' in tool_rule
+    assert '[ \\n\\t]*' not in calls_rule
 
 
 def test_effective_tool_schema_honors_x_optional_without_mutating_wire_schema():

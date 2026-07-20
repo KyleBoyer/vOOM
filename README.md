@@ -213,7 +213,8 @@ partial, interleaved 3D M-RoPE text path. Repeated identical image prompts reuse
 the exact prompt endpoint, skipping both the vision tower and language prefill;
 same-media text continuations reuse the image endpoint and prefill only the new
 text. The checkpoint's MTP layer is preserved in the packed store but is not
-yet used for speculative decoding.
+yet used for speculative decoding: rejecting a draft would require exact
+rollback of the recurrent DeltaNet state, not just trimming attention KV.
 
 Hot conversation retention carries both DeltaNet convolution/matrix state and
 attention KV. Only exact endpoints and strict extensions are eligible because a
@@ -234,8 +235,47 @@ vpack2 archive remains complete and authoritative; staged bodies are verified
 against its hashes on every cache miss:
 
 ```bash
-.venv/bin/python -m formats.fast_tier models/Qwen3.6-35B-A3B
+.venv/bin/python -m formats.fast_tier \
+  models/Qwen3.6-35B-A3B-mlx-expert-mxfp4
 ```
+
+Once vpack2 has passed full verification, the per-tensor `.vt` intermediates
+may be removed while retaining `weights.vpack/manifest.json`. The same staging
+command reconstructs any missing hot pages directly from authenticated vpack2
+bodies, so reclaiming the intermediate space does not make the fast tier
+one-shot.
+
+The `lossy-Qwen3.6-35B-A3B` side-quest profile automatically selects that
+adjacent expert-only MLX MXFP4 artifact when it is complete. The vision tower,
+embedding, attention/DeltaNet trunk, routers, shared experts, normalization,
+and output head remain in their converted checkpoint dtypes; only routed expert
+matrices are MXFP4. Standard MLX weight/scale triplets work from raw
+safetensors, vpack, and verified vpack2, including atomic fast-tier pages that
+stage each expert's weights and scales together. To reproduce the derived
+checkpoint and its packed archive:
+
+```bash
+.venv/bin/python -m formats.quantize_mlx \
+  models/Qwen3.6-35B-A3B \
+  models/Qwen3.6-35B-A3B-mlx-expert-mxfp4 \
+  --profile experts --mode mxfp4 --bits 4 --group-size 32
+
+.venv/bin/python - <<'PY'
+from pathlib import Path
+from formats.packed import pack_model
+from formats.packed2 import build_from_vpack, heat_rank_from_transitions
+
+model = Path("models/Qwen3.6-35B-A3B-mlx-expert-mxfp4")
+pack_model(model, verify_shards=True)
+rank = heat_rank_from_transitions(model / "expert_transitions.json")
+build_from_vpack(model, expert_rank=rank)
+PY
+```
+
+Fast mode also uses one canonical Hermes representation for both constrained
+tool-call generation and the following rendered history. That makes the real
+call an exact prefix of its tool-result continuation; the lossless profile keeps
+the checkpoint's released tool template unchanged.
 
 For a fully resident OLMoE side-quest artifact, convert beside the source
 checkpoint (one source shard is processed at a time, and interrupted runs

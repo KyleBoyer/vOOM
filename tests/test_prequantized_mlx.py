@@ -14,6 +14,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from runtime import layer_runner, quant
 from runtime.engine import RuntimeConfig, _quantization_cache_identity
 from runtime.model_loader import WeightStore
+from formats.packed import pack_model
+from formats.packed2 import build_from_vpack
 
 
 def _config() -> dict:
@@ -63,6 +65,43 @@ def test_standard_mlx_triplets_become_logical_qtensors(tmp_path):
         wq, scales=scales, biases=biases, group_size=64, bits=4)[token_ids]
     mx.eval(selected, expected)
     assert mx.allclose(selected, expected)
+
+
+def test_vpack2_standard_mlx_triplets_become_logical_qtensors(tmp_path):
+    original = mx.arange(8 * 64, dtype=mx.float32).reshape(8, 64) / 100
+    weight, scales = mx.quantize(
+        original, group_size=32, bits=4, mode="mxfp4")
+    mx.save_safetensors(str(tmp_path / "model.safetensors"), {
+        "model.embed_tokens.weight": weight,
+        "model.embed_tokens.scales": scales,
+        "model.norm.weight": mx.ones((64,), dtype=mx.float32),
+    })
+    config = _config()
+    config["quantization"] = {
+        "group_size": 32, "bits": 4, "mode": "mxfp4"}
+    (tmp_path / "config.json").write_text(json.dumps(config))
+    pack_model(tmp_path, verify_shards=True)
+    build_from_vpack(tmp_path)
+
+    store = WeightStore(tmp_path, require_vpack_hashes=True)
+    tensors, _seconds, nbytes = store.fetch([
+        "model.embed_tokens.weight", "model.norm.weight"])
+    embedded = tensors["model.embed_tokens.weight"]
+    expected_bytes = (
+        store.vpack2.index["model.embed_tokens.weight"]["len"]
+        + store.vpack2.index["model.embed_tokens.scales"]["len"]
+        + store.vpack2.index["model.norm.weight"]["len"])
+
+    assert store.on_disk_quantized
+    assert isinstance(embedded, quant.QTensor)
+    assert embedded.mode == "mxfp4"
+    assert nbytes == expected_bytes
+    selected = layer_runner.embed(mx.array([1, 6]), embedded)[0]
+    expected = mx.dequantize(
+        weight, scales=scales, group_size=32, bits=4,
+        mode="mxfp4")[mx.array([1, 6])]
+    mx.eval(selected, expected)
+    assert mx.array_equal(selected, expected)
 
 
 def test_quant_policy_does_not_requantize_a_disk_qtensor():

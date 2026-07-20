@@ -333,6 +333,22 @@ class Vpack2Reader:
     def has(self, name: str) -> bool:
         return name in self.index
 
+    def read_body(self, name: str) -> tuple[dict, bytes]:
+        """Return one authenticated compressed body without decoding it.
+
+        Fast-tier staging needs the original vpack payload, including its
+        compressed representation, rather than an MLX tensor.  Keeping this on
+        the reader centralizes immutable-archive and per-body hash checks.
+        """
+        self._assert_archive_immutable()
+        entry = self.index[name]
+        fd = os.open(self.archive, os.O_RDONLY)
+        try:
+            body = _pread_exact(fd, int(entry["len"]), int(entry["off"]))
+        finally:
+            os.close(fd)
+        return entry["head"], self._checked_body(name, entry, body)
+
     def fetch(self, names: list[str], parallel: int = 4) -> tuple[dict, float, int]:
         """Coalesce requested tensors into sequential runs; runs are read+decoded on
         a small thread pool (scattered expert reads benefit from queue depth, and

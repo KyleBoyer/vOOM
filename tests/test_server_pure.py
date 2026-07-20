@@ -235,6 +235,34 @@ def test_native_template_history_renders_tool_arguments_as_object_not_string():
     assert compact == '{"city":"Chicago"}'
 
 
+def test_fast_qwen35_tool_history_uses_one_canonical_hermes_prefix(tmp_path):
+    (tmp_path / "chat_template.jinja").write_text(
+        "{% for message in messages %}"
+        "{{ message.role }}={{ message.content or '' }}|"
+        "{% for call in message.tool_calls or [] %}NATIVE={{ call.function.name }}{% endfor %}"
+        "{% endfor %}{% if add_generation_prompt %}assistant={% endif %}")
+    engine = _fake_engine(model_type="qwen3_5_moe")
+    tool = _named_tool("get_weather")
+    first_messages = [{"role": "user", "content": "Weather?"}]
+    call = {"role": "assistant", "content": None, "tool_calls": [{
+        "id": "call_weather", "type": "function", "function": {
+            "name": "get_weather", "arguments": '{"value":"Chicago"}'}}]}
+    result = {"role": "tool", "tool_call_id": "call_weather",
+              "content": '{"temperature":72}'}
+
+    first, *_ = _prepare_chat_prompt(
+        engine, tmp_path, first_messages, "low", [tool], [tool], "fast", 8)
+    followup, *_ = _prepare_chat_prompt(
+        engine, tmp_path, [*first_messages, call, result], "low",
+        [tool], [tool], "fast", 8)
+    canonical_call = (
+        '<tool_call>{"name": "get_weather", '
+        '"arguments": {"value": "Chicago"}}</tool_call>')
+
+    assert "NATIVE=" not in followup
+    assert followup.startswith(str(first) + canonical_call)
+
+
 def test_standalone_jinja_template_receives_reasoning_and_thinking_controls():
     template = (
         "{{ reasoning_effort }}|"

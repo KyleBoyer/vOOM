@@ -2197,6 +2197,48 @@ def _messages_for_native_template(messages: list[dict]) -> list[dict]:
     return normalized
 
 
+def _messages_with_canonical_hermes_tool_history(
+        messages: list[dict]) -> list[dict]:
+    """Serialize structured history in the exact fast tool-call protocol.
+
+    Qwen3.5/3.6's released template renders historical calls as nested XML,
+    while vOOM's schema constraint and wire parser use Hermes JSON.  Mixing
+    those protocols means a valid call can never be an exact prefix of the
+    following tool-result turn, which is especially expensive for the hybrid
+    recurrent cache (it cannot rewind to a merely similar prefix).  Fast mode
+    deliberately uses canonical Hermes for both generation and history;
+    lossless mode continues to render the released template unchanged.
+    """
+    normalized = []
+    for message in messages:
+        copied = dict(message)
+        calls = copied.pop("tool_calls", None) or []
+        if calls:
+            blocks = []
+            for call in calls:
+                function = call.get("function", call)
+                arguments = function.get("arguments", {})
+                if isinstance(arguments, str):
+                    try:
+                        arguments = json.loads(arguments)
+                    except json.JSONDecodeError:
+                        # canonicalize_tool_history validates this before prompt
+                        # rendering; retain a fail-closed fallback for direct
+                        # private-helper callers.
+                        arguments = arguments
+                payload = {"name": function.get("name", ""),
+                           "arguments": arguments}
+                blocks.append(
+                    "<tool_call>"
+                    + json.dumps(payload, ensure_ascii=False,
+                                 separators=(", ", ": "), allow_nan=False)
+                    + "</tool_call>")
+            content = copied.get("content")
+            copied["content"] = (content if isinstance(content, str) else "") + "".join(blocks)
+        normalized.append(copied)
+    return normalized
+
+
 def _messages_with_effort_instruction(
         messages: list[dict], reasoning: str) -> list[dict]:
     instructions = {
@@ -2263,7 +2305,8 @@ def _prepend_system_content(messages: list[dict], content: str) -> list[dict]:
 def _chat_prompt(engine, model_dir: Path, messages: list[dict], reasoning: str,
                  tools: list[dict] | None = None, *, compact_json: bool = False,
                  enable_thinking: bool | None = None,
-                 reasoning_requested: bool = False) -> str:
+                 reasoning_requested: bool = False,
+                 canonical_hermes_tools: bool = False) -> str:
     # 2026-07-14: a standalone chat_template.json file is one HF convention,
     # but the more common one is a `chat_template` field embedded directly in
     # tokenizer_config.json -- checking ONLY for the standalone file meant
@@ -2299,7 +2342,15 @@ def _chat_prompt(engine, model_dir: Path, messages: list[dict], reasoning: str,
                      and "enable_thinking" not in template_text))):
         messages = _messages_with_effort_instruction(messages, reasoning)
     if template_text:
-        if tools and not _template_consumes_tools(template_text):
+        if tools and canonical_hermes_tools:
+            messages = _messages_with_canonical_hermes_tool_history(messages)
+            messages = _prepend_system_content(
+                messages,
+                _tools_system_preamble(tools, compact_json=compact_json))
+            template_tools = None
+        else:
+            template_tools = tools or None
+        if tools and not canonical_hermes_tools and not _template_consumes_tools(template_text):
             messages = _prepend_system_content(
                 messages,
                 _tools_system_preamble(tools, compact_json=compact_json))
@@ -2307,7 +2358,7 @@ def _chat_prompt(engine, model_dir: Path, messages: list[dict], reasoning: str,
             "messages": _messages_for_native_template(messages),
             "add_generation_prompt": True,
             "reasoning_effort": reasoning,
-            "tools": tools or None,
+            "tools": template_tools,
         }
         if enable_thinking is not None:
             context["enable_thinking"] = enable_thinking
@@ -3471,13 +3522,16 @@ def _prepare_chat_prompt(engine, model_dir: Path, messages: list[dict], reasonin
     effective_enable_thinking = enable_thinking
     if effective_enable_thinking is None and fast_mode:
         effective_enable_thinking = False
+    canonical_hermes_tools = bool(
+        compacted and engine.cfg.model_type == "qwen3_5_moe")
     prompt = _chat_prompt(
         engine, model_dir, messages, reasoning, tools=prompt_tools,
         compact_json=compacted,
         # Fast mode defaults to no hidden-thinking, but an explicit medium/high
         # API request overrides that default and is passed to native templates.
         enable_thinking=effective_enable_thinking,
-        reasoning_requested=reasoning_requested)
+        reasoning_requested=reasoning_requested,
+        canonical_hermes_tools=canonical_hermes_tools)
     prompt_ids, prompt_offsets, prompt_token_cache_hit = _prepared_prompt_ids(
         engine, prompt)
     tool_capsules = (
@@ -3511,6 +3565,8 @@ def _prepare_chat_prompt(engine, model_dir: Path, messages: list[dict], reasonin
             if limit else None),
         "schema_profile": "compact-no-nested-prose" if compacted else "released",
         "tool_order_profile": "canonical-name-v1" if compacted else "request-order",
+        "tool_protocol_profile": (
+            "canonical-hermes-v1" if canonical_hermes_tools else "released"),
         "tool_catalog_id": (
             hashlib.sha256(json.dumps(
                 prompt_tools, ensure_ascii=False, separators=(",", ":"),

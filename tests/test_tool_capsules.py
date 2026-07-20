@@ -159,6 +159,10 @@ class _TinyDenseEngine:
     def _lm_head_weight(self):
         return self._head
 
+    def _final_logits(self, hidden):
+        return layer_runner.final_logits(
+            hidden, self._norm_w, self._head, self.cfg.rms_norm_eps)
+
 
 def test_selective_sweep_matches_normal_prefill_when_every_token_recomputed():
     engine = _TinyDenseEngine()
