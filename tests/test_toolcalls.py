@@ -519,6 +519,23 @@ def test_fast_tool_ranking_keeps_historical_call_available():
     assert pinned_tool_indices(tools, messages) == [1]
 
 
+def test_fast_tool_ranking_capability_capsule_matches_shell_paraphrases():
+    tools = [
+        {"type": "function", "function": {
+            "name": "calendar_create_event",
+            "description": "Create a scheduled meeting.", "parameters": {}}},
+        {"type": "function", "function": {
+            "name": "workspace_execute_command",
+            "description": "Execute a command in the workspace.", "parameters": {}}},
+        {"type": "function", "function": {
+            "name": "browser_open_page",
+            "description": "Navigate to a web page.", "parameters": {}}},
+    ]
+    for paraphrase in ("run this with bash", "use the terminal", "invoke a CLI"):
+        messages = [{"role": "user", "content": paraphrase}]
+        assert rank_tool_indices(tools, messages)[0] == 1
+
+
 def test_tool_order_and_ranking_ties_are_canonical_not_request_order():
     tools = [
         {"type": "function", "function": {"name": "zeta", "parameters": {}}},
@@ -571,6 +588,26 @@ def test_fast_schema_compaction_preserves_constraints_not_nested_prose():
     assert "description" not in fn["parameters"]["properties"]["unit"]
     assert "default" not in fn["parameters"]["properties"]["unit"]
     assert original["function"]["parameters"]["properties"]["unit"]["default"] == "c"
+
+
+def test_fast_schema_compaction_honors_explicit_x_optional_arguments():
+    original = {"type": "function", "function": {
+        "name": "list_files", "parameters": {
+            "type": "object",
+            "properties": {
+                "path": {"type": ["string", "null"], "default": "."},
+                "depth": {"type": ["number", "null"], "default": 2},
+            },
+            "required": ["path", "depth"],
+            "x-optional": ["path", "depth"],
+            "additionalProperties": False,
+        }}}
+    compact = compact_tool_schema(original)
+    schema = compact["function"]["parameters"]
+    assert "required" not in schema
+    assert "x-optional" not in schema
+    assert "default" not in schema["properties"]["path"]
+    assert original["function"]["parameters"]["required"] == ["path", "depth"]
 
 
 def test_fast_schema_compaction_preserves_property_names_that_match_annotations():

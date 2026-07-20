@@ -41,6 +41,7 @@ runtime/
   weight_cache.py       WeightPage/WeightCache: LFU-admit, byte budget, pinning
   expert_batching.py    bounded-lifetime MoE expert-batch consumption
   prefetcher.py         background sequential prefetch into the cache
+  expert_plan.py        held-out expert layout/prefetch trace simulator
   kv_cache.py           simple all-resident KV
   kv_paged.py           PagedKVCache: fixed-size pages, disk spill + reload
   quant.py              quantize-on-load (QTensor, per-module policy)
@@ -121,9 +122,40 @@ storage — this is not required to run the project.
 # the bounded cache/prefetch profile for the requested local model.
 .venv/bin/python -m runtime.server --port 8077
 
+# Recommended lossy prompt profile for large agent harnesses. The model first
+# sees a fixed private search/re-enable catalog; full schemas are inserted only
+# if selected, and both hidden-phase KV states are checkpointed independently.
+VMODEL_FAST_TOOL_GATEWAY=1 VMODEL_FAST_TOOL_GATEWAY_LIMIT=32 \
+    VMODEL_FAST_TOOL_GATEWAY_SEARCH_RESULTS=4 \
+    VMODEL_FAST_TOOL_GATEWAY_KV_CHUNK_SIZE=512 \
+    VMODEL_TOOL_EMBEDDINGS=auto \
+    VMODEL_HOT_PROMPT_KV_PERSIST_DIR=.kv_prompts/qwen3-4b-fast \
+    VMODEL_HOT_PROMPT_KV_PERSIST_MAX_CHECKPOINTS=32 \
+    .venv/bin/python -m runtime.server --port 8077
+
+# Serving does not reserve an additional fixed amount of otherwise available
+# RAM: the live governor enforces the Metal ceiling, evicts durable KV branches
+# from RAM, and shrinks the weight cache. Proof/benchmark runs may opt into an
+# extra reserve with VMODEL_HOT_PROMPT_KV_MIN_AVAILABLE_MB.
+
+# Optional one-time semantic cache build (run without a serving model loaded).
+# Raw schemas/queries are not persisted in .tool_embeddings; only hashed,
+# integrity-checked vectors are stored there.
+.venv/bin/python -m huggingface_hub.cli.hf download BAAI/bge-small-en-v1.5 \
+    --revision 5c38ec7c405ec4b44b94cc5a9bb96e735b38267a \
+    --local-dir models/tool-embed-bge-small-en-v1.5 \
+    config.json model.safetensors tokenizer.json tokenizer_config.json \
+    special_tokens_map.json vocab.txt
+.venv/bin/python -m runtime.tool_embeddings build \
+    --capture /path/to/captured-responses-request.json
+
+# Simpler deterministic alternative: keep the top 32 relevant schemas plus
+# every tool explicitly named by the user or already used in the transcript.
+VMODEL_FAST_TOOL_LIMIT=32 .venv/bin/python -m runtime.server --port 8077
+
 # Dependency-light adapter/math regressions (no model process).
 .venv/bin/python -m pytest -q tests/test_toolcalls.py tests/test_server_pure.py \
-    tests/test_yarn_parameters.py tests/test_vision_positions.py \
+    tests/test_tool_embeddings.py tests/test_yarn_parameters.py tests/test_vision_positions.py \
     tests/test_incremental_decode.py
 ```
 
@@ -469,6 +501,50 @@ unknown markers remain assistant text. Chat Completions accepts modern
 `stream_options.include_usage`. Unsupported multi-choice, logprob, penalty,
 or stateful Responses controls fail explicitly rather than being ignored.
 
+## Expert layout and prefetch experiments
+
+MoE routing traces can be analyzed without rewriting or loading model weights.
+After a representative generation, export the authoritative routed unions:
+
+```python
+engine.generate(prompt, max_tokens=64)
+engine.export_expert_trace("traces/routes.json")
+```
+
+Then fit physical orders on the first part of the trace and score them on held-
+out sweeps. The default skips the first sweep because `generate()` normally
+starts with a multi-position prefill, and it assigns zero idle-I/O capacity to
+speculative reads until that capacity has actually been measured:
+
+```bash
+.venv/bin/python -m runtime.expert_plan \
+  --trace traces/routes.json \
+  --bandwidth-mbps 315 \
+  --request-overhead-ms 3 \
+  --cache-pages 0 \
+  --plan-out traces/layout-plan.json \
+  --report-out traces/layout-report.json
+```
+
+Set `--cache-pages` to the expert-only capacity remaining after subtracting
+pinned weights, trunk working pages, and KV; zero deliberately models an all-
+miss cache. The report compares independent expert reads, demand-only
+coalescing, heat and coactivation orders, and inseparable two/four-page bundles
+while charging every unused byte. It also measures held-out Markov prediction
+and adjacent-sweep route persistence. A generated plan is logical-only;
+applying it to checkpoint bytes still requires transactional publication,
+integrity verification, and a greedy token-identity gate.
+
+Predicted expert I/O is controlled separately from deterministic layer
+prefetch. It remains off by default. An explicit experiment can enable it while
+refusing to queue predictions behind already-busy prefetch work:
+
+```yaml
+runtime:
+  expert_predictive_prefetch: true
+  expert_prefetch_idle_only: true
+```
+
 ## Testing
 
 ```bash
@@ -495,9 +571,9 @@ tests are skipped automatically if optional dependencies (e.g. `torch`,
 ## Status
 
 - Streaming, weight caching, prefetch, KV paging, a placement planner, mixed
-  precision, MoE expert paging with predictive prefetch, and speculative
-  decoding are all implemented, with an OpenAI/Anthropic-compatible server on
-  top.
+  precision, MoE expert paging with explicit opt-in predictive prefetch, and
+  speculative decoding are all implemented, with an OpenAI/Anthropic-compatible
+  server on top.
 - Full-artifact short-context execution of a real 700B+-class MoE checkpoint
   is achieved on the target 16 GB machine. Released-model token conformance
   at long context (beyond the model's dense-attention window) is still being

@@ -8,7 +8,8 @@ import mlx.core as mx
 import pytest
 
 from runtime.structured import (GrammarConstraint, JSONSchemaValidationError,
-                                tool_call_json_schema, validate_json_schema)
+                                effective_tool_schema, tool_call_json_schema,
+                                validate_json_schema)
 
 
 WEATHER = {"type": "function", "function": {
@@ -42,6 +43,35 @@ def test_tool_call_union_binds_name_to_its_own_argument_schema():
     with pytest.raises(JSONSchemaValidationError):
         validate_json_schema(
             {"name": "weather", "arguments": {"tz": "UTC"}}, schema)
+
+
+def test_effective_tool_schema_honors_x_optional_without_mutating_wire_schema():
+    wire = {
+        "type": "object",
+        "properties": {
+            "path": {"type": ["string", "null"]},
+            "depth": {"type": ["integer", "null"]},
+            "query": {"type": "string"},
+        },
+        "required": ["path", "depth", "query"],
+        "x-optional": ["path", "depth"],
+        "additionalProperties": False,
+    }
+    effective = effective_tool_schema(wire)
+    assert effective["required"] == ["query"]
+    assert "x-optional" not in effective
+    assert wire["required"] == ["path", "depth", "query"]
+    assert wire["x-optional"] == ["path", "depth"]
+    validate_json_schema({"query": "files"}, effective)
+    with pytest.raises(JSONSchemaValidationError):
+        validate_json_schema({"query": "files", "depth": "deep"}, effective)
+
+
+def test_effective_tool_schema_rejects_unknown_x_optional_property():
+    with pytest.raises(JSONSchemaValidationError, match="unknown properties"):
+        effective_tool_schema({
+            "type": "object", "properties": {}, "x-optional": ["missing"],
+        })
 
 
 def test_xgrammar_constraint_accepts_complete_qwen_json_sequence():

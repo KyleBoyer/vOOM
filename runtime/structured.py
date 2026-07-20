@@ -9,6 +9,7 @@ instance validation uses the schema's declared draft through ``jsonschema``.
 from __future__ import annotations
 
 import re
+from copy import deepcopy
 from dataclasses import dataclass
 
 import mlx.core as mx
@@ -60,6 +61,65 @@ def _function(tool: dict) -> dict:
     return function if isinstance(function, dict) else {}
 
 
+def effective_tool_schema(schema: dict) -> dict:
+    """Apply tool-protocol schema extensions used by agent harnesses.
+
+    Some Zod-to-JSON-Schema adapters must list every property in ``required``
+    for provider compatibility, then preserve the actual optionality in the
+    explicit ``x-optional`` extension. Ignoring it forces local constrained
+    decoding to spell every nullable/default argument, which can exhaust a
+    small tool-call token budget before the closing marker. Return a detached
+    standards-compliant schema with those names removed from ``required``.
+    """
+    if not isinstance(schema, dict):
+        raise JSONSchemaValidationError("JSON Schema must be an object")
+    normalized = deepcopy(schema)
+
+    def walk(node) -> None:
+        if not isinstance(node, dict):
+            return
+        optional = node.pop("x-optional", None)
+        if optional is not None:
+            properties = node.get("properties")
+            if (not isinstance(optional, list)
+                    or not all(isinstance(name, str) for name in optional)):
+                raise JSONSchemaValidationError(
+                    "x-optional must be an array of property names")
+            if not isinstance(properties, dict):
+                raise JSONSchemaValidationError(
+                    "x-optional requires an object schema with properties")
+            unknown = sorted(set(optional) - set(properties))
+            if unknown:
+                raise JSONSchemaValidationError(
+                    f"x-optional names unknown properties: {unknown}")
+            required = node.get("required")
+            if required is not None:
+                remaining = [name for name in required if name not in optional]
+                if remaining:
+                    node["required"] = remaining
+                else:
+                    node.pop("required", None)
+
+        for key in ("properties", "patternProperties", "$defs", "definitions",
+                    "dependentSchemas"):
+            children = node.get(key)
+            if isinstance(children, dict):
+                for child in children.values():
+                    walk(child)
+        for key in ("anyOf", "oneOf", "allOf", "prefixItems"):
+            children = node.get(key)
+            if isinstance(children, list):
+                for child in children:
+                    walk(child)
+        for key in ("items", "contains", "additionalProperties",
+                    "propertyNames", "if", "then", "else", "not"):
+            walk(node.get(key))
+
+    walk(normalized)
+    check_json_schema(normalized)
+    return normalized
+
+
 def tool_argument_schemas(tools: list[dict]) -> dict[str, dict]:
     schemas = {}
     for tool in tools:
@@ -70,8 +130,7 @@ def tool_argument_schemas(tools: list[dict]) -> dict[str, dict]:
         schema = function.get("parameters")
         if schema is None:
             schema = function.get("input_schema")
-        schema = schema or {"type": "object"}
-        check_json_schema(schema)
+        schema = effective_tool_schema(schema or {"type": "object"})
         schemas[name] = schema
     return schemas
 

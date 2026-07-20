@@ -127,13 +127,20 @@ class PreparedPrompt(str):
     work while preserving ordinary ``str`` behavior for every protocol helper.
     """
 
-    def __new__(cls, text: str, token_ids, tool_capsules=()):
+    def __new__(cls, text: str, token_ids, tool_capsules=(),
+                cache_namespace: str = "default", force_paged_kv: bool = False):
         instance = super().__new__(cls, text)
         instance.token_ids = tuple(token_ids)
         # Optional (content-id, token-start, token-end) records used only by the
         # explicitly lossy dense-model PIC path. Ordinary PreparedPrompt callers
         # and every lossless request retain the original two-argument behavior.
         instance.tool_capsules = tuple(tool_capsules)
+        # Hidden tool routing renders two deliberately different prompt
+        # lineages.  Carry the phase into the engine so its bounded hot-KV LRU
+        # can prefer evicting a transient decision branch over an expensive
+        # execution branch, while the durable segment DAG retains both.
+        instance.cache_namespace = str(cache_namespace or "default")
+        instance.force_paged_kv = bool(force_paged_kv)
         return instance
 
 
@@ -472,7 +479,8 @@ def _registry() -> dict[str, Path]:
 
     reg: dict[str, Path] = {}
     for d in sorted((ROOT / "models").iterdir()):
-        if d.is_dir() and (d / "config.json").exists():
+        if (d.is_dir() and not d.name.startswith("tool-embed-")
+                and (d / "config.json").exists()):
             reg[d.name] = d
     storage = get_storage_config()
     for store in storage.stores:
@@ -481,7 +489,8 @@ def _registry() -> dict[str, Path]:
             if not base.is_dir():
                 continue
             for d in sorted(base.iterdir()):
-                if d.is_dir() and d.name not in reg and (d / "config.json").exists():
+                if (d.is_dir() and not d.name.startswith("tool-embed-")
+                        and d.name not in reg and (d / "config.json").exists()):
                     reg[d.name] = d
             break  # first healthy mount for this store wins (avoids scanning cycled duplicates)
     # Converter outputs live beside their source so multi-gigabyte artifacts do
@@ -514,6 +523,10 @@ _MIN_FREE_BYTES_FOR_AUTO_DOWNLOAD = 5_000_000_000  # 5 GB; see _resolve() note
 _DEFAULT_MAX_REQUEST_BODY_BYTES = 64 * 1024 * 1024
 _DEFAULT_REQUEST_READ_TIMEOUT_SECONDS = 30.0
 _DEFAULT_RESPONSE_WRITE_TIMEOUT_SECONDS = 30.0
+# API clients may omit an output budget and expect generation to stop at the
+# model's learned EOS. The engine still needs a finite runaway guard; 4096 is a
+# safety ceiling, not a planned response length, and can be tuned explicitly.
+_DEFAULT_OMITTED_MAX_OUTPUT_TOKENS = 4096
 # Current two-stage auto-pack deletes raw shards and intermediate .vt files
 # before a transactional generation is committed.  It is therefore disabled by
 # default: a daemon-thread crash or concurrent lazy read can otherwise destroy a
@@ -1009,6 +1022,23 @@ class EngineManager:
                     rc.quant_group_size = 32
                     rc.quant_min_dim = 0
                     rc.max_weight_cache_mb = 7000
+                    if (not getattr(cfg_probe, "num_experts", 0)
+                            and not getattr(cfg_probe, "vision_config", None)):
+                        default_fast_cache_floor = (
+                            "600" if os.environ.get(
+                                "VMODEL_FAST_TOOL_GATEWAY", "0") == "1"
+                            else "1500")
+                        try:
+                            rc.min_weight_cache_mb = int(os.environ.get(
+                                "VMODEL_FAST_WEIGHT_CACHE_FLOOR_MB",
+                                default_fast_cache_floor))
+                        except ValueError as error:
+                            raise ValueError(
+                                "VMODEL_FAST_WEIGHT_CACHE_FLOOR_MB must be an integer"
+                            ) from error
+                        if rc.min_weight_cache_mb <= 0:
+                            raise ValueError(
+                                "VMODEL_FAST_WEIGHT_CACHE_FLOOR_MB must be positive")
                     if getattr(cfg_probe, "num_experts", 0):
                         # Real OLMoE A/B (64 experts, top-8): quantizing only
                         # experts retained much longer BF16 token prefixes and
@@ -1190,6 +1220,72 @@ class EngineManager:
                     if rc.hot_prompt_kv_min_tokens < 0:
                         raise ValueError(
                             "VMODEL_HOT_PROMPT_KV_MIN_TOKENS must be >= 0")
+                    try:
+                        rc.hot_prompt_kv_min_available_mb = int(os.environ.get(
+                            "VMODEL_HOT_PROMPT_KV_MIN_AVAILABLE_MB", "0"))
+                    except ValueError as e:
+                        raise ValueError(
+                            "VMODEL_HOT_PROMPT_KV_MIN_AVAILABLE_MB must be an "
+                            "integer") from e
+                    if rc.hot_prompt_kv_min_available_mb < 0:
+                        raise ValueError(
+                            "VMODEL_HOT_PROMPT_KV_MIN_AVAILABLE_MB must be >= 0")
+                    if os.environ.get("VMODEL_FAST_TOOL_GATEWAY", "0") == "1":
+                        try:
+                            gateway_kv_min = int(os.environ.get(
+                                "VMODEL_FAST_TOOL_GATEWAY_KV_MIN_TOKENS", "1024"))
+                            gateway_kv_chunk = int(os.environ.get(
+                                "VMODEL_FAST_TOOL_GATEWAY_KV_CHUNK_SIZE", "512"))
+                        except ValueError as e:
+                            raise ValueError(
+                                "VMODEL fast tool gateway KV settings must be "
+                                "integers") from e
+                        if gateway_kv_min < 0:
+                            raise ValueError(
+                                "VMODEL_FAST_TOOL_GATEWAY_KV_MIN_TOKENS must be >= 0")
+                        if (not 256 <= gateway_kv_chunk <= 4096
+                                or gateway_kv_chunk & (gateway_kv_chunk - 1)):
+                            raise ValueError(
+                                "VMODEL_FAST_TOOL_GATEWAY_KV_CHUNK_SIZE must be "
+                                "a power of two in [256, 4096]")
+                        # The virtual-only real harness prompt is ~1.9K tokens,
+                        # just below the ordinary 2K anti-thrash threshold. Keep
+                        # this smaller threshold scoped to the explicit gateway
+                        # profile so its stable router prefix becomes warm while
+                        # the normal server still rejects tiny helper slots.
+                        rc.hot_prompt_kv_min_tokens = min(
+                            rc.hot_prompt_kv_min_tokens, gateway_kv_min)
+                        # Agent transcripts usually diverge at the previous
+                        # generation marker, so branch reuse floors to this
+                        # boundary. A 2K boundary left 1-2K old tokens to prefill
+                        # on nearly every follow-up. The gateway pays more small
+                        # durable segments on its first call in exchange for a
+                        # <=511-token alignment loss thereafter.
+                        rc.prefill_chunk_size = gateway_kv_chunk
+                        rc.hot_prompt_kv_chunk_size = gateway_kv_chunk
+                    try:
+                        adaptive_spill_default = (
+                            "256" if os.environ.get(
+                                "VMODEL_FAST_TOOL_GATEWAY", "0") == "1"
+                            else "0")
+                        rc.adaptive_kv_spill_mb = int(os.environ.get(
+                            "VMODEL_FAST_KV_ADAPTIVE_SPILL_MB",
+                            adaptive_spill_default))
+                        rc.adaptive_kv_spill_prefill_chunk_size = int(
+                            os.environ.get(
+                                "VMODEL_FAST_KV_ADAPTIVE_PREFILL_CHUNK_SIZE",
+                                "512"))
+                    except ValueError as error:
+                        raise ValueError(
+                            "VMODEL_FAST_KV_ADAPTIVE spill settings must be "
+                            "integers") from error
+                    if rc.adaptive_kv_spill_mb < 0:
+                        raise ValueError(
+                            "VMODEL_FAST_KV_ADAPTIVE_SPILL_MB must be >= 0")
+                    if not 1 <= rc.adaptive_kv_spill_prefill_chunk_size <= 4096:
+                        raise ValueError(
+                            "VMODEL_FAST_KV_ADAPTIVE_PREFILL_CHUNK_SIZE must "
+                            "be in [1, 4096]")
                     tool_pic_value = os.environ.get(
                         "VMODEL_FAST_TOOL_PIC", "1")
                     if tool_pic_value not in ("0", "1"):
@@ -1259,6 +1355,65 @@ class EngineManager:
                     if rc.hot_prompt_kv_persist_max_checkpoints < 0:
                         raise ValueError(
                             "VMODEL_HOT_PROMPT_KV_PERSIST_MAX_CHECKPOINTS must be >= 0")
+                    # Exact BF16 KV can dominate dense Qwen at agent-harness
+                    # prompt sizes even though the selected weight profile is
+                    # lossy.  Opt-in disk paging retains every KV bit while
+                    # bounding resident KV.  It is deliberately incompatible
+                    # with the in-memory hot/PIC paths: paged attention must
+                    # reload the complete history and cannot safely retain or
+                    # relocate those cache objects between requests yet.
+                    try:
+                        fast_kv_max_mb = int(os.environ.get(
+                            "VMODEL_FAST_KV_MAX_MB", "0"))
+                    except ValueError as error:
+                        raise ValueError(
+                            "VMODEL_FAST_KV_MAX_MB must be an integer") from error
+                    if fast_kv_max_mb < 0:
+                        raise ValueError(
+                            "VMODEL_FAST_KV_MAX_MB must be non-negative")
+                    if (fast_kv_max_mb
+                            and mtype in ("qwen2", "qwen3")
+                            and not cfg_probe.vision_config
+                            and not cfg_probe.num_experts):
+                        try:
+                            paged_chunk = int(os.environ.get(
+                                "VMODEL_FAST_KV_PREFILL_CHUNK_SIZE", "512"))
+                            paged_mlx_cache_mb = int(os.environ.get(
+                                "VMODEL_FAST_KV_MLX_CACHE_MB", "64"))
+                        except ValueError as error:
+                            raise ValueError(
+                                "VMODEL_FAST_KV prefill/cache limits must be "
+                                "integers") from error
+                        if not 1 <= paged_chunk <= 4096:
+                            raise ValueError(
+                                "VMODEL_FAST_KV_PREFILL_CHUNK_SIZE must be in "
+                                "[1, 4096]")
+                        if not 1 <= paged_mlx_cache_mb <= 1024:
+                            raise ValueError(
+                                "VMODEL_FAST_KV_MLX_CACHE_MB must be in [1, 1024]")
+                        compress_value = os.environ.get(
+                            "VMODEL_FAST_KV_SPILL_COMPRESS", "0")
+                        if compress_value not in ("0", "1"):
+                            raise ValueError(
+                                "VMODEL_FAST_KV_SPILL_COMPRESS must be 0 or 1")
+                        rc.max_kv_mb = fast_kv_max_mb
+                        rc.release_paged_kv_after_generate = True
+                        rc.mlx_cache_limit_mb = paged_mlx_cache_mb
+                        # Paged retention alone did not bound the 4,096-token
+                        # activation/reload transient: real 28K Qwen3 prefill
+                        # still fell below 4 GB available. Progressive 512-token
+                        # sweeps keep that separately bounded and expose much
+                        # finer-grained progress events.
+                        rc.prefill_chunk_size = paged_chunk
+                        rc.kv_spill_dir = os.environ.get(
+                            "VMODEL_FAST_KV_SPILL_DIR",
+                            str(ROOT / ".kv_spill"),
+                        )
+                        rc.kv_spill_compress = compress_value == "1"
+                        rc.hot_prompt_kv = False
+                        rc.hot_prompt_kv_persist_dir = ""
+                        rc.tool_pic = False
+                        rc.tool_pic_shared_pages = False
                     if mode == "fast-long":
                         rc.qwen_yarn_factor = yarn_factor
                 if (mode == "lossless"
@@ -2137,6 +2292,13 @@ def _positive_token_limit(value, field: str) -> int:
     return parsed
 
 
+def _omitted_output_token_limit() -> int:
+    value = os.environ.get(
+        "VMODEL_OMITTED_MAX_OUTPUT_TOKENS",
+        str(_DEFAULT_OMITTED_MAX_OUTPUT_TOKENS))
+    return _positive_token_limit(value, "VMODEL_OMITTED_MAX_OUTPUT_TOKENS")
+
+
 def _tool_request_controls(route: str, req: dict, tools: list[dict]):
     """Validate supported tool schemas/controls and return effective settings.
 
@@ -2607,11 +2769,556 @@ def _load_vision_images(sources):
     return images
 
 
+def _fast_dense_resident_kv_projection(
+        engine, mode: str, prompt_tokens: int, max_output_tokens: int):
+    """Project the exact resident BF16 KV payload for dense text Qwen.
+
+    Weight quantization does not change K/V activations.  Qwen3-4B's geometry
+    is 147,456 resident bytes per position, so a harness prompt that merely
+    looks like a moderate 28K context asks this 16-GB host to retain ~4.17 GB
+    of KV before layer weights and scratch.  Keep this arithmetic independent
+    of MLX so request validation and its regression tests remain CPU-only.
+    """
+    if mode not in ("fast", "fast-long"):
+        return None
+    cfg = getattr(engine, "cfg", None)
+    rc = getattr(engine, "rc", None)
+    if (cfg is None or rc is None
+            or getattr(cfg, "model_type", "") not in ("qwen2", "qwen3")
+            or getattr(cfg, "vision_config", None)
+            or getattr(cfg, "num_experts", 0)):
+        return None
+    if getattr(rc, "max_kv_mb", 0):
+        # Exact paging has its own explicit resident-byte budget.
+        return None
+    try:
+        limit_mb = int(os.environ.get(
+            "VMODEL_FAST_RESIDENT_KV_LIMIT_MB", "3000"))
+    except ValueError as error:
+        raise RequestValidationError(
+            "VMODEL_FAST_RESIDENT_KV_LIMIT_MB must be an integer") from error
+    if limit_mb < 0:
+        raise RequestValidationError(
+            "VMODEL_FAST_RESIDENT_KV_LIMIT_MB must be non-negative")
+    if limit_mb == 0:
+        return None
+    layers = int(getattr(cfg, "num_hidden_layers", 0) or 0)
+    kv_heads = int(getattr(cfg, "num_key_value_heads", 0) or 0)
+    head_dim = int(getattr(cfg, "head_dim", 0) or 0)
+    if min(layers, kv_heads, head_dim) <= 0:
+        return None
+    bytes_per_token = layers * 2 * kv_heads * head_dim * 2
+    # Reserve the KV that must exist before the first output token, not a
+    # hypothetical fully-consumed output ceiling. The engine grows exact KV
+    # incrementally and re-runs live admission during decode. Reserving all
+    # 4,096 optional output positions up front collapsed the weight cache for
+    # short tool calls that actually emitted only a handful of tokens.
+    positions = prompt_tokens
+    declared_positions = prompt_tokens + max_output_tokens
+    projection = {
+        "bytes_per_token": bytes_per_token,
+        "positions": positions,
+        "declared_positions": declared_positions,
+        "projected_bytes": positions * bytes_per_token,
+        "declared_projected_bytes": declared_positions * bytes_per_token,
+        "limit_bytes": limit_mb * 1_000_000,
+        "active_metal_bytes": 0,
+        "retained_prompt_kv_bytes": 0,
+        "orphan_prompt_kv_bytes": 0,
+        "evictable_prompt_kv_bytes": 0,
+        "active_after_prompt_kv_eviction_bytes": 0,
+        "dynamic_projected_bytes": 0,
+        "dynamic_ceiling_bytes": 0,
+        "admission_margin_bytes": 400_000_000,
+    }
+    snapshot_fn = getattr(engine, "prompt_cache_memory_snapshot", None)
+    if snapshot_fn is not None:
+        snapshot = snapshot_fn()
+        active = max(0, int(snapshot.get("active_metal_bytes", 0) or 0))
+        retained = max(0, int(
+            snapshot.get("retained_prompt_kv_bytes", 0) or 0))
+        orphan = max(0, int(
+            snapshot.get("orphan_prompt_kv_bytes", 0) or 0))
+        evictable = max(0, int(
+            snapshot.get("evictable_prompt_kv_bytes", retained + orphan) or 0))
+        ceiling = max(0, int(snapshot.get("metal_ceiling_bytes", 0) or 0))
+        active_after = max(0, active - min(active, evictable))
+        projection.update({
+            "active_metal_bytes": active,
+            "retained_prompt_kv_bytes": retained,
+            "orphan_prompt_kv_bytes": orphan,
+            "evictable_prompt_kv_bytes": evictable,
+            "active_after_prompt_kv_eviction_bytes": active_after,
+            "dynamic_projected_bytes": (
+                active_after + projection["projected_bytes"]
+                + projection["admission_margin_bytes"]),
+            "dynamic_ceiling_bytes": ceiling,
+        })
+    return projection
+
+
+def _validate_fast_dense_resident_kv(
+        engine, mode: str, prompt_tokens: int, max_output_tokens: int):
+    projection = _fast_dense_resident_kv_projection(
+        engine, mode, prompt_tokens, max_output_tokens)
+    if (projection is not None
+            and projection["projected_bytes"] > projection["limit_bytes"]):
+        adaptive_spill_mb = int(getattr(
+            getattr(engine, "rc", None), "adaptive_kv_spill_mb", 0) or 0)
+        if adaptive_spill_mb:
+            projection["adaptive_spill_required"] = 1
+            projection["adaptive_spill_mb"] = adaptive_spill_mb
+            return projection
+        projected_mb = math.ceil(projection["projected_bytes"] / 1_000_000)
+        limit_mb = projection["limit_bytes"] // 1_000_000
+        raise RequestValidationError(
+            "resident BF16 KV projection "
+            f"({projection['positions']} positions, {projected_mb} MB) exceeds "
+            f"the dense-Qwen safety limit ({limit_mb} MB). "
+            "Reduce the rendered input: for large tool catalogs, enable "
+            "VMODEL_FAST_TOOL_GATEWAY=1 or set "
+            "VMODEL_FAST_TOOL_LIMIT=32 or lower. Exact dense-Qwen disk-paged "
+            "KV is experimental and quarantined on this 16-GB host because "
+            "the real 28k-token gate exceeded the swap-out limit. "
+            "Set VMODEL_FAST_RESIDENT_KV_LIMIT_MB=0 only after an independent "
+            "memory/swap gate.")
+    if (projection is not None
+            and projection["dynamic_ceiling_bytes"]
+            and projection["dynamic_projected_bytes"]
+            > projection["dynamic_ceiling_bytes"]):
+        adaptive_spill_mb = int(getattr(
+            getattr(engine, "rc", None), "adaptive_kv_spill_mb", 0) or 0)
+        if adaptive_spill_mb:
+            projection["adaptive_spill_required"] = 1
+            projection["adaptive_spill_mb"] = adaptive_spill_mb
+            return projection
+        projected_mb = math.ceil(
+            projection["dynamic_projected_bytes"] / 1_000_000)
+        ceiling_mb = projection["dynamic_ceiling_bytes"] // 1_000_000
+        evictable_mb = projection["evictable_prompt_kv_bytes"] // 1_000_000
+        raise RequestValidationError(
+            "live dense-Qwen Metal projection remains unsafe even after "
+            f"evicting {evictable_mb} MB of retained prompt KV "
+            f"({projected_mb} MB projected including margin; "
+            f"{ceiling_mb} MB live ceiling). Reduce context/output or free "
+            "unified memory; the request was rejected before generation.")
+    return projection
+
+
+_HIDDEN_TOOL_SEARCH_NAME = "vmodel_search_tools"
+_HIDDEN_TOOL_ENABLE_NAME = "vmodel_enable_tools"
+_HIDDEN_TOOL_ABSTAIN_NAME = "vmodel_no_suitable_tool"
+
+# Hidden gateway activation is process-local routing metadata, not model state:
+# a bounded hash-keyed LRU remembers only real function names.  Raw messages and
+# schemas remain in the caller request/durable KV journal and are never copied
+# into this table.  The durable per-phase KV checkpoints are the restart tier;
+# this table merely keeps an execution catalog stable while the server lives.
+_GATEWAY_ACTIVATION_LOCK = threading.Lock()
+_GATEWAY_ACTIVATIONS: OrderedDict[str, tuple[str, ...]] = OrderedDict()
+_GATEWAY_ACTIVATION_LIMIT = 256
+
+_HIDDEN_GATEWAY_DECISION_POLICY = (
+    "Private tool-routing phase: decide whether the latest request needs "
+    "information or an action outside the conversation. If it needs the "
+    "filesystem, current working directory, shell/CLI, browser/web, network, "
+    "account, calendar, email, database, application, or any other external "
+    "state, call one private catalog function immediately as your first "
+    "output. Call vmodel_enable_tools when the previously enabled real tools "
+    "can continue the same operation (including pagination or corrected "
+    "arguments). Call vmodel_search_tools when a different capability may be "
+    "needed or the previous tool was unsuitable. Never "
+    "guess external state and never say that you will check, run, inspect, or "
+    "use a tool later: call the search function now. Answer directly only when "
+    "the answer follows from the conversation or stable general knowledge. If "
+    "the latest message is a tool result, answer from that result unless a new "
+    "external action is still required. This routing phase is hidden from the "
+    "caller."
+)
+
+_HIDDEN_GATEWAY_REAL_TOOL_POLICY = (
+    "Private tool-execution phase: catalog search has already selected the "
+    "most relevant real tools. Call exactly one real tool now when any provided "
+    "tool can perform the requested action or inspection. If and only if none "
+    "of the provided real tools is suitable, call vmodel_no_suitable_tool. Do "
+    "not answer with a plan, a promise to act later, guessed external state, "
+    "or an unrelated tool call."
+)
+_HIDDEN_GATEWAY_ABSTAIN_TEXT = (
+    "I couldn't find a suitable available tool for this request."
+)
+
+_GATEWAY_CONFIRMATION_RE = re.compile(
+    r"^(?:do it|go ahead|proceed|please do|run it|check it|try it|yes|ok(?:ay)?)"
+    r"[\s.!?]*$", re.IGNORECASE)
+_GATEWAY_COMMITMENT_RE = re.compile(
+    r"\b(?:i(?:'ll| will)|let me|i(?:'m| am) going to)\b.{0,100}"
+    r"\b(?:check|verify|inspect|run|execute|list|open|browse|search|query|use)\b",
+    re.IGNORECASE | re.DOTALL)
+_GATEWAY_EXPLICIT_TOOL_RE = re.compile(
+    r"\b(?:use|call|invoke)\s+(?:an?\s+)?(?:available\s+)?tool\b|"
+    r"\btool\s+call\b", re.IGNORECASE)
+_GATEWAY_ALWAYS_ACTION_RE = re.compile(
+    r"^(?:(?:please|actually|now)\s+)*"
+    r"(?:run|execute|download|upload|install|deploy|scan)\b|"
+    r"^(?:can|could|would|will)\s+you\s+(?:please\s+)?"
+    r"(?:run|execute|download|upload|install|deploy|scan)\b",
+    re.IGNORECASE)
+_GATEWAY_VERIFY_REAL_RE = re.compile(
+    r"^(?:(?:please|actually|now)\s+)*(?:check|verify|inspect)\b.*"
+    r"(?:for real|actually|current|live|on disk|in the workspace)\b",
+    re.IGNORECASE)
+_GATEWAY_ACTION_VERB_RE = re.compile(
+    r"\b(?:check|verify|inspect|list|open|browse|search|fetch|query|read|write|"
+    r"edit|create|delete|send|schedule|build|test)\b",
+    re.IGNORECASE)
+_GATEWAY_EXTERNAL_RESOURCE_RE = re.compile(
+    r"\b(?:files?|folders?|directories?|filesystem|paths?|workspace|"
+    r"repositories|repository|repo|terminal|shell|commands?|browser|web|urls?|"
+    r"websites?|email|inbox|calendar|database|spreadsheet|documents?|pdf|"
+    r"images?|video|audio|codebase|source code|git|github|plex|server|"
+    r"application|packages?)\b",
+    re.IGNORECASE)
+_GATEWAY_EXTERNAL_STATE_RE = re.compile(
+    r"\b(?:cwd|pwd|working directory|current (?:folder|directory)|"
+    r"what (?:folder|directory) (?:are|am) (?:we|i) in|"
+    r"top[- ]level (?:folder|directory)|"
+    r"largest (?:top[- ]level )?(?:folder|directory)|"
+    r"smallest (?:top[- ]level )?(?:folder|directory)|"
+    r"files? (?:in|inside|under) (?:this|the|our|my) |"
+    r"(?:this|our|my) (?:workspace|repository|repo|filesystem|folder|directory)|"
+    r"https?://|browser tab|terminal|shell command)\b",
+    re.IGNORECASE)
+
+
+def _gateway_message_text(message: dict) -> str:
+    content = message.get("content", "")
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return " ".join(
+            str(part.get("text", part.get("output", "")))
+            for part in content if isinstance(part, dict)
+        )
+    return ""
+
+
+def _hidden_gateway_force_reason(messages: list[dict]) -> str | None:
+    """Return a high-confidence reason to require hidden tool discovery.
+
+    This is intentionally narrower than semantic tool retrieval. It only
+    prevents the small serving model from hallucinating or promising action on
+    unmistakable external-state requests. Ambiguous/general-knowledge turns
+    still go through the model's ordinary auto decision.
+    """
+    if not messages:
+        return None
+    # A function result is followed by an answer turn, not another forced call.
+    if messages[-1].get("role") == "tool":
+        return None
+    user_index = next(
+        (index for index in range(len(messages) - 1, -1, -1)
+         if messages[index].get("role") == "user"),
+        None,
+    )
+    if user_index is None:
+        return None
+    user_text = " ".join(
+        _gateway_message_text(messages[user_index]).split())
+    if not user_text:
+        return None
+    if _GATEWAY_EXPLICIT_TOOL_RE.search(user_text):
+        return "explicit-tool-request"
+    if (_GATEWAY_ALWAYS_ACTION_RE.search(user_text)
+            or _GATEWAY_VERIFY_REAL_RE.search(user_text)
+            or (_GATEWAY_ACTION_VERB_RE.search(user_text)
+                and _GATEWAY_EXTERNAL_RESOURCE_RE.search(user_text))):
+        return "external-action-imperative"
+    if _GATEWAY_EXTERNAL_STATE_RE.search(user_text):
+        return "external-state-inspection"
+    if _GATEWAY_CONFIRMATION_RE.fullmatch(user_text):
+        previous_assistant = next(
+            (_gateway_message_text(messages[index])
+             for index in range(user_index - 1, -1, -1)
+             if messages[index].get("role") == "assistant"),
+            "",
+        )
+        if _GATEWAY_COMMITMENT_RE.search(previous_assistant):
+            return "confirmed-deferred-action"
+    return None
+
+
+def _hidden_gateway_decision_choice(
+        tool_choice: str, force_reason: str | None) -> str:
+    """Constrain only high-confidence action turns to hidden discovery."""
+    return (
+        f"specific:{_HIDDEN_TOOL_SEARCH_NAME}"
+        if force_reason is not None else tool_choice
+    )
+
+
+def _hidden_tool_search_pair():
+    """Return wrapped/raw copies of the gateway-only catalog search tool."""
+    raw = {
+        "type": "function",
+        "name": _HIDDEN_TOOL_SEARCH_NAME,
+        "description": (
+            "Search the hidden tool catalog when the request needs workspace, "
+            "browser, network, account, or other external action. For ordinary "
+            "questions that can be answered directly, do not call this tool. "
+            "If you call it, the tool call must be your first output, with no "
+            "prose before the call."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "A short capability-oriented search query.",
+                },
+                "max_results": {
+                    "type": "integer", "minimum": 1, "maximum": 64,
+                },
+            },
+            "required": ["query"],
+            "additionalProperties": False,
+        },
+    }
+    wrapped = {"type": "function", "function": {
+        "name": raw["name"],
+        "description": raw["description"],
+        "parameters": raw["parameters"],
+    }}
+    return wrapped, raw
+
+
+def _hidden_tool_enable_pair():
+    """Return the stable gateway-only reuse-current-catalog function."""
+    raw = {
+        "type": "function",
+        "name": _HIDDEN_TOOL_ENABLE_NAME,
+        "description": (
+            "Reuse the real tools already enabled for this conversation when "
+            "they can continue the same operation, such as pagination, retrying "
+            "with corrected arguments, or interpreting a prior tool result. "
+            "Use vmodel_search_tools instead when a different capability or "
+            "replacement tool may be needed."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {},
+            "additionalProperties": False,
+        },
+    }
+    wrapped = {"type": "function", "function": {
+        "name": raw["name"],
+        "description": raw["description"],
+        "parameters": raw["parameters"],
+    }}
+    return wrapped, raw
+
+
+def _hidden_gateway_virtual_pairs():
+    """The decision catalog is exactly these two schemas on every turn."""
+    search, search_raw = _hidden_tool_search_pair()
+    enable, enable_raw = _hidden_tool_enable_pair()
+    return [search, enable], [search_raw, enable_raw]
+
+
+def _tool_function_name(tool: dict) -> str:
+    function = tool.get("function", tool) if isinstance(tool, dict) else {}
+    return str(function.get("name", "")) if isinstance(function, dict) else ""
+
+
+def _hidden_gateway_conversation_key(
+        model_id: str, tools: list[dict], messages: list[dict]) -> str:
+    """Hash the stable conversation anchor and full catalog identity.
+
+    Appended assistant/tool/user turns deliberately do not change this key.
+    The first user turn plus any leading system/developer turns separates
+    concurrent chats without requiring a harness-supplied conversation id.
+    """
+    from .toolcalls import canonical_tool_indices, compact_tool_schema
+
+    anchor = []
+    for message in messages:
+        role = str(message.get("role", ""))
+        if role in ("system", "developer"):
+            anchor.append(message)
+            continue
+        if role == "user":
+            anchor.append(message)
+        break
+    order = canonical_tool_indices(tools)
+    catalog = [compact_tool_schema(tools[index]) for index in order]
+    payload = {
+        "model": model_id,
+        "anchor": anchor,
+        "catalog": catalog,
+    }
+    return hashlib.sha256(json.dumps(
+        payload, ensure_ascii=False, sort_keys=True,
+        separators=(",", ":")).encode("utf-8")).hexdigest()
+
+
+def _hidden_gateway_activation_get(key: str, tools: list[dict]) -> tuple[str, ...]:
+    available = {_tool_function_name(tool) for tool in tools}
+    with _GATEWAY_ACTIVATION_LOCK:
+        names = _GATEWAY_ACTIVATIONS.get(key, ())
+        if names:
+            _GATEWAY_ACTIVATIONS.move_to_end(key)
+    return tuple(name for name in names if name in available)
+
+
+def _hidden_gateway_activation_put(key: str, tools: list[dict]) -> tuple[str, ...]:
+    names = tuple(dict.fromkeys(
+        name for tool in tools if (name := _tool_function_name(tool))))
+    with _GATEWAY_ACTIVATION_LOCK:
+        _GATEWAY_ACTIVATIONS[key] = names
+        _GATEWAY_ACTIVATIONS.move_to_end(key)
+        while len(_GATEWAY_ACTIVATIONS) > _GATEWAY_ACTIVATION_LIMIT:
+            _GATEWAY_ACTIVATIONS.popitem(last=False)
+    return names
+
+
+def _hidden_gateway_activation_clear() -> None:
+    """Test/process lifecycle helper; durable KV is intentionally untouched."""
+    with _GATEWAY_ACTIVATION_LOCK:
+        _GATEWAY_ACTIVATIONS.clear()
+
+
+def _hidden_tool_abstain_pair():
+    """Return the gateway-only safe alternative to an irrelevant real call."""
+    raw = {
+        "type": "function",
+        "name": _HIDDEN_TOOL_ABSTAIN_NAME,
+        "description": (
+            "Use only when none of the retrieved real tools can perform the "
+            "requested action. Do not use this when any real tool is relevant."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "reason": {
+                    "type": "string",
+                    "description": "Why none of the retrieved tools is suitable.",
+                },
+            },
+            "required": ["reason"],
+            "additionalProperties": False,
+        },
+    }
+    wrapped = {"type": "function", "function": {
+        "name": raw["name"],
+        "description": raw["description"],
+        "parameters": raw["parameters"],
+    }}
+    return wrapped, raw
+
+
+def _hidden_tool_gateway_enabled(mode: str, tool_count: int, tool_choice: str) -> bool:
+    value = os.environ.get("VMODEL_FAST_TOOL_GATEWAY", "0")
+    if value not in ("0", "1"):
+        raise RequestValidationError("VMODEL_FAST_TOOL_GATEWAY must be 0 or 1")
+    if value == "0" or mode not in ("fast", "fast-long") or tool_count <= 0:
+        return False
+    # A named function is already the smallest correct catalog. `none` has no
+    # prompt tools after request normalization. Auto/required benefit from the
+    # hidden discovery round.
+    return tool_choice in ("auto", "required")
+
+
+def _hidden_gateway_search_result_limit(activated_limit: int, search_cap: int,
+                                        requested) -> int:
+    """Bound model-authored search breadth without forcing it to take the cap."""
+    if isinstance(requested, bool) or not isinstance(requested, int):
+        requested = activated_limit
+    return min(activated_limit, search_cap, max(1, requested))
+
+
+def _hidden_gateway_catalogs(tools, raw_tools, messages, query: str | None = None,
+                             limit: int = 32, *, activated_names=(),
+                             expansion_limit: int = 4,
+                             max_activated: int = 64):
+    """Build the real-tool subset before/after the hidden discovery round."""
+    from .toolcalls import pinned_tool_indices, rank_tool_indices
+
+    if limit <= 0:
+        raise RequestValidationError("hidden tool gateway limit must be positive")
+    if expansion_limit <= 0:
+        raise RequestValidationError(
+            "hidden tool gateway expansion limit must be positive")
+    if not limit <= max_activated <= 64:
+        raise RequestValidationError(
+            "hidden tool gateway activated limit must be between the search "
+            "limit and 64")
+    # The hidden query is authored by the serving model specifically for this
+    # catalog lookup. Rank against that intent alone: re-inserting a ~20K system
+    # prompt here lets generic framework vocabulary swamp both BM25 and vector
+    # retrieval. Transcript requirements are preserved separately as hard pins.
+    routed_messages = (
+        [{"role": "user", "content": query}] if query else list(messages))
+    pinned = pinned_tool_indices(tools, messages)
+    name_to_index = {
+        _tool_function_name(tool): index for index, tool in enumerate(tools)}
+    activated = [
+        name_to_index[name] for name in dict.fromkeys(activated_names)
+        if name in name_to_index
+    ]
+    selected = set(activated) | set(pinned)
+    retrieval_metadata = {
+        "tool_retrieval_profile": "not_queried",
+        "tool_embedding_status": "not_queried",
+    }
+    if query:
+        ranking, retrieval_metadata = rank_tool_indices(
+            tools, routed_messages, use_embeddings=True, return_metadata=True)
+        top_index = ranking[0] if ranking else None
+        top_already_activated = top_index in set(activated)
+        if activated and top_already_activated:
+            # Same capability/page/corrected-arguments path: preserve the exact
+            # schema set and therefore the execution KV prefix.
+            activation_profile = "stable-hit"
+        else:
+            target = max(limit, len(selected)) if not activated else min(
+                max_activated, max(len(selected), len(activated) + expansion_limit))
+            for index in ranking:
+                if len(selected) >= target:
+                    break
+                selected.add(index)
+            activation_profile = "initial" if not activated else "expanded"
+        retrieval_metadata = {
+            **retrieval_metadata,
+            "gateway_activation_profile": activation_profile,
+            "gateway_activation_previous_tools": len(activated),
+            "gateway_activation_top_tool_reused": int(top_already_activated),
+        }
+    else:
+        retrieval_metadata = {
+            **retrieval_metadata,
+            "gateway_activation_profile": (
+                "loaded" if activated else "not_queried"),
+            "gateway_activation_previous_tools": len(activated),
+            "gateway_activation_top_tool_reused": 0,
+        }
+    # Prompt rendering canonicalizes by function name. Returning the same order
+    # here makes state/metadata deterministic as well and keeps raw/wrapped
+    # catalogs aligned.
+    indices = sorted(selected, key=lambda index: _tool_function_name(tools[index]))
+    return (
+        [tools[index] for index in indices],
+        [raw_tools[index] for index in indices],
+        len(pinned),
+        retrieval_metadata,
+    )
+
+
 def _prepare_chat_prompt(engine, model_dir: Path, messages: list[dict], reasoning: str,
                          tools: list[dict], raw_tools: list[dict], mode: str,
                          max_output_tokens: int, *,
                          enable_thinking: bool | None = None,
-                         reasoning_requested: bool = False):
+                         reasoning_requested: bool = False,
+                         cache_namespace: str = "default"):
     """Apply explicitly side-quest-only tool compaction/retrieval and render.
 
     Fast mode keeps all tools by default but strips parameter-level prose and
@@ -2638,6 +3345,7 @@ def _prepare_chat_prompt(engine, model_dir: Path, messages: list[dict], reasonin
     compacted = fast_mode and bool(tools)
     limit = 0
     pinned_indices: list[int] = []
+    retrieval_metadata = {}
     if tools:
         try:
             canonical_tool_indices(tools)
@@ -2658,7 +3366,8 @@ def _prepare_chat_prompt(engine, model_dir: Path, messages: list[dict], reasonin
             raise RequestValidationError(
                 "VMODEL_FAST_TOOL_LIMIT must be a non-negative integer")
         if limit and requested > limit:
-            ranking = rank_tool_indices(tools, messages)
+            ranking, retrieval_metadata = rank_tool_indices(
+                tools, messages, use_embeddings=True, return_metadata=True)
             pinned_indices = pinned_tool_indices(tools, messages)
             selected = set(pinned_indices)
             # The configured limit is a soft budget. Transcript-required tools
@@ -2695,6 +3404,9 @@ def _prepare_chat_prompt(engine, model_dir: Path, messages: list[dict], reasonin
         if compacted else ())
     prompt_tokens = len(prompt_ids)
 
+    resident_kv = _validate_fast_dense_resident_kv(
+        engine, mode, prompt_tokens, max_output_tokens)
+
     # Never silently claim semantics beyond the active RoPE profile. Native
     # fast stays at the checkpoint limit; fast-long has a separately named,
     # cache-incompatible experimental YaRN profile.
@@ -2711,6 +3423,10 @@ def _prepare_chat_prompt(engine, model_dir: Path, messages: list[dict], reasonin
         "lossy_shortlist": len(selected_tools) != requested,
         "shortlist_soft_limit": limit,
         "pinned": len(pinned_indices),
+        "tool_retrieval_profile": (
+            retrieval_metadata.get(
+                "tool_retrieval_profile", "hybrid-lexical-capability-v1")
+            if limit else None),
         "schema_profile": "compact-no-nested-prose" if compacted else "released",
         "tool_order_profile": "canonical-name-v1" if compacted else "request-order",
         "tool_catalog_id": (
@@ -2729,6 +3445,28 @@ def _prepare_chat_prompt(engine, model_dir: Path, messages: list[dict], reasonin
         "reasoning_requested": int(reasoning_requested),
         "context_profile": getattr(engine, "rope_profile", "released"),
         "context_limit": context_limit,
+        "resident_kv_bytes_per_token": (
+            resident_kv["bytes_per_token"] if resident_kv else 0),
+        "resident_kv_projected_bytes": (
+            resident_kv["projected_bytes"] if resident_kv else 0),
+        "resident_kv_declared_projected_bytes": (
+            resident_kv["declared_projected_bytes"] if resident_kv else 0),
+        "resident_kv_limit_bytes": (
+            resident_kv["limit_bytes"] if resident_kv else 0),
+        "resident_kv_active_metal_bytes": (
+            resident_kv["active_metal_bytes"] if resident_kv else 0),
+        "resident_kv_retained_cache_bytes": (
+            resident_kv["retained_prompt_kv_bytes"] if resident_kv else 0),
+        "resident_kv_evictable_cache_bytes": (
+            resident_kv["evictable_prompt_kv_bytes"] if resident_kv else 0),
+        "resident_kv_dynamic_projected_bytes": (
+            resident_kv["dynamic_projected_bytes"] if resident_kv else 0),
+        "resident_kv_dynamic_ceiling_bytes": (
+            resident_kv["dynamic_ceiling_bytes"] if resident_kv else 0),
+        "resident_kv_paged": int(bool(
+            getattr(getattr(engine, "rc", None), "max_kv_mb", 0)
+            or (resident_kv or {}).get("adaptive_spill_required", 0))),
+        **retrieval_metadata,
     }
     schema_chars = sum(len(json.dumps(t, ensure_ascii=False)) for t in prompt_tools)
     print(
@@ -2739,7 +3477,12 @@ def _prepare_chat_prompt(engine, model_dir: Path, messages: list[dict], reasonin
         f"prompt_token_cache_hit={metadata['prompt_token_cache_hit']}",
         flush=True,
     )
-    return (PreparedPrompt(prompt, prompt_ids, tool_capsules), prompt_tokens, selected_tools,
+    return (PreparedPrompt(
+                prompt, prompt_ids, tool_capsules,
+                cache_namespace=cache_namespace,
+                force_paged_kv=bool(
+                    (resident_kv or {}).get("adaptive_spill_required", 0))),
+            prompt_tokens, selected_tools,
             selected_raw, metadata)
 
 
@@ -2775,6 +3518,37 @@ _HOLDBACK_MARKERS = {
     "gpt_oss": ("<tool_call>", "<|channel|>", "to=functions.", "commentary"),
 }
 _DEFAULT_HOLDBACK_MARKERS = ("<tool_call>",)
+
+# Hidden discovery is a start-of-output protocol: the virtual search call must
+# be the first non-whitespace output.  These are therefore deliberately the
+# complete starts of tool-call syntax rather than the broader fragments used
+# by the ordinary anywhere-in-output holdback above.  In particular, an
+# ordinary gpt-oss ``<|channel|>final`` response becomes direct as soon as the
+# channel name diverges from these prefixes.
+_HIDDEN_DECISION_MARKERS = {
+    "gpt_oss": (
+        "<tool_call>",
+        "<|channel|>commentary to=functions.",
+        "<|channel|>to=functions.",
+        "commentary to=functions.",
+        "to=functions.",
+    ),
+}
+
+
+def _hidden_decision_markers(model_type: str) -> tuple[str, ...]:
+    return _HIDDEN_DECISION_MARKERS.get(
+        model_type, _DEFAULT_HOLDBACK_MARKERS)
+
+
+def _hidden_marker_candidate(text: str, model_type: str) -> str:
+    candidate = text.lstrip()
+    if model_type == "gpt_oss":
+        # Harmony permits one-or-more spaces between ``commentary`` and
+        # ``to=functions``. Collapse them for prefix classification while
+        # preserving the original bytes for eventual streaming.
+        candidate = re.sub(r"\s+", " ", candidate)
+    return candidate
 
 
 def _safe_emit_len(pending: str, markers: tuple[str, ...]) -> int:
@@ -2825,6 +3599,114 @@ class _MarkerHoldback:
         return parsed_content[len(self.streamed):]
 
 
+class _HiddenDecisionStream:
+    """Stream a hidden-gateway decision once it cannot start with a call.
+
+    Only the leading whitespace/marker-prefix ambiguity is buffered. Once the
+    prefix diverges, the decision is permanently direct and its safe text is
+    forwarded incrementally. A second bounded holdback prevents a late marker
+    from leaking if a model violates the start-only hidden-search protocol;
+    the caller can then remove that virtual call before flushing the tail.
+    """
+
+    def __init__(self, model_type: str, emit):
+        self.model_type = model_type
+        self.start_markers = _hidden_decision_markers(model_type)
+        self.emit = emit
+        self.branch = "undecided"
+        self.prefix_pending = ""
+        self.direct_holdback = _MarkerHoldback(
+            _HOLDBACK_MARKERS.get(model_type, _DEFAULT_HOLDBACK_MARKERS))
+        self.late_marker_detected = False
+        self.finished = False
+
+    def _feed_direct(self, text: str) -> None:
+        safe = self.direct_holdback.feed(text)
+        if self.direct_holdback.holding:
+            self.late_marker_detected = True
+        if safe:
+            self.emit(safe)
+
+    def feed(self, text: str) -> None:
+        if self.finished or not text:
+            return
+        if self.branch == "tool":
+            return
+        if self.branch == "direct":
+            self._feed_direct(text)
+            return
+
+        self.prefix_pending += text
+        candidate = _hidden_marker_candidate(
+            self.prefix_pending, self.model_type)
+        if not candidate:
+            return
+        # Check a completed marker before the inverse prefix relationship:
+        # equality satisfies both, but is already conclusively the tool path.
+        if any(candidate.startswith(marker) for marker in self.start_markers):
+            self.branch = "tool"
+            return
+        if any(marker.startswith(candidate) for marker in self.start_markers):
+            return
+
+        self.branch = "direct"
+        pending, self.prefix_pending = self.prefix_pending, ""
+        self._feed_direct(pending)
+
+    def finish_direct(self, parsed_content: str) -> None:
+        """Flush direct content after all hidden calls have been removed."""
+        if self.finished:
+            return
+        if self.branch == "tool":
+            raise RuntimeError("cannot finish a tool-prefixed decision as direct")
+        if self.branch == "undecided":
+            self.branch = "direct"
+            pending, self.prefix_pending = self.prefix_pending, ""
+            self._feed_direct(pending)
+        remainder = self.direct_holdback.final_remainder(parsed_content)
+        if remainder:
+            self.emit(remainder)
+        self.finished = True
+
+
+def _cache_phase_telemetry(name: str, phase_result: dict) -> dict:
+    """Stable per-inference cache accounting for multi-phase Responses calls."""
+    stats = phase_result.get("path_stats") or {}
+    phase_prompt_tokens = int(phase_result.get("prompt_tokens", 0) or 0)
+    cached = min(phase_prompt_tokens, int(
+        stats.get("prompt_cache_prefix_tokens", 0) or 0))
+    pic_reused = int(stats.get("tool_pic_reused_tokens", 0) or 0)
+    return {
+        "phase": name,
+        "cache_namespace": stats.get("prompt_cache_namespace", name),
+        "input_tokens": phase_prompt_tokens,
+        "cached_tokens": cached,
+        "cache_write_tokens": min(phase_prompt_tokens, int(
+            stats.get("prompt_cache_write_tokens", 0) or 0)),
+        "effective_reused_tokens": min(
+            phase_prompt_tokens, cached + pic_reused),
+        "cache_source": stats.get("prompt_cache_source", "cold"),
+        "exact_hit": int(stats.get("prompt_cache_exact_hit", 0) or 0),
+        "tool_pic_reused_tokens": pic_reused,
+        "tool_pic_selected_tokens": int(
+            stats.get("tool_pic_selected_tokens", 0) or 0),
+        "suffix_prefill_seconds": round(float(
+            phase_result.get("prefill_s", 0.0) or 0.0), 4),
+        "cache_lookup_seconds": round(float(
+            stats.get("prompt_cache_lookup_s", 0.0) or 0.0), 4),
+        "admission_evicted_slots": int(stats.get(
+            "hot_prompt_admission_evicted_slots", 0) or 0),
+        "admission_evicted_bytes": int(stats.get(
+            "hot_prompt_admission_evicted_bytes", 0) or 0),
+        "admission_system_available_bytes": int(stats.get(
+            "hot_prompt_admission_system_available_bytes", 0) or 0),
+        "admission_system_floor_bytes": int(stats.get(
+            "hot_prompt_admission_system_floor_bytes", 0) or 0),
+        "admission_governor_reservations": int(stats.get(
+            "hot_prompt_admission_governor_reservations", 0) or 0),
+    }
+
+
 def _log_path_stats(result: dict, prompt_tokens: int) -> None:
     """F37 prompt-prefix caching (runtime/kv_store.py) has been enabled by
     default for every non-GLM model this whole time, but engine.generate()'s
@@ -2856,10 +3738,15 @@ def _log_path_stats(result: dict, prompt_tokens: int) -> None:
     hit = stats.get("prompt_cache_exact_hit")
     prefix = stats.get("prompt_cache_prefix_tokens", 0)
     source = stats.get("prompt_cache_source", "unknown")
+    namespace = stats.get("prompt_cache_namespace", "default")
+    admission_evicted = int(
+        stats.get("hot_prompt_admission_evicted_slots", 0) or 0)
+    admission_bytes = int(
+        stats.get("hot_prompt_admission_evicted_bytes", 0) or 0)
     lookup_s = float(stats.get("prompt_cache_lookup_s", 0.0) or 0.0)
     if stats.get("tool_pic"):
         print(
-            f"[server] tool-pic: exact_prefix={prefix}/{prompt_tokens}, "
+            f"[server] tool-pic[{namespace}]: exact_prefix={prefix}/{prompt_tokens}, "
             f"capsule_reused={int(stats.get('tool_pic_reused_tokens', 0) or 0)}, "
             f"selected={int(stats.get('tool_pic_selected_tokens', 0) or 0)}, "
             f"repaired={int(stats.get('tool_pic_repaired_tokens', 0) or 0)}, "
@@ -2871,7 +3758,7 @@ def _log_path_stats(result: dict, prompt_tokens: int) -> None:
     elif prefix or hit:
         pct = (100.0 * prefix / prompt_tokens) if prompt_tokens else 0.0
         print(
-            f"[server] prompt-cache: reused {prefix}/{prompt_tokens} prefix "
+            f"[server] prompt-cache[{namespace}]: reused {prefix}/{prompt_tokens} prefix "
             f"tokens ({pct:.0f}%) from {source} in {lookup_s:.3f}s"
             f"{' (exact hit, zero sweeps)' if hit else ''}; "
             f"suffix_prefill={result.get('prefill_s', 0.0):.3f}s, "
@@ -2880,12 +3767,19 @@ def _log_path_stats(result: dict, prompt_tokens: int) -> None:
         )
     else:
         print(
-            f"[server] prompt-cache: no prefix match ({prompt_tokens} tokens "
+            f"[server] prompt-cache[{namespace}]: no prefix match ({prompt_tokens} tokens "
             f"prefilled cold); lookup={lookup_s:.3f}s, "
             f"prefill={result.get('prefill_s', 0.0):.3f}s, "
             f"snapshot_writes="
             f"{float(stats.get('prompt_snapshot_write_s', 0.0) or 0.0) + float(stats.get('postgen_snapshot_write_s', 0.0) or 0.0):.3f}s, "
             f"engine_total={result.get('total_s', 0.0):.3f}s",
+            flush=True,
+        )
+    if admission_evicted:
+        print(
+            f"[server] prompt-cache[{namespace}] admission evicted "
+            f"{admission_evicted} unmatched slot(s), "
+            f"{admission_bytes / 1e9:.2f}GB resident KV",
             flush=True,
         )
 
@@ -2930,6 +3824,12 @@ def _vision_protocol_timing(result: dict) -> dict:
         "tool_pic_projected_bytes": int(metric(
             "tool_pic_projected_bytes",
             "vision_tool_pic_projected_bytes") or 0),
+        "tool_pic_system_available_bytes": int(metric(
+            "tool_pic_system_available_bytes") or 0),
+        "tool_pic_system_floor_bytes": int(metric(
+            "tool_pic_system_floor_bytes") or 0),
+        "tool_pic_system_memory_admitted": int(metric(
+            "tool_pic_system_memory_admitted") or 0),
         "prompt_state_approximate": int(metric(
             "prompt_state_approximate") or 0),
     }
@@ -3251,6 +4151,23 @@ class Handler(BaseHTTPRequestHandler):
                         or any(not isinstance(message, dict) for message in messages)):
                     return self._json(400, {
                         "error": "messages must be an array of objects"})
+                if route == "/messages":
+                    # Validate optional fields before the protocol-required
+                    # max_tokens field.  This keeps malformed values
+                    # diagnosable even when a minimal validation probe omits
+                    # max_tokens, and ensures request-shape errors are settled
+                    # before any model lookup or generation admission.
+                    stop_sequences = req.get("stop_sequences")
+                    if stop_sequences is not None and (
+                            not isinstance(stop_sequences, list)
+                            or not all(isinstance(value, str)
+                                       for value in stop_sequences)):
+                        return self._json(400, {
+                            "error": "stop_sequences must be a list of strings"})
+                    thinking = req.get("thinking")
+                    if thinking is not None and not isinstance(thinking, dict):
+                        return self._json(400, {
+                            "error": "thinking must be an object"})
             elif route == "/responses":
                 input_value = req.get("input", "")
                 if not isinstance(input_value, (str, list)):
@@ -3269,10 +4186,10 @@ class Handler(BaseHTTPRequestHandler):
             if mode not in ("lossless", "fast", "fast-long"):
                 return self._json(
                     400, {"error": "vmodel_mode must be lossless|fast|fast-long"})
+            token_budget_defaulted = False
             if route == "/responses":
-                max_tokens = _positive_token_limit(
-                    req.get("max_output_tokens", req.get("max_tokens", 64)),
-                    "max_output_tokens")
+                token_field = "max_output_tokens"
+                token_value = req.get("max_output_tokens", req.get("max_tokens"))
             elif route == "/chat/completions":
                 if (req.get("max_completion_tokens") is not None
                         and req.get("max_tokens") is not None):
@@ -3283,11 +4200,24 @@ class Handler(BaseHTTPRequestHandler):
                                else "max_tokens")
                 token_value = (req.get("max_completion_tokens")
                                if token_field == "max_completion_tokens"
-                               else req.get("max_tokens", 64))
-                max_tokens = _positive_token_limit(
-                    token_value, token_field)
+                               else req.get("max_tokens"))
+            elif route == "/messages":
+                token_field = "max_tokens"
+                token_value = req.get("max_tokens")
+                if token_value is None:
+                    raise RequestValidationError(
+                        "Anthropic Messages requires max_tokens")
             else:
-                max_tokens = _positive_token_limit(req.get("max_tokens", 64), "max_tokens")
+                token_field = "max_tokens"
+                token_value = req.get("max_tokens")
+            if token_value is None:
+                max_tokens = _omitted_output_token_limit()
+                token_budget_defaulted = True
+            else:
+                max_tokens = _positive_token_limit(token_value, token_field)
+            self._output_token_budget_source = (
+                "eos_safety_ceiling" if token_budget_defaulted else "request")
+            self._max_output_tokens = max_tokens
             stream_value = req.get("stream", False)
             if not isinstance(stream_value, bool):
                 return self._json(400, {"error": "stream must be a boolean"})
@@ -3323,18 +4253,7 @@ class Handler(BaseHTTPRequestHandler):
             else:
                 return self._json(400, {
                     "error": "stop must be a string or a list of strings"})
-            if route == "/messages":
-                stop_sequences = req.get("stop_sequences")
-                if stop_sequences is not None and (
-                        not isinstance(stop_sequences, list)
-                        or not all(isinstance(value, str)
-                                   for value in stop_sequences)):
-                    return self._json(400, {
-                        "error": "stop_sequences must be a list of strings"})
-                thinking = req.get("thinking")
-                if thinking is not None and not isinstance(thinking, dict):
-                    return self._json(400, {"error": "thinking must be an object"})
-            elif route == "/responses":
+            if route == "/responses":
                 reasoning = req.get("reasoning")
                 if reasoning is not None and not isinstance(reasoning, dict):
                     return self._json(400, {"error": "reasoning must be an object"})
@@ -3367,7 +4286,8 @@ class Handler(BaseHTTPRequestHandler):
             print(
                 f"[server] <- {self._route()} model={model_id} mode={mode} "
                 f"messages={len(_msgs) if isinstance(_msgs, list) else '?'} tools={len(_tools)} "
-                f"prompt_chars~{prompt_chars} max_tokens={max_tokens} stream={stream} "
+                f"prompt_chars~{prompt_chars} max_tokens={max_tokens}"
+                f"{'(eos-ceiling)' if token_budget_defaulted else ''} stream={stream} "
                 f"body_bytes={length}",
                 flush=True,
             )
@@ -3404,12 +4324,12 @@ class Handler(BaseHTTPRequestHandler):
             rendered_prompt_tokens = None
             if route == "/responses":
                 return self._do_responses(
-                    req, model_id, model_dir, engine, mode, stream, stop,
+                    req, model_id, model_dir, engine, mode, max_tokens, stream, stop,
                     tools, requested_tools, requested_tool_choice,
                     allow_parallel_tool_calls, normalized_messages, image_srcs)
             if route == "/messages":
                 return self._do_anthropic_messages(
-                    req, model_id, model_dir, engine, mode, stream, stop,
+                    req, model_id, model_dir, engine, mode, max_tokens, stream, stop,
                     tools, requested_tool_choice, allow_parallel_tool_calls,
                     normalized_messages, image_srcs)
             if route == "/chat/completions":
@@ -3740,13 +4660,26 @@ class Handler(BaseHTTPRequestHandler):
             import traceback
 
             traceback.print_exc()
+            if isinstance(e, MemoryError):
+                # A failed long prefill may own several GiB of KV through
+                # engine.last_kv.  Release that request before an agent harness
+                # retries, while preserving unrelated hot-prefix slots.
+                try:
+                    failed_engine = locals().get("engine")
+                    if failed_engine is not None:
+                        failed_engine.discard_failed_request_state()
+                        import mlx.core as mx
+                        mx.clear_cache()
+                except Exception:
+                    traceback.print_exc()
             try:
                 self._json(500, {"error": f"{type(e).__name__}: {e}"})
             except Exception:
                 pass
 
     def _do_responses(self, req: dict, model_id: str, model_dir: Path, engine, mode: str,
-                      stream: bool, stop: list, effective_raw_tools: list[dict],
+                      max_output_tokens: int, stream: bool, stop: list,
+                      effective_raw_tools: list[dict],
                       requested_raw_tools: list[dict], tool_choice: str,
                       allow_parallel_tool_calls: bool, msgs: list[dict],
                       image_srcs: list[str]) -> None:
@@ -3758,13 +4691,14 @@ class Handler(BaseHTTPRequestHandler):
         vision, streaming (typed SSE events), and reasoning/sampling-param
         honesty — the same standard as /v1/chat/completions."""
         instructions = req.get("instructions")
-        max_output_tokens = _positive_token_limit(
-            req.get("max_output_tokens", req.get("max_tokens", 64)),
-            "max_output_tokens")
         requested_temperature = req.get("temperature")
         requested_top_p = req.get("top_p")
         requested_top_k = req.get("top_k")
         requested_seed = req.get("seed")
+        progress_events = req.get("vmodel_progress_events", False)
+        if not isinstance(progress_events, bool):
+            raise RequestValidationError(
+                "vmodel_progress_events must be a boolean")
 
         # Responses API tools are FLAT ({"type":"function","name",...}); convert
         # to the {"type":"function","function":{...}} shape tools_preamble/
@@ -3784,16 +4718,102 @@ class Handler(BaseHTTPRequestHandler):
                 "Qwen3-VL model (e.g. Qwen3-VL-8B-Instruct) for image input")})
 
         msgs = _messages_for_structured_output(msgs, self._structured_output)
-        prompt, prompt_tokens, tools, selected_raw_tools, tool_selection = _prepare_chat_prompt(
-            engine, model_dir, msgs, self._reasoning_effort, tools,
-            raw_tools, mode, max_output_tokens,
-            enable_thinking=self._enable_thinking,
-            reasoning_requested=self._reasoning_requested)
+        all_tools = list(tools)
+        all_raw_tools = list(raw_tools)
+        gateway_enabled = (
+            _hidden_tool_gateway_enabled(mode, len(all_tools), tool_choice)
+            and not image_srcs
+        )
+        gateway_initial_tools = []
+        gateway_initial_raw = []
+        gateway_pinned = 0
+        gateway_force_reason = None
+        gateway_activation_key = ""
+        gateway_activated_names: tuple[str, ...] = ()
+        gateway_expansion_limit = 4
+        gateway_max_activated = 64
+        gateway_search_results = 4
+        gateway_virtual_tools = []
+        gateway_virtual_raw = []
+        if gateway_enabled:
+            try:
+                gateway_limit = int(os.environ.get(
+                    "VMODEL_FAST_TOOL_GATEWAY_LIMIT", "32"))
+                gateway_expansion_limit = int(os.environ.get(
+                    "VMODEL_FAST_TOOL_GATEWAY_EXPANSION_LIMIT", "4"))
+                gateway_max_activated = int(os.environ.get(
+                    "VMODEL_FAST_TOOL_GATEWAY_MAX_ACTIVATED", "64"))
+                gateway_search_results = int(os.environ.get(
+                    "VMODEL_FAST_TOOL_GATEWAY_SEARCH_RESULTS", "4"))
+            except ValueError as error:
+                raise RequestValidationError(
+                    "VMODEL fast tool gateway limits must be integers") from error
+            if not 1 <= gateway_limit <= 64:
+                raise RequestValidationError(
+                    "VMODEL_FAST_TOOL_GATEWAY_LIMIT must be in [1, 64]")
+            if not 1 <= gateway_expansion_limit <= 16:
+                raise RequestValidationError(
+                    "VMODEL_FAST_TOOL_GATEWAY_EXPANSION_LIMIT must be in [1, 16]")
+            if not gateway_limit <= gateway_max_activated <= 64:
+                raise RequestValidationError(
+                    "VMODEL_FAST_TOOL_GATEWAY_MAX_ACTIVATED must be between "
+                    "VMODEL_FAST_TOOL_GATEWAY_LIMIT and 64")
+            if not 1 <= gateway_search_results <= min(16, gateway_limit):
+                raise RequestValidationError(
+                    "VMODEL_FAST_TOOL_GATEWAY_SEARCH_RESULTS must be between "
+                    "1 and min(16, VMODEL_FAST_TOOL_GATEWAY_LIMIT)")
+            gateway_activation_key = _hidden_gateway_conversation_key(
+                model_id, all_tools, msgs)
+            gateway_activated_names = _hidden_gateway_activation_get(
+                gateway_activation_key, all_tools)
+            (gateway_initial_tools, gateway_initial_raw,
+             gateway_pinned, gateway_initial_retrieval) = _hidden_gateway_catalogs(
+                all_tools, all_raw_tools, msgs, limit=gateway_limit,
+                activated_names=gateway_activated_names,
+                expansion_limit=gateway_expansion_limit,
+                max_activated=gateway_max_activated)
+            gateway_force_reason = (
+                "client-required" if tool_choice == "required"
+                else _hidden_gateway_force_reason(msgs)
+            )
+            gateway_virtual_tools, gateway_virtual_raw = (
+                _hidden_gateway_virtual_pairs())
+            prompt_catalog = gateway_virtual_tools
+            prompt_raw_catalog = gateway_virtual_raw
+            decision_messages = _prepend_system_content(
+                msgs, _HIDDEN_GATEWAY_DECISION_POLICY)
+        else:
+            gateway_limit = 0
+            gateway_initial_retrieval = {}
+            prompt_catalog = all_tools
+            prompt_raw_catalog = all_raw_tools
+            decision_messages = msgs
+
+        prompt, prompt_tokens, prompt_tools, selected_raw_tools, tool_selection = \
+            _prepare_chat_prompt(
+                engine, model_dir, decision_messages, self._reasoning_effort,
+                prompt_catalog,
+                prompt_raw_catalog, mode, max_output_tokens,
+                enable_thinking=self._enable_thinking,
+                reasoning_requested=self._reasoning_requested,
+                cache_namespace=(
+                    "gateway_decision" if gateway_enabled else "default"))
+        gateway_decision_choice = (
+            f"specific:{_HIDDEN_TOOL_SEARCH_NAME}"
+            if gateway_enabled and gateway_force_reason is not None
+            else tool_choice
+        )
         self._constraint = _configure_constraint(
-            engine, self._structured_output, tools, tool_choice,
-            allow_parallel_tool_calls)
-        response_raw_tools = (requested_raw_tools if tool_choice == "none"
-                              else selected_raw_tools)
+            engine, self._structured_output, prompt_tools, gateway_decision_choice,
+            False if gateway_enabled else allow_parallel_tool_calls)
+        gateway_constraint = self._constraint
+        # API response parsing never admits the gateway-only virtual function.
+        # It may parse any caller-supplied real tool, while constrained decoding
+        # ensures the model itself only sees/calls the phase's selected subset.
+        response_parse_tools = all_tools
+        response_raw_tools = (
+            requested_raw_tools if gateway_enabled or tool_choice == "none"
+            else selected_raw_tools)
         wire_tool_choice = (
             {"type": "function", "name": tool_choice.split(":", 1)[1]}
             if tool_choice.startswith("specific:") else tool_choice)
@@ -3804,13 +4824,22 @@ class Handler(BaseHTTPRequestHandler):
         def build(text: str, n_tokens: int, result: dict | None = None) -> dict:
             result = result or {}
             path_stats = result.get("path_stats") or {}
-            cached_tokens = min(
-                prompt_tokens, int(path_stats.get("prompt_cache_prefix_tokens", 0) or 0))
-            cache_write_tokens = min(
-                prompt_tokens, int(path_stats.get("prompt_cache_write_tokens", 0) or 0))
+            phases = result.get("vmodel_cache_phases") or [
+                _cache_phase_telemetry("request", {
+                    **result,
+                    "prompt_tokens": int(
+                        result.get("prompt_tokens", prompt_tokens) or 0),
+                })
+            ]
+            usage_input_tokens = sum(int(
+                phase.get("input_tokens", 0) or 0) for phase in phases)
+            cached_tokens = sum(int(
+                phase.get("cached_tokens", 0) or 0) for phase in phases)
+            cache_write_tokens = sum(int(
+                phase.get("cache_write_tokens", 0) or 0) for phase in phases)
             incomplete = result.get("termination_reason") == "length"
             content, output = _responses_output_items(
-                text, tools, engine.cfg.model_type, response_message_id,
+                text, response_parse_tools, engine.cfg.model_type, response_message_id,
                 message_status="incomplete" if incomplete else "completed",
                 allow_parallel=allow_parallel_tool_calls)
             output_text = content
@@ -3825,16 +4854,19 @@ class Handler(BaseHTTPRequestHandler):
                 "tool_choice": wire_tool_choice, "tools": response_raw_tools,
                 "output": output, "output_text": output_text,
                 "usage": {
-                    "input_tokens": prompt_tokens,
+                    "input_tokens": usage_input_tokens,
                     "input_tokens_details": {
                         "cached_tokens": cached_tokens,
                         "cache_write_tokens": cache_write_tokens,
                     },
                     "output_tokens": n_tokens,
                     "output_tokens_details": {"reasoning_tokens": 0},
-                    "total_tokens": prompt_tokens + n_tokens,
+                    "total_tokens": usage_input_tokens + n_tokens,
                 },
+                "vmodel_cache_phases": phases,
                 "vmodel_sampling": self._sampling.profile,
+                "vmodel_max_output_tokens": max_output_tokens,
+                "vmodel_output_budget_source": self._output_token_budget_source,
                 "vmodel_top_k": requested_top_k,
                 "vmodel_seed": requested_seed,
                 "vmodel_reasoning_effort": self._reasoning_effort,
@@ -3866,6 +4898,264 @@ class Handler(BaseHTTPRequestHandler):
                 **PACKS.status_fields(model_id),
             }
 
+        def run_hidden_gateway(on_token=None, on_progress=None):
+            """Run one hidden discovery decision and at most one real-tool pass."""
+            nonlocal prompt, prompt_tokens, prompt_tools, selected_raw_tools
+            nonlocal tool_selection
+
+            decision_stream = (
+                _HiddenDecisionStream(engine.cfg.model_type, on_token)
+                if on_token is not None else None
+            )
+            decision = engine.generate(
+                prompt, max_output_tokens, stop=stop,
+                on_token=(decision_stream.feed if decision_stream is not None else None),
+                on_progress=on_progress, sampling=self._sampling,
+                constraint=gateway_constraint)
+            decision_cache_phase = _cache_phase_telemetry(
+                "gateway_decision", decision)
+            decision_content, calls = _parse_request_tool_calls(
+                decision["text"], prompt_tools, engine.cfg.model_type,
+                allow_parallel=False)
+            gateway_call = next(
+                (call for call in calls
+                 if call["function"]["name"] in (
+                     _HIDDEN_TOOL_SEARCH_NAME, _HIDDEN_TOOL_ENABLE_NAME)),
+                None,
+            )
+            # A hidden catalog action is valid only at the first non-whitespace
+            # output.
+            # Once direct text was streamed, retracting it would violate SSE's
+            # append-only contract. Suppress only the late virtual call, while
+            # preserving any real caller tool marker for the ordinary parser.
+            late_gateway_suppressed = bool(
+                gateway_call is not None
+                and decision_stream is not None
+                and decision_stream.branch == "direct"
+            )
+            if late_gateway_suppressed:
+                visible_text, _hidden_calls = _parse_request_tool_calls(
+                    decision["text"], gateway_virtual_tools,
+                    engine.cfg.model_type,
+                    allow_parallel=False)
+                decision["text"] = visible_text
+                decision_content, _visible_calls = _parse_request_tool_calls(
+                    visible_text, response_parse_tools, engine.cfg.model_type,
+                    allow_parallel=allow_parallel_tool_calls)
+                gateway_call = None
+            decision_branch = (
+                decision_stream.branch
+                if decision_stream is not None
+                else ("tool" if gateway_call is not None else "direct")
+            )
+            if decision_branch == "undecided":
+                decision_branch = "direct"
+            decision_meta = {
+                "requested": len(all_tools),
+                "selected": len(gateway_initial_tools),
+                "lossy_shortlist": len(gateway_initial_tools) != len(all_tools),
+                "shortlist_soft_limit": gateway_limit,
+                "gateway_search_result_cap": gateway_search_results,
+                "pinned": gateway_pinned,
+                "hidden_tool_gateway": True,
+                "gateway_phase": "direct",
+                "gateway_decision_prompt_tokens": int(
+                    decision.get("prompt_tokens", prompt_tokens)),
+                "gateway_decision_output_tokens": len(decision.get("tokens", ())),
+                "gateway_search_rounds": 0,
+                "gateway_search_forced": int(gateway_force_reason is not None),
+                "gateway_force_reason": gateway_force_reason,
+                "gateway_decision_branch": decision_branch,
+                "gateway_direct_streaming": bool(
+                    decision_stream is not None
+                    and decision_stream.branch == "direct"),
+                # Keep the old field for wire/log compatibility while exposing
+                # the action-neutral name to new harnesses.
+                "gateway_late_search_suppressed": int(
+                    late_gateway_suppressed),
+                "gateway_late_catalog_action_suppressed": int(
+                    late_gateway_suppressed),
+                "tool_retrieval_profile": "hybrid-lexical-capability-v1",
+                **gateway_initial_retrieval,
+            }
+            if gateway_call is None:
+                tool_selection = {**tool_selection, **decision_meta}
+                decision["vmodel_cache_phases"] = [decision_cache_phase]
+                if decision_stream is not None:
+                    if decision_stream.branch == "tool":
+                        # A leading marker was conclusive, but it was a real
+                        # caller tool (or malformed marker), not hidden search.
+                        # Replay through the ordinary marker-aware streamer.
+                        if decision["text"]:
+                            on_token(decision["text"])
+                        decision["first_token_s"] = decision.get(
+                            "total_s", decision.get("first_token_s", 0.0))
+                    else:
+                        decision_stream.finish_direct(decision_content)
+                return decision
+
+            gateway_call_name = gateway_call["function"]["name"]
+            try:
+                arguments = json.loads(gateway_call["function"]["arguments"])
+            except (TypeError, ValueError) as error:
+                raise RuntimeError(
+                    "hidden tool gateway produced invalid catalog arguments") from error
+            if gateway_call_name == _HIDDEN_TOOL_ENABLE_NAME and gateway_initial_tools:
+                query = ""
+                routed_limit = gateway_limit
+                selected_tools = gateway_initial_tools
+                selected_raw = gateway_initial_raw
+                pinned = gateway_pinned
+                retrieval_meta = {
+                    **gateway_initial_retrieval,
+                    "gateway_activation_profile": "enabled",
+                }
+            else:
+                if gateway_call_name == _HIDDEN_TOOL_SEARCH_NAME:
+                    query = str(arguments.get("query", "")).strip()
+                else:
+                    # An initial/expired activation cannot be enabled. Preserve
+                    # the model's action decision and perform a normal semantic
+                    # lookup against the latest user intent.
+                    from .toolcalls import semantic_tool_query
+
+                    query = semantic_tool_query(msgs)
+                if not query:
+                    raise RuntimeError(
+                        "hidden tool gateway produced an empty search query")
+                # `gateway_limit` bounds the activated catalog, not the amount
+                # one semantic lookup should eagerly materialize. Add only the
+                # best few results; a later decision pass can expand by another
+                # bounded batch when the first tool is unsuitable or a new
+                # capability/page is required.
+                routed_limit = _hidden_gateway_search_result_limit(
+                    gateway_limit, gateway_search_results,
+                    arguments.get("max_results", gateway_limit))
+                (selected_tools, selected_raw, pinned,
+                 retrieval_meta) = _hidden_gateway_catalogs(
+                    all_tools, all_raw_tools, msgs, query=query,
+                    limit=routed_limit,
+                    activated_names=gateway_activated_names,
+                    expansion_limit=gateway_expansion_limit,
+                    max_activated=gateway_max_activated)
+            _hidden_gateway_activation_put(
+                gateway_activation_key, selected_tools)
+            call_id = f"vmodel_gateway_{uuid.uuid4().hex[:12]}"
+            gateway_call_arguments = (
+                {} if gateway_call_name == _HIDDEN_TOOL_ENABLE_NAME else
+                {"query": query, "max_results": routed_limit})
+            internal_messages = list(msgs) + [
+                {
+                    "role": "assistant", "content": "",
+                    "tool_calls": [{
+                        "id": call_id, "type": "function",
+                        "function": {
+                            "name": gateway_call_name,
+                            "arguments": json.dumps(
+                                gateway_call_arguments,
+                                ensure_ascii=False, separators=(",", ":")),
+                        },
+                    }],
+                },
+                {
+                    "role": "tool", "tool_call_id": call_id,
+                    "name": gateway_call_name,
+                    "content": json.dumps({
+                        "status": "enabled",
+                        "tools": [
+                            tool["function"]["name"] for tool in selected_tools
+                        ],
+                    }, ensure_ascii=False, separators=(",", ":")),
+                },
+            ]
+            execution_messages = _prepend_system_content(
+                internal_messages, _HIDDEN_GATEWAY_REAL_TOOL_POLICY)
+            abstain_tool, abstain_raw = _hidden_tool_abstain_pair()
+            execution_tools = [*selected_tools, abstain_tool]
+            execution_raw = [*selected_raw, abstain_raw]
+            prompt, prompt_tokens, prompt_tools, selected_raw_tools, phase_meta = \
+                _prepare_chat_prompt(
+                    engine, model_dir, execution_messages, self._reasoning_effort,
+                    execution_tools, execution_raw, mode, max_output_tokens,
+                    enable_thinking=self._enable_thinking,
+                    reasoning_requested=self._reasoning_requested,
+                    cache_namespace="gateway_execution")
+            self._constraint = _configure_constraint(
+                engine, self._structured_output, prompt_tools, "required",
+                False)
+            result = engine.generate(
+                prompt, max_output_tokens, stop=stop,
+                on_progress=on_progress, sampling=self._sampling,
+                constraint=self._constraint)
+            execution_cache_phase = _cache_phase_telemetry(
+                "gateway_execution", result)
+            _execution_content, execution_calls = _parse_request_tool_calls(
+                result["text"], prompt_tools, engine.cfg.model_type,
+                allow_parallel=False)
+            abstain_call = next(
+                (call for call in execution_calls
+                 if call["function"]["name"] == _HIDDEN_TOOL_ABSTAIN_NAME),
+                None,
+            )
+            real_calls = [
+                call for call in execution_calls
+                if call["function"]["name"] != _HIDDEN_TOOL_ABSTAIN_NAME
+            ]
+            if abstain_call is not None:
+                execution_outcome = "no_suitable_tool"
+                result["text"] = _HIDDEN_GATEWAY_ABSTAIN_TEXT
+            elif real_calls:
+                execution_outcome = "real_tool"
+            else:
+                # Required structured generation can still hit a very small
+                # output limit before closing its marker. Never expose that
+                # partial virtual/real call as ordinary assistant prose.
+                execution_outcome = "invalid_or_incomplete_tool_call"
+                result["text"] = _HIDDEN_GATEWAY_ABSTAIN_TEXT
+            if on_token is not None and result["text"]:
+                # The execution choice was buffered because the abstention is
+                # gateway-private. Replay only the public real call or the
+                # converted ordinary explanation through the outer streamer.
+                on_token(result["text"])
+            hidden_total = float(decision.get("total_s", 0.0))
+            result["prefill_s"] = (
+                float(result.get("prefill_s", 0.0))
+                + float(decision.get("prefill_s", 0.0)))
+            result["decode_s"] = (
+                float(result.get("decode_s", 0.0))
+                + float(decision.get("decode_s", 0.0)))
+            result["first_token_s"] = (
+                float(result.get("first_token_s", 0.0)) + hidden_total)
+            result["total_s"] = float(result.get("total_s", 0.0)) + hidden_total
+            result["vmodel_cache_phases"] = [
+                decision_cache_phase, execution_cache_phase]
+            tool_selection = {
+                **phase_meta,
+                **decision_meta,
+                "selected": len(selected_tools),
+                "lossy_shortlist": len(selected_tools) != len(all_tools),
+                "pinned": pinned,
+                "gateway_phase": (
+                    "enable" if gateway_call_name == _HIDDEN_TOOL_ENABLE_NAME
+                    else "search"),
+                "gateway_search_rounds": int(
+                    gateway_call_name == _HIDDEN_TOOL_SEARCH_NAME),
+                "gateway_enable_rounds": int(
+                    gateway_call_name == _HIDDEN_TOOL_ENABLE_NAME),
+                "gateway_catalog_action": gateway_call_name,
+                "gateway_activated_tools": len(selected_tools),
+                "gateway_execution_choice_required": True,
+                "gateway_real_tool_required": False,
+                "gateway_abstention_available": True,
+                "gateway_execution_outcome": execution_outcome,
+                "gateway_query_sha256": (
+                    hashlib.sha256(query.encode("utf-8")).hexdigest()[:16]
+                    if query else None),
+                "gateway_requested_results": routed_limit,
+                **retrieval_meta,
+            }
+            return result
+
         if image_srcs:
             from .qwen3vl import generate_vl
 
@@ -3877,7 +5167,7 @@ class Handler(BaseHTTPRequestHandler):
                 prompt_label="expanded vision prompt", output_label="max_output_tokens")
             if stream:
                 return self._stream_responses(
-                    prompt, max_output_tokens, stop, engine, tools,
+                    prompt, max_output_tokens, stop, engine, prompt_tools,
                     build, rid, model_id, created_at, instructions,
                     requested_temperature, requested_top_p, response_raw_tools,
                     response_message_id, wire_tool_choice, allow_parallel_tool_calls,
@@ -3886,6 +5176,7 @@ class Handler(BaseHTTPRequestHandler):
                         on_token=on_token, stop=stop, on_progress=on_progress,
                         prepared=prepared_vl, sampling=self._sampling,
                         constraint=self._constraint),
+                    progress_events=progress_events,
                 )
             result = generate_vl(
                 engine, prompt, images, max_output_tokens, stop=stop,
@@ -3895,22 +5186,32 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(200, build(result["text"], len(result["tokens"]), result))
 
         if stream:
-            return self._stream_responses(prompt, max_output_tokens, stop, engine, tools,
+            return self._stream_responses(
+                                          prompt, max_output_tokens, stop, engine,
+                                          (response_parse_tools if gateway_enabled
+                                           else prompt_tools),
                                           build, rid, model_id, created_at, instructions,
                                           requested_temperature, requested_top_p,
                                           response_raw_tools, response_message_id,
-                                          wire_tool_choice, allow_parallel_tool_calls)
+                                          wire_tool_choice, allow_parallel_tool_calls,
+                                          generate_fn=(run_hidden_gateway
+                                                       if gateway_enabled else None),
+                                          progress_events=progress_events)
 
-        result = engine.generate(
-            prompt, max_output_tokens, stop=stop, sampling=self._sampling,
-            constraint=self._constraint)
+        result = (
+            run_hidden_gateway()
+            if gateway_enabled else
+            engine.generate(
+                prompt, max_output_tokens, stop=stop, sampling=self._sampling,
+                constraint=self._constraint)
+        )
         _log_path_stats(result, result.get("prompt_tokens", 0))
         self._json(200, build(result["text"], len(result["tokens"]), result))
 
     def _stream_responses(self, prompt, max_tokens, stop, engine, tools, build, rid, model_id,
                           created_at, instructions, temperature, top_p, raw_tools,
                           response_message_id, tool_choice, allow_parallel_tool_calls,
-                          generate_fn=None):
+                          generate_fn=None, progress_events=False):
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream")
         self.send_header("Cache-Control", "no-cache")
@@ -4019,20 +5320,60 @@ class Handler(BaseHTTPRequestHandler):
                     done = int(progress.get("completed_tokens", 0))
                     total = int(progress.get("total_tokens", 0))
                     label = "prefill"
-                self.wfile.write(f": {label} {done}/{total}\n\n".encode())
-                self.wfile.flush()
+                if progress_events:
+                    emit(
+                        f"response.vmodel.{label}_progress",
+                        phase=label,
+                        completed=done,
+                        total=total,
+                        fraction=(done / total if total else 0.0),
+                        cache_source=progress.get("cache_source", "cold"),
+                    )
+                else:
+                    self.wfile.write(f": {label} {done}/{total}\n\n".encode())
+                    self.wfile.flush()
             except (BrokenPipeError, ConnectionResetError):
                 print("[server] !! client disconnected during prefill", flush=True)
                 raise
 
-        result = (
-            generate_fn(on_token, on_progress)
-            if generate_fn is not None else
-            engine.generate(
-                prompt, max_tokens, on_token=on_token, stop=stop,
-                on_progress=on_progress, sampling=self._sampling,
-                constraint=self._constraint)
-        )
+        try:
+            result = (
+                generate_fn(on_token, on_progress)
+                if generate_fn is not None else
+                engine.generate(
+                    prompt, max_tokens, on_token=on_token, stop=stop,
+                    on_progress=on_progress, sampling=self._sampling,
+                    constraint=self._constraint)
+            )
+        except (BrokenPipeError, ConnectionResetError):
+            raise
+        except Exception as error:
+            # Headers and response.created are already on the wire. Attempting
+            # to append an HTTP 500 JSON document to this SSE stream makes
+            # Responses clients see an abrupt/truncated transport and retry the
+            # identical multi-GiB request indefinitely. Terminate the protocol
+            # correctly with response.failed instead.
+            import traceback
+
+            traceback.print_exc()
+            if isinstance(error, MemoryError):
+                try:
+                    engine.discard_failed_request_state()
+                    import mlx.core as mx
+                    mx.clear_cache()
+                except Exception:
+                    traceback.print_exc()
+            failed = {
+                **in_progress,
+                "status": "failed",
+                "error": {
+                    "code": "server_memory_error" if isinstance(
+                        error, MemoryError) else "server_error",
+                    "message": f"{type(error).__name__}: {error}",
+                },
+            }
+            emit("response.failed", response=failed)
+            return
         _log_path_stats(result, result.get("prompt_tokens", 0))
         final = build(result["text"], len(result["tokens"]), result)
         message_item = next(
@@ -4088,7 +5429,8 @@ class Handler(BaseHTTPRequestHandler):
              else "response.completed", response=final)
 
     def _do_anthropic_messages(self, req: dict, model_id: str, model_dir: Path, engine, mode: str,
-                               stream: bool, stop: list, raw_tools: list[dict],
+                               max_tokens: int, stream: bool, stop: list,
+                               raw_tools: list[dict],
                                tool_choice: str, allow_parallel_tool_calls: bool,
                                msgs: list[dict],
                                image_srcs: list[str]) -> None:
@@ -4102,8 +5444,6 @@ class Handler(BaseHTTPRequestHandler):
         honesty."""
         import json as _json
 
-        max_tokens = _positive_token_limit(
-            req.get("max_tokens", 64), "max_tokens")  # real API requires it; local default retained
         stop_sequences = req.get("stop_sequences") or []
         all_stop = list(stop) + list(stop_sequences)
         requested_temperature = req.get("temperature")

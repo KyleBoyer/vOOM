@@ -114,6 +114,12 @@ class WeightStore:
         self.on_disk_quantized = False
         self.quantization_identity = "none"
         self.quantized_bytes_per_weight = 0.0
+        # Physical expert payload estimate for trace/layout simulation. This is
+        # deliberately separate from the materialized WeightCache size: Kimi
+        # K2.5 reads released INT4+BF16-scales but currently expands to BF16 in
+        # memory, while runtime quantize-on-load does the opposite (reads BF16,
+        # retains a smaller QTensor).
+        self.expert_storage_bytes_per_weight = 2.0
 
         # Store preference: vpack2 (sequential archive, coalesced reads) over vpack
         # (per-tensor files) over raw safetensors. Both packed forms are bit-exact.
@@ -279,6 +285,31 @@ class WeightStore:
                 )
                 for aux in self._quant_aux.values()
             )
+            self.expert_storage_bytes_per_weight = (
+                self.quantized_bytes_per_weight)
+        elif self._ct_int4_aux:
+            # compressed-tensors groupwise INT4 stores 4 payload bits/weight
+            # plus one BF16 scale per group. Read the released descriptor rather
+            # than hard-coding K2.5's currently observed group size 32.
+            candidates = []
+            for group in self.quantization.get("config_groups", {}).values():
+                weights = group.get("weights", {}) if isinstance(group, dict) else {}
+                try:
+                    bits = int(weights["num_bits"])
+                    group_size = int(weights["group_size"])
+                except (KeyError, TypeError, ValueError):
+                    continue
+                if bits > 0 and group_size > 0:
+                    candidates.append(bits / 8 + 2 / group_size)
+            # An unfamiliar descriptor must not make an otherwise-decodable
+            # checkpoint unloadable merely for telemetry; retain the safe BF16
+            # fallback when the physical format cannot be priced here.
+            if candidates:
+                self.expert_storage_bytes_per_weight = max(candidates)
+        elif self.config.model_type == "gpt_oss":
+            # Released MXFP4 blocks plus scales/metadata. Match the existing
+            # conservative resident/admission estimate used by engine.py.
+            self.expert_storage_bytes_per_weight = 0.6
         elif (self.quantization and self.config.model_type != "gpt_oss"
                 and not (self.quantization.get("quant_method") == "compressed-tensors"
                          and self.quantization.get("format") == "pack-quantized"
@@ -325,6 +356,40 @@ class WeightStore:
 
     def has(self, name: str) -> bool:
         return name in self.weight_map
+
+    def estimate_expert_storage_page_bytes(
+            self, expert_prefix: str, fallback: int) -> int:
+        """Return an average physical expert page size without reading weights.
+
+        Vpack2 already has exact compressed extent lengths in its immutable
+        index, so use them. Raw/legacy stores fall back to architecture/format
+        math; individual safetensors do not expose compressed expert extents.
+        The planner still charges pages independently, so this is an average
+        byte estimate rather than a claim that every compressed page is equal.
+        """
+        fallback = int(fallback)
+        if self.vpack2 is None:
+            return fallback
+        marker = f".{expert_prefix}."
+        page_bytes: dict[tuple[str, int], int] = defaultdict(int)
+        for logical_name in self._names:
+            if marker not in logical_name:
+                continue
+            layer_prefix, suffix = logical_name.split(marker, 1)
+            if not layer_prefix.startswith("model.layers."):
+                continue
+            try:
+                expert = int(suffix.split(".", 1)[0])
+            except ValueError:
+                continue
+            physical_name = self._real_name.get(logical_name, logical_name)
+            entry = self.vpack2.index.get(physical_name)
+            if entry is None:
+                continue
+            page_bytes[(layer_prefix, expert)] += int(entry["len"])
+        if not page_bytes:
+            return fallback
+        return round(sum(page_bytes.values()) / len(page_bytes))
 
     def is_quantized(self, name: str) -> bool:
         """Whether one logical matrix is stored as an MLX quantized triplet.

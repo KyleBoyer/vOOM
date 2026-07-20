@@ -145,6 +145,9 @@ def test_weightstore_fetch_dequantizes_int4_experts_transparently():
     from runtime.model_loader import WeightStore
 
     store = WeightStore(str(MODEL_DIR))
+    # Layout simulation must charge released INT4 payload + one BF16 scale per
+    # 32 weights, not the BF16 array materialized by fetch().
+    assert store.expert_storage_bytes_per_weight == pytest.approx(0.5625)
     logical_name = "model.layers.4.mlp.experts.0.down_proj.weight"
     assert store.has(logical_name)
     out, _secs, nbytes = store.fetch([logical_name])

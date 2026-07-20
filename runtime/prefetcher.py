@@ -26,26 +26,41 @@ class Prefetcher:
         self._lock = threading.Lock()
         self.scheduled_count = 0
         self.skipped_budget = 0
+        self.skipped_busy = 0
         self.paused = False  # set by the memory-pressure governor
         self._closing = threading.Event()
         self._workers = [threading.Thread(target=self._run, daemon=True) for _ in range(max(1, workers))]
         for w in self._workers:
             w.start()
 
-    def schedule(self, key: str, names: list[str]):
+    def schedule(self, key: str, names: list[str], *, only_if_idle: bool = False) -> bool:
+        """Schedule one hint and report whether it was accepted.
+
+        ``only_if_idle`` is for speculative expert traffic.  Existing queued or
+        active prefetch work means the storage/decode path has no demonstrated
+        spare slot, so the hint is dropped instead of competing with known work.
+        Demand remains authoritative regardless of this advisory check.
+        """
         if self.paused or self._closing.is_set():
-            return
+            return False
         with self._lock:
+            # _scheduled contains queued AND active keys (removed only after a
+            # worker finishes), making this an atomic no-backlog gate without
+            # relying on Queue.empty() races.
+            if only_if_idle and self._scheduled:
+                self.skipped_busy += 1
+                return False
             if key in self._scheduled:
-                return
+                return False
             if self.cache.contains(key) or self.cache.inflight(key):
-                return
+                return False
             if not self.cache.would_fit(self.page_size_hint):
                 self.skipped_budget += 1
-                return
+                return False
             self._scheduled.add(key)
             self.scheduled_count += 1
         self._q.put((key, names))
+        return True
 
     def _run(self):
         while True:
@@ -86,4 +101,8 @@ class Prefetcher:
             raise RuntimeError(f"prefetch workers did not stop during close: {alive}")
 
     def summary(self) -> str:
-        return f"prefetch: {self.scheduled_count} scheduled, {self.skipped_budget} skipped (budget)"
+        return (
+            f"prefetch: {self.scheduled_count} scheduled, "
+            f"{self.skipped_budget} skipped (budget), "
+            f"{self.skipped_busy} speculative skipped (busy)"
+        )

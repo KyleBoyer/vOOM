@@ -8,7 +8,10 @@ predictor widens that window to a full layer step by prefetching layer i+1's lik
 experts as soon as layer i routes.
 
 Counts are learned online and persisted per model (expert_transitions.json), so
-acceptance improves across runs and across prompts with similar workloads.
+held-out accuracy can improve across runs and prompts with similar workloads.
+Issuing I/O from these predictions is separately gated by
+``RuntimeConfig.expert_predictive_prefetch`` and remains off by default: measured
+predictor recall does not prove spare storage bandwidth or a wall-clock win.
 """
 
 from __future__ import annotations

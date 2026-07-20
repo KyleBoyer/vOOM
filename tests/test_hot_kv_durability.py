@@ -31,11 +31,13 @@ def _journal(tmp_path: Path, *, chunk_size: int = 2,
         max_checkpoints=max_checkpoints, max_bytes=max_bytes)
 
 
-def _save(journal, tokens, *, parent=(), covered=0):
+def _save(journal, tokens, *, parent=(), covered=0,
+          cache_namespace="default"):
     kv, logits = _state(tokens)
     return journal.save(
         tuple(parent), covered, tokens, kv, logits, logits,
-        prompt_length=len(tokens), reusable_prefix=len(tokens))
+        prompt_length=len(tokens), reusable_prefix=len(tokens),
+        cache_namespace=cache_namespace)
 
 
 def _flip_one_byte_same_size(path: Path) -> None:
@@ -401,6 +403,38 @@ def test_tool_capsule_spans_survive_restart_load(tmp_path):
 
     assert len(loaded) == 1
     assert loaded[0][7] == capsules
+
+
+def test_decision_and_execution_namespaces_both_survive_one_slot_disk_tier(
+        tmp_path):
+    """RAM capacity must not decide which hidden phase remains durable."""
+    journal = _journal(tmp_path, max_checkpoints=8)
+    decision_tokens = list(range(8))
+    execution_tokens = list(range(20, 30))
+    _save(journal, decision_tokens, cache_namespace="gateway_decision")
+    _save(journal, execution_tokens, cache_namespace="gateway_execution")
+
+    # Both checkpoint generations coexist even though an engine may load only
+    # one of them into a slots=1 memory tier.
+    checkpoint_metas = [
+        json.loads(path.read_text()) for path in tmp_path.glob("*.ckpt.json")]
+    assert {meta["cache_namespace"] for meta in checkpoint_metas} == {
+        "gateway_decision", "gateway_execution"}
+
+    assert journal.find_best_match(
+        decision_tokens, 2, cache_namespace="gateway_execution") is None
+    decision_match = journal.find_best_match(
+        decision_tokens, 2, cache_namespace="gateway_decision")
+    execution_match = journal.find_best_match(
+        execution_tokens, 2, cache_namespace="gateway_execution")
+    assert decision_match is not None
+    assert execution_match is not None
+    assert journal.load_matched_chain(decision_match, 1) is not None
+    assert journal.load_matched_chain(execution_match, 1) is not None
+
+    loaded = _journal(tmp_path).load_all(num_layers=1, limit=2)
+    assert {entry[9] for entry in loaded} == {
+        "gateway_decision", "gateway_execution"}
 
 
 def test_invalid_persisted_tool_capsule_spans_fail_closed(tmp_path):

@@ -15,10 +15,27 @@ from runtime.server import (Handler, INFER_LOCK, PreparedPrompt, RequestValidati
                             _TokenOffsetIndex,
                             _active_context_limit,
                             _advertised_model_ids,
+                            _cache_phase_telemetry,
                             _execution_profile_fields,
+                            _fast_dense_resident_kv_projection,
+                            _hidden_gateway_catalogs,
+                            _hidden_gateway_activation_clear,
+                            _hidden_gateway_activation_get,
+                            _hidden_gateway_activation_put,
+                            _hidden_gateway_conversation_key,
+                            _HiddenDecisionStream,
+                            _hidden_gateway_decision_choice,
+                            _hidden_gateway_force_reason,
+                            _hidden_gateway_search_result_limit,
+                            _hidden_tool_gateway_enabled,
+                            _hidden_tool_abstain_pair,
+                            _hidden_tool_enable_pair,
+                            _hidden_tool_search_pair,
+                            _hidden_gateway_virtual_pairs,
                             _load_vision_images,
                             _MarkerHoldback,
                             _chat_prompt,
+                            _omitted_output_token_limit,
                             _positive_token_limit,
                             _prepare_chat_prompt, _render_template,
                             _compiled_template,
@@ -28,8 +45,10 @@ from runtime.server import (Handler, INFER_LOCK, PreparedPrompt, RequestValidati
                             _dspark_draft_for,
                             _speculative_draft_for,
                             _request_reasoning_controls, _request_sampling,
+                            _registry,
                             _tool_capsule_spans,
                             _vision_protocol_timing,
+                            _validate_fast_dense_resident_kv,
                             _validate_context_budget, _validate_generation_controls,
                             split_model_mode)
 
@@ -94,6 +113,9 @@ def test_vision_protocol_timing_uses_generic_path_stats():
         "tool_pic_repaired_tokens": 4,
         "tool_pic_memory_admitted": 1,
         "tool_pic_projected_bytes": 123_456,
+        "tool_pic_system_available_bytes": 0,
+        "tool_pic_system_floor_bytes": 0,
+        "tool_pic_system_memory_admitted": 0,
         "prompt_state_approximate": 1,
     }
 
@@ -608,6 +630,275 @@ def test_fast_shortlist_is_permutation_invariant_at_score_ties(tmp_path):
     assert {t["function"]["name"] for t in second[2]} == {"alpha", "beta"}
 
 
+def test_hidden_tool_gateway_starts_virtual_only_then_retrieves_real_tools():
+    from unittest.mock import patch
+
+    tools = [
+        _named_tool("workspace_execute", "Execute a shell command in the workspace."),
+        _named_tool("browser_open", "Open a web page in a browser."),
+        _named_tool("calendar_create", "Create a calendar event."),
+    ]
+    raw = [{
+        "type": "function",
+        "name": tool["function"]["name"],
+        "description": tool["function"]["description"],
+        "parameters": tool["function"]["parameters"],
+    } for tool in tools]
+    messages = [{"role": "user", "content": "Tell me a NodeJS joke."}]
+    initial, initial_raw, pinned, retrieval = _hidden_gateway_catalogs(
+        tools, raw, messages, limit=2)
+    assert initial == [] and initial_raw == [] and pinned == 0
+    assert retrieval["tool_embedding_status"] == "not_queried"
+
+    selected, selected_raw, pinned, retrieval = _hidden_gateway_catalogs(
+        tools, raw, messages, query="open this page in the browser", limit=2)
+    assert "browser_open" in {
+        tool["function"]["name"] for tool in selected
+    }
+    assert "browser_open" in {tool["name"] for tool in selected_raw}
+    assert len(selected) == 2 and pinned == 0
+    assert "tool_retrieval_profile" in retrieval
+
+    virtual, virtual_raw = _hidden_tool_search_pair()
+    assert virtual["function"]["name"] == "vmodel_search_tools"
+    assert virtual_raw["name"] == "vmodel_search_tools"
+    enable, enable_raw = _hidden_tool_enable_pair()
+    assert enable["function"]["name"] == "vmodel_enable_tools"
+    assert enable_raw["name"] == "vmodel_enable_tools"
+    virtuals, virtuals_raw = _hidden_gateway_virtual_pairs()
+    assert [tool["function"]["name"] for tool in virtuals] == [
+        "vmodel_search_tools", "vmodel_enable_tools"]
+    assert [tool["name"] for tool in virtuals_raw] == [
+        "vmodel_search_tools", "vmodel_enable_tools"]
+    abstain, abstain_raw = _hidden_tool_abstain_pair()
+    assert abstain["function"]["name"] == "vmodel_no_suitable_tool"
+    assert abstain_raw["parameters"]["required"] == ["reason"]
+    with patch.dict(os.environ, {"VMODEL_FAST_TOOL_GATEWAY": "1"}):
+        assert _hidden_tool_gateway_enabled("fast", len(tools), "auto")
+        assert not _hidden_tool_gateway_enabled("lossless", len(tools), "auto")
+        assert not _hidden_tool_gateway_enabled("fast", len(tools), "specific:browser_open")
+
+
+def test_plex_transcript_keeps_fixed_decision_catalog_and_pinned_execution_set():
+    """Regression for the user's real 2026-07-19 Plex pagination transcript."""
+    from unittest.mock import patch
+
+    tools = [
+        _named_tool("plugin__plex__plex_list_library", "List Plex media with pagination."),
+        _named_tool("workspace_execute", "Execute a workspace command."),
+        _named_tool("browser_open", "Open a browser page."),
+        _named_tool("calendar_create", "Create a calendar event."),
+    ]
+    raw = [{
+        "type": "function",
+        "name": tool["function"]["name"],
+        "description": tool["function"]["description"],
+        "parameters": tool["function"]["parameters"],
+    } for tool in tools]
+    first_turn = [{
+        "role": "user",
+        "content": (
+            "list the plex movies/tv shows that are age rating PG13 or TV-7 "
+            "or less(for younger kids) and whose root folder does NOT contain "
+            "\"/Kids/\"\nMake sure to paginate the plex listing\n"),
+    }]
+    later_turn = first_turn + [{
+        "role": "assistant", "content": "", "tool_calls": [{
+            "id": "call_plex", "type": "function", "function": {
+                "name": "plugin__plex__plex_list_library",
+                "arguments": '{"limit":32,"offset":0}',
+            },
+        }],
+    }, {
+        "role": "tool", "tool_call_id": "call_plex",
+        "name": "plugin__plex__plex_list_library",
+        "content": '{"movies":[{"title":"A Christmas Carol",'
+                   '"contentRating":"PG"}],"movieHasMore":true}',
+    }, {
+        "role": "user", "content": "try just doing no query?",
+    }]
+
+    # The decision schemas never include transcript-pinned real functions.
+    virtuals, _raw_virtuals = _hidden_gateway_virtual_pairs()
+    assert [tool["function"]["name"] for tool in virtuals] == [
+        "vmodel_search_tools", "vmodel_enable_tools"]
+
+    with patch("runtime.toolcalls.rank_tool_indices",
+               return_value=([0, 1, 2, 3], {"tool_embedding_status": "test"})):
+        selected, _selected_raw, _pinned, _meta = _hidden_gateway_catalogs(
+            tools, raw, first_turn, query="list Plex media", limit=2)
+    activated = tuple(tool["function"]["name"] for tool in selected)
+    assert activated == (
+        "plugin__plex__plex_list_library", "workspace_execute")
+
+    # Page/corrected-argument intent ranks an already-activated tool first:
+    # preserve the exact schema set even though call history now hard-pins Plex.
+    with patch("runtime.toolcalls.rank_tool_indices",
+               return_value=([0, 2, 3, 1], {"tool_embedding_status": "test"})):
+        stable, _stable_raw, pinned, metadata = _hidden_gateway_catalogs(
+            tools, raw, later_turn, query="continue Plex pagination without query",
+            limit=2, activated_names=activated,
+            expansion_limit=2, max_activated=4)
+    assert tuple(tool["function"]["name"] for tool in stable) == activated
+    assert pinned == 1
+    assert metadata["gateway_activation_profile"] == "stable-hit"
+
+    # A genuinely different top capability is still admitted rather than being
+    # trapped behind the old tool choice.
+    with patch("runtime.toolcalls.rank_tool_indices",
+               return_value=([2, 3, 0, 1], {"tool_embedding_status": "test"})):
+        expanded, _expanded_raw, _pinned, metadata = _hidden_gateway_catalogs(
+            tools, raw, later_turn, query="open a page in the browser",
+            limit=2, activated_names=activated,
+            expansion_limit=2, max_activated=4)
+    assert {tool["function"]["name"] for tool in expanded} == {
+        *activated, "browser_open", "calendar_create"}
+    assert metadata["gateway_activation_profile"] == "expanded"
+
+
+def test_hidden_gateway_search_hydrates_at_most_four_without_forcing_four():
+    assert _hidden_gateway_search_result_limit(32, 4, 32) == 4
+    assert _hidden_gateway_search_result_limit(32, 4, 2) == 2
+    assert _hidden_gateway_search_result_limit(32, 4, 0) == 1
+    assert _hidden_gateway_search_result_limit(32, 4, "many") == 4
+    assert _hidden_gateway_search_result_limit(3, 4, 32) == 3
+
+
+def test_gateway_activation_key_survives_appended_tool_turns_without_raw_state():
+    tools = [_named_tool("plugin__plex__plex_list_library")]
+    anchor = [{"role": "system", "content": "stable harness prompt"}, {
+        "role": "user", "content": "list Plex media and paginate"}]
+    continuation = anchor + [{
+        "role": "assistant", "content": "", "tool_calls": [{
+            "id": "call_1", "type": "function", "function": {
+                "name": "plugin__plex__plex_list_library", "arguments": "{}"}}]}, {
+        "role": "tool", "tool_call_id": "call_1", "content": "page one"}, {
+        "role": "user", "content": "get page two"}]
+    first_key = _hidden_gateway_conversation_key("lossy-Qwen3-4B", tools, anchor)
+    next_key = _hidden_gateway_conversation_key(
+        "lossy-Qwen3-4B", tools, continuation)
+    assert first_key == next_key
+    assert len(first_key) == 64
+
+    _hidden_gateway_activation_clear()
+    try:
+        _hidden_gateway_activation_put(first_key, tools)
+        assert _hidden_gateway_activation_get(next_key, tools) == (
+            "plugin__plex__plex_list_library",)
+    finally:
+        _hidden_gateway_activation_clear()
+
+
+def test_hidden_gateway_forces_only_high_confidence_external_intents():
+    assert _hidden_gateway_force_reason([
+        {"role": "user", "content": "Tell me a joke about Node.js."},
+    ]) is None
+    assert _hidden_gateway_force_reason([
+        {"role": "user", "content": "How does the Node.js event loop work?"},
+    ]) is None
+    assert _hidden_gateway_force_reason([
+        {"role": "user", "content": "Write one coherent paragraph about streaming."},
+    ]) is None
+    assert _hidden_gateway_force_reason([
+        {"role": "user", "content": "List three reasons streaming feels faster."},
+    ]) is None
+    assert _hidden_gateway_force_reason([
+        {"role": "user", "content": "Create a short poem."},
+    ]) is None
+    assert _hidden_gateway_force_reason([
+        {"role": "user", "content": "What folder are we in?"},
+    ]) == "external-state-inspection"
+    assert _hidden_gateway_force_reason([
+        {"role": "user", "content": "Whats the largest top level directory?"},
+    ]) == "external-state-inspection"
+    assert _hidden_gateway_force_reason([
+        {"role": "user", "content": "Check for real."},
+    ]) == "external-action-imperative"
+    assert _hidden_gateway_force_reason([
+        {"role": "user", "content": "Write this file in the workspace."},
+    ]) == "external-action-imperative"
+    assert _hidden_gateway_force_reason([
+        {"role": "user", "content": "Search the web."},
+    ]) == "external-action-imperative"
+    assert _hidden_gateway_force_reason([
+        {"role": "user", "content": "Use an available tool to inspect it."},
+    ]) == "explicit-tool-request"
+
+
+def test_hidden_gateway_forces_confirmed_deferred_action_but_not_bare_ack():
+    assert _hidden_gateway_force_reason([
+        {"role": "user", "content": "Which directory is largest?"},
+        {"role": "assistant", "content": "I'll run a command to check it."},
+        {"role": "user", "content": "do it"},
+    ]) == "confirmed-deferred-action"
+    assert _hidden_gateway_force_reason([
+        {"role": "assistant", "content": "That sounds good."},
+        {"role": "user", "content": "okay"},
+    ]) is None
+
+
+def test_hidden_gateway_does_not_force_again_after_tool_result():
+    assert _hidden_gateway_force_reason([
+        {"role": "user", "content": "What folder are we in?"},
+        {"role": "assistant", "content": "", "tool_calls": [{
+            "id": "call_1", "type": "function",
+            "function": {"name": "pwd", "arguments": "{}"},
+        }]},
+        {"role": "tool", "tool_call_id": "call_1", "content": "/tmp"},
+    ]) is None
+
+
+def test_hidden_gateway_required_client_or_intent_targets_only_search():
+    assert _hidden_gateway_decision_choice(
+        "auto", "external-state-inspection") == \
+        "specific:vmodel_search_tools"
+    assert _hidden_gateway_decision_choice(
+        "required", "client-required") == "specific:vmodel_search_tools"
+    assert _hidden_gateway_decision_choice("auto", None) == "auto"
+
+
+def test_hidden_tool_gateway_hard_pins_transcript_tools():
+    tools = [_named_tool("workspace_execute"), _named_tool("browser_open")]
+    raw = [{
+        "type": "function", "name": tool["function"]["name"],
+        "description": "", "parameters": {},
+    } for tool in tools]
+    messages = [{
+        "role": "assistant", "content": "",
+        "tool_calls": [{
+            "id": "call_1", "type": "function",
+            "function": {"name": "workspace_execute", "arguments": "{}"},
+        }],
+    }]
+    selected, _raw, pinned, _retrieval = _hidden_gateway_catalogs(
+        tools, raw, messages, limit=1)
+    assert pinned == 1
+    assert [tool["function"]["name"] for tool in selected] == ["workspace_execute"]
+
+
+def test_hidden_search_query_is_not_diluted_by_large_system_prompt():
+    from unittest.mock import patch
+
+    tools = [
+        _named_tool("workspace_execute", "Execute a shell command."),
+        _named_tool("calendar_create", "Create a calendar meeting."),
+    ]
+    raw = [{
+        "type": "function", "name": tool["function"]["name"],
+        "description": tool["function"]["description"], "parameters": {},
+    } for tool in tools]
+    messages = [{
+        "role": "system",
+        "content": "calendar meeting appointment event " * 5_000,
+    }]
+    with patch.dict(os.environ, {"VMODEL_TOOL_EMBEDDINGS": "0"}):
+        selected, _raw, _pinned, metadata = _hidden_gateway_catalogs(
+            tools, raw, messages, query="run a terminal command", limit=1)
+    assert [tool["function"]["name"] for tool in selected] == [
+        "workspace_execute"]
+    assert metadata["tool_embedding_status"] == "unavailable"
+
+
 def test_glm_fast_mode_enables_quantized_cache_pages():
     from unittest.mock import patch
 
@@ -699,6 +990,306 @@ def test_dense_fast_mode_uses_validated_mxfp4_and_pipelined_decode():
     assert rc.fused_swiglu
     assert rc.stepped_kv_threshold == 512
     assert not rc.embed_rows
+    assert rc.min_weight_cache_mb == 1500
+
+
+def test_dense_fast_gateway_uses_reclaimable_floor_and_2k_kv_boundaries():
+    from unittest.mock import patch
+
+    from runtime.server import EngineManager
+
+    captured = []
+
+    class FakeEngine:
+        def __init__(self, _path, rc):
+            captured.append(rc)
+
+        def close(self):
+            pass
+
+    cfg = SimpleNamespace(
+        model_type="qwen2", tie_word_embeddings=False,
+        index_topk=0, vision_config=None, num_experts=0,
+        hidden_size=3584, intermediate_size=18944,
+        num_hidden_layers=28, num_attention_heads=28,
+        num_key_value_heads=4, head_dim=128, vocab_size=152064,
+        attention_bias=True)
+    with patch.dict(os.environ, {"VMODEL_FAST_TOOL_GATEWAY": "1"}), \
+         patch("runtime.config.ModelConfig.from_dir", return_value=cfg), \
+         patch("runtime.path_resolver.resolve_model_dir",
+               side_effect=lambda path: path), \
+         patch("runtime.engine.StreamingEngine", FakeEngine):
+        EngineManager().get(Path("/tmp/fake-qwen-gateway"), "fast")
+
+    rc = captured[0]
+    assert rc.min_weight_cache_mb == 600
+    assert rc.prefill_chunk_size == 512
+    assert rc.hot_prompt_kv_chunk_size == 512
+    assert rc.adaptive_kv_spill_mb == 256
+    assert rc.adaptive_kv_spill_prefill_chunk_size == 512
+    assert rc.hot_prompt_kv_min_available_mb == 0
+
+
+def test_dense_fast_paged_kv_profile_disables_incompatible_hot_paths(tmp_path):
+    from unittest.mock import patch
+
+    from runtime.server import EngineManager
+
+    captured = []
+
+    class FakeEngine:
+        def __init__(self, _path, rc):
+            captured.append(rc)
+
+        def close(self):
+            pass
+
+    cfg = SimpleNamespace(
+        model_type="qwen3", tie_word_embeddings=True,
+        index_topk=0, vision_config=None, num_experts=0,
+        hidden_size=2560, intermediate_size=9728,
+        num_hidden_layers=36, num_attention_heads=32,
+        num_key_value_heads=8, head_dim=128, vocab_size=151936,
+        attention_bias=False)
+    env = {
+        "VMODEL_FAST_KV_MAX_MB": "2200",
+        "VMODEL_FAST_KV_SPILL_DIR": str(tmp_path / "spill"),
+        "VMODEL_FAST_KV_SPILL_COMPRESS": "1",
+    }
+    with patch.dict(os.environ, env), \
+         patch("runtime.config.ModelConfig.from_dir", return_value=cfg), \
+         patch("runtime.path_resolver.resolve_model_dir", side_effect=lambda path: path), \
+         patch("runtime.engine.StreamingEngine", FakeEngine):
+        EngineManager().get(Path("/tmp/fake-qwen3"), "fast")
+
+    rc = captured[0]
+    assert rc.max_kv_mb == 2200
+    assert rc.release_paged_kv_after_generate
+    assert rc.prefill_chunk_size == 512
+    assert rc.mlx_cache_limit_mb == 64
+    assert rc.kv_spill_dir == str(tmp_path / "spill")
+    assert rc.kv_spill_compress
+    assert not rc.hot_prompt_kv
+    assert not rc.tool_pic
+    assert not rc.tool_pic_shared_pages
+    assert rc.hot_prompt_kv_persist_dir == ""
+
+
+def test_qwen3_fast_resident_kv_projection_rejects_real_harness_scale():
+    engine = SimpleNamespace(
+        cfg=SimpleNamespace(
+            model_type="qwen3", vision_config=None, num_experts=0,
+            num_hidden_layers=36, num_key_value_heads=8, head_dim=128),
+        rc=SimpleNamespace(max_kv_mb=0),
+    )
+    safe = _fast_dense_resident_kv_projection(engine, "fast", 10_774, 16)
+    assert safe["bytes_per_token"] == 147_456
+    assert safe["projected_bytes"] < safe["limit_bytes"]
+    assert safe["positions"] == 10_774
+    assert safe["declared_positions"] == 10_790
+    assert safe["declared_projected_bytes"] > safe["projected_bytes"]
+
+    try:
+        _validate_fast_dense_resident_kv(engine, "fast", 28_307, 64)
+    except RequestValidationError as error:
+        message = str(error)
+        assert "resident BF16 KV projection" in message
+        assert "VMODEL_FAST_TOOL_GATEWAY=1" in message
+        assert "VMODEL_FAST_TOOL_LIMIT=32" in message
+        assert "quarantined" in message
+    else:
+        raise AssertionError("unsafe real-harness resident KV was accepted")
+
+    engine.rc.adaptive_kv_spill_mb = 256
+    adaptive = _validate_fast_dense_resident_kv(
+        engine, "fast", 28_307, 64)
+    assert adaptive["adaptive_spill_required"] == 1
+    assert adaptive["adaptive_spill_mb"] == 256
+
+    engine.rc.max_kv_mb = 2200
+    assert _validate_fast_dense_resident_kv(
+        engine, "fast", 28_307, 64) is None
+
+
+def test_dense_kv_preflight_subtracts_evictable_retained_state():
+    base = dict(
+        active_metal_bytes=7_830_000_000,
+        retained_prompt_kv_bytes=1_680_000_000,
+        orphan_prompt_kv_bytes=0,
+        evictable_prompt_kv_bytes=1_680_000_000,
+        hot_prompt_slots=1,
+        metal_ceiling_bytes=9_050_000_000,
+    )
+    engine = SimpleNamespace(
+        cfg=SimpleNamespace(
+            model_type="qwen3", vision_config=None, num_experts=0,
+            num_hidden_layers=36, num_key_value_heads=8, head_dim=128),
+        rc=SimpleNamespace(max_kv_mb=0),
+        prompt_cache_memory_snapshot=lambda: base,
+    )
+    projection = _validate_fast_dense_resident_kv(
+        engine, "fast", 10_453, 4_096)
+    assert projection["retained_prompt_kv_bytes"] == 1_680_000_000
+    assert projection["dynamic_projected_bytes"] < 9_050_000_000
+
+    engine.prompt_cache_memory_snapshot = lambda: {
+        **base,
+        "retained_prompt_kv_bytes": 0,
+        "evictable_prompt_kv_bytes": 0,
+    }
+    try:
+        _validate_fast_dense_resident_kv(engine, "fast", 10_453, 4_096)
+    except RequestValidationError as error:
+        assert "live dense-Qwen Metal projection" in str(error)
+        assert "before generation" in str(error)
+    else:
+        raise AssertionError("live projection ignored retained-cache pressure")
+
+
+def test_cache_phase_telemetry_keeps_hidden_phases_separate():
+    decision = _cache_phase_telemetry("gateway_decision", {
+        "prompt_tokens": 2_000,
+        "prefill_s": 0.25,
+        "path_stats": {
+            "prompt_cache_namespace": "gateway_decision",
+            "prompt_cache_prefix_tokens": 1_900,
+            "prompt_cache_source": "hot_disk",
+            "prompt_cache_exact_hit": 0,
+        },
+    })
+    execution = _cache_phase_telemetry("gateway_execution", {
+        "prompt_tokens": 10_000,
+        "prefill_s": 42.0,
+        "path_stats": {
+            "prompt_cache_namespace": "gateway_execution",
+            "prompt_cache_prefix_tokens": 0,
+            "prompt_cache_source": "cold",
+            "tool_pic_reused_tokens": 128,
+            "tool_pic_selected_tokens": 9_872,
+            "hot_prompt_admission_evicted_slots": 1,
+            "hot_prompt_admission_evicted_bytes": 1_500_000_000,
+        },
+    })
+    assert decision["cached_tokens"] == 1_900
+    assert decision["cache_source"] == "hot_disk"
+    assert execution["cached_tokens"] == 0
+    assert execution["effective_reused_tokens"] == 128
+    assert execution["admission_evicted_bytes"] == 1_500_000_000
+
+
+def test_responses_stream_emits_terminal_failure_instead_of_truncated_sse():
+    import io
+
+    handler = Handler.__new__(Handler)
+    handler.wfile = io.BytesIO()
+    statuses = []
+    handler.send_response = statuses.append
+    handler.send_header = lambda *_args: None
+    handler.end_headers = lambda: None
+    handler._sampling = SimpleNamespace()
+    handler._constraint = None
+
+    class Engine:
+        cfg = SimpleNamespace(model_type="qwen3")
+
+        def __init__(self):
+            self.cleaned = 0
+
+        def discard_failed_request_state(self):
+            self.cleaned += 1
+
+    engine = Engine()
+
+    def fail(_on_token, _on_progress):
+        raise MemoryError("projected working set exceeds ceiling")
+
+    handler._stream_responses(
+        "prompt", 64, [], engine, [], lambda *_args: {},
+        "resp_test", "Qwen3-4B", 1, None, None, None, [],
+        "msg_test", "auto", False, generate_fn=fail)
+
+    wire = handler.wfile.getvalue().decode()
+    assert statuses == [200]
+    assert '"type": "response.failed"' in wire
+    assert '"code": "server_memory_error"' in wire
+    assert '"status": "failed"' in wire
+    assert engine.cleaned == 1
+
+
+def test_failed_request_cleanup_releases_only_failed_kv():
+    from runtime.engine import StreamingEngine
+
+    class State:
+        def __init__(self):
+            self.releases = 0
+
+        def release(self):
+            self.releases += 1
+
+    failed = State()
+    survivor = State()
+    engine = StreamingEngine.__new__(StreamingEngine)
+    engine.last_kv = failed
+    engine._hot_prompt_slots = [
+        SimpleNamespace(kv=survivor),
+        SimpleNamespace(kv=failed),
+    ]
+    engine._h_window = object()
+    engine._h_last = object()
+    engine._provisional = object()
+
+    engine.discard_failed_request_state()
+
+    assert failed.releases == 1
+    assert survivor.releases == 0
+    assert [slot.kv for slot in engine._hot_prompt_slots] == [survivor]
+    assert engine.last_kv is None
+    assert engine._h_window is None
+    assert engine._h_last is None
+    assert engine._provisional is None
+
+
+def test_interrupted_prefill_retains_only_complete_exact_chunk():
+    from runtime.engine import KVCache, StreamingEngine
+
+    class State(KVCache):
+        def __init__(self, offset):
+            self._offset = offset
+            self.releases = 0
+
+        @property
+        def offset(self):
+            return self._offset
+
+        def release(self):
+            self.releases += 1
+
+    survivor = State(128)
+    partial = State(4096)
+    engine = StreamingEngine.__new__(StreamingEngine)
+    engine.rc = SimpleNamespace(
+        hot_prompt_kv=True, max_kv_mb=0,
+        hot_prompt_kv_min_tokens=2048, hot_prompt_kv_slots=1)
+    engine._hot_kv_persist = None
+    engine._hot_prompt_slots = [SimpleNamespace(kv=survivor)]
+    engine.last_kv = partial
+    engine._h_window = object()
+    engine._h_last = object()
+    tokens = list(range(8192))
+    capsules = (("inside", 100, 200), ("crosses", 4000, 4200))
+
+    assert engine._retain_interrupted_prefill(
+        tokens, partial, 4096, capsules)
+
+    assert survivor.releases == 1
+    assert len(engine._hot_prompt_slots) == 1
+    slot = engine._hot_prompt_slots[0]
+    assert slot.kv is partial
+    assert slot.tokens == tuple(tokens[:4096])
+    assert slot.logits is None and slot.prompt_logits is None
+    assert slot.reusable_prefix == 4096
+    assert slot.tool_capsules == (("inside", 100, 200),)
+    assert engine._h_window is None and engine._h_last is None
 
 
 def test_vision_fast_mode_quantizes_only_quality_gated_text_mlp():
@@ -1384,6 +1975,26 @@ def test_derived_quantized_checkpoint_is_advertised_only_as_lossy(tmp_path):
     assert "lossy-derived" in ids
 
 
+def test_registry_does_not_advertise_auxiliary_embedding_encoders(tmp_path):
+    from unittest.mock import patch
+
+    from runtime.local_config import StorageConfig
+
+    models = tmp_path / "models"
+    chat = models / "Qwen-test"
+    embed = models / "tool-embed-bge-small-en-v1.5"
+    chat.mkdir(parents=True)
+    embed.mkdir()
+    (chat / "config.json").write_text(json.dumps({"model_type": "qwen3"}))
+    (embed / "config.json").write_text(json.dumps({"model_type": "bert"}))
+    with patch("runtime.server.ROOT", tmp_path), \
+         patch("runtime.local_config.get_storage_config",
+               return_value=StorageConfig()):
+        registry = _registry()
+    assert "Qwen-test" in registry
+    assert "tool-embed-bge-small-en-v1.5" not in registry
+
+
 def test_engine_manager_rejects_derived_checkpoint_as_lossless(tmp_path):
     from unittest.mock import patch
 
@@ -1573,6 +2184,23 @@ def test_positive_token_limit_rejects_zero_negative_bool_fraction_and_text():
             raise AssertionError(f"invalid token limit accepted: {value!r}")
 
 
+def test_omitted_output_budget_is_eos_safety_ceiling_not_legacy_64():
+    from unittest.mock import patch
+
+    with patch.dict(os.environ, {}, clear=False):
+        os.environ.pop("VMODEL_OMITTED_MAX_OUTPUT_TOKENS", None)
+        assert _omitted_output_token_limit() == 4096
+    with patch.dict(os.environ, {"VMODEL_OMITTED_MAX_OUTPUT_TOKENS": "768"}):
+        assert _omitted_output_token_limit() == 768
+    with patch.dict(os.environ, {"VMODEL_OMITTED_MAX_OUTPUT_TOKENS": "0"}):
+        try:
+            _omitted_output_token_limit()
+        except RequestValidationError:
+            pass
+        else:
+            raise AssertionError("accepted a zero omitted-output safety ceiling")
+
+
 def test_responses_mixed_text_and_tool_call_keeps_both_items_and_id():
     text = (
         "I will check.\n"
@@ -1663,6 +2291,74 @@ def test_marker_holdback_streams_safe_text_and_replays_post_call_text():
     assert holdback.feed("call>{\"name\":\"x\"}") == ""
     assert holdback.holding
     assert holdback.final_remainder("hello after") == " after"
+
+
+def test_hidden_decision_streams_after_first_irreversible_prefix_mismatch():
+    emitted = []
+    decision = _HiddenDecisionStream("qwen3", emitted.append)
+    for piece in ("H", "ello", " from", " the model"):
+        decision.feed(piece)
+    decision.finish_direct("Hello from the model")
+    assert decision.branch == "direct"
+    assert "".join(emitted) == "Hello from the model"
+    assert len(emitted) == 4
+
+
+def test_hidden_decision_holds_marker_at_every_decode_split():
+    marker = "<tool_call>"
+    for split in range(len(marker) + 1):
+        emitted = []
+        decision = _HiddenDecisionStream("qwen3", emitted.append)
+        decision.feed(" \n" + marker[:split])
+        decision.feed(marker[split:] + '{"name":"vmodel_search_tools"}')
+        assert decision.branch == "tool"
+        assert emitted == []
+
+
+def test_hidden_decision_releases_marker_like_direct_text():
+    emitted = []
+    decision = _HiddenDecisionStream("qwen3", emitted.append)
+    decision.feed("<tool_calls> is ordinary text")
+    decision.finish_direct("<tool_calls> is ordinary text")
+    assert decision.branch == "direct"
+    assert "".join(emitted) == "<tool_calls> is ordinary text"
+
+
+def test_hidden_decision_never_leaks_late_virtual_marker():
+    emitted = []
+    decision = _HiddenDecisionStream("qwen3", emitted.append)
+    before = "Before. "
+    marker = (
+        '<tool_call>{"name":"vmodel_search_tools",'
+        '"arguments":{"query":"browser"}}</tool_call>')
+    after = " After."
+    decision.feed(before)
+    decision.feed("<tool_")
+    decision.feed(marker[len("<tool_"):] + after)
+    assert decision.branch == "direct"
+    assert decision.late_marker_detected
+    assert "<tool" not in "".join(emitted)
+    virtual, _raw = _hidden_tool_search_pair()
+    content, calls = _parse_request_tool_calls(
+        before + marker + after, [virtual], "qwen3", allow_parallel=False)
+    assert [call["function"]["name"] for call in calls] == [
+        "vmodel_search_tools"]
+    decision.finish_direct(content)
+    assert "".join(emitted) == before + after
+
+
+def test_hidden_decision_handles_harmony_spacing_and_final_channel():
+    emitted = []
+    tool_decision = _HiddenDecisionStream("gpt_oss", emitted.append)
+    tool_decision.feed("commentary   to=functions.vmodel_search_tools")
+    assert tool_decision.branch == "tool"
+    assert emitted == []
+
+    direct = _HiddenDecisionStream("gpt_oss", emitted.append)
+    direct.feed("<|channel|>final")
+    direct.finish_direct("<|channel|>final")
+    assert direct.branch == "direct"
+    assert "".join(emitted) == "<|channel|>final"
 
 
 def _run_all():

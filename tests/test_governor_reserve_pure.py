@@ -193,7 +193,9 @@ def test_reclaim_stops_at_floor_and_refuses_when_memory_does_not_release():
     else:
         raise AssertionError("unreclaimable cache was allowed to continue")
 
-    assert gov.cache.max_bytes == gov.floor
+    # A refusal must not poison an immediate harness retry with a needlessly
+    # collapsed cache budget. Raising the limit itself allocates no memory.
+    assert gov.cache.max_bytes == int(5e9)
     assert gov.reservations > 1
     assert gov.reservation_failures == 1
 

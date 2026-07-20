@@ -128,6 +128,19 @@ def _normalize_tool_capsules(value, prompt_length: int, *, strict: bool):
         return None
 
 
+def _normalize_cache_namespace(value, *, strict: bool) -> str | None:
+    """Validate the phase identity carried by each durable checkpoint."""
+    if value is None:
+        return "default"
+    if (isinstance(value, str) and value
+            and len(value) <= 128
+            and all(char.isalnum() or char in "._-" for char in value)):
+        return value
+    if strict:
+        raise ValueError("invalid prompt cache namespace")
+    return None
+
+
 def _sha256_file(path: Path, chunk_bytes: int = 8 * 1024 * 1024) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as handle:
@@ -529,7 +542,8 @@ class HotPromptKVPersistence:
              kv: KVCache, logits: mx.array, prompt_logits: mx.array,
              prompt_length: int, reusable_prefix: int,
              approximate: bool = False,
-             tool_capsules=()) -> tuple[str, ...]:
+             tool_capsules=(), cache_namespace: str = "default"
+             ) -> tuple[str, ...]:
         # Hold a shared journal lock from parent validation through checkpoint
         # publication. GC's exclusive lock cannot retire a just-written segment
         # in the small window before its checkpoint makes it reachable.
@@ -537,14 +551,15 @@ class HotPromptKVPersistence:
             return self._save_locked(
                 parent_chain, parent_covered, tokens, kv, logits,
                 prompt_logits, prompt_length, reusable_prefix, approximate,
-                tool_capsules)
+                tool_capsules, cache_namespace)
 
     def _save_locked(self, parent_chain: tuple[str, ...], parent_covered: int,
                      tokens, kv: KVCache, logits: mx.array,
                      prompt_logits: mx.array, prompt_length: int,
                      reusable_prefix: int,
                      approximate: bool = False,
-                     tool_capsules=()) -> tuple[str, ...]:
+                     tool_capsules=(), cache_namespace: str = "default"
+                     ) -> tuple[str, ...]:
         """Persist a slot as new segments on top of `parent_chain` (which the
         caller has already validated as a true prefix of `tokens`, covering
         exactly the first `parent_covered` tokens) plus a checkpoint for the
@@ -562,6 +577,8 @@ class HotPromptKVPersistence:
         chunk = self.chunk_size
         tool_capsules = _normalize_tool_capsules(
             tool_capsules, int(prompt_length), strict=True)
+        cache_namespace = _normalize_cache_namespace(
+            cache_namespace, strict=True)
         covered = parent_covered
         parent_id = parent_chain[-1] if parent_chain else None
         chain = list(parent_chain)
@@ -608,6 +625,7 @@ class HotPromptKVPersistence:
             "prompt_length": int(prompt_length),
             "reusable_prefix": int(reusable_prefix),
             "approximate": bool(approximate),
+            "cache_namespace": cache_namespace,
             "tool_capsules": [list(span) for span in tool_capsules],
             "payload_sha256": payload_sha256,
             "payload_bytes": payload_bytes,
@@ -672,7 +690,8 @@ class HotPromptKVPersistence:
             tokens.extend(meta["tokens"])
         return tokens
 
-    def find_best_match(self, tokens, chunk_size: int) -> dict | None:
+    def find_best_match(self, tokens, chunk_size: int, *,
+                        cache_namespace: str = "default") -> dict | None:
         """Cheap (metadata-only, no tensors loaded) scan of every
         checkpoint for the best repeat/endpoint/extension/branch candidate against
         `tokens`. Intended to be called ONLY on a total in-memory miss --
@@ -682,6 +701,8 @@ class HotPromptKVPersistence:
         shared prefix is still sitting on disk from an earlier task).
         Returns a dict describing the winner, with NO KV tensors loaded
         yet -- pass it to load_matched_chain() to actually load."""
+        cache_namespace = _normalize_cache_namespace(
+            cache_namespace, strict=True)
         candidates = []
         with self._locked(exclusive=False):
             checkpoint_paths = list(self.dir.glob("*.ckpt.json"))
@@ -698,6 +719,10 @@ class HotPromptKVPersistence:
             checkpoint_id = j.name[:-len(".ckpt.json")]
             meta = self._read_checkpoint_meta(checkpoint_id)
             if meta is None:
+                continue
+            persisted_namespace = _normalize_cache_namespace(
+                meta.get("cache_namespace", "default"), strict=False)
+            if persisted_namespace != cache_namespace:
                 continue
             leaf = meta.get("leaf")
             if not leaf:
@@ -727,6 +752,7 @@ class HotPromptKVPersistence:
                 "chain": chain, "checkpoint_id": checkpoint_id,
                 "ckpt_payload": ckpt_payload, "mtime": mtime,
                 "approximate": bool(meta.get("approximate", False)),
+                "cache_namespace": persisted_namespace,
                 "tool_capsules": _normalize_tool_capsules(
                     meta.get("tool_capsules", ()),
                     int(meta["prompt_length"]), strict=False),
@@ -930,7 +956,7 @@ class HotPromptKVPersistence:
     def load_all(self, num_layers: int, limit: int) -> list[tuple]:
         """Return up to `limit` (tokens, kv, logits, prompt_length,
         prompt_logits, reusable_prefix, approximate, tool_capsules,
-        segment_chain) tuples, oldest-mtime
+        segment_chain, cache_namespace) tuples, oldest-mtime
         first -- ready to append straight into `_hot_prompt_slots` in LRU
         order. Corrupt, fingerprint-mismatched, or broken-chain checkpoints
         are skipped, never fatal (same posture as F37)."""
@@ -982,15 +1008,17 @@ class HotPromptKVPersistence:
             tool_capsules = _normalize_tool_capsules(
                 meta.get("tool_capsules", ()), int(meta["prompt_length"]),
                 strict=False)
-            if tool_capsules is None:
-                print(f"[hot-kv-persist] skip checkpoint with invalid tool "
-                      f"capsule metadata (leaf={leaf})", flush=True)
+            cache_namespace = _normalize_cache_namespace(
+                meta.get("cache_namespace", "default"), strict=False)
+            if tool_capsules is None or cache_namespace is None:
+                print(f"[hot-kv-persist] skip checkpoint with invalid prompt "
+                      f"metadata (leaf={leaf})", flush=True)
                 continue
             out.append((
                 tuple(tokens), kv, ck["logits"], int(meta["prompt_length"]),
                 ck["prompt_logits"], int(meta["reusable_prefix"]),
                 bool(meta.get("approximate", False)), tool_capsules,
-                tuple(chain),
+                tuple(chain), cache_namespace,
             ))
         return out
 

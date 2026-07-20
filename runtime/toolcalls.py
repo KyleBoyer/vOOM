@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import json
 import math
+import os
 import re
 import uuid
 from collections import Counter
@@ -41,6 +42,26 @@ class VideoFrames:
 
 _SEARCH_WORD_RE = re.compile(r"[A-Za-z0-9]+")
 
+# Deterministic capability capsules for high-value tool-domain paraphrases.
+# This is deliberately compact and dependency-free: loading a second embedding
+# model beside a 4B LLM on a 16-GB unified-memory host would erase much of the
+# KV headroom this router is meant to recover. Both schema documents and model-
+# authored queries are expanded symmetrically, so `bash` can retrieve a tool
+# named `execute_command` even when the original description never says bash.
+_TOOL_CAPABILITY_GROUPS = tuple(frozenset(group.split()) for group in (
+    "bash sh shell cli terminal command commands exec execute subprocess",
+    "file files filesystem folder folders directory directories dir path paths workspace",
+    "browser web webpage url urls navigate navigation tab tabs chrome",
+    "search find lookup discover discovery retrieve retrieval",
+    "http https api network curl fetch download upload endpoint",
+    "code repository repo git github commit branch pull merge diff patch",
+    "email mail gmail outlook inbox",
+    "calendar event events meeting meetings schedule scheduling appointment",
+    "database databases db sql table tables row rows record records",
+    "image images picture pictures photo photos screenshot screenshots vision",
+    "document documents doc docs pdf spreadsheet spreadsheets excel sheet sheets",
+))
+
 
 def _reject_json_constant(value: str):
     raise ValueError(f"non-finite JSON constant is not allowed: {value}")
@@ -63,6 +84,17 @@ def _search_words(value) -> list[str]:
     return [w.lower() for w in _SEARCH_WORD_RE.findall(text) if len(w) > 1]
 
 
+def _capability_words(value) -> list[str]:
+    """Tokenize and enrich one tool/query into a semantic alias capsule."""
+    words = _search_words(value)
+    present = set(words)
+    enriched = list(words)
+    for group in _TOOL_CAPABILITY_GROUPS:
+        if present & group:
+            enriched.extend(sorted(group - present))
+    return enriched
+
+
 def _message_search_text(message: dict) -> str:
     content = message.get("content", "")
     if isinstance(content, list):
@@ -76,6 +108,95 @@ def _message_search_text(message: dict) -> str:
         for call in calls if isinstance(call, dict)
     )
     return f"{content or ''} {call_names}"
+
+
+def tool_search_capsule(tool: dict, *, max_chars: int = 6000) -> str:
+    """Create a bounded semantic passage for one tool without examples/defaults.
+
+    The passage is used only by the offline embedding encoder. It deliberately
+    includes humanized name components, purpose, input field paths/types, and
+    the same capability aliases as the lexical ranker. Arbitrary schema data is
+    bounded so one pathological catalog entry cannot dominate encoder work.
+    """
+    fn = tool.get("function", tool) if isinstance(tool, dict) else {}
+    if not isinstance(fn, dict):
+        fn = {}
+    name = str(fn.get("name", ""))
+    description = str(fn.get("description", ""))[:2000]
+    parameters = fn.get("parameters", fn.get("input_schema", {}))
+    fields: list[str] = []
+
+    def walk(schema, prefix: str = "", depth: int = 0) -> None:
+        if len(fields) >= 80 or depth > 5 or not isinstance(schema, dict):
+            return
+        properties = schema.get("properties")
+        if isinstance(properties, dict):
+            required = set(schema.get("required") or ())
+            for key in sorted(properties, key=str):
+                if len(fields) >= 80:
+                    break
+                child = properties[key]
+                path = f"{prefix}.{key}" if prefix else str(key)
+                if isinstance(child, dict):
+                    kind = child.get("type", "value")
+                    if isinstance(kind, list):
+                        kind = "/".join(map(str, kind))
+                    detail = str(child.get("description", ""))[:240]
+                    enum = child.get("enum")
+                    choices = ""
+                    if isinstance(enum, list) and len(enum) <= 12:
+                        choices = " choices " + ", ".join(map(str, enum))[:300]
+                    fields.append(
+                        f"{path}: {kind}{' required' if key in required else ''}"
+                        f"{choices}{' - ' + detail if detail else ''}")
+                    walk(child, path, depth + 1)
+        for union in ("anyOf", "oneOf", "allOf"):
+            variants = schema.get(union)
+            if isinstance(variants, list):
+                for child in variants[:8]:
+                    walk(child, prefix, depth + 1)
+        items = schema.get("items")
+        if isinstance(items, dict):
+            walk(items, f"{prefix}[]" if prefix else "item", depth + 1)
+
+    walk(parameters)
+    # Generic argument names such as ``query``, ``message``, or ``path`` are not
+    # sufficient evidence that the *tool* belongs to a capability family. Use
+    # only its identity/purpose to seed explicit aliases; BGE still sees the
+    # structural fields and can infer their softer semantic relationships.
+    alias_source = {"name": name, "description": description}
+    aliases = sorted(
+        set(_capability_words(alias_source)) - set(_search_words(alias_source)))
+    human_name = " ".join(_search_words(name))
+    parts = [
+        f"Tool: {name}",
+        f"Capability name: {human_name}",
+        f"Purpose: {description}",
+    ]
+    if aliases:
+        parts.append("Alternative capability terms: " + " ".join(aliases))
+    if fields:
+        parts.append("Inputs:\n" + "\n".join(fields))
+    return "\n".join(parts)[:max_chars]
+
+
+def semantic_tool_query(messages: list[dict], *, max_chars: int = 4000) -> str:
+    """Use the most recent user-authored intent as the embedding query.
+
+    Hidden discovery appends the model-authored catalog query as a user turn,
+    so it naturally wins here. Avoid embedding a 20K system prompt or stale
+    turns whose unrelated vocabulary would dilute the requested capability.
+    """
+    for message in reversed(messages):
+        if message.get("role") == "user":
+            text = _message_search_text(message).strip()
+            if text:
+                return text[:max_chars]
+    for message in reversed(messages):
+        text = _message_search_text(message).strip()
+        if text:
+            return text[:max_chars]
+    return ""
 
 
 def pinned_tool_indices(tools: list[dict], messages: list[dict]) -> list[int]:
@@ -111,23 +232,11 @@ def pinned_tool_indices(tools: list[dict], messages: list[dict]) -> list[int]:
     return pinned
 
 
-def rank_tool_indices(tools: list[dict], messages: list[dict]) -> list[int]:
-    """Rank tool schemas for the explicitly lossy fast-mode shortlist.
-
-    This is deterministic BM25-like lexical retrieval. Names explicitly
-    mentioned in the transcript and tools present in call history get strong
-    boosts; ``pinned_tool_indices`` is the separate hard-availability rule.
-    Canonical function-name order breaks ties.  Request order is deliberately
-    not a ranking signal: clients commonly rebuild the same tool catalog from
-    maps/plug-ins in a different order, and a tie at the shortlist boundary
-    must not silently select a different set merely because of that permutation.
-
-    It deliberately returns a ranking rather than silently dropping anything;
-    lossless endpoints never call it, and fast endpoints report the requested
-    and selected counts in response metadata.
-    """
+def _lexical_tool_scores(
+        tools: list[dict], messages: list[dict]) -> tuple[list[str], list[float]]:
+    """Return the pre-existing deterministic BM25-like score per tool."""
     if not tools:
-        return []
+        return [], []
 
     docs: list[Counter] = []
     names: list[str] = []
@@ -136,8 +245,8 @@ def rank_tool_indices(tools: list[dict], messages: list[dict]) -> list[int]:
         fn = tool.get("function", tool)
         name = str(fn.get("name", ""))
         names.append(name)
-        name_words.append(set(_search_words(name)))
-        docs.append(Counter(_search_words({
+        name_words.append(set(_capability_words(name)))
+        docs.append(Counter(_capability_words({
             "name": name,
             "description": fn.get("description", ""),
             "parameters": fn.get("parameters", fn.get("input_schema", {})),
@@ -156,15 +265,15 @@ def rank_tool_indices(tools: list[dict], messages: list[dict]) -> list[int]:
         transcript_parts.append(text.lower())
         role = message.get("role")
         weight = 6 if role == "user" else (1 if role == "system" else 2)
-        for word in _search_words(text):
+        for word in _capability_words(text):
             weighted_query[word] += weight
         for call in message.get("tool_calls") or []:
             if isinstance(call, dict):
                 historical_names.add(str((call.get("function") or {}).get("name", "")))
     transcript = "\n".join(transcript_parts)
 
-    scored = []
-    for i, (name, nws, doc) in enumerate(zip(names, name_words, docs)):
+    scores = []
+    for name, nws, doc in zip(names, name_words, docs):
         score = 0.0
         for word, q_weight in weighted_query.items():
             tf = min(doc.get(word, 0), 4)
@@ -179,9 +288,66 @@ def rank_tool_indices(tools: list[dict], messages: list[dict]) -> list[int]:
             score += 100_000.0
         if name in historical_names:
             score += 1_000_000.0
-        scored.append((-score, names[i], i))
+        scores.append(score)
+    return names, scores
+
+
+def rank_tool_indices(
+        tools: list[dict], messages: list[dict], *,
+        use_embeddings: bool = False, return_metadata: bool = False):
+    """Rank tool schemas for the explicitly lossy fast-mode shortlist.
+
+    The base is deterministic BM25-like lexical/alias retrieval. When requested
+    and an offline cache is complete, normalized BGE cosine similarity is fused
+    with that base score. Names explicitly mentioned in the transcript and
+    tools present in call history get strong boosts;
+    ``pinned_tool_indices`` is the separate hard-availability rule.
+    Canonical function-name order breaks ties.  Request order is deliberately
+    not a ranking signal: clients commonly rebuild the same tool catalog from
+    maps/plug-ins in a different order, and a tie at the shortlist boundary
+    must not silently select a different set merely because of that permutation.
+
+    It deliberately returns a ranking rather than silently dropping anything;
+    lossless endpoints never call it, and fast endpoints report the requested
+    and selected counts in response metadata.
+    """
+    names, scores = _lexical_tool_scores(tools, messages)
+    metadata = {
+        "tool_retrieval_profile": "hybrid-lexical-capability-v1",
+        "tool_embedding_status": "disabled",
+    }
+    if use_embeddings and tools:
+        try:
+            from .tool_embeddings import (
+                EmbeddingConfig, ToolEmbeddingError, embeddings_enabled,
+                hybrid_scores)
+            if embeddings_enabled():
+                scores, embedding_meta = hybrid_scores(
+                    [tool_search_capsule(tool) for tool in tools],
+                    semantic_tool_query(messages), scores,
+                    config=EmbeddingConfig.from_env())
+                metadata.update(embedding_meta)
+                if embedding_meta.get("tool_embedding_status") == "hybrid":
+                    metadata["tool_retrieval_profile"] = (
+                        "hybrid-bge-lexical-capability-v1")
+            else:
+                if os.environ.get(
+                        "VMODEL_TOOL_EMBEDDINGS_REQUIRED", "0") == "1":
+                    raise ToolEmbeddingError(
+                        "verified offline tool embedding cache is unavailable")
+                metadata["tool_embedding_status"] = "unavailable"
+        except (OSError, ValueError, ToolEmbeddingError) as error:
+            if os.environ.get("VMODEL_TOOL_EMBEDDINGS_REQUIRED", "0") == "1":
+                raise
+            metadata.update({
+                "tool_embedding_status": "fallback",
+                "tool_embedding_fallback": str(error)[:160],
+            })
+
+    scored = [(-score, names[i], i) for i, score in enumerate(scores)]
     scored.sort()
-    return [i for _, _, i in scored]
+    ranking = [i for _, _, i in scored]
+    return (ranking, metadata) if return_metadata else ranking
 
 
 def canonical_tool_indices(tools: list[dict]) -> list[int]:
@@ -263,7 +429,11 @@ def compact_tool_schema(tool: dict) -> dict:
     compact_fn = dict(source)
     parameter_key = "parameters" if "parameters" in compact_fn else "input_schema"
     if parameter_key in compact_fn:
-        compact_fn[parameter_key] = prune(compact_fn[parameter_key])
+        from .structured import effective_tool_schema
+
+        compact_fn[parameter_key] = prune(
+            effective_tool_schema(
+                compact_fn[parameter_key] or {"type": "object"}))
     if wrapped:
         return {**tool, "function": compact_fn}
     return compact_fn

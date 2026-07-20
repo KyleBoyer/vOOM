@@ -193,6 +193,24 @@ class PagedKVCache:
                 total += self._tail_k[layer].nbytes + self._tail_v[layer].nbytes
         return total
 
+    def release(self) -> None:
+        """Release resident tensors and only this cache's recorded spill files."""
+        paths = {
+            page.path
+            for pages in self._pages
+            for page in pages
+            if page.path is not None
+        }
+        self._pages = [[] for _ in range(self.num_layers)]
+        self._tail_k = [None] * self.num_layers
+        self._tail_v = [None] * self.num_layers
+        self._offset = 0
+        for path in paths:
+            try:
+                path.unlink()
+            except FileNotFoundError:
+                pass
+
     # ---- spilling -----------------------------------------------------------
 
     def _enforce_budget(self):

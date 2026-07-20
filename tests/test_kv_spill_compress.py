@@ -48,6 +48,14 @@ def test_compressed_page_round_trips_byte_identical():
         assert lk.dtype == mx.bfloat16
         assert bool(mx.array_equal(lk, ref_k[0]).item())
         assert bool(mx.array_equal(lv, ref_v[0]).item())
+        spill_paths = [
+            page.path for pages in kv._pages for page in pages
+            if page.path is not None
+        ]
+        assert spill_paths and all(path.exists() for path in spill_paths)
+        kv.release()
+        assert kv.offset == 0 and kv.nbytes() == 0
+        assert not any(path.exists() for path in spill_paths)
     finally:
         shutil.rmtree(spill_dir, ignore_errors=True)
 

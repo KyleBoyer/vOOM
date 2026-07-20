@@ -21,6 +21,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 import mlx.core as mx
+import psutil
 import yaml
 from tokenizers import Tokenizer
 
@@ -67,9 +68,38 @@ def _quantization_cache_identity(rc: "RuntimeConfig", store) -> str:
     return identity
 
 
+def _system_allocation_preserves_floor(
+        incoming_bytes: int, floor_mb: int) -> tuple[bool, int, int]:
+    """Sample whether one allocation leaves the configured unified-RAM floor."""
+    available = int(psutil.virtual_memory().available)
+    floor = max(0, int(floor_mb)) * 1_000_000
+    return (floor == 0 or available - int(incoming_bytes) >= floor,
+            available, floor)
+
+
+def _gptoss_rope_state(cfg, *, packed: bool):
+    """Initialize GPT-OSS RoPE independently of raw-MoE layout validation."""
+    if not packed:
+        raise RuntimeError(
+            "gpt-oss requires a packed store (fused expert tensors must be "
+            "unfused): run formats.packed.pack_model first"
+        )
+    from .gptoss import yarn_params
+
+    return yarn_params(cfg)
+
+
 @dataclass
 class RuntimeConfig:
     max_weight_cache_mb: int = 6000
+    mlx_cache_limit_mb: int = 1024
+    # Lowest cache budget the live governor may shrink to before refusing an
+    # imminent allocation.  Long dense prompts can devote several GiB to exact
+    # BF16 KV, so the historical global 1.5 GB floor needlessly made otherwise
+    # safe requests fail even though WeightCache supports pass-through pages.
+    # Keep the conservative default; side-quest server profiles may opt into a
+    # smaller floor with their own real-request gate.
+    min_weight_cache_mb: int = 1500
     pin_embeddings: bool = True
     pin_lm_head: bool = False
     pin_first_layers: int = 0
@@ -77,6 +107,13 @@ class RuntimeConfig:
     prefetch_depth: int = 0  # 0 disables prefetch
     prefetch_workers: int = 0  # 0 = store default (raw: 1, packed: 2)
     max_kv_mb: int = 0  # 0 = unpaged KV (all resident); >0 enables disk spilling
+    adaptive_kv_spill_mb: int = 0  # 0 disables last-resort per-request paging;
+    # when positive, ordinary hot KV remains preferred but an unsafe resident
+    # admission falls back to this bounded exact BF16 disk-paged cache.
+    adaptive_kv_spill_prefill_chunk_size: int = 512
+    release_paged_kv_after_generate: bool = False  # server-only single-request
+    # paging profile: drop resident pages and spill files before replying. Direct
+    # experiment callers retain the historical diagnostic `last_kv` by default.
     stepped_kv_threshold: int = 0  # request positions; 0 disables long-context stepped KV
     kv_page_positions: int = 256
     kv_spill_dir: str = ".kv_spill"
@@ -150,6 +187,11 @@ class RuntimeConfig:
     # slot holds a full KV state proportional to its context length -- this is a
     # real memory/quality tradeoff, not a free win; size it to the actual number of
     # concurrently-live prompt lineages a caller's harness produces, not larger.
+    hot_prompt_kv_min_available_mb: int = 0  # optional serving reserve above
+    # the governor's hardware-derived Metal ceiling and critical reserve.
+    # Durable slots are evicted from RAM first and weight-cache residency is
+    # shed next. Zero avoids turning a benchmark/ops floor into an ordinary
+    # request rejection; proofs may still opt into a stricter sampled floor.
     tool_pic: bool = False  # lossy Qwen/OLMoE tool-span relocation + boundary repair
     tool_pic_shared_pages: bool = False  # experimental dense-Qwen MiniPIC-style unrotated
     # K/V page sharing. Engine-local only: durable snapshots, spill, and
@@ -220,6 +262,12 @@ class RuntimeConfig:
     warm_mb: int = 0  # F04: compressed-RAM warm tier budget (0=off; bf16 pages only)
     final_dead_token_elim: bool = True  # F36: last layer's MLP runs only on the last prefill position
     router_lookahead: bool = False  # F45: measured NEGATIVE on local disk (pollutes LFU, competes with demand reads); retry over NAS only
+    expert_predictive_prefetch: bool = False  # Markov next-layer expert hints;
+    # separately gated from deterministic trunk prefetch because F45-class
+    # speculative traffic regressed on the saturated local disk. Explicit opt-in.
+    expert_prefetch_idle_only: bool = True  # when enabled, issue a predicted
+    # expert hint only if no other prefetch is queued/active. False is an
+    # intentionally aggressive experiment and must be byte/wall A/B tested.
     context_bound: int = 0  # F43: declared max positions (prompt+generation). On GLM, a bound
     # <= index_topk provably never invokes the DSA indexer, so its weights are never
     # loaded and its state never computed. Runs exceeding the bound are refused.
@@ -246,6 +294,8 @@ class RuntimeConfig:
                 "expert_top_k_by_layer must be a YAML sequence of integers")
         return cls(
             max_weight_cache_mb=mem.get("max_weight_cache_mb", 6000),
+            mlx_cache_limit_mb=mem.get("mlx_cache_limit_mb", 1024),
+            min_weight_cache_mb=mem.get("min_weight_cache_mb", 1500),
             pin_embeddings=pinned.get("embeddings", True),
             pin_lm_head=pinned.get("lm_head", False),
             pin_first_layers=pinned.get("first_layers", 0),
@@ -253,12 +303,17 @@ class RuntimeConfig:
             prefetch_depth=raw.get("prefetch", {}).get("depth", 0),
             prefetch_workers=raw.get("prefetch", {}).get("workers", 0),
             max_kv_mb=mem.get("max_kv_mb", 0),
+            release_paged_kv_after_generate=run.get(
+                "release_paged_kv_after_generate", False),
             stepped_kv_threshold=run.get("stepped_kv_threshold", 0),
             kv_page_positions=mem.get("kv_page_positions", 256),
             kv_spill_dir=mem.get("kv_spill_dir", run.get("kv_spill_dir", ".kv_spill")),
             kv_spill_compress=mem.get(
                 "kv_spill_compress", run.get("kv_spill_compress", False)
             ),
+            adaptive_kv_spill_mb=run.get("adaptive_kv_spill_mb", 0),
+            adaptive_kv_spill_prefill_chunk_size=run.get(
+                "adaptive_kv_spill_prefill_chunk_size", 512),
             quant_bits=raw.get("quant", {}).get("bits", 0),
             quant_group_size=raw.get("quant", {}).get("group_size", 64),
             quant_mode=raw.get("quant", {}).get("mode", "affine"),
@@ -302,6 +357,8 @@ class RuntimeConfig:
             hot_prompt_kv_chunk_size=run.get("hot_prompt_kv_chunk_size", 4096),
             hot_prompt_kv_slots=run.get("hot_prompt_kv_slots", 1),
             hot_prompt_kv_min_tokens=run.get("hot_prompt_kv_min_tokens", 0),
+            hot_prompt_kv_min_available_mb=run.get(
+                "hot_prompt_kv_min_available_mb", 0),
             tool_pic=run.get("tool_pic", False),
             tool_pic_shared_pages=run.get("tool_pic_shared_pages", False),
             tool_pic_repair_tokens=run.get("tool_pic_repair_tokens", 4),
@@ -343,6 +400,10 @@ class RuntimeConfig:
             warm_mb=run.get("warm_mb", 0),
             final_dead_token_elim=run.get("final_dead_token_elim", True),
             router_lookahead=run.get("router_lookahead", False),
+            expert_predictive_prefetch=run.get(
+                "expert_predictive_prefetch", False),
+            expert_prefetch_idle_only=run.get(
+                "expert_prefetch_idle_only", True),
             context_bound=run.get("context_bound", 0),
             expert_fetch_batch=run.get("expert_fetch_batch", 0),
             decode_expert_fetch_batch=run.get("decode_expert_fetch_batch", 0),
@@ -392,17 +453,28 @@ class _HotPromptSlot:
     # for n = reusable_prefix // hot_prompt_kv_chunk_size is a valid PARENT for a
     # future save (see the "branch" persist_parent_chain derivation in generate()).
     segment_chain: tuple[str, ...] = ()
+    # Logical prompt lineage. Hidden gateway decision/execution prompts differ
+    # near the beginning even when they belong to one caller turn. Namespace
+    # isolation prevents either phase from matching or displacing the other's
+    # logical cache. Exact token equality within a namespace remains the final
+    # correctness condition for reuse.
+    cache_namespace: str = "default"
 
 
 class StreamingEngine:
     def __init__(self, model_dir: str | Path, rc: RuntimeConfig | None = None):
+        self.rc = rc or RuntimeConfig()
+        if self.rc.mlx_cache_limit_mb <= 0:
+            raise ValueError("mlx_cache_limit_mb must be positive")
         # MLX's buffer cache is NOT counted in our weight budget and can balloon
         # by gigabytes under paging churn (measured 2.3 GB), pushing the machine
-        # over the macOS wired-memory line. Cap it.
-        mx.set_cache_limit(1 << 30)
-        self.rc = rc or RuntimeConfig()
+        # over the macOS wired-memory line. Exact paged-KV profiles use a much
+        # smaller server-configured cap than the ordinary 1-GiB default.
+        mx.set_cache_limit(self.rc.mlx_cache_limit_mb * 1_000_000)
         if self.rc.stepped_kv_threshold < 0:
             raise ValueError("stepped_kv_threshold must be >= 0")
+        if self.rc.min_weight_cache_mb <= 0:
+            raise ValueError("min_weight_cache_mb must be positive")
         if self.rc.prefetch_workers < 0:
             raise ValueError("prefetch_workers must be >= 0")
         if self.rc.resident_fast_prefill_limit < 0:
@@ -438,6 +510,11 @@ class StreamingEngine:
             )
         if self.rc.tool_pic and self.rc.max_kv_mb:
             raise ValueError("tool_pic does not support paged/spilled KV")
+        if self.rc.adaptive_kv_spill_mb < 0:
+            raise ValueError("adaptive_kv_spill_mb must be non-negative")
+        if not 1 <= self.rc.adaptive_kv_spill_prefill_chunk_size <= 4096:
+            raise ValueError(
+                "adaptive_kv_spill_prefill_chunk_size must be in [1, 4096]")
         if self.rc.tool_pic_shared_pages and not self.rc.tool_pic:
             raise ValueError("tool_pic_shared_pages requires tool_pic")
         if self.rc.tool_pic_shared_pages and not self.rc.hot_prompt_kv:
@@ -459,6 +536,8 @@ class StreamingEngine:
             raise ValueError("hot_prompt_kv_chunk_size must be positive when hot_prompt_kv is enabled")
         if self.rc.hot_prompt_kv and self.rc.hot_prompt_kv_slots <= 0:
             raise ValueError("hot_prompt_kv_slots must be positive when hot_prompt_kv is enabled")
+        if self.rc.hot_prompt_kv_min_available_mb < 0:
+            raise ValueError("hot_prompt_kv_min_available_mb must be non-negative")
         if self.rc.hot_prompt_kv:
             if self.rc.prefill_chunk_size != self.rc.hot_prompt_kv_chunk_size:
                 raise ValueError(
@@ -655,6 +734,15 @@ class StreamingEngine:
             3 * self.cfg.hidden_size * inter * 2)
         self._expert_page_bytes = int(
             3 * self.cfg.hidden_size * inter * resident_bytes_per_weight)
+        self._expert_storage_page_bytes = int(
+            3 * self.cfg.hidden_size * inter
+            * self.store.expert_storage_bytes_per_weight)
+        self._expert_storage_page_bytes = (
+            self.store.estimate_expert_storage_page_bytes(
+                self.cfg.moe_expert_prefix,
+                self._expert_storage_page_bytes,
+            )
+        )
         # Admission must cover peak load representation, not only the object
         # that survives in WeightCache. A standard pre-quantized checkpoint
         # loads its compact QTensor directly. Runtime quantize-on-load first
@@ -784,6 +872,7 @@ class StreamingEngine:
         self._min_adaptive_expert_batch = 0
         self._resident_fast_decode_sweeps = 0
         self._resident_fast_prefill_sweeps = 0
+        self._disable_resident_fast_for_request = False
         self._resident_fast_layers = None
         self._resident_fast_evictions = -1
         self._resident_moe_layers = None
@@ -842,11 +931,15 @@ class StreamingEngine:
                     f"mscale={mscale.hex()}:mscale_all_dim={mscale_all_dim.hex()}"
                 )
         if self.cfg.model_type == "gpt_oss":
-            if not self.store.packed:
-                raise RuntimeError(
-                    "gpt-oss requires a packed store (fused expert tensors must be "
-                    "unfused): run formats.packed.pack_model first"
-                )
+            self._rope_freqs, self._mscale = _gptoss_rope_state(
+                self.cfg, packed=self.store.packed)
+            mx.eval(self._rope_freqs)
+            # Quarantined: runtime/gptoss.py still differs from OpenAI's
+            # inverse-frequency/truncate:false reference. Make that visible in
+            # telemetry and invalidate any older cache identity rather than
+            # presenting the profile as conformance-validated.
+            self.rope_profile = "checkpoint-gptoss-yarn-unvalidated"
+            self.rope_cache_identity = "checkpoint-gptoss-yarn-unvalidated-v2"
         if self.cfg.num_experts and not self.store.packed:
             # 2026-07-19 (benchmark-sweep follow-up): some checkpoints ship
             # experts as ONE fused tensor per projection (e.g. Qwen3-VL-235B's
@@ -868,16 +961,6 @@ class StreamingEngine:
                     "checkpoints (this project's own EXPERT unfuse/pack step, "
                     "not a fla-core/compressed-tensors concept)."
                 )
-            from .gptoss import yarn_params
-
-            self._rope_freqs, self._mscale = yarn_params(self.cfg)
-            mx.eval(self._rope_freqs)
-            # Quarantined: runtime/gptoss.py still differs from OpenAI's
-            # inverse-frequency/truncate:false reference. Make that visible in
-            # telemetry and invalidate any older cache identity rather than
-            # presenting the profile as conformance-validated.
-            self.rope_profile = "checkpoint-gptoss-yarn-unvalidated"
-            self.rope_cache_identity = "checkpoint-gptoss-yarn-unvalidated-v2"
         if self.rc.resident_moe_decode:
             self._build_resident_moe_layers()
         self.predictor = None
@@ -934,7 +1017,14 @@ class StreamingEngine:
         if self.rc.governor:
             from .pressure import MemoryGovernor
 
-            self.governor = MemoryGovernor(self.cache, self.prefetcher)
+            self.governor = MemoryGovernor(
+                self.cache,
+                self.prefetcher,
+                floor_bytes=min(
+                    self.cache.max_bytes,
+                    self.rc.min_weight_cache_mb * 1_000_000,
+                ),
+            )
 
         # Hot-prompt-kv disk persistence (2026-07-15, generalized to a
         # parent-hashed segment DAG later the same day -- see
@@ -943,6 +1033,16 @@ class StreamingEngine:
         # conversation can resume warm instead of paying a full cold prefill
         # again.
         self._hot_kv_persist = None
+        self._completed_generations = 0
+        # A runtime-quantized dense Qwen checkpoint transforms its BF16 weights
+        # lazily on the first full layer sweep.  Restoring a large exact KV at
+        # construction can skip prefill, pushing that multi-GB transform into
+        # the first decode token while the restored KV is also resident.  On a
+        # 16 GB unified-memory host that ordering is unsafe even though either
+        # state fits by itself.  Keep durable KV disk-lazy until one ordinary
+        # generation has bootstrapped the resident packed/quantized weights.
+        self._defer_persisted_kv_until_bootstrap = (
+            self._should_defer_persisted_kv_until_bootstrap())
         if self.rc.hot_prompt_kv and self.rc.hot_prompt_kv_persist_dir:
             from .hot_kv_persist import HotPromptKVPersistence
 
@@ -956,17 +1056,234 @@ class StreamingEngine:
                     and bool(self.cfg.index_topk)
                     and not self._dsa_elided),
             )
-            for (tokens, kv, logits, prompt_length, prompt_logits,
-                 reusable_prefix, approximate, tool_capsules,
-                 segment_chain) in self._hot_kv_persist.load_all(
-                    self.cfg.num_hidden_layers, self.rc.hot_prompt_kv_slots):
-                self._hot_prompt_slots.append(_HotPromptSlot(
-                    tokens=tokens, kv=kv, logits=logits,
-                    prompt_length=prompt_length, prompt_logits=prompt_logits,
-                    reusable_prefix=reusable_prefix, approximate=approximate,
-                    tool_capsules=tool_capsules,
-                    segment_chain=segment_chain,
-                ))
+            if not self._defer_persisted_kv_until_bootstrap:
+                for (tokens, kv, logits, prompt_length, prompt_logits,
+                     reusable_prefix, approximate, tool_capsules,
+                     segment_chain, persisted_namespace
+                     ) in self._hot_kv_persist.load_all(
+                        self.cfg.num_hidden_layers, self.rc.hot_prompt_kv_slots):
+                    self._hot_prompt_slots.append(_HotPromptSlot(
+                        tokens=tokens, kv=kv, logits=logits,
+                        prompt_length=prompt_length, prompt_logits=prompt_logits,
+                        reusable_prefix=reusable_prefix, approximate=approximate,
+                        tool_capsules=tool_capsules,
+                        segment_chain=segment_chain,
+                        cache_namespace=persisted_namespace,
+                    ))
+            else:
+                print(
+                    "[hot-kv] durable restore deferred until dense-Qwen "
+                    "weight bootstrap completes", flush=True)
+
+    @staticmethod
+    def _kv_nbytes(kv) -> int:
+        measure = getattr(kv, "allocated_nbytes", None)
+        if measure is None:
+            measure = getattr(kv, "nbytes", None)
+        try:
+            return max(0, int(measure())) if measure is not None else 0
+        except (AttributeError, TypeError, ValueError):
+            return 0
+
+    def _should_defer_persisted_kv_until_bootstrap(self) -> bool:
+        """Whether restart KV restore would collide with lazy weight packing."""
+        return bool(
+            self.cfg.model_type in ("qwen2", "qwen3")
+            and not self.cfg.vision_config
+            and not self.cfg.num_experts
+            and self.rc.quant_bits
+            and self.rc.resident_fast_decode
+            and not self.store.on_disk_quantized
+        )
+
+    def _persisted_kv_restore_allowed(self) -> bool:
+        return bool(
+            not self._defer_persisted_kv_until_bootstrap
+            or self._completed_generations > 0
+        )
+
+    def prompt_cache_memory_snapshot(self) -> dict:
+        """Return live/evictable prompt-KV bytes for server preflight.
+
+        ``mx.get_active_memory()`` already includes these arrays.  Reporting
+        them separately lets admission project the state *after* unmatched
+        hot branches are released, instead of adding a new full KV on top of
+        an unrelated retained one and discovering the collision mid-stream.
+        """
+        seen = set()
+        retained = 0
+        for slot in self._hot_prompt_slots:
+            identity = id(slot.kv)
+            if identity in seen:
+                continue
+            seen.add(identity)
+            retained += self._kv_nbytes(slot.kv)
+        orphan = 0
+        last_kv = getattr(self, "last_kv", None)
+        if last_kv is not None and id(last_kv) not in seen:
+            orphan = self._kv_nbytes(last_kv)
+        return {
+            "active_metal_bytes": int(mx.get_active_memory()),
+            "retained_prompt_kv_bytes": retained,
+            "orphan_prompt_kv_bytes": orphan,
+            "evictable_prompt_kv_bytes": retained + orphan,
+            "hot_prompt_slots": len(self._hot_prompt_slots),
+            "metal_ceiling_bytes": (
+                int(self.governor.current_ceiling())
+                if self.governor is not None else 0),
+        }
+
+    def _project_dense_text_kv_bytes(self, positions: int) -> int:
+        if (self.cfg.model_type not in ("qwen2", "qwen3")
+                or self.cfg.vision_config or self.cfg.num_experts):
+            return 0
+        layers = int(self.cfg.num_hidden_layers or 0)
+        kv_heads = int(self.cfg.num_key_value_heads or 0)
+        head_dim = int(self.cfg.head_dim or 0)
+        if min(layers, kv_heads, head_dim, positions) <= 0:
+            return 0
+        return positions * layers * 2 * kv_heads * head_dim * 2
+
+    @staticmethod
+    def _hot_namespace_priority(namespace: str) -> int:
+        # The execution branch contains the selected real schemas and is the
+        # expensive state needed throughout a tool loop. The decision branch
+        # remains durable on disk but is the first in-memory eviction choice.
+        if namespace == "gateway_execution":
+            return 2
+        if namespace == "gateway_decision":
+            return 0
+        return 1
+
+    def _append_hot_prompt_slot(self, slot: _HotPromptSlot) -> tuple[int, int]:
+        """Insert with phase-aware bounded retention; return evicted count/bytes."""
+        self._hot_prompt_slots.append(slot)
+        evicted_count = 0
+        evicted_bytes = 0
+        capacity = max(1, self.rc.hot_prompt_kv_slots)
+        while len(self._hot_prompt_slots) > capacity:
+            # Lowest phase priority goes first; ties retain ordinary LRU order.
+            victim_index = min(
+                range(len(self._hot_prompt_slots)),
+                key=lambda index: (
+                    self._hot_namespace_priority(
+                        getattr(self._hot_prompt_slots[index],
+                                "cache_namespace", "default")),
+                    index,
+                ),
+            )
+            victim = self._hot_prompt_slots.pop(victim_index)
+            evicted_count += 1
+            evicted_bytes += self._kv_nbytes(victim.kv)
+            if victim.kv is not slot.kv:
+                self._release_kv(victim.kv)
+        return evicted_count, evicted_bytes
+
+    def _evict_hot_slots_for_admission(
+            self, required_total_kv_bytes: int, keep_kv,
+            cache_namespace: str, *, transient_bytes: int = 0) -> dict:
+        """Free persisted/unmatched branches until the next KV fits safely.
+
+        Hot slots are already checkpointed before entering the LRU whenever
+        persistence is enabled, so this is a RAM eviction, not a cache loss.
+        Without persistence it is still preferable to discard an unrelated
+        prefix than to enter macOS compression or fail the same allocation on
+        every automatic retry.
+        """
+        current_bytes = self._kv_nbytes(keep_kv) if keep_kv is not None else 0
+        incoming = max(0, int(required_total_kv_bytes) - current_bytes)
+        transient = max(0, int(transient_bytes))
+        stats = {
+            "evicted_slots": 0,
+            "evicted_bytes": 0,
+            "evicted_persisted_slots": 0,
+            "projected_incoming_bytes": incoming,
+            "projected_transient_bytes": transient,
+            "system_available_bytes": int(psutil.virtual_memory().available),
+            "system_available_floor_bytes": int(
+                getattr(getattr(self, "rc", None),
+                        "hot_prompt_kv_min_available_mb", 0) * 1_000_000),
+            "governor_reservations": 0,
+        }
+        if self.governor is None or incoming + transient <= 0:
+            return stats
+
+        margin = 400_000_000
+        system_floor = stats["system_available_floor_bytes"]
+
+        def pressure_sample():
+            active = int(mx.get_active_memory())
+            available = int(psutil.virtual_memory().available)
+            ceiling = int(self.governor.current_ceiling())
+            unsafe = (
+                active + incoming + transient + margin > ceiling
+                or (system_floor > 0
+                    and available - incoming - transient < system_floor)
+            )
+            return active, available, ceiling, unsafe
+
+        _active, available, ceiling, unsafe = pressure_sample()
+        while unsafe:
+            candidates = [
+                index for index, slot in enumerate(self._hot_prompt_slots)
+                if slot.kv is not keep_kv
+            ]
+            if not candidates:
+                break
+            # Prefer another phase, then the transient decision phase, then LRU.
+            victim_index = min(
+                candidates,
+                key=lambda index: (
+                    int(getattr(self._hot_prompt_slots[index],
+                                "cache_namespace", "default")
+                        == cache_namespace),
+                    self._hot_namespace_priority(
+                        getattr(self._hot_prompt_slots[index],
+                                "cache_namespace", "default")),
+                    index,
+                ),
+            )
+            victim = self._hot_prompt_slots.pop(victim_index)
+            victim_bytes = self._kv_nbytes(victim.kv)
+            stats["evicted_slots"] += 1
+            stats["evicted_bytes"] += victim_bytes
+            stats["evicted_persisted_slots"] += int(bool(
+                getattr(victim, "segment_chain", ())))
+            self._release_kv(victim.kv)
+            del victim
+            mx.clear_cache()
+            _active, available, ceiling, unsafe = pressure_sample()
+
+        # The old path stopped once no retained KV remained, even if the next
+        # allocation would still push system-available memory below an optional
+        # operator reserve. Ask the governor to reclaim weight-cache pages as
+        # the second tier. Its ceiling independently preserves `critical`;
+        # choosing the remainder as margin additionally enforces an explicitly
+        # configured `available - incoming >= system_floor` policy.
+        reserve = getattr(self.governor, "reserve", None)
+        reservations_before = int(getattr(
+            self.governor, "reservations", 0) or 0)
+        reservation_bytes = incoming + transient
+        if callable(reserve) and reservation_bytes > 0:
+            # `_resident_fast_layers` is a convenience tuple of the same dense
+            # arrays owned by WeightCache. Cache-budget shrink can evict their
+            # entries, but this second strong reference kept every tensor live
+            # until the *next* sweep noticed the eviction counter—too late for
+            # this pre-allocation reservation. Drop the view before asking the
+            # governor to reclaim pages; the following sweep rebuilds it from
+            # whatever cache budget remains.
+            if getattr(self, "_resident_fast_layers", None) is not None:
+                self._resident_fast_layers = None
+                self._resident_fast_evictions = -1
+                mx.clear_cache()
+            critical = int(getattr(self.governor, "critical", 0) or 0)
+            reserve_margin = max(margin, system_floor - critical)
+            reserve(reservation_bytes, margin=reserve_margin)
+        stats["governor_reservations"] = max(0, int(getattr(
+            self.governor, "reservations", 0) or 0) - reservations_before)
+        stats["system_available_bytes"] = int(
+            psutil.virtual_memory().available)
+        return stats
 
     def _note_true_peak(self):
         p = mx.get_peak_memory()
@@ -1172,13 +1489,31 @@ class StreamingEngine:
         if self.predictor is not None:
             if provisional is None:
                 self.predictor.observe(layer, expert_ids)
-            if self.prefetcher:
+            if self.prefetcher and self.rc.expert_predictive_prefetch:
                 for e in self.predictor.predict(layer, expert_ids, top_m=self.cfg.num_experts_per_tok):
                     self.prefetcher.schedule(
                         f"layer.{layer + 1}.expert.{e}",
                         self.store.names_with_prefix(
                             f"model.layers.{layer + 1}.{self.cfg.moe_expert_prefix}.{e}."),
+                        only_if_idle=self.rc.expert_prefetch_idle_only,
                     )
+
+    def export_expert_trace(self, path: str | Path) -> Path:
+        """Write routed unions for offline layout/prefetch simulation.
+
+        This exports decisions the authoritative router already made; it does
+        not evaluate activations, fetch weights, or alter generation.  Sweep
+        boundaries are reconstructed from the strictly increasing layer order.
+        """
+        from .expert_plan import write_trace
+
+        return write_trace(
+            path,
+            self.expert_trace,
+            model=str(self._model_dir),
+            num_experts=self.cfg.num_experts,
+            expert_page_bytes=self._expert_storage_page_bytes,
+        )
 
     def _fetch_experts(self, layer: int, expert_ids: list[int]) -> dict[int, dict]:
         """Fetch one lifetime-bounded expert batch; routing was recorded already."""
@@ -1265,7 +1600,8 @@ class StreamingEngine:
         the current hidden state (routing is largely stable across one block)
         and prefetch that union. Token-conditioned, unlike the Markov
         transition predictor. Never blocks on disk: skips unless the next
-        layer's page is already resident."""
+        layer's page is already resident, and the default idle-only gate admits
+        no backlog behind existing prefetch work."""
         key = self._layer_key(nxt)
         if not self.cache.contains(key):
             return
@@ -1299,6 +1635,7 @@ class StreamingEngine:
                 f"layer.{nxt}.expert.{e}",
                 self.store.names_with_prefix(
                     f"model.layers.{nxt}.{self.cfg.moe_expert_prefix}.{e}."),
+                only_if_idle=self.rc.expert_prefetch_idle_only,
             )
 
     def _estimate_layer_bytes(self) -> int:
@@ -1375,7 +1712,8 @@ class StreamingEngine:
             self._resident_fast_layers = None
             fast_layers = None
         fast_decode_eligible = (
-            self.rc.resident_fast_decode and x.shape[1] == 1)
+            self.rc.resident_fast_decode and x.shape[1] == 1
+            and not self._disable_resident_fast_for_request)
         fast_prefill_eligible = (
             self.rc.resident_fast_prefill_limit > 0
             and x.shape[1] > 1
@@ -1747,6 +2085,7 @@ class StreamingEngine:
         self._provisional = None  # F55 safety: a crashed spec round must not leave buffering on
         self._resident_fast_decode_sweeps = 0
         self._resident_fast_prefill_sweeps = 0
+        self._disable_resident_fast_for_request = False
         self._resident_moe_sweeps = 0
         self._true_peak_metal_bytes = mx.get_active_memory()  # see _note_true_peak
         if self.governor is not None:
@@ -1760,6 +2099,8 @@ class StreamingEngine:
         # config flag (a short prompt with chunk_size=4096 is a no-op).
         if isinstance(max_tokens, bool) or not isinstance(max_tokens, int) or max_tokens <= 0:
             raise ValueError("max_tokens must be a positive integer")
+        cache_namespace = str(
+            getattr(prompt, "cache_namespace", "default") or "default")
         path_stats = {
             "prompt_cache_exact_hit": 0,
             "prompt_cache_prefix_tokens": 0,
@@ -1776,6 +2117,18 @@ class StreamingEngine:
             "hot_prompt_kv_gc_s": 0.0,
             "hot_prompt_kv_gc_removed": 0,
             "hot_prompt_kv_disk_hit": 0,
+            "prompt_cache_namespace": cache_namespace,
+            "hot_prompt_admission_evicted_slots": 0,
+            "hot_prompt_admission_evicted_bytes": 0,
+            "hot_prompt_admission_evicted_persisted_slots": 0,
+            "hot_prompt_admission_projected_incoming_bytes": 0,
+            "hot_prompt_admission_projected_transient_bytes": 0,
+            "hot_prompt_admission_runtime_retries": 0,
+            "hot_prompt_admission_system_available_bytes": 0,
+            "hot_prompt_admission_system_floor_bytes": 0,
+            "hot_prompt_admission_governor_reservations": 0,
+            "hot_prompt_capacity_evicted_slots": 0,
+            "hot_prompt_capacity_evicted_bytes": 0,
             "tool_pic": 0,
             "tool_pic_selected_tokens": 0,
             "tool_pic_reused_tokens": 0,
@@ -1784,6 +2137,9 @@ class StreamingEngine:
             "tool_pic_memory_admitted": 0,
             "tool_pic_projected_bytes": 0,
             "tool_pic_rotated_view_projected_bytes": 0,
+            "tool_pic_system_available_bytes": 0,
+            "tool_pic_system_floor_bytes": 0,
+            "tool_pic_system_memory_admitted": 0,
             "prompt_state_approximate": 0,
             "suffix_decoding_enabled": int(self.rc.suffix_decoding),
             "suffix_decoding_used": 0,
@@ -1812,6 +2168,10 @@ class StreamingEngine:
             "constraint_profile": getattr(constraint, "profile", "none"),
             "prefill_chunks": 0,
             "prefill_checkpoints_saved": 0,
+            "paged_kv_chunk_cache_clears": 0,
+            "adaptive_kv_spill": 0,
+            "adaptive_kv_spill_reason": "",
+            "resident_fast_memory_fallback": 0,
             "prompt_snapshots_skipped_oversize": 0,
             "adaptive_chunk_failed": 0,
             "reranked_lm_head": int(self.rc.rerank_lm_head),
@@ -1842,16 +2202,22 @@ class StreamingEngine:
             raise ValueError(
                 f"context_bound={self.rc.context_bound} but prompt({len(tokens)})"
                 f"+max_tokens({max_tokens}) exceeds it")
+        adaptive_spill_mb = max(0, int(
+            getattr(self.rc, "adaptive_kv_spill_mb", 0) or 0))
+        force_adaptive_paged = bool(
+            adaptive_spill_mb and getattr(prompt, "force_paged_kv", False))
         use_stepped_kv = bool(
             self.rc.stepped_kv_threshold
             and len(tokens) + max_tokens > self.rc.stepped_kv_threshold
             and not self.rc.max_kv_mb
+            and not force_adaptive_paged
             and not self.rc.tool_pic_shared_pages
             and not (self.rc.mla_compressed_kv
                      and self.cfg.model_type == "glm_moe_dsa")
         )
         path_stats["kv_layout"] = (
             "position_free_shared" if self.rc.tool_pic_shared_pages else
+            "paged_adaptive" if force_adaptive_paged else
             "stepped" if use_stepped_kv else
             ("paged" if self.rc.max_kv_mb else "concatenated")
         )
@@ -1883,7 +2249,105 @@ class StreamingEngine:
         # yet. Keep this model type on the always-cold path until an
         # exact-match (not prefix-trim) reuse design exists for it.
         hot_eligible = (self.rc.hot_prompt_kv and not self.rc.max_kv_mb
+                        and not force_adaptive_paged
                         and self.cfg.model_type != "kimi_linear")
+        resident_prompt_kv_bytes = self._project_dense_text_kv_bytes(len(tokens))
+        configured_paged_mb = int(self.rc.max_kv_mb or 0)
+        initial_paged_mb = (
+            configured_paged_mb
+            or (adaptive_spill_mb if force_adaptive_paged else 0))
+        required_total_kv_bytes = (
+            min(resident_prompt_kv_bytes, initial_paged_mb * 1_000_000)
+            if initial_paged_mb else resident_prompt_kv_bytes)
+        admission_done = False
+
+        def record_hot_admission(admission):
+            path_stats["hot_prompt_admission_evicted_slots"] += int(
+                admission["evicted_slots"])
+            path_stats["hot_prompt_admission_evicted_bytes"] += int(
+                admission["evicted_bytes"])
+            path_stats["hot_prompt_admission_evicted_persisted_slots"] += int(
+                admission["evicted_persisted_slots"])
+            path_stats["hot_prompt_admission_projected_incoming_bytes"] = int(
+                admission["projected_incoming_bytes"])
+            path_stats["hot_prompt_admission_projected_transient_bytes"] = int(
+                admission.get("projected_transient_bytes", 0))
+            path_stats["hot_prompt_admission_system_available_bytes"] = int(
+                admission.get("system_available_bytes", 0))
+            path_stats["hot_prompt_admission_system_floor_bytes"] = int(
+                admission.get("system_available_floor_bytes", 0))
+            path_stats["hot_prompt_admission_governor_reservations"] += int(
+                admission.get("governor_reservations", 0))
+
+        def admit_hot_kv_growth(keep_kv):
+            nonlocal admission_done, force_adaptive_paged
+            try:
+                admission = self._evict_hot_slots_for_admission(
+                    required_total_kv_bytes, keep_kv, cache_namespace,
+                    transient_bytes=self._layer_transient)
+            except MemoryError as resident_error:
+                if not adaptive_spill_mb or force_adaptive_paged:
+                    raise
+                # Resident prompt KV could not coexist with the learned token
+                # transient even after durable inactive branches and reclaimable
+                # weights were shed. Run this phase cold with bounded paged KV;
+                # prior durable checkpoints remain untouched for a later warm
+                # request with more headroom.
+                force_adaptive_paged = True
+                path_stats["adaptive_kv_spill"] = 1
+                path_stats["adaptive_kv_spill_reason"] = "resident_admission"
+                path_stats["kv_layout"] = "paged_adaptive"
+                if keep_kv is not None:
+                    # The caller still owns the resident match. Return the
+                    # fallback decision first so it can drop that last strong
+                    # reference before we admit the paged replacement.
+                    admission_done = False
+                    return False
+                paged_required = min(
+                    resident_prompt_kv_bytes, adaptive_spill_mb * 1_000_000)
+                admission = self._evict_hot_slots_for_admission(
+                    paged_required, None, cache_namespace,
+                    transient_bytes=self._layer_transient)
+                print(
+                    f"[kv] resident admission fell back to "
+                    f"{adaptive_spill_mb}MB paged KV: {resident_error}",
+                    flush=True,
+                )
+            admission_done = True
+            record_hot_admission(admission)
+            return not force_adaptive_paged
+
+        def reserve_decode_step(active_kv):
+            if (self._disable_resident_fast_for_request
+                    or self.governor is None or not self._token_transient):
+                return
+            try:
+                self.governor.reserve(self._token_transient)
+            except MemoryError as resident_error:
+                # The learned token transient can become unsafe after prefill
+                # even though prompt KV itself fit. Prefer evicting a different,
+                # already-durable phase from RAM, then retry with the live
+                # governor, instead of failing and leaving the harness to rerun
+                # with a cold weight cache.
+                try:
+                    admission = self._evict_hot_slots_for_admission(
+                        self._kv_nbytes(active_kv), active_kv, cache_namespace,
+                        transient_bytes=self._token_transient)
+                except MemoryError:
+                    self._disable_resident_fast_for_request = True
+                    self._resident_fast_layers = None
+                    self._resident_fast_evictions = -1
+                    mx.clear_cache()
+                    path_stats["resident_fast_memory_fallback"] = 1
+                    print(
+                        f"[decode] resident token reservation fell back to "
+                        f"streamed layers: {resident_error}",
+                        flush=True,
+                    )
+                    return
+                record_hot_admission(admission)
+                path_stats["hot_prompt_admission_runtime_retries"] += 1
+
         if hot_eligible:
             hot_t0 = time.perf_counter()
             # `last_kv` normally aliases the winning slot's KV; clear it even if
@@ -1913,6 +2377,9 @@ class StreamingEngine:
             # needed only to derive the correct disk-persistence parent chain below
 
             for idx, slot in enumerate(self._hot_prompt_slots):
+                if (getattr(slot, "cache_namespace", "default")
+                        != cache_namespace):
+                    continue
                 if not (isinstance(slot.kv, KVCache) and slot.kv.offset == len(slot.tokens)):
                     continue
                 lcp = 0
@@ -2001,6 +2468,9 @@ class StreamingEngine:
                 baseline_positions = len(tokens) - best_matched
                 pic_candidates = []
                 for idx, slot in enumerate(self._hot_prompt_slots):
+                    if (getattr(slot, "cache_namespace", "default")
+                            != cache_namespace):
+                        continue
                     if slot.approximate or not slot.tool_capsules:
                         continue
                     lcp = 0
@@ -2071,10 +2541,21 @@ class StreamingEngine:
                     path_stats["tool_pic_rotated_view_projected_bytes"] = (
                         rotated_view_bytes)
                     admitted = True
+                    (system_admitted, system_available,
+                     system_floor) = _system_allocation_preserves_floor(
+                        incoming, self.rc.hot_prompt_kv_min_available_mb)
+                    path_stats["tool_pic_system_available_bytes"] = (
+                        system_available)
+                    path_stats["tool_pic_system_floor_bytes"] = system_floor
+                    path_stats["tool_pic_system_memory_admitted"] = int(
+                        system_admitted)
                     if self.governor is not None:
                         admitted = (
                             mx.get_active_memory() + incoming + int(0.4e9)
-                            <= self.governor.current_ceiling())
+                            <= self.governor.current_ceiling()
+                            and system_admitted)
+                    else:
+                        admitted = system_admitted
                     if admitted:
                         try:
                             if self.governor is not None:
@@ -2170,7 +2651,8 @@ class StreamingEngine:
                 reusable_watermark = best_reusable_watermark
                 path_stats["hot_prompt_lcp_tokens"] = best_lcp
                 path_stats["prompt_cache_source"] = "memory"
-            elif self._hot_kv_persist is not None:
+            elif (self._hot_kv_persist is not None
+                  and self._persisted_kv_restore_allowed()):
                 # Total in-memory miss. Before falling all the way back to
                 # a cold prefill, check whether the disk segment DAG has
                 # something useful -- e.g. more concurrent agentic/cron
@@ -2180,25 +2662,36 @@ class StreamingEngine:
                 # evicted from (or never entered) the in-memory LRU. This
                 # deliberately does not compete with an in-memory hit above
                 # -- it only fills the gap when memory has nothing at all.
-                disk_match = self._hot_kv_persist.find_best_match(
-                    tokens, self.rc.hot_prompt_kv_chunk_size)
-                if disk_match is not None:
-                    loaded = self._hot_kv_persist.load_matched_chain(
-                        disk_match, self.cfg.num_hidden_layers)
-                    if loaded is not None:
-                        loaded_tokens, loaded_kv, loaded_exact_logits = loaded
-                        kv = loaded_kv
-                        matched = disk_match["matched"]
-                        exact_logits = loaded_exact_logits
-                        reusable_watermark = disk_match["watermark"]
-                        persist_parent_chain = tuple(
-                            disk_match["chain"][: disk_match["n_segments"]])
-                        persist_parent_covered = disk_match["matched"]
-                        prompt_state_approximate = bool(
-                            disk_match.get("approximate", False))
-                        path_stats["hot_prompt_lcp_tokens"] = disk_match["lcp"]
-                        path_stats["prompt_cache_source"] = "hot_disk"
-                        path_stats["hot_prompt_kv_disk_hit"] = 1
+                # Loading the winning disk chain allocates real Metal arrays;
+                # release persisted, unmatched resident branches first when
+                # the live ceiling cannot hold both states simultaneously.
+                if admit_hot_kv_growth(None):
+                    disk_match = self._hot_kv_persist.find_best_match(
+                        tokens, self.rc.hot_prompt_kv_chunk_size,
+                        cache_namespace=cache_namespace)
+                    if disk_match is not None:
+                        loaded = self._hot_kv_persist.load_matched_chain(
+                            disk_match, self.cfg.num_hidden_layers)
+                        if loaded is not None:
+                            loaded_tokens, loaded_kv, loaded_exact_logits = loaded
+                            kv = loaded_kv
+                            matched = disk_match["matched"]
+                            exact_logits = loaded_exact_logits
+                            reusable_watermark = disk_match["watermark"]
+                            persist_parent_chain = tuple(
+                                disk_match["chain"][: disk_match["n_segments"]])
+                            persist_parent_covered = disk_match["matched"]
+                            prompt_state_approximate = bool(
+                                disk_match.get("approximate", False))
+                            path_stats["hot_prompt_lcp_tokens"] = disk_match["lcp"]
+                            path_stats["prompt_cache_source"] = "hot_disk"
+                            path_stats["hot_prompt_kv_disk_hit"] = 1
+            elif self._hot_kv_persist is not None:
+                # See _should_defer_persisted_kv_until_bootstrap().  The
+                # checkpoint remains untouched and becomes eligible on the
+                # next request; this first cold prefill is the safe weight
+                # bootstrap sweep.
+                path_stats["hot_prompt_kv_bootstrap_deferred"] = 1
 
             hot_elapsed = max(
                 0.0, time.perf_counter() - hot_t0
@@ -2206,13 +2699,38 @@ class StreamingEngine:
             path_stats["hot_prompt_lookup_s"] = hot_elapsed
             path_stats["prompt_cache_lookup_s"] += hot_elapsed
 
+        if required_total_kv_bytes and not admission_done:
+            # Covers an in-memory match (free unrelated branches before suffix
+            # growth) and a cold miss when durable persistence is disabled.
+            resident_admitted = admit_hot_kv_growth(kv)
+            if not resident_admitted and kv is not None:
+                self._release_kv(kv)
+                kv = None
+                mx.clear_cache()
+                matched = 0
+                exact_logits = None
+                reusable_watermark = 0
+                persist_parent_chain = ()
+                persist_parent_covered = 0
+                path_stats["prompt_cache_source"] = "cold"
+                paged_required = min(
+                    resident_prompt_kv_bytes, adaptive_spill_mb * 1_000_000)
+                paged_admission = self._evict_hot_slots_for_admission(
+                    paged_required, None, cache_namespace,
+                    transient_bytes=self._layer_transient)
+                record_hot_admission(paged_admission)
+                admission_done = True
+
         if kv is None:
-            if self.rc.max_kv_mb:
+            paged_kv_mb = (
+                self.rc.max_kv_mb
+                or (adaptive_spill_mb if force_adaptive_paged else 0))
+            if paged_kv_mb:
                 from .kv_paged import PagedKVCache
 
                 kv = PagedKVCache(
                     self.cfg.num_hidden_layers,
-                    max_bytes=self.rc.max_kv_mb * 1_000_000,
+                    max_bytes=paged_kv_mb * 1_000_000,
                     spill_dir=self.rc.kv_spill_dir,
                     page_positions=self.rc.kv_page_positions,
                     compress_spill=self.rc.kv_spill_compress,
@@ -2302,6 +2820,10 @@ class StreamingEngine:
             # separate. F37 v6 journals only new positions at a checkpoint; a
             # checkpoint-only config still uses its cadence as the compute chunk.
             chunk = self.rc.prefill_chunk_size or (ckpt if kv_store is not None else 0)
+            if force_adaptive_paged:
+                adaptive_paged_chunk = int(
+                    self.rc.adaptive_kv_spill_prefill_chunk_size)
+                chunk = min(chunk or adaptive_paged_chunk, adaptive_paged_chunk)
             # F68: learn a safe chunk size online instead of trusting a fixed
             # constant measured on a different model. Intended as a scheduling
             # decision, but chunk shapes can alter kernel/reduction selection, so
@@ -2400,10 +2922,36 @@ class StreamingEngine:
                             and end - chunk_start == self.rc.hot_prompt_kv_chunk_size):
                         reusable_watermark = end
                         path_stats["hot_prompt_reusable_prefix_tokens"] = reusable_watermark
+                    if self.rc.max_kv_mb or force_adaptive_paged:
+                        # Page reload + concatenation temporaries are dead once
+                        # the full layer sweep is materialized. With many small
+                        # progressive chunks, leaving `xc` and MLX's buffer cache
+                        # alive until the next iteration accumulated enough
+                        # reclaimable memory to push system-available below 4 GB.
+                        del xc
+                        mx.clear_cache()
+                        path_stats["paged_kv_chunk_cache_clears"] += 1
                     if on_progress is not None:
-                        on_progress({"phase": "prefill", "completed_tokens": pos,
-                                     "total_tokens": len(tokens),
-                                     "cache_source": path_stats["prompt_cache_source"]})
+                        try:
+                            on_progress({
+                                "phase": "prefill",
+                                "completed_tokens": pos,
+                                "total_tokens": len(tokens),
+                                "cache_source": path_stats["prompt_cache_source"],
+                            })
+                        except Exception:
+                            # A streaming client can disconnect after observing a
+                            # progress boundary but before cold prefill finishes.
+                            # Preserve the complete exact chunks already built so
+                            # a retry resumes from this boundary instead of paying
+                            # for them again.  Durable hot-KV has its own atomic
+                            # segment protocol and is intentionally excluded from
+                            # this in-memory-only recovery path.
+                            self._retain_interrupted_prefill(
+                                tokens, kv, reusable_watermark,
+                                getattr(prompt, "tool_capsules", ()),
+                                cache_namespace)
+                            raise
             x = self._embed(list(tokens[pos:]))
             # F36 applies here because generate() consumes only the last position;
             # forward_tokens (speculative verify) must NOT use it — it needs
@@ -2499,8 +3047,32 @@ class StreamingEngine:
             prompt_state_approximate)
         path_stats["suffix_decoding_fallback_reason"] = (
             suffix_reason or "")
+        resident_decode_memory_safe = True
+        if (self.rc.resident_fast_decode and self.governor is not None
+                and self._token_transient):
+            resident_decode_memory_safe = (
+                mx.get_active_memory() + self._token_transient + int(0.4e9)
+                <= self.governor.current_ceiling())
+        if not resident_decode_memory_safe:
+            # Full-stack lazy decode is a throughput optimization, not a
+            # correctness requirement. Under pressure, stream/evaluate one
+            # layer at a time; that path performs its own smaller per-layer
+            # reservations and avoids failing a response over a stale 1GB
+            # resident-token high-water estimate.
+            self._disable_resident_fast_for_request = True
+            self._resident_fast_layers = None
+            self._resident_fast_evictions = -1
+            mx.clear_cache()
+            path_stats["resident_fast_memory_fallback"] = 1
+            print(
+                f"[decode] streaming layers under live pressure instead of "
+                f"reserving {self._token_transient / 1e9:.2f}GB resident "
+                f"token transient",
+                flush=True,
+            )
         dense_pipeline_ready = (
             self.rc.resident_fast_decode
+            and not self._disable_resident_fast_for_request
             and not self.cfg.num_experts
             and all(self.cache.contains(self._layer_key(i))
                     for i in range(self.cfg.num_hidden_layers))
@@ -2562,8 +3134,7 @@ class StreamingEngine:
             # side-quest win after removing per-layer synchronization.
             decode_t0 = time.perf_counter()
             boundary = mx.get_active_memory()
-            if self.governor is not None and self._token_transient:
-                self.governor.reserve(self._token_transient)
+            reserve_decode_step(kv)
             mx.reset_peak_memory()
             current_token, current_logits = self._lazy_resident_decode_step(
                 mx.array(next_tok), kv)
@@ -2622,8 +3193,7 @@ class StreamingEngine:
                 # the greedy() sync point, not inside any one layer) — learn it and
                 # reserve before the next token so the ceiling is never crossed.
                 boundary = mx.get_active_memory()
-                if self.governor is not None and self._token_transient:
-                    self.governor.reserve(self._token_transient)
+                reserve_decode_step(kv)
                 mx.reset_peak_memory()
                 x = self._embed([next_tok])
                 x = self._sweep(x, kv, offset=kv.offset)
@@ -2707,6 +3277,8 @@ class StreamingEngine:
         path_stats["adaptive_expert_batch_clamps"] = self._adaptive_expert_batch_clamps
         path_stats["min_adaptive_expert_batch"] = self._min_adaptive_expert_batch
         path_stats["expert_resident_page_bytes_estimate"] = self._expert_page_bytes
+        path_stats["expert_storage_page_bytes_estimate"] = (
+            self._expert_storage_page_bytes)
         path_stats["expert_fetch_page_bytes_estimate"] = self._expert_fetch_page_bytes
         path_stats["resident_fast_decode_sweeps"] = self._resident_fast_decode_sweeps
         path_stats["resident_fast_prefill_sweeps"] = self._resident_fast_prefill_sweeps
@@ -2728,6 +3300,15 @@ class StreamingEngine:
         path_stats["position_free_rotated_view_bytes"] = int(
             kv.rotated_view_nbytes()
             if getattr(kv, "position_free", False) else 0)
+        paged_stats = getattr(kv, "stats", None)
+        path_stats["paged_kv_spills"] = int(
+            getattr(paged_stats, "spills", 0) or 0)
+        path_stats["paged_kv_reloads"] = int(
+            getattr(paged_stats, "reloads", 0) or 0)
+        path_stats["paged_kv_spill_seconds"] = float(
+            getattr(paged_stats, "spill_s", 0.0) or 0.0)
+        path_stats["paged_kv_reload_seconds"] = float(
+            getattr(paged_stats, "reload_s", 0.0) or 0.0)
         if getattr(kv, "position_free", False):
             # The view exists only to make this request's long decode use MLX's
             # fast pre-rotated SDPA. The retained hot slot owns shared physical
@@ -2758,6 +3339,7 @@ class StreamingEngine:
                     reusable_prefix=reusable_watermark,
                     approximate=prompt_state_approximate,
                     tool_capsules=tuple(getattr(prompt, "tool_capsules", ())),
+                    cache_namespace=cache_namespace,
                 )
                 path_stats["hot_prompt_kv_persist_write_s"] = (
                     time.perf_counter() - persist_t0)
@@ -2771,19 +3353,13 @@ class StreamingEngine:
                 approximate=prompt_state_approximate,
                 tool_capsules=tuple(getattr(prompt, "tool_capsules", ())),
                 segment_chain=segment_chain,
+                cache_namespace=cache_namespace,
             )
-            self._hot_prompt_slots.append(new_slot)
-            # Evict least-recently-(re)inserted slots over capacity. A slot
-            # that keeps getting matched is popped and re-appended by the
-            # lookup path above, so it naturally moves to the "recent" end;
-            # one that's never reused ages toward index 0 and is evicted first.
-            while len(self._hot_prompt_slots) > max(1, self.rc.hot_prompt_kv_slots):
-                evicted = self._hot_prompt_slots.pop(0)
-                if evicted.kv is not kv:
-                    self._release_kv(evicted.kv)
-                # frees the in-memory copy only;
-                # its disk checkpoint (if any) is a separate, larger-budget
-                # concern handled entirely by gc() below.
+            capacity_count, capacity_bytes = self._append_hot_prompt_slot(new_slot)
+            path_stats["hot_prompt_capacity_evicted_slots"] = capacity_count
+            path_stats["hot_prompt_capacity_evicted_bytes"] = capacity_bytes
+            # Capacity eviction frees only the in-memory copy. Its disk
+            # checkpoint is governed by the separate durable recency budget.
             if self._hot_kv_persist is not None:
                 gc_t0 = time.perf_counter()
                 path_stats["hot_prompt_kv_gc_removed"] = self._hot_kv_persist.gc()
@@ -2795,7 +3371,7 @@ class StreamingEngine:
                 self.governor.request_peak(),
                 mx.get_active_memory(),
             )
-        return {
+        result = {
             "text": final_text,
             "tokens": generated,
             "prefill_s": prefill_s,
@@ -2814,6 +3390,13 @@ class StreamingEngine:
             # already computed above, so exposing it costs no second tokenize.
             "prompt_tokens": len(tokens),
         }
+        if ((self.rc.release_paged_kv_after_generate and self.rc.max_kv_mb)
+                or force_adaptive_paged):
+            self.last_kv = None
+            self._release_kv(kv)
+            mx.clear_cache()
+        self._completed_generations += 1
+        return result
 
     def report(self) -> str:
         lines = [
@@ -2857,6 +3440,69 @@ class StreamingEngine:
         vision_embeddings = getattr(self, "_vision_embedding_cache", None)
         if vision_embeddings is not None:
             vision_embeddings.clear()
+
+    def discard_failed_request_state(self):
+        """Drop only state owned by the request that just failed.
+
+        A long-prefill MemoryError used to leave ``last_kv`` strongly referenced.
+        The harness then retried immediately against an allocator still holding
+        the failed request's multi-GiB KV, turning one safe refusal into a rapid
+        refusal loop.  Preserve unrelated hot slots, but remove/release the slot
+        that aliases the failed request (if any) and its diagnostic ``last_kv``.
+        """
+        self._disable_resident_fast_for_request = False
+        failed = self.last_kv
+        if failed is None:
+            return
+        self._hot_prompt_slots = [
+            slot for slot in self._hot_prompt_slots if slot.kv is not failed
+        ]
+        self._release_kv(failed)
+        self.last_kv = None
+        self._h_window = None
+        self._h_last = None
+        self._provisional = None
+
+    def _retain_interrupted_prefill(
+            self, tokens, kv, reusable_prefix: int, tool_capsules=(),
+            cache_namespace: str = "default") -> bool:
+        """Retain a complete chunk boundary after an SSE/client interruption.
+
+        The slot deliberately has no endpoint logits: on retry it is only an
+        exact prefix of the full prompt, so the ordinary extension path resumes
+        at ``kv.offset`` and produces the final endpoint logits normally.
+        """
+        covered = int(getattr(kv, "offset", 0) or 0)
+        if (not self.rc.hot_prompt_kv or self.rc.max_kv_mb
+                or self._hot_kv_persist is not None
+                or not isinstance(kv, KVCache)
+                or covered <= 0 or covered > len(tokens)
+                or covered < self.rc.hot_prompt_kv_min_tokens
+                or reusable_prefix != covered):
+            return False
+        retained_capsules = tuple(
+            capsule for capsule in tool_capsules
+            if len(capsule) >= 3 and int(capsule[2]) <= covered
+        )
+        self._hot_prompt_slots = [
+            slot for slot in self._hot_prompt_slots if slot.kv is not kv
+        ]
+        self._append_hot_prompt_slot(_HotPromptSlot(
+            tokens=tuple(tokens[:covered]),
+            kv=kv,
+            logits=None,
+            prompt_length=covered,
+            prompt_logits=None,
+            reusable_prefix=covered,
+            approximate=False,
+            tool_capsules=retained_capsules,
+            segment_chain=(),
+            cache_namespace=str(cache_namespace or "default"),
+        ))
+        self.last_kv = kv
+        self._h_window = None
+        self._h_last = None
+        return True
 
     @staticmethod
     def _release_kv(kv):

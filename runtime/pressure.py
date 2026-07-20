@@ -187,6 +187,7 @@ class MemoryGovernor:
             projected = active + incoming_bytes + margin
             return active, available, ceiling, projected
 
+        starting_cache_max = int(self.cache.max_bytes)
         active, available, ceiling, projected = sample()
         if projected <= ceiling:
             return
@@ -227,6 +228,15 @@ class MemoryGovernor:
         # the floor instead of weakening the reserve or continuing fail-open.
         if projected > ceiling:
             self.reservation_failures += 1
+            # Shrinking the cache is useful only when it makes the imminent
+            # allocation admissible. If it cannot, leave the *budget* where it
+            # started before raising. Raising a limit allocates nothing; it
+            # merely prevents an automatic harness retry from running with a
+            # needlessly collapsed cache after the failed request's KV is
+            # released. The pressure thread and the retry's own reservations
+            # still reclaim pages against fresh live samples.
+            if self.cache.max_bytes < starting_cache_max:
+                self._set_cache_max(starting_cache_max)
             raise MemoryError(
                 "unsafe Metal reservation refused before allocation: "
                 f"active={active / 1e9:.2f}GB incoming={incoming_bytes / 1e9:.2f}GB "

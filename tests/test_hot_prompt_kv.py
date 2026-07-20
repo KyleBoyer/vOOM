@@ -641,6 +641,265 @@ def test_disk_fallback_recovers_a_task_evicted_from_the_in_memory_lru():
         shutil.rmtree(PERSIST_DIR, ignore_errors=True)
 
 
+def test_phase_aware_single_slot_protects_gateway_execution_state():
+    from types import SimpleNamespace
+
+    from runtime.engine import _HotPromptSlot, StreamingEngine
+
+    class State:
+        def __init__(self, size):
+            self.size = size
+            self.releases = 0
+
+        def allocated_nbytes(self):
+            return self.size
+
+        def release(self):
+            self.releases += 1
+
+    def slot(namespace, state):
+        return _HotPromptSlot(
+            tokens=(1,), kv=state, logits=None, prompt_length=1,
+            prompt_logits=None, reusable_prefix=0,
+            segment_chain=(f"{namespace}-persisted",),
+            cache_namespace=namespace)
+
+    engine = StreamingEngine.__new__(StreamingEngine)
+    engine.rc = SimpleNamespace(hot_prompt_kv_slots=1)
+
+    execution_state = State(1_500_000_000)
+    decision_state = State(300_000_000)
+    execution = slot("gateway_execution", execution_state)
+    decision = slot("gateway_decision", decision_state)
+    engine._hot_prompt_slots = [execution]
+    count, _bytes = engine._append_hot_prompt_slot(decision)
+    assert count == 1
+    assert engine._hot_prompt_slots == [execution]
+    assert execution_state.releases == 0
+
+    engine._hot_prompt_slots = [decision]
+    count, _bytes = engine._append_hot_prompt_slot(execution)
+    assert count == 1
+    assert engine._hot_prompt_slots == [execution]
+    assert decision_state.releases == 1
+
+
+def test_identical_tokens_do_not_cross_reuse_hidden_phase_namespaces():
+    _ensure_fixture()
+    from runtime.engine import RuntimeConfig, StreamingEngine
+    from runtime.server import PreparedPrompt
+
+    cfg = RuntimeConfig(
+        max_weight_cache_mb=200, pin_lm_head=True, mla_compressed_kv=True,
+        prefill_chunk_size=4, hot_prompt_kv=True, hot_prompt_kv_chunk_size=4,
+        hot_prompt_kv_slots=2, hot_prompt_kv_min_tokens=0, governor=False,
+    )
+    engine = StreamingEngine(str(FIXTURE), cfg)
+    try:
+        ids = engine.tokenizer.encode(FIRST).ids
+        decision_prompt = PreparedPrompt(
+            FIRST, ids, cache_namespace="gateway_decision")
+        execution_prompt = PreparedPrompt(
+            FIRST, ids, cache_namespace="gateway_execution")
+        first = engine.generate(decision_prompt, 3)
+        other_phase = engine.generate(execution_prompt, 3)
+        same_phase = engine.generate(decision_prompt, 3)
+    finally:
+        engine.close()
+
+    assert first["path_stats"]["prompt_cache_source"] == "cold"
+    assert other_phase["path_stats"]["prompt_cache_source"] == "cold"
+    assert same_phase["path_stats"]["prompt_cache_source"] == "memory"
+    assert same_phase["path_stats"]["prompt_cache_exact_hit"] == 1
+
+
+def test_single_memory_slot_keeps_both_hidden_phases_durable_on_disk():
+    """The one-slot RAM policy is independent from the durable phase tier."""
+    _ensure_fixture()
+    import shutil
+
+    from runtime.engine import RuntimeConfig, StreamingEngine
+    from runtime.server import PreparedPrompt
+
+    shutil.rmtree(PERSIST_DIR, ignore_errors=True)
+    try:
+        cfg = RuntimeConfig(
+            max_weight_cache_mb=200, pin_lm_head=True, mla_compressed_kv=True,
+            prefill_chunk_size=4, hot_prompt_kv=True,
+            hot_prompt_kv_chunk_size=4, hot_prompt_kv_slots=1,
+            hot_prompt_kv_min_tokens=0,
+            hot_prompt_kv_persist_dir=str(PERSIST_DIR),
+            hot_prompt_kv_persist_max_checkpoints=8, governor=False,
+        )
+        engine = StreamingEngine(str(FIXTURE), cfg)
+        try:
+            decision_ids = engine.tokenizer.encode(FIRST).ids
+            execution_ids = engine.tokenizer.encode(SECOND).ids
+            decision_prompt = PreparedPrompt(
+                FIRST, decision_ids, cache_namespace="gateway_decision")
+            execution_prompt = PreparedPrompt(
+                SECOND, execution_ids, cache_namespace="gateway_execution")
+            engine.generate(decision_prompt, 3)
+            engine.generate(execution_prompt, 3)
+
+            manifests = [
+                json.loads(path.read_text())
+                for path in PERSIST_DIR.glob("*.ckpt.json")]
+            assert {value["cache_namespace"] for value in manifests} == {
+                "gateway_decision", "gateway_execution"}
+            assert len(engine._hot_prompt_slots) == 1
+            assert engine._hot_prompt_slots[0].cache_namespace == \
+                "gateway_execution"
+
+            # The transient decision state was evicted from RAM but remains an
+            # exact, namespace-scoped disk checkpoint.
+            recovered = engine.generate(decision_prompt, 3)
+            assert recovered["path_stats"]["prompt_cache_source"] == "hot_disk"
+            assert recovered["path_stats"]["prompt_cache_exact_hit"] == 1
+        finally:
+            engine.close()
+    finally:
+        shutil.rmtree(PERSIST_DIR, ignore_errors=True)
+
+
+def test_memory_admission_evicts_persisted_unmatched_phase_before_new_kv():
+    from types import SimpleNamespace
+    from unittest.mock import patch
+
+    from runtime.engine import _HotPromptSlot, StreamingEngine
+
+    active = [7_830_000_000]
+
+    class State:
+        def __init__(self, size):
+            self.size = size
+            self.releases = 0
+
+        def allocated_nbytes(self):
+            return self.size
+
+        def release(self):
+            self.releases += 1
+            active[0] -= self.size
+
+    retained = State(1_680_000_000)
+    engine = StreamingEngine.__new__(StreamingEngine)
+    engine.governor = SimpleNamespace(
+        current_ceiling=lambda: 9_050_000_000)
+    engine._hot_prompt_slots = [_HotPromptSlot(
+        tokens=(1,), kv=retained, logits=None, prompt_length=1,
+        prompt_logits=None, reusable_prefix=0,
+        segment_chain=("durable",),
+        cache_namespace="gateway_execution")]
+
+    with patch("runtime.engine.mx.get_active_memory",
+               side_effect=lambda: active[0]), \
+         patch("runtime.engine.mx.clear_cache"):
+        stats = engine._evict_hot_slots_for_admission(
+            2_145_000_000, None, "gateway_decision")
+
+    assert stats["evicted_slots"] == 1
+    assert stats["evicted_persisted_slots"] == 1
+    assert stats["evicted_bytes"] == 1_680_000_000
+    assert retained.releases == 1
+    assert engine._hot_prompt_slots == []
+    assert active[0] + 2_145_000_000 + 400_000_000 < 9_050_000_000
+
+
+def test_memory_admission_preserves_live_system_available_floor():
+    from types import SimpleNamespace
+    from unittest.mock import patch
+
+    from runtime.engine import _HotPromptSlot, StreamingEngine
+
+    available = [4_800_000_000]
+    reserve_calls = []
+
+    class State:
+        def allocated_nbytes(self):
+            return 1_700_000_000
+
+        def release(self):
+            available[0] = 6_600_000_000
+
+    def reserve(incoming, margin):
+        reserve_calls.append((incoming, margin))
+
+    engine = StreamingEngine.__new__(StreamingEngine)
+    engine.rc = SimpleNamespace(hot_prompt_kv_min_available_mb=4000)
+    engine._resident_fast_layers = ("stale-cache-view",)
+    engine._resident_fast_evictions = 7
+    engine.governor = SimpleNamespace(
+        current_ceiling=lambda: 12_000_000_000,
+        critical=1_200_000_000, reservations=0, reserve=reserve)
+    retained = State()
+    engine._hot_prompt_slots = [_HotPromptSlot(
+        tokens=(1,), kv=retained, logits=None, prompt_length=1,
+        prompt_logits=None, reusable_prefix=0,
+        segment_chain=("durable",), cache_namespace="gateway_execution")]
+
+    with patch("runtime.engine.mx.get_active_memory", return_value=2_000_000_000), \
+         patch("runtime.engine.mx.clear_cache"), \
+         patch("runtime.engine.psutil.virtual_memory",
+               side_effect=lambda: SimpleNamespace(available=available[0])):
+        stats = engine._evict_hot_slots_for_admission(
+            1_500_000_000, None, "gateway_decision")
+
+    assert stats["evicted_slots"] == 1
+    assert stats["evicted_persisted_slots"] == 1
+    assert stats["system_available_floor_bytes"] == 4_000_000_000
+    assert stats["system_available_bytes"] == 6_600_000_000
+    assert reserve_calls == [(1_500_000_000, 2_800_000_000)]
+    assert engine._resident_fast_layers is None
+    assert engine._resident_fast_evictions == -1
+
+
+def test_pic_duplicate_allocation_respects_same_system_floor():
+    from types import SimpleNamespace
+    from unittest.mock import patch
+
+    from runtime.engine import _system_allocation_preserves_floor
+
+    with patch("runtime.engine.psutil.virtual_memory",
+               return_value=SimpleNamespace(available=5_500_000_000)):
+        admitted, available, floor = _system_allocation_preserves_floor(
+            1_730_000_000, 4000)
+    assert not admitted
+    assert available == 5_500_000_000
+    assert floor == 4_000_000_000
+
+    with patch("runtime.engine.psutil.virtual_memory",
+               return_value=SimpleNamespace(available=6_000_000_000)):
+        admitted, _available, _floor = _system_allocation_preserves_floor(
+            1_730_000_000, 4000)
+    assert admitted
+
+
+def test_runtime_quantized_resident_qwen_defers_restart_kv_until_bootstrap():
+    from types import SimpleNamespace
+
+    from runtime.engine import StreamingEngine
+
+    engine = StreamingEngine.__new__(StreamingEngine)
+    engine.cfg = SimpleNamespace(
+        model_type="qwen3", vision_config=None, num_experts=0)
+    engine.rc = SimpleNamespace(quant_bits=4, resident_fast_decode=True)
+    engine.store = SimpleNamespace(on_disk_quantized=False)
+    engine._defer_persisted_kv_until_bootstrap = (
+        engine._should_defer_persisted_kv_until_bootstrap())
+    engine._completed_generations = 0
+
+    assert engine._defer_persisted_kv_until_bootstrap
+    assert not engine._persisted_kv_restore_allowed()
+    engine._completed_generations = 1
+    assert engine._persisted_kv_restore_allowed()
+
+    # A genuinely pre-quantized checkpoint has no lazy BF16->Q4 bootstrap
+    # collision, so its restart KV remains eligible immediately.
+    engine.store.on_disk_quantized = True
+    assert not engine._should_defer_persisted_kv_until_bootstrap()
+
+
 def _run_all():
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
     for test in tests:
