@@ -955,6 +955,46 @@ def test_k25_lossless_uses_demand_paging_without_speculative_prefetch():
     assert rc.quant_bits == 0
 
 
+def test_qwen36_profiles_bound_experts_and_disable_incomplete_prompt_kv():
+    from unittest.mock import patch
+
+    from runtime.server import EngineManager
+
+    captured = []
+
+    class FakeEngine:
+        def __init__(self, _path, rc):
+            captured.append(rc)
+
+        def close(self):
+            pass
+
+    cfg = SimpleNamespace(
+        model_type="qwen3_5_moe", tie_word_embeddings=False,
+        index_topk=0, vision_config={"depth": 27})
+    with patch("runtime.config.ModelConfig.from_dir", return_value=cfg), \
+         patch("runtime.path_resolver.resolve_model_dir", side_effect=lambda path: path), \
+         patch("runtime.engine.StreamingEngine", FakeEngine):
+        EngineManager().get(Path("/tmp/fake-qwen36"), "lossless")
+        EngineManager().get(Path("/tmp/fake-qwen36"), "fast")
+
+    lossless, fast = captured
+    for rc in captured:
+        assert rc.prompt_kv_dir == ""
+        assert not rc.hot_prompt_kv
+        assert rc.prefill_chunk_size == 512
+        assert rc.expert_fetch_batch == 1
+        assert rc.decode_expert_fetch_batch == 8
+    assert lossless.quant_bits == 0
+    assert lossless.max_weight_cache_mb == 5000
+    assert fast.quant_bits == 4
+    assert fast.quant_mode == "mxfp4"
+    assert not fast.quant_attention
+    assert not fast.quant_router
+    assert not fast.quant_lm_head
+    assert fast.max_weight_cache_mb == 6000
+
+
 def test_dense_fast_mode_uses_validated_mxfp4_and_pipelined_decode():
     from unittest.mock import patch
 

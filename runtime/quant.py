@@ -159,7 +159,9 @@ class QuantPolicy:
         # (a gate weight only short-circuits to `False` when quantize_router
         # is False; otherwise it falls through and is actually governed by
         # quantize_mlp, not quantize_router -- not touched here).
-        if ((name.endswith(".mlp.gate.weight") or name.endswith(".block_sparse_moe.gate.weight"))
+        if ((name.endswith(".mlp.gate.weight")
+             or name.endswith(".mlp.shared_expert_gate.weight")
+             or name.endswith(".block_sparse_moe.gate.weight"))
                 and not self.quantize_router):
             return False
         if ".mlp." in name or ".block_sparse_moe." in name:

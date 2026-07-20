@@ -71,7 +71,17 @@ def access_order(names: list[str], expert_rank: dict | None = None) -> list[str]
     def key(n: str):
         if "embed_tokens" in n:
             return (0, 0, 0, n)
-        m = re.match(r"model\.layers\.(\d+)\.(?:mlp\.experts\.(\d+)\.)?", n)
+        # Multimodal wrappers use either model.language_model.layers.*
+        # (Qwen3-VL/Qwen3.5/3.6) or language_model.model.layers.* (Kimi
+        # K2.5).  Pack manifests retain the released physical names; recognize
+        # all three forms here so the final archive is truly layer/expert
+        # ordered before WeightStore later canonicalizes them to model.layers.*.
+        m = re.match(
+            r"(?:model\.layers|model\.language_model\.layers|"
+            r"language_model\.model\.layers)\."
+            r"(\d+)\.(?:mlp\.experts\.(\d+)\.)?",
+            n,
+        )
         if m:
             layer = int(m.group(1))
             if m.group(2) is None:

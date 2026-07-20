@@ -30,8 +30,34 @@ STREAM_THRESHOLD = 256 * 1024 * 1024  # tensors above this are packed in chunks
 # Fused MoE expert tensors (gpt-oss style: [n_experts, ...]) are split into
 # per-expert tensors at pack time so expert paging can fetch one expert's slice.
 _FUSED_EXPERT_RE = _re.compile(r"^(.*\.mlp\.experts)\.(gate_up_proj|down_proj)_(blocks|scales|bias)$")
+_FUSED_BF16_EXPERT_RE = _re.compile(
+    r"^(.*\.mlp\.experts)\.(gate_up_proj|down_proj)$")
 _SHORT = {"gate_up_proj": "gate_up", "down_proj": "down"}
 CHUNK = 64 * 1024 * 1024  # even, so byte-plane parity is stable across chunks
+
+
+def _write_small_tensor(out_path: Path, dtype: str, shape: list[int],
+                        raw: bytes, level: int) -> int:
+    """Write one materialized tensor in ordinary vpack form.
+
+    Qwen3.5/3.6 stores every layer's 256 experts as two large BF16 tensors.
+    Splitting them produces ~2-4 MB tensors, safely below STREAM_THRESHOLD;
+    use the same byte-plane representation as the ordinary pack path and
+    return the exact stored byte count for accounting.
+    """
+    if dtype in PLANE_DTYPES:
+        hi_z = zstd.compress(raw[1::2], level=level)
+        lo = raw[0::2]
+        head = {"dtype": dtype, "shape": shape,
+                "hi_z": len(hi_z), "lo": len(lo)}
+        body = hi_z + lo
+    else:
+        head = {"dtype": dtype, "shape": shape, "raw": len(raw)}
+        body = raw
+    hj = json.dumps(head).encode()
+    with open(out_path, "wb") as of:
+        of.write(struct.pack("<Q", len(hj)) + hj + body)
+    return len(hj) + 8 + len(body)
 
 
 def _pack_tensor_streamed(src, abs_offset: int, nbytes: int, meta: dict, out_path: Path, level: int):
@@ -103,12 +129,17 @@ def pack_model(
     # for every bf16 tensor class measured on real GLM-5.2 weights (1.44-1.46x at
     # 2.2-2.6 GB/s vs 1.38-1.41x at ~1.6 GB/s) — see docs/benchmark_results.md
     delete_shards: bool = False,
+    verify_shards: bool = False,
     progress=None,  # optional callable(shards_done: int, shards_total: int); additive,
     # coarse (per-shard, not per-tensor) so it's low-risk to thread through this
     # existing verified pipeline. Used by the HTTP server's auto-pack-on-repeat-
     # request feature (2026-07-13) for a percent/ETA estimate; None elsewhere.
 ) -> Path:
-    """delete_shards=True: after each shard is fully packed AND every one of its
+    """verify_shards=True round-trips every packed tensor against its source
+    shard while retaining that shard. delete_shards=True implies the same full
+    verification and removes a shard only after it passes.
+
+    delete_shards=True: after each shard is fully packed AND every one of its
     tensors round-trips bit-exact, the raw shard is removed. Lets a model be packed
     in-place with only ~one shard of extra disk (needed when free space < 0.75x
     model size). The packed store is a complete lossless replacement."""
@@ -131,6 +162,24 @@ def pack_model(
         existing = {s.name for s in shards}
         for name, shard_name in weight_map.items():
             if shard_name not in existing:
+                fused_bf16 = _FUSED_BF16_EXPERT_RE.match(name)
+                if fused_bf16:
+                    prefix = f"{fused_bf16.group(1)}.".replace("/", "__")
+                    projections = (
+                        ("gate_proj.weight", "up_proj.weight")
+                        if fused_bf16.group(2) == "gate_up_proj"
+                        else ("down_proj.weight",)
+                    )
+                    recovered = []
+                    for projection in projections:
+                        recovered.extend(sorted(out.glob(
+                            f"{prefix}*.{projection}.vt")))
+                    assert recovered, (
+                        f"missing unfused BF16 tensors for {name} "
+                        f"(shard {shard_name} deleted)")
+                    for p in recovered:
+                        manifest[p.stem.replace("__", "/")] = p.name
+                    continue
                 fused = _FUSED_EXPERT_RE.match(name)
                 if fused:
                     prefix = f"{fused.group(1)}.".replace("/", "__")
@@ -155,6 +204,44 @@ def pack_model(
             if name == "__metadata__":
                 continue
             a, b = meta["data_offsets"]
+            fused_bf16 = _FUSED_BF16_EXPERT_RE.match(name)
+            if (fused_bf16 and len(meta["shape"]) == 3
+                    and meta["shape"][0] > 1):
+                if meta["dtype"] not in PLANE_DTYPES:
+                    raise ValueError(
+                        f"unsupported fused expert dtype {meta['dtype']} for {name}")
+                n_e = meta["shape"][0]
+                row = (b - a) // n_e
+                with open(shard, "rb") as sf:
+                    for e in range(n_e):
+                        sf.seek(base + a + e * row)
+                        raw_e = sf.read(row)
+                        if fused_bf16.group(2) == "gate_up_proj":
+                            if meta["shape"][1] % 2 or row % 2:
+                                raise ValueError(
+                                    f"odd fused gate/up split for {name}: "
+                                    f"shape={meta['shape']}, bytes/expert={row}")
+                            half = row // 2
+                            inter = meta["shape"][1] // 2
+                            parts = (
+                                ("gate_proj.weight", [inter, meta["shape"][2]],
+                                 raw_e[:half]),
+                                ("up_proj.weight", [inter, meta["shape"][2]],
+                                 raw_e[half:]),
+                            )
+                        else:
+                            parts = ((
+                                "down_proj.weight", list(meta["shape"][1:]), raw_e),)
+                        for projection, sub_shape, sub_raw in parts:
+                            sub = f"{fused_bf16.group(1)}.{e}.{projection}"
+                            sub_fname = sub.replace("/", "__") + ".vt"
+                            total_out += _write_small_tensor(
+                                out / sub_fname, meta["dtype"], sub_shape,
+                                sub_raw, level)
+                            manifest[sub] = sub_fname
+                shard_names.append(name)
+                total_in += b - a
+                continue
             fused = _FUSED_EXPERT_RE.match(name)
             if fused and len(meta["shape"]) >= 2 and meta["shape"][0] > 1:
                 n_e = meta["shape"][0]
@@ -203,12 +290,40 @@ def pack_model(
             shard_names.append(name)
             total_in += len(raw)
             total_out += len(body) + len(hj) + 8
-        if delete_shards:
-            # verify every tensor of this shard round-trips before deleting it
+        if delete_shards or verify_shards:
+            # Verify every tensor of this shard round-trips. Source retention is
+            # independent: large checkpoints with enough disk can now produce a
+            # proof-grade pack without making verification destructive.
             with open(shard, "rb") as sf:
                 for name in shard_names:
                     meta = shard_header[name]
                     a, b = meta["data_offsets"]
+                    fused_bf16 = _FUSED_BF16_EXPERT_RE.match(name)
+                    if (fused_bf16 and len(meta["shape"]) == 3
+                            and meta["shape"][0] > 1):
+                        n_e = meta["shape"][0]
+                        row = (b - a) // n_e
+                        for e in range(n_e):
+                            sf.seek(base + a + e * row)
+                            expected = sf.read(row)
+                            if fused_bf16.group(2) == "gate_up_proj":
+                                half = row // 2
+                                projections = (
+                                    ("gate_proj.weight", expected[:half]),
+                                    ("up_proj.weight", expected[half:]),
+                                )
+                            else:
+                                projections = (("down_proj.weight", expected),)
+                            for projection, expected_part in projections:
+                                sub = (f"{fused_bf16.group(1)}.{e}."
+                                       f"{projection}")
+                                _head, raw2 = read_tensor_bytes(
+                                    out, manifest[sub])
+                                got = (raw2.tobytes()
+                                       if isinstance(raw2, np.ndarray) else raw2)
+                                assert got == expected_part, (
+                                    f"round-trip mismatch: {sub}")
+                        continue
                     fused = _FUSED_EXPERT_RE.match(name)
                     if fused and len(meta["shape"]) >= 2 and meta["shape"][0] > 1:
                         n_e = meta["shape"][0]
@@ -229,8 +344,11 @@ def pack_model(
                     head, raw2 = read_tensor_bytes(out, manifest[name])
                     got = raw2.tobytes() if isinstance(raw2, np.ndarray) else raw2
                     assert got == raw, f"round-trip mismatch: {name} in {shard.name}"
-            shard.unlink()
-            print(f"  packed+verified+deleted {shard.name}", flush=True)
+            if delete_shards:
+                shard.unlink()
+                print(f"  packed+verified+deleted {shard.name}", flush=True)
+            else:
+                print(f"  packed+verified {shard.name}", flush=True)
         if progress:
             progress(shards.index(shard) + 1, len(shards))
     (out / "manifest.json").write_text(json.dumps(manifest))

@@ -1011,8 +1011,44 @@ class EngineManager:
                 # floor when system headroom requires it.
                 rc.max_weight_cache_mb = 1500
                 rc.prefetch_depth = 0
+            elif mtype == "qwen3_5_moe":
+                # Qwen3.6-35B-A3B retains Qwen3.5's architecture id. Thirty
+                # DeltaNet layers carry fixed recurrent+conv state that the
+                # token-indexed prompt-KV journal cannot serialize or trim.
+                # Keep prefix caches off until that composite state has its own
+                # exact checkpoint format; otherwise a nominal KV hit would
+                # resume with empty DeltaNet memory and silently change tokens.
+                rc.prompt_kv_dir = ""
+                rc.hot_prompt_kv = False
+                rc.max_weight_cache_mb = 5000
+                rc.prefill_chunk_size = 512
+                rc.expert_fetch_batch = 1
+                # One decode position activates exactly eight ~6.3 MB experts
+                # per layer. Fetching them as one archive-coalesced batch is
+                # comfortably bounded and avoids eight serialized disk waits;
+                # multi-position prefill retains q=1 above.
+                rc.decode_expert_fetch_batch = 8
+                if mode in ("fast", "fast-long"):
+                    # Initial side-quest profile: quantize only expert MLP
+                    # matrices. DeltaNet, gated full attention, routers, shared
+                    # scalar gates, embeddings, and the exact head remain BF16.
+                    # This is explicitly separate from lossless mode and must
+                    # pass a real-model quality gate before stronger transforms.
+                    rc.quant_bits = 4
+                    rc.quant_mode = "mxfp4"
+                    rc.quant_group_size = 32
+                    rc.quant_min_dim = 0
+                    rc.quant_attention = False
+                    rc.quant_router = False
+                    rc.quant_lm_head = False
+                    rc.max_weight_cache_mb = 6000
             else:
                 rc.max_weight_cache_mb = 6000
+                if mtype == "kimi_linear":
+                    # KDA state is a recurrent fold, not token-indexed KV.
+                    # Engine validation now fails closed if a caller tries to
+                    # persist only the ordinary KV half of this hybrid state.
+                    rc.prompt_kv_dir = ""
                 if mode in ("fast", "fast-long"):  # side-quest: lossy 4-bit resident cache
                     rc.quant_bits = 4
                     # Local Qwen A/B: MXFP4 retained coherent math/chat/code
@@ -2743,6 +2779,14 @@ def _validate_context_budget(engine, prompt_tokens: int, max_output_tokens: int,
 
 def _prepare_vision_prompt(engine, prompt: str, images):
     """Run allocation-free vision preflight and expose failures as HTTP 400."""
+    if engine.cfg.model_type == "qwen3_5_moe":
+        # Qwen3.6's text trunk is supported independently. Its new learned
+        # absolute vision positions/merger differ from Qwen3-VL's M-RoPE tower;
+        # never route image input through the older tower merely because the
+        # outer checkpoint advertises a vision_config.
+        raise RequestValidationError(
+            "Qwen3.5/Qwen3.6 image input is not implemented yet; text and "
+            "tool-calling requests are supported")
     from .qwen3vl import prepare_vl_prompt
 
     try:

@@ -565,6 +565,12 @@ class StreamingEngine:
         self._model_dir = self.store.dir
         self.cfg = self.store.config
         _apply_runtime_expert_top_k(self.rc, self.cfg)
+        if (self.cfg.model_type in ("kimi_linear", "qwen3_5_moe")
+                and self.rc.prompt_kv_dir):
+            raise ValueError(
+                f"{self.cfg.model_type} recurrent attention state is not "
+                "supported by token-indexed prompt KV persistence; "
+                "disable prompt_kv_dir")
         vision_tool_pic = bool(
             self.cfg.vision_config
             and self.cfg.model_type.startswith("qwen3_vl"))
@@ -630,7 +636,8 @@ class StreamingEngine:
                     "GLM indexer_types must describe every trunk layer: "
                     f"{len(self.cfg.indexer_types)} != {self.cfg.num_hidden_layers}"
                 )
-        if (self.cfg.model_type in ("glm_moe_dsa", "kimi_linear", "kimi_k25")
+        if (self.cfg.model_type in (
+                "glm_moe_dsa", "kimi_linear", "kimi_k25", "qwen3_5_moe")
                 and self.rc.expert_fetch_batch <= 0):
             # F74-v2 is a safety default for every construction path, including
             # direct experiments and YAML. Leaving zero as "unbounded" silently
@@ -642,7 +649,9 @@ class StreamingEngine:
             # 256/384 experts each, the same "prefill floods the union" risk
             # GLM was fixed for here (measured 2026-07-18: an unbounded fetch
             # on a 15-token prompt requested ~2.8GB in one shot and was
-            # correctly refused by the governor) -- same fix applies.
+            # correctly refused by the governor). Qwen3.6 likewise has 256
+            # experts per layer and can route a near-complete union during a
+            # multi-position prefill, so the same lifetime bound applies.
             self.rc.expert_fetch_batch = 1
         tokenizer_json = self._model_dir / "tokenizer.json"
         if tokenizer_json.exists():
@@ -1668,6 +1677,26 @@ class StreamingEngine:
             return self._lm_head_w
         return self.cache.get("lm_head", ["lm_head.weight"])["lm_head.weight"]
 
+    def _final_logits(self, hidden: mx.array, head=None) -> mx.array:
+        head = self._lm_head_weight() if head is None else head
+        if self.cfg.model_type == "qwen3_5_moe":
+            from .qwen35 import final_logits
+
+            return final_logits(
+                hidden, self._norm_w, head, self.cfg.rms_norm_eps)
+        return layer_runner.final_logits(
+            hidden, self._norm_w, head, self.cfg.rms_norm_eps)
+
+    def _all_logits(self, hidden: mx.array) -> mx.array:
+        head = self._lm_head_weight()
+        if self.cfg.model_type == "qwen3_5_moe":
+            from .qwen35 import all_logits
+
+            return all_logits(
+                hidden, self._norm_w, head, self.cfg.rms_norm_eps)
+        return layer_runner.all_logits(
+            hidden, self._norm_w, head, self.cfg.rms_norm_eps)
+
     # ---- inference --------------------------------------------------------
 
     def _sweep(self, x: mx.array, kv: KVCache, offset: int,
@@ -1825,6 +1854,14 @@ class StreamingEngine:
                     mlp_last_only=last_only,
                     iter_expert_batches=self._iter_expert_batches,
                 )
+            elif self.cfg.model_type == "qwen3_5_moe":
+                from .qwen35 import run_qwen35_block
+
+                x = run_qwen35_block(
+                    x, w, f"model.layers.{i}", self.cfg, kv, i, offset,
+                    self._get_experts, mlp_last_only=last_only,
+                    iter_expert_batches=self._iter_expert_batches,
+                )
             elif moe:
                 x = layer_runner.run_moe_block(
                     x, w, f"model.layers.{i}", self.cfg, kv, i, offset, self._get_experts,
@@ -1863,7 +1900,7 @@ class StreamingEngine:
         x = self._sweep(x, kv, offset=kv.offset, tap_layers=tap_layers)
         self._h_window = x  # trunk states for ALL fed positions (F32: rollback needs mid-window states)
         self._h_last = x[:, -1:, :]  # trunk state for MTP drafting (pre final-norm)
-        logits = layer_runner.all_logits(x, self._norm_w, self._lm_head_weight(), self.cfg.rms_norm_eps)
+        logits = self._all_logits(x)
         mx.eval(logits)
         return logits
 
@@ -1937,8 +1974,7 @@ class StreamingEngine:
         head = self._lm_head_weight()
         logits = []
         for hidden in positions:
-            value = layer_runner.final_logits(
-                hidden, self._norm_w, head, self.cfg.rms_norm_eps)
+            value = self._final_logits(hidden, head=head)
             mx.eval(value)
             logits.append(value)
         result = mx.stack(logits)
@@ -1958,8 +1994,7 @@ class StreamingEngine:
         """
         x = layer_runner.embed(token.reshape(-1), self._embed_weight())
         x = self._sweep(x, kv, offset=kv.offset)
-        logits = layer_runner.final_logits(
-            x, self._norm_w, self._lm_head_weight(), self.cfg.rms_norm_eps)
+        logits = self._final_logits(x)
         return mx.argmax(logits), logits
 
     def draft_tokens_resident(self, first_token: int, count: int, kv) -> list[int] | None:
@@ -2052,7 +2087,7 @@ class StreamingEngine:
                 from .glm_dsa import DSAState
 
                 kv.dsa = DSAState(self.cfg)
-        if self.cfg.model_type == "kimi_linear":
+        if self.cfg.model_type in ("kimi_linear", "qwen3_5_moe"):
             # F92/F94: KDA's recurrent state is not token-indexed and cannot
             # be trimmed/rewound like the KVCache it rides alongside -- see
             # the hot_eligible gate below, which keeps this model type off
@@ -2250,7 +2285,8 @@ class StreamingEngine:
         # exact-match (not prefix-trim) reuse design exists for it.
         hot_eligible = (self.rc.hot_prompt_kv and not self.rc.max_kv_mb
                         and not force_adaptive_paged
-                        and self.cfg.model_type != "kimi_linear")
+                        and self.cfg.model_type not in (
+                            "kimi_linear", "qwen3_5_moe"))
         resident_prompt_kv_bytes = self._project_dense_text_kv_bytes(len(tokens))
         configured_paged_mb = int(self.rc.max_kv_mb or 0)
         initial_paged_mb = (
@@ -2903,8 +2939,7 @@ class StreamingEngine:
                                     "budget even at chunk size 1"
                                 )
                     if ckpt and kv_store is not None and end % ckpt == 0:
-                        ck_logits = layer_runner.final_logits(
-                            xc, self._norm_w, self._lm_head_weight(), self.cfg.rms_norm_eps)
+                        ck_logits = self._final_logits(xc)
                         mx.eval(ck_logits)
                         write_t0 = time.perf_counter()
                         saved = kv_store.save(tokens[:end], kv, ck_logits,
@@ -2965,8 +3000,7 @@ class StreamingEngine:
                 path_stats["hot_prompt_reusable_prefix_tokens"] = reusable_watermark
             self._h_window = x
             self._h_last = x[:, -1:, :]
-            logits = layer_runner.final_logits(
-                x, self._norm_w, self._lm_head_weight(), self.cfg.rms_norm_eps)
+            logits = self._final_logits(x)
         sampled_logits = constraint.mask_logits(logits) if constraint is not None else logits
         next_tok = sample(sampled_logits, sampling)
         if constraint is not None:
@@ -3197,8 +3231,7 @@ class StreamingEngine:
                 mx.reset_peak_memory()
                 x = self._embed([next_tok])
                 x = self._sweep(x, kv, offset=kv.offset)
-                logits = layer_runner.final_logits(
-                    x, self._norm_w, self._lm_head_weight(), self.cfg.rms_norm_eps)
+                logits = self._final_logits(x)
                 sampled_logits = (
                     constraint.mask_logits(logits)
                     if constraint is not None else logits)

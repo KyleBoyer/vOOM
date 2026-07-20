@@ -441,7 +441,19 @@ class WeightStore:
             for attempt in range(4):
                 try:
                     if self.vpack2 is not None:
-                        out, _, nbytes = self.vpack2.fetch(names)
+                        # The archive index retains released physical names,
+                        # while multimodal wrappers are exposed to the engine
+                        # through canonical model.* aliases. Translate at the
+                        # archive boundary and translate results back; passing
+                        # canonical Qwen3-VL/Qwen3.6/K2.5 names directly into a
+                        # physical-name index otherwise raises a late KeyError.
+                        physical = [self._real_name.get(name, name)
+                                    for name in names]
+                        fetched, _, nbytes = self.vpack2.fetch(physical)
+                        out = {
+                            logical: fetched[stored]
+                            for logical, stored in zip(names, physical)
+                        }
                     else:
                         out, _, nbytes = self._fetch_packed(names)
                     return out, time.perf_counter() - t0, nbytes

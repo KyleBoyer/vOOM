@@ -59,6 +59,7 @@ runtime/
   toolcalls.py           tool schemas, protocol normalization, call parsing
   structured.py          XGrammar JSON/schema/tool-constrained decoding
   qwen3vl.py             Qwen3-VL image/video tower and multimodal generation
+  qwen35.py              Qwen3.5/3.6 hybrid DeltaNet/attention/MoE text runtime
   vision_positions.py    image/video grids and interleaved M-RoPE positions
   speculative.py          greedy speculative decoding (draft proposes k, target verifies)
   sampler.py              greedy/categorical temperature, top-p, top-k sampling
@@ -200,6 +201,28 @@ curl ... -d '{"model":"lossy-<local-model-name>", ...}'
 
 # Experimental Qwen2 static-YaRN factor-2 profile (capacity, not speed):
 curl ... -d '{"model":"lossy-long-<local-model-name>", ...}'
+```
+
+### Qwen3.6-35B-A3B
+
+`Qwen/Qwen3.6-35B-A3B` is supported losslessly for text generation and tool
+calling through the official hybrid text architecture: three recurrent Gated
+DeltaNet layers followed by one gated full-attention layer, repeating across
+40 layers. The loader accepts the multimodal checkpoint wrapper but rejects
+image input explicitly; its vision tower is not interchangeable with the
+Qwen3-VL implementation. The checkpoint's MTP layer is preserved in the packed
+store but is not yet used for speculative decoding.
+
+The recurrent state is request-local today. Hot prompt-KV retention is disabled
+for this model until the cache can preserve both DeltaNet convolution/matrix
+state and attention KV exactly. This makes the first implementation correct but
+means follow-up turns still prefill their full prompt. Use the bare model ID for
+released BF16 weights:
+
+```bash
+curl -s -X POST http://127.0.0.1:8077/v1/responses \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"Qwen3.6-35B-A3B","input":"Reply with READY.","reasoning":{"effort":"none"},"max_output_tokens":8}'
 ```
 
 For a fully resident OLMoE side-quest artifact, convert beside the source

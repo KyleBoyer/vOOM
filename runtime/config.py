@@ -107,6 +107,19 @@ class ModelConfig:
     kda_head_dim: int = 0
     kda_num_heads: int = 0
     kda_conv_kernel_size: int = 4
+    # Qwen3.5/Qwen3.6 Gated DeltaNet hybrid.  These checkpoints use one
+    # combined causal convolution over Q/K/V, scalar decay/write gates per
+    # value head, and periodic gated full-attention layers.  Keep the fields
+    # distinct from Kimi KDA: the recurrences are related, but their projection
+    # and gate layouts are not interchangeable.
+    linear_num_key_heads: int = 0
+    linear_num_value_heads: int = 0
+    linear_key_head_dim: int = 0
+    linear_value_head_dim: int = 0
+    linear_conv_kernel_dim: int = 4
+    shared_expert_intermediate_size: int = 0
+    partial_rotary_factor: float = 1.0
+    attn_output_gate: bool = False
     moe_layer_freq: int = 1
     # F92/F93: expert tensor prefix under each layer. GLM/gpt-oss/OLMoE/
     # generic Mixtral-style checkpoints use "mlp.experts"; Kimi's MoE module
@@ -209,6 +222,23 @@ class ModelConfig:
             t["model_type"] = raw["model_type"]
             t.setdefault("tie_word_embeddings", raw.get("tie_word_embeddings", False))
             raw = t
+        elif ("text_config" in raw
+              and raw.get("model_type", "") == "qwen3_5_moe"):
+            # Qwen3.6 deliberately retains Qwen3.5's architecture identifier.
+            # Its post-trained 35B-A3B checkpoint is a multimodal wrapper whose
+            # text trunk lives under model.language_model.*.  Preserve the
+            # outer type for dispatch while lifting the released text geometry;
+            # WeightStore handles the tensor-name canonicalization separately.
+            outer = raw
+            t = dict(outer["text_config"])
+            t["model_type"] = outer["model_type"]
+            t.setdefault("tie_word_embeddings", outer.get(
+                "tie_word_embeddings", False))
+            for k in ("image_token_id", "video_token_id",
+                      "vision_start_token_id", "vision_end_token_id"):
+                if k in outer:
+                    t[k] = outer[k]
+            raw = t
 
         vocab_size = raw["vocab_size"]
         eos = list(_validated_token_ids(
@@ -246,7 +276,13 @@ class ModelConfig:
         return cls(
             model_type=raw.get("model_type", "llama"),
             hidden_size=raw["hidden_size"],
-            intermediate_size=raw["intermediate_size"],
+            # Pure-MoE checkpoints need no dense intermediate_size and Qwen3.6
+            # omits it.  A concrete fallback keeps generic memory math defined
+            # without inventing a dense layer that the dispatcher would run.
+            intermediate_size=raw.get(
+                "intermediate_size",
+                raw.get("shared_expert_intermediate_size",
+                        raw.get("moe_intermediate_size", 0))),
             num_hidden_layers=raw["num_hidden_layers"],
             num_attention_heads=n_heads,
             num_key_value_heads=raw.get("num_key_value_heads", n_heads),
@@ -318,6 +354,18 @@ class ModelConfig:
             kda_head_dim=kda_head_dim,
             kda_num_heads=kda_num_heads,
             kda_conv_kernel_size=kda_conv_kernel_size,
+            linear_num_key_heads=raw.get("linear_num_key_heads", 0),
+            linear_num_value_heads=raw.get("linear_num_value_heads", 0),
+            linear_key_head_dim=raw.get("linear_key_head_dim", 0),
+            linear_value_head_dim=raw.get("linear_value_head_dim", 0),
+            linear_conv_kernel_dim=raw.get("linear_conv_kernel_dim", 4),
+            shared_expert_intermediate_size=raw.get(
+                "shared_expert_intermediate_size", 0),
+            partial_rotary_factor=raw.get(
+                "partial_rotary_factor",
+                raw.get("rope_parameters", {}).get(
+                    "partial_rotary_factor", 1.0)),
+            attn_output_gate=raw.get("attn_output_gate", False),
             moe_layer_freq=raw.get("moe_layer_freq", 1),
             mla_use_nope=raw.get("mla_use_nope", False),
             # F93 correction (2026-07-19): only Kimi Linear's MoE module is
