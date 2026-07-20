@@ -1,20 +1,28 @@
 #!/usr/bin/env python3
-"""Replay the private real-harness Qwen3 request without exposing its payload.
+"""Replay a private real-harness Qwen3 request without exposing its payload.
 
 The request body remains under ``logs/captured_requests`` (gitignored).  This
-tracked gate pins its identity, submits exact copies to a running vOOM server,
-and records only hashes, counts, timing/cache telemetry, progress events, and
-host pressure.  Response text and tool schemas are never printed or persisted.
+tracked gate pins each known capture's identity (see KNOWN_CAPTURES below),
+submits exact copies to a running vOOM server, and records only hashes,
+counts, timing/cache telemetry, progress events, and host pressure.  Response
+text and tool schemas are never printed or persisted.
 
-Example:
+Example (qwen35_large_agent_v1, the original 132-tool capture):
 
   .venv/bin/python tests/fixtures/qwen3_large_agent_replay_gate.py \
     logs/captured_requests/1784492063459_cfb3f558.json \
     --repeats 2 --max-output-tokens 16 --stream \
     --expected-selected-tools 32 --expected-max-input-tokens 12000
 
+Example (qwen36_gateway_thrash_v1, the 134-tool lossy-Qwen3.6-35B-A3B
+prefill/gateway-thrashing baseline from 2026-07-20):
+
+  .venv/bin/python tests/fixtures/qwen3_large_agent_replay_gate.py \
+    logs/captured_requests/1784574315421_94161f5f.json \
+    --repeats 1 --max-output-tokens 16 --stream
+
 Replay each user boundary from a saved Kai conversation while retaining the
-captured 132-tool catalog and harness system prefix:
+captured tool catalog and harness system prefix:
 
   .venv/bin/python tests/fixtures/qwen3_large_agent_replay_gate.py \
     logs/captured_requests/1784492063459_cfb3f558.json \
@@ -35,9 +43,31 @@ from pathlib import Path
 import psutil
 
 
-CAPTURE_SHA256 = "e921a49c770cfa1625bf946616aa1cb9f4f63f1bbfe9eddb66db45fd092a034d"
-CAPTURE_BYTES = 157_866
-CAPTURE_TOOLS = 132
+# 2026-07-20: was a single (sha256, bytes, tools) constant -- generalized to
+# a small registry so more than one real captured request can be pinned as
+# a durable baseline over time without displacing an existing one. Each
+# entry's identity is checked against the file's actual bytes; the payload
+# itself is still never committed (logs/captured_requests/ stays
+# gitignored -- only these hashes/counts, never the request body, live in
+# git).
+KNOWN_CAPTURES = {
+    "qwen35_large_agent_v1": {
+        "sha256": "e921a49c770cfa1625bf946616aa1cb9f4f63f1bbfe9eddb66db45fd092a034d",
+        "bytes": 157_866,
+        "tools": 132,
+    },
+    # Live-confirmed prefill/gateway-thrashing baseline (2026-07-20): a
+    # 134-tool, ~29,829-token lossy-Qwen3.6-35B-A3B request that originally
+    # crashed outright (duplicate leading system messages, then repeated
+    # MemoryError), used to validate the tool-gateway reduction,
+    # expert-fetch batching, and memory-adaptive trunk-pin/chunk-size work
+    # from that session.
+    "qwen36_gateway_thrash_v1": {
+        "sha256": "8ac18b8e8bc190180b4cc0e02c2453d313ec850642cc5d5f63b32e5537b90e85",
+        "bytes": 178_616,
+        "tools": 134,
+    },
+}
 
 DEFERRED_ACTION_TURNS = [
     {"role": "user", "content": "Tell me a joke about Node.js."},
@@ -386,12 +416,20 @@ def main() -> int:
 
     raw = args.capture.read_bytes()
     digest = hashlib.sha256(raw).hexdigest()
-    if (digest, len(raw)) != (CAPTURE_SHA256, CAPTURE_BYTES):
+    known_label = next(
+        (label for label, identity in KNOWN_CAPTURES.items()
+         if (identity["sha256"], identity["bytes"]) == (digest, len(raw))),
+        None)
+    if known_label is None:
+        expected = ", ".join(
+            f"{label}={identity['sha256']}/{identity['bytes']}"
+            for label, identity in KNOWN_CAPTURES.items())
         raise SystemExit(
             f"capture identity mismatch: got {digest}/{len(raw)}, "
-            f"expected {CAPTURE_SHA256}/{CAPTURE_BYTES}")
+            f"expected one of: {expected}")
+    capture_tools = KNOWN_CAPTURES[known_label]["tools"]
     request_value = json.loads(raw)
-    if len(request_value.get("tools") or []) != CAPTURE_TOOLS:
+    if len(request_value.get("tools") or []) != capture_tools:
         raise SystemExit("capture tool count mismatch")
     replacement_sha256 = None
     if args.scenario is not None:
@@ -538,7 +576,8 @@ def main() -> int:
     report = {
         "gate": "qwen3-large-agent-private-replay-v1",
         "capture": {
-            "sha256": digest, "bytes": len(raw), "tools": CAPTURE_TOOLS,
+            "label": known_label, "sha256": digest, "bytes": len(raw),
+            "tools": capture_tools,
         },
         "request": {
             "stream": args.stream,
