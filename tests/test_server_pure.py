@@ -1016,7 +1016,7 @@ def test_qwen36_profiles_bound_experts_and_use_hybrid_endpoint_cache():
 
     cfg = SimpleNamespace(
         model_type="qwen3_5_moe", tie_word_embeddings=False,
-        index_topk=0, vision_config={"depth": 27})
+        index_topk=0, vision_config={"depth": 27}, num_hidden_layers=40)
     with patch("runtime.config.ModelConfig.from_dir", return_value=cfg), \
          patch("runtime.path_resolver.resolve_model_dir", side_effect=lambda path: path), \
          patch("runtime.engine.StreamingEngine", FakeEngine):
@@ -1034,14 +1034,15 @@ def test_qwen36_profiles_bound_experts_and_use_hybrid_endpoint_cache():
         assert rc.expert_fetch_batch == 8
         assert rc.decode_expert_fetch_batch == 8
         assert rc.fast_dirs[0].endswith("vmodel_fast_tier/fake-qwen36")
+        assert rc.pin_first_layers == 40
     assert lossless.quant_bits == 0
-    assert lossless.max_weight_cache_mb == 6000
+    assert lossless.max_weight_cache_mb == 7000
     assert fast.quant_bits == 4
     assert fast.quant_mode == "mxfp4"
     assert not fast.quant_attention
     assert not fast.quant_router
     assert not fast.quant_lm_head
-    assert fast.max_weight_cache_mb == 6000
+    assert fast.max_weight_cache_mb == 7000
 
 
 def test_qwen36_fast_mode_respects_configured_weight_cache_budget():
@@ -1067,7 +1068,7 @@ def test_qwen36_fast_mode_respects_configured_weight_cache_budget():
 
     cfg = SimpleNamespace(
         model_type="qwen3_5_moe", tie_word_embeddings=False,
-        index_topk=0, vision_config={"depth": 27})
+        index_topk=0, vision_config={"depth": 27}, num_hidden_layers=40)
     with patch("runtime.config.ModelConfig.from_dir", return_value=cfg), \
          patch("runtime.path_resolver.resolve_model_dir", side_effect=lambda path: path), \
          patch("runtime.engine.StreamingEngine", FakeEngine), \

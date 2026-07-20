@@ -91,15 +91,6 @@ def _wait_for_server(proc, timeout=30):
     raise TimeoutError("server did not become ready in time")
 
 
-def _start_server():
-    proc = subprocess.Popen(
-        [sys.executable, "-m", "runtime.server", "--port", str(PORT)],
-        cwd=str(ROOT), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
-    )
-    _wait_for_server(proc)
-    return proc
-
-
 def _stop_server(proc):
     proc.terminate()
     try:
@@ -107,6 +98,31 @@ def _stop_server(proc):
     except subprocess.TimeoutExpired:
         proc.kill()
         proc.wait(timeout=10)
+
+
+def _start_server():
+    proc = subprocess.Popen(
+        [sys.executable, "-m", "runtime.server", "--port", str(PORT)],
+        cwd=str(ROOT), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+    )
+    # 2026-07-20: every caller does `proc = _start_server(); try: ... finally:
+    # _stop_server(proc)`, but that try/finally only wraps code AFTER this
+    # function returns. _wait_for_server raising (a slow model load past its
+    # 30s readiness timeout, or the process exiting early) propagated out of
+    # HERE, before proc ever reached the caller's try/finally -- orphaning an
+    # already-Popen'd live server with nothing left holding a reference to
+    # kill it. Live-confirmed: a real orphaned --port 8097 process kept
+    # appearing throughout a long, memory-constrained session, growing to
+    # multiple GB and competing with the actual server under test for the
+    # same tight budget, its readiness checks having timed out under exactly
+    # that same real memory pressure. Clean up here on any failure, then
+    # re-raise so the test still reports the original error.
+    try:
+        _wait_for_server(proc)
+    except Exception:
+        _stop_server(proc)
+        raise
+    return proc
 
 
 # ---- tool schema acceptance (request-side conversion correctness) ----

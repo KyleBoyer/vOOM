@@ -1048,13 +1048,41 @@ class EngineManager:
                     str(ROOT / ".kv_hybrid"))
                 try:
                     rc.max_weight_cache_mb = int(os.environ.get(
-                        "VMODEL_QWEN35_WEIGHT_CACHE_MB", "6000"))
+                        "VMODEL_QWEN35_WEIGHT_CACHE_MB", "7000"))
                 except ValueError as error:
                     raise ValueError(
                         "VMODEL_QWEN35_WEIGHT_CACHE_MB must be an integer") from error
                 if not 1500 <= rc.max_weight_cache_mb <= 7000:
                     raise ValueError(
                         "VMODEL_QWEN35_WEIGHT_CACHE_MB must be in [1500, 7000]")
+                # 2026-07-20: pin_first_layers defaulted to 0, so this
+                # checkpoint's 40-layer trunk (attention/DeltaNet/norms/
+                # router/shared-expert -- _layer_names excludes routed
+                # experts, which page separately) shared the SAME LRU pool
+                # as MoE expert pages instead of a dedicated pinned
+                # residency. Live-confirmed real damage: direct measurement
+                # of this checkpoint's own safetensors headers gives the
+                # full 40-layer trunk at ~2.92GB total -- with only
+                # embed+lm_head (~2.03GB) actually pinned, the LRU-shared
+                # remainder was so tight relative to a chunk's own routed-
+                # expert footprint that trunk weights got evicted and
+                # RE-fetched on later chunks of the SAME prefill sweep, not
+                # just across separate requests. A 5089-token/~10-chunk
+                # cold prefill moved 119GB through the store -- far more
+                # than the ~17.5GB a single full pass over every expert in
+                # every layer would need, meaning most of that traffic was
+                # repeat fetches, not first-time misses. Pinning the whole
+                # trunk (still excludes all 256 experts/layer -- pinning
+                # those would defeat the point, per _layer_names) guarantees
+                # it loads once per request and never competes with expert
+                # paging again. The weight-cache-budget default above was
+                # raised from 6000 to 7000 (still within the validated
+                # [1500, 7000] range) in the same change to give the
+                # expert-only LRU pool back the room this costs it
+                # (headroom for experts: was ~1.0-4.0GB depending on
+                # trunk-eviction state, now a guaranteed ~2.0GB that is
+                # never reclaimed by trunk).
+                rc.pin_first_layers = cfg_probe.num_hidden_layers
                 rc.fast_dirs = (str(
                     Path.home() / "vmodel_fast_tier" / model_dir.name),)
                 rc.prefill_chunk_size = 512
