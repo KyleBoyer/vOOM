@@ -100,6 +100,7 @@ import re
 import threading
 import time
 import uuid
+import psutil
 from bisect import bisect_left
 from collections import OrderedDict
 from dataclasses import replace
@@ -1055,34 +1056,56 @@ class EngineManager:
                 if not 1500 <= rc.max_weight_cache_mb <= 7000:
                     raise ValueError(
                         "VMODEL_QWEN35_WEIGHT_CACHE_MB must be in [1500, 7000]")
-                # 2026-07-20: pin_first_layers defaulted to 0, so this
-                # checkpoint's 40-layer trunk (attention/DeltaNet/norms/
-                # router/shared-expert -- _layer_names excludes routed
-                # experts, which page separately) shared the SAME LRU pool
-                # as MoE expert pages instead of a dedicated pinned
-                # residency. Live-confirmed real damage: direct measurement
-                # of this checkpoint's own safetensors headers gives the
-                # full 40-layer trunk at ~2.92GB total -- with only
-                # embed+lm_head (~2.03GB) actually pinned, the LRU-shared
-                # remainder was so tight relative to a chunk's own routed-
-                # expert footprint that trunk weights got evicted and
-                # RE-fetched on later chunks of the SAME prefill sweep, not
-                # just across separate requests. A 5089-token/~10-chunk
-                # cold prefill moved 119GB through the store -- far more
-                # than the ~17.5GB a single full pass over every expert in
-                # every layer would need, meaning most of that traffic was
-                # repeat fetches, not first-time misses. Pinning the whole
-                # trunk (still excludes all 256 experts/layer -- pinning
-                # those would defeat the point, per _layer_names) guarantees
-                # it loads once per request and never competes with expert
-                # paging again. The weight-cache-budget default above was
-                # raised from 6000 to 7000 (still within the validated
-                # [1500, 7000] range) in the same change to give the
-                # expert-only LRU pool back the room this costs it
-                # (headroom for experts: was ~1.0-4.0GB depending on
-                # trunk-eviction state, now a guaranteed ~2.0GB that is
-                # never reclaimed by trunk).
-                rc.pin_first_layers = cfg_probe.num_hidden_layers
+                # 2026-07-20: stream lm_head instead of caching/pinning it,
+                # same technique already proven for K2.5 (F02's
+                # StreamedLMHead -- bit-identical block-streamed matmul, not
+                # an approximation). Untied lm_head here is ~1.02GB; cutting
+                # it from the resident floor unconditionally buys back room
+                # for the MoE expert LRU pool regardless of whether trunk
+                # pinning below is active this request.
+                rc.pin_lm_head = False
+                rc.stream_lm_head = True
+                # pin_first_layers defaulted to 0, so this checkpoint's
+                # 40-layer trunk (attention/DeltaNet/norms/router/shared-
+                # expert -- _layer_names excludes routed experts, which page
+                # separately) shared the SAME LRU pool as MoE expert pages
+                # instead of a dedicated pinned residency. Live-confirmed
+                # real damage: direct measurement of this checkpoint's own
+                # safetensors headers gives the full 40-layer trunk at
+                # ~2.92GB total -- with only embed (~1.02GB, lm_head now
+                # streamed above) actually pinned, the LRU-shared remainder
+                # was so tight relative to a chunk's own routed-expert
+                # footprint that trunk weights got evicted and RE-fetched on
+                # later chunks of the SAME prefill sweep, not just across
+                # separate requests. A 5089-token/~10-chunk cold prefill
+                # moved 119GB through the store -- far more than the
+                # ~17.5GB a single full pass over every expert in every
+                # layer would need, meaning most of that traffic was repeat
+                # fetches, not first-time misses.
+                #
+                # But pinning the whole trunk guarantees ~2.92GB stays
+                # resident whether or not there's room for it -- live-
+                # confirmed to backfire on this same machine under real
+                # memory pressure (a later request failed at active=4.61GB,
+                # a higher floor than pre-pinning failures ever reached,
+                # because the pinned trunk could no longer be shed to make
+                # room the way a fully-evictable one could). Unlike the
+                # weight-cache BUDGET (which the live governor already
+                # adapts continuously via reserve()/admissible_units()),
+                # pin_first_layers is fixed for the engine's whole lifetime
+                # once construction picks it -- there's no live governor
+                # hook to un-pin mid-request. So this is a one-time decision
+                # at engine-construction time instead: only commit to the
+                # (irreversible-for-this-engine) pinned floor if live
+                # available memory comfortably covers it, otherwise fall
+                # back to the fully-evictable behavior that can still shrink
+                # arbitrarily far under pressure, same as before this
+                # change. Threshold: trunk cost (~2.92GB) plus >=1GB of
+                # actually-useful expert-LRU headroom -- pinning while
+                # leaving less than that would likely thrash almost as much
+                # as not pinning, for none of the benefit.
+                if psutil.virtual_memory().available >= 4_000_000_000:
+                    rc.pin_first_layers = cfg_probe.num_hidden_layers
                 rc.fast_dirs = (str(
                     Path.home() / "vmodel_fast_tier" / model_dir.name),)
                 rc.prefill_chunk_size = 512

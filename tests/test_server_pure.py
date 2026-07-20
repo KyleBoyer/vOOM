@@ -1019,7 +1019,9 @@ def test_qwen36_profiles_bound_experts_and_use_hybrid_endpoint_cache():
         index_topk=0, vision_config={"depth": 27}, num_hidden_layers=40)
     with patch("runtime.config.ModelConfig.from_dir", return_value=cfg), \
          patch("runtime.path_resolver.resolve_model_dir", side_effect=lambda path: path), \
-         patch("runtime.engine.StreamingEngine", FakeEngine):
+         patch("runtime.engine.StreamingEngine", FakeEngine), \
+         patch("runtime.server.psutil.virtual_memory",
+               return_value=SimpleNamespace(available=8_000_000_000)):
         EngineManager().get(Path("/tmp/fake-qwen36"), "lossless")
         EngineManager().get(Path("/tmp/fake-qwen36"), "fast")
 
@@ -1034,6 +1036,8 @@ def test_qwen36_profiles_bound_experts_and_use_hybrid_endpoint_cache():
         assert rc.expert_fetch_batch == 8
         assert rc.decode_expert_fetch_batch == 8
         assert rc.fast_dirs[0].endswith("vmodel_fast_tier/fake-qwen36")
+        assert not rc.pin_lm_head
+        assert rc.stream_lm_head
         assert rc.pin_first_layers == 40
     assert lossless.quant_bits == 0
     assert lossless.max_weight_cache_mb == 7000
@@ -1043,6 +1047,46 @@ def test_qwen36_profiles_bound_experts_and_use_hybrid_endpoint_cache():
     assert not fast.quant_router
     assert not fast.quant_lm_head
     assert fast.max_weight_cache_mb == 7000
+
+
+def test_qwen36_skips_trunk_pinning_under_low_available_memory():
+    """pin_first_layers guarantees the whole trunk stays resident for the
+    engine's entire lifetime -- unlike the weight-cache BUDGET, which the
+    live governor keeps adapting via reserve()/admissible_units(), there is
+    no way to un-pin mid-request. Live-confirmed this backfires under real
+    memory pressure: a request failed at a HIGHER active-memory point than
+    pre-pinning failures ever reached, because the pinned trunk could no
+    longer be shed to make room the way a fully-evictable one could
+    (2026-07-20). Pinning must therefore be a one-time, memory-aware
+    decision at engine-construction time, not unconditional."""
+    from unittest.mock import patch
+
+    from runtime.server import EngineManager
+
+    captured = []
+
+    class FakeEngine:
+        def __init__(self, _path, rc):
+            captured.append(rc)
+
+        def close(self):
+            pass
+
+    cfg = SimpleNamespace(
+        model_type="qwen3_5_moe", tie_word_embeddings=False,
+        index_topk=0, vision_config={"depth": 27}, num_hidden_layers=40)
+    with patch("runtime.config.ModelConfig.from_dir", return_value=cfg), \
+         patch("runtime.path_resolver.resolve_model_dir", side_effect=lambda path: path), \
+         patch("runtime.engine.StreamingEngine", FakeEngine), \
+         patch("runtime.server.psutil.virtual_memory",
+               return_value=SimpleNamespace(available=2_000_000_000)):
+        EngineManager().get(Path("/tmp/fake-qwen36-tight"), "fast")
+
+    assert captured[0].pin_first_layers == 0
+    # lm_head streaming is unconditional -- it costs nothing to keep even
+    # when there isn't room to also pin the trunk.
+    assert not captured[0].pin_lm_head
+    assert captured[0].stream_lm_head
 
 
 def test_qwen36_fast_mode_respects_configured_weight_cache_budget():
