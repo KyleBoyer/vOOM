@@ -261,6 +261,13 @@ class RuntimeConfig:
     suffix_decoding_max_nodes: int = 262_144
     suffix_decoding_max_bytes: int = 96_000_000
     suffix_decoding_max_local_tokens: int = 2_048
+    # F94: Qwen3.5/3.6's native single-depth MTP (real mtp.* checkpoint
+    # weights) as a verified draft source, wired via
+    # runtime.qwen35_mtp.QwenMTPSpeculativeEngine (a server.py construction
+    # decision, not consumed inside StreamingEngine itself -- this flag just
+    # signals intent/opt-in the same way draft_dir presence gates the
+    # existing SpeculativeEngine wrapper).
+    qwen_mtp_speculative: bool = False
     hot_prompt_kv_persist_dir: str = ""  # disk backing for the in-memory hot-
     # prompt-kv LRU above (2026-07-15): "" disables it -- pure in-memory,
     # does not survive a restart, the original behavior. When set, every
@@ -430,6 +437,7 @@ class RuntimeConfig:
                 "suffix_decoding_max_bytes", 96_000_000),
             suffix_decoding_max_local_tokens=run.get(
                 "suffix_decoding_max_local_tokens", 2_048),
+            qwen_mtp_speculative=run.get("qwen_mtp_speculative", False),
             hot_prompt_kv_persist_dir=run.get("hot_prompt_kv_persist_dir", ""),
             hot_prompt_kv_persist_max_checkpoints=run.get(
                 "hot_prompt_kv_persist_max_checkpoints", 64),
@@ -1995,7 +2003,18 @@ class StreamingEngine:
         fetches each layer only once for the complete verify window.
         """
         if self.cfg.num_experts or self.cfg.model_type in (
-                "glm_moe_dsa", "gpt_oss"):
+                "glm_moe_dsa", "gpt_oss", "qwen3_5", "qwen3_5_moe", "kimi_linear"):
+            # F94: layer_runner.run_block (this function's per-layer call
+            # below) is a plain dense-transformer block with no awareness of
+            # the hybrid DeltaNet/full-attention layer_types these model
+            # types use -- it silently looked up "model.layers.N.self_attn.*"
+            # tensor names that don't exist on a linear_attention layer,
+            # KeyError'ing rather than misrouting quietly. qwen3_5_moe/
+            # kimi_linear are already excluded via num_experts (MoE); dense
+            # qwen3_5 (Qwen3.5-4B/9B, Qwen3.6-27B) is not, so it needed an
+            # explicit exclusion here too. forward_tokens (via _sweep, which
+            # DOES have correct model_type dispatch) is the working
+            # alternative for these targets -- see runtime/qwen35_mtp.py.
             raise ValueError(
                 "serial-position verification currently supports dense models only")
         if not tokens:

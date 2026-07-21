@@ -513,6 +513,14 @@ def fallback_reason(engine, kv, sampling, constraint, *, terminal: bool) -> str 
         return "unproven-kv-layout"
     if getattr(kv, "compressed_mla", False):
         return "compressed-kv"
+    if getattr(kv, "kda_cache", None) is not None:
+        # F94: KVCache.trim() has no kda_cache branch -- a partially-accepted
+        # round would silently roll back only the ordinary KV, leaving the
+        # DeltaNet/KDA recurrent state polluted by the rejected suffix with
+        # no error raised. Fail closed rather than silently corrupt output;
+        # see runtime/qwen35_mtp.py's module docstring for the real fix this
+        # gap needs (fork/restore at a clean round boundary), not a trim().
+        return "recurrent-state-target"
     if engine._embed_rows is not None or engine._streamed_lm_head is not None:
         return "streamed-embedding-or-head"
     if engine.rc.rerank_lm_head:

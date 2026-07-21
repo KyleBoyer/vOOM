@@ -1104,6 +1104,13 @@ class EngineManager:
                 # exact endpoints/extensions (never a trimmed branch).
                 rc.prompt_kv_dir = ""
                 rc.hot_prompt_kv = True
+                # F94: native MTP speculative decoding, opt-in only (matching
+                # GLM's own still-"provisional"/F23 MTP path) -- gracefully
+                # skipped at construction if the checkpoint has no mtp.*
+                # weights (older Qwen3.5 generations), see the
+                # rc.qwen_mtp_speculative construction site in EngineManager.get.
+                rc.qwen_mtp_speculative = os.environ.get(
+                    "VMODEL_QWEN_MTP_SPECULATIVE", "0") == "1"
                 try:
                     rc.hot_prompt_kv_slots = int(os.environ.get(
                         "VMODEL_QWEN35_HOT_KV_SLOTS", "2"))
@@ -1287,6 +1294,13 @@ class EngineManager:
                 # imposes carry over from the MoE sibling.
                 rc.prompt_kv_dir = ""
                 rc.hot_prompt_kv = True
+                # F94: native MTP speculative decoding, opt-in only (matching
+                # GLM's own still-"provisional"/F23 MTP path) -- gracefully
+                # skipped at construction if the checkpoint has no mtp.*
+                # weights (older Qwen3.5 generations), see the
+                # rc.qwen_mtp_speculative construction site in EngineManager.get.
+                rc.qwen_mtp_speculative = os.environ.get(
+                    "VMODEL_QWEN_MTP_SPECULATIVE", "0") == "1"
                 try:
                     rc.hot_prompt_kv_slots = int(os.environ.get(
                         "VMODEL_QWEN35_HOT_KV_SLOTS", "2"))
@@ -2240,6 +2254,24 @@ class EngineManager:
                             f"could not initialize speculative draft {draft_dir}: {error}") from error
                     print(
                         f"[server] speculative draft skipped ({draft_dir}): {error}",
+                        flush=True,
+                    )
+            elif (getattr(rc, "qwen_mtp_speculative", False)
+                    and target_engine.store.names_with_prefix("mtp.")):
+                from .qwen35_mtp import QwenMTPSpeculativeEngine
+
+                try:
+                    self._engine = QwenMTPSpeculativeEngine(target_engine)
+                    print(
+                        f"[server] Qwen native MTP speculation: "
+                        f"target={model_dir.name}",
+                        flush=True,
+                    )
+                except Exception as error:
+                    self._engine = target_engine
+                    print(
+                        f"[server] Qwen MTP speculation skipped "
+                        f"({model_dir.name}): {error}",
                         flush=True,
                     )
             self._key = key

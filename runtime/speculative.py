@@ -112,6 +112,22 @@ class SpeculativeDecoder:
         threshold is a conservative heuristic rather than a proved break-even. It
         periodically re-probes after falling back to plain decoding."""
         self.target, self.draft, self.k = target, draft, k
+        if draft != "mtp" and getattr(target.cfg, "model_type", None) in (
+                "qwen3_5", "qwen3_5_moe", "kimi_linear"):
+            # F94: KVCache.trim() has no kda_cache branch, so a partially
+            # accepted draft-model/n-gram round would silently roll back
+            # only the ordinary KV, leaving the DeltaNet/KDA recurrent state
+            # polluted by the rejected suffix with no error raised. GLM's
+            # own MTP path (draft == "mtp") is exempt: its target never has
+            # kda_cache. Fail closed rather than silently corrupt output --
+            # see runtime/qwen35_mtp.py's QwenMTPSpeculativeEngine for the
+            # real fix this gap needs (fork/restore at a clean round
+            # boundary), which is architecturally separate from this class.
+            raise ValueError(
+                f"SpeculativeDecoder does not support recurrent-state "
+                f"targets ({target.cfg.model_type}) with draft={draft!r} -- "
+                f"KVCache.trim() cannot roll back kda_cache on partial "
+                f"rejection. Use QwenMTPSpeculativeEngine instead.")
         if prompt_cache_min_tokens < 0:
             raise ValueError("prompt_cache_min_tokens must be >= 0")
         self.prompt_cache_min_tokens = prompt_cache_min_tokens
