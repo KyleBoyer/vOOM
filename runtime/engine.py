@@ -956,9 +956,24 @@ class StreamingEngine:
             raise ValueError("qwen_yarn_factor must be finite")
         if qwen_yarn_factor < 0 or (0 < qwen_yarn_factor < 1):
             raise ValueError("qwen_yarn_factor must be 0 or at least 1")
-        if qwen_yarn_factor > 1 and self.cfg.model_type != "qwen2":
-            raise ValueError("qwen_yarn_factor is supported only for Qwen2 checkpoints")
-        if self.cfg.model_type == "qwen2":
+        if qwen_yarn_factor > 1 and self.cfg.model_type not in ("qwen2", "olmoe"):
+            raise ValueError(
+                "qwen_yarn_factor is supported only for Qwen2 and OLMoE checkpoints")
+        if self.cfg.model_type in ("qwen2", "olmoe"):
+            # F94 (2026-07-21): extended from Qwen2-only to also cover OLMoE.
+            # yarn_parameters()/supported_qwen_rope_type() were already
+            # architecture-agnostic (pure functions over head_dim/rope_theta/
+            # scaling dict, tests/test_yarn_parameters.py has no model_type
+            # dependency at all) and self._rope_freqs/_mscale are consumed
+            # generically by layer_runner.py's run_block for every model
+            # that reaches it (OLMoE included -- gpt_oss's own YaRN,
+            # _gptoss_rope_state below, already proves a second model type
+            # plugging into this same mechanism). The only actual gate was
+            # this one explicit model_type check; OLMoE's real config.json
+            # confirms standard (non-partial, non-M-RoPE) rotate-half RoPE
+            # with rope_scaling=None (no native YaRN, same as an
+            # unscaled Qwen2 checkpoint), so it takes the identical
+            # qwen_yarn_factor > 1 opt-in extension path.
             scaling = self.cfg.rope_scaling or {}
             from .rope import supported_qwen_rope_type
 
@@ -984,15 +999,16 @@ class StreamingEngine:
                 )
                 self._rope_freqs = mx.array(freqs, dtype=mx.float32)
                 mx.eval(self._rope_freqs)
+                yarn_label = self.cfg.model_type  # "qwen2" or "olmoe"
                 if qwen_yarn_factor > 1:
                     self.effective_max_position_embeddings = int(original * factor)
-                    self.rope_profile = f"experimental-qwen-yarn-{factor:g}x"
+                    self.rope_profile = f"experimental-{yarn_label}-yarn-{factor:g}x"
                 else:
                     self.effective_max_position_embeddings = max(
                         int(self.cfg.max_position_embeddings), int(original * factor))
-                    self.rope_profile = f"checkpoint-qwen-yarn-{factor:g}x"
+                    self.rope_profile = f"checkpoint-{yarn_label}-yarn-{factor:g}x"
                 self.rope_cache_identity = (
-                    "qwen-yarn-v1:"
+                    f"{yarn_label}-yarn-v1:"
                     f"factor={factor.hex()}:original={original}:"
                     f"beta_fast={beta_fast.hex()}:beta_slow={beta_slow.hex()}:"
                     f"mscale={mscale.hex()}:mscale_all_dim={mscale_all_dim.hex()}"

@@ -519,7 +519,14 @@ def _advertised_model_ids() -> list[str]:
     long_qwen = []
     for name in fast:
         try:
-            if json.loads((reg[name] / "config.json").read_text()).get("model_type") == "qwen2":
+            # F94 (2026-07-21): extended from Qwen2-only to also cover
+            # OLMoE -- see the matching qwen_yarn_factor widening in
+            # engine.py's __init__ for why this is safe (yarn_parameters()
+            # was already architecture-agnostic; OLMoE's real config.json
+            # has standard rotate-half RoPE with no native scaling, the
+            # same shape as an unscaled Qwen2 checkpoint).
+            if json.loads((reg[name] / "config.json").read_text()).get(
+                    "model_type") in ("qwen2", "olmoe"):
                 long_qwen.append(LOSSY_LONG_PREFIX + name)
         except (OSError, ValueError):
             pass
@@ -767,18 +774,39 @@ def _hybrid_prefill_chunk_size(available_bytes: int, model_scale: int = 0) -> in
     sweep can invalidate. Live-confirmed: forcing chunk=32 on the exact
     failing 30K-token request got through the first ~23% of the sweep with
     ZERO governor.reserve() events at all (vs. reserve() firing repeatedly
-    and still failing at chunk=512) before this fix landed."""
-    ladder_cap = 512
-    if model_scale >= 60_000_000:
-        ladder_cap = 32
-    if available_bytes >= 4_000_000_000:
-        return min(512, ladder_cap)
-    if available_bytes >= 2_000_000_000:
-        return min(128, ladder_cap)
+    and still failing at chunk=512) before this fix landed.
+
+    2026-07-21: BOTH the 512 and 128 tiers are now removed. This server
+    CACHES and REUSES one engine instance across every subsequent request
+    on the same model/mode -- the "available_bytes" reading that picks a
+    tier only ever happens once, at the FIRST request after a restart (when
+    memory looks its best, nothing else has run yet), and then stays fixed
+    for however long that server keeps running, serving requests under
+    whatever real memory conditions arise hours later. Live-reconfirmed
+    against a real Qwen3.6-35B-A3B (MoE) request: available=2.82GB, active
+    shrunk to 0.07GB (essentially nothing resident, cache floor already
+    doing all it can), and STILL failed -- ceiling=1.69GB couldn't cover
+    even a chunk=128 incoming=1.26GB reservation. 128 was picked by a
+    healthier reading taken long before, at this server's first request,
+    and never revisited -- and per this same investigation, chunk=128 is
+    not meaningfully cheaper than chunk=512 anyway (a direct probe found
+    only ~7% transient reduction going from 128 to 32, i.e. the "128 tier"
+    was mostly theater, not real protection). There is no live hook to
+    re-pick chunk size mid-lifetime (hot_prompt_kv needs it fixed), so the
+    only fix is to stop trusting a single favorable instant to hold for a
+    server's entire remaining lifetime: 32 -- proven reliable across
+    dozens of real, unattended hours-long attempts against the largest
+    dense sibling overnight, repeatedly reaching 25-53% of a 30K-token
+    sweep with ZERO governor.reserve() events before any external
+    interruption -- is now the ceiling for every model, not just ones
+    flagged by model_scale."""
+    # model_scale is no longer consulted -- 32 is now the ceiling for every
+    # model regardless of size (kept as a parameter so existing callers
+    # don't need to change shape).
     if available_bytes >= 1_000_000_000:
-        return min(32, ladder_cap)
+        return 32
     if available_bytes >= 500_000_000:
-        return min(8, ladder_cap)
+        return 8
     return 1
 
 
@@ -1185,9 +1213,23 @@ class EngineManager:
                 # actually-useful expert-LRU headroom -- pinning while
                 # leaving less than that would likely thrash almost as much
                 # as not pinning, for none of the benefit.
+                #
+                # F94 (2026-07-21): removed the >=4GB gate entirely, live-
+                # reconfirmed backfiring a SECOND time -- a fresh server's
+                # very first engine construction sees generous available
+                # memory (nothing else loaded yet) and commits to pinning,
+                # then real request traffic (tool-heavy prompts, MoE expert
+                # paging) drains memory well below 4GB by the time it
+                # actually matters, and the irrevocable pin has no live
+                # governor hook to undo. This is the exact same "stale
+                # construction-time snapshot" lesson already applied to
+                # min_weight_cache_mb/prefill_chunk_size elsewhere in this
+                # file: on this machine, a one-time favorable reading is not
+                # a safe basis for an irrevocable resident-memory bet, no
+                # matter how comfortable it looks at that instant. Never pin
+                # -- fully-evictable is the only behavior proven not to make
+                # a real failure worse.
                 qwen35_available_bytes = psutil.virtual_memory().available
-                if qwen35_available_bytes >= 4_000_000_000:
-                    rc.pin_first_layers = cfg_probe.num_hidden_layers
                 rc.fast_dirs = (str(
                     Path.home() / "vmodel_fast_tier" / model_dir.name),)
                 # 2026-07-20: every governor.reserve() failure this session
@@ -3865,8 +3907,8 @@ def _prepare_chat_prompt(engine, model_dir: Path, messages: list[dict], reasonin
     # Never silently claim semantics beyond the active RoPE profile. Native
     # fast stays at the checkpoint limit; fast-long has a separately named,
     # cache-incompatible experimental YaRN profile.
-    hint = ((" Use model id lossy-long-<name> for experimental Qwen2 YaRN, "
-             "or set VMODEL_FAST_TOOL_LIMIT=32 (or lower).")
+    hint = ((" Use model id lossy-long-<name> for experimental YaRN "
+             "(Qwen2/OLMoE), or set VMODEL_FAST_TOOL_LIMIT=32 (or lower).")
             if fast_mode and tools else "")
     context_limit = _validate_context_budget(
         engine, prompt_tokens, max_output_tokens,
