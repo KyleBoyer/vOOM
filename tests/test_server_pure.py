@@ -1049,6 +1049,76 @@ def test_qwen36_profiles_bound_experts_and_use_hybrid_endpoint_cache():
     assert fast.max_weight_cache_mb == 7000
 
 
+def test_hybrid_prefill_chunk_size_ladder_never_stops_shrinking():
+    """A binary 512/128 split was proven insufficient live: a real
+    lossy-Qwen3.6-27B request still hit "unsafe Metal reservation refused"
+    at chunk=128 because this model's per-layer dimensions are much larger
+    than the models the constant was tuned against. The floor tier
+    (chunk=1) must stay reachable no matter how tight memory gets, so that
+    a bigger model degrades to token-by-token prefill -- the same
+    granularity ordinary decode already uses successfully -- instead of
+    ever hard-failing purely due to chunk size (2026-07-20)."""
+    from runtime.server import _hybrid_prefill_chunk_size
+
+    assert _hybrid_prefill_chunk_size(10_000_000_000) == 512
+    assert _hybrid_prefill_chunk_size(4_000_000_000) == 512
+    assert _hybrid_prefill_chunk_size(3_999_999_999) == 128
+    assert _hybrid_prefill_chunk_size(2_000_000_000) == 128
+    assert _hybrid_prefill_chunk_size(1_999_999_999) == 32
+    assert _hybrid_prefill_chunk_size(1_000_000_000) == 32
+    assert _hybrid_prefill_chunk_size(999_999_999) == 8
+    assert _hybrid_prefill_chunk_size(500_000_000) == 8
+    assert _hybrid_prefill_chunk_size(499_999_999) == 1
+    assert _hybrid_prefill_chunk_size(0) == 1
+
+
+def test_hybrid_prefill_chunk_size_caps_large_dense_models_regardless_of_memory():
+    """The memory-only ladder was STILL insufficient live: a real
+    134-tool/~30K-token Qwen3.6-27B request constructed its engine at a
+    healthy available=10.27GB (picking chunk=512 from the ladder above),
+    then drained to available=2.80GB deep in its own prefill sweep and
+    failed anyway -- a one-time construction-time reading cannot predict
+    what a long sweep does to memory over its own lifetime. Separately,
+    a periodic full_attention layer's QK^T scratch scales with
+    chunk_size * kv_length_so_far, so a big enough dense model (Qwen3.6-27B:
+    hidden=5120, intermediate=17408, hidden*intermediate ~=89M) needs a
+    smaller chunk ceiling than its 4B/9B siblings (~23-50M) regardless of
+    what memory looks like at construction. Forcing chunk=32 on the exact
+    failing request got through ~23% of the sweep with ZERO
+    governor.reserve() events, versus reserve() firing repeatedly and
+    still failing at chunk=512 (2026-07-21)."""
+    from runtime.server import _hybrid_prefill_chunk_size
+
+    # Below the model_scale threshold (e.g. Qwen3.5-4B/9B): unaffected.
+    assert _hybrid_prefill_chunk_size(10_000_000_000, model_scale=50_000_000) == 512
+    assert _hybrid_prefill_chunk_size(1_999_999_999, model_scale=50_000_000) == 32
+
+    # At/above the threshold (e.g. Qwen3.6-27B, ~89M): capped at 32 even
+    # when available memory looks generous at construction time.
+    assert _hybrid_prefill_chunk_size(10_000_000_000, model_scale=89_000_000) == 32
+    assert _hybrid_prefill_chunk_size(4_000_000_000, model_scale=60_000_000) == 32
+    # The cap can only lower the ladder's pick, never raise it.
+    assert _hybrid_prefill_chunk_size(499_999_999, model_scale=89_000_000) == 1
+
+
+def test_hybrid_min_weight_cache_floor_is_unconditionally_low():
+    """Live-reproduced TWICE (2026-07-20): a real Qwen3.6-27B request
+    constructed its engine at a healthy available=10.27GB, yet still hit
+    "unsafe Metal reservation refused" ~3s later at available=2.80GB --
+    a single 30K-token/64-layer dense sweep drained 7.5GB of system memory
+    over its OWN lifetime before the failing layer was even reached. A
+    construction-time available_bytes reading (gating an earlier version
+    of this floor) cannot predict that a long sweep will drain memory
+    this much by itself, so the floor must stay conservative regardless
+    of what memory looked like at construction -- unlike prefill_chunk_size,
+    nothing requires this floor to vary with a point-in-time reading."""
+    from runtime.server import _hybrid_min_weight_cache_floor_mb
+
+    assert _hybrid_min_weight_cache_floor_mb(10_000_000_000) == 64
+    assert _hybrid_min_weight_cache_floor_mb(4_000_000_000) == 64
+    assert _hybrid_min_weight_cache_floor_mb(0) == 64
+
+
 def test_qwen36_skips_trunk_pinning_under_low_available_memory():
     """pin_first_layers guarantees the whole trunk stays resident for the
     engine's entire lifetime -- unlike the weight-cache BUDGET, which the
@@ -1097,6 +1167,12 @@ def test_qwen36_skips_trunk_pinning_under_low_available_memory():
     assert captured[0].stream_lm_head
     assert captured[0].prefill_chunk_size == 128
     assert captured[0].hot_prompt_kv_chunk_size == 128
+    # F94: the weight-cache floor stays unconditionally low regardless of
+    # available memory at construction -- a fixed 1.5GB floor left
+    # governor.reserve() with nothing further to shed on the real
+    # Qwen3.6-27B failure this was modeled on, even though available
+    # memory looked healthy when the engine was constructed.
+    assert captured[0].min_weight_cache_mb == 64
 
 
 def test_qwen36_fast_mode_respects_configured_weight_cache_budget():

@@ -615,7 +615,7 @@ class StreamingEngine:
         self._model_dir = self.store.dir
         self.cfg = self.store.config
         _apply_runtime_expert_top_k(self.rc, self.cfg)
-        if (self.cfg.model_type in ("kimi_linear", "qwen3_5_moe")
+        if (self.cfg.model_type in ("kimi_linear", "qwen3_5_moe", "qwen3_5")
                 and self.rc.prompt_kv_dir):
             raise ValueError(
                 f"{self.cfg.model_type} recurrent attention state is not "
@@ -1115,7 +1115,8 @@ class StreamingEngine:
                     and bool(self.cfg.index_topk)
                     and not self._dsa_elided),
                 require_recurrent=(
-                    self.cfg.model_type in ("kimi_linear", "qwen3_5_moe")),
+                    self.cfg.model_type in (
+                        "kimi_linear", "qwen3_5_moe", "qwen3_5")),
             )
             if not self._defer_persisted_kv_until_bootstrap:
                 for (tokens, kv, logits, prompt_length, prompt_logits,
@@ -1195,7 +1196,7 @@ class StreamingEngine:
         }
 
     def _project_dense_text_kv_bytes(self, positions: int) -> int:
-        if self.cfg.model_type == "qwen3_5_moe":
+        if self.cfg.model_type in ("qwen3_5_moe", "qwen3_5"):
             full_layers = sum(
                 layer_type == "full_attention"
                 for layer_type in self.cfg.layer_types)
@@ -1755,7 +1756,7 @@ class StreamingEngine:
 
     def _final_logits(self, hidden: mx.array, head=None) -> mx.array:
         head = self._lm_head_weight() if head is None else head
-        if self.cfg.model_type == "qwen3_5_moe":
+        if self.cfg.model_type in ("qwen3_5_moe", "qwen3_5"):
             from .qwen35 import final_logits
 
             return final_logits(
@@ -1765,7 +1766,7 @@ class StreamingEngine:
 
     def _all_logits(self, hidden: mx.array) -> mx.array:
         head = self._lm_head_weight()
-        if self.cfg.model_type == "qwen3_5_moe":
+        if self.cfg.model_type in ("qwen3_5_moe", "qwen3_5"):
             from .qwen35 import all_logits
 
             return all_logits(
@@ -1930,7 +1931,7 @@ class StreamingEngine:
                     mlp_last_only=last_only,
                     iter_expert_batches=self._iter_expert_batches,
                 )
-            elif self.cfg.model_type == "qwen3_5_moe":
+            elif self.cfg.model_type in ("qwen3_5_moe", "qwen3_5"):
                 from .qwen35 import run_qwen35_block
 
                 x = run_qwen35_block(
@@ -2169,7 +2170,7 @@ class StreamingEngine:
                 from .glm_dsa import DSAState
 
                 kv.dsa = DSAState(self.cfg)
-        if self.cfg.model_type in ("kimi_linear", "qwen3_5_moe"):
+        if self.cfg.model_type in ("kimi_linear", "qwen3_5_moe", "qwen3_5"):
             # KDA's recurrent state is fixed-size and not token-indexed. Exact
             # endpoint/extension retention and durable restore carry this
             # companion cache alongside attention KV; arbitrary prefix trims
@@ -2362,7 +2363,7 @@ class StreamingEngine:
         # endpoint and extended with a suffix. Candidate selection below
         # limits hybrid models to those two no-trim cases.
         recurrent_exact_only = self.cfg.model_type in (
-            "kimi_linear", "qwen3_5_moe")
+            "kimi_linear", "qwen3_5_moe", "qwen3_5")
         hot_eligible = (self.rc.hot_prompt_kv and not self.rc.max_kv_mb
                         and not force_adaptive_paged)
         resident_prompt_kv_bytes = self._project_dense_text_kv_bytes(len(tokens))

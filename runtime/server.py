@@ -331,7 +331,7 @@ def _derived_artifacts_for(source: Path) -> list[Path]:
 
 
 def _preferred_fast_artifact(source: Path) -> Path:
-    """Use a complete expert-MXFP4 sibling for supported MoE sources."""
+    """Use a complete MXFP4 sibling for supported MoE/dense sources."""
     if _is_voom_lossy_checkpoint(source):
         return source
     for candidate in _derived_artifacts_for(source):
@@ -345,10 +345,16 @@ def _preferred_fast_artifact(source: Path) -> Path:
             bits = int(quant.get("bits", 0))
         except (TypeError, ValueError):
             continue
-        if (config.get("model_type") in ("olmoe", "qwen3_5_moe")
-                and marker.get("profile") == "experts"
-                and quant.get("mode") == "mxfp4"
-                and bits == 4):
+        model_type = config.get("model_type")
+        # 2026-07-20: dense qwen3_5 (Qwen3.5-4B/9B, Qwen3.6-27B) has no
+        # experts to selectively quantize -- formats.quantize_mlx's "all"
+        # profile (full MXFP4: attention+MLP+lm_head) is its only fast
+        # artifact, same convention/provenance marker as the MoE "experts"
+        # profile, just a different profile value and model_type.
+        if ((model_type in ("olmoe", "qwen3_5_moe")
+                and marker.get("profile") == "experts")
+                or (model_type == "qwen3_5" and marker.get("profile") == "all")) \
+                and quant.get("mode") == "mxfp4" and bits == 4:
             print(f"[server] fast artifact: {source} -> {candidate}", flush=True)
             return candidate
     return source
@@ -732,6 +738,74 @@ def _resolve(model_id: str) -> Path:
     target = ROOT / "models" / base
     DOWNLOADS.start(model_id, base, target)
     raise ModelDownloading(model_id, DOWNLOADS.status(model_id))
+
+
+def _hybrid_prefill_chunk_size(available_bytes: int, model_scale: int = 0) -> int:
+    """F94: descending chunk-size ladder for qwen3_5/qwen3_5_moe's fixed,
+    hot_prompt_kv-compatible prefill chunk (GLM's live adaptive_chunk_size
+    resampling is not an option here -- see the callers' comments).
+
+    A single low/high binary split (512 vs 128) was proven insufficient
+    live: a real lossy-Qwen3.6-27B request reproducibly hit "unsafe Metal
+    reservation refused" with _layer_transient stuck at ~1.9GB at chunk=128.
+    The wider descending ladder alone was STILL insufficient: a real
+    134-tool/~30K-token request constructed its engine at a healthy
+    available=10.27GB (picking chunk=512), then drained to available=2.80GB
+    ~3s later, deep in the prefill sweep, and failed -- a one-time
+    memory reading at construction cannot predict what a long sweep does to
+    memory over its OWN lifetime (see _hybrid_min_weight_cache_floor_mb's
+    docstring for the same lesson applied to the cache floor). Unlike the
+    floor, though, chunk size genuinely matters here for a SEPARATE reason:
+    a periodic full_attention layer's QK^T score buffer scales with
+    chunk_size * kv_length_so_far, and this model's largest dense sibling
+    (Qwen3.6-27B: hidden=5120, intermediate=17408, hidden*intermediate
+    ~=89M) has meaningfully bigger per-layer dimensions than its 4B/9B
+    siblings (hidden*intermediate ~=23-50M), which never reproduced this
+    failure even under real testing. `model_scale` (hidden*intermediate)
+    lets a big dense model's chunk ceiling drop regardless of what memory
+    looked like at construction, rather than trusting a snapshot a long
+    sweep can invalidate. Live-confirmed: forcing chunk=32 on the exact
+    failing 30K-token request got through the first ~23% of the sweep with
+    ZERO governor.reserve() events at all (vs. reserve() firing repeatedly
+    and still failing at chunk=512) before this fix landed."""
+    ladder_cap = 512
+    if model_scale >= 60_000_000:
+        ladder_cap = 32
+    if available_bytes >= 4_000_000_000:
+        return min(512, ladder_cap)
+    if available_bytes >= 2_000_000_000:
+        return min(128, ladder_cap)
+    if available_bytes >= 1_000_000_000:
+        return min(32, ladder_cap)
+    if available_bytes >= 500_000_000:
+        return min(8, ladder_cap)
+    return 1
+
+
+def _hybrid_min_weight_cache_floor_mb(available_bytes: int) -> int:
+    """F94: the weight-cache floor for qwen3_5/qwen3_5_moe -- deliberately
+    NOT gated on `available_bytes` (the parameter is kept only so existing
+    callers/tests didn't need to change shape). Live-reproduced twice: a
+    real Qwen3.6-27B request constructed its engine at a HEALTHY
+    available=10.27GB (picking chunk=512, and the OLD code's floor=1.5GB
+    default), then still hit "unsafe Metal reservation refused" ~3s later
+    at available=2.80GB -- a single 30K-token/64-layer dense sweep drained
+    7.5GB of system memory over its OWN lifetime (growing weight cache,
+    growing KV, quantize-on-load scratch) before the failing layer was
+    even reached. A one-time construction-time reading cannot predict
+    that, so gating the floor on it is fighting the wrong variable --
+    unlike prefill_chunk_size (which hot_prompt_kv genuinely requires
+    fixed for the whole sweep, a real constraint), the cache floor has no
+    such requirement and can just always be conservative. A direct probe
+    also showed chunk size itself barely moves _layer_transient (~7% for
+    a 4x smaller chunk at chunk=128 vs 32) -- the floor is the lever with
+    real leverage (governor.reserve()'s shrink-then-reserve loop only
+    helps if it can shrink far enough), so make IT unconditionally low
+    instead. This costs nothing when memory is plentiful (the cache still
+    grows to max_weight_cache_mb under ordinary LRU eviction; the floor
+    only bites during an actual reserve() squeeze) and buys the maximum
+    possible headroom exactly when a squeeze happens."""
+    return 64
 
 
 def _dense_fast_resident_bytes(cfg) -> int:
@@ -1134,8 +1208,13 @@ class EngineManager:
                 # footprint per chunk. Reuse the same live-memory read
                 # already taken for the pinning decision above rather than
                 # sampling twice.
-                rc.prefill_chunk_size = 512 if qwen35_available_bytes >= 4_000_000_000 else 128
+                rc.prefill_chunk_size = _hybrid_prefill_chunk_size(
+                    qwen35_available_bytes,
+                    model_scale=int(getattr(cfg_probe, "hidden_size", 0) or 0)
+                    * int(getattr(cfg_probe, "intermediate_size", 0) or 0))
                 rc.hot_prompt_kv_chunk_size = rc.prefill_chunk_size
+                rc.min_weight_cache_mb = _hybrid_min_weight_cache_floor_mb(
+                    qwen35_available_bytes)
                 # 2026-07-20: this was q=1 (one expert fetched at a time,
                 # serially) copied from GLM-5.2's fail-closed prefill
                 # fallback -- but that caution was calibrated to GLM's
@@ -1189,6 +1268,88 @@ class EngineManager:
                     # budget to leave headroom for the expert-fetch reserve,
                     # and this line silently overrode that knob back to 6000
                     # every time).
+            elif mtype == "qwen3_5":
+                # 2026-07-20: the dense sibling of qwen3_5_moe (Qwen3.5-4B/
+                # 9B, Qwen3.6-27B) -- SAME hybrid DeltaNet/full-attention
+                # layer_types and recurrent-state restrictions as the MoE
+                # checkpoint (engine.py's require_recurrent/
+                # recurrent_exact_only checks already cover both), but
+                # num_experts=0: no trunk/expert split exists at all here.
+                # Every layer's weights are touched every token regardless
+                # of routing, so unlike the MoE sibling there is no "pin the
+                # small trunk, let the large expert pool page separately"
+                # trade to make -- pinning all layers here would mean
+                # pinning the WHOLE model (54GB for the 27B), the opposite
+                # of what a paging runtime is for. This is architecturally
+                # closer to any other large dense checkpoint (Qwen2.5-32B)
+                # for cache/paging purposes; only hot_prompt_kv (cross-turn
+                # DeltaNet-state reuse) and the fixed-chunk requirement it
+                # imposes carry over from the MoE sibling.
+                rc.prompt_kv_dir = ""
+                rc.hot_prompt_kv = True
+                try:
+                    rc.hot_prompt_kv_slots = int(os.environ.get(
+                        "VMODEL_QWEN35_HOT_KV_SLOTS", "2"))
+                    rc.hot_prompt_kv_min_tokens = int(os.environ.get(
+                        "VMODEL_QWEN35_HOT_KV_MIN_TOKENS", "16"))
+                except ValueError as error:
+                    raise ValueError(
+                        "VMODEL_QWEN35_HOT_KV settings must be integers") from error
+                if rc.hot_prompt_kv_slots <= 0:
+                    raise ValueError(
+                        "VMODEL_QWEN35_HOT_KV_SLOTS must be positive")
+                if rc.hot_prompt_kv_min_tokens < 0:
+                    raise ValueError(
+                        "VMODEL_QWEN35_HOT_KV_MIN_TOKENS must be non-negative")
+                rc.hot_prompt_kv_persist_dir = os.environ.get(
+                    "VMODEL_QWEN35_HOT_KV_PERSIST_DIR",
+                    str(ROOT / ".kv_hybrid"))
+                # lm_head streaming is the same unconditional, bit-identical
+                # win it is for the MoE sibling regardless of dense/MoE.
+                rc.pin_lm_head = False
+                rc.stream_lm_head = True
+                rc.max_weight_cache_mb = 6000
+                # 2026-07-20: live-confirmed the SAME governor.reserve()
+                # failure mode as the MoE sibling above -- a real
+                # lossy-Qwen3.6-27B request (the largest dense model here)
+                # hit "MemoryError: unsafe Metal reservation refused" at a
+                # fixed chunk=512, reproducibly, not a one-off, and STILL
+                # failed once memory was gated more finely (see
+                # _hybrid_prefill_chunk_size's docstring): a real
+                # 134-tool/~30K-token request drained from a healthy
+                # available=10.27GB at construction down to 2.80GB deep in
+                # its own prefill sweep, because a periodic full_attention
+                # layer's QK^T scratch scales with chunk_size *
+                # kv_length_so_far -- a quantity a one-time construction
+                # reading cannot predict. Qwen3.6-27B's per-layer
+                # dimensions (hidden=5120, intermediate=17408) make it the
+                # first dense sibling big enough to hit this; forcing
+                # chunk=32 on the exact failing request got through the
+                # first ~23% of the sweep with ZERO governor.reserve()
+                # events (vs. reserve() firing repeatedly and still failing
+                # at chunk=512), so model_scale caps this model's chunk
+                # ceiling regardless of what memory looks like at
+                # construction, rather than trusting a snapshot a long
+                # sweep can invalidate.
+                qwen35_dense_available_bytes = psutil.virtual_memory().available
+                rc.prefill_chunk_size = _hybrid_prefill_chunk_size(
+                    qwen35_dense_available_bytes,
+                    model_scale=int(getattr(cfg_probe, "hidden_size", 0) or 0)
+                    * int(getattr(cfg_probe, "intermediate_size", 0) or 0))
+                rc.hot_prompt_kv_chunk_size = rc.prefill_chunk_size
+                rc.min_weight_cache_mb = _hybrid_min_weight_cache_floor_mb(
+                    qwen35_dense_available_bytes)
+                if mode in ("fast", "fast-long"):
+                    # No expert-only profile exists for a dense checkpoint --
+                    # full MXFP4 (attention + MLP + lm_head all quantized),
+                    # the same policy the generic dense-model branch below
+                    # already uses for e.g. Qwen2.5-32B, not the MoE
+                    # sibling's mixed "experts only" policy.
+                    rc.quant_bits = 4
+                    rc.quant_mode = "mxfp4"
+                    rc.quant_group_size = 32
+                    rc.quant_min_dim = 0
+                    rc.max_weight_cache_mb = 7000
             else:
                 rc.max_weight_cache_mb = 6000
                 if mtype == "kimi_linear":

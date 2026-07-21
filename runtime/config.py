@@ -223,12 +223,18 @@ class ModelConfig:
             t.setdefault("tie_word_embeddings", raw.get("tie_word_embeddings", False))
             raw = t
         elif ("text_config" in raw
-              and raw.get("model_type", "") == "qwen3_5_moe"):
+              and raw.get("model_type", "") in ("qwen3_5_moe", "qwen3_5")):
             # Qwen3.6 deliberately retains Qwen3.5's architecture identifier.
             # Its post-trained 35B-A3B checkpoint is a multimodal wrapper whose
             # text trunk lives under model.language_model.*.  Preserve the
             # outer type for dispatch while lifting the released text geometry;
             # WeightStore handles the tensor-name canonicalization separately.
+            # 2026-07-20: "qwen3_5" (bare, no "_moe") is the DENSE sibling
+            # architecture -- same hybrid DeltaNet/full-attention layer_types
+            # and text_config nesting, just num_experts=0 (real Qwen3.5-4B/9B
+            # and Qwen3.6-27B config.json confirmed identical structure here,
+            # differing only in the MoE-specific fields this dataclass
+            # already defaults to 0/"dense model" when absent).
             outer = raw
             t = dict(outer["text_config"])
             t["model_type"] = outer["model_type"]

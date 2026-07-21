@@ -313,6 +313,17 @@ def run_qwen35_block(
     h = qwen35_rms_norm(
         x, w[f"{prefix}.post_attention_layernorm.weight"],
         cfg.rms_norm_eps)
+    # 2026-07-20: Qwen3.5/3.6's dense sibling checkpoints (bare "qwen3_5"
+    # model_type -- Qwen3.5-4B/9B, Qwen3.6-27B) share this exact hybrid
+    # DeltaNet/full-attention layer layout but have num_experts=0 (a plain
+    # per-layer MLP under {prefix}.mlp.* instead of routed/shared experts).
+    # _swiglu is the same generic gate/up/down-proj helper the shared-expert
+    # path above already reuses for a single dense FFN; the tensor names it
+    # reads (gate_proj/up_proj/down_proj under the given prefix) are the
+    # real released names confirmed directly from Qwen/Qwen3.5-4B's own
+    # config.json/weight layout, not inferred.
+    if not cfg.num_experts:
+        return x + _swiglu(h, w, f"{prefix}.mlp")
     return x + _moe(
         h, w, prefix, cfg, layer, get_experts,
         iter_expert_batches=iter_expert_batches)
