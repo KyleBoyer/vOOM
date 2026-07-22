@@ -92,7 +92,8 @@ def _read_text_retry(path: Path, attempts: int = 4) -> str:
 class WeightStore:
     def __init__(self, model_dir: str | Path, fast_dirs: list[str | Path] | None = None,
                  *, require_vpack_hashes: bool = False,
-                 require_raw_weight_hashes: bool = False):
+                 require_raw_weight_hashes: bool = False,
+                 parallel_storage_reads: bool = False):
         """fast_dirs: optional overlay directories on faster disks, ordered
         fastest-first (split placement across N drives). Packed tensor files found
         in an earlier tier are read from there instead of the primary store —
@@ -102,6 +103,10 @@ class WeightStore:
         self.fast_tier_bytes = 0
         self.fast_tier_tensors = 0
         self.archive_bytes = 0
+        self.parallel_storage_reads = bool(parallel_storage_reads)
+        self.parallel_tier_fetches = 0
+        self.parallel_tier_fast_bytes = 0
+        self.parallel_tier_archive_bytes = 0
         self.config = ModelConfig.from_dir(self.dir)
         raw_config = json.loads(_read_text_retry(self.dir / "config.json"))
         text_config = raw_config.get("text_config", {})
@@ -443,9 +448,19 @@ class WeightStore:
         hash on the same read that decodes it, so tiering cannot weaken the
         released-byte correctness contract.
         """
+        selected, remaining = self._locate_vpack2_fast_overlay(physical_names)
+        if not selected:
+            return {}, remaining, 0
+        decoded, nbytes = self._decode_vpack2_fast_overlay(selected)
+        return self._materialize_vpack2_fast_overlay(decoded), remaining, nbytes
+
+    def _locate_vpack2_fast_overlay(
+        self, physical_names: list[str],
+    ) -> tuple[list[tuple[str, Path]], list[str]]:
+        """Partition a request without reading either storage device."""
         if (not self.fast_dirs or not self._vpack_overlay_manifest
                 or self.vpack2 is None):
-            return {}, list(physical_names), 0
+            return [], list(physical_names)
         selected: list[tuple[str, Path]] = []
         remaining: list[str] = []
         for name in physical_names:
@@ -459,13 +474,20 @@ class WeightStore:
                 remaining.append(name)
             else:
                 selected.append((name, path))
-        if not selected:
-            return {}, remaining, 0
+        return selected, remaining
 
+    def _decode_vpack2_fast_overlay(
+        self, selected: list[tuple[str, Path]],
+    ) -> tuple[list[tuple[str, dict, object, int]], int]:
+        """Read/authenticate/decode fast files without creating MLX arrays.
+
+        This separation is what makes cross-device overlap safe: filesystem and
+        zstd/numpy work may run in a worker while all MLX materialization stays
+        on the engine's calling thread.
+        """
         import concurrent.futures as cf
         import struct
 
-        from formats.packed import to_mx
         from formats.packed2 import decode_body
 
         def read_one(item):
@@ -495,12 +517,31 @@ class WeightStore:
         else:
             with cf.ThreadPoolExecutor(max_workers=workers) as pool:
                 decoded = list(pool.map(read_one, selected))
+        return decoded, sum(value[3] for value in decoded)
+
+    @staticmethod
+    def _materialize_vpack2_fast_overlay(decoded) -> dict[str, mx.array]:
+        from formats.packed import to_mx
+
         output = {
             name: to_mx(header, raw)
             for name, header, raw, _length in decoded
         }
         mx.eval(list(output.values()))
-        return output, remaining, sum(value[3] for value in decoded)
+        return output
+
+    def _parallel_overlay_is_independent(
+        self, selected: list[tuple[str, Path]],
+    ) -> bool:
+        """True only when every selected overlay lives off the archive device."""
+        if self.vpack2 is None or not selected:
+            return False
+        try:
+            archive_device = self.vpack2.archive.stat().st_dev
+            overlay_devices = {path.stat().st_dev for _name, path in selected}
+        except OSError:
+            return False
+        return bool(overlay_devices) and archive_device not in overlay_devices
 
     def fetch(self, names: list[str]) -> tuple[dict[str, mx.array], float, int]:
         """Materialize tensors; return arrays, wall seconds, store-accounted bytes.
@@ -538,14 +579,47 @@ class WeightStore:
                         # physical-name index otherwise raises a late KeyError.
                         physical = [self._real_name.get(name, name)
                                     for name in physical_names]
-                        fetched, remaining, fast_bytes = (
-                            self._fetch_vpack2_fast_overlay(physical))
+                        selected, remaining = (
+                            self._locate_vpack2_fast_overlay(physical))
+                        parallel_tiers = bool(
+                            self.parallel_storage_reads and selected and remaining
+                            and self._parallel_overlay_is_independent(selected))
+                        if parallel_tiers:
+                            import concurrent.futures as cf
+
+                            # The worker returns only bytes/numpy. vpack2.fetch
+                            # remains on this thread because it materializes MLX
+                            # arrays after its own I/O/decode worker pool joins.
+                            with cf.ThreadPoolExecutor(max_workers=1) as pool:
+                                fast_future = pool.submit(
+                                    self._decode_vpack2_fast_overlay, selected)
+                                archive, _, archive_bytes = self.vpack2.fetch(
+                                    remaining)
+                                decoded, fast_bytes = fast_future.result()
+                            fetched = dict(archive)
+                            fetched.update(
+                                self._materialize_vpack2_fast_overlay(decoded))
+                            self.parallel_tier_fetches += 1
+                            self.parallel_tier_fast_bytes += fast_bytes
+                            self.parallel_tier_archive_bytes += archive_bytes
+                        else:
+                            if selected:
+                                decoded, fast_bytes = (
+                                    self._decode_vpack2_fast_overlay(selected))
+                                fetched = self._materialize_vpack2_fast_overlay(
+                                    decoded)
+                            else:
+                                fetched, fast_bytes = {}, 0
+                            if remaining:
+                                archive, _, archive_bytes = self.vpack2.fetch(
+                                    remaining)
+                                fetched.update(archive)
+                            else:
+                                archive_bytes = 0
                         nbytes = fast_bytes
                         self.fast_tier_bytes += fast_bytes
-                        self.fast_tier_tensors += len(fetched)
+                        self.fast_tier_tensors += len(selected)
                         if remaining:
-                            archive, _, archive_bytes = self.vpack2.fetch(remaining)
-                            fetched.update(archive)
                             nbytes += archive_bytes
                             self.archive_bytes += archive_bytes
                         out = {

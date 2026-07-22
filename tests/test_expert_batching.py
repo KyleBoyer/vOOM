@@ -54,9 +54,11 @@ def test_governor_clamps_validated_decode_cap_using_live_headroom():
     from runtime.engine import StreamingEngine
 
     class FakeGovernor:
-        def admissible_units(self, *, unit_bytes, fixed_bytes, max_units):
+        def admissible_units(
+                self, *, unit_bytes, fixed_bytes, max_units, margin):
             assert unit_bytes == 100
             assert fixed_bytes == 200
+            assert margin == 0
             return min(3, max_units)
 
     class FakeEngine:
@@ -65,6 +67,7 @@ def test_governor_clamps_validated_decode_cap_using_live_headroom():
         _expert_page_bytes = 100
         _expert_fetch_page_bytes = 100
         _layer_transient = 200
+        _layer_transient_margin = 0
         _expert_compute_batches = 0
         _max_experts_per_compute_batch = 0
         _adaptive_expert_batch_clamps = 0

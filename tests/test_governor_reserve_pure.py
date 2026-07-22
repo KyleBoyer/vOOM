@@ -221,6 +221,30 @@ def test_device_limit_uses_mlx_metadata_instead_of_a_fixed_host_cap():
     assert module._device_recommended_limit() == int(64e9)
 
 
+def test_swap_pressure_uses_growth_not_stale_swap_total():
+    module, _mx = load_pressure(0)
+    pressured, used_growth, out_growth = module._swap_growth(
+        3_000_000_000, 40_000_000_000,
+        3_010_000_000, 40_006_000_000)
+    assert not pressured
+    assert used_growth == 10_000_000
+    assert out_growth == 6_000_000
+
+    pressured, used_growth, out_growth = module._swap_growth(
+        3_000_000_000, 40_000_000_000,
+        3_017_000_000, 39_000_000_000)
+    assert pressured
+    assert used_growth == 17_000_000
+    assert out_growth == 0
+
+
+def test_swap_pressure_delays_cache_restoration_for_one_full_window():
+    module, _mx = load_pressure(0)
+    assert module._swap_restore_ready(100.0, None)
+    assert not module._swap_restore_ready(129.9, 100.0)
+    assert module._swap_restore_ready(130.0, 100.0)
+
+
 def test_cache_target_is_fitted_to_sampled_live_headroom():
     module, mx = load_pressure(int(5e9))
     gov = make_governor(module, mx, cache_max=int(9e9), floor=int(1.5e9))

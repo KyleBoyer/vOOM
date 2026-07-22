@@ -24,11 +24,34 @@ from __future__ import annotations
 import math
 import threading
 import time
+from collections import deque
 
 import mlx.core as mx
 import psutil
 
 _DEFAULT_CRITICAL_AVAILABLE = int(1.2e9)
+_SWAP_WINDOW_SECONDS = 30.0
+_SWAP_GROWTH_LIMIT = 16_000_000
+
+
+def _swap_growth(
+        start_used: int, start_out: int, current_used: int,
+        current_out: int, limit: int = _SWAP_GROWTH_LIMIT,
+) -> tuple[bool, int, int]:
+    """Return net/churn pressure without mistaking stale swap for activity."""
+    used_growth = max(0, int(current_used) - int(start_used))
+    out_growth = max(0, int(current_out) - int(start_out))
+    return (used_growth > limit or out_growth > limit,
+            used_growth, out_growth)
+
+
+def _swap_restore_ready(
+        now: float, last_pressure_at: float | None,
+        window_s: float = _SWAP_WINDOW_SECONDS,
+) -> bool:
+    """Require one complete quiet observation window before regrowing cache."""
+    return (last_pressure_at is None
+            or float(now) - float(last_pressure_at) >= float(window_s))
 
 
 def _device_recommended_limit() -> int:
@@ -85,6 +108,13 @@ class MemoryGovernor:
         self.restores = 0
         self.reservations = 0  # F42: synchronous pre-allocation sheds
         self.reservation_failures = 0
+        self.swap_pressure_events = 0
+        self.swap_pressure_used_growth_bytes = 0
+        self.swap_pressure_out_growth_bytes = 0
+        swap = psutil.swap_memory()
+        self._swap_samples = deque([(
+            time.monotonic(), int(swap.used), int(swap.sout))])
+        self._last_swap_pressure_at: float | None = None
         self.paused_prefetch = False
         self._green_streak = 0
         self._stop = threading.Event()
@@ -282,18 +312,41 @@ class MemoryGovernor:
             try:
                 avail = psutil.virtual_memory().available
                 metal = mx.get_active_memory()
+                now = time.monotonic()
+                swap = psutil.swap_memory()
+                self._swap_samples.append(
+                    (now, int(swap.used), int(swap.sout)))
+                while (len(self._swap_samples) > 1
+                       and now - self._swap_samples[1][0]
+                       >= _SWAP_WINDOW_SECONDS):
+                    self._swap_samples.popleft()
+                _start_t, start_used, start_out = self._swap_samples[0]
+                swap_pressure, used_growth, out_growth = _swap_growth(
+                    start_used, start_out, swap.used, swap.sout)
+                if swap_pressure:
+                    self._last_swap_pressure_at = now
+                    self.swap_pressure_events += 1
+                    self.swap_pressure_used_growth_bytes += used_growth
+                    self.swap_pressure_out_growth_bytes += out_growth
+                    # Start a fresh observation window after every response so
+                    # one old spike does not repeatedly collapse the cache.
+                    self._swap_samples.clear()
+                    self._swap_samples.append(
+                        (now, int(swap.used), int(swap.sout)))
                 ceiling = self._metal_ceiling(metal, avail)
                 with self._peak_lock:
                     self._request_peak_metal_bytes = max(
                         self._request_peak_metal_bytes, metal)
 
-                if avail < self.critical or metal > ceiling:
+                if swap_pressure or avail < self.critical or metal > ceiling:
                     new_max = max(self.floor, int(self.cache.max_bytes * (1 - self.shrink_step)))
                     if new_max < self.cache.max_bytes:
                         self._set_cache_max(new_max)
                         self.shrinks += 1
                         print(f"[governor] CRITICAL avail={avail / 1e9:.1f}GB "
                               f"metal={metal / 1e9:.1f}GB ceiling={ceiling / 1e9:.1f}GB "
+                              f"swap+={used_growth / 1e6:.0f}/"
+                              f"{out_growth / 1e6:.0f}MB "
                               f"-> cache budget {new_max / 1e9:.1f}GB", flush=True)
                     self._pause_prefetch(True)
                     mx.clear_cache()
@@ -302,7 +355,9 @@ class MemoryGovernor:
                     self._pause_prefetch(True)
                     mx.clear_cache()
                     self._green_streak = 0
-                elif avail > self.green:
+                elif (avail > self.green
+                      and _swap_restore_ready(
+                          now, self._last_swap_pressure_at)):
                     self._green_streak += 1
                     if self._green_streak >= 3:  # dwell: ~6 s of sustained green
                         if self.paused_prefetch:
@@ -329,5 +384,8 @@ class MemoryGovernor:
         return (f"governor: {self.shrinks} shrinks, {self.restores} restores, "
                 f"{self.reservations} reservations, "
                 f"{self.reservation_failures} refused, "
+                f"{self.swap_pressure_events} swap-pressure events "
+                f"(+{self.swap_pressure_used_growth_bytes / 1e6:.0f}MB used/"
+                f"{self.swap_pressure_out_growth_bytes / 1e6:.0f}MB out), "
                 f"budget now {self.cache.max_bytes / 1e9:.1f}GB "
                 f"(configured {self.configured_max / 1e9:.1f}GB)")

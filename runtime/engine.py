@@ -113,6 +113,36 @@ def _resident_adjusted_transient(
         int(start_active), int(end_active)))
 
 
+def _layer_transient_reserve_margin(position_count: int) -> int:
+    """Secondary F42 pad for a measured layer-compute high-water mark.
+
+    ``MemoryGovernor.current_ceiling`` already preserves its critical system
+    reserve (1.2 GB by default).  Multi-position prefill keeps the additional
+    400 MB estimator/allocator pad because a following layer can have a larger
+    shape-dependent scratch requirement than the observations seen so far.
+
+    A one-position decode sweep is different: ``_layer_transient`` is the
+    maximum observed scratch over the complete prompt sweep and every prior
+    decode layer, so adding the same 400 MB again can reject an operation even
+    after all reclaimable weights have been evicted and the measured high-water
+    itself fits below the hard live ceiling.  Use that measured maximum as the
+    fail-closed reservation while retaining the governor's independent critical
+    reserve.  This changes admission only; model arithmetic is untouched.
+    """
+    if position_count <= 0:
+        raise ValueError("position_count must be positive")
+    return 0 if position_count == 1 else 400_000_000
+
+
+def _layer_transient_for_positions(
+        position_count: int, prefill_bytes: int, decode_bytes: int,
+) -> tuple[int, int]:
+    """Return the shape-class high-water and its independent safety pad."""
+    margin = _layer_transient_reserve_margin(position_count)
+    transient = decode_bytes if position_count == 1 else prefill_bytes
+    return max(0, int(transient)), margin
+
+
 def _cache_io_snapshot(engine) -> tuple[int, ...]:
     """Cumulative counters used to derive one request's physical work."""
     stats = engine.cache.stats
@@ -123,8 +153,16 @@ def _cache_io_snapshot(engine) -> tuple[int, ...]:
         int(engine.expert_misses),
         int(getattr(governor, "reservations", 0) or 0),
         int(getattr(governor, "reservation_failures", 0) or 0),
+        int(getattr(governor, "swap_pressure_events", 0) or 0),
+        int(getattr(
+            governor, "swap_pressure_used_growth_bytes", 0) or 0),
+        int(getattr(
+            governor, "swap_pressure_out_growth_bytes", 0) or 0),
         int(getattr(engine.store, "fast_tier_bytes", 0) or 0),
         int(getattr(engine.store, "archive_bytes", 0) or 0),
+        int(getattr(engine.store, "parallel_tier_fetches", 0) or 0),
+        int(getattr(engine.store, "parallel_tier_fast_bytes", 0) or 0),
+        int(getattr(engine.store, "parallel_tier_archive_bytes", 0) or 0),
     )
 
 
@@ -139,7 +177,12 @@ def _record_cache_io_delta(
         "weight_cache_evictions", "weight_store_bytes_read",
         "expert_cache_hits", "expert_cache_misses",
         "governor_reservations", "governor_reservation_failures",
+        "governor_swap_pressure_events",
+        "governor_swap_used_growth_bytes",
+        "governor_swap_out_growth_bytes",
         "weight_fast_tier_bytes", "weight_archive_bytes",
+        "parallel_tier_fetches", "parallel_tier_fast_bytes",
+        "parallel_tier_archive_bytes",
     )
     for key, start, end in zip(keys, before, after, strict=True):
         stats[prefix + key] = max(0, end - start)
@@ -147,6 +190,12 @@ def _record_cache_io_delta(
         stats["weight_cache_resident_bytes"] = int(engine.cache.total_bytes)
         stats["weight_cache_budget_bytes"] = int(engine.cache.max_bytes)
         stats["layer_transient_bytes"] = int(engine._layer_transient)
+        stats["prefill_layer_transient_bytes"] = int(getattr(
+            engine, "_prefill_layer_transient", 0) or 0)
+        stats["decode_layer_transient_bytes"] = int(getattr(
+            engine, "_decode_layer_transient", 0) or 0)
+        stats["layer_transient_margin_bytes"] = int(getattr(
+            engine, "_layer_transient_margin", 400_000_000))
         stats["token_transient_bytes"] = int(engine._token_transient)
 
 
@@ -268,6 +317,8 @@ class RuntimeConfig:
     resident_attention_group_size: int = 32
     fused_swiglu: bool = False  # lossy side-quest: compiled/fused activation arithmetic
     fast_dirs: tuple[str, ...] = ()  # fast-tier overlay dirs, fastest first (split placement)
+    parallel_storage_reads: bool = False  # overlap authenticated fast-overlay
+    # decode with archive reads only when the paths resolve to distinct devices
     require_vpack_hashes: bool = False  # proof runs set True. False preserves
     # pre-F31 local archives but exposes path_stats=legacy-unhashed and is not L0.
     require_raw_weight_hashes: bool = False  # verify every raw safetensors shard
@@ -464,6 +515,9 @@ class RuntimeConfig:
                 "resident_attention_group_size", 32),
             fused_swiglu=run.get("fused_swiglu", False),
             fast_dirs=tuple(mem.get("fast_dirs", [])),
+            parallel_storage_reads=run.get(
+                "parallel_storage_reads", mem.get(
+                    "parallel_storage_reads", False)),
             require_vpack_hashes=run.get(
                 "require_vpack_hashes", mem.get("require_vpack_hashes", False)
             ),
@@ -692,6 +746,7 @@ class StreamingEngine:
             fast_dirs=list(self.rc.fast_dirs),
             require_vpack_hashes=self.rc.require_vpack_hashes,
             require_raw_weight_hashes=self.rc.require_raw_weight_hashes,
+            parallel_storage_reads=self.rc.parallel_storage_reads,
         )
         # WeightStore may have re-resolved a stale SMB mount from Plex to
         # Plex-N.  Every later checkpoint-relative path must follow that same
@@ -900,6 +955,10 @@ class StreamingEngine:
             else dense_expert_page_bytes + self._expert_page_bytes
         )
         self._layer_transient = 0  # F42: measured compute-scratch high-water mark
+        self._prefill_layer_transient = 0
+        self._prefill_layer_transient_by_positions: dict[int, int] = {}
+        self._decode_layer_transient = 0
+        self._layer_transient_margin = 400_000_000
         self._token_transient = 0  # F42: whole-token transient (greedy sync point)
         # 2026-07-13: F42's own per-layer/per-token mx.reset_peak_memory() calls
         # (below) mean a caller bracketing a whole generate() with reset_peak_memory
@@ -1177,6 +1236,15 @@ class StreamingEngine:
         if self.rc.governor:
             from .pressure import MemoryGovernor
 
+            governor_kwargs = {}
+            system_floor = max(0, int(
+                self.rc.hot_prompt_kv_min_available_mb)) * 1_000_000
+            if system_floor:
+                # Keep the synchronous hot-state admission floor and the
+                # background/live allocation ceiling consistent.  Otherwise
+                # a long prefill can cross an operator's abort threshold before
+                # the next hot-KV admission ever consults that floor.
+                governor_kwargs["critical_available"] = system_floor
             self.governor = MemoryGovernor(
                 self.cache,
                 self.prefetcher,
@@ -1184,6 +1252,7 @@ class StreamingEngine:
                     self.cache.max_bytes,
                     self.rc.min_weight_cache_mb * 1_000_000,
                 ),
+                **governor_kwargs,
             )
 
         # Hot-prompt-kv disk persistence (2026-07-15, generalized to a
@@ -1402,7 +1471,16 @@ class StreamingEngine:
         if self.governor is None or incoming + transient <= 0:
             return stats
 
-        margin = 400_000_000
+        # Match per-layer admission's phase-aware F42 pad.  At construction
+        # this is still 400 MB (unmeasured work fails closed); after a complete
+        # one-position decode sweep it is zero because ``transient`` is already
+        # that sweep's measured maximum and the governor independently keeps
+        # its critical system reserve.  Keeping a hard-coded 400 MB here made
+        # hot-state admission disagree with the layer allocations it was
+        # admitting: a live Qwen3.6-35B-A3B gateway request fit with the learned
+        # transient plus the 1.2 GB critical reserve, then was rejected solely
+        # by this second copy of the estimator pad.
+        margin = int(getattr(self, "_layer_transient_margin", 400_000_000))
         system_floor = stats["system_available_floor_bytes"]
 
         def pressure_sample():
@@ -1730,7 +1808,8 @@ class StreamingEngine:
             # Reserving the full routed union recreates the 16-22 GB false demand
             # even when fetch and compute lifetimes are correctly bounded.
             self.governor.reserve(
-                n_missing * self._expert_fetch_page_bytes + self._layer_transient)
+                n_missing * self._expert_fetch_page_bytes + self._layer_transient,
+                margin=self._layer_transient_margin)
 
         t0 = time.perf_counter()
         pages = self.cache.get_many(items)
@@ -1772,6 +1851,7 @@ class StreamingEngine:
                     unit_bytes=self._expert_fetch_page_bytes,
                     fixed_bytes=self._layer_transient,
                     max_units=batch_size,
+                    margin=self._layer_transient_margin,
                 )
                 if admitted < batch_size:
                     self._adaptive_expert_batch_clamps += 1
@@ -1894,6 +1974,23 @@ class StreamingEngine:
         # from a call other than the most recent one. See
         # tests/test_f62_hidden_taps.py for the tap-on/off identity proof.
         self._tap_hidden = {}
+        position_count = int(x.shape[1])
+        # Never charge one-position decode for a multi-position prefill
+        # high-water, or a smaller retry chunk for a larger prefill's
+        # high-water.  The first layer of each exact position-count class
+        # measures its own scratch, after which subsequent layers reserve that
+        # class-specific maximum.  A single global maximum made a live
+        # Qwen3.6-35B-A3B run finish prefill, then reject decode because it
+        # inherited 1.28 GB of prefill scratch that decode never allocates;
+        # a two-class version then made 8-token retries inherit the 32-token
+        # prefill maximum.  Indexing by actual tensor width fixes both.
+        (self._layer_transient,
+         self._layer_transient_margin) = _layer_transient_for_positions(
+             position_count,
+             getattr(
+                 self, "_prefill_layer_transient_by_positions", {}
+             ).get(position_count, 0),
+             getattr(self, "_decode_layer_transient", 0))
         n = self.cfg.num_hidden_layers
         moe = bool(self.cfg.num_experts)
         if self._resident_moe_layers is not None and tap_layers is None:
@@ -2001,7 +2098,9 @@ class StreamingEngine:
             # read by MoE's _get_experts), so every layer type gets the same
             # proactive protection, not just MoE ones.
             if self.governor is not None and self._layer_transient:
-                self.governor.reserve(self._layer_transient)
+                self.governor.reserve(
+                    self._layer_transient,
+                    margin=self._layer_transient_margin)
 
             t0 = time.perf_counter()
             # F42: learn the layer-compute scratch high-water mark; _get_experts
@@ -2065,6 +2164,14 @@ class StreamingEngine:
                 _resident_adjusted_transient(
                     active_before, mx.get_active_memory(),
                     mx.get_peak_memory()))
+            if position_count == 1:
+                self._decode_layer_transient = self._layer_transient
+            else:
+                by_positions = self._prefill_layer_transient_by_positions
+                by_positions[position_count] = max(
+                    int(by_positions.get(position_count, 0)),
+                    self._layer_transient)
+                self._prefill_layer_transient = max(by_positions.values())
             self._note_true_peak()
             self.timer.add("layer_compute", time.perf_counter() - t0)
             if tap_layers is not None and i in tap_layers:
@@ -2124,6 +2231,14 @@ class StreamingEngine:
 
         offset = kv.offset
         self._tap_hidden = {}
+        # Every block invocation below has the ordinary one-position decode
+        # shape even though several positions are retained across the
+        # layer-major sweep.  Do not inherit a batched-prefill scratch maximum.
+        self._layer_transient, self._layer_transient_margin = (
+            _layer_transient_for_positions(
+                1,
+                getattr(self, "_prefill_layer_transient", 0),
+                getattr(self, "_decode_layer_transient", 0)))
         tapset = set(tap_layers) if tap_layers is not None else None
         embedded = self._embed(list(tokens))
         positions = [embedded[:, i:i + 1, :] for i in range(len(tokens))]
@@ -2140,7 +2255,9 @@ class StreamingEngine:
                 self._layer_key(layer), self._layer_names(layer))
             self.timer.add("weights_wait", time.perf_counter() - t0)
             if self.governor is not None and self._layer_transient:
-                self.governor.reserve(self._layer_transient)
+                self.governor.reserve(
+                    self._layer_transient,
+                    margin=self._layer_transient_margin)
 
             active_before = mx.get_active_memory()
             mx.reset_peak_memory()
@@ -2170,6 +2287,7 @@ class StreamingEngine:
                 _resident_adjusted_transient(
                     active_before, mx.get_active_memory(),
                     mx.get_peak_memory()))
+            self._decode_layer_transient = self._layer_transient
             self._note_true_peak()
             del weights
 
@@ -2322,6 +2440,10 @@ class StreamingEngine:
         self._resident_fast_prefill_sweeps = 0
         self._disable_resident_fast_for_request = False
         self._resident_moe_sweeps = 0
+        # The serving retry wrapper may restart only a prefill that has not
+        # sampled or exposed any model output.  Once this becomes non-zero,
+        # retrying would reuse a mutated grammar/RNG state and is forbidden.
+        self._generation_sampled_tokens = 0
         self._true_peak_metal_bytes = mx.get_active_memory()  # see _note_true_peak
         if self.governor is not None:
             self.governor.reset_request_peak(self._true_peak_metal_bytes)
@@ -2993,6 +3115,21 @@ class StreamingEngine:
         if required_total_kv_bytes and not admission_done:
             # Covers an in-memory match (free unrelated branches before suffix
             # growth) and a cold miss when durable persistence is disabled.
+            # Admission happens before the first `_sweep`, so establish the
+            # retry chunk's phase margin here as well.  Without this, the final
+            # token-at-a-time fallback still inherited the construction-time
+            # 400 MB prefill pad and could be rejected before its first
+            # size-one sweep had a chance to set the correct zero margin.
+            admission_positions = min(
+                max(1, int(self.rc.prefill_chunk_size or 1)),
+                max(1, len(tokens) - 1))
+            position_transient = getattr(
+                self, "_prefill_layer_transient_by_positions", {}
+            ).get(admission_positions, 0)
+            (self._layer_transient,
+             self._layer_transient_margin) = _layer_transient_for_positions(
+                 admission_positions, position_transient,
+                 getattr(self, "_decode_layer_transient", 0))
             resident_admitted = admit_hot_kv_growth(kv)
             if not resident_admitted and kv is not None:
                 self._release_kv(kv)
@@ -3146,6 +3283,10 @@ class StreamingEngine:
                     adaptive_dynamic_ceiling)
                 path_stats["adaptive_chunk_safe_bytes_min"] = adaptive_safe_bytes
                 path_stats["adaptive_chunk_safe_bytes_max"] = adaptive_safe_bytes
+            pressure_chunk_events: list[dict] = []
+            observed_swap_pressure_events = int(getattr(
+                self.governor, "swap_pressure_events", 0) or 0)
+            path_stats["pressure_chunk_events"] = pressure_chunk_events
             if chunk:
                 prefill_limit = (
                     len(tokens) - 1
@@ -3155,6 +3296,36 @@ class StreamingEngine:
                 while pos < prefill_limit:
                     chunk_start = pos
                     gov = self.governor
+                    live_swap_events = int(getattr(
+                        gov, "swap_pressure_events", 0) or 0)
+                    if (live_swap_events > observed_swap_pressure_events
+                            and adaptive is None
+                            and self._memory_prefill_retry_applies()
+                            and chunk > 1):
+                        old_chunk = chunk
+                        chunk = next(
+                            (candidate for candidate in (128, 32, 8, 1)
+                             if candidate < old_chunk),
+                            1,
+                        )
+                        self.rc.prefill_chunk_size = chunk
+                        self.rc.hot_prompt_kv_chunk_size = chunk
+                        # Mixed chunk boundaries remain an exact sequential
+                        # prefill schedule, but this request cannot safely be
+                        # advertised as a fixed-boundary hot-cache lineage.
+                        hot_eligible = False
+                        pressure_chunk_events.append({
+                            "position": pos,
+                            "from": old_chunk,
+                            "to": chunk,
+                            "swap_pressure_event": live_swap_events,
+                        })
+                        print(
+                            f"[prefill] live swap pressure at position={pos}; "
+                            f"chunk {old_chunk}->{chunk} and disable hot retain",
+                            flush=True,
+                        )
+                    observed_swap_pressure_events = live_swap_events
                     if adaptive is not None and adaptive_dynamic_ceiling:
                         adaptive.update_safe_bytes(gov.current_ceiling())
                         path_stats["adaptive_chunk_safe_bytes_min"] = (
@@ -3269,6 +3440,7 @@ class StreamingEngine:
         next_tok = sample(sampled_logits, sampling)
         if constraint is not None:
             constraint.accept_token(next_tok)
+        self._generation_sampled_tokens = 1
         grammar_completed = bool(
             constraint is not None and constraint.completed)
         prompt_endpoint_logits = logits
@@ -3449,6 +3621,7 @@ class StreamingEngine:
                 next_tok = int(current_token)
                 logits = current_logits
                 generated.append(next_tok)
+                self._generation_sampled_tokens = len(generated)
                 pipelined_decode_steps += 1
 
                 if stop:
@@ -3514,6 +3687,7 @@ class StreamingEngine:
                 self._note_true_peak()
                 tok_times.append(time.perf_counter() - t0)
                 generated.append(next_tok)
+                self._generation_sampled_tokens = len(generated)
                 if stop:
                     decoded = self.tokenizer.decode(generated)
                     match = _stop_match(decoded)
@@ -3718,6 +3892,68 @@ class StreamingEngine:
         self._completed_generations += 1
         return result
 
+    def generate_with_memory_retry(
+            self, prompt: str, max_tokens: int = 64, on_token=None, stop=None,
+            on_progress=None, sampling: SamplingParams | None = None,
+            constraint=None) -> dict:
+        """Retry an unstarted hybrid prefill on progressively smaller chunks.
+
+        Qwen3.5/3.6's recurrent state cannot use the ordinary disk-paged KV
+        fallback, while large quantized dense Qwen sweeps can outgrow the
+        headroom observed at request start.  When
+        the governor refuses an allocation *before the first token is sampled*,
+        discard the partial recurrent/KV state and replay from the original
+        prompt at the next rung: 512 -> 128 -> 32 -> 8 -> 1.  This preserves
+        model math and favors arbitrarily slow token-at-a-time prefill over a
+        hard error.  No retry is allowed after sampling begins.
+        """
+        failed_seconds = 0.0
+        retry_chunks: list[int] = []
+        self._hybrid_retry_chunk_ceiling = 0
+        try:
+            while True:
+                attempt_t0 = time.perf_counter()
+                try:
+                    result = self.generate(
+                        prompt, max_tokens, on_token=on_token, stop=stop,
+                        on_progress=on_progress, sampling=sampling,
+                        constraint=constraint)
+                    if retry_chunks:
+                        result["prefill_s"] += failed_seconds
+                        result["first_token_s"] += failed_seconds
+                        result["total_s"] += failed_seconds
+                        stats = result.setdefault("path_stats", {})
+                        stats["memory_prefill_retries"] = len(retry_chunks)
+                        stats["memory_prefill_retry_chunks"] = retry_chunks
+                        stats["memory_prefill_retry_seconds"] = failed_seconds
+                    return result
+                except MemoryError:
+                    failed_seconds += time.perf_counter() - attempt_t0
+                    if (getattr(self, "_generation_sampled_tokens", 0)
+                            or not self._memory_prefill_retry_applies()):
+                        raise
+                    current = max(1, int(self.rc.prefill_chunk_size or 1))
+                    next_chunk = next(
+                        (candidate for candidate in (128, 32, 8, 1)
+                         if candidate < current),
+                        0,
+                    )
+                    if not next_chunk:
+                        raise
+                    retry_chunks.append(next_chunk)
+                    self.discard_failed_request_state()
+                    mx.clear_cache()
+                    self._hybrid_retry_chunk_ceiling = next_chunk
+                    self.rc.prefill_chunk_size = next_chunk
+                    self.rc.hot_prompt_kv_chunk_size = next_chunk
+                    print(
+                        f"[prefill] governor refusal before first sample; "
+                        f"retrying from scratch at chunk={next_chunk}",
+                        flush=True,
+                    )
+        finally:
+            self._hybrid_retry_chunk_ceiling = 0
+
     def report(self) -> str:
         lines = [
             self.cache.stats.summary(),
@@ -3792,6 +4028,17 @@ class StreamingEngine:
         return (self._hot_kv_persist is None
                 and self.cfg.model_type in ("qwen3_5", "qwen3_5_moe"))
 
+    def _memory_prefill_retry_applies(self) -> bool:
+        """Whether a fresh, unsampled prefill can be replayed more slowly."""
+        if self._hybrid_chunk_size_applies():
+            return True
+        return bool(
+            self._hot_kv_persist is None
+            and self.rc.hot_prompt_kv
+            and self.rc.quant_bits
+            and self.cfg.model_type in ("qwen2", "qwen3")
+        )
+
     def _select_prefill_chunk_size(self, matched_slot: "_HotPromptSlot | None") -> int:
         """F95: the actual per-conversation adaptivity decision.
 
@@ -3809,9 +4056,17 @@ class StreamingEngine:
         (512/128) are safe again despite being unsafe when picked once per
         engine (see hybrid_prefill_chunk_size's docstring)."""
         if matched_slot is not None:
-            return (getattr(matched_slot, "chunk_size", 0)
-                     or self.rc.hot_prompt_kv_chunk_size)
-        return hybrid_prefill_chunk_size(psutil.virtual_memory().available)
+            selected = (getattr(matched_slot, "chunk_size", 0)
+                        or self.rc.hot_prompt_kv_chunk_size)
+        else:
+            selected = hybrid_prefill_chunk_size(
+                psutil.virtual_memory().available)
+        # A failed partial prefill has already released any matched endpoint;
+        # keep the serving wrapper's strictly lower retry rung from being
+        # overwritten by a post-cleanup memory sample that looks healthy again.
+        retry_ceiling = int(getattr(
+            self, "_hybrid_retry_chunk_ceiling", 0) or 0)
+        return min(selected, retry_ceiling) if retry_ceiling else selected
 
     def _retain_interrupted_prefill(
             self, tokens, kv, reusable_prefix: int, tool_capsules=(),

@@ -222,14 +222,53 @@ def pinned_tool_indices(tools: list[dict], messages: list[dict]) -> list[int]:
     for i, tool in enumerate(tools):
         fn = tool.get("function", tool)
         name = str(fn.get("name", ""))
-        mentioned = bool(name) and re.search(
-            rf"(?<![A-Za-z0-9_.-]){re.escape(name)}(?![A-Za-z0-9_.-])",
-            user_transcript,
-            flags=re.IGNORECASE,
-        ) is not None
+        if any(character in name for character in "_.-"):
+            mentioned = bool(name) and re.search(
+                rf"(?<![A-Za-z0-9_.-]){re.escape(name)}(?![A-Za-z0-9_.-])",
+                user_transcript, flags=re.IGNORECASE) is not None
+        else:
+            # A bare function name may be an ordinary word (`make`, `go`,
+            # `open`). Require explicit tool-selection syntax instead of
+            # hard-pinning it from prose such as "make sure to paginate".
+            mentioned = bool(name) and re.search(
+                rf"(?:\b(?:use|call|invoke)\s+(?:the\s+)?|"
+                rf"\b(?:tool|function)\s+(?:named\s+)?|`)"
+                rf"{re.escape(name)}(?:`|\b)",
+                user_transcript, flags=re.IGNORECASE) is not None
         if name in historical_names or mentioned:
             pinned.append(i)
     return pinned
+
+
+def explicit_tool_namespaces(
+    tools: list[dict], messages: list[dict],
+) -> tuple[str, ...]:
+    """Return explicitly user-named ``plugin__namespace__`` providers.
+
+    Hidden catalog search deliberately ranks against a model-authored compact
+    query instead of a huge transcript. A small router can omit the provider
+    word while paraphrasing the capability (for example, "list files, movies,
+    and TV" for an explicit Plex request), which lets a generic workspace tool
+    outrank the intended plugin. Preserve only namespace tokens that are both
+    present in the offered catalog and explicitly named by a user; no fuzzy
+    provider inference is performed.
+    """
+    user_text = "\n".join(
+        _message_search_text(message)
+        for message in messages if message.get("role") == "user")
+    offered = set()
+    for tool in tools:
+        fn = tool.get("function", tool)
+        name = str(fn.get("name", "")) if isinstance(fn, dict) else ""
+        match = re.match(r"^plugin__([A-Za-z0-9-]+)__", name)
+        if match:
+            offered.add(match.group(1).lower())
+    return tuple(sorted(
+        namespace for namespace in offered
+        if re.search(
+            rf"(?<![A-Za-z0-9_-]){re.escape(namespace)}"
+            rf"(?![A-Za-z0-9_-])",
+            user_text, flags=re.IGNORECASE)))
 
 
 def _lexical_tool_scores(
@@ -245,12 +284,20 @@ def _lexical_tool_scores(
         fn = tool.get("function", tool)
         name = str(fn.get("name", ""))
         names.append(name)
-        name_words.append(set(_capability_words(name)))
-        docs.append(Counter(_capability_words({
+        # The large 4x name boost is for literal identity words only. Expanding
+        # `root_folder` into every filesystem alias made each synthetic alias
+        # look like another exact function-name match. Likewise, schema fields
+        # remain searchable but do not seed capability expansion: a generic
+        # `path` parameter does not turn a Plex query tool into a filesystem
+        # executor. This mirrors tool_search_capsule's semantic boundary.
+        name_words.append(set(_search_words(name)))
+        identity = {
             "name": name,
             "description": fn.get("description", ""),
-            "parameters": fn.get("parameters", fn.get("input_schema", {})),
-        })))
+        }
+        parameters = fn.get("parameters", fn.get("input_schema", {}))
+        docs.append(Counter([
+            *_capability_words(identity), *_search_words(parameters)]))
 
     df = Counter()
     for doc in docs:
@@ -391,6 +438,33 @@ _SCHEMA_NAMED_MAP_KEYS = {
 }
 
 
+def effective_tool_prompt_schema(tool: dict) -> dict:
+    """Detached, prose-preserving tool copy with real optionality applied.
+
+    Provider adapters may put every property in JSON Schema ``required`` and
+    separately use ``x-optional`` to carry the actual callable contract.  The
+    grammar path already honors that extension.  Prompting the model with the
+    contradictory wire form made Qwen spend hundreds of tokens debating how
+    to fill 25 supposedly-required nullable fields instead of calling Plex.
+    Preserve every description/enum while applying the same effective schema
+    the validator sees; the original wire tool remains untouched.
+    """
+    fn = tool.get("function")
+    wrapped = fn is not None
+    source = fn if wrapped else tool
+    normalized_fn = deepcopy(source)
+    parameter_key = (
+        "parameters" if "parameters" in normalized_fn else "input_schema")
+    if parameter_key in normalized_fn:
+        from .structured import effective_tool_schema
+
+        normalized_fn[parameter_key] = effective_tool_schema(
+            normalized_fn[parameter_key] or {"type": "object"})
+    if wrapped:
+        return {**tool, "function": normalized_fn}
+    return normalized_fn
+
+
 def compact_tool_schema(tool: dict) -> dict:
     """Side-quest prompt copy of a tool with nested schema prose removed.
 
@@ -404,9 +478,10 @@ def compact_tool_schema(tool: dict) -> dict:
     It is also canonical: changes confined to stripped annotations no longer
     invalidate an otherwise identical prompt cache entry.
     """
-    fn = tool.get("function")
+    normalized = effective_tool_prompt_schema(tool)
+    fn = normalized.get("function")
     wrapped = fn is not None
-    source = fn if wrapped else tool
+    source = fn if wrapped else normalized
 
     def prune(value, *, named_map: bool = False):
         if isinstance(value, dict):
@@ -429,11 +504,7 @@ def compact_tool_schema(tool: dict) -> dict:
     compact_fn = dict(source)
     parameter_key = "parameters" if "parameters" in compact_fn else "input_schema"
     if parameter_key in compact_fn:
-        from .structured import effective_tool_schema
-
-        compact_fn[parameter_key] = prune(
-            effective_tool_schema(
-                compact_fn[parameter_key] or {"type": "object"}))
+        compact_fn[parameter_key] = prune(compact_fn[parameter_key])
     if wrapped:
         return {**tool, "function": compact_fn}
     return compact_fn
@@ -1295,6 +1366,33 @@ def parse_tool_calls(text: str, model_type: str, *,
         if isinstance(obj, dict) and "name" in obj:
             if mk(obj["name"], json.dumps(obj.get("arguments", {}))):
                 spans.append(m.span())
+    # xLAM-2 and a few other function-calling specialists are trained to emit
+    # a bare top-level JSON array rather than Hermes markers. Accept only when
+    # the *entire* response is a non-empty array of exact call-shaped objects;
+    # every name and argument object must pass the same allow-list/schema gates
+    # as Hermes. Ordinary JSON answers therefore remain ordinary content.
+    if not calls:
+        stripped = text.strip()
+        try:
+            array = (_strict_json_loads(stripped)
+                     if stripped.startswith("[") and stripped.endswith("]")
+                     else None)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            array = None
+        if (isinstance(array, list) and array
+                and all(isinstance(item, dict)
+                        and set(item) == {"name", "arguments"}
+                        and isinstance(item.get("arguments"), dict)
+                        for item in array)):
+            before = len(calls)
+            valid = all(
+                mk(item["name"], json.dumps(item["arguments"]))
+                for item in array)
+            if valid:
+                start = text.find(stripped)
+                spans.append((start, start + len(stripped)))
+            else:
+                del calls[before:]
     if not calls:
         return text, []
     content = "".join(

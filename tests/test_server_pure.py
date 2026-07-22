@@ -316,6 +316,60 @@ def test_fast_mode_disables_template_thinking_while_lossless_keeps_default():
     assert fastest == "no-thinking"
 
 
+def test_selected_execution_tools_can_restore_parameter_descriptions(tmp_path):
+    """The hidden gateway compacts the large discovery catalog, but once it
+    has selected a tiny execution set the field-level distinctions are part of
+    the model's job, not disposable retrieval prose."""
+    (tmp_path / "chat_template.jinja").write_text(
+        "{% for tool in tools %}"
+        "{{ tool.function.parameters.properties.path.description "
+        "if tool.function.parameters.properties.path.description is defined "
+        "else 'MISSING' }}"
+        "{% endfor %}")
+    tool = {"type": "function", "function": {
+        "name": "list_media", "description": "List media.",
+        "parameters": {"type": "object", "properties": {
+            "path": {"type": "string", "description":
+                     "A root folder path, not a library section name."}},
+            "required": ["path"], "additionalProperties": False}}}
+    args = (
+        _fake_engine(), tmp_path, [{"role": "user", "content": "x"}],
+        "low", [tool], [tool], "fast", 1)
+
+    compact, *_rest, compact_meta = _prepare_chat_prompt(*args)
+    hydrated, *_rest, hydrated_meta = _prepare_chat_prompt(
+        *args, preserve_tool_parameter_prose=True)
+
+    assert compact == "MISSING"
+    assert compact_meta["schema_profile"] == "compact-no-nested-prose"
+    assert hydrated == "A root folder path, not a library section name."
+    assert hydrated_meta["schema_profile"] == (
+        "selected-full-prose-compact-json")
+
+
+def test_lossless_prompt_preserves_prose_but_applies_x_optional(tmp_path):
+    (tmp_path / "chat_template.jinja").write_text(
+        "{% for tool in tools %}"
+        "{{ tool.function.parameters.required|join(',') }}|"
+        "{{ tool.function.parameters.properties.path.description }}"
+        "{% endfor %}")
+    tool = {"type": "function", "function": {
+        "name": "list_media", "parameters": {
+            "type": "object", "properties": {
+                "path": {"type": ["string", "null"],
+                         "description": "Root folder path."},
+                "limit": {"type": "integer"},
+            },
+            "required": ["path", "limit"], "x-optional": ["path"],
+        }}}
+    prompt, *_rest, metadata = _prepare_chat_prompt(
+        _fake_engine(), tmp_path, [{"role": "user", "content": "x"}],
+        "low", [tool], [tool], "lossless", 1)
+    assert prompt == "limit|Root folder path."
+    assert metadata["schema_profile"] == "released-effective-optionality"
+    assert tool["function"]["parameters"]["required"] == ["path", "limit"]
+
+
 def test_explicit_high_effort_overrides_fast_no_thinking_default():
     template = "{{ 'thinking' if enable_thinking else 'no-thinking' }}"
     with tempfile.TemporaryDirectory() as directory:
@@ -773,8 +827,7 @@ def test_plex_transcript_keeps_fixed_decision_catalog_and_pinned_execution_set()
         selected, _selected_raw, _pinned, _meta = _hidden_gateway_catalogs(
             tools, raw, first_turn, query="list Plex media", limit=2)
     activated = tuple(tool["function"]["name"] for tool in selected)
-    assert activated == (
-        "plugin__plex__plex_list_library", "workspace_execute")
+    assert activated == ("plugin__plex__plex_list_library",)
 
     # Page/corrected-argument intent ranks an already-activated tool first:
     # preserve the exact schema set even though call history now hard-pins Plex.
@@ -807,6 +860,24 @@ def test_hidden_gateway_search_hydrates_at_most_four_without_forcing_four():
     assert _hidden_gateway_search_result_limit(32, 4, 0) == 1
     assert _hidden_gateway_search_result_limit(32, 4, "many") == 4
     assert _hidden_gateway_search_result_limit(3, 4, 32) == 3
+
+
+def test_hidden_gateway_preserves_explicit_plugin_namespace_in_router_query():
+    tools = [
+        _named_tool("plugin__plex__plex_list_library",
+                    "List Plex movies and TV series."),
+        _named_tool("mastra_workspace_list_files",
+                    "List files and folders in the workspace."),
+    ]
+    raw = [{"type": "function", **tool["function"]} for tool in tools]
+    selected, _raw, _pinned, metadata = _hidden_gateway_catalogs(
+        tools, raw,
+        [{"role": "user", "content": (
+            "Use Plex to list movies and TV outside a root folder")}],
+        query="list files movies tv root folder", limit=1)
+    assert selected[0]["function"]["name"] == (
+        "plugin__plex__plex_list_library")
+    assert metadata["gateway_explicit_namespaces"] == ["plex"]
 
 
 def test_gateway_activation_key_survives_appended_tool_turns_without_raw_state():
@@ -891,6 +962,35 @@ def test_hidden_gateway_does_not_force_again_after_tool_result():
         }]},
         {"role": "tool", "tool_call_id": "call_1", "content": "/tmp"},
     ]) is None
+
+
+def test_hidden_gateway_forces_activated_catalog_for_explicit_pagination():
+    messages = [{
+        "role": "tool", "tool_call_id": "call_1",
+        "content": json.dumps({
+            "movieHasMore": True,
+            "nested": {"series_has_more": False},
+        }),
+    }]
+    assert _hidden_gateway_force_reason(messages) == "tool-result-pagination"
+    assert _hidden_gateway_decision_choice(
+        "auto", "tool-result-pagination", activated_tools=True,
+    ) == "specific:vmodel_enable_tools"
+    assert _hidden_gateway_decision_choice(
+        "auto", "tool-result-pagination", activated_tools=False,
+    ) == "specific:vmodel_search_tools"
+
+
+def test_hidden_gateway_does_not_treat_false_or_text_has_more_as_pagination():
+    assert _hidden_gateway_force_reason([{
+        "role": "tool", "content": json.dumps({"hasMore": False}),
+    }]) is None
+    assert _hidden_gateway_force_reason([{
+        "role": "tool", "content": json.dumps({"hasMore": "true"}),
+    }]) is None
+    assert _hidden_gateway_force_reason([{
+        "role": "tool", "content": "hasMore=true but not JSON",
+    }]) is None
 
 
 def test_hidden_gateway_required_client_or_intent_targets_only_search():
@@ -1031,6 +1131,7 @@ def test_qwen36_profiles_bound_experts_and_use_hybrid_endpoint_cache():
         assert rc.hot_prompt_kv
         assert rc.hot_prompt_kv_slots == 2
         assert rc.hot_prompt_kv_min_tokens == 16
+        assert rc.hot_prompt_kv_min_available_mb == 0
         # F95 (2026-07-21): this construction-time pick is now a
         # best-effort DEFAULT only -- StreamingEngine.generate() resamples
         # the same ladder fresh per conversation (see engine.py's
@@ -1041,6 +1142,7 @@ def test_qwen36_profiles_bound_experts_and_use_hybrid_endpoint_cache():
         assert rc.expert_fetch_batch == 8
         assert rc.decode_expert_fetch_batch == 8
         assert rc.fast_dirs[0].endswith("vmodel_fast_tier/fake-qwen36")
+        assert rc.parallel_storage_reads
         assert not rc.pin_lm_head
         assert rc.stream_lm_head
         # F94 (2026-07-21): pin_first_layers is never set for qwen3_5_moe
@@ -1183,6 +1285,7 @@ def test_qwen36_never_pins_trunk_and_adapts_chunk_size_under_low_memory():
     # per conversation instead of trusting this for the engine's lifetime.
     assert captured[0].prefill_chunk_size == 128
     assert captured[0].hot_prompt_kv_chunk_size == 128
+    assert captured[0].hot_prompt_kv_min_available_mb == 0
     # F94: the weight-cache floor stays unconditionally low regardless of
     # available memory at construction -- a fixed 1.5GB floor left
     # governor.reserve() with nothing further to shed on the real
@@ -2654,11 +2757,18 @@ def test_hidden_decision_handles_harmony_spacing_and_final_channel():
 
 
 def test_resident_adjusted_transient_excludes_persistent_cache_growth():
-    from runtime.engine import _resident_adjusted_transient
+    from runtime.engine import (
+        _layer_transient_for_positions, _layer_transient_reserve_margin,
+        _resident_adjusted_transient)
 
     assert _resident_adjusted_transient(1_000, 2_500, 2_500) == 0
     assert _resident_adjusted_transient(1_000, 2_500, 2_900) == 400
     assert _resident_adjusted_transient(2_500, 1_000, 2_900) == 400
+    assert _layer_transient_reserve_margin(1) == 0
+    assert _layer_transient_reserve_margin(2) == 400_000_000
+    assert _layer_transient_for_positions(1, 1_280, 96) == (96, 0)
+    assert _layer_transient_for_positions(32, 1_280, 96) == (
+        1_280, 400_000_000)
 
 
 def test_cache_io_delta_reports_only_current_request():

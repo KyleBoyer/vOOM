@@ -854,6 +854,36 @@ def test_memory_admission_preserves_live_system_available_floor():
     assert engine._resident_fast_evictions == -1
 
 
+def test_memory_admission_uses_decode_phase_margin_after_measured_sweep():
+    from types import SimpleNamespace
+    from unittest.mock import patch
+
+    from runtime.engine import StreamingEngine
+
+    reserve_calls = []
+    engine = StreamingEngine.__new__(StreamingEngine)
+    engine.rc = SimpleNamespace(hot_prompt_kv_min_available_mb=0)
+    engine._layer_transient_margin = 0
+    engine._resident_fast_layers = None
+    engine._hot_prompt_slots = []
+    engine.governor = SimpleNamespace(
+        current_ceiling=lambda: 2_000_000_000,
+        critical=1_200_000_000,
+        reservations=0,
+        reserve=lambda incoming, margin: reserve_calls.append(
+            (incoming, margin)))
+
+    with patch("runtime.engine.mx.get_active_memory", return_value=150_000_000), \
+         patch("runtime.engine.psutil.virtual_memory",
+               return_value=SimpleNamespace(available=2_900_000_000)):
+        stats = engine._evict_hot_slots_for_admission(
+            1_370_000_000, None, "gateway_execution",
+            transient_bytes=150_000_000)
+
+    assert stats["evicted_slots"] == 0
+    assert reserve_calls == [(1_520_000_000, 0)]
+
+
 def test_pic_duplicate_allocation_respects_same_system_floor():
     from types import SimpleNamespace
     from unittest.mock import patch

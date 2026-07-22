@@ -34,8 +34,15 @@ Split placement math: with overlapped reads, per-token time ≈ max over drives 
 (bytes_on_drive / drive_throughput). Copy-ahead staging through a fast drive does
 NOT raise steady-state throughput (every byte still crosses the slow drive once
 per token); only *static residency* on a faster tier removes bytes from the
-bottleneck. When the fast tiers' time share is small, serial reads already capture
-~98% of the overlap bound. RAM pinning (pin_first/last_layers) is the same idea
+bottleneck. A serial fetch path must never promote a page onto a slower tier.
+`runtime.storage_tiers.plan_static_placement` makes that exclusion explicit; its
+parallel projection uses longest-processing-time/minimax scheduling and is not a
+speed claim until the serving reader overlaps the devices. The vpack2 reader now
+has that exact cross-device path for a mixed internal-overlay/archive fetch:
+filesystem plus zstd/numpy work overlaps, all MLX materialization stays on the
+engine thread, and `st_dev` equality forces serial fallback. A real Qwen3.6
+expert-page A/B measured 0.3220 s serial versus 0.1835 s parallel median (1.755x)
+over disjoint ~430 MB requests. RAM pinning (pin_first/last_layers) is the same idea
 one tier up — a rotating LRU window is worthless under cyclic dense-layer sweeps
 (a page is always evicted before reuse), but statically pinned layers never touch
 disk. Routed-expert traces are not a pure dense sweep: some pages are genuinely
@@ -292,5 +299,7 @@ sequences. At `B=64`, the independent-route estimate is about 222 experts or
 `tests/test_expert_batching.py` and `tests/test_expert_batching_mlx.py`; the
 real-scale Metal-lifetime proof remains open as described above.
 
-Measured floor on this machine (USB SSD, ~315 MB/s cold reads): streamed fp16
-7B ⇒ ~13 GB/token ⇒ ~41 s/token. Fully-resident 4-bit cache ⇒ 15.4 tok/s.
+Historical floor on the former USB model source (~315 MB/s cold reads): streamed
+fp16 7B ⇒ ~13 GB/token ⇒ ~41 s/token. The current project NVMe is ~1.56 GB/s
+sequential first-touch; the attached backup USB is only ~92 MB/s and must not be
+substituted into that historical calculation.

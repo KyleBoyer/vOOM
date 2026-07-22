@@ -1077,6 +1077,16 @@ class EngineManager:
                 if rc.hot_prompt_kv_min_tokens < 0:
                     raise ValueError(
                         "VMODEL_QWEN35_HOT_KV_MIN_TOKENS must be non-negative")
+                try:
+                    rc.hot_prompt_kv_min_available_mb = int(os.environ.get(
+                        "VMODEL_QWEN35_MIN_AVAILABLE_MB", "0"))
+                except ValueError as error:
+                    raise ValueError(
+                        "VMODEL_QWEN35_MIN_AVAILABLE_MB must be an integer"
+                    ) from error
+                if rc.hot_prompt_kv_min_available_mb < 0:
+                    raise ValueError(
+                        "VMODEL_QWEN35_MIN_AVAILABLE_MB must be non-negative")
                 # F95 (2026-07-21): off by default now, per explicit user
                 # choice -- durable persistence bakes ONE chunk size into
                 # its on-disk format for the whole store, incompatible with
@@ -1290,6 +1300,16 @@ class EngineManager:
                 if rc.hot_prompt_kv_min_tokens < 0:
                     raise ValueError(
                         "VMODEL_QWEN35_HOT_KV_MIN_TOKENS must be non-negative")
+                try:
+                    rc.hot_prompt_kv_min_available_mb = int(os.environ.get(
+                        "VMODEL_QWEN35_MIN_AVAILABLE_MB", "0"))
+                except ValueError as error:
+                    raise ValueError(
+                        "VMODEL_QWEN35_MIN_AVAILABLE_MB must be an integer"
+                    ) from error
+                if rc.hot_prompt_kv_min_available_mb < 0:
+                    raise ValueError(
+                        "VMODEL_QWEN35_MIN_AVAILABLE_MB must be non-negative")
                 # F95 (2026-07-21): off by default now, per explicit user
                 # choice -- durable persistence bakes ONE chunk size into
                 # its on-disk format for the whole store, incompatible with
@@ -1498,6 +1518,20 @@ class EngineManager:
                         # and peak rose, so keep the side-quest bound tighter.
                         rc.resident_fast_prefill_limit = 512
                         rc.fused_swiglu = True
+                        # A 32B-class dense Qwen can drain several GiB during
+                        # one unchunked prompt sweep even when the request was
+                        # admitted with ample RAM.  Bound only the large-width
+                        # side-quest path; smaller 7B-class profiles retain
+                        # their measured scheduling optimum.  The fail-slow
+                        # wrapper can reduce this further (32 -> 8 -> 1) if the
+                        # live governor later tightens.
+                        dense_model_scale = (
+                            int(getattr(cfg_probe, "hidden_size", 0) or 0)
+                            * int(getattr(
+                                cfg_probe, "intermediate_size", 0) or 0))
+                        if dense_model_scale >= 80_000_000:
+                            rc.prefill_chunk_size = min(
+                                int(rc.prefill_chunk_size or 32), 32)
                         # Dense Qwen A/B: short 1.5B decode slightly favors
                         # concatenation, while stepped KV wins beyond 512
                         # requested positions (+12% around 2K on both 1.5B/7B).
@@ -1811,6 +1845,27 @@ class EngineManager:
                     rc.resident_fast_decode = True
                     rc.resident_fast_prefill_limit = 2048
                     rc.embed_rows = False
+            # Authenticated `.vt` overlays are model-family agnostic whenever
+            # the source has vpack2 hashes. Qwen3.5/3.6 already names its
+            # candidate above; discover the same bounded internal tier for GLM
+            # and other packed models instead of leaving it family-locked.
+            fast_tier_candidate = (
+                Path.home() / "vmodel_fast_tier" / model_dir.name)
+            if (not rc.fast_dirs and fast_tier_candidate.is_dir()
+                    and next(fast_tier_candidate.glob("*.vt"), None) is not None):
+                rc.fast_dirs = (str(fast_tier_candidate),)
+            tier_overlap = os.environ.get(
+                "VMODEL_PARALLEL_STORAGE_READS", "auto").strip().lower()
+            if tier_overlap not in ("auto", "0", "1"):
+                raise ValueError(
+                    "VMODEL_PARALLEL_STORAGE_READS must be auto, 0, or 1")
+            # `auto` enables only the scheduling capability. WeightStore still
+            # checks st_dev for every mixed fetch and falls back to serial when
+            # archive and overlay resolve to the same physical device. A real
+            # Qwen3.6 A/B over 4 x ~430MB disjoint expert sets measured 1.75x.
+            rc.parallel_storage_reads = bool(
+                rc.fast_dirs and tier_overlap != "0")
+
             draft_dir = None
             speculative_k = 6
             speculative_prompt_limit = 2048
@@ -3384,6 +3439,12 @@ _HIDDEN_GATEWAY_ABSTAIN_TEXT = (
     "I couldn't find a suitable available tool for this request."
 )
 
+
+def _engine_generate(engine, *args, **kwargs):
+    """Use fail-slow prefill retry when the concrete engine supports it."""
+    generate = getattr(engine, "generate_with_memory_retry", engine.generate)
+    return generate(*args, **kwargs)
+
 _GATEWAY_CONFIRMATION_RE = re.compile(
     r"^(?:do it|go ahead|proceed|please do|run it|check it|try it|yes|ok(?:ay)?)"
     r"[\s.!?]*$", re.IGNORECASE)
@@ -3439,6 +3500,37 @@ def _gateway_message_text(message: dict) -> str:
     return ""
 
 
+def _gateway_tool_result_has_more(message: dict) -> bool:
+    """Recognize an explicit pagination contract in a tool result.
+
+    This is protocol state, not a model inference: a boolean field whose name
+    ends in ``hasMore`` says that the external operation is incomplete.  The
+    hidden gateway can therefore require its already-activated catalog on the
+    next pass instead of spending a full generation deciding whether to keep
+    working.  Unknown/non-JSON tool outputs retain the ordinary model path.
+    """
+    if message.get("role") != "tool":
+        return False
+    try:
+        value = json.loads(_gateway_message_text(message))
+    except (TypeError, ValueError):
+        return False
+
+    def contains_has_more(item) -> bool:
+        if isinstance(item, dict):
+            for key, child in item.items():
+                normalized = re.sub(r"[^a-z0-9]", "", str(key).lower())
+                if normalized.endswith("hasmore") and child is True:
+                    return True
+                if contains_has_more(child):
+                    return True
+        elif isinstance(item, list):
+            return any(contains_has_more(child) for child in item)
+        return False
+
+    return contains_has_more(value)
+
+
 def _hidden_gateway_force_reason(messages: list[dict]) -> str | None:
     """Return a high-confidence reason to require hidden tool discovery.
 
@@ -3449,9 +3541,10 @@ def _hidden_gateway_force_reason(messages: list[dict]) -> str | None:
     """
     if not messages:
         return None
-    # A function result is followed by an answer turn, not another forced call.
     if messages[-1].get("role") == "tool":
-        return None
+        return (
+            "tool-result-pagination"
+            if _gateway_tool_result_has_more(messages[-1]) else None)
     user_index = next(
         (index for index in range(len(messages) - 1, -1, -1)
          if messages[index].get("role") == "user"),
@@ -3485,8 +3578,11 @@ def _hidden_gateway_force_reason(messages: list[dict]) -> str | None:
 
 
 def _hidden_gateway_decision_choice(
-        tool_choice: str, force_reason: str | None) -> str:
+        tool_choice: str, force_reason: str | None,
+        activated_tools: bool = False) -> str:
     """Constrain only high-confidence action turns to hidden discovery."""
+    if force_reason == "tool-result-pagination" and activated_tools:
+        return f"specific:{_HIDDEN_TOOL_ENABLE_NAME}"
     return (
         f"specific:{_HIDDEN_TOOL_SEARCH_NAME}"
         if force_reason is not None else tool_choice
@@ -3677,7 +3773,8 @@ def _hidden_gateway_catalogs(tools, raw_tools, messages, query: str | None = Non
                              expansion_limit: int = 4,
                              max_activated: int = 64):
     """Build the real-tool subset before/after the hidden discovery round."""
-    from .toolcalls import pinned_tool_indices, rank_tool_indices
+    from .toolcalls import (explicit_tool_namespaces, pinned_tool_indices,
+                            rank_tool_indices)
 
     if limit <= 0:
         raise RequestValidationError("hidden tool gateway limit must be positive")
@@ -3692,8 +3789,12 @@ def _hidden_gateway_catalogs(tools, raw_tools, messages, query: str | None = Non
     # catalog lookup. Rank against that intent alone: re-inserting a ~20K system
     # prompt here lets generic framework vocabulary swamp both BM25 and vector
     # retrieval. Transcript requirements are preserved separately as hard pins.
+    namespaces = explicit_tool_namespaces(tools, messages)
+    grounded_query = (
+        " ".join((query, *namespaces)).strip() if query else None)
     routed_messages = (
-        [{"role": "user", "content": query}] if query else list(messages))
+        [{"role": "user", "content": grounded_query}]
+        if grounded_query else list(messages))
     pinned = pinned_tool_indices(tools, messages)
     name_to_index = {
         _tool_function_name(tool): index for index, tool in enumerate(tools)}
@@ -3705,10 +3806,28 @@ def _hidden_gateway_catalogs(tools, raw_tools, messages, query: str | None = Non
     retrieval_metadata = {
         "tool_retrieval_profile": "not_queried",
         "tool_embedding_status": "not_queried",
+        "gateway_explicit_namespaces": list(namespaces),
     }
     if query:
         ranking, retrieval_metadata = rank_tool_indices(
             tools, routed_messages, use_embeddings=True, return_metadata=True)
+        # Reserve only the best-ranked tool from each explicitly named plugin,
+        # then let ordinary ranking fill the rest. Pinning an entire provider
+        # (Plex exposes ~40 functions) would recreate the large catalog; merely
+        # repeating the namespace in BM25 is too weak against a router query
+        # containing generic words such as "files" and "root folder".
+        namespace_heads = []
+        for namespace in namespaces:
+            prefix = f"plugin__{namespace}__"
+            head = next((index for index in ranking
+                         if _tool_function_name(tools[index]).lower().startswith(
+                             prefix)), None)
+            if head is not None:
+                namespace_heads.append(head)
+        selected.update(namespace_heads)
+        # Activation stability still follows the newly authored capability
+        # query. The namespace reservation guarantees availability, but must
+        # not hide a later browser/calendar request behind an old Plex catalog.
         top_index = ranking[0] if ranking else None
         top_already_activated = top_index in set(activated)
         if activated and top_already_activated:
@@ -3716,15 +3835,37 @@ def _hidden_gateway_catalogs(tools, raw_tools, messages, query: str | None = Non
             # schema set and therefore the execution KV prefix.
             activation_profile = "stable-hit"
         else:
-            target = max(limit, len(selected)) if not activated else min(
-                max_activated, max(len(selected), len(activated) + expansion_limit))
-            for index in ranking:
+            target = (
+                max(1, len(selected)) if namespaces and not activated
+                else max(limit, len(selected)) if not activated
+                else min(max_activated, max(
+                    len(selected), len(activated) + expansion_limit)))
+            # On the initial action for an explicitly named provider, do not
+            # mix generic same-keyword tools into its execution catalog. The
+            # next gateway turn can expand to another capability after the
+            # provider result. This prevents "Plex ... root folder" from also
+            # admitting—and a 1.5B router selecting—workspace_list_files.
+            selection_ranking = ranking
+            if namespaces and not activated:
+                prefixes = tuple(
+                    f"plugin__{namespace}__" for namespace in namespaces)
+                selection_ranking = [
+                    index for index in ranking
+                    if _tool_function_name(tools[index]).lower().startswith(
+                        prefixes)]
+            for index in selection_ranking:
                 if len(selected) >= target:
                     break
                 selected.add(index)
             activation_profile = "initial" if not activated else "expanded"
         retrieval_metadata = {
             **retrieval_metadata,
+            "gateway_explicit_namespaces": list(namespaces),
+            "gateway_namespace_pins": len(namespace_heads),
+            "gateway_namespace_heads": [
+                _tool_function_name(tools[index]) for index in namespace_heads],
+            "gateway_namespace_single_tool": int(
+                bool(namespaces) and not activated),
             "gateway_activation_profile": activation_profile,
             "gateway_activation_previous_tools": len(activated),
             "gateway_activation_top_tool_reused": int(top_already_activated),
@@ -3732,6 +3873,7 @@ def _hidden_gateway_catalogs(tools, raw_tools, messages, query: str | None = Non
     else:
         retrieval_metadata = {
             **retrieval_metadata,
+            "gateway_explicit_namespaces": list(namespaces),
             "gateway_activation_profile": (
                 "loaded" if activated else "not_queried"),
             "gateway_activation_previous_tools": len(activated),
@@ -3754,7 +3896,8 @@ def _prepare_chat_prompt(engine, model_dir: Path, messages: list[dict], reasonin
                          max_output_tokens: int, *,
                          enable_thinking: bool | None = None,
                          reasoning_requested: bool = False,
-                         cache_namespace: str = "default"):
+                         cache_namespace: str = "default",
+                         preserve_tool_parameter_prose: bool = False):
     """Apply explicitly side-quest-only tool compaction/retrieval and render.
 
     Fast mode keeps all tools by default but strips parameter-level prose and
@@ -3767,8 +3910,8 @@ def _prepare_chat_prompt(engine, model_dir: Path, messages: list[dict], reasonin
     is compacted. Any tool shortlist is reported rather than silently hidden.
     """
     from .toolcalls import (canonical_tool_indices, canonicalize_tool_history,
-                            compact_tool_schema, pinned_tool_indices,
-                            rank_tool_indices)
+                            compact_tool_schema, effective_tool_prompt_schema,
+                            pinned_tool_indices, rank_tool_indices)
 
     try:
         messages = canonicalize_tool_history(messages)
@@ -3778,7 +3921,8 @@ def _prepare_chat_prompt(engine, model_dir: Path, messages: list[dict], reasonin
     requested = len(tools)
     selected_indices = list(range(requested))
     fast_mode = mode in ("fast", "fast-long")
-    compacted = fast_mode and bool(tools)
+    compact_json = fast_mode and bool(tools)
+    compacted = compact_json and not preserve_tool_parameter_prose
     limit = 0
     pinned_indices: list[int] = []
     retrieval_metadata = {}
@@ -3817,19 +3961,28 @@ def _prepare_chat_prompt(engine, model_dir: Path, messages: list[dict], reasonin
 
     selected_tools = [tools[i] for i in selected_indices]
     selected_raw = [raw_tools[i] for i in selected_indices]
-    if compacted:
+    if compact_json:
         prompt_order = canonical_tool_indices(selected_tools)
-        prompt_tools = [compact_tool_schema(selected_tools[i]) for i in prompt_order]
+        prompt_tools = [
+            (compact_tool_schema(selected_tools[i])
+             if compacted else effective_tool_prompt_schema(selected_tools[i]))
+            for i in prompt_order
+        ]
     else:
-        prompt_tools = selected_tools
+        # ``x-optional`` is the wire adapter's source of truth in every mode,
+        # not a side-quest optimization.  Keep released prose/order/JSON
+        # formatting while removing the contradictory provider-required list
+        # from the prompt copy, exactly as grammar validation already does.
+        prompt_tools = [
+            effective_tool_prompt_schema(tool) for tool in selected_tools]
     effective_enable_thinking = enable_thinking
     if effective_enable_thinking is None and fast_mode:
         effective_enable_thinking = False
     canonical_hermes_tools = bool(
-        compacted and engine.cfg.model_type == "qwen3_5_moe")
+        compact_json and engine.cfg.model_type == "qwen3_5_moe")
     prompt = _chat_prompt(
         engine, model_dir, messages, reasoning, tools=prompt_tools,
-        compact_json=compacted,
+        compact_json=compact_json,
         # Fast mode defaults to no hidden-thinking, but an explicit medium/high
         # API request overrides that default and is passed to native templates.
         enable_thinking=effective_enable_thinking,
@@ -3840,7 +3993,7 @@ def _prepare_chat_prompt(engine, model_dir: Path, messages: list[dict], reasonin
     tool_capsules = (
         _tool_capsule_spans(
             prompt, prompt_tools, prompt_ids, prompt_offsets)
-        if compacted else ())
+        if compact_json else ())
     prompt_tokens = len(prompt_ids)
 
     resident_kv = _validate_fast_dense_resident_kv(
@@ -3866,8 +4019,11 @@ def _prepare_chat_prompt(engine, model_dir: Path, messages: list[dict], reasonin
             retrieval_metadata.get(
                 "tool_retrieval_profile", "hybrid-lexical-capability-v1")
             if limit else None),
-        "schema_profile": "compact-no-nested-prose" if compacted else "released",
-        "tool_order_profile": "canonical-name-v1" if compacted else "request-order",
+        "schema_profile": (
+            "compact-no-nested-prose" if compacted else
+            "selected-full-prose-compact-json" if compact_json else
+            "released-effective-optionality"),
+        "tool_order_profile": "canonical-name-v1" if compact_json else "request-order",
         "tool_protocol_profile": (
             "canonical-hermes-v1" if canonical_hermes_tools else "released"),
         "tool_catalog_id": (
@@ -5025,7 +5181,7 @@ class Handler(BaseHTTPRequestHandler):
 
                 if kind == "chat.completion":
                     write_stream_chunk({"role": "assistant"})
-                result = engine.generate(
+                result = _engine_generate(engine,
                     prompt, max_tokens, on_token=emit, stop=stop,
                     on_progress=on_progress, sampling=self._sampling,
                     constraint=self._constraint)
@@ -5071,7 +5227,7 @@ class Handler(BaseHTTPRequestHandler):
                 self.wfile.flush()
                 return
 
-            result = engine.generate(
+            result = _engine_generate(engine,
                 prompt, max_tokens, stop=stop, sampling=self._sampling,
                 constraint=self._constraint)
             _log_path_stats(result, result.get("prompt_tokens", 0))
@@ -5261,12 +5417,19 @@ class Handler(BaseHTTPRequestHandler):
                 enable_thinking=self._enable_thinking,
                 reasoning_requested=self._reasoning_requested,
                 cache_namespace=(
-                    "gateway_decision" if gateway_enabled else "default"))
+                    "gateway_decision" if gateway_enabled else "default"),
+                # Nested parameter descriptions are expensive only while a
+                # broad catalog is still present.  A directly supplied small
+                # catalog is already selected, so preserve semantic contrasts
+                # (path vs section, movie vs TV ratings) just as the gateway's
+                # post-retrieval execution phase does.
+                preserve_tool_parameter_prose=(
+                    not gateway_enabled and len(prompt_catalog) <= 4))
         gateway_decision_choice = (
-            f"specific:{_HIDDEN_TOOL_SEARCH_NAME}"
-            if gateway_enabled and gateway_force_reason is not None
-            else tool_choice
-        )
+            _hidden_gateway_decision_choice(
+                tool_choice, gateway_force_reason,
+                bool(gateway_activated_names))
+            if gateway_enabled else tool_choice)
         self._constraint = _configure_constraint(
             engine, self._structured_output, prompt_tools, gateway_decision_choice,
             False if gateway_enabled else allow_parallel_tool_calls)
@@ -5371,7 +5534,7 @@ class Handler(BaseHTTPRequestHandler):
                 _HiddenDecisionStream(engine.cfg.model_type, on_token)
                 if on_token is not None else None
             )
-            decision = engine.generate(
+            decision = _engine_generate(engine,
                 prompt, max_output_tokens, stop=stop,
                 on_token=(decision_stream.feed if decision_stream is not None else None),
                 on_progress=on_progress, sampling=self._sampling,
@@ -5543,11 +5706,21 @@ class Handler(BaseHTTPRequestHandler):
                     execution_tools, execution_raw, mode, max_output_tokens,
                     enable_thinking=self._enable_thinking,
                     reasoning_requested=self._reasoning_requested,
-                    cache_namespace="gateway_execution")
+                    cache_namespace="gateway_execution",
+                    # The search pass needs tiny schemas because it reasons
+                    # over the whole catalog. Once retrieval has reduced that
+                    # catalog to a handful of execution candidates, restore
+                    # parameter descriptions: distinctions such as a Plex root
+                    # folder versus a Plex library section, or movie versus TV
+                    # rating ladders, are semantic constraints rather than
+                    # dispensable prose. Canonical ordering and compact JSON
+                    # remain enabled, so this does not restore the 130+ tool
+                    # prompt that the hidden gateway was built to avoid.
+                    preserve_tool_parameter_prose=True)
             self._constraint = _configure_constraint(
                 engine, self._structured_output, prompt_tools, "required",
                 False)
-            result = engine.generate(
+            result = _engine_generate(engine,
                 prompt, max_output_tokens, stop=stop,
                 on_progress=on_progress, sampling=self._sampling,
                 constraint=self._constraint)
@@ -5665,7 +5838,7 @@ class Handler(BaseHTTPRequestHandler):
         result = (
             run_hidden_gateway()
             if gateway_enabled else
-            engine.generate(
+            _engine_generate(engine,
                 prompt, max_output_tokens, stop=stop, sampling=self._sampling,
                 constraint=self._constraint)
         )
@@ -5804,7 +5977,7 @@ class Handler(BaseHTTPRequestHandler):
             result = (
                 generate_fn(on_token, on_progress)
                 if generate_fn is not None else
-                engine.generate(
+                _engine_generate(engine,
                     prompt, max_tokens, on_token=on_token, stop=stop,
                     on_progress=on_progress, sampling=self._sampling,
                     constraint=self._constraint)
@@ -6003,7 +6176,7 @@ class Handler(BaseHTTPRequestHandler):
             return self._stream_anthropic_messages(prompt, max_tokens, all_stop, engine, tools,
                                                     build_content, model_id, prompt_tokens)
 
-        result = engine.generate(
+        result = _engine_generate(engine,
             prompt, max_tokens, stop=all_stop, sampling=self._sampling,
             constraint=self._constraint)
         _log_path_stats(result, result.get("prompt_tokens", 0))
@@ -6093,7 +6266,7 @@ class Handler(BaseHTTPRequestHandler):
         result = (
             generate_fn(on_token, on_progress)
             if generate_fn is not None else
-            engine.generate(
+            _engine_generate(engine,
                 prompt, max_tokens, on_token=on_token, stop=all_stop,
                 on_progress=on_progress, sampling=self._sampling,
                 constraint=self._constraint)

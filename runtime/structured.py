@@ -154,6 +154,51 @@ def tool_call_json_schema(tools: list[dict], specific_name: str | None = None) -
     return choices[0] if len(choices) == 1 else {"oneOf": choices}
 
 
+def _grammar_compatible_schema(schema: dict) -> dict:
+    """Rewrite an equivalent conditional-required shape XGrammar mishandles.
+
+    XGrammar 0.1.35 accepts an object with base ``required`` fields plus an
+    ``anyOf`` whose branches contain only more ``required`` fields, but its
+    compiled grammar can terminate without the base fields.  The ordinary
+    JSON-Schema validator catches that after generation, so execution remains
+    safe, but a required tool request degrades into rejected text. Distribute
+    the parent object into each branch before compilation. This is equivalent
+    for this exact schema shape and makes every branch carry its full required
+    set explicitly. Keep the wire and validation schemas unchanged.
+    """
+    def rewrite(value):
+        if isinstance(value, list):
+            return [rewrite(item) for item in value]
+        if not isinstance(value, dict):
+            return value
+        node = {key: rewrite(child) for key, child in value.items()}
+        branches = node.get("anyOf")
+        properties = node.get("properties")
+        if (node.get("type") == "object" and isinstance(properties, dict)
+                and isinstance(branches, list) and branches
+                and all(isinstance(branch, dict)
+                        and set(branch) == {"required"}
+                        and isinstance(branch.get("required"), list)
+                        and branch["required"]
+                        and all(isinstance(name, str)
+                                for name in branch["required"])
+                        for branch in branches)):
+            base = {key: child for key, child in node.items() if key != "anyOf"}
+            inherited = list(base.get("required") or [])
+            expanded = []
+            for branch in branches:
+                variant = deepcopy(base)
+                variant["required"] = list(dict.fromkeys(
+                    [*inherited, *branch["required"]]))
+                expanded.append(variant)
+            return {"anyOf": expanded}
+        return node
+
+    compatible = rewrite(schema)
+    check_json_schema(compatible)
+    return compatible
+
+
 def _xgrammar():
     try:
         import xgrammar as xgr
@@ -248,7 +293,8 @@ class GrammarConstraint:
     @classmethod
     def tools(cls, engine, tools: list[dict], *, required: bool,
               specific_name: str | None = None, allow_parallel: bool = True):
-        schema = tool_call_json_schema(tools, specific_name)
+        schema = _grammar_compatible_schema(
+            tool_call_json_schema(tools, specific_name))
         compiler = _compiler(engine)
         xgr = _xgrammar()
         if required:

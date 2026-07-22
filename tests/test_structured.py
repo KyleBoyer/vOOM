@@ -8,6 +8,7 @@ import mlx.core as mx
 import pytest
 
 from runtime.structured import (GrammarConstraint, JSONSchemaValidationError,
+                                _grammar_compatible_schema,
                                 _required_tool_grammar, effective_tool_schema,
                                 tool_call_json_schema,
                                 validate_json_schema)
@@ -85,6 +86,34 @@ def test_effective_tool_schema_rejects_unknown_x_optional_property():
         effective_tool_schema({
             "type": "object", "properties": {}, "x-optional": ["missing"],
         })
+
+
+def test_grammar_schema_distributes_conditional_required_fields():
+    source = {
+        "type": "object",
+        "properties": {
+            "core": {"type": "string"},
+            "root": {"type": "string"},
+            "section": {"type": "string"},
+        },
+        "required": ["core"],
+        "anyOf": [
+            {"required": ["root"]},
+            {"required": ["section"]},
+        ],
+        "additionalProperties": False,
+    }
+    compatible = _grammar_compatible_schema(source)
+    assert "anyOf" in compatible
+    assert all("core" in branch["required"]
+               for branch in compatible["anyOf"])
+    validate_json_schema({"core": "x", "root": "Kids"}, compatible)
+    validate_json_schema({"core": "x", "section": "Kids"}, compatible)
+    with pytest.raises(JSONSchemaValidationError):
+        validate_json_schema({"root": "Kids"}, compatible)
+    with pytest.raises(JSONSchemaValidationError):
+        validate_json_schema({"core": "x"}, compatible)
+    assert source["required"] == ["core"]
 
 
 def test_xgrammar_constraint_accepts_complete_qwen_json_sequence():

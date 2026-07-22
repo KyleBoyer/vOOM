@@ -35,6 +35,40 @@ def test_hermes_multi_call():
     assert c.strip() == ""
 
 
+def test_xlam_bare_json_array_calls_are_parsed_and_validated():
+    text = json.dumps([
+        {"name": "weather", "arguments": {"city": "Chicago"}},
+        {"name": "clock", "arguments": {"timezone": "UTC"}},
+    ])
+    content, calls = parse_tool_calls(
+        text, "qwen2", allowed_names={"weather", "clock"},
+        argument_schemas={
+            "weather": {"type": "object", "properties": {
+                "city": {"type": "string"}}, "required": ["city"]},
+            "clock": {"type": "object", "properties": {
+                "timezone": {"type": "string"}}, "required": ["timezone"]},
+        })
+    assert content.strip() == ""
+    assert [call["function"]["name"] for call in calls] == [
+        "weather", "clock"]
+
+
+def test_plain_or_invalid_json_array_is_not_misclassified_as_tool_call():
+    for text in (
+        '[{"title":"ordinary answer","arguments":{}}]',
+        '[{"name":"not_offered","arguments":{}}]',
+        '[{"name":"weather","arguments":{"city":7}}]',
+    ):
+        content, calls = parse_tool_calls(
+            text, "qwen2", allowed_names={"weather"},
+            argument_schemas={
+                "weather": {"type": "object", "properties": {
+                    "city": {"type": "string"}}, "required": ["city"]},
+            })
+        assert calls == []
+        assert content == text
+
+
 def test_unoffered_generated_tool_remains_plain_text():
     unknown = '<tool_call>{"name":"delete_everything","arguments":{}}</tool_call>'
     known = '<tool_call>{"name":"weather","arguments":{"city":"Chicago"}}</tool_call>'
@@ -611,8 +645,17 @@ def test_fast_tool_pins_explicit_names_even_past_soft_limit():
         {"type": "function", "function": {"name": name, "parameters": {}}}
         for name in ("alpha", "beta", "gamma")
     ]
-    messages = [{"role": "user", "content": "Use alpha and gamma together."}]
+    messages = [{"role": "user", "content": "Use alpha and call gamma."}]
     assert pinned_tool_indices(tools, messages) == [0, 2]
+
+
+def test_fast_tool_does_not_pin_plain_word_from_ordinary_prose():
+    tools = [{"type": "function", "function": {
+        "name": "make", "parameters": {}}}]
+    assert pinned_tool_indices(
+        tools, [{"role": "user", "content": "Make sure to paginate."}]) == []
+    assert pinned_tool_indices(
+        tools, [{"role": "user", "content": "Call make."}]) == [0]
 
 
 def test_fast_schema_compaction_preserves_constraints_not_nested_prose():
@@ -652,6 +695,47 @@ def test_fast_schema_compaction_honors_explicit_x_optional_arguments():
     assert "x-optional" not in schema
     assert "default" not in schema["properties"]["path"]
     assert original["function"]["parameters"]["required"] == ["path", "depth"]
+
+
+def test_prose_preserving_prompt_schema_honors_x_optional_arguments():
+    from runtime.toolcalls import effective_tool_prompt_schema
+
+    original = {"type": "function", "name": "list_media",
+                "description": "Keep this selection prose.", "parameters": {
+        "type": "object",
+        "properties": {
+            "query": {"type": ["string", "null"],
+                      "description": "Keep this parameter prose."},
+            "limit": {"type": "integer"},
+        },
+        "required": ["query", "limit"],
+        "x-optional": ["query"],
+    }}
+    effective = effective_tool_prompt_schema(original)
+    assert effective["description"] == "Keep this selection prose."
+    assert effective["parameters"]["properties"]["query"]["description"] == (
+        "Keep this parameter prose.")
+    assert effective["parameters"]["required"] == ["limit"]
+    assert "x-optional" not in effective["parameters"]
+    assert original["parameters"]["required"] == ["query", "limit"]
+    assert original["parameters"]["x-optional"] == ["query"]
+
+
+def test_explicit_plugin_namespace_requires_user_mention_and_offered_tools():
+    from runtime.toolcalls import explicit_tool_namespaces
+
+    tools = [
+        {"type": "function", "function": {
+            "name": "plugin__plex__list_library"}},
+        {"type": "function", "function": {
+            "name": "plugin__browser__open"}},
+    ]
+    assert explicit_tool_namespaces(
+        tools, [{"role": "user", "content": "List my Plex movies"}]) == (
+            "plex",)
+    assert explicit_tool_namespaces(
+        tools, [{"role": "system", "content": "Plex is available"},
+                {"role": "user", "content": "List files"}]) == ()
 
 
 def test_fast_schema_compaction_preserves_property_names_that_match_annotations():

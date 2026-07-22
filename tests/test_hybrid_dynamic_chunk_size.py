@@ -111,3 +111,74 @@ def test_two_conversations_can_use_different_chunk_sizes_independently():
     assert engine._select_prefill_chunk_size(healthy_slot) == 512
     # Retrieving one again is unaffected by having just retrieved the other.
     assert engine._select_prefill_chunk_size(tight_slot) == 8
+
+
+def test_memory_retry_replays_unsampled_prefill_on_lower_rungs():
+    from runtime.engine import StreamingEngine
+
+    engine = _bare_engine("qwen3_5_moe", hot_kv_persist=None,
+                          hot_prompt_kv_chunk_size=512)
+    engine.rc.prefill_chunk_size = 512
+    attempts = []
+    discards = []
+
+    def generate(*_args, **_kwargs):
+        attempts.append(engine.rc.prefill_chunk_size)
+        engine._generation_sampled_tokens = 0
+        if len(attempts) < 3:
+            raise MemoryError("synthetic governor refusal")
+        return {
+            "prefill_s": 1.0, "first_token_s": 1.5, "total_s": 2.0,
+            "path_stats": {},
+        }
+
+    engine.generate = generate
+    engine.discard_failed_request_state = lambda: discards.append(True)
+    with patch("runtime.engine.mx.clear_cache"):
+        result = StreamingEngine.generate_with_memory_retry(engine, "prompt")
+
+    assert attempts == [512, 128, 32]
+    assert len(discards) == 2
+    assert result["path_stats"]["memory_prefill_retries"] == 2
+    assert result["path_stats"]["memory_prefill_retry_chunks"] == [128, 32]
+    assert result["total_s"] >= 2.0
+    assert engine._hybrid_retry_chunk_ceiling == 0
+
+
+def test_memory_retry_never_replays_after_sampling_started():
+    from runtime.engine import StreamingEngine
+
+    engine = _bare_engine("qwen3_5_moe", hot_kv_persist=None,
+                          hot_prompt_kv_chunk_size=512)
+    engine.rc.prefill_chunk_size = 512
+    calls = []
+
+    def generate(*_args, **_kwargs):
+        calls.append(True)
+        engine._generation_sampled_tokens = 1
+        raise MemoryError("decode refusal")
+
+    engine.generate = generate
+    engine.discard_failed_request_state = lambda: None
+    try:
+        StreamingEngine.generate_with_memory_retry(engine, "prompt")
+    except MemoryError as error:
+        assert "decode refusal" in str(error)
+    else:
+        raise AssertionError("decode MemoryError must propagate")
+    assert len(calls) == 1
+
+
+def test_memory_retry_also_applies_to_lossy_dense_qwen_without_persistence():
+    from runtime.engine import StreamingEngine
+
+    engine = StreamingEngine.__new__(StreamingEngine)
+    engine.cfg = SimpleNamespace(model_type="qwen2")
+    engine._hot_kv_persist = None
+    engine.rc = SimpleNamespace(
+        hot_prompt_kv=True, quant_bits=4,
+        prefill_chunk_size=32, hot_prompt_kv_chunk_size=32)
+    assert engine._memory_prefill_retry_applies()
+
+    engine.rc.quant_bits = 0
+    assert not engine._memory_prefill_retry_applies()
