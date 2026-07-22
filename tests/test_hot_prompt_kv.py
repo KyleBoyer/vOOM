@@ -660,7 +660,7 @@ def test_phase_aware_single_slot_protects_gateway_execution_state():
     def slot(namespace, state):
         return _HotPromptSlot(
             tokens=(1,), kv=state, logits=None, prompt_length=1,
-            prompt_logits=None, reusable_prefix=0,
+            prompt_logits=None, reusable_prefix=0, chunk_size=32,
             segment_chain=(f"{namespace}-persisted",),
             cache_namespace=namespace)
 
@@ -788,7 +788,7 @@ def test_memory_admission_evicts_persisted_unmatched_phase_before_new_kv():
         current_ceiling=lambda: 9_050_000_000)
     engine._hot_prompt_slots = [_HotPromptSlot(
         tokens=(1,), kv=retained, logits=None, prompt_length=1,
-        prompt_logits=None, reusable_prefix=0,
+        prompt_logits=None, reusable_prefix=0, chunk_size=32,
         segment_chain=("durable",),
         cache_namespace="gateway_execution")]
 
@@ -835,7 +835,7 @@ def test_memory_admission_preserves_live_system_available_floor():
     retained = State()
     engine._hot_prompt_slots = [_HotPromptSlot(
         tokens=(1,), kv=retained, logits=None, prompt_length=1,
-        prompt_logits=None, reusable_prefix=0,
+        prompt_logits=None, reusable_prefix=0, chunk_size=32,
         segment_chain=("durable",), cache_namespace="gateway_execution")]
 
     with patch("runtime.engine.mx.get_active_memory", return_value=2_000_000_000), \

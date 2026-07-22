@@ -1031,11 +1031,12 @@ def test_qwen36_profiles_bound_experts_and_use_hybrid_endpoint_cache():
         assert rc.hot_prompt_kv
         assert rc.hot_prompt_kv_slots == 2
         assert rc.hot_prompt_kv_min_tokens == 16
-        # F94 (2026-07-21): 32 is now the ceiling regardless of available
-        # memory at construction -- see _hybrid_prefill_chunk_size's
-        # docstring (engine reuse across a server's lifetime makes any
-        # more generous tier an eventual liability, not just a first-request bet).
-        assert rc.prefill_chunk_size == 32
+        # F95 (2026-07-21): this construction-time pick is now a
+        # best-effort DEFAULT only -- StreamingEngine.generate() resamples
+        # the same ladder fresh per conversation (see engine.py's
+        # hybrid_prefill_chunk_size docstring), so the wider tiers are safe
+        # to use again here too. available=8GB -> 512 (the >=4GB tier).
+        assert rc.prefill_chunk_size == 512
         assert rc.hot_prompt_kv_chunk_size == rc.prefill_chunk_size
         assert rc.expert_fetch_batch == 8
         assert rc.decode_expert_fetch_batch == 8
@@ -1060,52 +1061,51 @@ def test_qwen36_profiles_bound_experts_and_use_hybrid_endpoint_cache():
     assert fast.max_weight_cache_mb == 7000
 
 
-def test_hybrid_prefill_chunk_size_ladder_never_stops_shrinking():
-    """A binary 512/128 split was proven insufficient live: a real
-    lossy-Qwen3.6-27B request still hit "unsafe Metal reservation refused"
-    at chunk=128 because this model's per-layer dimensions are much larger
-    than the models the constant was tuned against. The floor tier
-    (chunk=1) must stay reachable no matter how tight memory gets, so that
-    a bigger model degrades to token-by-token prefill -- the same
-    granularity ordinary decode already uses successfully -- instead of
-    ever hard-failing purely due to chunk size (2026-07-20).
+def test_hybrid_prefill_chunk_size_ladder_reinstated_for_per_conversation_use():
+    """F94 (2026-07-20/21): a binary 512/128 split was proven insufficient
+    live, and the wider ladder was STILL insufficient once this server
+    started caching and reusing ONE engine across every subsequent
+    request forever -- a healthy available_bytes reading taken once, at a
+    server's first-ever request, has no bearing on real memory conditions
+    hours later. The 512/128 tiers were removed and 32 became the ceiling
+    for everything, regardless of size or reading.
 
-    2026-07-21: the 512 AND 128 tiers were removed entirely after a
-    SEPARATE real failure: this server caches and reuses one engine across
-    every subsequent request, so "available_bytes" is only ever sampled
-    once, at the very first request after a restart (memory looks its
-    best then) -- and stays fixed for the server's whole remaining
-    lifetime. A real Qwen3.6-35B-A3B (MoE) request later reproduced the
-    exact same failure AT chunk=128 (active shrunk to 0.07GB, essentially
-    nothing left to shed, still didn't fit). 32 is now the ceiling for
-    every model regardless of size, proven reliable across many real
-    overnight attempts against the largest dense sibling."""
-    from runtime.server import _hybrid_prefill_chunk_size
+    F95 (2026-07-21): reinstated 512/128, now that this function (moved to
+    runtime.engine, see hybrid_prefill_chunk_size there) is called PER
+    CONVERSATION instead of once per engine lifetime -- a fresh reading
+    only has to stay valid for one conversation's own lifetime, not a
+    whole server's. The floor tier (chunk=1) still must stay reachable no
+    matter how tight memory gets, so a request degrades to token-by-token
+    prefill instead of ever hard-failing purely due to chunk size."""
+    from runtime.engine import hybrid_prefill_chunk_size
 
-    assert _hybrid_prefill_chunk_size(10_000_000_000) == 32
-    assert _hybrid_prefill_chunk_size(4_000_000_000) == 32
-    assert _hybrid_prefill_chunk_size(1_999_999_999) == 32
-    assert _hybrid_prefill_chunk_size(1_000_000_000) == 32
-    assert _hybrid_prefill_chunk_size(999_999_999) == 8
-    assert _hybrid_prefill_chunk_size(500_000_000) == 8
-    assert _hybrid_prefill_chunk_size(499_999_999) == 1
-    assert _hybrid_prefill_chunk_size(0) == 1
+    assert hybrid_prefill_chunk_size(10_000_000_000) == 512
+    assert hybrid_prefill_chunk_size(4_000_000_000) == 512
+    assert hybrid_prefill_chunk_size(3_999_999_999) == 128
+    assert hybrid_prefill_chunk_size(2_000_000_000) == 128
+    assert hybrid_prefill_chunk_size(1_999_999_999) == 32
+    assert hybrid_prefill_chunk_size(1_000_000_000) == 32
+    assert hybrid_prefill_chunk_size(999_999_999) == 8
+    assert hybrid_prefill_chunk_size(500_000_000) == 8
+    assert hybrid_prefill_chunk_size(499_999_999) == 1
+    assert hybrid_prefill_chunk_size(0) == 1
 
 
 def test_hybrid_prefill_chunk_size_model_scale_no_longer_changes_the_ceiling():
     """model_scale used to lower the ceiling further for large dense models
-    specifically (see the ladder test above's history), but since 32 is now
-    the ceiling for every model regardless of size, model_scale is a
-    accepted-but-inert parameter -- kept only so existing callers don't
+    specifically, but a direct probe found chunk size barely moves
+    _layer_transient for a fixed model size anyway (~7% from 128 to 32) --
+    the real lever was always the weight-cache floor. model_scale is now
+    an accepted-but-inert parameter, kept only so existing callers don't
     need to change shape. Any value must produce the exact same result as
     omitting it (2026-07-21)."""
-    from runtime.server import _hybrid_prefill_chunk_size
+    from runtime.engine import hybrid_prefill_chunk_size
 
     for available in (10_000_000_000, 4_000_000_000, 1_999_999_999,
                       999_999_999, 499_999_999, 0):
-        baseline = _hybrid_prefill_chunk_size(available)
+        baseline = hybrid_prefill_chunk_size(available)
         for model_scale in (0, 50_000_000, 89_000_000, 1_000_000_000):
-            assert _hybrid_prefill_chunk_size(
+            assert hybrid_prefill_chunk_size(
                 available, model_scale=model_scale) == baseline
 
 
@@ -1118,13 +1118,14 @@ def test_hybrid_min_weight_cache_floor_is_unconditionally_low():
     construction-time available_bytes reading (gating an earlier version
     of this floor) cannot predict that a long sweep will drain memory
     this much by itself, so the floor must stay conservative regardless
-    of what memory looked like at construction -- unlike prefill_chunk_size,
-    nothing requires this floor to vary with a point-in-time reading."""
-    from runtime.server import _hybrid_min_weight_cache_floor_mb
+    of what memory looked like at construction -- unlike prefill_chunk_size
+    (which F95 now resamples per conversation), nothing requires this
+    floor to vary with a point-in-time reading at all; it stays engine-wide."""
+    from runtime.engine import hybrid_min_weight_cache_floor_mb
 
-    assert _hybrid_min_weight_cache_floor_mb(10_000_000_000) == 64
-    assert _hybrid_min_weight_cache_floor_mb(4_000_000_000) == 64
-    assert _hybrid_min_weight_cache_floor_mb(0) == 64
+    assert hybrid_min_weight_cache_floor_mb(10_000_000_000) == 64
+    assert hybrid_min_weight_cache_floor_mb(4_000_000_000) == 64
+    assert hybrid_min_weight_cache_floor_mb(0) == 64
 
 
 def test_qwen36_never_pins_trunk_and_adapts_chunk_size_under_low_memory():
@@ -1177,8 +1178,11 @@ def test_qwen36_never_pins_trunk_and_adapts_chunk_size_under_low_memory():
     # when there isn't room to also pin the trunk.
     assert not captured[0].pin_lm_head
     assert captured[0].stream_lm_head
-    assert captured[0].prefill_chunk_size == 32
-    assert captured[0].hot_prompt_kv_chunk_size == 32
+    # F95: this is now just the construction-time default (available=2GB
+    # -> 128, the >=2GB tier); StreamingEngine.generate() resamples fresh
+    # per conversation instead of trusting this for the engine's lifetime.
+    assert captured[0].prefill_chunk_size == 128
+    assert captured[0].hot_prompt_kv_chunk_size == 128
     # F94: the weight-cache floor stays unconditionally low regardless of
     # available memory at construction -- a fixed 1.5GB floor left
     # governor.reserve() with nothing further to shed on the real
@@ -1537,7 +1541,8 @@ def test_interrupted_prefill_retains_only_complete_exact_chunk():
     engine = StreamingEngine.__new__(StreamingEngine)
     engine.rc = SimpleNamespace(
         hot_prompt_kv=True, max_kv_mb=0,
-        hot_prompt_kv_min_tokens=2048, hot_prompt_kv_slots=1)
+        hot_prompt_kv_min_tokens=2048, hot_prompt_kv_slots=1,
+        prefill_chunk_size=4096)
     engine._hot_kv_persist = None
     engine._hot_prompt_slots = [SimpleNamespace(kv=survivor)]
     engine.last_kv = partial
@@ -1556,6 +1561,9 @@ def test_interrupted_prefill_retains_only_complete_exact_chunk():
     assert slot.tokens == tuple(tokens[:4096])
     assert slot.logits is None and slot.prompt_logits is None
     assert slot.reusable_prefix == 4096
+    # F95: records whatever chunk size was actually driving this
+    # interrupted request, so a retry resumes with the same value.
+    assert slot.chunk_size == 4096
     assert slot.tool_capsules == (("inside", 100, 200),)
     assert engine._h_window is None and engine._h_last is None
 

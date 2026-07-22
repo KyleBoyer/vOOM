@@ -34,6 +34,72 @@ from .sampler import SamplingParams, sample
 from .weight_cache import WeightCache
 
 
+def hybrid_prefill_chunk_size(available_bytes: int, model_scale: int = 0) -> int:
+    """F94/F95: descending chunk-size ladder for qwen3_5/qwen3_5_moe's fixed,
+    hot_prompt_kv-compatible prefill chunk (GLM's live adaptive_chunk_size
+    resampling is not an option here -- see the callers' comments).
+
+    History: a single low/high binary split (512 vs 128) was proven
+    insufficient live (F94, 2026-07-20/21) -- a real lossy-Qwen3.6-27B
+    request reproducibly hit "unsafe Metal reservation refused" at
+    chunk=128, and the wider descending ladder was STILL insufficient once
+    this server started caching and reusing ONE engine across every
+    subsequent request forever: a healthy available_bytes reading taken
+    once, at a server's first-ever request, has no bearing on real memory
+    conditions hours later, so the 512/128 tiers were removed entirely and
+    32 became the ceiling for everything, regardless of size or reading.
+
+    F95 (2026-07-21): reinstated the wider tiers (512/128), because the
+    actual problem was never "chunk=512 is unsafe" -- it was "deciding it
+    ONCE, engine-wide, for a lifetime memory can drift arbitrarily far
+    over" that was unsafe. This function is now called PER CONVERSATION
+    (see StreamingEngine.generate()'s hot_prompt_kv slot handling): a fresh
+    conversation with no matching hot-KV slot samples live memory right
+    then and picks a chunk size that only has to stay valid for that ONE
+    conversation's own lifetime (typically minutes), not the whole
+    server's. A conversation that already has a matching slot reuses
+    THAT slot's own recorded chunk size instead of resampling at all,
+    preserving the fixed-chunk invariant hot_prompt_kv needs within one
+    reuse lineage. `model_scale` (hidden*intermediate) is no longer
+    consulted (a direct probe found chunk size barely moves
+    _layer_transient for a fixed model size anyway, ~7% from 128 to 32;
+    the real lever was always the weight-cache floor, see
+    hybrid_min_weight_cache_floor_mb) -- kept only so existing callers
+    don't need to change shape."""
+    if available_bytes >= 4_000_000_000:
+        return 512
+    if available_bytes >= 2_000_000_000:
+        return 128
+    if available_bytes >= 1_000_000_000:
+        return 32
+    if available_bytes >= 500_000_000:
+        return 8
+    return 1
+
+
+def hybrid_min_weight_cache_floor_mb(available_bytes: int) -> int:
+    """F94: the weight-cache floor for qwen3_5/qwen3_5_moe -- deliberately
+    NOT gated on `available_bytes` (the parameter is kept only so existing
+    callers/tests didn't need to change shape). Live-reproduced twice: a
+    real Qwen3.6-27B request constructed its engine at a HEALTHY
+    available=10.27GB (picking chunk=512, and the OLD code's floor=1.5GB
+    default), then still hit "unsafe Metal reservation refused" ~3s later
+    at available=2.80GB -- a single 30K-token/64-layer dense sweep drained
+    7.5GB of system memory over its OWN lifetime (growing weight cache,
+    growing KV, quantize-on-load scratch) before the failing layer was
+    even reached. A one-time construction-time reading cannot predict
+    that, so gating the floor on it is fighting the wrong variable --
+    unlike prefill_chunk_size (which hot_prompt_kv genuinely requires
+    fixed for the whole sweep, a real constraint each conversation still
+    has), the cache floor has no such requirement and can just always be
+    conservative, engine-wide, regardless of per-conversation chunk size.
+    This costs nothing when memory is plentiful (the cache still grows to
+    max_weight_cache_mb under ordinary LRU eviction; the floor only bites
+    during an actual reserve() squeeze) and buys the maximum possible
+    headroom exactly when a squeeze happens."""
+    return 64
+
+
 def _resident_adjusted_transient(
     start_active: int, end_active: int, peak_active: int,
 ) -> int:
@@ -500,6 +566,17 @@ class _HotPromptSlot:
     prompt_length: int
     prompt_logits: mx.array
     reusable_prefix: int
+    # F95 (2026-07-21): the prefill_chunk_size this slot's KV/recurrent state
+    # was actually built with. A continuation matching this slot MUST reuse
+    # this exact value (hot_prompt_kv's fixed-chunk-per-lineage invariant),
+    # not whatever the engine's current default happens to be -- that's what
+    # makes per-CONVERSATION chunk-size adaptivity safe: a fresh conversation
+    # (no matching slot) samples live memory and can pick a bigger chunk when
+    # healthy, while a continuing one stays pinned to whatever built it,
+    # never silently drifting mid-lineage. Required (no default) so every
+    # construction site must decide this explicitly rather than risk a
+    # stale/wrong value slipping through unnoticed.
+    chunk_size: int
     approximate: bool = False  # true only for a selectively repaired PIC prompt
     # Optional (content id, prompt-token start, prompt-token end) records used
     # by the lossy PIC path. They are included in durable checkpoint manifests
@@ -1151,7 +1228,14 @@ class StreamingEngine:
                     self._hot_prompt_slots.append(_HotPromptSlot(
                         tokens=tokens, kv=kv, logits=logits,
                         prompt_length=prompt_length, prompt_logits=prompt_logits,
-                        reusable_prefix=reusable_prefix, approximate=approximate,
+                        reusable_prefix=reusable_prefix,
+                        # F95: durable persistence bakes ONE chunk size into
+                        # its on-disk format for the whole store (see
+                        # HotPromptKVPersistence.__init__) -- restored slots
+                        # always use that fixed, engine-wide value, never
+                        # the per-conversation adaptive pick.
+                        chunk_size=self.rc.hot_prompt_kv_chunk_size,
+                        approximate=approximate,
                         tool_capsules=tool_capsules,
                         segment_chain=segment_chain,
                         cache_namespace=persisted_namespace,
@@ -2627,7 +2711,12 @@ class StreamingEngine:
                     # shape for every slightly different conversation prefix.
                     # Endpoint logits belong only to the untrimmed sequence, so
                     # this candidate never has exact logits.
-                    boundary = self.rc.hot_prompt_kv_chunk_size
+                    # F95: THIS candidate's own recorded chunk size, not the
+                    # engine's current default -- different slots (different
+                    # conversations) can legitimately have been built with
+                    # different chunk sizes.
+                    boundary = getattr(
+                        slot, "chunk_size", 0) or self.rc.hot_prompt_kv_chunk_size
                     reusable = min(lcp, max(0, len(tokens) - 1))
                     reusable = (reusable // boundary) * boundary
                     reusable = min(reusable, slot.reusable_prefix)
@@ -2679,7 +2768,11 @@ class StreamingEngine:
                             or (len(tokens) > len(slot.tokens)
                                 and lcp == len(slot.tokens))):
                         continue
-                    boundary = self.rc.hot_prompt_kv_chunk_size
+                    # F95: this slot's own chunk size (tool_pic is not
+                    # currently reachable for the models this varies for,
+                    # but kept consistent with the matching loop above).
+                    boundary = getattr(
+                        slot, "chunk_size", 0) or self.rc.hot_prompt_kv_chunk_size
                     safe_prefix = min(lcp, max(0, len(tokens) - 1))
                     safe_prefix = (safe_prefix // boundary) * boundary
                     safe_prefix = min(safe_prefix, slot.reusable_prefix)
@@ -2796,6 +2889,10 @@ class StreamingEngine:
                 pass
             elif best_idx is not None and best_matched > 0:
                 slot = self._hot_prompt_slots.pop(best_idx)  # consume: remove from the LRU
+                if self._hybrid_chunk_size_applies():
+                    continued_chunk = self._select_prefill_chunk_size(slot)
+                    self.rc.prefill_chunk_size = continued_chunk
+                    self.rc.hot_prompt_kv_chunk_size = continued_chunk
                 prompt_state_approximate = slot.approximate
                 if self._hot_kv_persist is not None:
                     # Deliberately do NOT delete this slot's own checkpoint
@@ -2930,6 +3027,15 @@ class StreamingEngine:
                     compress_spill=self.rc.kv_spill_compress,
                 )
             else:
+                # F95: a genuinely NEW conversation -- no in-memory slot and
+                # no disk match (persistence is off by default now anyway).
+                # The slot created at the end of this request records
+                # whatever value this becomes, so later turns of THIS
+                # conversation stay pinned to it.
+                if hot_eligible and self._hybrid_chunk_size_applies():
+                    fresh_chunk = self._select_prefill_chunk_size(None)
+                    self.rc.prefill_chunk_size = fresh_chunk
+                    self.rc.hot_prompt_kv_chunk_size = fresh_chunk
                 kv = self.new_kv(stepped=use_stepped_kv)
         self.last_kv = kv
         if getattr(kv, "position_free", False):
@@ -3550,6 +3656,11 @@ class StreamingEngine:
                 prompt_length=len(tokens),
                 prompt_logits=prompt_endpoint_logits,
                 reusable_prefix=reusable_watermark,
+                # F95: whatever chunk size actually built this state --
+                # either the matched slot's own value (continuing) or a
+                # fresh per-conversation pick (new), set earlier in this
+                # same generate() call.
+                chunk_size=self.rc.prefill_chunk_size,
                 approximate=prompt_state_approximate,
                 tool_capsules=tuple(getattr(prompt, "tool_capsules", ())),
                 segment_chain=segment_chain,
@@ -3672,6 +3783,36 @@ class StreamingEngine:
         self._h_last = None
         self._provisional = None
 
+    def _hybrid_chunk_size_applies(self) -> bool:
+        """F95: per-conversation prefill_chunk_size adaptivity is scoped to
+        qwen3_5/qwen3_5_moe hot_prompt_kv targets with durable persistence
+        OFF -- persistence bakes one engine-wide chunk size into its
+        on-disk format (HotPromptKVPersistence), incompatible with varying
+        it per conversation until a follow-up extends that format too."""
+        return (self._hot_kv_persist is None
+                and self.cfg.model_type in ("qwen3_5", "qwen3_5_moe"))
+
+    def _select_prefill_chunk_size(self, matched_slot: "_HotPromptSlot | None") -> int:
+        """F95: the actual per-conversation adaptivity decision.
+
+        matched_slot is the hot-KV slot this request is CONTINUING (already
+        popped off the LRU by the caller), or None for a brand-new
+        conversation with no match at all. A continuing conversation MUST
+        reuse whatever chunk size actually built that slot's KV/recurrent
+        state -- hot_prompt_kv's fixed-chunk invariant applies per reuse
+        lineage, not engine-wide, so reading matched_slot.chunk_size (not
+        self.rc.hot_prompt_kv_chunk_size) is what makes two DIFFERENT
+        conversations free to use different chunk sizes without
+        conflicting. A brand-new conversation samples live memory THIS
+        INSTANT and picks a size that only has to stay valid for its own
+        lifetime, not this engine's -- the reason the wider ladder tiers
+        (512/128) are safe again despite being unsafe when picked once per
+        engine (see hybrid_prefill_chunk_size's docstring)."""
+        if matched_slot is not None:
+            return (getattr(matched_slot, "chunk_size", 0)
+                     or self.rc.hot_prompt_kv_chunk_size)
+        return hybrid_prefill_chunk_size(psutil.virtual_memory().available)
+
     def _retain_interrupted_prefill(
             self, tokens, kv, reusable_prefix: int, tool_capsules=(),
             cache_namespace: str = "default") -> bool:
@@ -3703,6 +3844,11 @@ class StreamingEngine:
             prompt_length=covered,
             prompt_logits=None,
             reusable_prefix=covered,
+            # F95: this path already excludes durable persistence (see the
+            # bail-out above), so it's always the in-memory adaptive case --
+            # whatever chunk size was actually driving this interrupted
+            # request is what a retry must resume with.
+            chunk_size=self.rc.prefill_chunk_size,
             approximate=False,
             tool_capsules=retained_capsules,
             segment_chain=(),

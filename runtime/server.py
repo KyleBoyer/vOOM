@@ -747,93 +747,12 @@ def _resolve(model_id: str) -> Path:
     raise ModelDownloading(model_id, DOWNLOADS.status(model_id))
 
 
-def _hybrid_prefill_chunk_size(available_bytes: int, model_scale: int = 0) -> int:
-    """F94: descending chunk-size ladder for qwen3_5/qwen3_5_moe's fixed,
-    hot_prompt_kv-compatible prefill chunk (GLM's live adaptive_chunk_size
-    resampling is not an option here -- see the callers' comments).
-
-    A single low/high binary split (512 vs 128) was proven insufficient
-    live: a real lossy-Qwen3.6-27B request reproducibly hit "unsafe Metal
-    reservation refused" with _layer_transient stuck at ~1.9GB at chunk=128.
-    The wider descending ladder alone was STILL insufficient: a real
-    134-tool/~30K-token request constructed its engine at a healthy
-    available=10.27GB (picking chunk=512), then drained to available=2.80GB
-    ~3s later, deep in the prefill sweep, and failed -- a one-time
-    memory reading at construction cannot predict what a long sweep does to
-    memory over its OWN lifetime (see _hybrid_min_weight_cache_floor_mb's
-    docstring for the same lesson applied to the cache floor). Unlike the
-    floor, though, chunk size genuinely matters here for a SEPARATE reason:
-    a periodic full_attention layer's QK^T score buffer scales with
-    chunk_size * kv_length_so_far, and this model's largest dense sibling
-    (Qwen3.6-27B: hidden=5120, intermediate=17408, hidden*intermediate
-    ~=89M) has meaningfully bigger per-layer dimensions than its 4B/9B
-    siblings (hidden*intermediate ~=23-50M), which never reproduced this
-    failure even under real testing. `model_scale` (hidden*intermediate)
-    lets a big dense model's chunk ceiling drop regardless of what memory
-    looked like at construction, rather than trusting a snapshot a long
-    sweep can invalidate. Live-confirmed: forcing chunk=32 on the exact
-    failing 30K-token request got through the first ~23% of the sweep with
-    ZERO governor.reserve() events at all (vs. reserve() firing repeatedly
-    and still failing at chunk=512) before this fix landed.
-
-    2026-07-21: BOTH the 512 and 128 tiers are now removed. This server
-    CACHES and REUSES one engine instance across every subsequent request
-    on the same model/mode -- the "available_bytes" reading that picks a
-    tier only ever happens once, at the FIRST request after a restart (when
-    memory looks its best, nothing else has run yet), and then stays fixed
-    for however long that server keeps running, serving requests under
-    whatever real memory conditions arise hours later. Live-reconfirmed
-    against a real Qwen3.6-35B-A3B (MoE) request: available=2.82GB, active
-    shrunk to 0.07GB (essentially nothing resident, cache floor already
-    doing all it can), and STILL failed -- ceiling=1.69GB couldn't cover
-    even a chunk=128 incoming=1.26GB reservation. 128 was picked by a
-    healthier reading taken long before, at this server's first request,
-    and never revisited -- and per this same investigation, chunk=128 is
-    not meaningfully cheaper than chunk=512 anyway (a direct probe found
-    only ~7% transient reduction going from 128 to 32, i.e. the "128 tier"
-    was mostly theater, not real protection). There is no live hook to
-    re-pick chunk size mid-lifetime (hot_prompt_kv needs it fixed), so the
-    only fix is to stop trusting a single favorable instant to hold for a
-    server's entire remaining lifetime: 32 -- proven reliable across
-    dozens of real, unattended hours-long attempts against the largest
-    dense sibling overnight, repeatedly reaching 25-53% of a 30K-token
-    sweep with ZERO governor.reserve() events before any external
-    interruption -- is now the ceiling for every model, not just ones
-    flagged by model_scale."""
-    # model_scale is no longer consulted -- 32 is now the ceiling for every
-    # model regardless of size (kept as a parameter so existing callers
-    # don't need to change shape).
-    if available_bytes >= 1_000_000_000:
-        return 32
-    if available_bytes >= 500_000_000:
-        return 8
-    return 1
-
-
-def _hybrid_min_weight_cache_floor_mb(available_bytes: int) -> int:
-    """F94: the weight-cache floor for qwen3_5/qwen3_5_moe -- deliberately
-    NOT gated on `available_bytes` (the parameter is kept only so existing
-    callers/tests didn't need to change shape). Live-reproduced twice: a
-    real Qwen3.6-27B request constructed its engine at a HEALTHY
-    available=10.27GB (picking chunk=512, and the OLD code's floor=1.5GB
-    default), then still hit "unsafe Metal reservation refused" ~3s later
-    at available=2.80GB -- a single 30K-token/64-layer dense sweep drained
-    7.5GB of system memory over its OWN lifetime (growing weight cache,
-    growing KV, quantize-on-load scratch) before the failing layer was
-    even reached. A one-time construction-time reading cannot predict
-    that, so gating the floor on it is fighting the wrong variable --
-    unlike prefill_chunk_size (which hot_prompt_kv genuinely requires
-    fixed for the whole sweep, a real constraint), the cache floor has no
-    such requirement and can just always be conservative. A direct probe
-    also showed chunk size itself barely moves _layer_transient (~7% for
-    a 4x smaller chunk at chunk=128 vs 32) -- the floor is the lever with
-    real leverage (governor.reserve()'s shrink-then-reserve loop only
-    helps if it can shrink far enough), so make IT unconditionally low
-    instead. This costs nothing when memory is plentiful (the cache still
-    grows to max_weight_cache_mb under ordinary LRU eviction; the floor
-    only bites during an actual reserve() squeeze) and buys the maximum
-    possible headroom exactly when a squeeze happens."""
-    return 64
+# F94/F95: _hybrid_prefill_chunk_size/_hybrid_min_weight_cache_floor_mb moved
+# to runtime.engine (hybrid_prefill_chunk_size/hybrid_min_weight_cache_floor_mb)
+# so StreamingEngine.generate() can call the SAME chunk-size ladder
+# per-conversation (see F95 in engine.py's docstring), not just once at
+# server-side engine construction. Imported below for backward-compatible
+# local names.
 
 
 def _dense_fast_resident_bytes(cfg) -> int:
@@ -938,7 +857,12 @@ class EngineManager:
         import mlx.core as mx
 
         from .config import ModelConfig
-        from .engine import RuntimeConfig, StreamingEngine
+        from .engine import (
+            RuntimeConfig,
+            StreamingEngine,
+            hybrid_min_weight_cache_floor_mb as _hybrid_min_weight_cache_floor_mb,
+            hybrid_prefill_chunk_size as _hybrid_prefill_chunk_size,
+        )
         from .path_resolver import resolve_model_dir
 
         yarn_factor = 0.0
@@ -972,9 +896,9 @@ class EngineManager:
                 "this checkpoint is a vOOM-derived lossy artifact; request it "
                 f"as {LOSSY_PREFIX}{model_dir.name} (fast mode), or use its "
                 "original source checkpoint for lossless mode")
-        if mode == "fast-long" and mtype != "qwen2":
+        if mode == "fast-long" and mtype not in ("qwen2", "olmoe"):
             raise RequestValidationError(
-                "fast-long is currently supported only for Qwen2 checkpoints")
+                "fast-long is currently supported only for Qwen2 and OLMoE checkpoints")
         with self._lock:
             # Recheck after the read-only probe for callers that use
             # EngineManager outside the server's coarser INFER_LOCK.
@@ -1153,9 +1077,18 @@ class EngineManager:
                 if rc.hot_prompt_kv_min_tokens < 0:
                     raise ValueError(
                         "VMODEL_QWEN35_HOT_KV_MIN_TOKENS must be non-negative")
+                # F95 (2026-07-21): off by default now, per explicit user
+                # choice -- durable persistence bakes ONE chunk size into
+                # its on-disk format for the whole store, incompatible with
+                # per-conversation adaptive chunk sizing (see
+                # hybrid_prefill_chunk_size in engine.py). Set this env var
+                # to opt back into cross-restart conversation resumption;
+                # doing so falls back to the old fixed-chunk-size behavior
+                # for every conversation (StreamingEngine.generate() skips
+                # the adaptive path whenever self._hot_kv_persist is not
+                # None), trading the new speed/IO benefit for durability.
                 rc.hot_prompt_kv_persist_dir = os.environ.get(
-                    "VMODEL_QWEN35_HOT_KV_PERSIST_DIR",
-                    str(ROOT / ".kv_hybrid"))
+                    "VMODEL_QWEN35_HOT_KV_PERSIST_DIR", "")
                 try:
                     rc.max_weight_cache_mb = int(os.environ.get(
                         "VMODEL_QWEN35_WEIGHT_CACHE_MB", "7000"))
@@ -1357,9 +1290,18 @@ class EngineManager:
                 if rc.hot_prompt_kv_min_tokens < 0:
                     raise ValueError(
                         "VMODEL_QWEN35_HOT_KV_MIN_TOKENS must be non-negative")
+                # F95 (2026-07-21): off by default now, per explicit user
+                # choice -- durable persistence bakes ONE chunk size into
+                # its on-disk format for the whole store, incompatible with
+                # per-conversation adaptive chunk sizing (see
+                # hybrid_prefill_chunk_size in engine.py). Set this env var
+                # to opt back into cross-restart conversation resumption;
+                # doing so falls back to the old fixed-chunk-size behavior
+                # for every conversation (StreamingEngine.generate() skips
+                # the adaptive path whenever self._hot_kv_persist is not
+                # None), trading the new speed/IO benefit for durability.
                 rc.hot_prompt_kv_persist_dir = os.environ.get(
-                    "VMODEL_QWEN35_HOT_KV_PERSIST_DIR",
-                    str(ROOT / ".kv_hybrid"))
+                    "VMODEL_QWEN35_HOT_KV_PERSIST_DIR", "")
                 # lm_head streaming is the same unconditional, bit-identical
                 # win it is for the MoE sibling regardless of dense/MoE.
                 rc.pin_lm_head = False
