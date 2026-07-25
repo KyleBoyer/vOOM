@@ -2657,8 +2657,9 @@ class StreamingEngine:
         every layer instead, but keep the loop layer-major so a streamed target
         fetches each layer only once for the complete verify window.
         """
-        if self.cfg.num_experts or self.cfg.model_type in (
-                "glm_moe_dsa", "gpt_oss", "qwen3_5", "qwen3_5_moe", "kimi_linear"):
+        glm_family = self.cfg.model_type in ("glm_moe_dsa", "kimi_k25", "glm4_moe_lite")
+        if not glm_family and (self.cfg.num_experts or self.cfg.model_type in (
+                "gpt_oss", "qwen3_5", "qwen3_5_moe", "kimi_linear")):
             # F94: layer_runner.run_block (this function's per-layer call
             # below) is a plain dense-transformer block with no awareness of
             # the hybrid DeltaNet/full-attention layer_types these model
@@ -2670,6 +2671,16 @@ class StreamingEngine:
             # explicit exclusion here too. forward_tokens (via _sweep, which
             # DOES have correct model_type dispatch) is the working
             # alternative for these targets -- see runtime/qwen35_mtp.py.
+            #
+            # F113 (2026-07-25): GLM-family (glm_moe_dsa/kimi_k25/
+            # glm4_moe_lite) targets get the real fix instead of exclusion
+            # -- see the glm_family per-position dispatch branch below,
+            # which reuses _glm_attention_residual/_glm_mlp_residual
+            # (already split out for F35) so MoE routing/MLA attention runs
+            # at the SAME one-position-at-a-time granularity ordinary
+            # decode uses, matching this function's whole purpose (exact
+            # per-position match with true sequential decode) instead of
+            # the batched-GEMM-can-diverge risk forward_tokens carries.
             raise ValueError(
                 "serial-position verification currently supports dense models only")
         if not tokens:
@@ -2691,6 +2702,8 @@ class StreamingEngine:
         embedded = self._embed(list(tokens))
         positions = [embedded[:, i:i + 1, :] for i in range(len(tokens))]
         n = self.cfg.num_hidden_layers
+        if glm_family:
+            from .glm import _glm_attention_residual, _glm_mlp_residual
         for layer in range(n):
             if self.prefetcher:
                 for nxt in range(
@@ -2711,12 +2724,28 @@ class StreamingEngine:
             mx.reset_peak_memory()
             next_positions = []
             for position, hidden in enumerate(positions):
-                hidden = layer_runner.run_block(
-                    hidden, weights, f"model.layers.{layer}", self.cfg,
-                    kv, layer, offset + position,
-                    rope_freqs=self._rope_freqs, rope_mscale=self._mscale,
-                    fused_swiglu=self.rc.fused_swiglu,
-                )
+                if glm_family:
+                    # F113: MLA attention + MoE routing/experts computed at
+                    # the SAME one-position-at-a-time granularity ordinary
+                    # decode uses -- routing for position i sees only
+                    # position i's own hidden state, exactly matching what
+                    # true sequential decode would compute, unlike a
+                    # batched multi-position routing call.
+                    prefix = f"model.layers.{layer}"
+                    attn_out = _glm_attention_residual(
+                        hidden, weights, prefix, self.cfg, kv, layer,
+                        offset + position)
+                    hidden = _glm_mlp_residual(
+                        attn_out, weights, prefix, self.cfg, layer,
+                        self._get_experts,
+                        iter_expert_batches=self._iter_expert_batches)
+                else:
+                    hidden = layer_runner.run_block(
+                        hidden, weights, f"model.layers.{layer}", self.cfg,
+                        kv, layer, offset + position,
+                        rope_freqs=self._rope_freqs, rope_mscale=self._mscale,
+                        fused_swiglu=self.rc.fused_swiglu,
+                    )
                 next_positions.append(hidden)
             # Keep every block call at the ordinary one-token shape, but use a
             # single layer barrier for the position outputs. The lazy KV chain

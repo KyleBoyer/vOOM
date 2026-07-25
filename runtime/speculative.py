@@ -140,14 +140,17 @@ class SpeculativeDecoder:
                 f"targets ({target.cfg.model_type}) with draft={draft!r} -- "
                 f"KVCache.trim() cannot roll back kda_cache on partial "
                 f"rejection. Use QwenMTPSpeculativeEngine instead.")
-        if not _unsafe_allow_moe_verify and (getattr(target.cfg, "num_experts", 0) or getattr(
-                target.cfg, "model_type", None) in (
-                "glm_moe_dsa", "gpt_oss", "qwen3_5", "qwen3_5_moe", "kimi_linear")):
+        target_glm_family = getattr(target.cfg, "model_type", None) in (
+            "glm_moe_dsa", "kimi_k25", "glm4_moe_lite")
+        if not _unsafe_allow_moe_verify and not target_glm_family and (
+                getattr(target.cfg, "num_experts", 0) or getattr(
+                    target.cfg, "model_type", None) in (
+                    "gpt_oss", "qwen3_5", "qwen3_5_moe", "kimi_linear")):
             # F113 (2026-07-25): this class's multi-position verify sweep
             # uses forward_tokens_serial_positions() when eligible, but that
-            # method explicitly refuses the exact same set of targets (its
-            # own layer_runner.run_block has no hybrid/MoE dispatch
-            # awareness) -- which forces verification onto plain
+            # method explicitly refuses most MoE/hybrid targets (their
+            # layer_runner.run_block-based per-layer call has no MoE/hybrid
+            # dispatch awareness) -- which forces verification onto plain
             # forward_tokens() instead. That method's own docstring already
             # documents the mechanism: "Batched (L, hidden) GEMMs can choose
             # different reduction kernels from ordinary one-token greedy
@@ -162,6 +165,15 @@ class SpeculativeDecoder:
             # draft mode this class supports (not just "mtp") since the
             # unsafe verify path is the same regardless of where proposals
             # come from.
+            #
+            # glm_moe_dsa/kimi_k25/glm4_moe_lite are EXEMPT from this guard
+            # (same day, later): forward_tokens_serial_positions gained a
+            # real MoE-aware per-position dispatch for exactly these model
+            # types (reusing _glm_attention_residual/_glm_mlp_residual),
+            # verified byte-identical (0.0 max abs logit diff, all
+            # positions) against true sequential decode on the real
+            # Kimi-K2.5 checkpoint -- the underlying bug is fixed for this
+            # architecture family specifically, not just gated around.
             raise ValueError(
                 f"SpeculativeDecoder does not support MoE/hybrid targets "
                 f"({target.cfg.model_type}) -- their multi-position verify "
@@ -467,7 +479,16 @@ class SpeculativeDecoder:
             tgt.begin_provisional()  # F55: routing stats commit post-acceptance
             verify_tokens = [all_tokens[-1]] + proposals
             try:
-                if not tgt.cfg.num_experts and len(verify_tokens) > 1:
+                # F113 (2026-07-25): glm_moe_dsa/kimi_k25/glm4_moe_lite now
+                # have real MoE-aware serial-position support (see
+                # forward_tokens_serial_positions's own glm_family branch) --
+                # route them there too, not just num_experts==0 targets,
+                # since the whole reason this dispatch exists is to avoid
+                # the batched-GEMM verify divergence confirmed for these
+                # architectures.
+                glm_family = tgt.cfg.model_type in (
+                    "glm_moe_dsa", "kimi_k25", "glm4_moe_lite")
+                if (not tgt.cfg.num_experts or glm_family) and len(verify_tokens) > 1:
                     logits = tgt.forward_tokens_serial_positions(
                         verify_tokens, t_kv)
                 else:
