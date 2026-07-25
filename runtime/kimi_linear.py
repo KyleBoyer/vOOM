@@ -184,6 +184,7 @@ def _kimi_expert_swiglu(h: mx.array, w: dict, prefix: str) -> mx.array:
 
 def _kda_attention(
     h: mx.array, w: dict, prefix: str, cfg: ModelConfig, kda_cache: KDAStateCache | None, layer: int,
+    native_fused_decode: bool = False,
 ) -> mx.array:
     B, L, _ = h.shape
     H = cfg.kda_num_heads
@@ -198,9 +199,22 @@ def _kda_attention(
         kda_cache.conv_history(layer) if kda_cache is not None and kda_cache.conv_history(layer) is not None
         else (None, None, None)
     )
-    q, q_hist_new = _causal_depthwise_conv1d(q, w[f"{prefix}.self_attn.q_conv1d.weight"], q_hist, K)
-    k, k_hist_new = _causal_depthwise_conv1d(k, w[f"{prefix}.self_attn.k_conv1d.weight"], k_hist, K)
-    v, v_hist_new = _causal_depthwise_conv1d(v, w[f"{prefix}.self_attn.v_conv1d.weight"], v_hist, K)
+    # 2026-07-25: KDA's per-channel causal conv (K-tap weighted sum + SiLU)
+    # is mathematically IDENTICAL to qwen3.5's own conv1d+SiLU -- this file
+    # already provides the plain/shared implementation qwen35.py imports
+    # (_causal_depthwise_conv1d, above), and qwen35.py's F103 native fused
+    # Metal kernel is a verified-byte-identical drop-in for it (same K-tap
+    # weighted sum + sigmoid(acc)*acc SiLU, same (B,L,C)/(C,1,K) shapes).
+    # Reused directly here, the same "found a mathematically identical
+    # existing loop, reused the kernel unmodified" pattern that already
+    # worked for Jet-Nemotron's DeltaNet-step kernel reuse.
+    conv_fn = _causal_depthwise_conv1d
+    if L == 1 and native_fused_decode:
+        from .qwen35 import _native_fused_causal_conv1d
+        conv_fn = _native_fused_causal_conv1d
+    q, q_hist_new = conv_fn(q, w[f"{prefix}.self_attn.q_conv1d.weight"], q_hist, K)
+    k, k_hist_new = conv_fn(k, w[f"{prefix}.self_attn.k_conv1d.weight"], k_hist, K)
+    v, v_hist_new = conv_fn(v, w[f"{prefix}.self_attn.v_conv1d.weight"], v_hist, K)
 
     dt_bias = w[f"{prefix}.self_attn.dt_bias"].reshape(H, D).astype(mx.float32)
     g_raw = _linear(_linear(h, w, f"{prefix}.self_attn.f_a_proj"), w, f"{prefix}.self_attn.f_b_proj")
@@ -255,6 +269,7 @@ def _kda_attention(
 def _kimi_linear_attention_residual(
     x: mx.array, w: dict, prefix: str, cfg: ModelConfig, kv,
     layer: int, offset: int, mlp_last_only: bool = False,
+    native_fused_decode: bool = False,
 ) -> mx.array:
     """Attention (KDA or MLA) + residual only, no MLP/MoE. Split out of
     the original monolithic `run_kimi_linear_block` (F35-prep, 2026-07-24)
@@ -279,7 +294,9 @@ def _kimi_linear_attention_residual(
         x = x + _mla_attention(h, w, prefix, cfg, kv, layer, offset)
     elif layer in cfg.kda_layers:
         kda_cache = getattr(kv, "kda_cache", None)
-        x = x + _kda_attention(h, w, prefix, cfg, kda_cache, layer)
+        x = x + _kda_attention(
+            h, w, prefix, cfg, kda_cache, layer,
+            native_fused_decode=native_fused_decode)
     else:
         raise ValueError(
             f"layer {layer} is in neither cfg.full_attn_layers nor cfg.kda_layers")
@@ -339,12 +356,14 @@ def _kimi_linear_mlp_residual(
 def run_kimi_linear_block(
     x: mx.array, w: dict, prefix: str, cfg: ModelConfig, kv,
     layer: int, offset: int, get_experts, mlp_last_only: bool = False, iter_expert_batches=None,
+    native_fused_decode: bool = False,
 ) -> mx.array:
     """One Kimi Linear decoder block (chunk-major / ordinary use). Thin
     wrapper over `_kimi_linear_attention_residual` +
     `_kimi_linear_mlp_residual` -- see those functions' docstrings for why
     the split exists (layer-stationary tiled prefill, F35-prep)."""
     x = _kimi_linear_attention_residual(
-        x, w, prefix, cfg, kv, layer, offset, mlp_last_only=mlp_last_only)
+        x, w, prefix, cfg, kv, layer, offset, mlp_last_only=mlp_last_only,
+        native_fused_decode=native_fused_decode)
     return _kimi_linear_mlp_residual(
         x, w, prefix, cfg, layer, get_experts, iter_expert_batches=iter_expert_batches)

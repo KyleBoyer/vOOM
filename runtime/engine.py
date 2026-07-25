@@ -2246,6 +2246,7 @@ class StreamingEngine:
                     x, w, f"model.layers.{i}", self.cfg, kv, i, offset, self._get_experts,
                     mlp_last_only=last_only,
                     iter_expert_batches=self._iter_expert_batches,
+                    native_fused_decode=self.rc.native_fused_deltanet_decode,
                 )
             elif self.cfg.model_type in ("qwen3_5_moe", "qwen3_5"):
                 from .qwen35 import run_qwen35_block
@@ -2608,7 +2609,8 @@ class StreamingEngine:
                 xt = x[:, pos:end, :]
                 yt = _kimi_linear_attention_residual(
                     xt, w, f"model.layers.{i}", self.cfg, kv, i, offset + pos,
-                    mlp_last_only=False)
+                    mlp_last_only=False,
+                    native_fused_decode=self.rc.native_fused_deltanet_decode)
                 mx.eval(yt)
                 tiles.append(yt)
                 pos = end
