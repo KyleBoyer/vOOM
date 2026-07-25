@@ -184,6 +184,46 @@ class QuantPolicy:
             self.bits, self.group_size, self.mode)
 
 
+_DEQUANT_INT4_SOURCE = """
+    uint row = thread_position_in_grid.y;
+    uint col = thread_position_in_grid.x;
+    if (col >= COLS) return;
+    uint num_words = packed_shape[1];
+    uint num_groups = scale_shape[1];
+    uint word_idx = col / 8;
+    uint nibble_shift = (col % 8) * 4;
+    uint word = packed[row * num_words + word_idx];
+    uint nibble = (word >> nibble_shift) & 0xFu;
+    int signed_val = int(nibble) - 8;
+    uint group_idx = col / GROUP_SIZE;
+    float s = float(scale[row * num_groups + group_idx]);
+    out[row * COLS + col] = T(float(signed_val) * s);
+"""
+
+_dequant_int4_kernel_cache: dict[tuple[int, int], "mx.fast.metal_kernel"] = {}
+
+
+def _dequant_int4_kernel(cols: int, group_size: int):
+    """F107 (2026-07-25): cols/group_size baked in as source-literal constants
+    (not runtime shape lookups) so the compiled kernel needs no per-call
+    division -- cached per (cols, group_size) pair since a real checkpoint
+    only has a handful of distinct expert-weight shapes (gate/up/down_proj),
+    so this compiles at most a few times per process, not once per call."""
+    key = (cols, group_size)
+    kernel = _dequant_int4_kernel_cache.get(key)
+    if kernel is None:
+        source = _DEQUANT_INT4_SOURCE.replace(
+            "COLS", str(cols)).replace("GROUP_SIZE", str(group_size))
+        kernel = mx.fast.metal_kernel(
+            name=f"dequant_ct_int4_{cols}_{group_size}",
+            input_names=["packed", "scale"],
+            output_names=["out"],
+            source=source,
+        )
+        _dequant_int4_kernel_cache[key] = kernel
+    return kernel
+
+
 def dequantize_compressed_tensors_int4(
     packed: mx.array, scale: mx.array, shape: tuple[int, int], packed_dim: int = 1,
 ) -> mx.array:
@@ -208,6 +248,21 @@ def dequantize_compressed_tensors_int4(
     checkpoint), one BF16 scale per `group_size` consecutive elements along
     `packed_dim`.
 
+    F107 (2026-07-25): a real per-op profile of the original 5-op MLX
+    composite (bit-shift+mask, reshape, signed-offset, scale mx.repeat,
+    final multiply+cast) against a real K2.5 expert-weight shape (2048,
+    7168) found NO single dominant op -- each cost 1-4ms, ~9.2ms total --
+    and, critically, that this dequantization is ~97.6% of the COMBINED
+    dequant+matmul time for one expert (9.2ms dequant vs 0.5ms matmul),
+    unlike this session's RMSNorm findings where the op was negligible next
+    to its surrounding matmul. This single `mx.fast.metal_kernel` fuses all
+    5 steps into one dispatch (no intermediate nibbles/signed/scale-expanded
+    tensors ever materialized) -- verified byte-identical (0.0 max abs diff)
+    against the original composite, isolated speedup 7.48x (9.298ms ->
+    1.243ms) at this same real shape. See docs/future_lossless_techniques.md
+    F107 for the real end-to-end verdict this produced against the real
+    K2.5 checkpoint -- not trusted from this isolated number alone.
+
     :param packed: int32 tensor, the `.weight_packed` tensor as loaded
     :param scale: BF16 tensor, the `.weight_scale` tensor as loaded --
         shape (rows, cols // group_size) for packed_dim=1
@@ -222,20 +277,21 @@ def dequantize_compressed_tensors_int4(
         raise ValueError(
             f"packed shape {packed.shape} inconsistent with logical shape {shape} "
             "for 8-values-per-int32 (num_bits=4) packing")
-    num_words = packed.shape[1]
-    shifts = mx.arange(8, dtype=mx.uint32) * 4
-    p = packed.astype(mx.uint32)
-    nibbles = (p[:, :, None] >> shifts[None, None, :]) & mx.array(0xF, dtype=mx.uint32)
-    nibbles = nibbles.reshape(rows, num_words * 8)[:, :cols]
-    signed = nibbles.astype(mx.int32) - 8  # F93: +8-offset-encoded, see docstring
-
-    group_size = cols // scale.shape[1]
-    if group_size * scale.shape[1] != cols:
+    if cols % scale.shape[1]:
         raise ValueError(
             f"weight_scale shape {scale.shape} does not evenly divide "
             f"logical cols {cols} (implied group_size {cols / scale.shape[1]})")
-    scale_expanded = mx.repeat(scale.astype(mx.float32), group_size, axis=1)
-    return (signed.astype(mx.float32) * scale_expanded).astype(scale.dtype)
+    group_size = cols // scale.shape[1]
+    kernel = _dequant_int4_kernel(cols, group_size)
+    out = kernel(
+        inputs=[packed.astype(mx.uint32), scale],
+        template=[("T", scale.dtype)],
+        grid=(cols, rows, 1),
+        threadgroup=(min(cols, 256), 1, 1),
+        output_shapes=[(rows, cols)],
+        output_dtypes=[scale.dtype],
+    )[0]
+    return out
 
 
 def matmul(x: mx.array, w) -> mx.array:
