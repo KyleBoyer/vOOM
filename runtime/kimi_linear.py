@@ -241,11 +241,21 @@ def _kda_attention(
     return _linear(o, w, f"{prefix}.self_attn.o_proj")
 
 
-def run_kimi_linear_block(
+def _kimi_linear_attention_residual(
     x: mx.array, w: dict, prefix: str, cfg: ModelConfig, kv,
-    layer: int, offset: int, get_experts, mlp_last_only: bool = False, iter_expert_batches=None,
+    layer: int, offset: int, mlp_last_only: bool = False,
 ) -> mx.array:
-    """`kv` carries KDA's recurrent state the same way GLM's MLA carries
+    """Attention (KDA or MLA) + residual only, no MLP/MoE. Split out of
+    the original monolithic `run_kimi_linear_block` (F35-prep, 2026-07-24)
+    so layer-stationary tiled prefill can call this PER TILE (attention
+    must still see tiles in causal/sequential order -- KDA's recurrent
+    state and MLA's KV cache both accumulate exactly as before, this split
+    changes nothing about that) while calling the MLP/MoE half exactly
+    ONCE per layer across the whole prompt instead. `run_kimi_linear_block`
+    below is now a thin two-call wrapper preserving the exact original
+    behavior for existing (chunk-major) callers.
+
+    `kv` carries KDA's recurrent state the same way GLM's MLA carries
     `kv.compressed_mla`/`kv.dsa` -- an ad-hoc `kv.kda_cache` (KDAStateCache)
     attribute set once in Engine.new_kv(), not a separate threaded argument.
     A bare KVCache (or None, as the oracle/smoke tests pass) has no
@@ -265,7 +275,20 @@ def run_kimi_linear_block(
 
     if mlp_last_only:  # KV/state is built; only the last position feeds the logits
         x = x[:, -1:, :]
+    return x
 
+
+def _kimi_linear_mlp_residual(
+    x: mx.array, w: dict, prefix: str, cfg: ModelConfig, layer: int,
+    get_experts, iter_expert_batches=None,
+) -> mx.array:
+    """MLP (dense) or MoE + residual only, given `x` already post-attention.
+    See `_kimi_linear_attention_residual`'s docstring for why this is split
+    out. `x` may cover any subset of positions (a single tile, or the
+    whole prompt) -- routing/expert-fetch always operates on exactly
+    whatever positions are present in `x`, which is what lets a
+    layer-stationary caller route the WHOLE prompt at once instead of
+    per-tile."""
     h = mx.fast.rms_norm(x, w[f"{prefix}.post_attention_layernorm.weight"], cfg.rms_norm_eps)
 
     if layer < cfg.first_k_dense_replace:
@@ -300,3 +323,17 @@ def run_kimi_linear_block(
     consume_expert_batches(batches, consume_batch)
     out = out + _swiglu(h, w, f"{moe_prefix}.shared_experts")
     return x + out
+
+
+def run_kimi_linear_block(
+    x: mx.array, w: dict, prefix: str, cfg: ModelConfig, kv,
+    layer: int, offset: int, get_experts, mlp_last_only: bool = False, iter_expert_batches=None,
+) -> mx.array:
+    """One Kimi Linear decoder block (chunk-major / ordinary use). Thin
+    wrapper over `_kimi_linear_attention_residual` +
+    `_kimi_linear_mlp_residual` -- see those functions' docstrings for why
+    the split exists (layer-stationary tiled prefill, F35-prep)."""
+    x = _kimi_linear_attention_residual(
+        x, w, prefix, cfg, kv, layer, offset, mlp_last_only=mlp_last_only)
+    return _kimi_linear_mlp_residual(
+        x, w, prefix, cfg, layer, get_experts, iter_expert_batches=iter_expert_batches)

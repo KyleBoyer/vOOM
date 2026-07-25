@@ -257,15 +257,28 @@ def _group_routes(idx: mx.array, weights: mx.array
     return groups
 
 
-def run_glm_block(
+def _glm_attention_residual(
     x: mx.array, w: dict, prefix: str, cfg: ModelConfig, kv, layer: int, offset: int,
-    get_experts, mlp_last_only: bool = False, iter_expert_batches=None,
+    mlp_last_only: bool = False,
 ) -> mx.array:
+    """MLA attention + residual only, no MLP/MoE -- split out of run_glm_block
+    (F35-prep extension, 2026-07-25) so a caller can run attention per-tile
+    (preserving causal KV order) while deferring MoE routing to run once per
+    layer over the whole tile-concatenated output, mirroring
+    _kimi_linear_attention_residual's split for the same reason."""
     h = mx.fast.rms_norm(x, w[f"{prefix}.input_layernorm.weight"], cfg.rms_norm_eps)
     x = x + _mla_attention(h, w, prefix, cfg, kv, layer, offset)
     if mlp_last_only:  # F36: KV is built; only the last position feeds the logits
         x = x[:, -1:, :]
+    return x
 
+
+def _glm_mlp_residual(
+    x: mx.array, w: dict, prefix: str, cfg: ModelConfig, layer: int,
+    get_experts, iter_expert_batches=None,
+) -> mx.array:
+    """MLP (dense) or MoE + residual only, given x already post-attention --
+    the other half of run_glm_block's split, see _glm_attention_residual."""
     h = mx.fast.rms_norm(x, w[f"{prefix}.post_attention_layernorm.weight"], cfg.rms_norm_eps)
 
     is_dense = (
@@ -317,3 +330,16 @@ def run_glm_block(
     consume_expert_batches(batches, consume_batch)
     out = out + _swiglu(h, w, f"{prefix}.mlp.shared_experts")
     return x + out
+
+
+def run_glm_block(
+    x: mx.array, w: dict, prefix: str, cfg: ModelConfig, kv, layer: int, offset: int,
+    get_experts, mlp_last_only: bool = False, iter_expert_batches=None,
+) -> mx.array:
+    """One GLM/K2.5 decoder block (chunk-major / ordinary use). Thin wrapper
+    over the attention/MLP split below -- see _layer_stationary_glm_sweep in
+    engine.py for the layer-major caller that uses the split directly."""
+    x = _glm_attention_residual(
+        x, w, prefix, cfg, kv, layer, offset, mlp_last_only=mlp_last_only)
+    return _glm_mlp_residual(
+        x, w, prefix, cfg, layer, get_experts, iter_expert_batches=iter_expert_batches)

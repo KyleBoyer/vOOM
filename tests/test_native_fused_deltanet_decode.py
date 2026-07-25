@@ -126,3 +126,41 @@ def test_native_fused_decode_matches_baseline_byte_identical():
         "greedy output to the existing float32-accumulated implementation"
     )
     assert fused["text"] == baseline["text"]
+
+
+_JET_MODEL_DIR = (
+    Path(__file__).resolve().parent.parent / "models" / "Jet-Nemotron-4B")
+_skip_jet = pytest.mark.skipif(
+    not _JET_MODEL_DIR.exists(),
+    reason="real Jet-Nemotron-4B checkpoint not present on this machine")
+
+
+@_skip_jet
+def test_native_kernel_reused_for_jet_nemotron_byte_identical():
+    """Jet-Nemotron's JetBlock recurrence (runtime/jet_nemotron.py::
+    _jet_block) is mathematically identical to qwen3_5's gated delta rule
+    -- the SAME kernel is reused directly (dimension-agnostic via runtime
+    shape reads), no new kernel written. Real dimensions differ from
+    Qwen3.5-4B (16 heads / Dv=256 here vs 32 heads / Dv=128 there) -- a
+    genuine test that the kernel generalizes, not just coincidentally
+    works for the one shape it was designed against."""
+    from runtime.engine import RuntimeConfig, StreamingEngine
+    from runtime.sampler import SamplingParams
+
+    prompt = ("The capital of France is Paris. The capital of Germany is "
+              "Berlin. The capital of Italy is")
+
+    def run(native_fused):
+        rc = RuntimeConfig(
+            prefill_chunk_size=512, native_fused_deltanet_decode=native_fused)
+        engine = StreamingEngine(str(_JET_MODEL_DIR), rc)
+        try:
+            return engine.generate(
+                prompt, max_tokens=16, sampling=SamplingParams(temperature=0.0))
+        finally:
+            engine.close()
+
+    baseline = run(False)
+    fused = run(True)
+    assert fused["tokens"] == baseline["tokens"]
+    assert fused["text"] == baseline["text"]

@@ -100,6 +100,7 @@ def _dynamic_causal_conv1d(
 def _jet_block(
     h: mx.array, w: dict, prefix: str, cfg: ModelConfig,
     state_cache: "object | None", layer: int,
+    native_fused_decode: bool = False,
 ) -> mx.array:
     """JetBlock ("jet" layer type): gated-delta-rule linear attention with
     a dynamically-generated causal conv on V. h: (1, L, hidden)."""
@@ -148,19 +149,30 @@ def _jet_block(
     state = state_cache.state(layer) if state_cache is not None else None
     if state is None:
         state = mx.zeros((batch, num_heads, head_dim, head_v_dim), dtype=mx.float32)
-    outputs = []
-    for position in range(length):
-        q_t = q[:, position]
-        k_t = k[:, position]
-        v_t = v[:, position]
-        state = state * mx.exp(decay[:, position])[..., None, None]
-        predicted = mx.sum(k_t[..., None] * state, axis=-2)
-        delta = (v_t - predicted) * beta[:, position, :, None]
-        state = state + k_t[..., None] * delta[..., None, :]
-        outputs.append(mx.sum(q_t[..., None] * state, axis=-2))
-        if (position + 1) % 32 == 0:
-            mx.eval(state)
-    output = mx.stack(outputs, axis=1)
+    if native_fused_decode and length == 1:
+        # F103 follow-up (2026-07-24): identical recurrence math to
+        # qwen3_5's own gated delta rule -- reuses the SAME, already
+        # oracle-verified mx.fast.metal_kernel directly (dimension-
+        # agnostic via runtime shape reads, no new kernel needed).
+        from .qwen35 import _native_fused_gated_delta_step
+
+        step_out, state = _native_fused_gated_delta_step(
+            q[:, 0], k[:, 0], v[:, 0], beta[:, 0], decay[:, 0], state)
+        output = step_out[:, None]
+    else:
+        outputs = []
+        for position in range(length):
+            q_t = q[:, position]
+            k_t = k[:, position]
+            v_t = v[:, position]
+            state = state * mx.exp(decay[:, position])[..., None, None]
+            predicted = mx.sum(k_t[..., None] * state, axis=-2)
+            delta = (v_t - predicted) * beta[:, position, :, None]
+            state = state + k_t[..., None] * delta[..., None, :]
+            outputs.append(mx.sum(q_t[..., None] * state, axis=-2))
+            if (position + 1) % 32 == 0:
+                mx.eval(state)
+        output = mx.stack(outputs, axis=1)
     if state_cache is not None:
         mx.eval(state)
         state_cache.set_state(layer, state)
@@ -182,6 +194,7 @@ def run_jet_nemotron_block(
     kv: "object", layer: int, offset: int,
     rope_freqs: mx.array | None = None,
     mlp_last_only: bool = False,
+    native_fused_decode: bool = False,
 ) -> mx.array:
     """One Jet-Nemotron decoder block, dispatching on
     ``cfg.layer_types[layer]`` ("jet" | "swa" | "attn"). Mirrors
@@ -201,7 +214,8 @@ def run_jet_nemotron_block(
     h = mx.fast.rms_norm(x, w[f"{prefix}.input_layernorm.weight"], cfg.rms_norm_eps)
     if layer_type == "jet":
         recurrent_state = getattr(kv, "kda_cache", None)
-        x = x + _jet_block(h, w, prefix, cfg, recurrent_state, layer)
+        x = x + _jet_block(h, w, prefix, cfg, recurrent_state, layer,
+                           native_fused_decode=native_fused_decode)
     else:
         sliding_window = cfg.sliding_window if layer_type == "swa" else 0
         x = x + _attention(

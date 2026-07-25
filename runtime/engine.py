@@ -2263,6 +2263,7 @@ class StreamingEngine:
                 x = run_jet_nemotron_block(
                     x, w, f"model.layers.{i}", self.cfg, kv, i, offset,
                     rope_freqs=self._rope_freqs, mlp_last_only=last_only,
+                    native_fused_decode=self.rc.native_fused_deltanet_decode,
                 )
             elif self.cfg.model_type == "afmoe":
                 from .afmoe import run_afmoe_block
@@ -2400,6 +2401,201 @@ class StreamingEngine:
                 tiles.append(yt)
                 pos = end
             x = tiles[0] if len(tiles) == 1 else mx.concatenate(tiles, axis=1)
+            self.timer.add("layer_compute", time.perf_counter() - t0)
+            self._layer_transient = max(
+                self._layer_transient,
+                _resident_adjusted_transient(
+                    active_before, mx.get_active_memory(), mx.get_peak_memory()))
+            by_positions = self._prefill_layer_transient_by_positions
+            by_positions[total] = max(
+                int(by_positions.get(total, 0)), self._layer_transient)
+            self._prefill_layer_transient = max(by_positions.values())
+            self._note_true_peak()
+            del w
+        return x
+
+    def _layer_stationary_glm_sweep(
+            self, x: mx.array, kv, offset: int, tile_width: int) -> mx.array:
+        """F35 extension (2026-07-25): layer-major prefill for GLM-5.2/K2.5/
+        glm4_moe_lite (real q_lora MLA + noaux_tc MoE, run_glm_block's
+        shape) -- the same technique `_layer_stationary_kimi_linear_sweep`
+        applies to Kimi Linear's MLA layers, reusing the identical
+        attention/MLP split pattern (`_glm_attention_residual` /
+        `_glm_mlp_residual` in runtime/glm.py, split out of run_glm_block the
+        same way `_kimi_linear_attention_residual`/`_kimi_linear_mlp_residual`
+        were split out of run_kimi_linear_block).
+
+        MLA attention has no recurrent state analogous to KDA, but the same
+        correctness argument still applies: each layer's attention depends
+        only on that layer's own KV history and current tile, never on
+        another layer's loop position, and MoE routing is a stateless
+        function of `h` -- computing it once per layer over the whole tiled
+        range is the same function evaluated on the union of what chunk-major
+        would have called it on per-chunk, not a different function. Proven
+        directly in tests/test_f35_glm_layer_stationary_oracle.py against the
+        real Kimi-K2.5 checkpoint (kimi_k25 shares this exact block shape).
+        """
+        from .glm import _glm_attention_residual, _glm_mlp_residual
+
+        if tile_width <= 0:
+            raise ValueError("tile_width must be positive")
+        n = self.cfg.num_hidden_layers
+        total = int(x.shape[1])
+        (self._layer_transient,
+         self._layer_transient_margin) = _layer_transient_for_positions(
+             total,
+             getattr(
+                 self, "_prefill_layer_transient_by_positions", {}
+             ).get(total, 0),
+             getattr(self, "_decode_layer_transient", 0))
+        for i in range(n):
+            if self.prefetcher:
+                for j in range(i + 1, min(i + 1 + self.rc.prefetch_depth, n)):
+                    self.prefetcher.schedule(self._layer_key(j), self._layer_names(j))
+
+            t0 = time.perf_counter()
+            layer_key = self._layer_key(i)
+            layer_names = self._layer_names(i)
+            if not self.cache.contains(layer_key):
+                incoming_page = self._layer_fetch_bytes_estimate(i)
+                if incoming_page:
+                    self.cache.prepare_for(incoming_page)
+                    if self.governor is not None:
+                        self.governor.reserve(incoming_page)
+            w = self.cache.get(layer_key, layer_names)
+            self.timer.add("weights_wait", time.perf_counter() - t0)
+
+            active_before = mx.get_active_memory()
+            mx.reset_peak_memory()
+            t0 = time.perf_counter()
+            tiles = []
+            pos = 0
+            while pos < total:
+                end = min(pos + tile_width, total)
+                if self.governor is not None and self._layer_transient:
+                    self.governor.reserve(
+                        self._layer_transient,
+                        margin=self._layer_transient_margin)
+                xt = x[:, pos:end, :]
+                yt = _glm_attention_residual(
+                    xt, w, f"model.layers.{i}", self.cfg, kv, i, offset + pos,
+                    mlp_last_only=False)
+                mx.eval(yt)
+                tiles.append(yt)
+                pos = end
+            x_after_attn = tiles[0] if len(tiles) == 1 else mx.concatenate(tiles, axis=1)
+            x = _glm_mlp_residual(
+                x_after_attn, w, f"model.layers.{i}", self.cfg, i,
+                self._get_experts, iter_expert_batches=self._iter_expert_batches)
+            mx.eval(x)
+            self.timer.add("layer_compute", time.perf_counter() - t0)
+            self._layer_transient = max(
+                self._layer_transient,
+                _resident_adjusted_transient(
+                    active_before, mx.get_active_memory(), mx.get_peak_memory()))
+            by_positions = self._prefill_layer_transient_by_positions
+            by_positions[total] = max(
+                int(by_positions.get(total, 0)), self._layer_transient)
+            self._prefill_layer_transient = max(by_positions.values())
+            self._note_true_peak()
+            del w
+        return x
+
+    def _layer_stationary_kimi_linear_sweep(
+            self, x: mx.array, kv, offset: int, tile_width: int) -> mx.array:
+        """F35-prep (2026-07-24): layer-major prefill for Kimi Linear, the
+        MoE analogue of F94's dense-only `_layer_stationary_qwen35_sweep`.
+
+        Quantified motivation (docs/future_lossless_techniques.md F92,
+        2026-07-24 update): a real per-layer routed-expert footprint check
+        against a real 291-token prompt found each MoE layer's TRUE unique-
+        expert union across the whole prefill is only ~90-117/256, but the
+        chunk-major loop's measured average weight-cache misses per layer
+        was ~194 -- roughly double, the signature of chunk-major re-routing
+        (and re-fetching) overlapping-but-not-identical expert sets once
+        per chunk instead of once per layer.
+
+        This fixes it by construction, not by any new "union of experts
+        across chunks" bookkeeping: `_kimi_linear_attention_residual` still
+        runs per TILE (attention/KDA state must still see tiles in causal
+        order -- unchanged from chunk-major), but
+        `_kimi_linear_mlp_residual` (routing + expert fetch + combination)
+        now runs exactly ONCE per layer, on the FULL tiled-together
+        attention output for every position in `x` -- there is no
+        per-chunk MoE call left to redundantly re-route/re-fetch.
+
+        `_layer_names(i)` already correctly excludes routed-expert tensor
+        names for MoE models (`self.cfg.num_experts` gate, confirmed by
+        reading the function directly) -- the SAME per-layer weight-fetch
+        mechanism `_layer_stationary_qwen35_sweep` already uses is reused
+        unmodified; the only new code is the attention/MLP call-site split
+        itself (in runtime/kimi_linear.py) and this sweep's loop shape.
+
+        Correctness argument mirrors `_layer_stationary_qwen35_sweep`'s own
+        exactly: each layer's KDA/MLA state depends only on that layer's
+        own sequential inputs and its own prior state, never on another
+        layer's loop position, so reordering (layer, tile) -> outer layer,
+        inner tile changes nothing about state evolution. Routing itself
+        is stateless per call (a function of `h` alone) -- computing it
+        once over all positions instead of once per chunk over a subset of
+        positions is the SAME function evaluated on a UNION of its
+        arguments, not a different function. Proven directly (not just
+        argued) in tests/test_f35_kimi_linear_layer_stationary_oracle.py.
+        """
+        from .kimi_linear import (
+            _kimi_linear_attention_residual, _kimi_linear_mlp_residual)
+
+        if tile_width <= 0:
+            raise ValueError("tile_width must be positive")
+        n = self.cfg.num_hidden_layers
+        total = int(x.shape[1])
+        (self._layer_transient,
+         self._layer_transient_margin) = _layer_transient_for_positions(
+             total,
+             getattr(
+                 self, "_prefill_layer_transient_by_positions", {}
+             ).get(total, 0),
+             getattr(self, "_decode_layer_transient", 0))
+        for i in range(n):
+            if self.prefetcher:
+                for j in range(i + 1, min(i + 1 + self.rc.prefetch_depth, n)):
+                    self.prefetcher.schedule(self._layer_key(j), self._layer_names(j))
+
+            t0 = time.perf_counter()
+            layer_key = self._layer_key(i)
+            layer_names = self._layer_names(i)
+            if not self.cache.contains(layer_key):
+                incoming_page = self._layer_fetch_bytes_estimate(i)
+                if incoming_page:
+                    self.cache.prepare_for(incoming_page)
+                    if self.governor is not None:
+                        self.governor.reserve(incoming_page)
+            w = self.cache.get(layer_key, layer_names)
+            self.timer.add("weights_wait", time.perf_counter() - t0)
+
+            active_before = mx.get_active_memory()
+            mx.reset_peak_memory()
+            t0 = time.perf_counter()
+            tiles = []
+            pos = 0
+            while pos < total:
+                end = min(pos + tile_width, total)
+                if self.governor is not None and self._layer_transient:
+                    self.governor.reserve(
+                        self._layer_transient,
+                        margin=self._layer_transient_margin)
+                xt = x[:, pos:end, :]
+                yt = _kimi_linear_attention_residual(
+                    xt, w, f"model.layers.{i}", self.cfg, kv, i, offset + pos,
+                    mlp_last_only=False)
+                mx.eval(yt)
+                tiles.append(yt)
+                pos = end
+            x_after_attn = tiles[0] if len(tiles) == 1 else mx.concatenate(tiles, axis=1)
+            x = _kimi_linear_mlp_residual(
+                x_after_attn, w, f"model.layers.{i}", self.cfg, i,
+                self._get_experts, iter_expert_batches=self._iter_expert_batches)
+            mx.eval(x)
             self.timer.add("layer_compute", time.perf_counter() - t0)
             self._layer_transient = max(
                 self._layer_transient,
@@ -3572,7 +3768,8 @@ class StreamingEngine:
             layer_stationary_eligible = (
                 bool(chunk)
                 and self.rc.layer_stationary_prefill
-                and self.cfg.model_type == "qwen3_5"
+                and self.cfg.model_type in (
+                    "qwen3_5", "kimi_linear", "glm_moe_dsa", "kimi_k25", "glm4_moe_lite")
                 and adaptive is None
                 and not (ckpt and kv_store is not None)
                 and not force_adaptive_paged
@@ -3610,8 +3807,16 @@ class StreamingEngine:
                     watermark_continuous = (
                         hot_eligible and reusable_watermark == pos)
                     xc = self._embed(list(tokens[pos:stop_before]))
-                    xc = self._layer_stationary_qwen35_sweep(
-                        xc, kv, offset=pos, tile_width=chunk)
+                    if self.cfg.model_type == "kimi_linear":
+                        xc = self._layer_stationary_kimi_linear_sweep(
+                            xc, kv, offset=pos, tile_width=chunk)
+                    elif self.cfg.model_type in (
+                            "glm_moe_dsa", "kimi_k25", "glm4_moe_lite"):
+                        xc = self._layer_stationary_glm_sweep(
+                            xc, kv, offset=pos, tile_width=chunk)
+                    else:
+                        xc = self._layer_stationary_qwen35_sweep(
+                            xc, kv, offset=pos, tile_width=chunk)
                     del xc
                     if self.rc.max_kv_mb or force_adaptive_paged:
                         mx.clear_cache()
