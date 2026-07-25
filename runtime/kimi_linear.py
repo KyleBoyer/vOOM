@@ -155,12 +155,23 @@ def _causal_depthwise_conv1d(
 
 
 def _gated_rms_norm(x: mx.array, gate: mx.array, weight: mx.array, eps: float) -> mx.array:
-    """out = rmsnorm(x) * weight * sigmoid(gate) -- gate applied AFTER norm+scale."""
+    """out = rmsnorm(x) * weight * sigmoid(gate) -- gate applied AFTER norm+scale.
+
+    F105-style native-primitive reuse (2026-07-25): this was a hand-rolled
+    composite (mean/sqrt/multiply) that never called mx.fast.rms_norm,
+    unlike this same file's input_layernorm/post_attention_layernorm calls
+    a few lines below, which already did. No formula transform needed here
+    (plain weight scaling, no zero-centered offset) -- verified
+    byte-identical (0.0 max abs diff) against the original composite.
+    Same expectation as F105's qwen3.5 case: this op is tiny relative to
+    the matmul/disk costs that dominate a decode step, so it is kept as a
+    correctness-preserving simplification, not claimed as a speed win
+    without a real measurement to back that claim."""
+    source_dtype = x.dtype
     x32 = x.astype(mx.float32)
-    var = mx.mean(x32 * x32, axis=-1, keepdims=True)
-    x_hat = x32 * (1.0 / mx.sqrt(var + eps))
-    y = x_hat * weight.astype(mx.float32) * mx.sigmoid(gate.astype(mx.float32))
-    return y.astype(x.dtype)
+    w32 = weight.astype(mx.float32)
+    normed = mx.fast.rms_norm(x32, w32, eps)
+    return (normed * mx.sigmoid(gate.astype(mx.float32))).astype(source_dtype)
 
 
 def _kimi_expert_swiglu(h: mx.array, w: dict, prefix: str) -> mx.array:
