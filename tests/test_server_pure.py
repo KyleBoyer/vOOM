@@ -43,6 +43,8 @@ from runtime.server import (Handler, INFER_LOCK, PreparedPrompt, RequestValidati
                             _parse_request_tool_calls, _tool_request_controls,
                             _preferred_fast_artifact,
                             _dspark_draft_for,
+                            _engine_generate,
+                            _has_own_method,
                             _speculative_draft_for,
                             _request_reasoning_controls, _request_sampling,
                             _registry,
@@ -2810,6 +2812,75 @@ def test_cache_io_delta_reports_only_current_request():
     assert stats["weight_archive_bytes"] == 10
     assert stats["weight_cache_resident_bytes"] == 400
     assert stats["layer_transient_bytes"] == 60
+
+
+class _WrapperEngine:
+    """Mirrors SpeculativeEngine/DSparkSpeculativeEngine/
+    QwenMTPSpeculativeEngine's shape: a plain object (no inheritance from
+    the wrapped target) that defines its OWN .generate() and forwards
+    every other attribute via __getattr__."""
+
+    def __init__(self, target):
+        self.target = target
+        self.own_generate_calls = 0
+
+    def __getattr__(self, name):
+        return getattr(self.target, name)
+
+    def generate(self, *args, **kwargs):
+        self.own_generate_calls += 1
+        return {"via": "wrapper"}
+
+
+class _PlainTarget:
+    def __init__(self):
+        self.retry_calls = 0
+        self.plain_calls = 0
+
+    def generate(self, *args, **kwargs):
+        self.plain_calls += 1
+        return {"via": "target-plain"}
+
+    def generate_with_memory_retry(self, *args, **kwargs):
+        self.retry_calls += 1
+        return {"via": "target-retry"}
+
+
+def test_has_own_method_distinguishes_real_methods_from_getattr_proxy():
+    target = _PlainTarget()
+    wrapper = _WrapperEngine(target)
+    assert _has_own_method(target, "generate_with_memory_retry")
+    assert not _has_own_method(wrapper, "generate_with_memory_retry")
+    # The wrapper's OWN .generate is still a real method, unaffected.
+    assert _has_own_method(wrapper, "generate")
+
+
+def test_engine_generate_uses_wrappers_own_generate_not_targets_retry():
+    """2026-07-22 regression: a naive getattr(engine,
+    "generate_with_memory_retry", engine.generate) resolves through a
+    wrapper's __getattr__ straight to the TARGET's bound retry method,
+    silently bypassing the wrapper's own speculative .generate() override
+    for every request -- live-confirmed this made MTP speculative decoding
+    never actually engage despite being "enabled". A wrapper adapter that
+    defines its own .generate() must have that method called, never the
+    wrapped target's."""
+    target = _PlainTarget()
+    wrapper = _WrapperEngine(target)
+    result = _engine_generate(wrapper, "prompt", 16)
+    assert result == {"via": "wrapper"}
+    assert wrapper.own_generate_calls == 1
+    assert target.retry_calls == 0
+    assert target.plain_calls == 0
+
+
+def test_engine_generate_uses_plain_targets_own_retry_method():
+    """A real (unwrapped) engine's own generate_with_memory_retry must
+    still be preferred, exactly as before this fix."""
+    target = _PlainTarget()
+    result = _engine_generate(target, "prompt", 16)
+    assert result == {"via": "target-retry"}
+    assert target.retry_calls == 1
+    assert target.plain_calls == 0
 
 
 def _run_all():

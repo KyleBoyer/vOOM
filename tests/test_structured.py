@@ -138,3 +138,72 @@ def test_xgrammar_constraint_accepts_complete_qwen_json_sequence():
         assert float(masked[token]) == 0.0
         constraint.accept_token(token)
     assert constraint.completed
+
+
+class _FakeMatcher:
+    """Stands in for xgr.GrammarMatcher, letting tests choose exactly which
+    bits fill_next_token_bitmask writes and whether accept_token rejects,
+    without a real compiled grammar."""
+
+    def __init__(self, *, allow_all: bool, accept: bool = True):
+        self._allow_all = allow_all
+        self._accept = accept
+
+    def fill_next_token_bitmask(self, bitmask) -> bool:
+        bitmask.fill_(-1 if self._allow_all else 0)
+        return True
+
+    def accept_token(self, token: int) -> bool:
+        return self._accept
+
+    def is_completed(self) -> bool:
+        return False
+
+
+def test_dead_grammar_state_stops_generation_instead_of_crashing():
+    """An under-tuned/untrained model (no native tool-call special tokens,
+    e.g. OLMoE) can commit to a tool-call span it can never complete
+    validly, walking the grammar into a state with genuinely zero legal
+    next tokens. Every position is then -inf, so ANY sampler (greedy argmax
+    included) returns an arbitrary index that the matcher would reject
+    regardless of which one it picked. This must degrade to a clean stop,
+    not a crashed request.
+    """
+    constraint = GrammarConstraint(
+        matcher=_FakeMatcher(allow_all=False, accept=False),
+        vocab_size=8, profile="test")
+    masked = constraint.mask_logits(mx.zeros((8,)))
+    assert bool(mx.all(masked == float("-inf")).item())
+    # Whatever index a sampler picked from an all -inf row is irrelevant --
+    # none of them were ever going to be legal. Must not raise.
+    constraint.accept_token(0)
+    assert constraint.completed
+
+
+def test_rejection_despite_available_tokens_also_stops_cleanly():
+    """Live-reproduced 2026-07-22 against OLMoE-1B-7B: _compiler() builds
+    xgrammar's own vocabulary view via transformers.AutoTokenizer, separate
+    from the raw tokenizers.Tokenizer this engine actually samples/decodes
+    with -- for a checkpoint whose vocabulary the two disagree on (OLMoE's
+    id 0 is an unusual non-BOS/EOS/pad special token, "|||IP_ADDRESS|||"),
+    mask_logits can report real tokens as legal, greedy argmax can pick one
+    of them, and the grammar matcher can still reject it. This is not
+    resampling-recoverable mid-generation either -- it must ALSO degrade to
+    a clean stop rather than crash the whole request, exactly like a fully
+    dead grammar state, even though plenty of tokens were "allowed"."""
+    constraint = GrammarConstraint(
+        matcher=_FakeMatcher(allow_all=True, accept=False),
+        vocab_size=8, profile="test")
+    masked = constraint.mask_logits(mx.zeros((8,)))
+    assert not bool(mx.any(masked == float("-inf")).item())
+    constraint.accept_token(3)
+    assert constraint.completed
+
+
+def test_accepted_token_completes_normally():
+    constraint = GrammarConstraint(
+        matcher=_FakeMatcher(allow_all=True, accept=True),
+        vocab_size=8, profile="test", stop_on_complete=False)
+    constraint.mask_logits(mx.zeros((8,)))
+    constraint.accept_token(3)
+    assert not constraint.completed

@@ -14,6 +14,8 @@ measured sequential KDA path.
 
 from __future__ import annotations
 
+import os
+
 import mlx.core as mx
 import numpy as np
 
@@ -25,6 +27,109 @@ from .kda_state import KDAStateCache
 from .kimi_linear import _causal_depthwise_conv1d
 from .layer_runner import _linear, _swiglu
 from .lm_head_stream import StreamedLMHead
+
+
+def _zmlx_deltanet_kernels():
+    """Lazy import so zmlx stays an optional dependency for everyone who
+    doesn't set rc.zmlx_fused_deltanet_decode (SQ26)."""
+    from zmlx.kernels import deltanet
+    return deltanet
+
+
+def _zmlx_causal_depthwise_conv1d(
+    x: mx.array, weight: mx.array, history: mx.array | None, kernel_size: int,
+) -> tuple[mx.array, mx.array]:
+    """zmlx-fused drop-in for _causal_depthwise_conv1d, decode (L=1) only.
+
+    Real greedy-token quality gate (2026-07-23,
+    tests/test_zmlx_fused_deltanet_decode.py): 24 real generated tokens
+    against Qwen3.5-4B, byte-identical to the existing float32-accumulated
+    implementation despite a genuine per-call bf16 precision difference
+    (SQ26) -- the difference doesn't flip any observed argmax. Callers must
+    only use this for L==1; falls back to the exact existing
+    implementation otherwise as a safety net, not a silent shape assumption.
+    """
+    b, length, channels = x.shape
+    if length != 1:
+        return _causal_depthwise_conv1d(x, weight, history, kernel_size)
+    if history is None:
+        history = mx.zeros((b, kernel_size - 1, channels), dtype=x.dtype)
+    conv_input = mx.concatenate([history, x], axis=1)  # (B, K, C)
+    out, new_history = _zmlx_deltanet_kernels().fused_conv1d_silu(
+        conv_input, weight)
+    return out, new_history
+
+
+def _zmlx_silu_gated_rms_norm(
+    x: mx.array, gate: mx.array, weight: mx.array, eps: float,
+) -> mx.array:
+    """zmlx-fused drop-in for _silu_gated_rms_norm -- see
+    _zmlx_causal_depthwise_conv1d's docstring for the quality-gate proof.
+    Unlike the conv fusion, zmlx's gated_rmsnorm_silu has no shape
+    restriction, but this is still only ever called for L==1 (see
+    _gated_delta_net's own decode-only gating of zmlx_fused_decode)."""
+    return _zmlx_deltanet_kernels().gated_rmsnorm_silu(
+        x, gate, weight, eps=eps)
+
+
+_NATIVE_CONV1D_STEP_SOURCE = """
+    uint c = thread_position_in_grid.x;
+    uint b = thread_position_in_grid.y;
+    uint C = padded_shape[2];
+    uint K = padded_shape[1];
+    if (c >= C) return;
+
+    float acc = 0.0;
+    for (uint k = 0; k < K; k++) {
+        acc += float(padded[(b * K + k) * C + c]) * float(taps[c * K + k]);
+    }
+    float silu = acc / (1.0 + exp(-acc));
+    out[b * C + c] = T(silu);
+"""
+
+_native_conv1d_step_kernel = mx.fast.metal_kernel(
+    name="qwen35_conv1d_decode_step",
+    input_names=["padded", "taps"],
+    output_names=["out"],
+    source=_NATIVE_CONV1D_STEP_SOURCE,
+)
+
+
+def _native_fused_causal_conv1d(
+    x: mx.array, weight: mx.array, history: mx.array | None, kernel_size: int,
+) -> tuple[mx.array, mx.array]:
+    """Native mx.fast.metal_kernel drop-in for _causal_depthwise_conv1d,
+    decode (L=1) only -- fuses the K-tap weighted sum + SiLU into one
+    dispatch instead of K elementwise-multiply-adds + a separate sigmoid*x.
+    F103 (2026-07-24): verified in isolation against the reference math to
+    max abs diff 4.8e-7 (near machine precision, tighter than the DeltaNet
+    step kernel's 1.9e-5 since there's no float32-state-accumulation order
+    difference here, just a reduction over K=4 taps), ~3.9x in an isolated
+    back-to-back microbenchmark -- NOT trusted alone, see
+    tests/test_native_fused_deltanet_decode.py for the real end-to-end
+    verdict this specific fusion produced. Callers must only use this for
+    L==1; falls back to the exact existing implementation otherwise,
+    mirroring _zmlx_causal_depthwise_conv1d's own safety-net convention.
+    """
+    b, length, channels = x.shape
+    if length != 1:
+        return _causal_depthwise_conv1d(x, weight, history, kernel_size)
+    if history is None:
+        history = mx.zeros((b, kernel_size - 1, channels), dtype=x.dtype)
+    padded = mx.concatenate([history, x], axis=1)  # (B, K, C)
+    taps = weight.reshape(channels, kernel_size)
+    out = _native_conv1d_step_kernel(
+        inputs=[padded, taps],
+        template=[("T", x.dtype)],
+        grid=(channels, b, 1),
+        threadgroup=(min(channels, 256), 1, 1),
+        output_shapes=[(b, channels)],
+        output_dtypes=[x.dtype],
+    )[0][:, None, :]
+    new_history = (
+        padded[:, 1:, :] if kernel_size > 1
+        else mx.zeros((b, 0, channels), dtype=x.dtype))
+    return out, new_history
 
 
 def qwen35_rms_norm(x: mx.array, weight: mx.array, eps: float) -> mx.array:
@@ -151,9 +256,193 @@ def _full_attention(
     return _linear(attended, w, f"{prefix}.self_attn.o_proj")
 
 
+# Chunked-parallel DeltaNet (opt-in, 2026-07-23): replaces the sequential
+# per-position recurrence for multi-position sweeps (prefill, speculative
+# verify) with the chunkwise WY form below. Read once at import; toggled by
+# server restart like the other opt-in speed flags.
+_CHUNKED_DELTA_PREFILL = os.environ.get(
+    "VMODEL_QWEN35_CHUNKED_DELTA", "0") == "1"
+
+
+def _sequential_gated_delta_rule(q, k, v, beta, decay, state):
+    """The verbatim per-position recurrence (q,k,v: (B,L,H,dim) float32;
+    beta/decay: (B,L,H); state: (B,H,K,V)). Factored out so the chunked
+    twin below can be math-A/B'd directly against it -- this loop is the
+    path already oracle-verified against real HF sources."""
+    length = q.shape[1]
+    outputs = []
+    for position in range(length):
+        q_t = q[:, position]
+        k_t = k[:, position]
+        v_t = v[:, position]
+        state = state * mx.exp(decay[:, position])[..., None, None]
+        predicted = mx.sum(k_t[..., None] * state, axis=-2)
+        delta = (v_t - predicted) * beta[:, position, :, None]
+        state = state + k_t[..., None] * delta[..., None, :]
+        outputs.append(mx.sum(q_t[..., None] * state, axis=-2))
+        if (position + 1) % 32 == 0:
+            mx.eval(state)
+    return mx.stack(outputs, axis=1), state
+
+
+_NATIVE_DELTANET_STEP_SOURCE = """
+    uint dv = thread_position_in_grid.x;
+    uint h  = thread_position_in_grid.y;
+    uint b  = thread_position_in_grid.z;
+    uint Dk = state_shape[2];
+    uint Dv = state_shape[3];
+    uint H  = state_shape[1];
+    if (dv >= Dv) return;
+
+    float dec = exp(float(decay[(b * H) + h]));
+    float bet = float(beta[(b * H) + h]);
+    float vt  = float(v[(b * H + h) * Dv + dv]);
+    uint state_base = ((b * H + h) * Dk) * Dv + dv;
+
+    float predicted = 0.0;
+    for (uint dk = 0; dk < Dk; dk++) {
+        float s = float(state[state_base + dk * Dv]) * dec;
+        out_state[state_base + dk * Dv] = T(s);
+        predicted += float(k[(b * H + h) * Dk + dk]) * s;
+    }
+    float delta = (vt - predicted) * bet;
+
+    float o = 0.0;
+    for (uint dk = 0; dk < Dk; dk++) {
+        float kk = float(k[(b * H + h) * Dk + dk]);
+        float s = float(out_state[state_base + dk * Dv]) + kk * delta;
+        out_state[state_base + dk * Dv] = T(s);
+        o += float(q[(b * H + h) * Dk + dk]) * s;
+    }
+    out[(b * H + h) * Dv + dv] = T(o);
+"""
+
+_native_deltanet_step_kernel = mx.fast.metal_kernel(
+    name="qwen35_deltanet_decode_step",
+    input_names=["q", "k", "v", "beta", "decay", "state"],
+    output_names=["out", "out_state"],
+    source=_NATIVE_DELTANET_STEP_SOURCE,
+)
+
+
+def _native_fused_gated_delta_step(q, k, v, beta, decay, state):
+    """Hand-written `mx.fast.metal_kernel` fusion of the ENTIRE single-position
+    recurrence body (decay-scale, predicted-value dot, delta, state update,
+    output dot) into one Metal dispatch, for decode (L=1) only.
+
+    F103 (2026-07-24): this is a from-scratch custom kernel, NOT zmlx (SQ26's
+    third-party library, found to be a net decode slowdown despite winning an
+    isolated microbenchmark -- attributed to per-call dispatch/abstraction
+    overhead that a real, interleaved generate() loop doesn't get to amortize
+    the way a 200-iteration back-to-back loop does). Verified in isolation
+    against `_sequential_gated_delta_rule`'s single-step body at real
+    Qwen3.5-4B dimensions (H=32, Dk=Dv=128): max abs diff ~1.9e-5 (float32
+    accumulation-order noise, same class of tolerance this project already
+    accepts for zmlx's conv/rmsnorm fusions), ~2.1x faster in that same
+    isolated back-to-back loop. Given the zmlx precedent, an isolated win is
+    NOT proof of a real decode-loop win -- real end-to-end A/B on an actual
+    model is the only claim this project trusts (see
+    tests/test_native_fused_deltanet_decode.py and the dated STATUS.md entry
+    for whichever verdict that real test produced).
+
+    Callers must only invoke this for L==1 (single decode position); q/k/v
+    here are already squeezed to (B,H,dim) -- the L axis is the caller's
+    responsibility, mirroring _zmlx_causal_depthwise_conv1d's convention.
+    """
+    B, H, Dk = q.shape
+    Dv = v.shape[-1]
+    outputs = _native_deltanet_step_kernel(
+        inputs=[q, k, v, beta, decay, state],
+        template=[("T", state.dtype)],
+        grid=(Dv, H, B),
+        threadgroup=(min(Dv, 256), 1, 1),
+        output_shapes=[(B, H, Dv), state.shape],
+        output_dtypes=[state.dtype, state.dtype],
+    )
+    return outputs[0], outputs[1]
+
+
+def _chunked_gated_delta_rule(q, k, v, beta, decay, state, chunk: int = 64):
+    """Chunkwise (WY/UT-transform) form of the SAME recurrence.
+
+    Standard parallelization of the gated delta rule (Gated DeltaNet paper;
+    fla's chunk_gated_delta_rule implements the same algebra in Triton):
+    within a chunk, unrolling S_j = a_j*S_{j-1} + k_j u_j^T with
+    u_j = beta_j (v_j - (a_j S_{j-1})^T k_j) gives a unit-lower-triangular
+    system (I + M) U = R with
+      M[j,l] = beta_j * (A_j/A_l) * (k_j . k_l)   (l < j)
+      R_j    = beta_j * (v_j - A_j * k_j^T S_0)
+      A_j    = exp(cumsum(decay)_j)
+    solved by forward substitution (C tiny steps instead of C full
+    (K,V)-state updates), after which outputs and the end-of-chunk state
+    are plain matmuls:
+      o_j = A_j * q_j^T S_0 + sum_{l<=j} (A_j/A_l)(q_j . k_l) u_l
+      S_C = A_C * S_0 + Kc^T diag(A_C/A_l) U
+    Inputs/outputs and semantics identical to _sequential_gated_delta_rule
+    (decay applied before the read, output taken from the post-update
+    state) -- proven equivalent to <=1e-4 in
+    tests/test_chunked_delta_rule_oracle.py.
+    """
+    B, L, H, K = k.shape
+    outputs = []
+    for start in range(0, L, chunk):
+        end = min(start + chunk, L)
+        C = end - start
+        qc = q[:, start:end].transpose(0, 2, 1, 3)      # (B,H,C,K)
+        kc = k[:, start:end].transpose(0, 2, 1, 3)
+        vc = v[:, start:end].transpose(0, 2, 1, 3)      # (B,H,C,V)
+        bc = beta[:, start:end].transpose(0, 2, 1)      # (B,H,C)
+        cs = mx.cumsum(decay[:, start:end].transpose(0, 2, 1), axis=-1)
+        A = mx.exp(cs)                                   # (B,H,C) = A_j
+        # G[j,l] = A_j / A_l = exp(cs_j - cs_l); bounded <= 1 for l <= j
+        # since decay <= 0. For l > j (never a valid term -- both M and the
+        # output masks zero it out) the exponent is >= 0 and can be large
+        # enough to overflow to +inf at real model scale; inf * 0 = nan,
+        # which then poisons the whole chunk (caught live: real prefill
+        # produced all-token-0 garbage despite the small-scale oracle test
+        # passing -- its random decay range never got large enough to
+        # overflow). Mask the exponent itself, not just the product, so an
+        # invalid entry becomes exp(-inf) = 0 exactly, never inf * 0.
+        incl_lower = mx.tri(C, k=0, dtype=q.dtype)
+        neg_inf = mx.array(-float("inf"), dtype=cs.dtype)
+        exponent = mx.where(
+            incl_lower.astype(mx.bool_), cs[..., :, None] - cs[..., None, :],
+            neg_inf)
+        G = mx.exp(exponent)                             # (B,H,C,C), 0 above diag
+        kk = kc @ kc.swapaxes(-1, -2)                    # (B,H,C,C)
+        strict_lower = mx.tri(C, k=-1, dtype=q.dtype)
+        M = bc[..., :, None] * G * kk * strict_lower
+        k_s0 = kc @ state                                # (B,H,C,V)
+        R = bc[..., None] * (vc - A[..., None] * k_s0)
+        # Forward substitution on the unit-lower-triangular system: C tiny
+        # steps -- the sequential dependency shrinks from full-state updates
+        # to C-length dot products.
+        u_rows = []
+        for j in range(C):
+            u_j = R[..., j, :]
+            if j:
+                stacked = mx.stack(u_rows, axis=-2)       # (B,H,j,V)
+                u_j = u_j - mx.sum(
+                    M[..., j, :j, None] * stacked, axis=-2)
+            u_rows.append(u_j)
+        U = mx.stack(u_rows, axis=-2)                     # (B,H,C,V)
+        qk = qc @ kc.swapaxes(-1, -2)
+        o = A[..., None] * (qc @ state) + (G * qk * incl_lower) @ U
+        outputs.append(o.transpose(0, 2, 1, 3))           # (B,C,H,V)
+        A_last = A[..., -1]                               # (B,H)
+        carry = mx.exp(cs[..., -1, None] - cs)            # A_C/A_l, (B,H,C)
+        state = A_last[..., None, None] * state + (
+            kc.swapaxes(-1, -2) @ (carry[..., None] * U))
+        mx.eval(state)
+    return mx.concatenate(outputs, axis=1), state
+
+
 def _gated_delta_net(
     h: mx.array, w: dict, prefix: str, cfg: ModelConfig,
     state_cache: KDAStateCache | None, layer: int,
+    zmlx_fused_decode: bool = False,
+    defer_state_eval: bool = False,
+    native_fused_decode: bool = False,
 ) -> mx.array:
     batch, length, _ = h.shape
     key_heads = cfg.linear_num_key_heads
@@ -174,7 +463,13 @@ def _gated_delta_net(
         state_cache.conv_history(layer) if state_cache is not None else None)
     if cached_history is not None:
         history = cached_history[0]
-    mixed, new_history = _causal_depthwise_conv1d(
+    conv_fn = _causal_depthwise_conv1d
+    if length == 1:
+        if native_fused_decode:
+            conv_fn = _native_fused_causal_conv1d
+        elif zmlx_fused_decode:
+            conv_fn = _zmlx_causal_depthwise_conv1d
+    mixed, new_history = conv_fn(
         mixed, w[f"{prefix}.linear_attn.conv1d.weight"], history, kernel)
     q, k, v = mx.split(mixed, (key_width, 2 * key_width), axis=-1)
     q = q.reshape(batch, length, key_heads, key_dim)
@@ -208,27 +503,34 @@ def _gated_delta_net(
     if state is None:
         state = mx.zeros(
             (batch, value_heads, key_dim, value_dim), dtype=mx.float32)
-    outputs = []
-    for position in range(length):
-        q_t = q[:, position]
-        k_t = k[:, position]
-        v_t = v[:, position]
-        state = state * mx.exp(decay[:, position])[..., None, None]
-        predicted = mx.sum(k_t[..., None] * state, axis=-2)
-        delta = (v_t - predicted) * beta[:, position, :, None]
-        state = state + k_t[..., None] * delta[..., None, :]
-        outputs.append(mx.sum(q_t[..., None] * state, axis=-2))
-        if (position + 1) % 32 == 0:
-            mx.eval(state)
-    output = mx.stack(outputs, axis=1)
+    if _CHUNKED_DELTA_PREFILL and length > 1:
+        output, state = _chunked_gated_delta_rule(q, k, v, beta, decay, state)
+    elif native_fused_decode and length == 1:
+        # F103: hand-written mx.fast.metal_kernel fusion of the single-step
+        # recurrence body. See _native_fused_gated_delta_step's docstring.
+        step_out, state = _native_fused_gated_delta_step(
+            q[:, 0], k[:, 0], v[:, 0], beta[:, 0], decay[:, 0], state)
+        output = step_out[:, None]
+    else:
+        output, state = _sequential_gated_delta_rule(q, k, v, beta, decay, state)
     if state_cache is not None:
-        mx.eval(state)
+        # Per-layer state eval is a bounded-lazy-graph checkpoint for long
+        # prefill sweeps, but at decode (L=1) it is one of ~24 pure GPU sync
+        # points per token. The resident hybrid fast path (engine._sweep)
+        # defers it and batch-evals every layer's updated state in ONE call
+        # at the sweep boundary instead -- identical arithmetic, different
+        # eval boundary only.
+        if not defer_state_eval:
+            mx.eval(state)
         state_cache.set_state(layer, state)
         state_cache.set_conv_history(layer, (new_history,))
 
     z = _linear(h, w, f"{prefix}.linear_attn.in_proj_z").reshape(
         batch, length, value_heads, value_dim)
-    output = _silu_gated_rms_norm(
+    norm_fn = (
+        _zmlx_silu_gated_rms_norm if zmlx_fused_decode and length == 1
+        else _silu_gated_rms_norm)
+    output = norm_fn(
         output, z, w[f"{prefix}.linear_attn.norm.weight"],
         cfg.rms_norm_eps)
     output = output.reshape(batch, length, value_width)
@@ -294,6 +596,9 @@ def run_qwen35_block(
     layer: int, offset: int, get_experts, mlp_last_only: bool = False,
     iter_expert_batches=None,
     positions3: np.ndarray | mx.array | None = None,
+    zmlx_fused_decode: bool = False,
+    defer_state_eval: bool = False,
+    native_fused_decode: bool = False,
 ) -> mx.array:
     residual = x
     h = qwen35_rms_norm(
@@ -301,7 +606,10 @@ def run_qwen35_block(
     layer_type = cfg.layer_types[layer]
     if layer_type == "linear_attention":
         mixed = _gated_delta_net(
-            h, w, prefix, cfg, getattr(kv, "kda_cache", None), layer)
+            h, w, prefix, cfg, getattr(kv, "kda_cache", None), layer,
+            zmlx_fused_decode=zmlx_fused_decode,
+            defer_state_eval=defer_state_eval,
+            native_fused_decode=native_fused_decode)
     elif layer_type == "full_attention":
         mixed = _full_attention(
             h, w, prefix, cfg, kv, layer, offset, positions3)

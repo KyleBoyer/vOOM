@@ -55,8 +55,18 @@ def _attention(
     offset: int,
     rope_freqs: mx.array | None = None,
     rope_mscale: float = 1.0,
+    sliding_window: int = 0,
 ) -> mx.array:
-    """Attention sub-block on pre-normed input h. Returns o_proj output (no residual)."""
+    """Attention sub-block on pre-normed input h. Returns o_proj output (no residual).
+
+    ``sliding_window`` (0 = disabled, ordinary full attention): bounds
+    attention to the last N keys, matching gpt-oss's own
+    "sliding_attention" layer-type handling (runtime/gptoss.py) -- added
+    for Jet-Nemotron's "swa" layer type, which needs the identical
+    mask-during-prefill/truncate-during-decode treatment but otherwise
+    reuses this function unchanged (bias-based QKV already handled
+    generically via _linear, no QK-norm since those weights are simply
+    absent for this checkpoint)."""
     B, L, _ = h.shape
     n_h, n_kv, hd = cfg.num_attention_heads, cfg.num_key_value_heads, cfg.head_dim
 
@@ -147,13 +157,24 @@ def _attention(
     else:
         keys, values = kv.update(layer, k, v)
 
-    # Single query token attends to everything. Multi-token windows need an
-    # explicit causal mask aligned to the cache offset ("causal" assumes offset 0).
+    if sliding_window and L == 1 and keys.shape[2] > sliding_window:
+        # Decode fast path: a sliding layer only ever attends to the last
+        # `window` keys -- unmasked single-token attention here would
+        # silently corrupt generations past ~window tokens.
+        keys = keys[:, :, -sliding_window:, :]
+        values = values[:, :, -sliding_window:, :]
+
+    # Single query token attends to everything (subject to the decode-path
+    # truncation above). Multi-token windows need an explicit causal (+
+    # sliding) mask aligned to the cache offset ("causal" assumes offset 0).
     mask = None
     if L > 1:
         q_pos = query_positions[:, None]
         k_pos = mx.arange(keys.shape[2])[None, :]
-        mask = mx.where(k_pos <= q_pos, 0.0, float("-inf")).astype(q.dtype)
+        allowed = k_pos <= q_pos
+        if sliding_window:
+            allowed = allowed & (k_pos > q_pos - sliding_window)
+        mask = mx.where(allowed, 0.0, float("-inf")).astype(q.dtype)
 
     attn = mx.fast.scaled_dot_product_attention(
         q, keys, values, scale=hd**-0.5, mask=mask)

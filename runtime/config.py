@@ -117,10 +117,31 @@ class ModelConfig:
     linear_key_head_dim: int = 0
     linear_value_head_dim: int = 0
     linear_conv_kernel_dim: int = 4
+    # Jet-Nemotron (jet-ai/Jet-Nemotron-4B/2B) JetBlock hybrid -- a THIRD,
+    # distinct layer-type mix (see docs/future_lossless_techniques.md): "jet"
+    # (JetBlock, gated-delta-rule + a dynamically-generated per-token causal
+    # conv on V), "swa" (sliding-window attention), "attn" (full attention).
+    # layer_types entries are the raw strings ("jet"/"swa"/"attn") per layer,
+    # not pre-split index tuples like kda_layers/full_attn_layers above --
+    # Jet-Nemotron's own config.json already ships them this way and three
+    # categories make paired 0/1-of-N tuples awkward; dispatch reads
+    # layer_types[i] directly instead.
+    jet_num_heads: int = 0
+    jet_head_dim: int = 0
+    jet_head_v_dim: int = 0  # head_dim * expand_v (may make expand_v non-integer)
+    jet_conv_kernel_size: int = 4
+    jet_dconv_generator_reduction: int = 8
+    jet_sliding_window: int = 0
     shared_expert_intermediate_size: int = 0
     partial_rotary_factor: float = 1.0
     attn_output_gate: bool = False
     moe_layer_freq: int = 1
+    # Afmoe (Trinity Nano/Mini): embedding-level maximal-update-
+    # parametrization scale, hidden_states *= hidden_size**0.5, applied once
+    # right after embed_tokens (runtime/engine.py::_embed), before any
+    # layer. False (the default) for every other architecture -- none of
+    # them set this.
+    mup_enabled: bool = False
     # F92/F93: expert tensor prefix under each layer. GLM/gpt-oss/OLMoE/
     # generic Mixtral-style checkpoints use "mlp.experts"; Kimi's MoE module
     # is named "block_sparse_moe" instead. Every expert-fetch call site in
@@ -279,6 +300,30 @@ class ModelConfig:
             kda_num_heads = linear_attn_config.get("num_heads", 0)
             kda_conv_kernel_size = linear_attn_config.get("short_conv_kernel_size", 4)
 
+        # Jet-Nemotron (jet-ai/Jet-Nemotron-4B/2B): a THIRD, distinct hybrid
+        # layout alongside kda_layers/linear_attn_config above -- see
+        # docs/future_lossless_techniques.md. layer_types (already captured
+        # generically below, same field gpt-oss uses) carries the raw
+        # "jet"/"swa"/"attn" strings directly; only the per-block-kind
+        # dimensions live in efficient_attention_config, nested under keys
+        # matching each layer_types entry.
+        jet_num_heads = jet_head_dim = jet_head_v_dim = 0
+        jet_conv_kernel_size = 4
+        jet_dconv_generator_reduction = 8
+        jet_sliding_window = 0
+        efficient_attention_config = raw.get("efficient_attention_config")
+        if efficient_attention_config is not None:
+            jet_cfg = efficient_attention_config.get("jet", {})
+            jet_num_heads = jet_cfg.get("num_heads", 0)
+            jet_head_dim = jet_cfg.get("head_dim", 0)
+            expand_v = jet_cfg.get("expand_v", 1)
+            jet_head_v_dim = round(jet_head_dim * expand_v)
+            jet_conv_kernel_size = jet_cfg.get("conv_size", 4)
+            jet_dconv_generator_reduction = jet_cfg.get(
+                "dconv_generator_reduction", 8)
+            jet_sliding_window = efficient_attention_config.get(
+                "swa", {}).get("window_size", 0)
+
         return cls(
             model_type=raw.get("model_type", "llama"),
             hidden_size=raw["hidden_size"],
@@ -305,15 +350,17 @@ class ModelConfig:
             num_experts=raw.get("num_experts", raw.get("n_routed_experts", raw.get("num_local_experts", 0))),
             num_experts_per_tok=raw.get("num_experts_per_tok", raw.get(
                 "experts_per_token", raw.get("num_experts_per_token", 0))),
-            norm_topk_prob=raw.get("norm_topk_prob", raw.get("moe_renormalize", False)),
+            norm_topk_prob=raw.get("norm_topk_prob", raw.get(
+                "moe_renormalize", raw.get("route_norm", False))),
             layer_types=tuple(raw.get("layer_types", ())),
-            sliding_window=raw.get("sliding_window") or 0,
+            sliding_window=raw.get("sliding_window") or jet_sliding_window or 0,
             swiglu_limit=raw.get("swiglu_limit", 7.0),
             # Qwen3.5/3.6 names the same multimodal RoPE payload
             # ``rope_parameters``. Preserve it under the runtime's historical
             # rope_scaling field so vision/text position code has one source.
             rope_scaling=raw.get("rope_scaling", raw.get("rope_parameters")),
-            first_k_dense_replace=raw.get("first_k_dense_replace", 0),
+            first_k_dense_replace=raw.get("first_k_dense_replace", raw.get(
+                "num_dense_layers", 0)),
             qk_nope_head_dim=raw.get("qk_nope_head_dim", 0),
             qk_rope_head_dim=raw.get("qk_rope_head_dim", 0),
             v_head_dim=raw.get("v_head_dim", 0),
@@ -325,7 +372,9 @@ class ModelConfig:
             n_shared_experts=raw.get("n_shared_experts", raw.get("num_shared_experts", 0)),
             n_group=raw.get("n_group", raw.get("num_expert_group", 1)),
             topk_group=raw.get("topk_group", 1),
-            routed_scaling_factor=raw.get("routed_scaling_factor", 1.0),
+            routed_scaling_factor=raw.get("routed_scaling_factor", raw.get(
+                "route_scale", 1.0)),
+            mup_enabled=raw.get("mup_enabled", False),
             mlp_layer_types=tuple(raw.get("mlp_layer_types", ())),
             num_nextn_predict_layers=raw.get("num_nextn_predict_layers", 0),
             # F93 (2026-07-19, real-oracle-verified): DeepSeek-V3-family
@@ -368,6 +417,12 @@ class ModelConfig:
             linear_key_head_dim=raw.get("linear_key_head_dim", 0),
             linear_value_head_dim=raw.get("linear_value_head_dim", 0),
             linear_conv_kernel_dim=raw.get("linear_conv_kernel_dim", 4),
+            jet_num_heads=jet_num_heads,
+            jet_head_dim=jet_head_dim,
+            jet_head_v_dim=jet_head_v_dim,
+            jet_conv_kernel_size=jet_conv_kernel_size,
+            jet_dconv_generator_reduction=jet_dconv_generator_reduction,
+            jet_sliding_window=jet_sliding_window,
             shared_expert_intermediate_size=raw.get(
                 "shared_expert_intermediate_size", 0),
             partial_rotary_factor=raw.get(

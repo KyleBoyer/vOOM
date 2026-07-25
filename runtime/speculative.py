@@ -653,7 +653,14 @@ class SpeculativeEngine:
             kwargs["sampling"] = sampling
         if constraint is not None:
             kwargs["constraint"] = constraint
-        result = self.target.generate(prompt, max_tokens, **kwargs)
+        # Prefer the target's OWN fail-slow prefill retry (a genuine bound
+        # method on the plain StreamingEngine, not a delegated wrapper
+        # attribute -- see _engine_generate's docstring in server.py for
+        # the equivalent mistake this class's own __getattr__ used to let
+        # the server-side caller make one level up).
+        target_generate = getattr(
+            self.target, "generate_with_memory_retry", self.target.generate)
+        result = target_generate(prompt, max_tokens, **kwargs)
         path_stats = result.setdefault("path_stats", {})
         path_stats.update({
             "speculative_enabled": 1,

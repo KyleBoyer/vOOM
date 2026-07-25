@@ -21,7 +21,7 @@ import mlx.core as mx
 import numpy as np
 
 from . import layer_runner
-from .kv_cache import KVCache
+from .kv_cache import KVCache, fork_hybrid_kv_endpoint
 from .sampler import SamplingParams, sample
 from .vision_positions import (build_multimodal_positions, image_grid_size,
                                MAX_GLOBAL_VISION_PATCHES,
@@ -381,35 +381,6 @@ def _store_vision_prompt_cache(engine, key, kv, logits, prompt_tokens: int, *,
         "approximate": bool(approximate),
     })
     return True
-
-
-def _fork_hybrid_prompt_endpoint(kv: KVCache) -> KVCache:
-    """Share an evaluated Qwen3.6 prompt endpoint before decode advances it.
-
-    Plain KVCache updates replace attention arrays with concatenations, and
-    KDAStateCache updates replace recurrent arrays, so the evaluated prompt
-    buffers are immutable under subsequent decode.  SteppedKVCache writes into
-    spare capacity in place and is deliberately rejected until it has a
-    dedicated copy-on-write snapshot operation.
-    """
-    if type(kv) is not KVCache:
-        raise TypeError("hybrid vision endpoint snapshots require plain KVCache")
-    recurrent = getattr(kv, "kda_cache", None)
-    if recurrent is None:
-        raise ValueError("hybrid vision endpoint is missing recurrent state")
-    snapshot = KVCache(len(kv.keys))
-    snapshot.keys = list(kv.keys)
-    snapshot.values = list(kv.values)
-    snapshot.compressed_mla = kv.compressed_mla
-    snapshot.kda_cache = recurrent.fork()
-    arrays = [
-        value for value in (*snapshot.keys, *snapshot.values)
-        if value is not None
-    ]
-    if arrays:
-        mx.eval(*arrays)
-    snapshot.kda_cache.synchronize()
-    return snapshot
 
 
 def _vision_prompt_cache_mode(cached_prompt, tokens, cfg) -> str | None:
@@ -1275,10 +1246,10 @@ def generate_vl(engine, prompt_text: str, images, max_tokens: int = 64,
     # replacement-based for this plain-cache path, so decode advances only the
     # live owner. The retained copy can serve an exact repeat or text suffix.
     hybrid_prompt_kv = (
-        _fork_hybrid_prompt_endpoint(kv) if hybrid_recurrent else None)
+        fork_hybrid_kv_endpoint(kv) if hybrid_recurrent else None)
     decode_t0 = time.perf_counter()
     sampled_logits = constraint.mask_logits(logits) if constraint is not None else logits
-    next_tok = sample(sampled_logits, sampling)
+    next_tok = sample(sampled_logits, sampling, history=tokens)
     if constraint is not None:
         constraint.accept_token(next_tok)
     grammar_completed = bool(
@@ -1366,7 +1337,10 @@ def generate_vl(engine, prompt_text: str, images, max_tokens: int = 64,
             sampled_logits = (
                 constraint.mask_logits(logits)
                 if constraint is not None else logits)
-            next_tok = sample(sampled_logits, sampling)
+            next_tok = sample(
+                sampled_logits, sampling,
+                history=tokens + generated
+                if sampling.repetition_penalty != 1.0 else None)
             if constraint is not None:
                 constraint.accept_token(next_tok)
                 grammar_completed = bool(constraint.completed)

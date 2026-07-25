@@ -269,7 +269,7 @@ def test_hybrid_prompt_endpoint_snapshot_is_not_advanced_by_decode():
     kv.kda_cache.set_state(0, mx.array([[[[7.0]]]]))
     kv.kda_cache.set_conv_history(0, (mx.array([[[8.0]]]),))
 
-    snapshot = qwen3vl._fork_hybrid_prompt_endpoint(kv)
+    snapshot = qwen3vl.fork_hybrid_kv_endpoint(kv)
     kv.update(1, mx.array([[[[9.0]]]]), mx.array([[[[10.0]]]]))
     kv.kda_cache.set_state(0, mx.array([[[[11.0]]]]))
     mx.eval(*kv.keys[1:], *kv.values[1:])

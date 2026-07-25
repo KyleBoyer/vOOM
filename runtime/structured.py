@@ -208,6 +208,29 @@ def _xgrammar():
     return xgr
 
 
+def _relax_layer_type_validation() -> None:
+    """Drop transformers' ``validate_layer_type`` class validator.
+
+    Newer transformers versions added a strict enum check on
+    ``PretrainedConfig.layer_types`` against a hardcoded whitelist (see
+    ``transformers/configuration_utils.py``). Third-party remote-code archs
+    that predate this check (e.g. Jet-Nemotron's real released config, which
+    uses "jet"/"swa"/"attn") fail ``AutoConfig``/``AutoTokenizer.from_pretrained``
+    with a ``StrictDataclassClassValidationError`` even though ``layer_types``
+    is never consulted by transformers' own generic code -- only by that
+    model's own remote modeling file, which reads the raw strings directly.
+    Validation-only, so this cannot change any model's actual computation.
+    """
+    from transformers.configuration_utils import PretrainedConfig
+
+    validators = getattr(PretrainedConfig, "__class_validators__", None)
+    if not validators or not any(
+            v.__name__ == "validate_layer_type" for v in validators):
+        return
+    PretrainedConfig.__class_validators__ = [
+        v for v in validators if v.__name__ != "validate_layer_type"]
+
+
 def _compiler(engine):
     compiler = getattr(engine, "_xgrammar_compiler", None)
     if compiler is not None:
@@ -216,6 +239,7 @@ def _compiler(engine):
     try:
         from transformers import AutoTokenizer
 
+        _relax_layer_type_validation()
         tokenizer = AutoTokenizer.from_pretrained(
             str(engine._model_dir), local_files_only=True)
         info = xgr.TokenizerInfo.from_huggingface(
@@ -275,14 +299,37 @@ class GrammarConstraint:
         self._bitmask = xgr.allocate_token_bitmask(1, self.vocab_size)
         self._token_indices = mx.arange(self.vocab_size, dtype=mx.uint32)
         self.completed = False
+        self._dead_end = False
 
     @classmethod
-    def json(cls, engine, schema: dict | None = None, *, strict: bool = True):
+    def json(cls, engine, schema: dict | None = None, *, strict: bool = True,
+             canonical_whitespace: bool = False):
+        """`canonical_whitespace=True` compiles with `any_whitespace=False`
+        (the same no-extra-whitespace convention `.tools()`'s required-tool
+        grammar already uses) instead of the default `any_whitespace=True`.
+
+        This is a real formatting change, not just an internal detail: with
+        `any_whitespace=True`, xgrammar's `find_jump_forward_string()`
+        degenerates to almost nothing (measured: just `'{'` for a real
+        3-field schema) because arbitrary whitespace could legally precede
+        every key/punctuation mark, so nothing past the opening brace is
+        actually determined. `any_whitespace=False` collapses that
+        uncertainty and forces the canonical `{"key": ` span too (measured:
+        `'{"title": "'` for the same schema) -- directly raising F98's
+        forced fraction for JSON-schema-constrained requests, the same way
+        the tool-call grammar already benefits. Gated to the lossy profile
+        (server.py only sets this alongside `grammar_jump_forward_lossy`)
+        because it changes emitted JSON whitespace byte-for-byte versus
+        what the model would naturally produce unconstrained -- a real
+        lossy tradeoff on output formatting, not merely an implementation
+        detail, even though JSON semantics/content are unaffected either way.
+        """
         compiler = _compiler(engine)
+        any_whitespace = not canonical_whitespace
         compiled = (compiler.compile_builtin_json_grammar()
                     if schema is None else
                     compiler.compile_json_schema(
-                        schema, any_whitespace=True, strict_mode=strict))
+                        schema, any_whitespace=any_whitespace, strict_mode=strict))
         xgr = _xgrammar()
         return cls(
             xgr.GrammarMatcher(
@@ -323,6 +370,7 @@ class GrammarConstraint:
             return logits
         need_apply = self.matcher.fill_next_token_bitmask(self._bitmask)
         if not need_apply:
+            self._dead_end = False
             return logits
         words = mx.array(
             self._bitmask.numpy().reshape(-1).astype(np.int32)).astype(mx.uint32)
@@ -331,11 +379,125 @@ class GrammarConstraint:
             (words[(indices // 32).astype(mx.int32)] >> (indices % 32))
             & mx.array(1, dtype=mx.uint32)
         ) != 0
+        # An under-tuned/untrained model (e.g. no native tool-call special
+        # tokens) can commit to a tool-call span it cannot complete validly,
+        # walking the grammar into a state with genuinely zero legal next
+        # tokens. Every position is then -inf and any sampler (greedy argmax
+        # included) returns an arbitrary index that accept_token() below
+        # will reject regardless of which one it picked. Recording that
+        # here lets accept_token() log this specific, expected case at a
+        # lower level of concern than an ordinary rejection (see there).
+        self._dead_end = not bool(mx.any(allowed).item())
         return mx.where(allowed, logits.reshape(-1), float("-inf"))
 
     def accept_token(self, token: int) -> None:
         if not self.matcher.accept_token(int(token)):
-            raise RuntimeError(
-                f"constrained decoder sampled token {token} outside its grammar")
+            # _compiler() (above) builds xgrammar's own tokenizer/vocabulary
+            # view via `transformers.AutoTokenizer`, separate from the raw
+            # `tokenizers.Tokenizer` this engine samples/decodes with
+            # elsewhere -- live-confirmed 2026-07-22 that the two disagree
+            # for OLMoE-1B-7B (whose vocabulary includes an unusual
+            # non-BOS/EOS/pad special token at id 0, "|||IP_ADDRESS|||"):
+            # mask_logits above reported real tokens as legal, greedy argmax
+            # picked one of them, and the grammar matcher still rejected it.
+            # A dead grammar state (see mask_logits) hits this same path
+            # for a different, better-understood reason: an under-tuned
+            # model with no native tool-call tokens can commit to a
+            # tool-call span it can never complete validly. Neither case is
+            # recoverable by resampling mid-generation -- stop the response
+            # cleanly with whatever valid content exists so far rather than
+            # failing the whole request over one token choice.
+            if not self._dead_end:
+                print(
+                    f"[structured] constrained decoder rejected token {token} "
+                    f"despite mask_logits allowing it (profile={self.profile}); "
+                    "stopping generation for this request rather than failing it",
+                    flush=True,
+                )
+            self.completed = True
+            return
         self.completed = bool(
             self.stop_on_complete and self.matcher.is_completed())
+
+    def forced_run(self, limit: int, encode=None) -> list[int]:
+        """Grammar fast-forward (jump-forward decoding, token-level exact
+        variant): return the run of tokens the grammar FORCES next.
+
+        ``encode`` (optional, LOSSY-profile only): a ``str -> list[int]``
+        tokenizer callback enabling SGLang-style STRING-level jump-forward
+        via ``matcher.find_jump_forward_string()``. Measured 2026-07-23 on a
+        real required-tool grammar: the exact token-level check below almost
+        never fires (1 forced token in a 39-token call) because the grammar
+        is byte-level -- in a forced-STRING region many BPE tokens are still
+        legal (every token spelling a prefix of the forced text), so
+        "exactly one legal token" is rare even where the text is fully
+        determined. The string-level variant commits the canonical
+        tokenization of the forced string instead (59 forced chars at the
+        same tool-call state). That can DIFFER from the tokenization the
+        model itself would have picked through per-token masked argmax
+        (identical rendered text, different token ids), so it is gated to
+        the fast/lossy profile and never the lossless target.
+
+        Whenever the grammar allows exactly one legal next token, the
+        constrained sampler's masked argmax is guaranteed to pick it
+        regardless of model logits (every other position is -inf) -- so the
+        token's identity needs no model forward pass at all, only its KV/
+        recurrent-state update, which the caller batches into one
+        multi-position sweep. This is byte-identical to the plain
+        constrained path BY CONSTRUCTION (unlike SGLang-style string-level
+        jump-forward, which can change tokenization): each committed token
+        is precisely the one the plain per-token loop would have sampled.
+
+        Each returned token has already been accepted into the matcher.
+        Stops at `limit`, at grammar completion (setting self.completed,
+        mirroring accept_token), at a dead-end/ambiguous state, or when the
+        mask allows more than one token (the model must genuinely choose).
+        """
+        # is_terminated() guard: the auto tool profile terminates via an
+        # accepted stop token WITHOUT setting self.completed
+        # (stop_on_complete=False), and xgrammar hard-fails
+        # find_jump_forward_string()/further stepping on a terminated
+        # matcher (live-crashed 2026-07-23 on the real Plex capture; the
+        # required-tool synthetic test never hit it because that profile
+        # terminates without a stop token and sets completed instead).
+        if self.completed or self.matcher.is_terminated():
+            return []
+        if encode is not None:
+            jump = self.matcher.find_jump_forward_string()
+            if len(jump) >= 2:
+                forced: list[int] = []
+                for token in list(encode(jump))[:limit]:
+                    if not self.matcher.accept_token(int(token)):
+                        # A canonical tokenization of grammar-forced text
+                        # should always be accepted; fail closed to the
+                        # per-token path on any disagreement.
+                        break
+                    forced.append(int(token))
+                    if self.matcher.is_terminated() or self.matcher.is_completed():
+                        if self.stop_on_complete and self.matcher.is_completed():
+                            self.completed = True
+                        break
+                if forced:
+                    return forced
+        forced = []
+        while len(forced) < limit:
+            if not self.matcher.fill_next_token_bitmask(self._bitmask):
+                break  # no mask needed -> everything legal -> not forced
+            words = self._bitmask.numpy().reshape(-1).astype(np.int32)
+            bits = np.unpackbits(
+                words.astype("<i4").view(np.uint8), bitorder="little")
+            allowed = np.flatnonzero(bits[:self.vocab_size])
+            if allowed.size != 1:
+                break  # free choice (or dead end -- normal path handles it)
+            token = int(allowed[0])
+            if not self.matcher.accept_token(token):
+                # Should be impossible (the matcher itself reported the
+                # token as the only legal one); fail closed to the ordinary
+                # per-token path rather than trusting a contradicted state.
+                break
+            forced.append(token)
+            if self.matcher.is_terminated() or self.matcher.is_completed():
+                if self.stop_on_complete and self.matcher.is_completed():
+                    self.completed = True
+                break
+        return forced

@@ -20,6 +20,7 @@ class SamplingParams:
     top_p: float = 1.0
     top_k: int = 0
     seed: int | None = None
+    repetition_penalty: float = 1.0
 
     def __post_init__(self) -> None:
         if (isinstance(self.temperature, bool)
@@ -39,6 +40,11 @@ class SamplingParams:
                 and (isinstance(self.seed, bool) or not isinstance(self.seed, int)
                      or not 0 <= self.seed < 2 ** 64)):
             raise ValueError("seed must be an unsigned 64-bit integer or null")
+        if (isinstance(self.repetition_penalty, bool)
+                or not isinstance(self.repetition_penalty, (int, float))
+                or not math.isfinite(float(self.repetition_penalty))
+                or float(self.repetition_penalty) <= 0):
+            raise ValueError("repetition_penalty must be a finite number > 0")
 
     @property
     def is_greedy(self) -> bool:
@@ -60,9 +66,33 @@ def greedy(logits: mx.array) -> int:
     return int(mx.argmax(logits))
 
 
-def sample(logits: mx.array, params: SamplingParams | None = None) -> int:
+def _apply_repetition_penalty(
+    values: mx.array, history, penalty: float) -> mx.array:
+    """HF-style repetition penalty: `logit / penalty` if positive, `logit *
+    penalty` if negative (an already-negative logit made MORE negative by a
+    penalty > 1, since dividing a negative number would move it toward zero
+    -- the wrong direction). `penalty > 1` discourages repeats; `penalty ==
+    1` (the default) is a no-op and short-circuits before this is ever
+    called, so existing byte-identical proofs are unaffected."""
+    if not history:
+        return values
+    vocab_size = values.size
+    unique = {int(t) for t in history}
+    valid = sorted(i for i in unique if 0 <= i < vocab_size)
+    if not valid:
+        return values
+    ids = mx.array(valid)
+    selected = values[ids].astype(mx.float32)
+    penalized = mx.where(selected > 0, selected / penalty, selected * penalty)
+    return values.astype(mx.float32).at[ids].add(penalized - selected)
+
+
+def sample(logits: mx.array, params: SamplingParams | None = None,
+          history=None) -> int:
     """Sample one token from a rank-1 (or flattenable) logits vector.
 
+    `history`: token ids already emitted this request (prompt + generated
+    so far) -- only consulted when `params.repetition_penalty != 1.0`.
     Filtering is applied before categorical sampling. When top-k is active,
     top-p sorts only those candidates rather than the whole vocabulary.
     """
@@ -70,6 +100,9 @@ def sample(logits: mx.array, params: SamplingParams | None = None) -> int:
     values = logits.reshape(-1)
     if values.size == 0:
         raise ValueError("cannot sample from empty logits")
+    if params.repetition_penalty != 1.0:
+        values = _apply_repetition_penalty(
+            values, history, float(params.repetition_penalty))
     if params.is_greedy:
         return int(mx.argmax(values))
 

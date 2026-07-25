@@ -27,7 +27,7 @@ from tokenizers import Tokenizer
 
 from . import layer_runner, telemetry
 from .config import validate_expert_top_k_by_layer
-from .kv_cache import KVCache
+from .kv_cache import KVCache, fork_hybrid_kv_endpoint
 from .model_loader import WeightStore
 from .prefetcher import Prefetcher
 from .sampler import SamplingParams, sample
@@ -385,6 +385,55 @@ class RuntimeConfig:
     # signals intent/opt-in the same way draft_dir presence gates the
     # existing SpeculativeEngine wrapper).
     qwen_mtp_speculative: bool = False
+    # SQ26: zmlx's fused DeltaNet decode kernels (fused_conv1d_silu,
+    # gated_rmsnorm_silu). Real, measured decode-shape (L=1) speedup on this
+    # hardware (1.81x/1.38x); a genuine bf16 precision difference exists in
+    # isolation (0.03125/0.0625 max abs diff vs this codebase's own
+    # float32-accumulated implementations) but a real greedy-token quality
+    # gate against Qwen3.5-4B (2026-07-23) found zero divergence over 24
+    # tokens -- see tests/test_zmlx_fused_deltanet_decode.py. Gated to
+    # fast/lossy mode only in server.py, never lossless (the precision
+    # difference is real even if it happens not to flip any observed
+    # argmax); applied only for L==1 decode shape, never prefill.
+    zmlx_fused_deltanet_decode: bool = False
+    # F103: from-scratch mx.fast.metal_kernel fusion of the single-step
+    # gated-delta-rule recurrence body (decay-scale, predicted dot, delta,
+    # state update, output dot) into one Metal dispatch, decode (L==1) only.
+    # Distinct from zmlx_fused_deltanet_decode above (a third-party library,
+    # SQ26, found to be a net decode slowdown despite an isolated-benchmark
+    # win) -- this is this project's own kernel, written to test whether a
+    # tightly-scoped, hand-written fusion avoids zmlx's per-call dispatch
+    # overhead. See tests/test_native_fused_deltanet_decode.py for the
+    # correctness gate and STATUS.md for whichever real end-to-end verdict
+    # that test's A/B produced -- an isolated microbenchmark win is
+    # deliberately NOT trusted on its own given the zmlx precedent.
+    native_fused_deltanet_decode: bool = False
+    # F11: prompt-lookup (n-gram) speculative decoding, mutually exclusive
+    # with qwen_mtp_speculative above for this first version (see
+    # EngineManager.get()'s construction site in server.py). Zero-model --
+    # proposals come from repeated substrings already in the token history
+    # (runtime/speculative.py's ngram_propose), free when there's no match,
+    # and can propose k>1 tokens per round unlike MTP's fixed k=1. Real
+    # greedy-token quality gate: tests/test_qwen35_ngram_speculative.py.
+    qwen_ngram_speculative: bool = False
+    # Grammar fast-forward (2026-07-23, token-level jump-forward decoding):
+    # under constrained decoding, whenever the grammar allows exactly ONE
+    # legal next token, masked argmax is forced regardless of model logits,
+    # so the token needs no per-token model sweep -- only a KV/state update,
+    # which generate() batches into one multi-position feed. Byte-identical
+    # to the plain constrained path by construction (token-level, NOT
+    # SGLang's string-level variant, which can change tokenization). Targets
+    # exactly the workload every speculative scheme above failed on: forced
+    # tool-call JSON structure under a grammar constraint.
+    grammar_fast_forward: bool = False
+    # String-level jump-forward (SGLang-style), fast/lossy profile ONLY:
+    # commits the canonical tokenization of grammar-forced TEXT spans via
+    # matcher.find_jump_forward_string(). Rendered text stays grammar-forced
+    # but token ids can differ from what per-token masked argmax would have
+    # picked (multiple legal tokenizations), so this is never enabled for
+    # the lossless target -- see GrammarConstraint.forced_run's docstring
+    # for the measured motivation (token-level forcing almost never fires).
+    grammar_jump_forward_lossy: bool = False
     hot_prompt_kv_persist_dir: str = ""  # disk backing for the in-memory hot-
     # prompt-kv LRU above (2026-07-15): "" disables it -- pure in-memory,
     # does not survive a restart, the original behavior. When set, every
@@ -403,6 +452,13 @@ class RuntimeConfig:
     # declare rope_scaling. 0/1 = released RoPE; >1 = static YaRN extrapolation.
     qwen_yarn_factor: float = 0.0
     prefill_chunk_size: int = 0  # bound prefill compute/transient memory WITHOUT writing state
+    # F94: layer-major (not chunk-major) dense prefill for qwen3_5 (dense
+    # hybrid DeltaNet/full-attention, e.g. Qwen3.5-4B/9B, Qwen3.6-27B) --
+    # fetches each layer's weights exactly once for the whole prefill instead
+    # of once per chunk. Opt-in only for a first live rollout; see
+    # StreamingEngine._layer_stationary_qwen35_sweep and CLAUDE.md's
+    # 2026-07-23 note on why chunk-major re-reads dominate prefill time here.
+    layer_stationary_prefill: bool = False
     prefill_last_token_separate: bool = False  # MLX-LM-compatible endpoint schedule
     prefill_checkpoint_every: int = 0  # F60: save prompt-KV state every N prefill positions
     # (0 = off). Interrupted mega-prefills then RESUME via the existing
@@ -810,7 +866,7 @@ class StreamingEngine:
         # the engine lifetime instead of rebuilding every segment index on each
         # request. It is initialized lazily only after the admission threshold.
         self._prompt_kv_store = None
-        if self.cfg.model_type in ("glm_moe_dsa", "kimi_k25"):
+        if self.cfg.model_type in ("glm_moe_dsa", "kimi_k25", "glm4_moe_lite"):
             # This runtime currently implements the released target's n_group=1
             # router. Silently ignoring group-restricted routing on another GLM
             # checkpoint would change the discontinuous expert choice. Kimi
@@ -1893,7 +1949,7 @@ class StreamingEngine:
                 logits = logits + bias
             idx = mx.argpartition(-logits, kth=k - 1, axis=-1)[..., :k]
         elif gate_w is not None:
-            if self.cfg.model_type in ("glm_moe_dsa", "kimi_k25"):
+            if self.cfg.model_type in ("glm_moe_dsa", "kimi_k25", "glm4_moe_lite"):
                 scores = h.astype(mx.float32) @ gate_w.astype(mx.float32).T
             else:
                 scores = (h @ gate_w.T).astype(mx.float32)
@@ -1929,8 +1985,15 @@ class StreamingEngine:
 
     def _embed(self, tokens: list[int]) -> mx.array:
         if self._embed_rows is not None:
-            return self._embed_rows.lookup(tokens)
-        return layer_runner.embed(mx.array(tokens), self._embed_weight())
+            result = self._embed_rows.lookup(tokens)
+        else:
+            result = layer_runner.embed(mx.array(tokens), self._embed_weight())
+        if self.cfg.mup_enabled:
+            # Afmoe (Trinity Nano/Mini): real modeling_afmoe.py applies this
+            # ONCE right after embed_tokens, before any layer -- see
+            # runtime/afmoe.py's module docstring.
+            result = result * (self.cfg.hidden_size ** 0.5)
+        return result
 
     def _lm_head_weight(self):
         if self.cfg.tie_word_embeddings:
@@ -2023,7 +2086,17 @@ class StreamingEngine:
             self._resident_fast_layers = None
             fast_layers = None
         fast_decode_eligible = (
-            self.rc.resident_fast_decode and x.shape[1] == 1
+            self.rc.resident_fast_decode
+            # Speculative verify/refeed sweeps are decode-shaped work at
+            # small widths (catchup + forced prefix + <=k proposals), not
+            # prefill: without this, every verify sweep pays the ordinary
+            # loop's per-layer sync cost while plain decode enjoys the
+            # fast path, inverting speculation's economics. The hint is set
+            # only by speculative wrappers around their own forward_tokens
+            # calls (see qwen35_ngram.py), never for real prefill.
+            and (x.shape[1] == 1
+                 or (x.shape[1] <= 48
+                     and getattr(self, "_speculative_verify_hint", False)))
             and not self._disable_resident_fast_for_request)
         fast_prefill_eligible = (
             self.rc.resident_fast_prefill_limit > 0
@@ -2054,6 +2127,42 @@ class StreamingEngine:
                 self._resident_fast_decode_sweeps += 1
             else:
                 self._resident_fast_prefill_sweeps += 1
+            if self.cfg.model_type == "qwen3_5":
+                # 2026-07-23: hybrid resident fast decode. Two things at
+                # once: (1) the unconditional run_block below was a latent
+                # crash for qwen3_5 (a plain dense block that looks up
+                # self_attn.* names linear_attention layers don't have) --
+                # the path simply never fired for qwen3_5 before because
+                # server.py never set resident_fast_decode for it; (2) the
+                # ordinary per-layer loop costs ~56 GPU sync points per
+                # decode token for this hybrid (32 per-layer mx.eval(x) + 24
+                # per-DeltaNet-layer mx.eval(state)), which dominates the
+                # resident compute-bound regime. Run every layer lazily
+                # (defer_state_eval) and batch-eval all updated recurrent
+                # state in ONE call at the sweep boundary -- identical
+                # arithmetic, one sync instead of ~56.
+                from .qwen35 import run_qwen35_block
+
+                for i, w in enumerate(fast_layers):
+                    x = run_qwen35_block(
+                        x, w, f"model.layers.{i}", self.cfg, kv, i, offset,
+                        self._get_experts,
+                        iter_expert_batches=self._iter_expert_batches,
+                        zmlx_fused_decode=self.rc.zmlx_fused_deltanet_decode,
+                        native_fused_decode=self.rc.native_fused_deltanet_decode,
+                        defer_state_eval=True,
+                    )
+                kda = getattr(kv, "kda_cache", None)
+                if kda is not None:
+                    pending_state = [
+                        s for s in kda._state if s is not None]
+                    pending_state.extend(
+                        value
+                        for history in kda._conv if history is not None
+                        for value in history if value is not None)
+                    if pending_state:
+                        mx.eval(*pending_state)
+                return x
             for i, w in enumerate(fast_layers):
                 last_only = (
                     final_mlp_last_only and i == n - 1 and x.shape[1] > 1)
@@ -2115,7 +2224,7 @@ class StreamingEngine:
                     self._get_experts, self._rope_freqs, self._mscale,
                     mlp_last_only=last_only,
                 )
-            elif self.cfg.model_type in ("glm_moe_dsa", "kimi_k25"):
+            elif self.cfg.model_type in ("glm_moe_dsa", "kimi_k25", "glm4_moe_lite"):
                 # F93: Kimi K2.5's language model is architecturally identical
                 # to GLM's MLA+noaux_tc-MoE block (real q_lora MLA, real RoPE
                 # -- no NoPE, no DSA, standard .mlp.experts.<id>.gate_proj/
@@ -2142,6 +2251,23 @@ class StreamingEngine:
                 from .qwen35 import run_qwen35_block
 
                 x = run_qwen35_block(
+                    x, w, f"model.layers.{i}", self.cfg, kv, i, offset,
+                    self._get_experts, mlp_last_only=last_only,
+                    iter_expert_batches=self._iter_expert_batches,
+                    zmlx_fused_decode=self.rc.zmlx_fused_deltanet_decode,
+                    native_fused_decode=self.rc.native_fused_deltanet_decode,
+                )
+            elif self.cfg.model_type == "jet_nemotron":
+                from .jet_nemotron import run_jet_nemotron_block
+
+                x = run_jet_nemotron_block(
+                    x, w, f"model.layers.{i}", self.cfg, kv, i, offset,
+                    rope_freqs=self._rope_freqs, mlp_last_only=last_only,
+                )
+            elif self.cfg.model_type == "afmoe":
+                from .afmoe import run_afmoe_block
+
+                x = run_afmoe_block(
                     x, w, f"model.layers.{i}", self.cfg, kv, i, offset,
                     self._get_experts, mlp_last_only=last_only,
                     iter_expert_batches=self._iter_expert_batches,
@@ -2181,6 +2307,109 @@ class StreamingEngine:
                 # F45 — decode only: prefill's multi-position unions flooded the
                 # cache and halved hit rates (measured; see benchmark_results)
                 self._router_lookahead(x, i + 1)
+            del w
+        return x
+
+    def _layer_stationary_qwen35_sweep(
+            self, x: mx.array, kv: KVCache, offset: int,
+            tile_width: int) -> mx.array:
+        """F94 live path: layer-major (not chunk-major) prefill for dense
+        qwen3_5 (Qwen3.5-4B/9B, Qwen3.6-27B hybrid DeltaNet/full-attention
+        layers, num_experts=0). Fetches each layer's weights exactly once for
+        the WHOLE prefill range in `x`, unlike `_sweep` (called once per
+        chunk by generate()'s prefill loop), which re-fetches every layer's
+        weights once per chunk whenever the resident cache can't hold the
+        whole model. See CLAUDE.md's 2026-07-23 correction: measured single-
+        layer fetches already run at raw disk bandwidth (~1.6 GB/s) -- the
+        real cost is fetching the SAME layers repeatedly across chunks, not
+        any per-fetch overhead. Deliberately narrower than layer_stationary.py
+        (which is model-agnostic but untested against real recurrent state):
+        this dispatches straight to run_qwen35_block per layer, so it is only
+        used for the dense (non-MoE) qwen3_5 model_type -- MoE routing makes
+        per-token expert selection order-sensitive (a separate, harder
+        problem, F35), and other hybrid model_types have their own per-layer
+        dispatch this method does not attempt to generalize to.
+
+        Mirrors _sweep's per-layer governor reservation, transient-memory
+        tracking, and prefetch scheduling exactly (just reordered: tiles of
+        the whole prompt nested inside the layer loop, rather than one
+        chunk's positions swept across all layers) so it inherits the same
+        memory-safety behavior _sweep already has, not a weaker or different
+        one. KDAStateCache correctness across tile boundaries follows from
+        each layer's own recurrent state depending only on that layer's own
+        sequential inputs and its own prior state -- never on another layer's
+        loop position -- so re-associating the (layer, tile) loop nesting
+        cannot change any layer's own state evolution; this is proven
+        directly (not just argued) in
+        tests/test_f94_qwen35_layer_stationary_oracle.py.
+        """
+        from .qwen35 import run_qwen35_block
+
+        if tile_width <= 0:
+            raise ValueError("tile_width must be positive")
+        n = self.cfg.num_hidden_layers
+        total = int(x.shape[1])
+        (self._layer_transient,
+         self._layer_transient_margin) = _layer_transient_for_positions(
+             total,
+             getattr(
+                 self, "_prefill_layer_transient_by_positions", {}
+             ).get(total, 0),
+             getattr(self, "_decode_layer_transient", 0))
+        for i in range(n):
+            if self.prefetcher:
+                for j in range(i + 1, min(i + 1 + self.rc.prefetch_depth, n)):
+                    self.prefetcher.schedule(self._layer_key(j), self._layer_names(j))
+
+            t0 = time.perf_counter()
+            layer_key = self._layer_key(i)
+            layer_names = self._layer_names(i)
+            if not self.cache.contains(layer_key):
+                incoming_page = self._layer_fetch_bytes_estimate(i)
+                if incoming_page:
+                    self.cache.prepare_for(incoming_page)
+                    if self.governor is not None:
+                        self.governor.reserve(incoming_page)
+            w = self.cache.get(layer_key, layer_names)
+            self.timer.add("weights_wait", time.perf_counter() - t0)
+
+            active_before = mx.get_active_memory()
+            mx.reset_peak_memory()
+            tiles = []
+            pos = 0
+            t0 = time.perf_counter()
+            while pos < total:
+                end = min(pos + tile_width, total)
+                # Same per-tile proactive reserve _sweep does once per chunk
+                # (matching that granularity, not just once per layer), so a
+                # real mid-sweep pressure spike is caught at the same
+                # resolution the chunk-major path already catches it at.
+                if self.governor is not None and self._layer_transient:
+                    self.governor.reserve(
+                        self._layer_transient,
+                        margin=self._layer_transient_margin)
+                xt = x[:, pos:end, :]
+                yt = run_qwen35_block(
+                    xt, w, f"model.layers.{i}", self.cfg, kv, i,
+                    offset + pos, self._get_experts, mlp_last_only=False,
+                    iter_expert_batches=self._iter_expert_batches,
+                    zmlx_fused_decode=self.rc.zmlx_fused_deltanet_decode,
+                    native_fused_decode=self.rc.native_fused_deltanet_decode,
+                )
+                mx.eval(yt)
+                tiles.append(yt)
+                pos = end
+            x = tiles[0] if len(tiles) == 1 else mx.concatenate(tiles, axis=1)
+            self.timer.add("layer_compute", time.perf_counter() - t0)
+            self._layer_transient = max(
+                self._layer_transient,
+                _resident_adjusted_transient(
+                    active_before, mx.get_active_memory(), mx.get_peak_memory()))
+            by_positions = self._prefill_layer_transient_by_positions
+            by_positions[total] = max(
+                int(by_positions.get(total, 0)), self._layer_transient)
+            self._prefill_layer_transient = max(by_positions.values())
+            self._note_true_peak()
             del w
         return x
 
@@ -2407,11 +2636,16 @@ class StreamingEngine:
                 from .glm_dsa import DSAState
 
                 kv.dsa = DSAState(self.cfg)
-        if self.cfg.model_type in ("kimi_linear", "qwen3_5_moe", "qwen3_5"):
+        if self.cfg.model_type in (
+                "kimi_linear", "qwen3_5_moe", "qwen3_5", "jet_nemotron"):
             # KDA's recurrent state is fixed-size and not token-indexed. Exact
             # endpoint/extension retention and durable restore carry this
             # companion cache alongside attention KV; arbitrary prefix trims
             # remain forbidden by the candidate-selection gate in generate().
+            # F97: Jet-Nemotron's "jet" (JetBlock) layers use the SAME
+            # KDAStateCache interface (.state/.set_state/.conv_history/
+            # .set_conv_history) as Kimi Linear's KDA and Qwen3.5's DeltaNet
+            # -- see runtime/jet_nemotron.py.
             from .kda_state import KDAStateCache
 
             kv.kda_cache = KDAStateCache(self.cfg.num_hidden_layers)
@@ -2604,7 +2838,7 @@ class StreamingEngine:
         # endpoint and extended with a suffix. Candidate selection below
         # limits hybrid models to those two no-trim cases.
         recurrent_exact_only = self.cfg.model_type in (
-            "kimi_linear", "qwen3_5_moe", "qwen3_5")
+            "kimi_linear", "qwen3_5_moe", "qwen3_5", "jet_nemotron")
         hot_eligible = (self.rc.hot_prompt_kv and not self.rc.max_kv_mb
                         and not force_adaptive_paged)
         resident_prompt_kv_bytes = self._project_dense_text_kv_bytes(len(tokens))
@@ -3243,6 +3477,13 @@ class StreamingEngine:
                     hot_dsa.stats[key] = 0
 
         t0 = time.perf_counter()
+        # F96: token count/state fork of this turn's stable boundary (this
+        # conversation rendered WITHOUT its own trailing generation scaffold),
+        # only ever populated below in the cold-sweep branch. Initialized here
+        # so the post-generation slot-storage code can check it unconditionally
+        # regardless of which of the three branches below actually ran.
+        boundary_fork_tokens = 0
+        boundary_fork_kv = None
         if exact_logits is not None:
             logits = exact_logits  # exact hit: zero sweeps
             path_stats["prompt_cache_exact_hit"] = 1
@@ -3252,6 +3493,39 @@ class StreamingEngine:
             logits = precomputed_prompt_logits
         else:
             pos = matched
+            # Fork a retention checkpoint at this turn's stable boundary for
+            # recurrent_exact_only models. The released chat template
+            # re-renders any but the LATEST assistant turn without its own
+            # generation scaffold once a further turn follows it, so a slot
+            # retained past this point (the old behavior) can never match a
+            # real second turn -- live-reproduced 2026-07-22 as a 100% hot-KV
+            # miss rate on every qwen3_5/qwen3_5_moe conversation past its
+            # first turn. Forking here instead means the retained slot's
+            # tokens are exactly what ANY future continuation of this same
+            # conversation is guaranteed to re-render byte-identically.
+            if (recurrent_exact_only and hot_eligible
+                    and type(kv) is KVCache):
+                stable_boundary = int(
+                    getattr(prompt, "stable_boundary_tokens", 0) or 0)
+                if pos < stable_boundary < len(tokens):
+                    # Chunk this mini-sweep exactly like the ordinary prefill
+                    # loop below -- an unchunked sweep of an entire first-turn
+                    # prompt here would bypass the same peak-memory bound
+                    # every other prefill sweep in this method respects.
+                    boundary_chunk = max(1, int(self.rc.prefill_chunk_size or (
+                        stable_boundary - pos)))
+                    bpos = pos
+                    while bpos < stable_boundary:
+                        bend = min(bpos + boundary_chunk, stable_boundary)
+                        bx = self._embed(list(tokens[bpos:bend]))
+                        bx = self._sweep(
+                            bx, kv, offset=bpos,
+                            final_mlp_last_only=self.rc.final_dead_token_elim)
+                        bpos = bend
+                    boundary_fork_kv = fork_hybrid_kv_endpoint(kv)
+                    boundary_fork_tokens = stable_boundary
+                    pos = stable_boundary
+                    path_stats["hot_prompt_boundary_fork_tokens"] = stable_boundary
             ckpt = self.rc.prefill_checkpoint_every
             # Memory chunking and persistent checkpoints are deliberately
             # separate. F37 v6 journals only new positions at a checkpoint; a
@@ -3287,7 +3561,68 @@ class StreamingEngine:
             observed_swap_pressure_events = int(getattr(
                 self.governor, "swap_pressure_events", 0) or 0)
             path_stats["pressure_chunk_events"] = pressure_chunk_events
-            if chunk:
+            # F94: layer-major fast path, opt-in (rc.layer_stationary_prefill)
+            # and narrowly scoped -- only when none of the features below that
+            # need PER-CHUNK control (adaptive resizing, mid-prefill
+            # checkpoint saves, paged-KV forced chunking) are in play for THIS
+            # request. Anything more complex falls through to the existing,
+            # already-safe chunk-major loop unchanged. Eligibility is checked
+            # fresh every call (never cached), so a request that later needs
+            # one of those features is simply never routed here.
+            layer_stationary_eligible = (
+                bool(chunk)
+                and self.rc.layer_stationary_prefill
+                and self.cfg.model_type == "qwen3_5"
+                and adaptive is None
+                and not (ckpt and kv_store is not None)
+                and not force_adaptive_paged
+            )
+            if layer_stationary_eligible:
+                prefill_limit = (
+                    len(tokens) - 1
+                    if self.rc.prefill_last_token_separate and len(tokens) > 1
+                    else len(tokens)
+                )
+                # Replicate the ordinary loop's own chunk-boundary arithmetic
+                # (below) purely to find where IT would stop -- chunk is
+                # constant here (adaptive is None, no mid-loop pressure-driven
+                # resizing is attempted in this fast path), so this is exact,
+                # not an approximation. The true final tail is always left for
+                # the unchanged code after this whole if/else, exactly as the
+                # ordinary loop already leaves it.
+                stop_before = pos
+                while stop_before < prefill_limit:
+                    end = min(stop_before + chunk, prefill_limit)
+                    if (not self.rc.prefill_last_token_separate
+                            and end >= len(tokens)):
+                        break
+                    stop_before = end
+                if stop_before > pos:
+                    # F96 hot-KV bookkeeping: the ordinary loop advances
+                    # reusable_watermark by exactly `chunk` on every iteration
+                    # where chunk_start == reusable_watermark (i.e. as long as
+                    # watermark tracking hasn't already fallen behind `pos`).
+                    # chunk is constant here, so by induction the same holds
+                    # for every full-chunk step this fast path takes -- only
+                    # replicate it when that continuity actually holds at the
+                    # start, exactly matching what the ordinary loop would
+                    # have done, not a separate/weaker approximation of it.
+                    watermark_continuous = (
+                        hot_eligible and reusable_watermark == pos)
+                    xc = self._embed(list(tokens[pos:stop_before]))
+                    xc = self._layer_stationary_qwen35_sweep(
+                        xc, kv, offset=pos, tile_width=chunk)
+                    del xc
+                    if self.rc.max_kv_mb or force_adaptive_paged:
+                        mx.clear_cache()
+                    path_stats["prefill_chunks"] += -(-(stop_before - pos) // chunk)
+                    if watermark_continuous:
+                        reusable_watermark = pos + (
+                            (stop_before - pos) // chunk) * chunk
+                        path_stats["hot_prompt_reusable_prefix_tokens"] = (
+                            reusable_watermark)
+                    pos = stop_before
+            elif chunk:
                 prefill_limit = (
                     len(tokens) - 1
                     if self.rc.prefill_last_token_separate and len(tokens) > 1
@@ -3437,7 +3772,7 @@ class StreamingEngine:
             self._h_last = x[:, -1:, :]
             logits = self._final_logits(x)
         sampled_logits = constraint.mask_logits(logits) if constraint is not None else logits
-        next_tok = sample(sampled_logits, sampling)
+        next_tok = sample(sampled_logits, sampling, history=tokens)
         if constraint is not None:
             constraint.accept_token(next_tok)
         self._generation_sampled_tokens = 1
@@ -3554,6 +3889,12 @@ class StreamingEngine:
         )
         can_pipeline = (
             sampling.is_greedy
+            # F102: this path calls mx.argmax directly, bypassing sample()
+            # entirely -- a non-default repetition_penalty would otherwise
+            # be silently ignored even though is_greedy stays True (the
+            # penalty doesn't change the sampling STRATEGY, just the logits
+            # it strategy operates on).
+            and sampling.repetition_penalty == 1.0
             and constraint is None
             and stop_text is None
             and remaining_decode > 0
@@ -3605,6 +3946,7 @@ class StreamingEngine:
             # side-quest win after removing per-layer synchronization.
             decode_t0 = time.perf_counter()
             boundary = mx.get_active_memory()
+            misses_before = self.cache.stats.misses
             reserve_decode_step(kv)
             mx.reset_peak_memory()
             current_token, current_logits = self._lazy_resident_decode_step(
@@ -3651,54 +3993,163 @@ class StreamingEngine:
                 current_token, current_logits = future_token, future_logits
 
             mx.eval(logits)
-            self._token_transient = max(
-                self._token_transient,
-                _resident_adjusted_transient(
-                    boundary, mx.get_active_memory(), mx.get_peak_memory()))
+            # See the plain per-token loop's identical guard below for why:
+            # a mid-stream cache miss (e.g. a budget eviction while
+            # pipelined) would fold one-time fetch/quantize scratch into
+            # this engine-lifetime ratchet otherwise.
+            if self.cache.stats.misses == misses_before:
+                self._token_transient = max(
+                    self._token_transient,
+                    _resident_adjusted_transient(
+                        boundary, mx.get_active_memory(), mx.get_peak_memory()))
             self._note_true_peak()
             decode_elapsed = time.perf_counter() - decode_t0
             tok_times = [decode_elapsed / pipelined_decode_steps] * pipelined_decode_steps
         elif stop_text is None:
-            for _ in range(max_tokens - 1):
-                if grammar_completed or next_tok in self.cfg.eos_token_ids:
-                    break
-                t0 = time.perf_counter()
-                # F42: the real overshoot is the WHOLE-TOKEN transient (measured at
-                # the greedy() sync point, not inside any one layer) — learn it and
-                # reserve before the next token so the ceiling is never crossed.
-                boundary = mx.get_active_memory()
-                reserve_decode_step(kv)
-                mx.reset_peak_memory()
-                x = self._embed([next_tok])
-                x = self._sweep(x, kv, offset=kv.offset)
-                logits = self._final_logits(x)
-                sampled_logits = (
-                    constraint.mask_logits(logits)
-                    if constraint is not None else logits)
-                next_tok = sample(sampled_logits, sampling)
-                if constraint is not None:
-                    constraint.accept_token(next_tok)
-                    grammar_completed = bool(constraint.completed)
-                self._token_transient = max(
-                    self._token_transient,
-                    _resident_adjusted_transient(
-                        boundary, mx.get_active_memory(),
-                        mx.get_peak_memory()))
-                self._note_true_peak()
-                tok_times.append(time.perf_counter() - t0)
-                generated.append(next_tok)
+            # Grammar fast-forward (rc.grammar_fast_forward, 2026-07-23):
+            # `pending` holds sampled/forced tokens not yet fed to the model.
+            # The plain path keeps it at exactly [next_tok] (identical
+            # behavior); fast-forward extends it with grammar-FORCED tokens
+            # (positions where the mask allows exactly one id -- masked
+            # argmax is then deterministic, so no per-token sweep is needed
+            # to decide them) and the next iteration feeds the whole run in
+            # ONE multi-position sweep. Termination invariants preserved
+            # everywhere: kv always ends holding prompt+generated[:-1] and
+            # `logits` the distribution that predicted generated[-1] (the
+            # postgen kv_store.save below depends on both).
+            pending = [next_tok]
+
+            def _grammar_fast_forward() -> bool:
+                """Emit forced tokens; True if generation must terminate."""
+                nonlocal stop_text, matched_stop_sequence, grammar_completed
+                nonlocal pending, logits
+                forced = constraint.forced_run(
+                    max(0, max_tokens - len(generated)),
+                    encode=(
+                        (lambda text: self.tokenizer.encode(text).ids)
+                        if self.rc.grammar_jump_forward_lossy else None))
+                if not forced:
+                    return False
+                grammar_completed = bool(constraint.completed)
+                path_stats["grammar_fast_forward_tokens"] = path_stats.get(
+                    "grammar_fast_forward_tokens", 0) + len(forced)
+                terminal = False
+                committed: list[int] = []
+                for tok in forced:
+                    generated.append(tok)
+                    committed.append(tok)
+                    if stop:
+                        decoded = self.tokenizer.decode(generated)
+                        match = _stop_match(decoded)
+                        if match is not None:
+                            cut, _order, matched_stop_sequence = match
+                            stop_text = decoded[:cut]
+                            terminal = True
+                            break  # never streamed, matching the plain path
+                    if stream_decoder is not None:
+                        delta = stream_decoder.push(generated)
+                        if delta:
+                            on_token(delta)
+                    if (tok in self.cfg.eos_token_ids
+                            or len(generated) >= max_tokens):
+                        terminal = True
+                        break
                 self._generation_sampled_tokens = len(generated)
-                if stop:
-                    decoded = self.tokenizer.decode(generated)
-                    match = _stop_match(decoded)
-                    if match is not None:
-                        cut, _order, matched_stop_sequence = match
-                        stop_text = decoded[:cut]
-                        break  # never streamed: on_token withheld for the matching token
-                if stream_decoder is not None:
-                    delta = stream_decoder.push(generated)
-                    if delta:
-                        on_token(delta)
+                if terminal or grammar_completed:
+                    # Final-token-never-fed contract: feed everything up to
+                    # generated[-2] now so kv/logits land in exactly the
+                    # state the plain per-token loop leaves them in.
+                    feed = pending + committed[:-1]
+                    if feed:
+                        xf = self._embed(feed)
+                        xf = self._sweep(xf, kv, offset=kv.offset)
+                        logits = self._final_logits(xf)
+                        mx.eval(logits)
+                    pending = [generated[-1]]
+                    return True
+                pending = pending + committed
+                return False
+
+            ff_active = (
+                constraint is not None
+                and (self.rc.grammar_fast_forward
+                     or self.rc.grammar_jump_forward_lossy))
+            ff_terminated = False
+            if ff_active and not grammar_completed:
+                # The endpoint-sampled first token may itself open a forced
+                # span (e.g. "<tool_call>" scaffolding) before any decode
+                # iteration runs.
+                ff_terminated = _grammar_fast_forward()
+            if not ff_terminated:
+                while len(generated) < max_tokens:
+                    if grammar_completed or next_tok in self.cfg.eos_token_ids:
+                        break
+                    t0 = time.perf_counter()
+                    # F42: the real overshoot is the WHOLE-TOKEN transient
+                    # (measured at the greedy() sync point, not inside any one
+                    # layer) — learn it and reserve before the next token so
+                    # the ceiling is never crossed.
+                    boundary = mx.get_active_memory()
+                    misses_before = self.cache.stats.misses
+                    reserve_decode_step(kv)
+                    mx.reset_peak_memory()
+                    x = self._embed(pending)
+                    x = self._sweep(x, kv, offset=kv.offset)
+                    logits = self._final_logits(x)
+                    sampled_logits = (
+                        constraint.mask_logits(logits)
+                        if constraint is not None else logits)
+                    next_tok = sample(
+                        sampled_logits, sampling,
+                        history=tokens + generated
+                        if sampling.repetition_penalty != 1.0 else None)
+                    if constraint is not None:
+                        constraint.accept_token(next_tok)
+                        grammar_completed = bool(constraint.completed)
+                    # 2026-07-23: a cache MISS during this step means at least
+                    # one layer was fetched fresh (quantize-on-load configs:
+                    # real bf16->Q4 conversion scratch, not just an I/O wait) --
+                    # a one-time cost, not the steady-state per-token transient
+                    # this ratchet exists to learn. self._token_transient never
+                    # resets across requests (engine-lifetime), so folding a
+                    # polluted first-decode-token measurement in here silently
+                    # disabled F99's resident fast path (reserve_decode_step's
+                    # own check) for the rest of THIS engine's life, not just
+                    # this one request -- live-caught investigating why F99
+                    # never engaged on quantize-on-load configs.
+                    if self.cache.stats.misses == misses_before:
+                        self._token_transient = max(
+                            self._token_transient,
+                            _resident_adjusted_transient(
+                                boundary, mx.get_active_memory(),
+                                mx.get_peak_memory()))
+                    self._note_true_peak()
+                    tok_times.append(time.perf_counter() - t0)
+                    generated.append(next_tok)
+                    self._generation_sampled_tokens = len(generated)
+                    pending = [next_tok]
+                    if stop:
+                        decoded = self.tokenizer.decode(generated)
+                        match = _stop_match(decoded)
+                        if match is not None:
+                            cut, _order, matched_stop_sequence = match
+                            stop_text = decoded[:cut]
+                            break  # never streamed: on_token withheld for the matching token
+                    if stream_decoder is not None:
+                        delta = stream_decoder.push(generated)
+                        if delta:
+                            on_token(delta)
+                    if ff_active and not grammar_completed:
+                        if _grammar_fast_forward():
+                            break
+                if len(pending) > 1:
+                    # Loop exhausted max_tokens with an unfed fast-forward
+                    # run still pending: restore the kv/logits endpoint
+                    # contract (see _grammar_fast_forward's terminal branch).
+                    xf = self._embed(pending[:-1])
+                    xf = self._sweep(xf, kv, offset=kv.offset)
+                    logits = self._final_logits(xf)
+                    mx.eval(logits)
 
         final_text = stop_text if stop_text is not None else self.tokenizer.decode(generated)
         termination_reason = (
@@ -3823,22 +4274,16 @@ class StreamingEngine:
                 )
                 path_stats["hot_prompt_kv_persist_write_s"] = (
                     time.perf_counter() - persist_t0)
-            new_slot = _HotPromptSlot(
-                tokens=full_tokens,
-                kv=kv,
-                logits=logits,
-                prompt_length=len(tokens),
-                prompt_logits=prompt_endpoint_logits,
-                reusable_prefix=reusable_watermark,
-                # F95: whatever chunk size actually built this state --
-                # either the matched slot's own value (continuing) or a
-                # fresh per-conversation pick (new), set earlier in this
-                # same generate() call.
-                chunk_size=self.rc.prefill_chunk_size,
-                approximate=prompt_state_approximate,
+            new_slot = self._new_hot_prompt_slot(
+                recurrent_exact_only=recurrent_exact_only,
+                boundary_fork_kv=boundary_fork_kv,
+                boundary_fork_tokens=boundary_fork_tokens,
+                tokens=tokens, full_tokens=full_tokens, kv=kv, logits=logits,
+                prompt_endpoint_logits=prompt_endpoint_logits,
+                reusable_watermark=reusable_watermark,
+                prompt_state_approximate=prompt_state_approximate,
                 tool_capsules=tuple(getattr(prompt, "tool_capsules", ())),
-                segment_chain=segment_chain,
-                cache_namespace=cache_namespace,
+                segment_chain=segment_chain, cache_namespace=cache_namespace,
             )
             capacity_count, capacity_bytes = self._append_hot_prompt_slot(new_slot)
             path_stats["hot_prompt_capacity_evicted_slots"] = capacity_count
@@ -3964,6 +4409,10 @@ class StreamingEngine:
         lines += [
             f"cache resident: {self.cache.total_bytes / 1e6:.0f}MB "
             f"(budget {self.cache.max_bytes / 1e6:.0f}MB), keys={self.cache.resident_keys}",
+            f"resident_fast: decode_sweeps={self._resident_fast_decode_sweeps} "
+            f"prefill_sweeps={self._resident_fast_prefill_sweeps} "
+            f"moe_sweeps={self._resident_moe_sweeps} "
+            f"disabled_for_request={self._disable_resident_fast_for_request}",
             telemetry.fmt_mem(),
             self.timer.summary(),
         ]
@@ -4067,6 +4516,70 @@ class StreamingEngine:
         retry_ceiling = int(getattr(
             self, "_hybrid_retry_chunk_ceiling", 0) or 0)
         return min(selected, retry_ceiling) if retry_ceiling else selected
+
+    def _new_hot_prompt_slot(
+            self, *, recurrent_exact_only: bool, boundary_fork_kv,
+            boundary_fork_tokens: int, tokens, full_tokens, kv, logits,
+            prompt_endpoint_logits, reusable_watermark: int,
+            prompt_state_approximate: bool, tool_capsules, segment_chain,
+            cache_namespace: str) -> "_HotPromptSlot":
+        """F96: which state to retain for the next request on this lineage.
+
+        For an ordinary (non-recurrent) model the full post-generation
+        endpoint (prompt + every fed-back generated token) is a real,
+        reusable artifact: a repeat, an exact-endpoint continuation, or a
+        divergent branch can all match against it.
+
+        For a recurrent_exact_only model (qwen3_5/qwen3_5_moe/kimi_linear)
+        it is NOT: the released chat template re-renders any but the latest
+        assistant turn without its own generation scaffold once a further
+        turn follows it, so a slot retained at the full endpoint can only
+        ever match a byte-identical verbatim replay of the same request --
+        live-reproduced 2026-07-22 as a 100% hot-KV miss rate on every real
+        second turn. When a boundary fork was taken during this request's
+        own prefill (this conversation's content with NO generation
+        scaffold at all -- see the fork site earlier in generate()),
+        retaining THAT instead is what makes the "extension" arm of the
+        matching loop above actually fire on this conversation's next turn:
+        that fork's tokens are exactly what ANY future continuation of this
+        conversation is guaranteed to re-render byte-identically.
+
+        boundary_fork_kv is None whenever no fork applies (non-recurrent
+        model, no stable-boundary hint was available, or this request's
+        boundary already fell inside an already-matched prefix) -- degrades
+        to the ordinary full-endpoint slot exactly as before this feature.
+        """
+        if recurrent_exact_only and boundary_fork_kv is not None:
+            return _HotPromptSlot(
+                tokens=tuple(tokens[:boundary_fork_tokens]),
+                kv=boundary_fork_kv,
+                logits=None,
+                prompt_length=boundary_fork_tokens,
+                prompt_logits=None,
+                reusable_prefix=0,
+                chunk_size=self.rc.prefill_chunk_size,
+                approximate=prompt_state_approximate,
+                tool_capsules=(),
+                segment_chain=(),
+                cache_namespace=cache_namespace,
+            )
+        return _HotPromptSlot(
+            tokens=full_tokens,
+            kv=kv,
+            logits=logits,
+            prompt_length=len(tokens),
+            prompt_logits=prompt_endpoint_logits,
+            reusable_prefix=reusable_watermark,
+            # F95: whatever chunk size actually built this state -- either
+            # the matched slot's own value (continuing) or a fresh
+            # per-conversation pick (new), set earlier in this same
+            # generate() call.
+            chunk_size=self.rc.prefill_chunk_size,
+            approximate=prompt_state_approximate,
+            tool_capsules=tool_capsules,
+            segment_chain=segment_chain,
+            cache_namespace=cache_namespace,
+        )
 
     def _retain_interrupted_prefill(
             self, tokens, kv, reusable_prefix: int, tool_capsules=(),

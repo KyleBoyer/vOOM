@@ -71,6 +71,38 @@ class KVCache:
             dsa.trim(length)
 
 
+def fork_hybrid_kv_endpoint(kv: "KVCache") -> "KVCache":
+    """Share an evaluated hybrid (DeltaNet/KDA + attention) endpoint cheaply.
+
+    Plain KVCache updates replace attention arrays with concatenations, and
+    KDAStateCache updates replace recurrent arrays, so the evaluated prompt
+    buffers are immutable under subsequent decode/prefill of the ORIGINAL
+    cache -- a fork can share them without copying until either branch
+    advances, at which point MLX's functional array semantics naturally
+    separate them. SteppedKVCache writes into spare capacity in place and is
+    deliberately rejected until it has a dedicated copy-on-write snapshot
+    operation.
+    """
+    if type(kv) is not KVCache:
+        raise TypeError("hybrid endpoint snapshots require plain KVCache")
+    recurrent = getattr(kv, "kda_cache", None)
+    if recurrent is None:
+        raise ValueError("hybrid endpoint is missing recurrent state")
+    snapshot = KVCache(len(kv.keys))
+    snapshot.keys = list(kv.keys)
+    snapshot.values = list(kv.values)
+    snapshot.compressed_mla = kv.compressed_mla
+    snapshot.kda_cache = recurrent.fork()
+    arrays = [
+        value for value in (*snapshot.keys, *snapshot.values)
+        if value is not None
+    ]
+    if arrays:
+        mx.eval(*arrays)
+    snapshot.kda_cache.synchronize()
+    return snapshot
+
+
 class PositionFreePagePool:
     """Engine-wide immutable K/V pages for position-independent reuse.
 

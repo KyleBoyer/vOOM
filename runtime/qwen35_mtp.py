@@ -39,7 +39,7 @@ between exactly two states -- no chain of K checkpoints, no compact
 transition-factor math (contra the general case solved by SpecLA, arXiv
 2607.16673). KDAStateCache.fork() (kda_state.py) is already a cheap,
 existing snapshot primitive (list-shallow-copy, no array copies) with one
-prior caller (qwen3vl.py's _fork_hybrid_prompt_endpoint).
+prior caller (kv_cache.py's fork_hybrid_kv_endpoint, used by qwen3vl.py).
 
 Round structure (matching speculative.py's own "1 + k" verify-batch
 convention exactly, k=1 here): each round feeds
@@ -184,7 +184,13 @@ class QwenMTPSpeculativeEngine:
             kwargs["sampling"] = sampling
         if constraint is not None:
             kwargs["constraint"] = constraint
-        result = self.target.generate(prompt, max_tokens, **kwargs)
+        # Prefer the target's OWN fail-slow prefill retry (a genuine bound
+        # method on the plain StreamingEngine, not a delegated wrapper
+        # attribute -- see _engine_generate's docstring in server.py for the
+        # bug this class used to trigger via the opposite mistake).
+        target_generate = getattr(
+            self.target, "generate_with_memory_retry", self.target.generate)
+        result = target_generate(prompt, max_tokens, **kwargs)
         path_stats = result.setdefault("path_stats", {})
         path_stats.update({
             "qwen_mtp_enabled": 1,
@@ -231,9 +237,20 @@ class QwenMTPSpeculativeEngine:
         kv = tgt.new_kv()
         mtp_kv = KVCache(1)
         prefill_t0 = time.perf_counter()
-        logits = tgt.forward_tokens(ids, kv)
-        prompt_last_logits = logits[-1]
-        mx.eval(prompt_last_logits)
+        try:
+            logits = tgt.forward_tokens(ids, kv)
+            prompt_last_logits = logits[-1]
+            mx.eval(prompt_last_logits)
+        except MemoryError:
+            # Nothing sampled yet -- safe to discard and replay the whole
+            # request through the target's own fail-slow retry ladder
+            # (progressively smaller prefill chunks) rather than losing
+            # that safety net just because this request happened to route
+            # through MTP speculation first.
+            tgt.release_request_state()
+            return self._target_generate(
+                "memory-pressure-fallback", prompt, max_tokens, on_token,
+                stop, on_progress, sampling, constraint)
         prefill_s = time.perf_counter() - prefill_t0
 
         proposed = 0

@@ -159,6 +159,37 @@ def test_real_weights_kda_and_mla_layers_produce_finite_output():
     assert not bool(mx.any(mx.isnan(out_mla)).item())
 
 
+@_model_skip
+def test_real_engine_generate_end_to_end():
+    """F92 step 6, the last "still open" item from CLAUDE.md's Goal 3: a
+    real `StreamingEngine.generate()` call through the FULL 27-layer stack
+    (20 KDA layers + 7 real MLA/MoE layers, real tiktoken-converted
+    tokenizer, real disk-tier weight/expert paging for a 98GB checkpoint
+    against a small resident cache budget) rather than a hand-picked pair of
+    layers. No numerical oracle exists at this scale (F92's oracle uses a
+    tiny random-weight instance -- see this module's docstring), so this is
+    a coherence/plumbing gate, not a byte-identical proof: a well-known
+    factual completion should come out semantically correct, and real
+    weight-cache activity must have occurred (proving genuine disk
+    streaming happened, not some degenerate no-op path)."""
+    from runtime.engine import RuntimeConfig, StreamingEngine
+    from runtime.sampler import SamplingParams
+
+    rc = RuntimeConfig(
+        prefill_chunk_size=256, min_weight_cache_mb=200, max_weight_cache_mb=6000)
+    engine = StreamingEngine(str(MODEL_DIR), rc)
+    try:
+        result = engine.generate(
+            "The capital of France is", max_tokens=3,
+            sampling=SamplingParams(temperature=0.0))
+    finally:
+        engine.close()
+    assert result["text"].strip().startswith("Paris"), result["text"]
+    stats = result["path_stats"]
+    assert stats["weight_cache_misses"] > 0
+    assert stats["expert_cache_misses"] > 0
+
+
 def _expert_loader(w: dict, model_dir: Path):
     import json
     index = json.loads((model_dir / "model.safetensors.index.json").read_text())

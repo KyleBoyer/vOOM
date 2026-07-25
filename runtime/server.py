@@ -129,7 +129,8 @@ class PreparedPrompt(str):
     """
 
     def __new__(cls, text: str, token_ids, tool_capsules=(),
-                cache_namespace: str = "default", force_paged_kv: bool = False):
+                cache_namespace: str = "default", force_paged_kv: bool = False,
+                stable_boundary_tokens: int = 0):
         instance = super().__new__(cls, text)
         instance.token_ids = tuple(token_ids)
         # Optional (content-id, token-start, token-end) records used only by the
@@ -142,6 +143,11 @@ class PreparedPrompt(str):
         # execution branch, while the durable segment DAG retains both.
         instance.cache_namespace = str(cache_namespace or "default")
         instance.force_paged_kv = bool(force_paged_kv)
+        # F96: token count of this SAME conversation rendered without the
+        # trailing generation scaffold -- see _hybrid_stable_boundary_tokens.
+        # 0 means "no hint" (not a recurrent-hybrid model, or the template's
+        # add_generation_prompt=False rendering wasn't a clean prefix).
+        instance.stable_boundary_tokens = int(stable_boundary_tokens or 0)
         return instance
 
 
@@ -956,7 +962,89 @@ class EngineManager:
                                    raw_hash_value == "1"),
                                prefill_chunk_size=4096,
                                prefill_checkpoint_every=0)
-            if mtype == "gpt_oss":
+            # Grammar fast-forward (token-level jump-forward decoding,
+            # 2026-07-23): model-agnostic -- it lives entirely in the
+            # constrained-decoding sampler loop, so it is read once here
+            # rather than per-model-type. Byte-identical by construction
+            # (see RuntimeConfig.grammar_fast_forward), opt-in for the
+            # first rollout.
+            rc.grammar_fast_forward = os.environ.get(
+                "VMODEL_GRAMMAR_FAST_FORWARD", "0") == "1"
+            # String-level jump-forward changes token ids (not rendered
+            # text) versus per-token masked argmax, so it is fast/lossy
+            # profile ONLY -- never the lossless target.
+            rc.grammar_jump_forward_lossy = (
+                mode in ("fast", "fast-long")
+                and os.environ.get(
+                    "VMODEL_GRAMMAR_JUMP_FORWARD_LOSSY", "0") == "1")
+            if mtype == "jet_nemotron":
+                # F97: Jet-Nemotron (jet-ai/Jet-Nemotron-4B/2B) -- a third,
+                # distinct hybrid layer-type mix (JetBlock "jet" + ordinary
+                # sliding-window "swa" + ordinary full "attn") alongside
+                # Kimi Linear's KDA and Qwen3.5/3.6's DeltaNet already
+                # supported here. Core block math is oracle-verified against
+                # the real released jet_block.py (see
+                # docs/future_lossless_techniques.md F97); this is the
+                # first live-engine wiring, deliberately kept minimal and
+                # separate from the older, more complex qwen3_5/kimi_linear
+                # branches below rather than threaded into their nested
+                # logic -- JetBlock's recurrent layers need the same
+                # fixed-chunk/hot-KV treatment those hybrids already use,
+                # but nothing else here depends on their qwen3_5-specific
+                # quantization/YaRN/tool-pic details.
+                rc.prompt_kv_dir = ""
+                rc.hot_prompt_kv = True
+                try:
+                    rc.hot_prompt_kv_slots = int(os.environ.get(
+                        "VMODEL_JET_NEMOTRON_HOT_KV_SLOTS", "2"))
+                    rc.hot_prompt_kv_min_tokens = int(os.environ.get(
+                        "VMODEL_JET_NEMOTRON_HOT_KV_MIN_TOKENS", "16"))
+                except ValueError as error:
+                    raise ValueError(
+                        "VMODEL_JET_NEMOTRON_HOT_KV settings must be "
+                        "integers") from error
+                if rc.hot_prompt_kv_slots <= 0:
+                    raise ValueError(
+                        "VMODEL_JET_NEMOTRON_HOT_KV_SLOTS must be positive")
+                if rc.hot_prompt_kv_min_tokens < 0:
+                    raise ValueError(
+                        "VMODEL_JET_NEMOTRON_HOT_KV_MIN_TOKENS must be "
+                        "non-negative")
+                jet_available_bytes = psutil.virtual_memory().available
+                rc.prefill_chunk_size = _hybrid_prefill_chunk_size(
+                    jet_available_bytes,
+                    model_scale=int(getattr(cfg_probe, "hidden_size", 0) or 0)
+                    * int(getattr(cfg_probe, "intermediate_size", 0) or 0))
+                rc.hot_prompt_kv_chunk_size = rc.prefill_chunk_size
+                rc.min_weight_cache_mb = _hybrid_min_weight_cache_floor_mb(
+                    jet_available_bytes)
+                # Unlike GLM/Kimi's sparse MoE (only active experts touched
+                # per token), every "jet"/"swa"/"attn" layer here is fully
+                # dense -- decode touches EVERY layer's weights EVERY step.
+                # A cache smaller than the real checkpoint forces constant
+                # evict-and-refetch on the decode path. Measured live: with
+                # a flat 6000 MB cap against this 4B checkpoint's real
+                # ~7.4 GB of shards, decode ran at ~0.2 tok/s (vs. ~2.1 tok/s
+                # for the same checkpoint in a standalone script that keeps
+                # all weights resident) with ~56 GB of swap churn over one
+                # request. `_dense_lossless_resident_bytes` assumes a
+                # standard Llama/Qwen attn+MLP shape per layer, which
+                # doesn't match JetBlock's extra tensors (A_log, dt_bias,
+                # dynamic-conv kernel generator, g_proj, o_norm) -- read the
+                # real shard sizes from disk instead, exact rather than
+                # estimated.
+                rc.max_weight_cache_mb = max(
+                    6000,
+                    math.ceil(
+                        _checkpoint_payload_bytes(model_dir) * 1.07
+                        / 1_000_000))
+                if mode in ("fast", "fast-long"):
+                    # No measured quality gate exists yet for a quantized
+                    # profile (see F97's docstring) -- fast mode still
+                    # serves the released bf16 weights unquantized rather
+                    # than silently apply an unverified transform.
+                    pass
+            elif mtype == "gpt_oss":
                 rc.max_weight_cache_mb, rc.pin_first_layers = 6500, 36
             elif mtype == "glm_moe_dsa":
                 rc.max_weight_cache_mb = 5000
@@ -1063,6 +1151,12 @@ class EngineManager:
                 # rc.qwen_mtp_speculative construction site in EngineManager.get.
                 rc.qwen_mtp_speculative = os.environ.get(
                     "VMODEL_QWEN_MTP_SPECULATIVE", "0") == "1"
+                # F11: prompt-lookup/n-gram speculation, mutually exclusive
+                # with the native MTP flag above (see EngineManager.get()'s
+                # construction site) -- opt-in only, real greedy-token
+                # quality gate in tests/test_qwen35_ngram_speculative.py.
+                rc.qwen_ngram_speculative = os.environ.get(
+                    "VMODEL_QWEN_NGRAM_SPECULATIVE", "0") == "1"
                 try:
                     rc.hot_prompt_kv_slots = int(os.environ.get(
                         "VMODEL_QWEN35_HOT_KV_SLOTS", "2"))
@@ -1252,6 +1346,22 @@ class EngineManager:
                     rc.quant_attention = False
                     rc.quant_router = False
                     rc.quant_lm_head = False
+                    # SQ26: zmlx's fused DeltaNet decode kernels. Gated to
+                    # fast/lossy mode ONLY, never lossless -- a real bf16
+                    # precision difference exists per-call even though a real
+                    # greedy-token quality gate found zero divergence over 24
+                    # tokens (tests/test_zmlx_fused_deltanet_decode.py, run
+                    # against the dense qwen3_5 sibling -- same _gated_delta_net
+                    # math, same conv/norm kernel calls).
+                    rc.zmlx_fused_deltanet_decode = os.environ.get(
+                        "VMODEL_ZMLX_FUSED_DELTANET_DECODE", "0") == "1"
+                    # F103: this project's own hand-written Metal kernel
+                    # fusion of the DeltaNet decode step. Kept fast/lossy-only
+                    # for now (same caution as zmlx above) pending a full
+                    # real-model correctness+speed gate -- see
+                    # tests/test_native_fused_deltanet_decode.py.
+                    rc.native_fused_deltanet_decode = os.environ.get(
+                        "VMODEL_NATIVE_FUSED_DELTANET_DECODE", "0") == "1"
                     # NOT rc.max_weight_cache_mb = 6000 here: that stomped the
                     # VMODEL_QWEN35_WEIGHT_CACHE_MB-configured value set above
                     # right before every fast/fast-long request regardless of
@@ -1286,6 +1396,21 @@ class EngineManager:
                 # rc.qwen_mtp_speculative construction site in EngineManager.get.
                 rc.qwen_mtp_speculative = os.environ.get(
                     "VMODEL_QWEN_MTP_SPECULATIVE", "0") == "1"
+                # F11: prompt-lookup/n-gram speculation, mutually exclusive
+                # with the native MTP flag above (see EngineManager.get()'s
+                # construction site) -- opt-in only, real greedy-token
+                # quality gate in tests/test_qwen35_ngram_speculative.py.
+                rc.qwen_ngram_speculative = os.environ.get(
+                    "VMODEL_QWEN_NGRAM_SPECULATIVE", "0") == "1"
+                # F94: layer-major (not chunk-major) prefill, opt-in only for
+                # this first live rollout. Dense-only (this branch, not the
+                # MoE sibling above) -- see generate()'s
+                # layer_stationary_eligible check, which additionally falls
+                # back automatically to the ordinary chunk-major loop
+                # whenever adaptive chunk sizing, mid-prefill checkpointing,
+                # or forced paged-KV chunking is in play for a given request.
+                rc.layer_stationary_prefill = os.environ.get(
+                    "VMODEL_QWEN35_LAYER_STATIONARY_PREFILL", "0") == "1"
                 try:
                     rc.hot_prompt_kv_slots = int(os.environ.get(
                         "VMODEL_QWEN35_HOT_KV_SLOTS", "2"))
@@ -1326,7 +1451,26 @@ class EngineManager:
                 # win it is for the MoE sibling regardless of dense/MoE.
                 rc.pin_lm_head = False
                 rc.stream_lm_head = True
-                rc.max_weight_cache_mb = 6000
+                # 2026-07-23: dense qwen3_5 is fully dense (no MoE sparsity),
+                # so lossless decode touches every layer every token -- a
+                # flat 6000 MB cache against Qwen3.5-9B's real ~19.3 GB bf16
+                # checkpoint meant most of the model was evicted and
+                # re-fetched every single decode step (measured: ~9.7 s/token,
+                # matching 19.3 GB / ~1.64 GB/s real disk bandwidth almost
+                # exactly -- see CLAUDE.md's 2026-07-23 correction). The model
+                # cannot fit fully resident under the ~8.5 GB Metal-working-set
+                # ceiling either way (19.3 GB > 8.5 GB), so this cannot fully
+                # eliminate the re-read, but every additional GB of residency
+                # proportionally reduces how much must be re-streamed each
+                # token. Sized from the real on-disk bytes, capped at a safe
+                # maximum that leaves headroom for KV/activations/governor
+                # reservations within the ceiling (the live governor still
+                # shrinks this further under real pressure regardless).
+                rc.max_weight_cache_mb = min(
+                    8000,
+                    math.ceil(
+                        _checkpoint_payload_bytes(model_dir) * 1.07
+                        / 1_000_000))
                 # 2026-07-20: live-confirmed the SAME governor.reserve()
                 # failure mode as the MoE sibling above -- a real
                 # lossy-Qwen3.6-27B request (the largest dense model here)
@@ -1368,6 +1512,27 @@ class EngineManager:
                     rc.quant_group_size = 32
                     rc.quant_min_dim = 0
                     rc.max_weight_cache_mb = 7000
+                    # SQ26: zmlx's fused DeltaNet decode kernels. Gated to
+                    # fast/lossy mode ONLY, never lossless -- a real bf16
+                    # precision difference exists per-call even though a real
+                    # greedy-token quality gate found zero divergence over 24
+                    # tokens (tests/test_zmlx_fused_deltanet_decode.py).
+                    rc.zmlx_fused_deltanet_decode = os.environ.get(
+                        "VMODEL_ZMLX_FUSED_DELTANET_DECODE", "0") == "1"
+                    rc.native_fused_deltanet_decode = os.environ.get(
+                        "VMODEL_NATIVE_FUSED_DELTANET_DECODE", "0") == "1"
+                    # 2026-07-23: hybrid resident fast decode (see _sweep's
+                    # qwen3_5 fast branch): once every layer of the MXFP4
+                    # artifact is cache-resident, skip the ordinary loop's
+                    # ~56 per-token GPU sync points (32 per-layer mx.eval +
+                    # 24 per-DeltaNet-layer state evals) in favor of one
+                    # lazy graph with a single batched state eval at the
+                    # sweep boundary. Identical arithmetic; eval-boundary
+                    # scheduling only. Byte-identical A/B gated by
+                    # tests/test_grammar_fast_forward.py-style checks; opt-in
+                    # for the first rollout, matching project convention.
+                    rc.resident_fast_decode = os.environ.get(
+                        "VMODEL_QWEN35_RESIDENT_FAST_DECODE", "0") == "1"
             else:
                 rc.max_weight_cache_mb = 6000
                 if mtype == "kimi_linear":
@@ -2313,6 +2478,30 @@ class EngineManager:
                         f"({model_dir.name}): {error}",
                         flush=True,
                     )
+            elif getattr(rc, "qwen_ngram_speculative", False):
+                # F11: prompt-lookup/n-gram speculation, mutually exclusive
+                # with native MTP above for this first version -- both are
+                # verified-draft schemes over the same hybrid recurrent
+                # state, and combining them (falling back from a rejected
+                # n-gram round to an MTP-drafted one, say) is real added
+                # complexity with no evidence yet that it's worth it over
+                # picking whichever wins for a given workload.
+                from .qwen35_ngram import QwenNgramSpeculativeEngine
+
+                try:
+                    self._engine = QwenNgramSpeculativeEngine(target_engine)
+                    print(
+                        f"[server] Qwen n-gram speculation: "
+                        f"target={model_dir.name}",
+                        flush=True,
+                    )
+                except Exception as error:
+                    self._engine = target_engine
+                    print(
+                        f"[server] Qwen n-gram speculation skipped "
+                        f"({model_dir.name}): {error}",
+                        flush=True,
+                    )
             self._key = key
             return self._engine
 
@@ -2664,7 +2853,8 @@ def _chat_prompt(engine, model_dir: Path, messages: list[dict], reasoning: str,
                  tools: list[dict] | None = None, *, compact_json: bool = False,
                  enable_thinking: bool | None = None,
                  reasoning_requested: bool = False,
-                 canonical_hermes_tools: bool = False) -> str:
+                 canonical_hermes_tools: bool = False,
+                 add_generation_prompt: bool = True) -> str:
     # 2026-07-14: a standalone chat_template.json file is one HF convention,
     # but the more common one is a `chat_template` field embedded directly in
     # tokenizer_config.json -- checking ONLY for the standalone file meant
@@ -2714,7 +2904,7 @@ def _chat_prompt(engine, model_dir: Path, messages: list[dict], reasoning: str,
                 _tools_system_preamble(tools, compact_json=compact_json))
         context = {
             "messages": _messages_for_native_template(messages),
-            "add_generation_prompt": True,
+            "add_generation_prompt": add_generation_prompt,
             "reasoning_effort": reasoning,
             "tools": template_tools,
         }
@@ -2961,6 +3151,14 @@ def _request_sampling(route: str, req: dict):
     if isinstance(top_k, bool) or not isinstance(top_k, int) or top_k < 0:
         raise RequestValidationError("top_k must be a non-negative integer")
     seed = req.get("seed")
+    repetition_penalty = req.get("repetition_penalty")
+    if repetition_penalty is not None:
+        if (isinstance(repetition_penalty, bool)
+                or not isinstance(repetition_penalty, (int, float))
+                or not math.isfinite(float(repetition_penalty))
+                or float(repetition_penalty) <= 0):
+            raise RequestValidationError(
+                "repetition_penalty must be a finite number > 0")
     explicit_sampling = any(req.get(field) is not None for field in (
         "temperature", "top_p", "top_k", "seed"))
     temperature = req.get("temperature")
@@ -2972,6 +3170,8 @@ def _request_sampling(route: str, req: dict):
             top_p=float(1.0 if req.get("top_p") is None else req["top_p"]),
             top_k=top_k,
             seed=seed,
+            repetition_penalty=float(
+                1.0 if repetition_penalty is None else repetition_penalty),
         )
     except ValueError as error:
         raise RequestValidationError(str(error)) from error
@@ -3073,7 +3273,9 @@ def _configure_constraint(engine, structured_output, tools: list[dict],
             return GrammarConstraint.json(
                 engine, (schema if kind == "json_schema" else
                          {"type": "object", "additionalProperties": True}),
-                strict=(strict if kind == "json_schema" else False))
+                strict=(strict if kind == "json_schema" else False),
+                canonical_whitespace=getattr(
+                    engine.rc, "grammar_jump_forward_lossy", False))
         if tools and tool_choice != "none":
             specific = (tool_choice.split(":", 1)[1]
                         if tool_choice.startswith("specific:") else None)
@@ -3440,10 +3642,37 @@ _HIDDEN_GATEWAY_ABSTAIN_TEXT = (
 )
 
 
+def _has_own_method(obj, name: str) -> bool:
+    """Whether ``name`` is a REAL method somewhere in obj's own class MRO,
+    as opposed to something only reachable via a ``__getattr__`` delegation
+    proxy (SpeculativeEngine/DSparkSpeculativeEngine/QwenMTPSpeculativeEngine
+    all forward unknown attributes to a wrapped ``self.target``)."""
+    return any(name in cls.__dict__ for cls in type(obj).__mro__)
+
+
 def _engine_generate(engine, *args, **kwargs):
-    """Use fail-slow prefill retry when the concrete engine supports it."""
-    generate = getattr(engine, "generate_with_memory_retry", engine.generate)
-    return generate(*args, **kwargs)
+    """Use fail-slow prefill retry when the concrete engine supports it.
+
+    2026-07-22: a plain ``getattr(engine, "generate_with_memory_retry",
+    engine.generate)`` silently broke every speculative-decoding wrapper
+    (SpeculativeEngine, DSparkSpeculativeEngine, QwenMTPSpeculativeEngine)
+    that doesn't define its own ``generate_with_memory_retry`` -- none of
+    them do, so the lookup fell through each wrapper's ``__getattr__``
+    straight to the wrapped TARGET's bound method, which calls
+    ``self.generate`` where ``self`` is the plain target, never the
+    wrapper. Every ordinary request therefore silently bypassed the
+    wrapper's own speculative ``.generate()`` override entirely -- live-
+    confirmed MTP speculation never actually engaged despite being
+    "enabled" for the whole time it existed. Only take the retry path when
+    the object genuinely implements it itself.
+    """
+    generate = (engine.generate_with_memory_retry
+                if _has_own_method(engine, "generate_with_memory_retry")
+                else engine.generate)
+    result = generate(*args, **kwargs)
+    if os.environ.get("VMODEL_DEBUG_ENGINE_REPORT", "0") == "1":
+        print("[debug] engine.report():\n" + engine.report(), flush=True)
+    return result
 
 _GATEWAY_CONFIRMATION_RE = re.compile(
     r"^(?:do it|go ahead|proceed|please do|run it|check it|try it|yes|ok(?:ay)?)"
@@ -3891,6 +4120,53 @@ def _hidden_gateway_catalogs(tools, raw_tools, messages, query: str | None = Non
     )
 
 
+_HYBRID_RECURRENT_MODEL_TYPES = ("qwen3_5", "qwen3_5_moe", "kimi_linear")
+
+
+def _hybrid_stable_boundary_tokens(
+        engine, model_dir: Path, messages: list[dict], reasoning: str,
+        prompt_tools: list[dict] | None, prompt_ids: tuple[int, ...], *,
+        compact_json: bool, enable_thinking: bool | None,
+        reasoning_requested: bool, canonical_hermes_tools: bool) -> int:
+    """Token count of this same conversation WITHOUT the trailing generation
+    scaffold (``add_generation_prompt=False``), for recurrent hybrid models.
+
+    Qwen3.5/3.6 and Kimi Linear carry DeltaNet/KDA recurrent state that can
+    only be exactly *extended*, never trimmed to an arbitrary common prefix
+    (see ``recurrent_exact_only`` in engine.py). Live-reproduced 2026-07-22:
+    the released chat template re-renders any but the LATEST assistant turn
+    WITHOUT its own generation-prompt scaffold (``<|im_start|>assistant\\n
+    <think>\\n\\n</think>\\n\\n`` for a no-thinking answer) once a new turn
+    follows it -- so a hot-KV slot retained at the full post-reply endpoint
+    can never match again on a real second turn; every conversation fell
+    back to a full cold re-prefill on every turn after the first with ZERO
+    exceptions observed. The boundary computed here (this turn's content
+    with NO scaffold at all) is exactly the prefix any future continuation
+    of this same conversation is guaranteed to re-render byte-identically,
+    so a state checkpoint forked there (engine.py's boundary-fork logic)
+    stays valid indefinitely across turns instead of dying after one.
+    """
+    if engine.cfg.model_type not in _HYBRID_RECURRENT_MODEL_TYPES:
+        return 0
+    if not getattr(engine.rc, "hot_prompt_kv", False):
+        return 0
+    boundary_prompt = _chat_prompt(
+        engine, model_dir, messages, reasoning, tools=prompt_tools,
+        compact_json=compact_json, enable_thinking=enable_thinking,
+        reasoning_requested=reasoning_requested,
+        canonical_hermes_tools=canonical_hermes_tools,
+        add_generation_prompt=False)
+    boundary_ids, _offsets, _cache_hit = _prepared_prompt_ids(
+        engine, boundary_prompt)
+    n = len(boundary_ids)
+    if not (0 < n < len(prompt_ids)) or tuple(prompt_ids[:n]) != tuple(boundary_ids):
+        # Never seen live, but the template is data, not a contract: fail
+        # closed to "no boundary hint" rather than risk feeding engine.py a
+        # position that doesn't actually describe a real shared prefix.
+        return 0
+    return n
+
+
 def _prepare_chat_prompt(engine, model_dir: Path, messages: list[dict], reasoning: str,
                          tools: list[dict], raw_tools: list[dict], mode: str,
                          max_output_tokens: int, *,
@@ -3990,6 +4266,11 @@ def _prepare_chat_prompt(engine, model_dir: Path, messages: list[dict], reasonin
         canonical_hermes_tools=canonical_hermes_tools)
     prompt_ids, prompt_offsets, prompt_token_cache_hit = _prepared_prompt_ids(
         engine, prompt)
+    stable_boundary_tokens = _hybrid_stable_boundary_tokens(
+        engine, model_dir, messages, reasoning, prompt_tools, prompt_ids,
+        compact_json=compact_json, enable_thinking=effective_enable_thinking,
+        reasoning_requested=reasoning_requested,
+        canonical_hermes_tools=canonical_hermes_tools)
     tool_capsules = (
         _tool_capsule_spans(
             prompt, prompt_tools, prompt_ids, prompt_offsets)
@@ -4078,7 +4359,8 @@ def _prepare_chat_prompt(engine, model_dir: Path, messages: list[dict], reasonin
                 prompt, prompt_ids, tool_capsules,
                 cache_namespace=cache_namespace,
                 force_paged_kv=bool(
-                    (resident_kv or {}).get("adaptive_spill_required", 0))),
+                    (resident_kv or {}).get("adaptive_spill_required", 0)),
+                stable_boundary_tokens=stable_boundary_tokens),
             prompt_tokens, selected_tools,
             selected_raw, metadata)
 
@@ -4330,6 +4612,46 @@ def _log_path_stats(result: dict, prompt_tokens: int) -> None:
         print(
             f"[server] speculation fallback: "
             f"{stats.get('speculative_fallback_reason', 'unknown')}",
+            flush=True,
+        )
+    elif stats.get("qwen_mtp_used"):
+        proposed = int(stats.get("qwen_mtp_proposed", 0) or 0)
+        accepted = int(stats.get("qwen_mtp_accepted", 0) or 0)
+        acceptance = 100.0 * accepted / proposed if proposed else 0.0
+        print(
+            f"[server] Qwen MTP speculation: accepted {accepted}/{proposed} "
+            f"({acceptance:.0f}%), target_sweeps="
+            f"{int(stats.get('qwen_mtp_target_sweeps', 0) or 0)}",
+            flush=True,
+        )
+    elif stats.get("qwen_mtp_enabled"):
+        print(
+            f"[server] Qwen MTP speculation fallback: "
+            f"{stats.get('qwen_mtp_fallback_reason', 'unknown')}",
+            flush=True,
+        )
+    elif stats.get("qwen_ngram_used"):
+        proposed = int(stats.get("qwen_ngram_proposed", 0) or 0)
+        accepted = int(stats.get("qwen_ngram_accepted", 0) or 0)
+        acceptance = 100.0 * accepted / proposed if proposed else 0.0
+        print(
+            f"[server] Qwen n-gram speculation: accepted {accepted}/{proposed} "
+            f"({acceptance:.0f}%), rounds="
+            f"{int(stats.get('qwen_ngram_rounds', 0) or 0)}, target_sweeps="
+            f"{int(stats.get('qwen_ngram_target_sweeps', 0) or 0)}",
+            flush=True,
+        )
+    elif stats.get("qwen_ngram_enabled"):
+        print(
+            f"[server] Qwen n-gram speculation fallback: "
+            f"{stats.get('qwen_ngram_fallback_reason', 'unknown')}",
+            flush=True,
+        )
+    if stats.get("grammar_fast_forward_tokens"):
+        print(
+            f"[server] grammar fast-forward: "
+            f"{int(stats['grammar_fast_forward_tokens'])} forced tokens "
+            "committed without model sweeps",
             flush=True,
         )
     hit = stats.get("prompt_cache_exact_hit")
