@@ -2314,22 +2314,36 @@ class StreamingEngine:
     def _layer_stationary_qwen35_sweep(
             self, x: mx.array, kv: KVCache, offset: int,
             tile_width: int) -> mx.array:
-        """F94 live path: layer-major (not chunk-major) prefill for dense
-        qwen3_5 (Qwen3.5-4B/9B, Qwen3.6-27B hybrid DeltaNet/full-attention
-        layers, num_experts=0). Fetches each layer's weights exactly once for
-        the WHOLE prefill range in `x`, unlike `_sweep` (called once per
-        chunk by generate()'s prefill loop), which re-fetches every layer's
-        weights once per chunk whenever the resident cache can't hold the
-        whole model. See CLAUDE.md's 2026-07-23 correction: measured single-
-        layer fetches already run at raw disk bandwidth (~1.6 GB/s) -- the
-        real cost is fetching the SAME layers repeatedly across chunks, not
-        any per-fetch overhead. Deliberately narrower than layer_stationary.py
-        (which is model-agnostic but untested against real recurrent state):
-        this dispatches straight to run_qwen35_block per layer, so it is only
-        used for the dense (non-MoE) qwen3_5 model_type -- MoE routing makes
-        per-token expert selection order-sensitive (a separate, harder
-        problem, F35), and other hybrid model_types have their own per-layer
-        dispatch this method does not attempt to generalize to.
+        """F94 live path: layer-major (not chunk-major) prefill for qwen3_5/
+        qwen3_5_moe (Qwen3.5-4B/9B, Qwen3.6-27B hybrid DeltaNet/full-attention
+        layers). Fetches each layer's weights exactly once for the WHOLE
+        prefill range in `x`, unlike `_sweep` (called once per chunk by
+        generate()'s prefill loop), which re-fetches every layer's weights
+        once per chunk whenever the resident cache can't hold the whole
+        model. See CLAUDE.md's 2026-07-23 correction: measured single-layer
+        fetches already run at raw disk bandwidth (~1.6 GB/s) -- the real
+        cost is fetching the SAME layers repeatedly across chunks, not any
+        per-fetch overhead. Deliberately narrower than layer_stationary.py
+        (which is model-agnostic but untested against real recurrent state).
+
+        F94 (2026-07-20) originally covered only the dense (num_experts=0)
+        case by dispatching straight to run_qwen35_block per layer per tile.
+        **Extended 2026-07-25** to qwen3_5_moe (Qwen3.6-27B/35B-A3B,
+        Qwen3.5-35B-A3B's routed layers) the same way F35 extended Kimi
+        Linear/GLM: attention still runs per TILE via
+        `_qwen35_attention_residual` (DeltaNet state and ordinary KV both
+        still need causal tile order, unchanged), but
+        `_qwen35_mlp_residual` (MoE routing + expert fetch, when
+        cfg.num_experts>0) now runs exactly ONCE per layer on the full
+        tile-concatenated attention output, instead of once per tile inside
+        the old single run_qwen35_block call -- eliminating the same
+        cross-chunk redundant expert re-routing/re-fetching F35 fixed for
+        Kimi Linear/GLM. For the dense case (num_experts=0) this is a no-op
+        change: running _swiglu once over the concatenated range is the same
+        deterministic per-position function as running it once per tile,
+        since dense MLP has no cross-position state -- so this generalizes
+        the sweep without altering dense qwen3_5's own already-proven
+        behavior.
 
         Mirrors _sweep's per-layer governor reservation, transient-memory
         tracking, and prefetch scheduling exactly (just reordered: tiles of
@@ -2340,11 +2354,15 @@ class StreamingEngine:
         each layer's own recurrent state depending only on that layer's own
         sequential inputs and its own prior state -- never on another layer's
         loop position -- so re-associating the (layer, tile) loop nesting
-        cannot change any layer's own state evolution; this is proven
-        directly (not just argued) in
-        tests/test_f94_qwen35_layer_stationary_oracle.py.
+        cannot change any layer's own state evolution; MoE routing is
+        stateless per call (a function of `h` alone), so computing it once
+        over all positions is the same function evaluated on the union of
+        its arguments, not a different function -- the same argument F35
+        already used for Kimi Linear/GLM. Proven directly (not just argued)
+        in tests/test_f94_qwen35_layer_stationary_oracle.py (dense) and
+        tests/test_f35_qwen35_moe_layer_stationary_oracle.py (MoE).
         """
-        from .qwen35 import run_qwen35_block
+        from .qwen35 import _qwen35_attention_residual, _qwen35_mlp_residual
 
         if tile_width <= 0:
             raise ValueError("tile_width must be positive")
@@ -2390,17 +2408,20 @@ class StreamingEngine:
                         self._layer_transient,
                         margin=self._layer_transient_margin)
                 xt = x[:, pos:end, :]
-                yt = run_qwen35_block(
+                yt = _qwen35_attention_residual(
                     xt, w, f"model.layers.{i}", self.cfg, kv, i,
-                    offset + pos, self._get_experts, mlp_last_only=False,
-                    iter_expert_batches=self._iter_expert_batches,
+                    offset + pos, mlp_last_only=False,
                     zmlx_fused_decode=self.rc.zmlx_fused_deltanet_decode,
                     native_fused_decode=self.rc.native_fused_deltanet_decode,
                 )
                 mx.eval(yt)
                 tiles.append(yt)
                 pos = end
-            x = tiles[0] if len(tiles) == 1 else mx.concatenate(tiles, axis=1)
+            x_after_attn = tiles[0] if len(tiles) == 1 else mx.concatenate(tiles, axis=1)
+            x = _qwen35_mlp_residual(
+                x_after_attn, w, f"model.layers.{i}", self.cfg, i,
+                self._get_experts, iter_expert_batches=self._iter_expert_batches)
+            mx.eval(x)
             self.timer.add("layer_compute", time.perf_counter() - t0)
             self._layer_transient = max(
                 self._layer_transient,
@@ -3769,7 +3790,8 @@ class StreamingEngine:
                 bool(chunk)
                 and self.rc.layer_stationary_prefill
                 and self.cfg.model_type in (
-                    "qwen3_5", "kimi_linear", "glm_moe_dsa", "kimi_k25", "glm4_moe_lite")
+                    "qwen3_5", "qwen3_5_moe", "kimi_linear",
+                    "glm_moe_dsa", "kimi_k25", "glm4_moe_lite")
                 and adaptive is None
                 and not (ckpt and kv_store is not None)
                 and not force_adaptive_paged

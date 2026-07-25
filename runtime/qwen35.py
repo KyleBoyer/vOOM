@@ -133,23 +133,42 @@ def _native_fused_causal_conv1d(
 
 
 def qwen35_rms_norm(x: mx.array, weight: mx.array, eps: float) -> mx.array:
-    """Official zero-centered decoder RMSNorm: norm(x.float) * (1+w)."""
+    """Official zero-centered decoder RMSNorm: norm(x.float) * (1+w).
+
+    mx.fast.rms_norm computes x*rsqrt(mean(x^2)+eps)*weight -- no native
+    "(1+w)" variant exists, but passing weight+1 as ITS weight argument
+    computes exactly this formula through the same single fused Metal
+    dispatch instead of the 5+ separate ops (square/mean/rsqrt/add/mul)
+    the manual composite used. Verified byte-identical (0.0 max abs diff,
+    not just close) against the original composite across representative
+    shapes -- the previous rms_norm+residual FUSION attempt (a from-
+    scratch custom kernel, F103's third target) failed and was correctly
+    abandoned because it competed against this exact native primitive
+    directly; this instead just routes qwen3.5's own formula THROUGH that
+    primitive, which the original composite never did."""
     source_dtype = x.dtype
     x32 = x.astype(mx.float32)
-    normalized = x32 * mx.rsqrt(mx.mean(x32 * x32, axis=-1, keepdims=True) + eps)
-    return (normalized * (1.0 + weight.astype(mx.float32))).astype(source_dtype)
+    w32 = weight.astype(mx.float32) + 1.0
+    return mx.fast.rms_norm(x32, w32, eps).astype(source_dtype)
 
 
 def _silu_gated_rms_norm(
     x: mx.array, gate: mx.array, weight: mx.array, eps: float,
 ) -> mx.array:
-    """DeltaNet's ordinary-scale RMSNorm followed by a SiLU output gate."""
+    """DeltaNet's ordinary-scale RMSNorm followed by a SiLU output gate.
+
+    Same native-primitive-reuse idea as qwen35_rms_norm above: the norm+
+    weight portion is plain (no 1+w offset here), so it maps onto
+    mx.fast.rms_norm directly with no weight transform at all -- only the
+    SiLU gate multiply stays a separate op (it isn't part of RMSNorm's
+    own math). Verified byte-identical against the original composite."""
     source_dtype = x.dtype
     x32 = x.astype(mx.float32)
-    normalized = x32 * mx.rsqrt(mx.mean(x32 * x32, axis=-1, keepdims=True) + eps)
+    w32 = weight.astype(mx.float32)
+    normalized = mx.fast.rms_norm(x32, w32, eps)
     gate32 = gate.astype(mx.float32)
     silu_gate = gate32 * mx.sigmoid(gate32)
-    return (normalized * weight.astype(mx.float32) * silu_gate).astype(source_dtype)
+    return (normalized * silu_gate).astype(source_dtype)
 
 
 def _rotate_half(x: mx.array) -> mx.array:
@@ -591,15 +610,22 @@ def _moe(
     return routed + shared_gate * shared
 
 
-def run_qwen35_block(
+def _qwen35_attention_residual(
     x: mx.array, w: dict, prefix: str, cfg: ModelConfig, kv,
-    layer: int, offset: int, get_experts, mlp_last_only: bool = False,
-    iter_expert_batches=None,
+    layer: int, offset: int, mlp_last_only: bool = False,
     positions3: np.ndarray | mx.array | None = None,
     zmlx_fused_decode: bool = False,
     defer_state_eval: bool = False,
     native_fused_decode: bool = False,
 ) -> mx.array:
+    """DeltaNet-or-full-attention + residual only, no MLP/MoE -- split out of
+    run_qwen35_block (2026-07-25) so a caller can run attention per-tile
+    (DeltaNet state and ordinary KV both still need causal tile order,
+    unchanged) while deferring MoE routing to run once per layer, mirroring
+    _kimi_linear_attention_residual/_glm_attention_residual's own split for
+    the same reason -- this is what lets F35's layer-stationary technique
+    extend to qwen3_5_moe (Qwen3.5-35B-A3B, Qwen3.6-27B/35B-A3B's routed
+    layers), not just the bare dense "qwen3_5" F94 already covered."""
     residual = x
     h = qwen35_rms_norm(
         x, w[f"{prefix}.input_layernorm.weight"], cfg.rms_norm_eps)
@@ -618,6 +644,16 @@ def run_qwen35_block(
     x = residual + mixed
     if mlp_last_only:
         x = x[:, -1:, :]
+    return x
+
+
+def _qwen35_mlp_residual(
+    x: mx.array, w: dict, prefix: str, cfg: ModelConfig, layer: int,
+    get_experts, iter_expert_batches=None,
+) -> mx.array:
+    """MLP (dense) or MoE + residual only, given x already post-attention --
+    the other half of run_qwen35_block's split, see
+    _qwen35_attention_residual."""
     h = qwen35_rms_norm(
         x, w[f"{prefix}.post_attention_layernorm.weight"],
         cfg.rms_norm_eps)
@@ -634,6 +670,30 @@ def run_qwen35_block(
         return x + _swiglu(h, w, f"{prefix}.mlp")
     return x + _moe(
         h, w, prefix, cfg, layer, get_experts,
+        iter_expert_batches=iter_expert_batches)
+
+
+def run_qwen35_block(
+    x: mx.array, w: dict, prefix: str, cfg: ModelConfig, kv,
+    layer: int, offset: int, get_experts, mlp_last_only: bool = False,
+    iter_expert_batches=None,
+    positions3: np.ndarray | mx.array | None = None,
+    zmlx_fused_decode: bool = False,
+    defer_state_eval: bool = False,
+    native_fused_decode: bool = False,
+) -> mx.array:
+    """One Qwen3.5/3.6 decoder block (chunk-major / ordinary use). Thin
+    wrapper over the attention/MLP split above -- see
+    StreamingEngine._layer_stationary_qwen35_sweep in engine.py for the
+    layer-major caller that uses the split directly, now for MoE variants
+    too, not just the dense case F94 originally built it for."""
+    x = _qwen35_attention_residual(
+        x, w, prefix, cfg, kv, layer, offset, mlp_last_only=mlp_last_only,
+        positions3=positions3, zmlx_fused_decode=zmlx_fused_decode,
+        defer_state_eval=defer_state_eval,
+        native_fused_decode=native_fused_decode)
+    return _qwen35_mlp_residual(
+        x, w, prefix, cfg, layer, get_experts,
         iter_expert_batches=iter_expert_batches)
 
 
