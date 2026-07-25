@@ -256,6 +256,30 @@ def test_suffix_fallbacks_are_explicit_and_fail_closed():
         terminal=False) == "unproven-kv-layout"
 
 
+def test_suffix_vision_config_alone_does_not_disqualify_text_only_qwen():
+    """Real Qwen3.5/3.6 text checkpoints (e.g. Qwen3.5-9B) carry a non-empty
+    vision_config sub-dict inherited from a shared multimodal-family config
+    template even though their model_type is plain "qwen3_5" and they never
+    take the vision code path -- vision_config truthiness ALONE must not
+    disqualify them (a real bug found and fixed 2026-07-25: it silently did,
+    for every such checkpoint, whenever a caller opted into suffix_decoding).
+    A genuine qwen3_vl target must still be excluded."""
+    from runtime.kv_cache import KVCache
+    from runtime.sampler import SamplingParams
+    from runtime.suffix_decoding import fallback_reason
+
+    kv = KVCache(1)
+    greedy = SamplingParams()
+    engine = _fallback_engine(enabled=True)
+    engine.cfg.model_type = "qwen3_5"
+    engine.cfg.vision_config = {"depth": 27}
+    assert fallback_reason(engine, kv, greedy, None, terminal=False) is None
+
+    engine.cfg.model_type = "qwen3_vl"
+    assert fallback_reason(
+        engine, kv, greedy, None, terminal=False) == "vision-target"
+
+
 def test_runtime_config_yaml_is_explicit_and_default_off(tmp_path):
     from runtime.engine import RuntimeConfig
 

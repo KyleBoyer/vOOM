@@ -507,7 +507,18 @@ def fallback_reason(engine, kv, sampling, constraint, *, terminal: bool) -> str 
         return "resident-decode"
     if engine.cfg.num_experts or engine.cfg.model_type in ("glm_moe_dsa", "gpt_oss"):
         return "non-dense-target"
-    if getattr(engine.cfg, "vision_config", None):
+    # 2026-07-25: real Qwen3.5/3.6 text checkpoints (e.g. Qwen3.5-9B) carry a
+    # non-empty `vision_config` sub-dict in their raw config.json (inherited
+    # from a shared multimodal-family template) even though their own
+    # model_type is plain "qwen3_5", not "qwen3_vl" -- they never take the
+    # vision/multimodal code path at all. `vision_config` truthiness ALONE
+    # was silently disqualifying every such checkpoint from suffix decoding.
+    # engine.py's own established convention for "is this deployment
+    # actually vision-active" (e.g. the `_needs_multimodal_prefill`-style
+    # checks around engine.py:821-822) always pairs vision_config with the
+    # model_type prefix -- mirrored here for consistency.
+    if (getattr(engine.cfg, "vision_config", None)
+            and engine.cfg.model_type.startswith("qwen3_vl")):
         return "vision-target"
     if type(kv) is not KVCache:
         return "unproven-kv-layout"
