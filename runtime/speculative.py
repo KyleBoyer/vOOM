@@ -102,9 +102,21 @@ def ngram_propose(tokens: list[int], k: int, max_ngram: int = 6, min_ngram: int 
 class SpeculativeDecoder:
     def __init__(self, target: StreamingEngine, draft: StreamingEngine | None, k: int = 6,
                  min_tokens_per_sweep: float | None = None,
-                 prompt_cache_min_tokens: int = 0):
+                 prompt_cache_min_tokens: int = 0,
+                 _unsafe_allow_moe_verify: bool = False):
         """draft=None -> prompt-lookup mode (F11): proposals come from n-gram
         matches in the running context instead of a draft model.
+
+        _unsafe_allow_moe_verify: F113 (2026-07-25) escape hatch for tests
+        ONLY -- bypasses the MoE/hybrid-target construction guard below.
+        Real usage against real weights has a CONFIRMED correctness bug at
+        this configuration (see the guard's own comment); the only
+        legitimate caller is tests/test_f32_rollback.py, which exercises
+        accept/reject/KV-rollback BOOKKEEPING against a tiny synthetic
+        fixture with forced/fake draft outputs -- small enough that the
+        batched-GEMM numerical divergence this guard protects against does
+        not manifest, so the bookkeeping arithmetic itself is still validly
+        tested. Never pass this for a real checkpoint.
 
         F01 acceptance controller: a multi-position MoE verify sweep can cost far
         more routed-expert bytes than a plain token. The present ~2.0-2.6x range is
@@ -128,6 +140,36 @@ class SpeculativeDecoder:
                 f"targets ({target.cfg.model_type}) with draft={draft!r} -- "
                 f"KVCache.trim() cannot roll back kda_cache on partial "
                 f"rejection. Use QwenMTPSpeculativeEngine instead.")
+        if not _unsafe_allow_moe_verify and (getattr(target.cfg, "num_experts", 0) or getattr(
+                target.cfg, "model_type", None) in (
+                "glm_moe_dsa", "gpt_oss", "qwen3_5", "qwen3_5_moe", "kimi_linear")):
+            # F113 (2026-07-25): this class's multi-position verify sweep
+            # uses forward_tokens_serial_positions() when eligible, but that
+            # method explicitly refuses the exact same set of targets (its
+            # own layer_runner.run_block has no hybrid/MoE dispatch
+            # awareness) -- which forces verification onto plain
+            # forward_tokens() instead. That method's own docstring already
+            # documents the mechanism: "Batched (L, hidden) GEMMs can choose
+            # different reduction kernels from ordinary one-token greedy
+            # decode and were observed to move Qwen-7B tokens during
+            # speculative verification." Confirmed empirically for
+            # draft="mtp" against the real GLM-4.7-Flash checkpoint: a real
+            # 6-position batched forward_tokens() verify call produced a
+            # DIFFERENT argmax at position 5 (token 15332) than true
+            # sequential single-position decoding (token 17664) using the
+            # identical real weights -- a real, reproducible correctness
+            # violation, not a performance question. Fail closed for every
+            # draft mode this class supports (not just "mtp") since the
+            # unsafe verify path is the same regardless of where proposals
+            # come from.
+            raise ValueError(
+                f"SpeculativeDecoder does not support MoE/hybrid targets "
+                f"({target.cfg.model_type}) -- their multi-position verify "
+                f"sweep cannot use the numerically-safe "
+                f"forward_tokens_serial_positions() path (excluded there "
+                f"too), and the batched forward_tokens() fallback has been "
+                f"confirmed to diverge from true sequential decode for "
+                f"these architectures.")
         if prompt_cache_min_tokens < 0:
             raise ValueError("prompt_cache_min_tokens must be >= 0")
         self.prompt_cache_min_tokens = prompt_cache_min_tokens

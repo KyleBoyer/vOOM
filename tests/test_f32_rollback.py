@@ -43,7 +43,13 @@ def _forced_boundary(n_match: int, k: int, prompt: str, max_tokens: int, true_to
 
     eng = StreamingEngine(str(FIXTURE), RuntimeConfig(
         max_weight_cache_mb=200, pin_lm_head=True, mla_compressed_kv=True))
-    dec = SpeculativeDecoder(eng, "mtp", k=k)
+    # F113 (2026-07-25): SpeculativeDecoder now refuses MoE/hybrid targets
+    # by default (a real correctness bug confirmed for real weights at this
+    # scale -- see runtime/speculative.py's guard). This test exercises
+    # accept/reject/KV-rollback bookkeeping against a tiny synthetic
+    # fixture with FORCED draft outputs, not real numerical verification --
+    # the escape hatch is documented as test-only for exactly this case.
+    dec = SpeculativeDecoder(eng, "mtp", k=k, _unsafe_allow_moe_verify=True)
     call_count = [0]
 
     def forced_draft(h_last, last_token, kk, mtp_kv, offset):
@@ -136,7 +142,10 @@ def test_mtp_layer_derives_from_config():
     from runtime.speculative import SpeculativeDecoder
 
     eng = StreamingEngine(str(FIXTURE), RuntimeConfig(max_weight_cache_mb=200))
-    dec = SpeculativeDecoder(eng, "mtp", k=2)
+    # F113 (2026-07-25): see the comment on the earlier _forced_boundary
+    # call site -- this test-only escape hatch is documented in
+    # runtime/speculative.py's guard.
+    dec = SpeculativeDecoder(eng, "mtp", k=2, _unsafe_allow_moe_verify=True)
     assert dec.mtp.mtp_layer == eng.cfg.num_hidden_layers == 4
     eng.close()
 
