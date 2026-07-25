@@ -2491,7 +2491,8 @@ class EngineManager:
                         f"({model_dir.name}): {error}",
                         flush=True,
                     )
-            elif getattr(rc, "qwen_ngram_speculative", False):
+            elif (getattr(rc, "qwen_ngram_speculative", False)
+                    and not target_engine.cfg.num_experts):
                 # F11: prompt-lookup/n-gram speculation, mutually exclusive
                 # with native MTP above for this first version -- both are
                 # verified-draft schemes over the same hybrid recurrent
@@ -2499,6 +2500,22 @@ class EngineManager:
                 # n-gram round to an MTP-drafted one, say) is real added
                 # complexity with no evidence yet that it's worth it over
                 # picking whichever wins for a given workload.
+                #
+                # F112 (2026-07-25): real A/B against Qwen3.5-35B-A3B (MoE)
+                # found n-gram speculation is ALSO a real regression there
+                # (118.601s -> 163.409s, 0.726x -- worse than MTP's own
+                # 0.945x regression on the same checkpoint), despite the
+                # draft step itself being free (no draft model at all):
+                # verifying k proposed positions in one forward pass routes
+                # all k+1 through each MoE layer's gate at once, and the
+                # union of distinct experts selected across k+1 mostly-
+                # independent (sometimes implausible speculative) positions
+                # is generically larger than what real sequential decode
+                # would touch -- on a rejected round (~68% of rounds in
+                # that test) that extra expert-fetch breadth is pure waste.
+                # Gated to num_experts==0 (dense) for the same reason as
+                # the MTP gate above: never let the opt-in env var silently
+                # regress a MoE deployment.
                 from .qwen35_ngram import QwenNgramSpeculativeEngine
 
                 try:
