@@ -505,7 +505,8 @@ def fallback_reason(engine, kv, sampling, constraint, *, terminal: bool) -> str 
         return "constrained-decoding"
     if engine.rc.resident_fast_decode or engine.rc.resident_moe_decode:
         return "resident-decode"
-    if engine.cfg.num_experts or engine.cfg.model_type in ("glm_moe_dsa", "gpt_oss"):
+    glm_family = engine.cfg.model_type in ("glm_moe_dsa", "kimi_k25", "glm4_moe_lite")
+    if not glm_family and (engine.cfg.num_experts or engine.cfg.model_type == "gpt_oss"):
         return "non-dense-target"
     # 2026-07-25: real Qwen3.5/3.6 text checkpoints (e.g. Qwen3.5-9B) carry a
     # non-empty `vision_config` sub-dict in their raw config.json (inherited
