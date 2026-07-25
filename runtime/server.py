@@ -2461,7 +2461,20 @@ class EngineManager:
                         flush=True,
                     )
             elif (getattr(rc, "qwen_mtp_speculative", False)
-                    and target_engine.store.names_with_prefix("mtp.")):
+                    and target_engine.store.names_with_prefix("mtp.")
+                    and not target_engine.cfg.num_experts):
+                # F110 (2026-07-25): real A/B against real checkpoints found
+                # MTP speculation is a real ~1.8x win for DENSE qwen3_5
+                # targets but a real ~0.95x REGRESSION for qwen3_5_moe --
+                # drafting a token for a MoE checkpoint requires the MTP
+                # layer's own small MoE routing + a separate expert-page
+                # fetch (QwenMTPDrafter._get_experts) on top of the trunk's
+                # verify pass, and that extra disk-bound fetch outweighs the
+                # savings from needing fewer trunk passes. Gated to
+                # num_experts==0 (dense) so enabling the opt-in env var
+                # never silently regresses a MoE deployment; MoE targets
+                # fall through to the plain target engine below exactly as
+                # if no mtp.* weights existed.
                 from .qwen35_mtp import QwenMTPSpeculativeEngine
 
                 try:
