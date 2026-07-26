@@ -14,8 +14,6 @@ measured sequential KDA path.
 
 from __future__ import annotations
 
-import os
-
 import mlx.core as mx
 import numpy as np
 
@@ -275,12 +273,16 @@ def _full_attention(
     return _linear(attended, w, f"{prefix}.self_attn.o_proj")
 
 
-# Chunked-parallel DeltaNet (opt-in, 2026-07-23): replaces the sequential
+# Chunked-parallel DeltaNet (fast/lossy, 2026-07-23): replaces the sequential
 # per-position recurrence for multi-position sweeps (prefill, speculative
-# verify) with the chunkwise WY form below. Read once at import; toggled by
-# server restart like the other opt-in speed flags.
-_CHUNKED_DELTA_PREFILL = os.environ.get(
-    "VMODEL_QWEN35_CHUNKED_DELTA", "0") == "1"
+# verify) with the chunkwise WY form below. F100's real greedy 9B gate measured
+# ~4x and the private captured-request profile in F121 independently measured
+# 86.62s -> 48.40s on the lossy 9B artifact. The chunkwise reassociation is
+# close but not activation-identical across arbitrary prompt-checkpoint
+# boundaries, so the exact endpoint continuation oracle must pass under the
+# default sequential recurrence. Admission is an engine-local runtime setting:
+# fast/lossy routes default on, lossless routes default off, and switching model
+# IDs in one server cannot leak a process-global choice across engines.
 
 
 def _sequential_gated_delta_rule(q, k, v, beta, decay, state):
@@ -462,6 +464,7 @@ def _gated_delta_net(
     zmlx_fused_decode: bool = False,
     defer_state_eval: bool = False,
     native_fused_decode: bool = False,
+    chunked_delta_prefill: bool = False,
 ) -> mx.array:
     batch, length, _ = h.shape
     key_heads = cfg.linear_num_key_heads
@@ -522,7 +525,7 @@ def _gated_delta_net(
     if state is None:
         state = mx.zeros(
             (batch, value_heads, key_dim, value_dim), dtype=mx.float32)
-    if _CHUNKED_DELTA_PREFILL and length > 1:
+    if chunked_delta_prefill and length > 1:
         output, state = _chunked_gated_delta_rule(q, k, v, beta, decay, state)
     elif native_fused_decode and length == 1:
         # F103: hand-written mx.fast.metal_kernel fusion of the single-step
@@ -570,10 +573,14 @@ def _route_experts(
 
 def _moe(
     h: mx.array, w: dict, prefix: str, cfg: ModelConfig, layer: int,
-    get_experts, iter_expert_batches=None,
+    get_experts, iter_expert_batches=None, profile=None,
 ) -> mx.array:
+    router_t0 = profile.start_substep() if profile is not None else None
     indices, scores = _route_experts(h, w, prefix, cfg, layer)
-    mx.eval(indices, scores)
+    if not (profile is not None and profile.finish_substep(
+            "router", layer, router_t0, indices, scores,
+            positions=int(h.shape[1]))):
+        mx.eval(indices, scores)
     groups = _group_routes(indices, scores)
     routed = mx.zeros_like(h)
     expert_ids = sorted(groups)
@@ -617,6 +624,7 @@ def _qwen35_attention_residual(
     zmlx_fused_decode: bool = False,
     defer_state_eval: bool = False,
     native_fused_decode: bool = False,
+    chunked_delta_prefill: bool = False,
 ) -> mx.array:
     """DeltaNet-or-full-attention + residual only, no MLP/MoE -- split out of
     run_qwen35_block (2026-07-25) so a caller can run attention per-tile
@@ -635,7 +643,8 @@ def _qwen35_attention_residual(
             h, w, prefix, cfg, getattr(kv, "kda_cache", None), layer,
             zmlx_fused_decode=zmlx_fused_decode,
             defer_state_eval=defer_state_eval,
-            native_fused_decode=native_fused_decode)
+            native_fused_decode=native_fused_decode,
+            chunked_delta_prefill=chunked_delta_prefill)
     elif layer_type == "full_attention":
         mixed = _full_attention(
             h, w, prefix, cfg, kv, layer, offset, positions3)
@@ -649,7 +658,7 @@ def _qwen35_attention_residual(
 
 def _qwen35_mlp_residual(
     x: mx.array, w: dict, prefix: str, cfg: ModelConfig, layer: int,
-    get_experts, iter_expert_batches=None,
+    get_experts, iter_expert_batches=None, profile=None,
 ) -> mx.array:
     """MLP (dense) or MoE + residual only, given x already post-attention --
     the other half of run_qwen35_block's split, see
@@ -670,7 +679,7 @@ def _qwen35_mlp_residual(
         return x + _swiglu(h, w, f"{prefix}.mlp")
     return x + _moe(
         h, w, prefix, cfg, layer, get_experts,
-        iter_expert_batches=iter_expert_batches)
+        iter_expert_batches=iter_expert_batches, profile=profile)
 
 
 def run_qwen35_block(
@@ -681,20 +690,33 @@ def run_qwen35_block(
     zmlx_fused_decode: bool = False,
     defer_state_eval: bool = False,
     native_fused_decode: bool = False,
+    chunked_delta_prefill: bool = False,
+    profile=None,
 ) -> mx.array:
     """One Qwen3.5/3.6 decoder block (chunk-major / ordinary use). Thin
     wrapper over the attention/MLP split above -- see
     StreamingEngine._layer_stationary_qwen35_sweep in engine.py for the
     layer-major caller that uses the split directly, now for MoE variants
     too, not just the dense case F94 originally built it for."""
+    positions = int(x.shape[1])
+    attention_t0 = profile.start_substep() if profile is not None else None
     x = _qwen35_attention_residual(
         x, w, prefix, cfg, kv, layer, offset, mlp_last_only=mlp_last_only,
         positions3=positions3, zmlx_fused_decode=zmlx_fused_decode,
         defer_state_eval=defer_state_eval,
-        native_fused_decode=native_fused_decode)
-    return _qwen35_mlp_residual(
+        native_fused_decode=native_fused_decode,
+        chunked_delta_prefill=chunked_delta_prefill)
+    if profile is not None:
+        profile.finish_substep(
+            "attention", layer, attention_t0, x, positions=positions)
+    mlp_t0 = profile.start_substep() if profile is not None else None
+    x = _qwen35_mlp_residual(
         x, w, prefix, cfg, layer, get_experts,
-        iter_expert_batches=iter_expert_batches)
+        iter_expert_batches=iter_expert_batches, profile=profile)
+    if profile is not None:
+        profile.finish_substep(
+            "mlp", layer, mlp_t0, x, positions=int(x.shape[1]))
+    return x
 
 
 def multimodal_prefill(
@@ -731,6 +753,7 @@ def multimodal_prefill(
             engine._get_experts,
             iter_expert_batches=engine._iter_expert_batches,
             positions3=positions3,
+            chunked_delta_prefill=engine.rc.qwen_chunked_delta_prefill,
         )
         mx.eval(x)
     logits = engine._final_logits(x)
@@ -772,6 +795,7 @@ def multimodal_suffix_prefill(
             engine._get_experts,
             iter_expert_batches=engine._iter_expert_batches,
             positions3=suffix_positions,
+            chunked_delta_prefill=engine.rc.qwen_chunked_delta_prefill,
         )
         mx.eval(x)
     logits = engine._final_logits(x)

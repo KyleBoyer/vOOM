@@ -275,7 +275,7 @@ def _glm_attention_residual(
 
 def _glm_mlp_residual(
     x: mx.array, w: dict, prefix: str, cfg: ModelConfig, layer: int,
-    get_experts, iter_expert_batches=None,
+    get_experts, iter_expert_batches=None, profile=None,
 ) -> mx.array:
     """MLP (dense) or MoE + residual only, given x already post-attention --
     the other half of run_glm_block's split, see _glm_attention_residual."""
@@ -289,8 +289,12 @@ def _glm_mlp_residual(
     if is_dense:
         return x + _swiglu(h, w, f"{prefix}.mlp")
 
+    router_t0 = profile.start_substep() if profile is not None else None
     idx, pw = _route_experts(h, w, prefix, cfg)
-    mx.eval(idx, pw)
+    if not (profile is not None and profile.finish_substep(
+            "router", layer, router_t0, idx, pw,
+            positions=int(h.shape[1]))):
+        mx.eval(idx, pw)
     groups = _group_routes(idx, pw)
 
     # HF accumulates routed contributions into zeros in ascending expert order,
@@ -335,11 +339,23 @@ def _glm_mlp_residual(
 def run_glm_block(
     x: mx.array, w: dict, prefix: str, cfg: ModelConfig, kv, layer: int, offset: int,
     get_experts, mlp_last_only: bool = False, iter_expert_batches=None,
+    profile=None,
 ) -> mx.array:
     """One GLM/K2.5 decoder block (chunk-major / ordinary use). Thin wrapper
     over the attention/MLP split below -- see _layer_stationary_glm_sweep in
     engine.py for the layer-major caller that uses the split directly."""
+    positions = int(x.shape[1])
+    attention_t0 = profile.start_substep() if profile is not None else None
     x = _glm_attention_residual(
         x, w, prefix, cfg, kv, layer, offset, mlp_last_only=mlp_last_only)
-    return _glm_mlp_residual(
-        x, w, prefix, cfg, layer, get_experts, iter_expert_batches=iter_expert_batches)
+    if profile is not None:
+        profile.finish_substep(
+            "attention", layer, attention_t0, x, positions=positions)
+    mlp_t0 = profile.start_substep() if profile is not None else None
+    x = _glm_mlp_residual(
+        x, w, prefix, cfg, layer, get_experts,
+        iter_expert_batches=iter_expert_batches, profile=profile)
+    if profile is not None:
+        profile.finish_substep(
+            "mlp", layer, mlp_t0, x, positions=int(x.shape[1]))
+    return x

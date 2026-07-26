@@ -49,6 +49,13 @@ import psutil
 
 
 PLEX_TOOL = "plugin__plex__plex_list_library"
+# The captured catalog also exposes a narrower media-listing endpoint. Larger
+# Qwen models sometimes select it instead of the planner-adapted list endpoint.
+# It is still a real paginatable Plex call and must receive its tool result;
+# historically the profiler recorded it in ``call_names`` but silently stopped
+# after turn one because the continuation loop matched only ``PLEX_TOOL``.
+PLEX_MEDIA_TOOL = "plugin__plex__plex_list_library_media"
+PLEX_PAGINATION_TOOLS = frozenset((PLEX_TOOL, PLEX_MEDIA_TOOL))
 EXPECTED_PROMPT_TERMS = ("plex", "movies/tv", "/Kids/")
 
 SYNTHETIC_PAGES = (
@@ -223,7 +230,7 @@ def evaluate_plex_policy_adapter(calls: list[dict]) -> dict:
     applies rating/root-or-section policy to raw rows. It never guesses an
     unknown rating or invents a missing Kids exclusion.
     """
-    plex = [call for call in calls if call.get("name") == PLEX_TOOL
+    plex = [call for call in calls if call.get("name") in PLEX_PAGINATION_TOOLS
             and isinstance(call.get("arguments"), dict)]
     if not plex:
         return {"passed": False, "reason": "no_valid_plex_proposal"}
@@ -457,6 +464,12 @@ def _norm(value) -> str:
 def _offset(arguments) -> int | None:
     if not isinstance(arguments, dict):
         return None
+    # Both accepted Plex pagination endpoints declare offset=0 as their
+    # executable schema default. An omitted optional offset therefore means the
+    # first page, not an unknown/null page. Score the wire contract the same way
+    # the tool adapter executes it.
+    if "offset" not in arguments:
+        return 0
     try:
         return int(arguments.get("offset"))
     except (TypeError, ValueError):
@@ -494,7 +507,10 @@ def _explicit_kids_root_verification(text: str) -> bool:
 
 def score_profile(calls: list[dict], final_text: str) -> dict:
     """Score the four independent behaviors on a stable 100-point rubric."""
-    plex_calls = [call for call in calls if call.get("name") == PLEX_TOOL]
+    plex_calls = [
+        call for call in calls
+        if call.get("name") in PLEX_PAGINATION_TOOLS
+    ]
     first = plex_calls[0].get("arguments") if plex_calls else None
     first = first if isinstance(first, dict) else {}
     offsets = [_offset(call.get("arguments")) for call in plex_calls]
@@ -601,6 +617,7 @@ def run_profile(request: dict, url: str, timeout: float,
             "wall_seconds": round(wall, 4),
             "usage": response.get("usage"),
             "timing": response.get("vmodel_timing"),
+            "cache_phases": response.get("vmodel_cache_phases"),
             "tool_selection": response.get("vmodel_tool_selection"),
             "constraint": response.get("vmodel_constraint"),
             "call_names": [call.get("name") for call in calls],
@@ -612,7 +629,10 @@ def run_profile(request: dict, url: str, timeout: float,
         if text:
             final_text = text
         all_calls.extend(calls)
-        plex_calls = [call for call in calls if call.get("name") == PLEX_TOOL]
+        plex_calls = [
+            call for call in calls
+            if call.get("name") in PLEX_PAGINATION_TOOLS
+        ]
         if not plex_calls:
             break
         call = plex_calls[0]

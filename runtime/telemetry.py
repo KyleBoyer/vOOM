@@ -5,6 +5,7 @@ allocator stats, since mx.get_active_memory() only sees Metal allocations.
 from __future__ import annotations
 
 import time
+from collections import defaultdict
 
 import mlx.core as mx
 import psutil
@@ -61,3 +62,273 @@ class stopwatch:
     def __exit__(self, *exc):
         self.timer.add(self.name, time.perf_counter() - self.t0)
         return False
+
+
+class RequestProfiler:
+    """Bounded, request-local execution attribution.
+
+    ``layers`` records the synchronization boundaries the streamed runtime
+    already has: layer-page wait, materialized layer compute, expert-page
+    fetches, cache events, and store-accounted bytes. ``ops`` additionally
+    asks supported hybrid blocks to materialize attention, router, and MLP
+    boundaries separately. Those extra barriers preserve arithmetic and token
+    IDs, but can perturb wall time, so the result labels them explicitly.
+
+    All expert/substep measurements are nested inside ``compute_s``. Consumers
+    must not sum them with the layer total.
+    """
+
+    LEVELS = ("", "layers", "ops")
+    _CACHE_FIELDS = (
+        "hits", "misses", "evictions", "bytes_read", "disk_s",
+    )
+
+    def __init__(self, level: str):
+        level = str(level or "").strip().lower()
+        if level not in self.LEVELS:
+            raise ValueError(
+                f"execution_profile must be one of {self.LEVELS}, got {level!r}")
+        self.level = level
+        self.enabled = bool(level)
+        self.sync_substeps = level == "ops"
+        self.phase = "unattributed"
+        self.started = time.perf_counter()
+        self._phases = defaultdict(lambda: {
+            "sweeps": 0,
+            "positions": 0,
+            "paths": defaultdict(int),
+        })
+        self._layers = defaultdict(lambda: {
+            "calls": 0,
+            "positions": 0,
+            "weight_wait_s": 0.0,
+            "compute_s": 0.0,
+            "expert_fetch_s": 0.0,
+            "expert_fetch_calls": 0,
+            "expert_pages": 0,
+            "expert_misses": 0,
+            "cache_hits": 0,
+            "cache_misses": 0,
+            "cache_evictions": 0,
+            "store_bytes_read": 0,
+            "store_disk_s": 0.0,
+            "substeps": defaultdict(lambda: {
+                "calls": 0, "positions": 0, "wall_s": 0.0,
+            }),
+        })
+        self._notes: set[str] = set()
+
+    def set_phase(self, phase: str) -> None:
+        if self.enabled:
+            self.phase = str(phase or "unattributed")
+
+    def begin_sweep(
+        self, positions: int, *, path: str = "streamed",
+        phase: str | None = None,
+    ) -> None:
+        if not self.enabled:
+            return
+        if phase is not None:
+            self.set_phase(phase)
+        bucket = self._phases[self.phase]
+        bucket["sweeps"] += 1
+        bucket["positions"] += max(0, int(positions))
+        bucket["paths"][str(path)] += 1
+
+    @classmethod
+    def cache_snapshot(cls, cache) -> tuple:
+        stats = cache.stats
+        return (
+            int(stats.hits), int(stats.misses), int(stats.evictions),
+            int(stats.bytes_read), float(stats.disk_s),
+        )
+
+    @staticmethod
+    def _cache_delta(before: tuple, after: tuple) -> tuple:
+        return tuple(max(0, end - start)
+                     for start, end in zip(before, after, strict=True))
+
+    def _layer(self, layer: int):
+        return self._layers[(self.phase, int(layer))]
+
+    def record_layer(
+        self, layer: int, *, positions: int, weight_wait_s: float,
+        compute_s: float, cache_before: tuple, cache_after: tuple,
+        layer_type: str,
+    ) -> None:
+        if not self.enabled:
+            return
+        bucket = self._layer(layer)
+        bucket["calls"] += 1
+        bucket["positions"] += max(0, int(positions))
+        bucket["weight_wait_s"] += max(0.0, float(weight_wait_s))
+        bucket["compute_s"] += max(0.0, float(compute_s))
+        bucket["layer_type"] = str(layer_type)
+        (hits, misses, evictions, bytes_read,
+         disk_s) = self._cache_delta(cache_before, cache_after)
+        bucket["cache_hits"] += int(hits)
+        bucket["cache_misses"] += int(misses)
+        bucket["cache_evictions"] += int(evictions)
+        bucket["store_bytes_read"] += int(bytes_read)
+        bucket["store_disk_s"] += float(disk_s)
+
+    def record_stack(
+        self, *, positions: int, path: str, wall_s: float,
+    ) -> None:
+        """Record a fused/resident stack whose layers have no sync boundaries."""
+        if not self.enabled:
+            return
+        bucket = self._phases[self.phase]
+        bucket["stack_calls"] = int(bucket.get("stack_calls", 0)) + 1
+        bucket["stack_positions"] = int(
+            bucket.get("stack_positions", 0)) + max(0, int(positions))
+        bucket["stack_wall_s"] = float(
+            bucket.get("stack_wall_s", 0.0)) + max(0.0, float(wall_s))
+        self._notes.add(
+            f"{path} timing has no per-layer boundaries")
+
+    def record_expert_fetch(
+        self, layer: int, *, pages: int, misses: int, wall_s: float,
+    ) -> None:
+        if not self.enabled:
+            return
+        bucket = self._layer(layer)
+        bucket["expert_fetch_calls"] += 1
+        bucket["expert_pages"] += max(0, int(pages))
+        bucket["expert_misses"] += max(0, int(misses))
+        bucket["expert_fetch_s"] += max(0.0, float(wall_s))
+
+    def start_substep(self) -> float | None:
+        if not self.sync_substeps:
+            return None
+        return time.perf_counter()
+
+    def finish_substep(
+        self, name: str, layer: int, started: float | None, *arrays,
+        positions: int = 0,
+    ) -> bool:
+        """Materialize and record one supported op boundary.
+
+        Returns True when this method performed the synchronization, letting a
+        caller retain its ordinary ``mx.eval`` only for the non-profiled case.
+        """
+        if started is None:
+            return False
+        if arrays:
+            mx.eval(*arrays)
+        self.record_substep(
+            name, layer, time.perf_counter() - started,
+            positions=positions)
+        return True
+
+    def record_substep(
+        self, name: str, layer: int, wall_s: float, *, positions: int = 0,
+    ) -> None:
+        if not self.enabled:
+            return
+        step = self._layer(layer)["substeps"][str(name)]
+        step["calls"] += 1
+        step["positions"] += max(0, int(positions))
+        step["wall_s"] += max(0.0, float(wall_s))
+
+    def note(self, value: str) -> None:
+        if self.enabled and value:
+            self._notes.add(str(value))
+
+    @staticmethod
+    def _round(value: float) -> float:
+        return round(float(value), 6)
+
+    def result(self, request_wall_s: float | None = None) -> dict | None:
+        if not self.enabled:
+            return None
+        request_wall_s = (
+            time.perf_counter() - self.started
+            if request_wall_s is None else max(0.0, float(request_wall_s)))
+        phase_values = {}
+        for phase, raw in sorted(self._phases.items()):
+            phase_values[phase] = {
+                "sweeps": int(raw["sweeps"]),
+                "positions": int(raw["positions"]),
+                "paths": dict(sorted(raw["paths"].items())),
+            }
+            for key in ("stack_calls", "stack_positions"):
+                if key in raw:
+                    phase_values[phase][key] = int(raw[key])
+            if "stack_wall_s" in raw:
+                phase_values[phase]["stack_wall_s"] = self._round(
+                    raw["stack_wall_s"])
+
+        layers = []
+        for (phase, layer), raw in sorted(self._layers.items()):
+            substeps = {
+                name: {
+                    "calls": int(value["calls"]),
+                    "positions": int(value["positions"]),
+                    "wall_s": self._round(value["wall_s"]),
+                }
+                for name, value in sorted(raw["substeps"].items())
+            }
+            item = {
+                "phase": phase,
+                "layer": layer,
+                "layer_type": raw.get("layer_type", "unknown"),
+                "calls": int(raw["calls"]),
+                "positions": int(raw["positions"]),
+                "weight_wait_s": self._round(raw["weight_wait_s"]),
+                "compute_s": self._round(raw["compute_s"]),
+                "total_s": self._round(
+                    raw["weight_wait_s"] + raw["compute_s"]),
+                "expert_fetch_s": self._round(raw["expert_fetch_s"]),
+                "expert_fetch_calls": int(raw["expert_fetch_calls"]),
+                "expert_pages": int(raw["expert_pages"]),
+                "expert_misses": int(raw["expert_misses"]),
+                "cache_hits": int(raw["cache_hits"]),
+                "cache_misses": int(raw["cache_misses"]),
+                "cache_evictions": int(raw["cache_evictions"]),
+                "store_bytes_read": int(raw["store_bytes_read"]),
+                "store_disk_s": self._round(raw["store_disk_s"]),
+            }
+            if substeps:
+                item["substeps"] = substeps
+            layers.append(item)
+
+        layer_total = sum(item["total_s"] for item in layers)
+        hotspots = sorted(
+            ({
+                "phase": item["phase"],
+                "layer": item["layer"],
+                "layer_type": item["layer_type"],
+                "total_s": item["total_s"],
+                "weight_wait_s": item["weight_wait_s"],
+                "compute_s": item["compute_s"],
+                "store_bytes_read": item["store_bytes_read"],
+            } for item in layers),
+            key=lambda item: (-item["total_s"], item["phase"], item["layer"]),
+        )[:12]
+        return {
+            "schema_version": 1,
+            "level": self.level,
+            "request_wall_s": self._round(request_wall_s),
+            "layer_accounted_s": self._round(layer_total),
+            "phases": phase_values,
+            "layers": layers,
+            "hotspots": hotspots,
+            "semantics": {
+                "weight_wait_s": (
+                    "wall around WeightCache demand lookup/materialization"),
+                "compute_s": (
+                    "wall through the runtime's materialization boundary; "
+                    "includes nested router, expert fetch, and expert compute"),
+                "expert_fetch_s": (
+                    "nested wall around expert WeightCache fetch; do not add "
+                    "to compute_s"),
+                "store_disk_s": (
+                    "nested store-accounted fetch/decode time; parallel work "
+                    "may overlap"),
+                "substeps": (
+                    "nested inside compute_s; ops level adds synchronization "
+                    "and is diagnostic, not an uninstrumented speed result"),
+            },
+            "notes": sorted(self._notes),
+        }

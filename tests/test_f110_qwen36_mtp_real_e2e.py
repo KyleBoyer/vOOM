@@ -42,7 +42,11 @@ _PROMPT = (
 def _run(use_mtp: bool, max_tokens: int = 8):
     rc = RuntimeConfig(prefill_chunk_size=512, resident_fast_decode=True)
     engine = StreamingEngine(str(_REAL_MODEL_DIR), rc)
-    driver = QwenMTPSpeculativeEngine(engine) if use_mtp else engine
+    driver = (
+        QwenMTPSpeculativeEngine(
+            engine, min_output_tokens=2, adaptive_stop=False,
+            plain_warmup_tokens=0)
+        if use_mtp else engine)
     try:
         result = driver.generate(
             _PROMPT, max_tokens=max_tokens,

@@ -123,6 +123,35 @@ storage — this is not required to run the project.
 # the bounded cache/prefetch profile for the requested local model.
 .venv/bin/python -m runtime.server --port 8077
 
+# Fast-mode text requests automatically use the optional MLX-LM backend when
+# the selected checkpoint is a measured, fully resident dense-Qwen MXFP4
+# artifact and current system/Metal headroom admits it. Qwen3.5-4B keeps the
+# 2,048-token MLX-LM prefill step; the larger 9B defaults to the measured-safe
+# 512-token step. MoE/out-of-core, lossless, vision, and layer/ops-profile
+# requests stay on vOOM. Every response reports `vmodel_backend`; timing also
+# reports the execution path, prefill step, retained KV, and true Metal peak.
+# Operators can force either side for A/B and rollback:
+VMODEL_RESIDENT_BACKEND=voom .venv/bin/python -m runtime.server --port 8077
+# VMODEL_RESIDENT_BACKEND=mlx-lm forces MLX-LM but still cannot bypass its
+# architecture, checkpoint-provenance, live-headroom, or Metal safety gates.
+# VMODEL_MLX_LM_PREFILL_STEP_SIZE is an expert-only override; an in-request
+# live peak guard aborts rather than crossing the configured Metal ceiling.
+# VMODEL_MLX_LM_REQUEST_SYSTEM_RESERVE_MB defaults to 1200 and is added to
+# the prompt KV + recurrent-state + measured prefill-scratch projection.
+# Exact token extensions reuse the resident hybrid prompt state by default;
+# exact repeats, branches, and token mismatches prefill cold. Set
+# VMODEL_MLX_LM_PROMPT_CACHE=0 for a cold control/rollback.
+
+# Attribute one request by phase, execution path, layer type, weight wait,
+# materialized compute, cache movement, and store bytes. "ops" additionally
+# places diagnostic barriers around supported attention/router/MLP substeps.
+# The profile is returned as `vmodel_execution_profile` and its largest
+# hotspots are also logged by the server.
+VMODEL_EXECUTION_PROFILE=layers \
+    .venv/bin/python -m runtime.server --port 8077
+# VMODEL_EXECUTION_PROFILE=ops is more intrusive; use it for diagnosis, not
+# throughput claims made against an unprofiled control.
+
 # Recommended lossy prompt profile for large agent harnesses. The model first
 # sees a fixed private search/re-enable catalog; full schemas are inserted only
 # if selected, and both hidden-phase KV states are checkpointed independently.
@@ -159,6 +188,39 @@ VMODEL_FAST_TOOL_LIMIT=32 .venv/bin/python -m runtime.server --port 8077
     tests/test_tool_embeddings.py tests/test_yarn_parameters.py tests/test_vision_positions.py \
     tests/test_incremental_decode.py
 ```
+
+Qwen3.5/3.6 fast/lossy model IDs automatically use the chunkwise DeltaNet
+prefill path. `VMODEL_QWEN35_CHUNKED_DELTA=0` disables it for an A/B;
+`=1` explicitly enables it. Lossless model IDs retain the sequential
+recurrence because reassociation produces tiny activation differences across
+arbitrary prompt-checkpoint boundaries. Qwen MoE prefill defaults to
+the exact layer-stationary schedule;
+`VMODEL_QWEN_MOE_LAYER_STATIONARY_PREFILL=0` restores chunk-major scheduling.
+Its routed-expert fetch ceiling defaults to the real-measured q=16
+(`VMODEL_QWEN_MOE_PREFILL_EXPERT_BATCH=8` restores the former ceiling); the
+live memory governor can still clamp individual layers below that value.
+Dense Qwen keeps layer-stationary prefill off by default because a deterministic
+9B captured-boundary A/B measured a small regression.
+
+Fast/lossy routes can opt into string-level grammar jump-forward for
+constrained tool/JSON scaffolding with
+`VMODEL_GRAMMAR_JUMP_FORWARD_LOSSY=1`. It remains off by default because the
+speed path can change free-choice arguments even when forced scaffolding stays
+valid. With the hidden tool gateway enabled, high-confidence forced actions
+and conventional activated pagination bypass redundant private model-routing
+generation by default; `VMODEL_FAST_TOOL_GATEWAY_HOST_ROUTE=0` restores the
+model decision A/B.
+
+Native Qwen MTP defaults to `auto`: it is considered only for dense checkpoints
+whose payload exceeds vOOM's weight-cache budget, and only for output budgets
+of at least 32 tokens. It decodes three tokens normally, then after three draft
+probe rounds continues only when measured acceptance is above the 50%
+target-sweep break-even point; otherwise the request finishes through ordinary
+exact decode. Fully resident dense Qwen and every MoE Qwen stay plain.
+`VMODEL_QWEN_MTP_SPECULATIVE=0` is the rollback;
+`VMODEL_QWEN_MTP_SPECULATIVE=1` forces the dense experimental path without the
+adaptive stop. The default prompt limit is 32K tokens and can be changed with
+`VMODEL_QWEN_MTP_MAX_PROMPT_TOKENS`.
 
 Raw HF indexes do not hash shard bodies. For proof-grade cache identity, build
 and verify a full-body manifest once, then require it at server startup:

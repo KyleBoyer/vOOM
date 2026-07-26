@@ -5,6 +5,8 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+import mlx.core as mx
+
 
 class _Encoding:
     def __init__(self, ids):
@@ -84,6 +86,19 @@ def test_qwen_mtp_adapter_falls_back_for_prompt_limit():
     assert len(target.calls) == 1
 
 
+def test_qwen_mtp_adapter_falls_back_for_short_output_budget():
+    from runtime.qwen35_mtp import QwenMTPSpeculativeEngine
+
+    target = _Engine("/models/target")
+    engine = QwenMTPSpeculativeEngine(
+        target, max_prompt_tokens=8, min_output_tokens=8)
+
+    result = engine.generate("x", 4)
+    assert result["path_stats"]["qwen_mtp_fallback_reason"] == (
+        "short-output-budget")
+    assert len(target.calls) == 1
+
+
 def test_qwen_mtp_adapter_rejects_invalid_max_tokens():
     from runtime.qwen35_mtp import QwenMTPSpeculativeEngine
 
@@ -124,6 +139,81 @@ def test_qwen_mtp_drafter_construction_requires_mtp_weights():
     except ValueError:
         raised = True
     assert raised, "QwenMTPDrafter must refuse a checkpoint with no mtp.* weights"
+
+
+def test_qwen_mtp_accepted_pair_stops_on_first_token_eos():
+    """An accepted pair is [verified draft, bonus]. If the draft itself is
+    EOS, the unused bonus must never become the next catchup token."""
+    from runtime.qwen35_mtp import QwenMTPSpeculativeEngine
+
+    class _KV:
+        def __init__(self):
+            self.offset = 3
+            self.kda_cache = None
+
+        def trim(self, offset):
+            self.offset = offset
+
+        def nbytes(self):
+            return 0
+
+    class _Target(_Engine):
+        def __init__(self):
+            super().__init__("/models/target")
+            self.cfg.eos_token_ids = (9,)
+            self.cache = SimpleNamespace(
+                stats=SimpleNamespace(
+                    hits=0, misses=0, evictions=0, bytes_read=0),
+                total_bytes=0, max_bytes=1)
+            self.expert_hits = self.expert_misses = 0
+            for name in (
+                    "fast_tier_bytes", "archive_bytes",
+                    "parallel_tier_fetches", "parallel_tier_fast_bytes",
+                    "parallel_tier_archive_bytes"):
+                setattr(self.store, name, 0)
+            self.governor = None
+            self._layer_transient = 0
+            self._prefill_layer_transient = 0
+            self._decode_layer_transient = 0
+            self._layer_transient_margin = 0
+            self._token_transient = 0
+            self._true_peak_metal_bytes = 0
+            self._request_profiler = None
+            self._hot_prompt_slots = []
+            self._h_last = mx.zeros((1, 1, 1))
+            self.last_kv = None
+
+        def generate(self, prompt, max_tokens, **_kwargs):
+            assert max_tokens == 1
+            self.last_kv = _KV()
+            return {
+                "text": "4", "tokens": [4], "prefill_s": 0.0,
+                "first_token_s": 0.0, "decode_s": 0.0, "total_s": 0.0,
+                "termination_reason": "length", "stop_sequence": None,
+                "path_stats": {}, "prompt_tokens": 3,
+            }
+
+        def forward_tokens(self, tokens, kv):
+            assert tokens == [4, 9]
+            kv.offset += 2
+            logits = mx.zeros((2, 10))
+            logits = logits.at[0, 9].add(1)
+            logits = logits.at[1, 7].add(1)
+            self._h_last = mx.zeros((1, 1, 1))
+            return logits
+
+    target = _Target()
+    engine = QwenMTPSpeculativeEngine(
+        target, max_prompt_tokens=8, min_output_tokens=2,
+        plain_warmup_tokens=0)
+    engine.drafter = SimpleNamespace(
+        draft_token=lambda *_args, **_kwargs: 9)
+
+    result = engine.generate("x", 32)
+
+    assert result["tokens"] == [4, 9]
+    assert result["termination_reason"] == "eos"
+    assert result["kv_positions"] == 4
 
 
 def test_forward_tokens_serial_positions_excludes_hybrid_model_types():

@@ -23,6 +23,9 @@ from runtime.server import (Handler, INFER_LOCK, PreparedPrompt, RequestValidati
                             _hidden_gateway_activation_get,
                             _hidden_gateway_activation_put,
                             _hidden_gateway_conversation_key,
+                            _hidden_gateway_execution_messages,
+                            _hidden_gateway_host_action,
+                            _hidden_gateway_pagination_call,
                             _HiddenDecisionStream,
                             _hidden_gateway_decision_choice,
                             _hidden_gateway_force_reason,
@@ -44,7 +47,9 @@ from runtime.server import (Handler, INFER_LOCK, PreparedPrompt, RequestValidati
                             _preferred_fast_artifact,
                             _dspark_draft_for,
                             _engine_generate,
+                            _grammar_jump_forward_policy,
                             _has_own_method,
+                            _qwen_chunked_delta_policy,
                             _speculative_draft_for,
                             _request_reasoning_controls, _request_sampling,
                             _registry,
@@ -102,6 +107,15 @@ def test_vision_protocol_timing_uses_generic_path_stats():
     timing = _vision_protocol_timing(result)
 
     assert timing == {
+        "true_peak_metal_bytes": 0,
+        "kv_bytes": 0,
+        "kv_positions": 0,
+        "execution_backend": "voom",
+        "execution_path": "",
+        "prefill_step_size": 0,
+        "request_incremental_projection_bytes": 0,
+        "request_system_available_bytes": 0,
+        "request_system_required_bytes": 0,
         "vision_cache_hits": 2,
         "vision_cache_misses": 1,
         "vision_prompt_cache_tower_skipped": 1,
@@ -907,6 +921,71 @@ def test_gateway_activation_key_survives_appended_tool_turns_without_raw_state()
         _hidden_gateway_activation_clear()
 
 
+def test_hidden_gateway_execution_prompt_is_prefix_stable_across_tool_result():
+    tools = [_named_tool("plugin__plex__plex_list_library_media")]
+    anchor = [{"role": "system", "content": "stable harness prompt"}, {
+        "role": "user", "content": "list Plex media and paginate"}]
+    continuation = anchor + [{
+        "role": "assistant", "content": "", "tool_calls": [{
+            "id": "call_1", "type": "function", "function": {
+                "name": "plugin__plex__plex_list_library_media",
+                "arguments": "{\"limit\":500,\"offset\":0}"}}]}, {
+        "role": "tool", "tool_call_id": "call_1",
+        "name": "plugin__plex__plex_list_library_media",
+        "content": "{\"movieHasMore\":true}"}]
+    activation_key = "a" * 64
+
+    initial = _hidden_gateway_execution_messages(
+        anchor, tools, activation_key)
+    followup = _hidden_gateway_execution_messages(
+        continuation, tools, activation_key)
+
+    assert followup[:len(initial)] == initial
+    assert followup[len(initial):] == continuation[len(anchor):]
+    assert initial[-2]["tool_calls"][0]["function"] == {
+        "name": "vmodel_enable_tools", "arguments": "{}"}
+    assert initial[-1]["name"] == "vmodel_enable_tools"
+
+
+def test_hidden_gateway_execution_activation_changes_with_catalog():
+    anchor = [{"role": "user", "content": "inspect Plex"}]
+    first = _hidden_gateway_execution_messages(
+        anchor, [_named_tool("plex_list")], "b" * 64)
+    expanded = _hidden_gateway_execution_messages(
+        anchor, [_named_tool("plex_list"), _named_tool("plex_search")],
+        "b" * 64)
+    assert first[-2]["tool_calls"][0]["id"] != \
+        expanded[-2]["tool_calls"][0]["id"]
+    assert json.loads(expanded[-1]["content"])["tools"] == [
+        "plex_list", "plex_search"]
+
+
+def test_qwen_chunked_delta_auto_is_lossy_only_and_overridable():
+    assert _qwen_chunked_delta_policy(
+        "auto", mode="fast", model_type="qwen3_5_moe",
+    ) == (True, "auto-lossy-qwen")
+    assert _qwen_chunked_delta_policy(
+        "auto", mode="lossless", model_type="qwen3_5",
+    ) == (False, "lossless-checkpoint-boundary")
+    assert _qwen_chunked_delta_policy(
+        "1", mode="lossless", model_type="qwen3_5",
+    ) == (True, "operator-forced")
+    assert _qwen_chunked_delta_policy(
+        "auto", mode="fast", model_type="glm_moe_dsa",
+    ) == (False, "unsupported-architecture")
+
+
+def test_grammar_jump_forward_auto_is_lossy_only_and_overridable():
+    assert _grammar_jump_forward_policy(
+        "auto", mode="fast") == (True, "auto-lossy")
+    assert _grammar_jump_forward_policy(
+        "0", mode="fast") == (False, "operator-disabled")
+    assert _grammar_jump_forward_policy(
+        "1", mode="fast-long") == (True, "operator-forced")
+    assert _grammar_jump_forward_policy(
+        "1", mode="lossless") == (False, "lossless-route")
+
+
 def test_hidden_gateway_forces_only_high_confidence_external_intents():
     assert _hidden_gateway_force_reason([
         {"role": "user", "content": "Tell me a joke about Node.js."},
@@ -981,6 +1060,67 @@ def test_hidden_gateway_forces_activated_catalog_for_explicit_pagination():
     assert _hidden_gateway_decision_choice(
         "auto", "tool-result-pagination", activated_tools=False,
     ) == "specific:vmodel_search_tools"
+
+
+def test_hidden_gateway_host_route_only_skips_already_forced_decisions():
+    assert _hidden_gateway_host_action(
+        "external-action-imperative",
+        activated_tools=False, semantic_query="list Plex media",
+    ) == "vmodel_search_tools"
+    assert _hidden_gateway_host_action(
+        "tool-result-pagination",
+        activated_tools=True, semantic_query="original user request",
+    ) == "vmodel_enable_tools"
+    assert _hidden_gateway_host_action(
+        None, activated_tools=True, semantic_query="maybe use a tool",
+    ) is None
+    assert _hidden_gateway_host_action(
+        "client-required", activated_tools=False, semantic_query="",
+    ) is None
+
+
+def test_hidden_gateway_host_pagination_advances_offset_from_schema_defaults():
+    tool = _named_tool("plugin__plex__plex_list_library_media")
+    tool["function"]["parameters"] = {
+        "type": "object",
+        "properties": {
+            "limit": {"type": "integer", "default": 100},
+            "offset": {"anyOf": [
+                {"type": "integer", "default": 0}, {"type": "null"}]},
+            "query": {"type": "string"},
+        },
+    }
+    messages = [{
+        "role": "assistant", "content": "", "tool_calls": [{
+            "id": "call_1", "type": "function", "function": {
+                "name": "plugin__plex__plex_list_library_media",
+                "arguments": "{\"query\":\"kids\"}",
+            },
+        }],
+    }, {
+        "role": "tool", "tool_call_id": "call_1",
+        "content": "{\"movieHasMore\":true}",
+    }]
+    assert _hidden_gateway_pagination_call(messages, [tool]) == {
+        "name": "plugin__plex__plex_list_library_media",
+        "arguments": {"query": "kids", "limit": 100, "offset": 100},
+    }
+
+
+def test_hidden_gateway_host_pagination_falls_back_for_ambiguous_contracts():
+    tool = _named_tool("search")
+    tool["function"]["parameters"] = {
+        "type": "object", "properties": {"cursor": {"type": "string"}}}
+    messages = [{
+        "role": "assistant", "tool_calls": [{
+            "id": "call_1", "type": "function",
+            "function": {"name": "search", "arguments": "{}"},
+        }],
+    }, {
+        "role": "tool", "tool_call_id": "call_1",
+        "content": "{\"hasMore\":true,\"nextCursor\":\"opaque\"}",
+    }]
+    assert _hidden_gateway_pagination_call(messages, [tool]) is None
 
 
 def test_hidden_gateway_does_not_treat_false_or_text_has_more_as_pagination():
@@ -1141,8 +1281,9 @@ def test_qwen36_profiles_bound_experts_and_use_hybrid_endpoint_cache():
         # to use again here too. available=8GB -> 512 (the >=4GB tier).
         assert rc.prefill_chunk_size == 512
         assert rc.hot_prompt_kv_chunk_size == rc.prefill_chunk_size
-        assert rc.expert_fetch_batch == 8
+        assert rc.expert_fetch_batch == 16
         assert rc.decode_expert_fetch_batch == 8
+        assert rc.layer_stationary_prefill
         assert rc.fast_dirs[0].endswith("vmodel_fast_tier/fake-qwen36")
         assert rc.parallel_storage_reads
         assert not rc.pin_lm_head
@@ -1163,6 +1304,46 @@ def test_qwen36_profiles_bound_experts_and_use_hybrid_endpoint_cache():
     assert not fast.quant_router
     assert not fast.quant_lm_head
     assert fast.max_weight_cache_mb == 7000
+
+
+def test_qwen_native_mtp_auto_policy_targets_only_out_of_core_dense_models():
+    from runtime.server import _qwen_native_mtp_policy
+
+    enabled, reason = _qwen_native_mtp_policy(
+        "auto", model_type="qwen3_5", num_experts=0,
+        payload_bytes=16_800_000_000, cache_bytes=7_000_000_000)
+    assert enabled
+    assert reason == "auto-out-of-core-dense"
+
+    enabled, reason = _qwen_native_mtp_policy(
+        "auto", model_type="qwen3_5", num_experts=0,
+        payload_bytes=3_200_000_000, cache_bytes=7_000_000_000)
+    assert not enabled
+    assert reason == "resident-dense-overhead"
+
+    enabled, reason = _qwen_native_mtp_policy(
+        "auto", model_type="qwen3_5_moe", num_experts=256,
+        payload_bytes=23_400_000_000, cache_bytes=7_000_000_000)
+    assert not enabled
+    assert reason == "moe-expert-io-regression"
+
+    enabled, reason = _qwen_native_mtp_policy(
+        "auto", model_type="qwen3_5", num_experts=0,
+        payload_bytes=16_800_000_000, cache_bytes=7_000_000_000,
+        ngram_enabled=True)
+    assert not enabled
+    assert reason == "explicit-ngram-selected"
+
+
+def test_qwen_native_mtp_policy_validates_operator_mode():
+    import pytest
+
+    from runtime.server import _qwen_native_mtp_policy
+
+    with pytest.raises(ValueError, match="auto, 0, or 1"):
+        _qwen_native_mtp_policy(
+            "sometimes", model_type="qwen3_5", num_experts=0,
+            payload_bytes=16_800_000_000, cache_bytes=7_000_000_000)
 
 
 def test_hybrid_prefill_chunk_size_ladder_reinstated_for_per_conversation_use():
@@ -1523,6 +1704,37 @@ def test_dense_kv_preflight_subtracts_evictable_retained_state():
         raise AssertionError("live projection ignored retained-cache pressure")
 
 
+def test_resident_qwen35_projects_only_growing_full_attention_kv():
+    engine = SimpleNamespace(
+        backend_name="mlx-lm",
+        cfg=SimpleNamespace(
+            model_type="qwen3_5", vision_config={"model_type": "qwen3_5"},
+            num_experts=0, num_hidden_layers=32,
+            full_attention_interval=4, num_key_value_heads=4, head_dim=256),
+        rc=SimpleNamespace(max_kv_mb=0, adaptive_kv_spill_mb=256),
+        prompt_cache_memory_snapshot=lambda: {
+            "active_metal_bytes": 6_300_000_000,
+            "retained_prompt_kv_bytes": 0,
+            "orphan_prompt_kv_bytes": 0,
+            "evictable_prompt_kv_bytes": 0,
+            "metal_ceiling_bytes": 8_300_000_000,
+        },
+    )
+
+    measured_shape = _validate_fast_dense_resident_kv(
+        engine, "fast", 14_375, 16)
+    assert measured_shape["bytes_per_token"] == 32_768
+    assert measured_shape["projected_bytes"] == 471_040_000
+    assert measured_shape["dynamic_projected_bytes"] == 7_171_040_000
+
+    try:
+        _validate_fast_dense_resident_kv(engine, "fast", 60_000, 16)
+    except RequestValidationError as error:
+        assert "live dense-Qwen Metal projection" in str(error)
+    else:
+        raise AssertionError("unsafe resident Qwen3.5 context was accepted")
+
+
 def test_cache_phase_telemetry_keeps_hidden_phases_separate():
     decision = _cache_phase_telemetry("gateway_decision", {
         "prompt_tokens": 2_000,
@@ -1537,6 +1749,7 @@ def test_cache_phase_telemetry_keeps_hidden_phases_separate():
     execution = _cache_phase_telemetry("gateway_execution", {
         "prompt_tokens": 10_000,
         "prefill_s": 42.0,
+        "execution_profile": {"schema_version": 1, "level": "layers"},
         "path_stats": {
             "prompt_cache_namespace": "gateway_execution",
             "prompt_cache_prefix_tokens": 0,
@@ -1552,6 +1765,7 @@ def test_cache_phase_telemetry_keeps_hidden_phases_separate():
     assert execution["cached_tokens"] == 0
     assert execution["effective_reused_tokens"] == 128
     assert execution["admission_evicted_bytes"] == 1_500_000_000
+    assert execution["execution_profile"]["level"] == "layers"
 
 
 def test_responses_stream_emits_terminal_failure_instead_of_truncated_sse():
@@ -2448,6 +2662,7 @@ def test_execution_profile_discloses_effective_derived_artifact(tmp_path):
     assert _execution_profile_fields(engine) == {
         "vmodel_checkpoint": tmp_path.name,
         "vmodel_weight_profile": "experts-mxfp4-q4-g32",
+        "vmodel_backend": "voom",
     }
 
 

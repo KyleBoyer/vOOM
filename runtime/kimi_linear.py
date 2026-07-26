@@ -308,7 +308,7 @@ def _kimi_linear_attention_residual(
 
 def _kimi_linear_mlp_residual(
     x: mx.array, w: dict, prefix: str, cfg: ModelConfig, layer: int,
-    get_experts, iter_expert_batches=None,
+    get_experts, iter_expert_batches=None, profile=None,
 ) -> mx.array:
     """MLP (dense) or MoE + residual only, given `x` already post-attention.
     See `_kimi_linear_attention_residual`'s docstring for why this is split
@@ -323,8 +323,12 @@ def _kimi_linear_mlp_residual(
         return x + _swiglu(h, w, f"{prefix}.mlp")
 
     moe_prefix = f"{prefix}.block_sparse_moe"
+    router_t0 = profile.start_substep() if profile is not None else None
     idx, pw = _route_experts(h, w, moe_prefix, cfg)
-    mx.eval(idx, pw)
+    if not (profile is not None and profile.finish_substep(
+            "router", layer, router_t0, idx, pw,
+            positions=int(h.shape[1]))):
+        mx.eval(idx, pw)
     groups = _group_routes(idx, pw)
 
     out = mx.zeros_like(h)
@@ -357,13 +361,25 @@ def run_kimi_linear_block(
     x: mx.array, w: dict, prefix: str, cfg: ModelConfig, kv,
     layer: int, offset: int, get_experts, mlp_last_only: bool = False, iter_expert_batches=None,
     native_fused_decode: bool = False,
+    profile=None,
 ) -> mx.array:
     """One Kimi Linear decoder block (chunk-major / ordinary use). Thin
     wrapper over `_kimi_linear_attention_residual` +
     `_kimi_linear_mlp_residual` -- see those functions' docstrings for why
     the split exists (layer-stationary tiled prefill, F35-prep)."""
+    positions = int(x.shape[1])
+    attention_t0 = profile.start_substep() if profile is not None else None
     x = _kimi_linear_attention_residual(
         x, w, prefix, cfg, kv, layer, offset, mlp_last_only=mlp_last_only,
         native_fused_decode=native_fused_decode)
-    return _kimi_linear_mlp_residual(
-        x, w, prefix, cfg, layer, get_experts, iter_expert_batches=iter_expert_batches)
+    if profile is not None:
+        profile.finish_substep(
+            "attention", layer, attention_t0, x, positions=positions)
+    mlp_t0 = profile.start_substep() if profile is not None else None
+    x = _kimi_linear_mlp_residual(
+        x, w, prefix, cfg, layer, get_experts,
+        iter_expert_batches=iter_expert_batches, profile=profile)
+    if profile is not None:
+        profile.finish_substep(
+            "mlp", layer, mlp_t0, x, positions=int(x.shape[1]))
+    return x

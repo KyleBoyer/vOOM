@@ -59,6 +59,7 @@ _TOOL_CAPABILITY_GROUPS = tuple(frozenset(group.split()) for group in (
     "calendar event events meeting meetings schedule scheduling appointment",
     "database databases db sql table tables row rows record records",
     "image images picture pictures photo photos screenshot screenshots vision",
+    "media movie movies film films show shows series title titles",
     "document documents doc docs pdf spreadsheet spreadsheets excel sheet sheets",
 ))
 
@@ -197,6 +198,30 @@ def semantic_tool_query(messages: list[dict], *, max_chars: int = 4000) -> str:
         if text:
             return text[:max_chars]
     return ""
+
+
+def semantic_tool_capability_query(
+        messages: list[dict], *, max_chars: int = 1000) -> str:
+    """Compress the latest intent to capability words, not argument filters.
+
+    Hidden host routing needs the same short query the model-authored catalog
+    phase produced. Full requests often append clauses describing argument
+    values (for example, a root-folder exclusion); feeding those clauses back
+    into retrieval can select a metadata helper instead of the primary listing
+    capability. The execution model still receives the complete original
+    request and owns every argument.
+    """
+    raw = semantic_tool_query(messages, max_chars=max_chars * 4)
+    if not raw:
+        return ""
+    primary = re.split(
+        r"\b(?:whose|where|excluding|except)\b", raw,
+        maxsplit=1, flags=re.IGNORECASE)[0]
+    words = _search_words(primary)[:48]
+    all_words = set(_search_words(raw))
+    if all_words & {"paginate", "pagination", "paging", "pages"}:
+        words.append("paginate")
+    return " ".join(words)[:max_chars].strip()
 
 
 def pinned_tool_indices(tools: list[dict], messages: list[dict]) -> list[int]:

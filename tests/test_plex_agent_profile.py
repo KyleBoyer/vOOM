@@ -75,6 +75,14 @@ def test_no_pagination_and_leaked_bad_titles_are_scored_separately():
     assert result["passed"] is False
 
 
+def test_omitted_first_offset_uses_tool_schema_default_zero():
+    calls = [_call(), _call(limit=100, offset=100)]
+    result = score_profile(calls, "")
+    assert result["offsets"] == [0, 100]
+    assert result["checks"]["initial_offset_zero"]["passed"]
+    assert result["checks"]["pagination_offset_increased"]["passed"]
+
+
 def test_explicit_post_filtering_and_final_section_are_scored_semantically():
     calls = [
         _call(mediaType="all", ratingOperator="lte",

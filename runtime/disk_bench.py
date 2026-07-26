@@ -2,7 +2,7 @@
 
 2026-07-20: audited the whole tree for hardcoded disk-speed constants after
 a stale "315 MB/s" figure (measured years ago on a USB-attached SSD, now
-replaced by a PCIe NVMe volume measuring ~3.0 GB/s) turned up as a default
+replaced by a PCIe NVMe volume) turned up as a default
 in two offline planning tools. Neither was wired into the live server path
 (runtime/server.py, engine.py, pressure.py's governor, weight_cache.py,
 model_loader.py, formats/packed.py, formats/packed2.py all confirmed free of
@@ -12,6 +12,11 @@ an assumed disk speed), but a stale default in a *planning* tool still
 produces a misleading estimate. Rather than swap one hardcoded number for
 another that will just as quietly go stale the next time storage changes,
 this measures the real, current device on demand.
+
+2026-07-26: two independent Darwin ``F_NOCACHE`` reads of large shards on
+the project volume measured 1,615.0 and 1,616.9 MB/s. That is the current
+uncached sequential figure. Cached/scattered probes can be much higher and
+must not be presented as the cold streaming floor.
 
 Pure Python, no MLX -- safe to import from runtime/expert_plan.py, which
 deliberately stays weight/MLX-free.

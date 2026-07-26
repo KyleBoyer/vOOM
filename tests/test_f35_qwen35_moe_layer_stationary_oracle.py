@@ -46,8 +46,13 @@ _CHUNK = 8
 
 
 def _run(layer_stationary: bool, count_fetches: bool = False, max_tokens: int = 4):
+    from runtime.server import PreparedPrompt
+
     rc = RuntimeConfig(
         prefill_chunk_size=_CHUNK,
+        hot_prompt_kv_chunk_size=_CHUNK,
+        hot_prompt_kv=True,
+        hot_prompt_kv_min_tokens=0,
         layer_stationary_prefill=layer_stationary,
         min_weight_cache_mb=200, max_weight_cache_mb=6000,
     )
@@ -62,8 +67,12 @@ def _run(layer_stationary: bool, count_fetches: bool = False, max_tokens: int = 
 
         engine.cache.get = counting_get
     try:
+        prompt_ids = engine.tokenizer.encode(_PROMPT).ids
+        prompt = PreparedPrompt(
+            _PROMPT, prompt_ids,
+            stable_boundary_tokens=max(1, len(prompt_ids) - 2))
         result = engine.generate(
-            _PROMPT, max_tokens=max_tokens,
+            prompt, max_tokens=max_tokens,
             sampling=SamplingParams(temperature=0.0))
     finally:
         engine.close()

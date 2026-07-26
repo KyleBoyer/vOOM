@@ -44,6 +44,7 @@ _CHUNK = 8
 def _run(layer_stationary: bool, count_fetches: bool = False, max_tokens: int = 6):
     rc = RuntimeConfig(
         prefill_chunk_size=_CHUNK,
+        hot_prompt_kv_chunk_size=_CHUNK,
         layer_stationary_prefill=layer_stationary,
     )
     engine = StreamingEngine(str(_REAL_MODEL_DIR), rc)
@@ -65,6 +66,32 @@ def _run(layer_stationary: bool, count_fetches: bool = False, max_tokens: int = 
     return result, fetch_counts
 
 
+def _run_with_stable_boundary(layer_stationary: bool):
+    """Exercise the server-style first-turn boundary fork, not a plain str."""
+    from runtime.server import PreparedPrompt
+
+    rc = RuntimeConfig(
+        prefill_chunk_size=_CHUNK,
+        hot_prompt_kv_chunk_size=_CHUNK,
+        layer_stationary_prefill=layer_stationary,
+        hot_prompt_kv=True,
+        hot_prompt_kv_min_tokens=0,
+        execution_profile="layers",
+    )
+    engine = StreamingEngine(str(_REAL_MODEL_DIR), rc)
+    try:
+        token_ids = engine.tokenizer.encode(_PROMPT).ids
+        prompt = PreparedPrompt(
+            _PROMPT, token_ids,
+            stable_boundary_tokens=max(1, len(token_ids) - 2))
+        result = engine.generate(
+            prompt, max_tokens=2,
+            sampling=SamplingParams(temperature=0.0))
+    finally:
+        engine.close()
+    return result
+
+
 @_model_skip
 def test_layer_stationary_matches_chunk_major_byte_identical():
     baseline, _ = _run(layer_stationary=False)
@@ -74,6 +101,21 @@ def test_layer_stationary_matches_chunk_major_byte_identical():
         "output to chunk-major prefill for the same prompt"
     )
     assert layer_major["text"] == baseline["text"]
+
+
+@_model_skip
+def test_stable_boundary_uses_layer_stationary_and_stays_byte_identical():
+    """A server PreparedPrompt's stable boundary must not bypass F94."""
+    baseline = _run_with_stable_boundary(layer_stationary=False)
+    layer_major = _run_with_stable_boundary(layer_stationary=True)
+
+    assert layer_major["tokens"] == baseline["tokens"]
+    assert layer_major["text"] == baseline["text"]
+    paths = layer_major["execution_profile"]["phases"]["prefill"]["paths"]
+    assert paths.get("layer_stationary_qwen35", 0) == 1
+    assert any(
+        "hot_boundary layer_stationary eligible=1" in note
+        for note in layer_major["execution_profile"]["notes"])
 
 
 @_model_skip

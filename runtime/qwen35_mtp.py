@@ -167,12 +167,26 @@ class QwenMTPSpeculativeEngine:
     target so protocol rendering/telemetry see the real checkpoint,
     tokenizer, config, and execution profile."""
 
-    def __init__(self, target, max_prompt_tokens: int = 8192):
+    def __init__(
+        self, target, max_prompt_tokens: int = 32768,
+        min_output_tokens: int = 32, adaptive_stop: bool = True,
+        adaptive_probe_rounds: int = 3, plain_warmup_tokens: int = 3,
+    ):
         if max_prompt_tokens <= 0:
             raise ValueError("max_prompt_tokens must be positive")
+        if min_output_tokens <= 1:
+            raise ValueError("min_output_tokens must be greater than one")
+        if adaptive_probe_rounds <= 0:
+            raise ValueError("adaptive_probe_rounds must be positive")
+        if plain_warmup_tokens < 0:
+            raise ValueError("plain_warmup_tokens must be non-negative")
         self.target = target
         self.drafter = QwenMTPDrafter(target)
         self.max_prompt_tokens = max_prompt_tokens
+        self.min_output_tokens = min_output_tokens
+        self.adaptive_stop = bool(adaptive_stop)
+        self.adaptive_probe_rounds = int(adaptive_probe_rounds)
+        self.plain_warmup_tokens = int(plain_warmup_tokens)
 
     def __getattr__(self, name):
         return getattr(self.target, name)
@@ -221,6 +235,10 @@ class QwenMTPSpeculativeEngine:
             return self._target_generate(
                 "prompt-limit", prompt, max_tokens, on_token, stop,
                 on_progress, sampling, constraint)
+        if max_tokens < self.min_output_tokens:
+            return self._target_generate(
+                "short-output-budget", prompt, max_tokens, on_token, stop,
+                on_progress, sampling, constraint)
         if (tgt.effective_max_position_embeddings
                 and len(ids) + max_tokens > tgt.effective_max_position_embeddings):
             raise ValueError(
@@ -228,46 +246,88 @@ class QwenMTPSpeculativeEngine:
                 f"context limit={tgt.effective_max_position_embeddings} "
                 f"({tgt.rope_profile})")
 
+        # Let the target's ordinary generation path do exactly one thing:
+        # safe prefill plus sampling the first (still-unfed) token. This keeps
+        # all of StreamingEngine's chunking, layer-stationary scheduling,
+        # memory retries, exact hot-prefix reuse, and request telemetry. The
+        # old MTP adapter called forward_tokens(ids, kv) directly, bypassing
+        # every one of those mechanisms and therefore had to fall back above
+        # an arbitrary 8K prompt limit. After this bootstrap, ``last_kv`` is at
+        # the same endpoint the MTP loop expects: prompt fully fed, first token
+        # sampled but not fed.
+        from .engine import _cache_io_snapshot, _record_cache_io_delta
+
         request_t0 = time.perf_counter()
-        tokenize_s = 0.0
-        tgt.release_request_state()
+        request_cache_before = _cache_io_snapshot(tgt)
         eos = set(tgt.cfg.eos_token_ids)
         stop = stop or []
+        bootstrap_generate = getattr(
+            tgt, "generate_with_memory_retry", tgt.generate)
+        bootstrap = bootstrap_generate(
+            prompt, 1, on_token=None, stop=stop, on_progress=on_progress,
+            sampling=sampling)
+        bootstrap_stats = dict(bootstrap.get("path_stats") or {})
+        bootstrap_stats.update({
+            "qwen_mtp_enabled": 1,
+            "qwen_mtp_used": 0,
+        })
+        if (max_tokens == 1
+                or bootstrap.get("termination_reason") != "length"):
+            reason = (
+                "single-token-budget" if max_tokens == 1
+                else f"terminal-first-token:{bootstrap.get('termination_reason')}")
+            bootstrap_stats["qwen_mtp_fallback_reason"] = reason
+            bootstrap["path_stats"] = bootstrap_stats
+            if on_token is not None and bootstrap.get("text"):
+                on_token(bootstrap["text"])
+            return bootstrap
 
-        kv = tgt.new_kv()
+        kv = getattr(tgt, "last_kv", None)
+        if kv is None:
+            raise RuntimeError(
+                "Qwen MTP bootstrap did not retain its exact target KV endpoint")
+        decode_cache_before = _cache_io_snapshot(tgt)
         mtp_kv = KVCache(1)
-        prefill_t0 = time.perf_counter()
-        try:
-            logits = tgt.forward_tokens(ids, kv)
-            prompt_last_logits = logits[-1]
-            mx.eval(prompt_last_logits)
-        except MemoryError:
-            # Nothing sampled yet -- safe to discard and replay the whole
-            # request through the target's own fail-slow retry ladder
-            # (progressively smaller prefill chunks) rather than losing
-            # that safety net just because this request happened to route
-            # through MTP speculation first.
-            tgt.release_request_state()
-            return self._target_generate(
-                "memory-pressure-fallback", prompt, max_tokens, on_token,
-                stop, on_progress, sampling, constraint)
-        prefill_s = time.perf_counter() - prefill_t0
-
         proposed = 0
         accepted = 0
-        sweeps = 1  # count the prefill sweep, matching SpeculativeDecoder's convention
+        target_decode_sweeps = 0
+        plain_decode_sweeps = 0
+        warmup_decode_sweeps = 0
+        warmup_remaining = self.plain_warmup_tokens
+        adaptive_disabled = False
 
         # Invariant (matching speculative.py's documented one): all_tokens =
         # prompt + emitted; catchup_tok = all_tokens[-1] is sampled but not
         # yet fed to kv (kv.offset == len(all_tokens) - 1) until this
         # round's combined forward call feeds it.
-        catchup_tok = int(mx.argmax(prompt_last_logits))
+        catchup_tok = int(bootstrap["tokens"][0])
         h_last = tgt._h_last
         all_tokens = list(ids) + [catchup_tok]
         emitted = [catchup_tok]
-        first_token_s = time.perf_counter() - request_t0
-        stop_text = None
-        matched_stop_sequence = None
+        prefill_s = float(bootstrap.get("prefill_s", 0.0))
+        first_token_s = float(bootstrap.get("first_token_s", prefill_s))
+        stop_text = (
+            bootstrap.get("text")
+            if bootstrap.get("termination_reason") == "stop_sequence"
+            else None)
+        matched_stop_sequence = bootstrap.get("stop_sequence")
+
+        # StreamingEngine retained a prompt endpoint after the one-token
+        # bootstrap. Transfer that slot before mutating its KV; otherwise the
+        # slot's token tuple would still describe the prompt while its aliased
+        # recurrent state advances through speculative decode. Stable-boundary
+        # slots own a separate fork and remain untouched (they are the useful
+        # next-turn cache for recurrent chat templates).
+        endpoint_slot = None
+        hot_slots = getattr(tgt, "_hot_prompt_slots", None)
+        if hot_slots is not None:
+            for index, slot in enumerate(hot_slots):
+                if getattr(slot, "kv", None) is kv:
+                    endpoint_slot = hot_slots.pop(index)
+                    break
+        last_emitted_logits = (
+            getattr(endpoint_slot, "logits", None)
+            if endpoint_slot is not None else None)
 
         def _stop_match(text: str):
             matches = [(text.find(value), index, value)
@@ -281,11 +341,6 @@ class QwenMTPSpeculativeEngine:
             if match is not None:
                 cut, _order, matched_stop_sequence = match
                 stop_text = decoded[:cut]
-        if on_progress is not None:
-            on_progress({
-                "phase": "prefill", "completed_tokens": len(ids),
-                "total_tokens": len(ids), "cache_source": "qwen-mtp-cold",
-            })
         stream_decoder = None
         if on_token is not None:
             from .incremental_decode import IncrementalDetokenizer
@@ -299,69 +354,82 @@ class QwenMTPSpeculativeEngine:
         decode_t0 = time.perf_counter()
         while (len(emitted) < max_tokens and catchup_tok not in eos
                and stop_text is None):
-            # Position of catchup_tok, matching kv.offset before this round's
-            # combined call feeds it.
-            round_start_offset = kv.offset
-            # GLM's identical prefill-sync convention (glm_mtp.py:53-69,
-            # "entry i covers position i") confirms the MTP entry's RoPE
-            # position matches h_last's OWN position (round_start_offset-1,
-            # the state that produced catchup_tok) -- not catchup_tok's
-            # position. Only affects acceptance rate, never correctness.
-            draft_tok = self.drafter.draft_token(
-                h_last, catchup_tok, mtp_kv, round_start_offset - 1)
-            proposed += 1
-
-            # Checkpoint: state reflects exactly the PREVIOUS round's
-            # committed endpoint -- the one clean rollback point this scheme
-            # needs, taken before catchup_tok is fed at all.
-            kda_checkpoint = (
-                kv.kda_cache.fork() if getattr(kv, "kda_cache", None) is not None
-                else None)
-
-            # forward_tokens_serial_positions is NOT usable here: it calls
-            # layer_runner.run_block, a plain dense-transformer block with no
-            # awareness of qwen3_5's hybrid DeltaNet/full-attention
-            # layer_types (engine.py excludes qwen3_5/qwen3_5_moe/
-            # kimi_linear from it for exactly this reason). forward_tokens
-            # (via _sweep, which DOES dispatch correctly to
-            # run_qwen35_block) is the correct path for both dense and MoE
-            # qwen3_5 targets.
-            verify_tokens = [catchup_tok, draft_tok]
-            spec_logits = tgt.forward_tokens(verify_tokens, kv)
-            sweeps += 1
-            true_tok = int(mx.argmax(spec_logits[0]))
-
-            if true_tok == draft_tok:
-                # Accept: kv already reflects [..., catchup_tok, draft_tok]
-                # from the single combined call above -- draft_tok is
-                # committed, and spec_logits[1] is a genuinely free second
-                # token from the SAME pass (this is the actual speedup: one
-                # combined forward call emits two verified tokens).
-                accepted += 1
-                bonus_tok = int(mx.argmax(spec_logits[1]))
-                new_tokens = [draft_tok, bonus_tok]
+            if warmup_remaining or adaptive_disabled:
+                plain_logits = tgt.forward_tokens([catchup_tok], kv)
+                target_decode_sweeps += 1
+                plain_decode_sweeps += 1
+                if warmup_remaining:
+                    warmup_remaining -= 1
+                    warmup_decode_sweeps += 1
+                mx.eval(plain_logits)
+                new_tokens = [int(mx.argmax(plain_logits[-1]))]
+                new_token_logits = [plain_logits[-1]]
                 h_last = tgt._h_last
-                next_catchup_tok = bonus_tok
+                next_catchup_tok = new_tokens[0]
             else:
-                # Reject: discard the speculative advance through draft_tok
-                # entirely -- restore kda_cache to the pre-round checkpoint
-                # and roll ordinary KV back to round_start_offset (removing
-                # BOTH fed positions), then re-feed catchup_tok alone. This
-                # costs one extra single-position forward pass versus plain
-                # decoding for this one round -- the standard cost of a
-                # rejected speculative round, never more.
-                if kda_checkpoint is not None:
-                    kv.kda_cache = kda_checkpoint
-                kv.trim(round_start_offset)
-                catchup_logits = tgt.forward_tokens([catchup_tok], kv)
-                mx.eval(catchup_logits)
-                new_tokens = [true_tok]
-                h_last = tgt._h_last
-                next_catchup_tok = true_tok
+                # Position of catchup_tok, matching kv.offset before this
+                # round's combined call feeds it.
+                round_start_offset = kv.offset
+                # GLM's identical prefill-sync convention (glm_mtp.py:53-69,
+                # "entry i covers position i") confirms the MTP entry's RoPE
+                # position matches h_last's OWN position (round_start_offset-1,
+                # the state that produced catchup_tok) -- not catchup_tok's
+                # position. Only affects acceptance rate, never correctness.
+                draft_tok = self.drafter.draft_token(
+                    h_last, catchup_tok, mtp_kv, round_start_offset - 1)
+                proposed += 1
 
-            for tok in new_tokens:
+                # Checkpoint: state reflects exactly the PREVIOUS round's
+                # committed endpoint -- the one clean rollback point this
+                # scheme needs, taken before catchup_tok is fed at all.
+                kda_checkpoint = (
+                    kv.kda_cache.fork()
+                    if getattr(kv, "kda_cache", None) is not None else None)
+
+                # forward_tokens_serial_positions is NOT usable here: it calls
+                # layer_runner.run_block, a plain dense-transformer block with
+                # no awareness of qwen3_5's hybrid DeltaNet/full-attention
+                # layer_types (engine.py excludes qwen3_5/qwen3_5_moe/
+                # kimi_linear from it for exactly this reason). forward_tokens
+                # (via _sweep, which DOES dispatch correctly to
+                # run_qwen35_block) is the correct path for both dense and MoE
+                # qwen3_5 targets.
+                verify_tokens = [catchup_tok, draft_tok]
+                spec_logits = tgt.forward_tokens(verify_tokens, kv)
+                target_decode_sweeps += 1
+                true_tok = int(mx.argmax(spec_logits[0]))
+
+                if true_tok == draft_tok:
+                    # Accept: kv already reflects [..., catchup_tok, draft_tok]
+                    # from the single combined call above -- draft_tok is
+                    # committed, and spec_logits[1] is a genuinely free second
+                    # token from the SAME pass.
+                    accepted += 1
+                    bonus_tok = int(mx.argmax(spec_logits[1]))
+                    new_tokens = [draft_tok, bonus_tok]
+                    new_token_logits = [spec_logits[0], spec_logits[1]]
+                    h_last = tgt._h_last
+                    next_catchup_tok = bonus_tok
+                else:
+                    # Reject: restore the clean pre-round recurrent endpoint,
+                    # trim both speculative positions, then feed only the real
+                    # catchup token.
+                    if kda_checkpoint is not None:
+                        kv.kda_cache = kda_checkpoint
+                    kv.trim(round_start_offset)
+                    catchup_logits = tgt.forward_tokens([catchup_tok], kv)
+                    target_decode_sweeps += 1
+                    mx.eval(catchup_logits)
+                    new_tokens = [true_tok]
+                    new_token_logits = [catchup_logits[-1]]
+                    h_last = tgt._h_last
+                    next_catchup_tok = true_tok
+
+            for tok, token_logits in zip(
+                    new_tokens, new_token_logits, strict=True):
                 all_tokens.append(tok)
                 emitted.append(tok)
+                last_emitted_logits = token_logits
                 if stop:
                     decoded = tgt.tokenizer.decode(emitted)
                     match = _stop_match(decoded)
@@ -375,7 +443,28 @@ class QwenMTPSpeculativeEngine:
                 if (stop_text is not None or tok in eos
                         or len(emitted) >= max_tokens):
                     break
-            catchup_tok = next_catchup_tok
+            terminal_round = (
+                stop_text is not None
+                or emitted[-1] in eos
+                or len(emitted) >= max_tokens)
+            # An accepted pair may encounter EOS/stop on its first token, in
+            # which case ``next_catchup_tok`` is the unused bonus token. Never
+            # continue from that uncommitted value (the old behavior leaked
+            # post-EOS template tokens such as ``user`` into the response).
+            catchup_tok = emitted[-1] if terminal_round else next_catchup_tok
+            if terminal_round:
+                break
+            # Each accepted k=1 round saves one target sweep; each rejection
+            # costs one. Acceptance therefore must be strictly above 50% to
+            # improve this disk-bound target. Stop after a small bounded probe
+            # when the observed balance is not positive, then finish through
+            # the exact ordinary one-position path. This bounds a bad
+            # prompt/template distribution instead of extrapolating the high
+            # acceptance measured on a different prompt.
+            if (not adaptive_disabled and self.adaptive_stop
+                    and proposed >= self.adaptive_probe_rounds
+                    and 2 * accepted <= proposed):
+                adaptive_disabled = True
 
         final_text = stop_text if stop_text is not None else tgt.tokenizer.decode(emitted)
         if stream_decoder is not None:
@@ -389,17 +478,62 @@ class QwenMTPSpeculativeEngine:
         if kv.offset > endpoint:
             kv.trim(endpoint)
         total_s = time.perf_counter() - request_t0
-        path_stats = {
-            "prompt_tokenize_s": tokenize_s,
-            "rope_profile": tgt.rope_profile,
-            "effective_context_limit": tgt.effective_max_position_embeddings,
+        path_stats = bootstrap_stats
+        path_stats.update({
             "qwen_mtp_enabled": 1,
-            "qwen_mtp_used": 1,
-            "qwen_mtp_target_sweeps": max(0, sweeps - 1),
+            "qwen_mtp_used": int(proposed > 0),
+            "qwen_mtp_target_sweeps": target_decode_sweeps,
             "qwen_mtp_proposed": proposed,
             "qwen_mtp_accepted": accepted,
-        }
-        return {
+            "qwen_mtp_accept_rate": (
+                accepted / proposed if proposed else 0.0),
+            "qwen_mtp_decode_tokens": max(0, len(emitted) - 1),
+            "qwen_mtp_adaptive_disabled": int(adaptive_disabled),
+            "qwen_mtp_probe_rounds": min(
+                proposed, self.adaptive_probe_rounds),
+            "qwen_mtp_plain_decode_sweeps": plain_decode_sweeps,
+            "qwen_mtp_warmup_decode_sweeps": warmup_decode_sweeps,
+        })
+        if not proposed:
+            path_stats["qwen_mtp_fallback_reason"] = (
+                "terminal-during-plain-warmup")
+
+        request_cache_after = _cache_io_snapshot(tgt)
+        _record_cache_io_delta(
+            tgt, request_cache_before, path_stats, after=request_cache_after)
+        _record_cache_io_delta(
+            tgt, request_cache_before, path_stats, prefix="prefill_",
+            after=decode_cache_before)
+        _record_cache_io_delta(
+            tgt, decode_cache_before, path_stats, prefix="decode_",
+            after=request_cache_after)
+
+        # Restore a truthful full endpoint slot only when the bootstrap slot
+        # itself owned this KV. A separately forked stable-boundary slot is
+        # already the correct reusable artifact and was intentionally left in
+        # the LRU above.
+        if endpoint_slot is not None and last_emitted_logits is not None:
+            mx.eval(last_emitted_logits)
+            recurrent_state = getattr(kv, "kda_cache", None)
+            if recurrent_state is not None:
+                recurrent_state.synchronize()
+            endpoint_slot.tokens = tuple(ids + emitted[:-1])
+            endpoint_slot.kv = kv
+            endpoint_slot.logits = last_emitted_logits
+            endpoint_slot.prompt_length = len(ids)
+            endpoint_slot.segment_chain = ()
+            tgt._append_hot_prompt_slot(endpoint_slot)
+
+        if tgt.governor is not None:
+            tgt._true_peak_metal_bytes = max(
+                tgt._true_peak_metal_bytes,
+                tgt.governor.request_peak(),
+                mx.get_active_memory(),
+            )
+        profiler = getattr(tgt, "_request_profiler", None)
+        execution_profile = (
+            profiler.result(total_s) if profiler is not None else None)
+        result = {
             "text": final_text,
             "tokens": emitted,
             "prefill_s": prefill_s,
@@ -414,7 +548,10 @@ class QwenMTPSpeculativeEngine:
             "termination_reason": (
                 "stop_sequence" if stop_text is not None else
                 "eos" if emitted[-1] in eos else "length"),
-            "true_peak_metal_bytes": mx.get_active_memory(),
+            "true_peak_metal_bytes": tgt._true_peak_metal_bytes,
             "path_stats": path_stats,
             "prompt_tokens": len(ids),
         }
+        if execution_profile is not None:
+            result["execution_profile"] = execution_profile
+        return result

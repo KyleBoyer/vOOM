@@ -171,6 +171,11 @@ def _summary(response: dict, *, wall_s: float, events: list[str],
         "usage": response.get("usage"),
         "cache_phases": response.get("vmodel_cache_phases"),
         "timing": response.get("vmodel_timing"),
+        "execution_profile": response.get("vmodel_execution_profile"),
+        "backend": response.get("vmodel_backend"),
+        "backend_admission": response.get("vmodel_backend_admission"),
+        "checkpoint": response.get("vmodel_checkpoint"),
+        "weight_profile": response.get("vmodel_weight_profile"),
         "max_output_tokens": response.get("vmodel_max_output_tokens"),
         "output_budget_source": response.get("vmodel_output_budget_source"),
         "tool_selection": _safe_selection(response.get("vmodel_tool_selection")),
@@ -243,6 +248,20 @@ def _post(url: str, payload: bytes, timeout: float, stream: bool) -> dict:
             "http_status": error.code,
             "response_status": None,
             "error": detail.get("error", detail),
+            "wall_seconds": round(time.perf_counter() - started, 4),
+            "sse_event_types": events,
+            "output_text_delta_events": len(deltas),
+            "output_text_delta_bytes": sum(
+                len(delta.encode("utf-8")) for delta in deltas),
+            "output_text_delta_max_bytes": max(
+                (len(delta.encode("utf-8")) for delta in deltas), default=0),
+            "prefill_progress": progress,
+        }
+    except (TimeoutError, urllib.error.URLError, ConnectionError) as error:
+        return {
+            "http_status": 599,
+            "response_status": None,
+            "error": f"{type(error).__name__}: {error}",
             "wall_seconds": round(time.perf_counter() - started, 4),
             "sse_event_types": events,
             "output_text_delta_events": len(deltas),
@@ -366,8 +385,19 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("capture", type=Path)
     parser.add_argument("--url", default="http://127.0.0.1:8077/v1/responses")
+    parser.add_argument(
+        "--model",
+        help=(
+            "override only the request model after capture identity validation; "
+            "the private prompt and tool catalog remain byte-for-byte unchanged"))
     parser.add_argument("--repeats", type=int, default=2)
     parser.add_argument("--max-output-tokens", type=int, default=16)
+    parser.add_argument(
+        "--temperature", type=float,
+        help="override sampling temperature after capture identity validation")
+    parser.add_argument(
+        "--seed", type=int,
+        help="override sampling seed after capture identity validation")
     parser.add_argument("--omit-max-output-tokens", action="store_true")
     parser.add_argument("--timeout", type=float, default=300.0)
     parser.add_argument("--stream", action="store_true")
@@ -399,6 +429,8 @@ def main() -> int:
     args = parser.parse_args()
     if args.repeats <= 0 or args.max_output_tokens <= 0 or args.timeout <= 0:
         parser.error("repeats, max-output-tokens, and timeout must be positive")
+    if args.temperature is not None and args.temperature < 0:
+        parser.error("temperature must be non-negative")
     if (args.expected_min_output_tokens is not None
             and args.expected_min_output_tokens <= 0):
         parser.error("expected-min-output-tokens must be positive")
@@ -431,6 +463,10 @@ def main() -> int:
     request_value = json.loads(raw)
     if len(request_value.get("tools") or []) != capture_tools:
         raise SystemExit("capture tool count mismatch")
+    if args.model is not None:
+        if not args.model.strip():
+            parser.error("model must not be empty")
+        request_value["model"] = args.model
     replacement_sha256 = None
     if args.scenario is not None:
         inputs = request_value.get("input")
@@ -464,6 +500,10 @@ def main() -> int:
     payloads = []
     for label, value in request_values:
         value["stream"] = args.stream
+        if args.temperature is not None:
+            value["temperature"] = args.temperature
+        if args.seed is not None:
+            value["seed"] = args.seed
         if args.omit_max_output_tokens:
             value.pop("max_output_tokens", None)
             value.pop("max_tokens", None)
@@ -580,6 +620,9 @@ def main() -> int:
             "tools": capture_tools,
         },
         "request": {
+            "model_override": args.model,
+            "temperature_override": args.temperature,
+            "seed_override": args.seed,
             "stream": args.stream,
             "max_output_tokens": (
                 None if args.omit_max_output_tokens else args.max_output_tokens),

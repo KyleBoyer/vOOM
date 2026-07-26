@@ -117,6 +117,7 @@ class ModelConfig:
     linear_key_head_dim: int = 0
     linear_value_head_dim: int = 0
     linear_conv_kernel_dim: int = 4
+    full_attention_interval: int = 0
     # Jet-Nemotron (jet-ai/Jet-Nemotron-4B/2B) JetBlock hybrid -- a THIRD,
     # distinct layer-type mix (see docs/future_lossless_techniques.md): "jet"
     # (JetBlock, gated-delta-rule + a dynamically-generated per-token causal
@@ -417,6 +418,7 @@ class ModelConfig:
             linear_key_head_dim=raw.get("linear_key_head_dim", 0),
             linear_value_head_dim=raw.get("linear_value_head_dim", 0),
             linear_conv_kernel_dim=raw.get("linear_conv_kernel_dim", 4),
+            full_attention_interval=raw.get("full_attention_interval", 0),
             jet_num_heads=jet_num_heads,
             jet_head_dim=jet_head_dim,
             jet_head_v_dim=jet_head_v_dim,

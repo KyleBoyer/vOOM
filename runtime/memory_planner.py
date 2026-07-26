@@ -72,9 +72,10 @@ class MemoryPlanner:
         if disk_mb_per_s is None:
             # 2026-07-20: this used to default to a hardcoded 300.0 ("measured
             # ~315 MB/s on this machine's USB SSD"). That number went stale
-            # the moment storage changed (a real PCIe NVMe now measures
-            # ~3.0 GB/s here) and nothing re-validated it -- it would have
-            # silently made every est_token_s in Plan.summary() ~10x too
+            # the moment storage changed (the current PCIe NVMe measured
+            # ~1.62 GB/s uncached sequential on 2026-07-26) and nothing
+            # re-validated it -- it would have silently made every
+            # est_token_s in Plan.summary() ~5x too
             # pessimistic. Measure the actual current device instead of
             # trusting any fixed constant.
             from .disk_bench import measure_sequential_mb_per_s

@@ -14,7 +14,8 @@ from runtime.toolcalls import (anthropic_messages_to_canonical,
                                compact_tool_schema, expand_image_pad_tokens,
                                load_image, merge_leading_system_messages,
                                normalize_messages, parse_tool_calls, pinned_tool_indices,
-                               rank_tool_indices, responses_input_to_messages, tools_preamble)
+                               rank_tool_indices, responses_input_to_messages,
+                               semantic_tool_capability_query, tools_preamble)
 
 
 def test_hermes_single_call():
@@ -612,6 +613,32 @@ def test_fast_tool_ranking_capability_capsule_matches_shell_paraphrases():
     for paraphrase in ("run this with bash", "use the terminal", "invoke a CLI"):
         messages = [{"role": "user", "content": paraphrase}]
         assert rank_tool_indices(tools, messages)[0] == 1
+
+
+def test_fast_tool_ranking_maps_movies_and_shows_to_media_capability():
+    tools = [
+        {"type": "function", "function": {
+            "name": "plex_list_library",
+            "description": "List library metadata and configured folders.",
+            "parameters": {}}},
+        {"type": "function", "function": {
+            "name": "plex_list_library_media",
+            "description": "List media titles with content ratings.",
+            "parameters": {}}},
+    ]
+    messages = [{"role": "user", "content": (
+        "List the Plex movies and TV shows by age rating and paginate.")}]
+    assert rank_tool_indices(tools, messages)[0] == 1
+
+
+def test_semantic_tool_capability_query_drops_argument_qualifier_clause():
+    messages = [{"role": "user", "content": (
+        "List Plex movies and TV shows by age rating whose root folder does "
+        "not contain /Kids/. Make sure to paginate the listing.")}]
+    query = semantic_tool_capability_query(messages)
+    assert "plex movies and tv shows" in query
+    assert "root folder" not in query
+    assert query.endswith("paginate")
 
 
 def test_tool_order_and_ranking_ties_are_canonical_not_request_order():

@@ -843,6 +843,71 @@ def _checkpoint_payload_bytes(model_dir: Path) -> int:
         return 0
 
 
+def _qwen_native_mtp_policy(
+    requested: str, *, model_type: str, num_experts: int,
+    payload_bytes: int, cache_bytes: int, ngram_enabled: bool = False,
+) -> tuple[bool, str]:
+    """Choose native Qwen MTP only where measured trunk-I/O savings exist.
+
+    The real-checkpoint A/Bs are deliberately encoded as an architectural
+    policy rather than a model-name allowlist: MTP regressed on fully resident
+    dense 4B and on MoE 35B, while it won on dense models whose payload exceeds
+    the streamed weight-cache budget (9B/27B). ``1`` remains an expert override;
+    the construction site still refuses MoE targets unconditionally.
+    """
+    requested = str(requested or "auto").strip().lower()
+    if requested not in ("auto", "0", "1"):
+        raise ValueError("VMODEL_QWEN_MTP_SPECULATIVE must be auto, 0, or 1")
+    if model_type not in ("qwen3_5", "qwen3_5_moe"):
+        return False, "unsupported-architecture"
+    if num_experts:
+        return False, "moe-expert-io-regression"
+    if requested == "0":
+        return False, "operator-disabled"
+    if requested == "1":
+        return True, "operator-forced"
+    if ngram_enabled:
+        return False, "explicit-ngram-selected"
+    if payload_bytes <= 0:
+        return False, "unknown-payload"
+    if payload_bytes <= max(0, cache_bytes):
+        return False, "resident-dense-overhead"
+    return True, "auto-out-of-core-dense"
+
+
+def _qwen_chunked_delta_policy(
+        requested: str, *, mode: str, model_type: str) -> tuple[bool, str]:
+    """Admit reassociated DeltaNet prefill only to the lossy Qwen route."""
+    requested = str(requested or "auto").strip().lower()
+    if requested not in ("auto", "0", "1"):
+        raise ValueError(
+            "VMODEL_QWEN35_CHUNKED_DELTA must be auto, 0, or 1")
+    if model_type not in ("qwen3_5", "qwen3_5_moe"):
+        return False, "unsupported-architecture"
+    if requested == "0":
+        return False, "operator-disabled"
+    if requested == "1":
+        return True, "operator-forced"
+    if mode in ("fast", "fast-long"):
+        return True, "auto-lossy-qwen"
+    return False, "lossless-checkpoint-boundary"
+
+
+def _grammar_jump_forward_policy(requested: str, *, mode: str) -> tuple[bool, str]:
+    """Use string-level grammar jumps automatically only in lossy modes."""
+    requested = str(requested or "auto").strip().lower()
+    if requested not in ("auto", "0", "1"):
+        raise ValueError(
+            "VMODEL_GRAMMAR_JUMP_FORWARD_LOSSY must be auto, 0, or 1")
+    if mode not in ("fast", "fast-long"):
+        return False, "lossless-route"
+    if requested == "0":
+        return False, "operator-disabled"
+    if requested == "1":
+        return True, "operator-forced"
+    return True, "auto-lossy"
+
+
 class EngineManager:
     """One resident engine; (model_dir, mode) keyed swap."""
 
@@ -859,7 +924,9 @@ class EngineManager:
                 self._engine = None
                 self._key = None
 
-    def get(self, model_dir: Path, mode: str):
+    def get(
+        self, model_dir: Path, mode: str, *, requires_vision: bool = False,
+    ):
         import mlx.core as mx
 
         from .config import ModelConfig
@@ -881,7 +948,20 @@ class EngineManager:
             if not math.isfinite(yarn_factor) or yarn_factor <= 1:
                 raise RequestValidationError(
                     "VMODEL_FAST_LONG_YARN_FACTOR must be finite and greater than 1")
-        key = (str(model_dir), mode, yarn_factor.hex())
+        resident_backend_request = os.environ.get(
+            "VMODEL_RESIDENT_BACKEND", "auto").strip().lower()
+        qwen_mtp_request = os.environ.get(
+            "VMODEL_QWEN_MTP_SPECULATIVE", "auto").strip().lower()
+        qwen_moe_prefill_batch_request = os.environ.get(
+            "VMODEL_QWEN_MOE_PREFILL_EXPERT_BATCH", "16").strip()
+        qwen_moe_decode_batch_request = os.environ.get(
+            "VMODEL_QWEN_MOE_DECODE_EXPERT_BATCH", "8").strip()
+        key = (
+            str(model_dir), mode, yarn_factor.hex(),
+            bool(requires_vision), resident_backend_request,
+            qwen_mtp_request, qwen_moe_prefill_batch_request,
+            qwen_moe_decode_batch_request,
+        )
         # A healthy resident engine owns all state it needs. Return before
         # touching model storage so a transient NAS disconnect cannot stall or
         # fail an otherwise cache-hot request.
@@ -890,7 +970,12 @@ class EngineManager:
                 return self._engine
 
         model_dir = resolve_model_dir(model_dir)
-        key = (str(model_dir), mode, yarn_factor.hex())
+        key = (
+            str(model_dir), mode, yarn_factor.hex(),
+            bool(requires_vision), resident_backend_request,
+            qwen_mtp_request, qwen_moe_prefill_batch_request,
+            qwen_moe_decode_batch_request,
+        )
         # Validate the requested profile before evicting a healthy resident
         # engine. ModelConfig.from_dir is read-only and has the same remount
         # retry behavior as WeightStore.
@@ -968,15 +1053,20 @@ class EngineManager:
             # rather than per-model-type. Byte-identical by construction
             # (see RuntimeConfig.grammar_fast_forward), opt-in for the
             # first rollout.
-            rc.grammar_fast_forward = os.environ.get(
-                "VMODEL_GRAMMAR_FAST_FORWARD", "0") == "1"
+            grammar_fast_forward = os.environ.get(
+                "VMODEL_GRAMMAR_FAST_FORWARD", "0")
+            if grammar_fast_forward not in ("0", "1"):
+                raise ValueError(
+                    "VMODEL_GRAMMAR_FAST_FORWARD must be 0 or 1")
+            rc.grammar_fast_forward = grammar_fast_forward == "1"
             # String-level jump-forward changes token ids (not rendered
             # text) versus per-token masked argmax, so it is fast/lossy
             # profile ONLY -- never the lossless target.
-            rc.grammar_jump_forward_lossy = (
-                mode in ("fast", "fast-long")
-                and os.environ.get(
-                    "VMODEL_GRAMMAR_JUMP_FORWARD_LOSSY", "0") == "1")
+            (rc.grammar_jump_forward_lossy,
+             grammar_jump_forward_reason) = _grammar_jump_forward_policy(
+                os.environ.get(
+                    "VMODEL_GRAMMAR_JUMP_FORWARD_LOSSY", "0"),
+                mode=mode)
             if mtype == "jet_nemotron":
                 # F97: Jet-Nemotron (jet-ai/Jet-Nemotron-4B/2B) -- a third,
                 # distinct hybrid layer-type mix (JetBlock "jet" + ordinary
@@ -1144,16 +1234,9 @@ class EngineManager:
                 # exact endpoints/extensions (never a trimmed branch).
                 rc.prompt_kv_dir = ""
                 rc.hot_prompt_kv = True
-                # F94: native MTP speculative decoding, opt-in only (matching
-                # GLM's own still-"provisional"/F23 MTP path) -- gracefully
-                # skipped at construction if the checkpoint has no mtp.*
-                # weights (older Qwen3.5 generations), see the
-                # rc.qwen_mtp_speculative construction site in EngineManager.get.
-                rc.qwen_mtp_speculative = os.environ.get(
-                    "VMODEL_QWEN_MTP_SPECULATIVE", "0") == "1"
                 # F11: prompt-lookup/n-gram speculation, mutually exclusive
-                # with the native MTP flag above (see EngineManager.get()'s
-                # construction site) -- opt-in only, real greedy-token
+                # with native MTP (see EngineManager.get()'s construction
+                # site) -- opt-in only, real greedy-token
                 # quality gate in tests/test_qwen35_ngram_speculative.py.
                 rc.qwen_ngram_speculative = os.environ.get(
                     "VMODEL_QWEN_NGRAM_SPECULATIVE", "0") == "1"
@@ -1313,26 +1396,58 @@ class EngineManager:
                 # governor-reservation-plus-lock round trip per expert, which
                 # is cheap next to a slow USB drive's own per-read latency
                 # but became the dominant cost once this repo's storage
-                # moved to a real NVMe (~3 GB/s measured, see
+                # moved to a real NVMe (~1.62 GB/s uncached sequential,
+                # measured 2026-07-26; see
                 # runtime/disk_bench.py) -- live-confirmed: a 134-tool,
                 # ~30K-token prompt prefilled at ~13 tok/s, and process
                 # sampling showed real time going to thread-sync waits
                 # around each single-expert fetch, not to disk reads
-                # themselves. Raised to 8 to match decode's already-proven
-                # value below and let get_many's shard-grouped batching
-                # actually engage during prefill too. This does NOT bypass
+                # themselves. Raised first to 8, then to 16 after a real
+                # Qwen3.6-35B A/B: q=8 8.110s -> q=16 7.551s (1.074x),
+                # identical token IDs, expert compute batches 275 -> 203,
+                # and the same 8.054GB true Metal peak. This lets get_many's
+                # shard-grouped batching engage more effectively. It does not
+                # bypass
                 # memory safety: governor.admissible_units() (called inside
                 # _iter_expert_batches) still adaptively clamps the live
                 # batch size down to whatever current headroom allows,
-                # exactly as it already does for decode's batch=8 -- this
+                # exactly as it already does for decode's batch=8 -- 16
                 # only raises the ceiling attempted when there's room, never
                 # forces a bigger batch under pressure.
-                rc.expert_fetch_batch = 8
+                try:
+                    rc.expert_fetch_batch = int(
+                        qwen_moe_prefill_batch_request)
+                    rc.decode_expert_fetch_batch = int(
+                        qwen_moe_decode_batch_request)
+                except ValueError as error:
+                    raise ValueError(
+                        "VMODEL_QWEN_MOE_*_EXPERT_BATCH must be integers"
+                    ) from error
+                if not 1 <= rc.expert_fetch_batch <= 64:
+                    raise ValueError(
+                        "VMODEL_QWEN_MOE_PREFILL_EXPERT_BATCH must be in [1, 64]")
+                if not 1 <= rc.decode_expert_fetch_batch <= 8:
+                    raise ValueError(
+                        "VMODEL_QWEN_MOE_DECODE_EXPERT_BATCH must be in [1, 8]")
                 # One decode position activates exactly eight ~6.3 MB experts
                 # per layer. Fetching them as one archive-coalesced batch is
                 # comfortably bounded and avoids eight serialized disk waits;
-                # multi-position prefill now batches the same width above.
-                rc.decode_expert_fetch_batch = 8
+                # multi-position prefill uses its separately measured q=16
+                # ceiling above.
+                # F106's real 600-word A/B on this exact architecture was
+                # byte-identical and reduced 1002.49s -> 229.30s (4.372x) by
+                # routing/fetching the prompt's expert union once per layer
+                # instead of once per chunk. The production server branch
+                # accidentally never exposed the already-existing MoE path;
+                # make the proven lossless schedule the default here with a
+                # deliberate opt-out for diagnostics.
+                qwen_moe_layer_stationary = os.environ.get(
+                    "VMODEL_QWEN_MOE_LAYER_STATIONARY_PREFILL", "1")
+                if qwen_moe_layer_stationary not in ("0", "1"):
+                    raise ValueError(
+                        "VMODEL_QWEN_MOE_LAYER_STATIONARY_PREFILL must be 0 or 1")
+                rc.layer_stationary_prefill = (
+                    qwen_moe_layer_stationary == "1")
                 if mode in ("fast", "fast-long"):
                     # Initial side-quest profile: quantize only expert MLP
                     # matrices. DeltaNet, gated full attention, routers, shared
@@ -1389,16 +1504,9 @@ class EngineManager:
                 # imposes carry over from the MoE sibling.
                 rc.prompt_kv_dir = ""
                 rc.hot_prompt_kv = True
-                # F94: native MTP speculative decoding, opt-in only (matching
-                # GLM's own still-"provisional"/F23 MTP path) -- gracefully
-                # skipped at construction if the checkpoint has no mtp.*
-                # weights (older Qwen3.5 generations), see the
-                # rc.qwen_mtp_speculative construction site in EngineManager.get.
-                rc.qwen_mtp_speculative = os.environ.get(
-                    "VMODEL_QWEN_MTP_SPECULATIVE", "0") == "1"
                 # F11: prompt-lookup/n-gram speculation, mutually exclusive
-                # with the native MTP flag above (see EngineManager.get()'s
-                # construction site) -- opt-in only, real greedy-token
+                # with native MTP (see EngineManager.get()'s construction
+                # site) -- opt-in only, real greedy-token
                 # quality gate in tests/test_qwen35_ngram_speculative.py.
                 rc.qwen_ngram_speculative = os.environ.get(
                     "VMODEL_QWEN_NGRAM_SPECULATIVE", "0") == "1"
@@ -2222,8 +2330,115 @@ class EngineManager:
                     raise RequestValidationError(
                         "VMODEL_HOT_PROMPT_KV_MIN_TOKENS must be >= 0")
 
+            qwen_mtp_reason = "not-qwen"
+            if mtype in ("qwen3_5", "qwen3_5_moe"):
+                try:
+                    (rc.qwen_mtp_speculative,
+                     qwen_mtp_reason) = _qwen_native_mtp_policy(
+                        qwen_mtp_request,
+                        model_type=mtype,
+                        num_experts=int(getattr(cfg_probe, "num_experts", 0) or 0),
+                        payload_bytes=_checkpoint_payload_bytes(model_dir),
+                        cache_bytes=int(rc.max_weight_cache_mb) * 1_000_000,
+                        ngram_enabled=bool(rc.qwen_ngram_speculative),
+                    )
+                except ValueError as error:
+                    raise RequestValidationError(str(error)) from error
+
+            execution_profile = os.environ.get(
+                "VMODEL_EXECUTION_PROFILE", "").strip().lower()
+            if execution_profile not in ("", "layers", "ops"):
+                raise RequestValidationError(
+                    "VMODEL_EXECUTION_PROFILE must be '', 'layers', or 'ops'")
+            chunked_delta_request = os.environ.get(
+                "VMODEL_QWEN35_CHUNKED_DELTA", "auto")
+            try:
+                (rc.qwen_chunked_delta_prefill,
+                 chunked_delta_reason) = _qwen_chunked_delta_policy(
+                    chunked_delta_request, mode=mode, model_type=mtype)
+            except ValueError as error:
+                raise RequestValidationError(str(error)) from error
+            rc.execution_profile = execution_profile
+            from .resident_mlx_lm import (
+                ResidentMLXLMEngine, choose_resident_backend)
+
+            try:
+                resident_decision = choose_resident_backend(
+                    model_dir, cfg_probe, mode,
+                    requires_vision=requires_vision,
+                    execution_profile=execution_profile)
+            except ValueError as error:
+                raise RequestValidationError(str(error)) from error
+            if resident_decision.admitted:
+                try:
+                    target_engine = ResidentMLXLMEngine(
+                        model_dir, cfg_probe, rc, resident_decision)
+                except Exception as error:
+                    if resident_decision.requested == "mlx-lm":
+                        raise RequestValidationError(
+                            f"forced MLX-LM backend could not initialize: "
+                            f"{type(error).__name__}: {error}") from error
+                    mx.clear_cache()
+                    print(
+                        "[server] MLX-LM resident route failed closed; "
+                        f"using vOOM: {type(error).__name__}: {error}",
+                        flush=True,
+                    )
+                else:
+                    self._engine = target_engine
+                    self._key = key
+                    print(
+                        "[server] resident backend admitted: "
+                        f"backend=mlx-lm target={model_dir.name} "
+                        f"payload={resident_decision.payload_bytes / 1e9:.2f}GB "
+                        f"estimated_metal="
+                        f"{resident_decision.estimated_metal_bytes / 1e9:.2f}GB "
+                        f"available="
+                        f"{resident_decision.available_bytes / 1e9:.2f}GB "
+                        f"load={target_engine._load_s:.2f}s",
+                        flush=True,
+                    )
+                    return self._engine
+            elif resident_decision.requested == "mlx-lm":
+                raise RequestValidationError(
+                    "forced MLX-LM backend was not admitted: "
+                    f"{resident_decision.reason} "
+                    f"(payload={resident_decision.payload_bytes / 1e9:.2f}GB, "
+                    f"estimated_metal="
+                    f"{resident_decision.estimated_metal_bytes / 1e9:.2f}GB, "
+                    f"available={resident_decision.available_bytes / 1e9:.2f}GB)")
+            elif (
+                mode in ("fast", "fast-long")
+                and cfg_probe.model_type == "qwen3_5"
+                and not cfg_probe.num_experts
+            ):
+                print(
+                    "[server] resident backend not admitted: "
+                    f"target={model_dir.name} "
+                    f"reason={resident_decision.reason} "
+                    f"payload={resident_decision.payload_bytes / 1e9:.2f}GB "
+                    f"estimated_metal="
+                    f"{resident_decision.estimated_metal_bytes / 1e9:.2f}GB "
+                    f"available={resident_decision.available_bytes / 1e9:.2f}GB; "
+                    "using vOOM",
+                    flush=True,
+                )
             target_engine = StreamingEngine(model_dir, rc)
             self._engine = target_engine
+            if execution_profile:
+                print(
+                    "[server] execution-profile config: "
+                    f"level={execution_profile} "
+                    f"architecture={target_engine.cfg.model_type} "
+                    f"chunk={rc.prefill_chunk_size} "
+                    f"adaptive_chunk={int(rc.adaptive_chunk_size)} "
+                    f"layer_stationary={int(rc.layer_stationary_prefill)} "
+                    f"chunked_delta={int(rc.qwen_chunked_delta_prefill)} "
+                    f"chunked_delta_reason={chunked_delta_reason} "
+                    f"expert_batch={rc.expert_fetch_batch}/"
+                    f"{rc.decode_expert_fetch_batch}",
+                    flush=True,
+                )
             if qwen2_adaptive_candidate:
                 fitted_cache = target_engine.cache.max_bytes
                 if target_engine.governor is not None:
@@ -2478,10 +2693,27 @@ class EngineManager:
                 from .qwen35_mtp import QwenMTPSpeculativeEngine
 
                 try:
-                    self._engine = QwenMTPSpeculativeEngine(target_engine)
+                    try:
+                        qwen_mtp_max_prompt_tokens = int(os.environ.get(
+                            "VMODEL_QWEN_MTP_MAX_PROMPT_TOKENS", "32768"))
+                        qwen_mtp_min_output_tokens = int(os.environ.get(
+                            "VMODEL_QWEN_MTP_MIN_OUTPUT_TOKENS", "32"))
+                    except ValueError as error:
+                        raise ValueError(
+                            "VMODEL_QWEN_MTP prompt/output limits must be integers"
+                        ) from error
+                    self._engine = QwenMTPSpeculativeEngine(
+                        target_engine,
+                        max_prompt_tokens=qwen_mtp_max_prompt_tokens,
+                        min_output_tokens=qwen_mtp_min_output_tokens,
+                        adaptive_stop=(qwen_mtp_request == "auto"),
+                        plain_warmup_tokens=(
+                            3 if qwen_mtp_request == "auto" else 0))
                     print(
                         f"[server] Qwen native MTP speculation: "
-                        f"target={model_dir.name}",
+                        f"target={model_dir.name} policy={qwen_mtp_reason} "
+                        f"prompt_limit={qwen_mtp_max_prompt_tokens} "
+                        f"min_output={qwen_mtp_min_output_tokens}",
                         flush=True,
                     )
                 except Exception as error:
@@ -3494,22 +3726,32 @@ def _load_vision_images(sources):
 
 def _fast_dense_resident_kv_projection(
         engine, mode: str, prompt_tokens: int, max_output_tokens: int):
-    """Project the exact resident BF16 KV payload for dense text Qwen.
+    """Project resident BF16 KV payload for dense and hybrid text Qwen.
 
     Weight quantization does not change K/V activations.  Qwen3-4B's geometry
     is 147,456 resident bytes per position, so a harness prompt that merely
     looks like a moderate 28K context asks this 16-GB host to retain ~4.17 GB
     of KV before layer weights and scratch.  Keep this arithmetic independent
     of MLX so request validation and its regression tests remain CPU-only.
+
+    Qwen3.5 is hybrid: only every ``full_attention_interval`` layer grows a
+    conventional KV cache; the DeltaNet layers retain fixed-size recurrent
+    state.  The resident MLX-LM adapter reports its live model/cache ownership,
+    allowing this same gate to project the growing full-attention portion.
     """
     if mode not in ("fast", "fast-long"):
         return None
     cfg = getattr(engine, "cfg", None)
     rc = getattr(engine, "rc", None)
-    if (cfg is None or rc is None
-            or getattr(cfg, "model_type", "") not in ("qwen2", "qwen3")
-            or getattr(cfg, "vision_config", None)
-            or getattr(cfg, "num_experts", 0)):
+    if cfg is None or rc is None or getattr(cfg, "num_experts", 0):
+        return None
+    model_type = getattr(cfg, "model_type", "")
+    resident_qwen35 = (
+        getattr(engine, "backend_name", "") == "mlx-lm"
+        and model_type == "qwen3_5")
+    if not resident_qwen35 and (
+            model_type not in ("qwen2", "qwen3")
+            or getattr(cfg, "vision_config", None)):
         return None
     if getattr(rc, "max_kv_mb", 0):
         # Exact paging has its own explicit resident-byte budget.
@@ -3526,6 +3768,11 @@ def _fast_dense_resident_kv_projection(
     if limit_mb == 0:
         return None
     layers = int(getattr(cfg, "num_hidden_layers", 0) or 0)
+    if resident_qwen35:
+        interval = int(getattr(cfg, "full_attention_interval", 0) or 0)
+        if interval <= 0:
+            return None
+        layers = (layers + interval - 1) // interval
     kv_heads = int(getattr(cfg, "num_key_value_heads", 0) or 0)
     head_dim = int(getattr(cfg, "head_dim", 0) or 0)
     if min(layers, kv_heads, head_dim) <= 0:
@@ -3586,8 +3833,10 @@ def _validate_fast_dense_resident_kv(
         engine, mode, prompt_tokens, max_output_tokens)
     if (projection is not None
             and projection["projected_bytes"] > projection["limit_bytes"]):
-        adaptive_spill_mb = int(getattr(
-            getattr(engine, "rc", None), "adaptive_kv_spill_mb", 0) or 0)
+        adaptive_spill_mb = (
+            0 if getattr(engine, "backend_name", "") == "mlx-lm" else
+            int(getattr(
+                getattr(engine, "rc", None), "adaptive_kv_spill_mb", 0) or 0))
         if adaptive_spill_mb:
             projection["adaptive_spill_required"] = 1
             projection["adaptive_spill_mb"] = adaptive_spill_mb
@@ -3609,8 +3858,10 @@ def _validate_fast_dense_resident_kv(
             and projection["dynamic_ceiling_bytes"]
             and projection["dynamic_projected_bytes"]
             > projection["dynamic_ceiling_bytes"]):
-        adaptive_spill_mb = int(getattr(
-            getattr(engine, "rc", None), "adaptive_kv_spill_mb", 0) or 0)
+        adaptive_spill_mb = (
+            0 if getattr(engine, "backend_name", "") == "mlx-lm" else
+            int(getattr(
+                getattr(engine, "rc", None), "adaptive_kv_spill_mb", 0) or 0))
         if adaptive_spill_mb:
             projection["adaptive_spill_required"] = 1
             projection["adaptive_spill_mb"] = adaptive_spill_mb
@@ -3848,6 +4099,116 @@ def _hidden_gateway_decision_choice(
     )
 
 
+def _hidden_gateway_host_action(
+        force_reason: str | None, *, activated_tools: bool,
+        semantic_query: str) -> str | None:
+    """Return a catalog action only when generation was already constrained.
+
+    A non-null force reason makes the ordinary hidden decision constraint
+    require a private catalog call; the model is therefore not allowed to
+    answer directly. Replaying that entire model phase only to emit the forced
+    marker is redundant. Pagination can reuse an activated catalog, while
+    other forced actions need a non-empty deterministic semantic query.
+    """
+    if force_reason is None:
+        return None
+    if force_reason == "tool-result-pagination" and activated_tools:
+        return _HIDDEN_TOOL_ENABLE_NAME
+    if semantic_query.strip():
+        return _HIDDEN_TOOL_SEARCH_NAME
+    return None
+
+
+def _tool_property_default(tool: dict, name: str):
+    function = tool.get("function", tool) if isinstance(tool, dict) else {}
+    schema = function.get("parameters", {}) if isinstance(function, dict) else {}
+    prop = (schema.get("properties", {}).get(name, {})
+            if isinstance(schema, dict) else {})
+    if not isinstance(prop, dict):
+        return None
+    if "default" in prop:
+        return prop["default"]
+    for variant in prop.get("anyOf", ()):
+        if isinstance(variant, dict) and "default" in variant:
+            return variant["default"]
+    return None
+
+
+def _hidden_gateway_pagination_call(
+        messages: list[dict], selected_tools: list[dict]) -> dict | None:
+    """Advance a conventional pagination contract without model inference.
+
+    This is deliberately protocol-only: the latest message must be JSON with
+    an explicit boolean ``*hasMore: true``; the previous assistant call must
+    target exactly one still-selected tool; and that tool must expose a
+    conventional numeric offset+limit or page field. All non-pagination
+    arguments are preserved byte-semantically after JSON parsing. Unknown
+    cursor/custom pagination contracts fall back to the model.
+    """
+    if not messages or not _gateway_tool_result_has_more(messages[-1]):
+        return None
+    selected = {
+        _tool_function_name(tool): tool for tool in selected_tools
+        if _tool_function_name(tool)}
+    if not selected:
+        return None
+    result_call_id = str(messages[-1].get("tool_call_id", ""))
+    prior_call = None
+    for message in reversed(messages[:-1]):
+        if message.get("role") != "assistant":
+            continue
+        for call in reversed(message.get("tool_calls", ())):
+            if not isinstance(call, dict):
+                continue
+            name = _tool_function_name(call)
+            if name not in selected:
+                continue
+            if result_call_id and str(call.get("id", "")) != result_call_id:
+                continue
+            prior_call = call
+            break
+        if prior_call is not None:
+            break
+    if prior_call is None:
+        return None
+
+    function = prior_call.get("function", {})
+    raw_arguments = function.get("arguments", "{}")
+    try:
+        arguments = (
+            json.loads(raw_arguments)
+            if isinstance(raw_arguments, str) else dict(raw_arguments))
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(arguments, dict):
+        return None
+    name = str(function.get("name", ""))
+    tool = selected[name]
+    properties = (
+        tool.get("function", tool).get(
+            "parameters", {}).get("properties", {}))
+
+    if "offset" in properties and "limit" in properties:
+        offset = arguments.get(
+            "offset", _tool_property_default(tool, "offset"))
+        limit = arguments.get(
+            "limit", _tool_property_default(tool, "limit"))
+        if (isinstance(offset, bool) or not isinstance(offset, (int, float))
+                or isinstance(limit, bool) or not isinstance(limit, (int, float))
+                or limit <= 0):
+            return None
+        arguments["limit"] = limit
+        arguments["offset"] = offset + limit
+    elif "page" in properties:
+        page = arguments.get("page", _tool_property_default(tool, "page"))
+        if isinstance(page, bool) or not isinstance(page, (int, float)):
+            return None
+        arguments["page"] = page + 1
+    else:
+        return None
+    return {"name": name, "arguments": arguments}
+
+
 def _hidden_tool_search_pair():
     """Return wrapped/raw copies of the gateway-only catalog search tool."""
     raw = {
@@ -3970,6 +4331,63 @@ def _hidden_gateway_activation_put(key: str, tools: list[dict]) -> tuple[str, ..
         while len(_GATEWAY_ACTIVATIONS) > _GATEWAY_ACTIVATION_LIMIT:
             _GATEWAY_ACTIVATIONS.popitem(last=False)
     return names
+
+
+def _hidden_gateway_execution_messages(
+        messages: list[dict], selected_tools: list[dict],
+        activation_key: str) -> list[dict]:
+    """Insert one canonical private activation pair at a prefix-stable point.
+
+    The discovery action itself is intentionally absent: an initial turn may
+    search while a continuation enables the existing catalog, so preserving
+    that model-authored action in the execution prompt makes two otherwise
+    prefix-related turns diverge before the real assistant/tool exchange.  A
+    stable enable pair describes the execution phase's actual state on both
+    turns.  It is inserted immediately before the first call to an activated
+    real tool; on the initial turn there is no such call yet, so it is appended.
+    Consequently the initial execution prompt is an exact prefix of a normal
+    tool-result continuation and the phase-specific hot-KV cache can reuse it.
+    """
+    names = tuple(dict.fromkeys(
+        name for tool in selected_tools
+        if (name := _tool_function_name(tool))))
+    identity = json.dumps(
+        {"activation_key": activation_key, "tools": names},
+        ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    call_id = (
+        "vmodel_gateway_"
+        + hashlib.sha256(identity.encode("utf-8")).hexdigest()[:12])
+    pair = [{
+        "role": "assistant", "content": "",
+        "tool_calls": [{
+            "id": call_id, "type": "function",
+            "function": {
+                "name": _HIDDEN_TOOL_ENABLE_NAME,
+                "arguments": "{}",
+            },
+        }],
+    }, {
+        "role": "tool", "tool_call_id": call_id,
+        "name": _HIDDEN_TOOL_ENABLE_NAME,
+        "content": json.dumps({
+            "status": "enabled",
+            "tools": list(names),
+        }, ensure_ascii=False, separators=(",", ":")),
+    }]
+
+    activated = set(names)
+    insert_at = len(messages)
+    for index, message in enumerate(messages):
+        if message.get("role") != "assistant":
+            continue
+        calls = message.get("tool_calls", ())
+        if any(
+                isinstance(call, dict)
+                and _tool_function_name(call) in activated
+                for call in calls if isinstance(calls, list)):
+            insert_at = index
+            break
+    return [*messages[:insert_at], *pair, *messages[insert_at:]]
 
 
 def _hidden_gateway_activation_clear() -> None:
@@ -4585,7 +5003,7 @@ def _cache_phase_telemetry(name: str, phase_result: dict) -> dict:
     cached = min(phase_prompt_tokens, int(
         stats.get("prompt_cache_prefix_tokens", 0) or 0))
     pic_reused = int(stats.get("tool_pic_reused_tokens", 0) or 0)
-    return {
+    value = {
         "phase": name,
         "cache_namespace": stats.get("prompt_cache_namespace", name),
         "input_tokens": phase_prompt_tokens,
@@ -4601,6 +5019,13 @@ def _cache_phase_telemetry(name: str, phase_result: dict) -> dict:
             stats.get("tool_pic_selected_tokens", 0) or 0),
         "suffix_prefill_seconds": round(float(
             phase_result.get("prefill_s", 0.0) or 0.0), 4),
+        "decode_seconds": round(float(
+            phase_result.get("decode_s", 0.0) or 0.0), 4),
+        "total_engine_seconds": round(float(
+            phase_result.get("total_s", 0.0) or 0.0), 4),
+        "output_tokens": len(phase_result.get("tokens", ())),
+        "weight_store_bytes_read": int(
+            phase_result.get("weight_store_bytes_read", 0) or 0),
         "cache_lookup_seconds": round(float(
             stats.get("prompt_cache_lookup_s", 0.0) or 0.0), 4),
         "admission_evicted_slots": int(stats.get(
@@ -4614,6 +5039,9 @@ def _cache_phase_telemetry(name: str, phase_result: dict) -> dict:
         "admission_governor_reservations": int(stats.get(
             "hot_prompt_admission_governor_reservations", 0) or 0),
     }
+    if phase_result.get("execution_profile") is not None:
+        value["execution_profile"] = phase_result["execution_profile"]
+    return value
 
 
 def _log_path_stats(result: dict, prompt_tokens: int) -> None:
@@ -4648,10 +5076,19 @@ def _log_path_stats(result: dict, prompt_tokens: int) -> None:
         proposed = int(stats.get("qwen_mtp_proposed", 0) or 0)
         accepted = int(stats.get("qwen_mtp_accepted", 0) or 0)
         acceptance = 100.0 * accepted / proposed if proposed else 0.0
+        target_sweeps = int(
+            stats.get("qwen_mtp_target_sweeps", 0) or 0)
+        decode_tokens = int(
+            stats.get("qwen_mtp_decode_tokens", 0) or 0)
         print(
             f"[server] Qwen MTP speculation: accepted {accepted}/{proposed} "
-            f"({acceptance:.0f}%), target_sweeps="
-            f"{int(stats.get('qwen_mtp_target_sweeps', 0) or 0)}",
+            f"({acceptance:.0f}%), target_sweeps={target_sweeps}, "
+            f"decode_tokens={decode_tokens}, "
+            f"net_sweeps_saved={decode_tokens - target_sweeps}, "
+            f"adaptive_disabled="
+            f"{int(stats.get('qwen_mtp_adaptive_disabled', 0) or 0)}, "
+            f"plain_finish_sweeps="
+            f"{int(stats.get('qwen_mtp_plain_decode_sweeps', 0) or 0)}",
             flush=True,
         )
     elif stats.get("qwen_mtp_enabled"):
@@ -4752,10 +5189,35 @@ def _log_path_stats(result: dict, prompt_tokens: int) -> None:
             f"{int(stats.get('governor_reservations', 0) or 0)}",
             flush=True,
         )
+    elif int(stats.get("weight_store_bytes_read", 0) or 0):
+        print(
+            f"[server] weight-I/O: "
+            f"store={int(stats.get('weight_store_bytes_read', 0) or 0) / 1e9:.2f}GB "
+            f"(prefill={int(stats.get('prefill_weight_store_bytes_read', 0) or 0) / 1e9:.2f}, "
+            f"decode={int(stats.get('decode_weight_store_bytes_read', 0) or 0) / 1e9:.2f}; "
+            f"fast-tier={int(stats.get('weight_fast_tier_bytes', 0) or 0) / 1e9:.2f}), "
+            f"evictions={int(stats.get('weight_cache_evictions', 0) or 0)}, "
+            f"resident={int(stats.get('weight_cache_resident_bytes', 0) or 0) / 1e9:.2f}/"
+            f"{int(stats.get('weight_cache_budget_bytes', 0) or 0) / 1e9:.2f}GB",
+            flush=True,
+        )
+    execution_profile = result.get("execution_profile") or {}
+    hotspots = execution_profile.get("hotspots") or []
+    if hotspots:
+        compact = ", ".join(
+            f"{item.get('phase')} L{item.get('layer')}"
+            f"({item.get('layer_type')}):{float(item.get('total_s', 0.0)):.3f}s"
+            f"/{int(item.get('store_bytes_read', 0) or 0) / 1e6:.0f}MB"
+            for item in hotspots[:5])
+        print(
+            f"[server] execution-profile[{execution_profile.get('level')}]: "
+            f"{compact}",
+            flush=True,
+        )
 
 
 def _vision_protocol_timing(result: dict) -> dict:
-    """Stable protocol fields backed by generic vision ``path_stats``."""
+    """Stable protocol fields backed by generic request ``path_stats``."""
     stats = result.get("path_stats") or {}
 
     def metric(path_key: str, result_key: str | None = None, default=0):
@@ -4763,7 +5225,23 @@ def _vision_protocol_timing(result: dict) -> dict:
             return stats[path_key]
         return result.get(result_key or path_key, default)
 
-    return {
+    value = {
+        "true_peak_metal_bytes": int(
+            result.get("true_peak_metal_bytes", 0) or 0),
+        "kv_bytes": int(result.get("kv_bytes", 0) or 0),
+        "kv_positions": int(result.get("kv_positions", 0) or 0),
+        "execution_backend": str(metric(
+            "execution_backend", default="voom") or "voom"),
+        "execution_path": str(metric(
+            "execution_path", default="") or ""),
+        "prefill_step_size": int(metric(
+            "prefill_step_size", default=0) or 0),
+        "request_incremental_projection_bytes": int(metric(
+            "request_incremental_projection_bytes", default=0) or 0),
+        "request_system_available_bytes": int(metric(
+            "request_system_available_bytes", default=0) or 0),
+        "request_system_required_bytes": int(metric(
+            "request_system_required_bytes", default=0) or 0),
         "vision_cache_hits": int(metric("vision_cache_hits") or 0),
         "vision_cache_misses": int(metric("vision_cache_misses") or 0),
         "vision_prompt_cache_tower_skipped": int(metric(
@@ -4803,6 +5281,35 @@ def _vision_protocol_timing(result: dict) -> dict:
         "prompt_state_approximate": int(metric(
             "prompt_state_approximate") or 0),
     }
+    # These fields were added after the stable vision timing contract. Keep
+    # legacy/non-model helper calls byte-for-byte unchanged while exposing the
+    # counters on real results that actually carry request I/O/speculation
+    # telemetry.
+    optional_integer_fields = (
+        "weight_store_bytes_read",
+        "prefill_weight_store_bytes_read",
+        "decode_weight_store_bytes_read",
+        "weight_fast_tier_bytes",
+        "weight_archive_bytes",
+        "weight_cache_hits",
+        "weight_cache_misses",
+        "weight_cache_evictions",
+        "expert_cache_hits",
+        "expert_cache_misses",
+        "qwen_mtp_enabled",
+        "qwen_mtp_used",
+        "qwen_mtp_proposed",
+        "qwen_mtp_accepted",
+        "qwen_mtp_target_sweeps",
+        "qwen_mtp_decode_tokens",
+        "qwen_mtp_adaptive_disabled",
+        "qwen_mtp_plain_decode_sweeps",
+        "qwen_mtp_warmup_decode_sweeps",
+    )
+    for key in optional_integer_fields:
+        if key in stats or key in result:
+            value[key] = int(metric(key) or 0)
+    return value
 
 
 def _execution_profile_fields(engine) -> dict[str, str]:
@@ -4851,7 +5358,11 @@ def _execution_profile_fields(engine) -> dict[str, str]:
     fields = {
         "vmodel_checkpoint": model_dir.name or "unknown",
         "vmodel_weight_profile": weight_profile,
+        "vmodel_backend": str(getattr(engine, "backend_name", "voom")),
     }
+    resident_decision = getattr(engine, "_resident_backend_decision", None)
+    if resident_decision is not None:
+        fields["vmodel_backend_admission"] = str(resident_decision.reason)
     draft_dir = getattr(engine, "_speculative_draft_dir", None)
     if draft_dir is not None:
         kind = getattr(engine, "_speculative_kind", "autoregressive")
@@ -5289,7 +5800,8 @@ class Handler(BaseHTTPRequestHandler):
                 })
             if mode == "fast":
                 model_dir = _preferred_fast_artifact(model_dir)
-            engine = MANAGER.get(model_dir, mode)
+            engine = MANAGER.get(
+                model_dir, mode, requires_vision=bool(image_srcs))
 
             tools = effective_tools
             tool_selection = None
@@ -5705,6 +6217,7 @@ class Handler(BaseHTTPRequestHandler):
         gateway_expansion_limit = 4
         gateway_max_activated = 64
         gateway_search_results = 4
+        gateway_host_route = False
         gateway_virtual_tools = []
         gateway_virtual_raw = []
         if gateway_enabled:
@@ -5734,6 +6247,12 @@ class Handler(BaseHTTPRequestHandler):
                 raise RequestValidationError(
                     "VMODEL_FAST_TOOL_GATEWAY_SEARCH_RESULTS must be between "
                     "1 and min(16, VMODEL_FAST_TOOL_GATEWAY_LIMIT)")
+            gateway_host_route_value = os.environ.get(
+                "VMODEL_FAST_TOOL_GATEWAY_HOST_ROUTE", "1")
+            if gateway_host_route_value not in ("0", "1"):
+                raise RequestValidationError(
+                    "VMODEL_FAST_TOOL_GATEWAY_HOST_ROUTE must be 0 or 1")
+            gateway_host_route = gateway_host_route_value == "1"
             gateway_activation_key = _hidden_gateway_conversation_key(
                 model_id, all_tools, msgs)
             gateway_activated_names = _hidden_gateway_activation_get(
@@ -5854,6 +6373,7 @@ class Handler(BaseHTTPRequestHandler):
                     (result.get("path_stats") or {}).get(
                         "constraint_profile", result.get("constraint_profile", "none"))),
                 "vmodel_tool_selection": tool_selection,
+                "vmodel_execution_profile": result.get("execution_profile"),
                 **_execution_profile_fields(engine),
                 "vmodel_timing": {
                     "vision_seconds": round(float(result.get("vision_s", 0.0)), 4),
@@ -5882,53 +6402,94 @@ class Handler(BaseHTTPRequestHandler):
             nonlocal prompt, prompt_tokens, prompt_tools, selected_raw_tools
             nonlocal tool_selection
 
-            decision_stream = (
-                _HiddenDecisionStream(engine.cfg.model_type, on_token)
-                if on_token is not None else None
-            )
-            decision = _engine_generate(engine,
-                prompt, max_output_tokens, stop=stop,
-                on_token=(decision_stream.feed if decision_stream is not None else None),
-                on_progress=on_progress, sampling=self._sampling,
-                constraint=gateway_constraint)
-            decision_cache_phase = _cache_phase_telemetry(
-                "gateway_decision", decision)
-            decision_content, calls = _parse_request_tool_calls(
-                decision["text"], prompt_tools, engine.cfg.model_type,
-                allow_parallel=False)
-            gateway_call = next(
-                (call for call in calls
-                 if call["function"]["name"] in (
-                     _HIDDEN_TOOL_SEARCH_NAME, _HIDDEN_TOOL_ENABLE_NAME)),
-                None,
-            )
-            # A hidden catalog action is valid only at the first non-whitespace
-            # output.
-            # Once direct text was streamed, retracting it would violate SSE's
-            # append-only contract. Suppress only the late virtual call, while
-            # preserving any real caller tool marker for the ordinary parser.
-            late_gateway_suppressed = bool(
-                gateway_call is not None
-                and decision_stream is not None
-                and decision_stream.branch == "direct"
-            )
-            if late_gateway_suppressed:
-                visible_text, _hidden_calls = _parse_request_tool_calls(
-                    decision["text"], gateway_virtual_tools,
-                    engine.cfg.model_type,
+            from .toolcalls import (
+                semantic_tool_capability_query, semantic_tool_query)
+
+            host_query = semantic_tool_capability_query(msgs)
+            host_action = (
+                _hidden_gateway_host_action(
+                    gateway_force_reason,
+                    activated_tools=bool(gateway_initial_tools),
+                    semantic_query=host_query)
+                if gateway_host_route else None)
+
+            if host_action is not None:
+                decision_stream = None
+                decision_content = ""
+                late_gateway_suppressed = False
+                decision_branch = "host"
+                host_arguments = (
+                    {} if host_action == _HIDDEN_TOOL_ENABLE_NAME else {
+                        "query": host_query,
+                        "max_results": gateway_search_results,
+                    })
+                gateway_call = {"function": {
+                    "name": host_action,
+                    "arguments": json.dumps(
+                        host_arguments, ensure_ascii=False,
+                        separators=(",", ":")),
+                }}
+                decision = {
+                    "text": "", "tokens": (), "prompt_tokens": 0,
+                    "prefill_s": 0.0, "decode_s": 0.0,
+                    "first_token_s": 0.0, "total_s": 0.0,
+                    "path_stats": {
+                        "prompt_cache_namespace": "gateway_decision_host",
+                        "prompt_cache_source": "host",
+                    },
+                }
+                decision_cache_phase = _cache_phase_telemetry(
+                    "gateway_decision", decision)
+            else:
+                decision_stream = (
+                    _HiddenDecisionStream(engine.cfg.model_type, on_token)
+                    if on_token is not None else None
+                )
+                decision = _engine_generate(engine,
+                    prompt, max_output_tokens, stop=stop,
+                    on_token=(
+                        decision_stream.feed
+                        if decision_stream is not None else None),
+                    on_progress=on_progress, sampling=self._sampling,
+                    constraint=gateway_constraint)
+                decision_cache_phase = _cache_phase_telemetry(
+                    "gateway_decision", decision)
+                decision_content, calls = _parse_request_tool_calls(
+                    decision["text"], prompt_tools, engine.cfg.model_type,
                     allow_parallel=False)
-                decision["text"] = visible_text
-                decision_content, _visible_calls = _parse_request_tool_calls(
-                    visible_text, response_parse_tools, engine.cfg.model_type,
-                    allow_parallel=allow_parallel_tool_calls)
-                gateway_call = None
-            decision_branch = (
-                decision_stream.branch
-                if decision_stream is not None
-                else ("tool" if gateway_call is not None else "direct")
-            )
-            if decision_branch == "undecided":
-                decision_branch = "direct"
+                gateway_call = next(
+                    (call for call in calls
+                     if call["function"]["name"] in (
+                         _HIDDEN_TOOL_SEARCH_NAME, _HIDDEN_TOOL_ENABLE_NAME)),
+                    None,
+                )
+                # A hidden catalog action is valid only at the first
+                # non-whitespace output. Once direct text was streamed,
+                # retracting it would violate SSE's append-only contract.
+                late_gateway_suppressed = bool(
+                    gateway_call is not None
+                    and decision_stream is not None
+                    and decision_stream.branch == "direct"
+                )
+                if late_gateway_suppressed:
+                    visible_text, _hidden_calls = _parse_request_tool_calls(
+                        decision["text"], gateway_virtual_tools,
+                        engine.cfg.model_type,
+                        allow_parallel=False)
+                    decision["text"] = visible_text
+                    decision_content, _visible_calls = \
+                        _parse_request_tool_calls(
+                            visible_text, response_parse_tools,
+                            engine.cfg.model_type,
+                            allow_parallel=allow_parallel_tool_calls)
+                    gateway_call = None
+                decision_branch = (
+                    decision_stream.branch
+                    if decision_stream is not None
+                    else ("tool" if gateway_call is not None else "direct")
+                )
+                if decision_branch == "undecided":
+                    decision_branch = "direct"
             decision_meta = {
                 "requested": len(all_tools),
                 "selected": len(gateway_initial_tools),
@@ -5945,6 +6506,7 @@ class Handler(BaseHTTPRequestHandler):
                 "gateway_search_forced": int(gateway_force_reason is not None),
                 "gateway_force_reason": gateway_force_reason,
                 "gateway_decision_branch": decision_branch,
+                "gateway_host_routed": int(host_action is not None),
                 "gateway_direct_streaming": bool(
                     decision_stream is not None
                     and decision_stream.branch == "direct"),
@@ -5996,8 +6558,6 @@ class Handler(BaseHTTPRequestHandler):
                     # An initial/expired activation cannot be enabled. Preserve
                     # the model's action decision and perform a normal semantic
                     # lookup against the latest user intent.
-                    from .toolcalls import semantic_tool_query
-
                     query = semantic_tool_query(msgs)
                 if not query:
                     raise RuntimeError(
@@ -6019,34 +6579,8 @@ class Handler(BaseHTTPRequestHandler):
                     max_activated=gateway_max_activated)
             _hidden_gateway_activation_put(
                 gateway_activation_key, selected_tools)
-            call_id = f"vmodel_gateway_{uuid.uuid4().hex[:12]}"
-            gateway_call_arguments = (
-                {} if gateway_call_name == _HIDDEN_TOOL_ENABLE_NAME else
-                {"query": query, "max_results": routed_limit})
-            internal_messages = list(msgs) + [
-                {
-                    "role": "assistant", "content": "",
-                    "tool_calls": [{
-                        "id": call_id, "type": "function",
-                        "function": {
-                            "name": gateway_call_name,
-                            "arguments": json.dumps(
-                                gateway_call_arguments,
-                                ensure_ascii=False, separators=(",", ":")),
-                        },
-                    }],
-                },
-                {
-                    "role": "tool", "tool_call_id": call_id,
-                    "name": gateway_call_name,
-                    "content": json.dumps({
-                        "status": "enabled",
-                        "tools": [
-                            tool["function"]["name"] for tool in selected_tools
-                        ],
-                    }, ensure_ascii=False, separators=(",", ":")),
-                },
-            ]
+            internal_messages = _hidden_gateway_execution_messages(
+                msgs, selected_tools, gateway_activation_key)
             execution_messages = _prepend_system_content(
                 internal_messages, _HIDDEN_GATEWAY_REAL_TOOL_POLICY)
             abstain_tool, abstain_raw = _hidden_tool_abstain_pair()
@@ -6072,10 +6606,32 @@ class Handler(BaseHTTPRequestHandler):
             self._constraint = _configure_constraint(
                 engine, self._structured_output, prompt_tools, "required",
                 False)
-            result = _engine_generate(engine,
-                prompt, max_output_tokens, stop=stop,
-                on_progress=on_progress, sampling=self._sampling,
-                constraint=self._constraint)
+            pagination_call = (
+                _hidden_gateway_pagination_call(msgs, selected_tools)
+                if gateway_host_route
+                and gateway_force_reason == "tool-result-pagination"
+                else None)
+            if pagination_call is not None:
+                result = {
+                    "text": (
+                        "<tool_call>\n"
+                        + json.dumps(
+                            pagination_call, ensure_ascii=False,
+                            separators=(",", ":"))
+                        + "\n</tool_call>"),
+                    "tokens": (), "prompt_tokens": 0,
+                    "prefill_s": 0.0, "decode_s": 0.0,
+                    "first_token_s": 0.0, "total_s": 0.0,
+                    "path_stats": {
+                        "prompt_cache_namespace": "gateway_execution_host",
+                        "prompt_cache_source": "host",
+                    },
+                }
+            else:
+                result = _engine_generate(engine,
+                    prompt, max_output_tokens, stop=stop,
+                    on_progress=on_progress, sampling=self._sampling,
+                    constraint=self._constraint)
             execution_cache_phase = _cache_phase_telemetry(
                 "gateway_execution", result)
             _execution_content, execution_calls = _parse_request_tool_calls(
@@ -6137,6 +6693,8 @@ class Handler(BaseHTTPRequestHandler):
                 "gateway_real_tool_required": False,
                 "gateway_abstention_available": True,
                 "gateway_execution_outcome": execution_outcome,
+                "gateway_pagination_host_routed": int(
+                    pagination_call is not None),
                 "gateway_query_sha256": (
                     hashlib.sha256(query.encode("utf-8")).hexdigest()[:16]
                     if query else None),
@@ -6305,6 +6863,10 @@ class Handler(BaseHTTPRequestHandler):
                     done = int(progress.get("completed_images", 0))
                     total = int(progress.get("total_images", 0))
                     label = "vision"
+                elif progress.get("phase") == "prefill_layer":
+                    done = int(progress.get("completed_layers", 0))
+                    total = int(progress.get("total_layers", 0))
+                    label = "prefill_layer"
                 else:
                     done = int(progress.get("completed_tokens", 0))
                     total = int(progress.get("total_tokens", 0))
@@ -6317,6 +6879,7 @@ class Handler(BaseHTTPRequestHandler):
                         total=total,
                         fraction=(done / total if total else 0.0),
                         cache_source=progress.get("cache_source", "cold"),
+                        token_total=progress.get("total_tokens"),
                     )
                 else:
                     self.wfile.write(f": {label} {done}/{total}\n\n".encode())

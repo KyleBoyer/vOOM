@@ -258,6 +258,10 @@ def _gptoss_rope_state(cfg, *, packed: bool):
 class RuntimeConfig:
     max_weight_cache_mb: int = 6000
     mlx_cache_limit_mb: int = 1024
+    # Opt-in request-local attribution. "" disables it; "layers" records the
+    # runtime's existing materialization boundaries; "ops" adds diagnostic
+    # attention/router/MLP barriers for supported Qwen/Kimi/GLM hybrid blocks.
+    execution_profile: str = ""
     # Lowest cache budget the live governor may shrink to before refusing an
     # imminent allocation.  Long dense prompts can devote several GiB to exact
     # BF16 KV, so the historical global 1.5 GB floor needlessly made otherwise
@@ -408,6 +412,10 @@ class RuntimeConfig:
     # that test's A/B produced -- an isolated microbenchmark win is
     # deliberately NOT trusted on its own given the zmlx precedent.
     native_fused_deltanet_decode: bool = False
+    # Chunkwise WY DeltaNet prefill. Numerically close but not
+    # activation-identical across arbitrary checkpoint splits, so server.py
+    # admits it automatically only for fast/lossy Qwen3.5/3.6 routes.
+    qwen_chunked_delta_prefill: bool = False
     # F11: prompt-lookup (n-gram) speculative decoding, mutually exclusive
     # with qwen_mtp_speculative above for this first version (see
     # EngineManager.get()'s construction site in server.py). Zero-model --
@@ -525,6 +533,7 @@ class RuntimeConfig:
         return cls(
             max_weight_cache_mb=mem.get("max_weight_cache_mb", 6000),
             mlx_cache_limit_mb=mem.get("mlx_cache_limit_mb", 1024),
+            execution_profile=run.get("execution_profile", ""),
             min_weight_cache_mb=mem.get("min_weight_cache_mb", 1500),
             pin_embeddings=pinned.get("embeddings", True),
             pin_lm_head=pinned.get("lm_head", False),
@@ -709,6 +718,11 @@ class _HotPromptSlot:
 class StreamingEngine:
     def __init__(self, model_dir: str | Path, rc: RuntimeConfig | None = None):
         self.rc = rc or RuntimeConfig()
+        self.rc.execution_profile = str(
+            self.rc.execution_profile or "").strip().lower()
+        if self.rc.execution_profile not in telemetry.RequestProfiler.LEVELS:
+            raise ValueError(
+                "execution_profile must be '', 'layers', or 'ops'")
         if self.rc.mlx_cache_limit_mb <= 0:
             raise ValueError("mlx_cache_limit_mb must be positive")
         # MLX's buffer cache is NOT counted in our weight budget and can balloon
@@ -970,6 +984,10 @@ class StreamingEngine:
         self.cache = WeightCache(self.store, self.rc.max_weight_cache_mb * 1_000_000, transform, warm,
                                   max_fetch_batch=self.rc.expert_fetch_batch)
         self.timer = telemetry.Timer()
+        # Created afresh by generate(); never shared across requests. Keeping
+        # the disabled state as None makes ordinary inference pay only a single
+        # predictable branch at existing layer boundaries.
+        self._request_profiler: telemetry.RequestProfiler | None = None
         # F42: per-expert page byte estimate for pre-allocation reservations.
         # moe_intermediate_size when the config has it, else the dense size
         # (over-estimate = conservative); MXFP4 stores ~0.53 B/weight.
@@ -1625,6 +1643,21 @@ class StreamingEngine:
     def _layer_key(self, i: int) -> str:
         return f"layer.{i}"
 
+    def _profile_layer_type(self, i: int) -> str:
+        """Stable architecture label for profiler rows."""
+        if i < len(self.cfg.layer_types):
+            return str(self.cfg.layer_types[i])
+        if i in self.cfg.kda_layers:
+            return "kda"
+        if i in self.cfg.full_attn_layers:
+            return "full_attention"
+        if i < len(self.cfg.indexer_types):
+            return f"mla_{self.cfg.indexer_types[i]}"
+        if self.cfg.model_type in (
+                "glm_moe_dsa", "kimi_k25", "glm4_moe_lite"):
+            return "mla"
+        return "attention"
+
     def _layer_names(self, i: int) -> list[str]:
         """Names for the always-needed part of a layer. For MoE layers this is
         attention + norms + router — experts page separately, after routing."""
@@ -1869,7 +1902,13 @@ class StreamingEngine:
 
         t0 = time.perf_counter()
         pages = self.cache.get_many(items)
-        self.timer.add("expert_wait", time.perf_counter() - t0)
+        elapsed = time.perf_counter() - t0
+        self.timer.add("expert_wait", elapsed)
+        profiler = self._request_profiler
+        if profiler is not None:
+            profiler.record_expert_fetch(
+                layer, pages=len(expert_ids), misses=n_missing,
+                wall_s=elapsed)
         return {e: pages[f"layer.{layer}.expert.{e}"] for e in expert_ids}
 
     def _get_experts(self, layer: int, expert_ids: list[int],
@@ -2038,6 +2077,7 @@ class StreamingEngine:
         # tests/test_f62_hidden_taps.py for the tap-on/off identity proof.
         self._tap_hidden = {}
         position_count = int(x.shape[1])
+        profiler = self._request_profiler
         # Never charge one-position decode for a multi-position prefill
         # high-water, or a smaller retry chunk for a larger prefill's
         # high-water.  The first layer of each exact position-count class
@@ -2057,6 +2097,10 @@ class StreamingEngine:
         n = self.cfg.num_hidden_layers
         moe = bool(self.cfg.num_experts)
         if self._resident_moe_layers is not None and tap_layers is None:
+            if profiler is not None:
+                profiler.begin_sweep(
+                    position_count, path="resident_moe_stack")
+                stack_t0 = time.perf_counter()
             self._resident_moe_sweeps += 1
             for i, (weights, fused_experts) in enumerate(self._resident_moe_layers):
                 last_only = (
@@ -2076,6 +2120,11 @@ class StreamingEngine:
                     fused_swiglu=self.rc.fused_swiglu,
                     mlx_router_semantics=True,
                 )
+            if profiler is not None:
+                mx.eval(x)
+                profiler.record_stack(
+                    positions=position_count, path="resident_moe_stack",
+                    wall_s=time.perf_counter() - stack_t0)
             return x
         fast_layers = self._resident_fast_layers
         if (fast_layers is not None
@@ -2127,6 +2176,10 @@ class StreamingEngine:
                 self._resident_fast_decode_sweeps += 1
             else:
                 self._resident_fast_prefill_sweeps += 1
+            if profiler is not None:
+                profiler.begin_sweep(
+                    position_count, path="resident_fast_stack")
+                stack_t0 = time.perf_counter()
             if self.cfg.model_type == "qwen3_5":
                 # 2026-07-23: hybrid resident fast decode. Two things at
                 # once: (1) the unconditional run_block below was a latent
@@ -2150,6 +2203,8 @@ class StreamingEngine:
                         iter_expert_batches=self._iter_expert_batches,
                         zmlx_fused_decode=self.rc.zmlx_fused_deltanet_decode,
                         native_fused_decode=self.rc.native_fused_deltanet_decode,
+                        chunked_delta_prefill=(
+                            self.rc.qwen_chunked_delta_prefill),
                         defer_state_eval=True,
                     )
                 kda = getattr(kv, "kda_cache", None)
@@ -2162,6 +2217,12 @@ class StreamingEngine:
                         for value in history if value is not None)
                     if pending_state:
                         mx.eval(*pending_state)
+                if profiler is not None and profiler.sync_substeps:
+                    mx.eval(x)
+                    profiler.record_stack(
+                        positions=position_count,
+                        path="resident_fast_stack",
+                        wall_s=time.perf_counter() - stack_t0)
                 return x
             for i, w in enumerate(fast_layers):
                 last_only = (
@@ -2172,7 +2233,14 @@ class StreamingEngine:
                     rope_freqs=self._rope_freqs, rope_mscale=self._mscale,
                     fused_swiglu=self.rc.fused_swiglu,
                 )
+            if profiler is not None and profiler.sync_substeps:
+                mx.eval(x)
+                profiler.record_stack(
+                    positions=position_count, path="resident_fast_stack",
+                    wall_s=time.perf_counter() - stack_t0)
             return x
+        if profiler is not None:
+            profiler.begin_sweep(position_count, path="streamed")
         for i in range(n):
             # F36: on the last layer of a prefill whose only consumer is the last
             # position's logits, MLP outputs for earlier positions are dead —
@@ -2182,6 +2250,9 @@ class StreamingEngine:
                 for j in range(i + 1, min(i + 1 + self.rc.prefetch_depth, n)):
                     self.prefetcher.schedule(self._layer_key(j), self._layer_names(j))
 
+            cache_before = (
+                profiler.cache_snapshot(self.cache)
+                if profiler is not None else None)
             t0 = time.perf_counter()
             layer_key = self._layer_key(i)
             layer_names = self._layer_names(i)
@@ -2192,7 +2263,8 @@ class StreamingEngine:
                     if self.governor is not None:
                         self.governor.reserve(incoming_page)
             w = self.cache.get(layer_key, layer_names)
-            self.timer.add("weights_wait", time.perf_counter() - t0)
+            weight_wait_s = time.perf_counter() - t0
+            self.timer.add("weights_wait", weight_wait_s)
 
             # 2026-07-13: F42's proactive reserve() was only ever called from
             # _get_experts (MoE expert fetch) and the per-token decode boundary
@@ -2238,6 +2310,7 @@ class StreamingEngine:
                     x, w, f"model.layers.{i}", self.cfg, kv, i, offset, self._get_experts,
                     mlp_last_only=last_only,
                     iter_expert_batches=self._iter_expert_batches,
+                    profile=profiler,
                 )
             elif self.cfg.model_type == "kimi_linear":
                 from .kimi_linear import run_kimi_linear_block
@@ -2247,6 +2320,7 @@ class StreamingEngine:
                     mlp_last_only=last_only,
                     iter_expert_batches=self._iter_expert_batches,
                     native_fused_decode=self.rc.native_fused_deltanet_decode,
+                    profile=profiler,
                 )
             elif self.cfg.model_type in ("qwen3_5_moe", "qwen3_5"):
                 from .qwen35 import run_qwen35_block
@@ -2257,6 +2331,9 @@ class StreamingEngine:
                     iter_expert_batches=self._iter_expert_batches,
                     zmlx_fused_decode=self.rc.zmlx_fused_deltanet_decode,
                     native_fused_decode=self.rc.native_fused_deltanet_decode,
+                    chunked_delta_prefill=(
+                        self.rc.qwen_chunked_delta_prefill),
+                    profile=profiler,
                 )
             elif self.cfg.model_type == "jet_nemotron":
                 from .jet_nemotron import run_jet_nemotron_block
@@ -2301,7 +2378,16 @@ class StreamingEngine:
                     self._layer_transient)
                 self._prefill_layer_transient = max(by_positions.values())
             self._note_true_peak()
-            self.timer.add("layer_compute", time.perf_counter() - t0)
+            compute_s = time.perf_counter() - t0
+            self.timer.add("layer_compute", compute_s)
+            if profiler is not None:
+                profiler.record_layer(
+                    i, positions=position_count,
+                    weight_wait_s=weight_wait_s, compute_s=compute_s,
+                    cache_before=cache_before,
+                    cache_after=profiler.cache_snapshot(self.cache),
+                    layer_type=self._profile_layer_type(i),
+                )
             if tap_layers is not None and i in tap_layers:
                 self._tap_hidden[i] = x  # read-only capture; x itself is untouched
             if (self.rc.router_lookahead and moe and self.prefetcher
@@ -2314,7 +2400,7 @@ class StreamingEngine:
 
     def _layer_stationary_qwen35_sweep(
             self, x: mx.array, kv: KVCache, offset: int,
-            tile_width: int) -> mx.array:
+            tile_width: int, on_progress=None) -> mx.array:
         """F94 live path: layer-major (not chunk-major) prefill for qwen3_5/
         qwen3_5_moe (Qwen3.5-4B/9B, Qwen3.6-27B hybrid DeltaNet/full-attention
         layers). Fetches each layer's weights exactly once for the WHOLE
@@ -2376,11 +2462,17 @@ class StreamingEngine:
                  self, "_prefill_layer_transient_by_positions", {}
              ).get(total, 0),
              getattr(self, "_decode_layer_transient", 0))
+        profiler = self._request_profiler
+        if profiler is not None:
+            profiler.begin_sweep(total, path="layer_stationary_qwen35")
         for i in range(n):
             if self.prefetcher:
                 for j in range(i + 1, min(i + 1 + self.rc.prefetch_depth, n)):
                     self.prefetcher.schedule(self._layer_key(j), self._layer_names(j))
 
+            cache_before = (
+                profiler.cache_snapshot(self.cache)
+                if profiler is not None else None)
             t0 = time.perf_counter()
             layer_key = self._layer_key(i)
             layer_names = self._layer_names(i)
@@ -2391,7 +2483,8 @@ class StreamingEngine:
                     if self.governor is not None:
                         self.governor.reserve(incoming_page)
             w = self.cache.get(layer_key, layer_names)
-            self.timer.add("weights_wait", time.perf_counter() - t0)
+            weight_wait_s = time.perf_counter() - t0
+            self.timer.add("weights_wait", weight_wait_s)
 
             active_before = mx.get_active_memory()
             mx.reset_peak_memory()
@@ -2409,21 +2502,52 @@ class StreamingEngine:
                         self._layer_transient,
                         margin=self._layer_transient_margin)
                 xt = x[:, pos:end, :]
+                attention_t0 = time.perf_counter()
                 yt = _qwen35_attention_residual(
                     xt, w, f"model.layers.{i}", self.cfg, kv, i,
                     offset + pos, mlp_last_only=False,
                     zmlx_fused_decode=self.rc.zmlx_fused_deltanet_decode,
                     native_fused_decode=self.rc.native_fused_deltanet_decode,
+                    chunked_delta_prefill=(
+                        self.rc.qwen_chunked_delta_prefill),
                 )
                 mx.eval(yt)
+                if profiler is not None and profiler.sync_substeps:
+                    profiler.record_substep(
+                        "attention", i,
+                        time.perf_counter() - attention_t0,
+                        positions=end - pos)
                 tiles.append(yt)
                 pos = end
             x_after_attn = tiles[0] if len(tiles) == 1 else mx.concatenate(tiles, axis=1)
+            mlp_t0 = time.perf_counter()
             x = _qwen35_mlp_residual(
                 x_after_attn, w, f"model.layers.{i}", self.cfg, i,
-                self._get_experts, iter_expert_batches=self._iter_expert_batches)
+                self._get_experts,
+                iter_expert_batches=self._iter_expert_batches,
+                profile=profiler)
             mx.eval(x)
-            self.timer.add("layer_compute", time.perf_counter() - t0)
+            if profiler is not None and profiler.sync_substeps:
+                profiler.record_substep(
+                    "mlp", i, time.perf_counter() - mlp_t0,
+                    positions=total)
+            compute_s = time.perf_counter() - t0
+            self.timer.add("layer_compute", compute_s)
+            if profiler is not None:
+                profiler.record_layer(
+                    i, positions=total, weight_wait_s=weight_wait_s,
+                    compute_s=compute_s, cache_before=cache_before,
+                    cache_after=profiler.cache_snapshot(self.cache),
+                    layer_type=self._profile_layer_type(i),
+                )
+            if on_progress is not None:
+                on_progress({
+                    "phase": "prefill_layer",
+                    "completed_layers": i + 1,
+                    "total_layers": n,
+                    "total_tokens": total,
+                    "cache_source": "cold",
+                })
             self._layer_transient = max(
                 self._layer_transient,
                 _resident_adjusted_transient(
@@ -2437,7 +2561,8 @@ class StreamingEngine:
         return x
 
     def _layer_stationary_glm_sweep(
-            self, x: mx.array, kv, offset: int, tile_width: int) -> mx.array:
+            self, x: mx.array, kv, offset: int, tile_width: int,
+            on_progress=None) -> mx.array:
         """F35 extension (2026-07-25): layer-major prefill for GLM-5.2/K2.5/
         glm4_moe_lite (real q_lora MLA + noaux_tc MoE, run_glm_block's
         shape) -- the same technique `_layer_stationary_kimi_linear_sweep`
@@ -2470,11 +2595,17 @@ class StreamingEngine:
                  self, "_prefill_layer_transient_by_positions", {}
              ).get(total, 0),
              getattr(self, "_decode_layer_transient", 0))
+        profiler = self._request_profiler
+        if profiler is not None:
+            profiler.begin_sweep(total, path="layer_stationary_glm")
         for i in range(n):
             if self.prefetcher:
                 for j in range(i + 1, min(i + 1 + self.rc.prefetch_depth, n)):
                     self.prefetcher.schedule(self._layer_key(j), self._layer_names(j))
 
+            cache_before = (
+                profiler.cache_snapshot(self.cache)
+                if profiler is not None else None)
             t0 = time.perf_counter()
             layer_key = self._layer_key(i)
             layer_names = self._layer_names(i)
@@ -2485,7 +2616,8 @@ class StreamingEngine:
                     if self.governor is not None:
                         self.governor.reserve(incoming_page)
             w = self.cache.get(layer_key, layer_names)
-            self.timer.add("weights_wait", time.perf_counter() - t0)
+            weight_wait_s = time.perf_counter() - t0
+            self.timer.add("weights_wait", weight_wait_s)
 
             active_before = mx.get_active_memory()
             mx.reset_peak_memory()
@@ -2499,18 +2631,47 @@ class StreamingEngine:
                         self._layer_transient,
                         margin=self._layer_transient_margin)
                 xt = x[:, pos:end, :]
+                attention_t0 = time.perf_counter()
                 yt = _glm_attention_residual(
                     xt, w, f"model.layers.{i}", self.cfg, kv, i, offset + pos,
                     mlp_last_only=False)
                 mx.eval(yt)
+                if profiler is not None and profiler.sync_substeps:
+                    profiler.record_substep(
+                        "attention", i,
+                        time.perf_counter() - attention_t0,
+                        positions=end - pos)
                 tiles.append(yt)
                 pos = end
             x_after_attn = tiles[0] if len(tiles) == 1 else mx.concatenate(tiles, axis=1)
+            mlp_t0 = time.perf_counter()
             x = _glm_mlp_residual(
                 x_after_attn, w, f"model.layers.{i}", self.cfg, i,
-                self._get_experts, iter_expert_batches=self._iter_expert_batches)
+                self._get_experts,
+                iter_expert_batches=self._iter_expert_batches,
+                profile=profiler)
             mx.eval(x)
-            self.timer.add("layer_compute", time.perf_counter() - t0)
+            if profiler is not None and profiler.sync_substeps:
+                profiler.record_substep(
+                    "mlp", i, time.perf_counter() - mlp_t0,
+                    positions=total)
+            compute_s = time.perf_counter() - t0
+            self.timer.add("layer_compute", compute_s)
+            if profiler is not None:
+                profiler.record_layer(
+                    i, positions=total, weight_wait_s=weight_wait_s,
+                    compute_s=compute_s, cache_before=cache_before,
+                    cache_after=profiler.cache_snapshot(self.cache),
+                    layer_type=self._profile_layer_type(i),
+                )
+            if on_progress is not None:
+                on_progress({
+                    "phase": "prefill_layer",
+                    "completed_layers": i + 1,
+                    "total_layers": n,
+                    "total_tokens": total,
+                    "cache_source": "cold",
+                })
             self._layer_transient = max(
                 self._layer_transient,
                 _resident_adjusted_transient(
@@ -2524,7 +2685,8 @@ class StreamingEngine:
         return x
 
     def _layer_stationary_kimi_linear_sweep(
-            self, x: mx.array, kv, offset: int, tile_width: int) -> mx.array:
+            self, x: mx.array, kv, offset: int, tile_width: int,
+            on_progress=None) -> mx.array:
         """F35-prep (2026-07-24): layer-major prefill for Kimi Linear, the
         MoE analogue of F94's dense-only `_layer_stationary_qwen35_sweep`.
 
@@ -2578,11 +2740,17 @@ class StreamingEngine:
                  self, "_prefill_layer_transient_by_positions", {}
              ).get(total, 0),
              getattr(self, "_decode_layer_transient", 0))
+        profiler = self._request_profiler
+        if profiler is not None:
+            profiler.begin_sweep(total, path="layer_stationary_kimi_linear")
         for i in range(n):
             if self.prefetcher:
                 for j in range(i + 1, min(i + 1 + self.rc.prefetch_depth, n)):
                     self.prefetcher.schedule(self._layer_key(j), self._layer_names(j))
 
+            cache_before = (
+                profiler.cache_snapshot(self.cache)
+                if profiler is not None else None)
             t0 = time.perf_counter()
             layer_key = self._layer_key(i)
             layer_names = self._layer_names(i)
@@ -2593,7 +2761,8 @@ class StreamingEngine:
                     if self.governor is not None:
                         self.governor.reserve(incoming_page)
             w = self.cache.get(layer_key, layer_names)
-            self.timer.add("weights_wait", time.perf_counter() - t0)
+            weight_wait_s = time.perf_counter() - t0
+            self.timer.add("weights_wait", weight_wait_s)
 
             active_before = mx.get_active_memory()
             mx.reset_peak_memory()
@@ -2607,19 +2776,48 @@ class StreamingEngine:
                         self._layer_transient,
                         margin=self._layer_transient_margin)
                 xt = x[:, pos:end, :]
+                attention_t0 = time.perf_counter()
                 yt = _kimi_linear_attention_residual(
                     xt, w, f"model.layers.{i}", self.cfg, kv, i, offset + pos,
                     mlp_last_only=False,
                     native_fused_decode=self.rc.native_fused_deltanet_decode)
                 mx.eval(yt)
+                if profiler is not None and profiler.sync_substeps:
+                    profiler.record_substep(
+                        "attention", i,
+                        time.perf_counter() - attention_t0,
+                        positions=end - pos)
                 tiles.append(yt)
                 pos = end
             x_after_attn = tiles[0] if len(tiles) == 1 else mx.concatenate(tiles, axis=1)
+            mlp_t0 = time.perf_counter()
             x = _kimi_linear_mlp_residual(
                 x_after_attn, w, f"model.layers.{i}", self.cfg, i,
-                self._get_experts, iter_expert_batches=self._iter_expert_batches)
+                self._get_experts,
+                iter_expert_batches=self._iter_expert_batches,
+                profile=profiler)
             mx.eval(x)
-            self.timer.add("layer_compute", time.perf_counter() - t0)
+            if profiler is not None and profiler.sync_substeps:
+                profiler.record_substep(
+                    "mlp", i, time.perf_counter() - mlp_t0,
+                    positions=total)
+            compute_s = time.perf_counter() - t0
+            self.timer.add("layer_compute", compute_s)
+            if profiler is not None:
+                profiler.record_layer(
+                    i, positions=total, weight_wait_s=weight_wait_s,
+                    compute_s=compute_s, cache_before=cache_before,
+                    cache_after=profiler.cache_snapshot(self.cache),
+                    layer_type=self._profile_layer_type(i),
+                )
+            if on_progress is not None:
+                on_progress({
+                    "phase": "prefill_layer",
+                    "completed_layers": i + 1,
+                    "total_layers": n,
+                    "total_tokens": total,
+                    "cache_source": "cold",
+                })
             self._layer_transient = max(
                 self._layer_transient,
                 _resident_adjusted_transient(
@@ -2775,7 +2973,9 @@ class StreamingEngine:
                     prefix = f"model.layers.{layer}"
                     attn_out = _qwen35_attention_residual(
                         hidden, weights, prefix, self.cfg, kv, layer,
-                        offset + position)
+                        offset + position,
+                        chunked_delta_prefill=(
+                            self.rc.qwen_chunked_delta_prefill))
                     hidden = _qwen35_mlp_residual(
                         attn_out, weights, prefix, self.cfg, layer,
                         self._get_experts,
@@ -2966,6 +3166,11 @@ class StreamingEngine:
         is never passed to `on_token` (streaming clients never see past the
         stop point)."""
         request_t0 = time.perf_counter()
+        self._request_profiler = (
+            telemetry.RequestProfiler(self.rc.execution_profile)
+            if self.rc.execution_profile else None)
+        if self._request_profiler is not None:
+            self._request_profiler.set_phase("prefill")
         sampling = sampling or SamplingParams()
         sampling.seed_rng()
         stop = stop or []
@@ -3819,13 +4024,72 @@ class StreamingEngine:
                     boundary_chunk = max(1, int(self.rc.prefill_chunk_size or (
                         stable_boundary - pos)))
                     bpos = pos
-                    while bpos < stable_boundary:
-                        bend = min(bpos + boundary_chunk, stable_boundary)
-                        bx = self._embed(list(tokens[bpos:bend]))
-                        bx = self._sweep(
-                            bx, kv, offset=bpos,
-                            final_mlp_last_only=self.rc.final_dead_token_elim)
-                        bpos = bend
+                    # F121: this boundary used to bypass F94/F35 completely.
+                    # On a first agent turn it is usually almost the whole
+                    # system+tool prompt, so the later layer-stationary branch
+                    # saw only the tiny generation scaffold and truthfully
+                    # reported itself eligible without ever running. That
+                    # reintroduced chunk-major expert routing/refetch for the
+                    # exact long-tool workload layer-stationary prefill was
+                    # built to fix. Apply the same already-oracle-gated sweep
+                    # to the boundary range when its ordinary eligibility
+                    # conditions hold; the resulting endpoint state is the
+                    # same state forked below.
+                    boundary_layer_stationary = (
+                        self.rc.layer_stationary_prefill
+                        and self.cfg.model_type in (
+                            "qwen3_5", "qwen3_5_moe", "kimi_linear",
+                            "glm_moe_dsa", "kimi_k25", "glm4_moe_lite")
+                        and not self.rc.adaptive_chunk_size
+                        and not (
+                            self.rc.prefill_checkpoint_every
+                            and kv_store is not None)
+                        and not force_adaptive_paged
+                    )
+                    if self._request_profiler is not None:
+                        self._request_profiler.note(
+                            "hot_boundary layer_stationary "
+                            f"eligible={int(boundary_layer_stationary)} "
+                            f"positions={stable_boundary - pos}")
+                    if boundary_layer_stationary:
+                        bx = self._embed(list(tokens[pos:stable_boundary]))
+                        if self.cfg.model_type == "kimi_linear":
+                            bx = self._layer_stationary_kimi_linear_sweep(
+                                bx, kv, offset=pos,
+                                tile_width=boundary_chunk,
+                                on_progress=on_progress)
+                        elif self.cfg.model_type in (
+                                "glm_moe_dsa", "kimi_k25", "glm4_moe_lite"):
+                            bx = self._layer_stationary_glm_sweep(
+                                bx, kv, offset=pos,
+                                tile_width=boundary_chunk,
+                                on_progress=on_progress)
+                        else:
+                            bx = self._layer_stationary_qwen35_sweep(
+                                bx, kv, offset=pos,
+                                tile_width=boundary_chunk,
+                                on_progress=on_progress)
+                        del bx
+                        bpos = stable_boundary
+                        path_stats["hot_prompt_boundary_layer_stationary"] = 1
+                    else:
+                        while bpos < stable_boundary:
+                            bend = min(bpos + boundary_chunk, stable_boundary)
+                            bx = self._embed(list(tokens[bpos:bend]))
+                            bx = self._sweep(
+                                bx, kv, offset=bpos,
+                                final_mlp_last_only=self.rc.final_dead_token_elim)
+                            bpos = bend
+                            if on_progress is not None:
+                                on_progress({
+                                    "phase": "prefill",
+                                    "completed_tokens": bpos,
+                                    "total_tokens": len(tokens),
+                                    "cache_source": path_stats[
+                                        "prompt_cache_source"],
+                                })
+                    path_stats["hot_prompt_boundary_prefill_chunks"] = (
+                        -(-(stable_boundary - pos) // boundary_chunk))
                     boundary_fork_kv = fork_hybrid_kv_endpoint(kv)
                     boundary_fork_tokens = stable_boundary
                     pos = stable_boundary
@@ -3883,6 +4147,28 @@ class StreamingEngine:
                 and not (ckpt and kv_store is not None)
                 and not force_adaptive_paged
             )
+            if self._request_profiler is not None:
+                blockers = []
+                if not chunk:
+                    blockers.append("no_chunk")
+                if not self.rc.layer_stationary_prefill:
+                    blockers.append("disabled")
+                if self.cfg.model_type not in (
+                        "qwen3_5", "qwen3_5_moe", "kimi_linear",
+                        "glm_moe_dsa", "kimi_k25", "glm4_moe_lite"):
+                    blockers.append("architecture")
+                if adaptive is not None:
+                    blockers.append("adaptive_chunk")
+                if ckpt and kv_store is not None:
+                    blockers.append("checkpoint_store")
+                if force_adaptive_paged:
+                    blockers.append("paged_kv")
+                self._request_profiler.note(
+                    "layer_stationary "
+                    f"configured={int(self.rc.layer_stationary_prefill)} "
+                    f"eligible={int(layer_stationary_eligible)} "
+                    f"chunk={int(chunk or 0)} "
+                    f"blockers={','.join(blockers) if blockers else 'none'}")
             if layer_stationary_eligible:
                 prefill_limit = (
                     len(tokens) - 1
@@ -3918,14 +4204,17 @@ class StreamingEngine:
                     xc = self._embed(list(tokens[pos:stop_before]))
                     if self.cfg.model_type == "kimi_linear":
                         xc = self._layer_stationary_kimi_linear_sweep(
-                            xc, kv, offset=pos, tile_width=chunk)
+                            xc, kv, offset=pos, tile_width=chunk,
+                            on_progress=on_progress)
                     elif self.cfg.model_type in (
                             "glm_moe_dsa", "kimi_k25", "glm4_moe_lite"):
                         xc = self._layer_stationary_glm_sweep(
-                            xc, kv, offset=pos, tile_width=chunk)
+                            xc, kv, offset=pos, tile_width=chunk,
+                            on_progress=on_progress)
                     else:
                         xc = self._layer_stationary_qwen35_sweep(
-                            xc, kv, offset=pos, tile_width=chunk)
+                            xc, kv, offset=pos, tile_width=chunk,
+                            on_progress=on_progress)
                     del xc
                     if self.rc.max_kv_mb or force_adaptive_paged:
                         mx.clear_cache()
@@ -4096,6 +4385,8 @@ class StreamingEngine:
         prefill_cache_after = _cache_io_snapshot(self)
         prefill_s = (time.perf_counter() - t0
                      + path_stats["tool_pic_prefill_s"])
+        if self._request_profiler is not None:
+            self._request_profiler.set_phase("decode")
         if (kv_store is not None and exact_logits is None
                 and precomputed_prompt_logits is None and matched < len(tokens)):
             write_t0 = time.perf_counter()
@@ -4624,13 +4915,17 @@ class StreamingEngine:
         _record_cache_io_delta(
             self, prefill_cache_after, path_stats, prefix="decode_",
             after=request_cache_after)
+        total_s = time.perf_counter() - request_t0
+        execution_profile = (
+            self._request_profiler.result(total_s)
+            if self._request_profiler is not None else None)
         result = {
             "text": final_text,
             "tokens": generated,
             "prefill_s": prefill_s,
             "decode_s": sum(tok_times),
             "first_token_s": first_token_s,
-            "total_s": time.perf_counter() - request_t0,
+            "total_s": total_s,
             "tok_per_s": len(tok_times) / sum(tok_times) if tok_times else 0.0,
             "kv_bytes": kv.nbytes(),
             "kv_positions": kv.offset,
@@ -4643,6 +4938,8 @@ class StreamingEngine:
             # already computed above, so exposing it costs no second tokenize.
             "prompt_tokens": len(tokens),
         }
+        if execution_profile is not None:
+            result["execution_profile"] = execution_profile
         if ((self.rc.release_paged_kv_after_generate and self.rc.max_kv_mb)
                 or force_adaptive_paged):
             self.last_kv = None
