@@ -332,7 +332,8 @@ The lossy 35B path defaults to a 5.0 GB evictable weight-cache budget. On the
 real 134-tool captured request, 5.0 GB completed at 7.24 GB peak Metal, while
 5.5 GB crossed the macOS paging cliff and failed; the lossless profile retains
 its previous 7.0 GB default. `VMODEL_QWEN35_WEIGHT_CACHE_MB` remains the
-explicit operator override.
+explicit operator override. The ranked post-sub-30 research and implementation
+queue is in [`docs/qwen36_next_optimizations.md`](docs/qwen36_next_optimizations.md).
 
 To reproduce the derived checkpoint and its packed archive:
 
