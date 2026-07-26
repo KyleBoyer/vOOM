@@ -654,20 +654,22 @@ class RuntimeConfig:
 
 
 def _apply_runtime_expert_top_k(rc: RuntimeConfig, cfg) -> None:
-    """Validate and copy the runtime-only OLMoE routing schedule."""
+    """Validate and copy an explicitly lossy runtime routing schedule."""
     raw_schedule = rc.expert_top_k_by_layer
     if not isinstance(raw_schedule, (list, tuple)):
         raise ValueError(
             "expert_top_k_by_layer must be a list or tuple of integers")
-    if raw_schedule and cfg.model_type != "olmoe":
+    supported = cfg.model_type in ("olmoe", "qwen3_5_moe")
+    if raw_schedule and not supported:
         raise ValueError(
-            "expert_top_k_by_layer is supported only for OLMoE checkpoints")
+            "expert_top_k_by_layer is supported only for OLMoE and "
+            "Qwen3.5/3.6 MoE checkpoints")
     schedule = (
         validate_expert_top_k_by_layer(cfg, raw_schedule)
-        if cfg.model_type == "olmoe" else ()
+        if supported else ()
     )
     rc.expert_top_k_by_layer = schedule
-    if cfg.model_type == "olmoe":
+    if supported:
         cfg.expert_top_k_by_layer = schedule
 
 

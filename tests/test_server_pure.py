@@ -23,8 +23,11 @@ from runtime.server import (Handler, INFER_LOCK, PreparedPrompt, RequestValidati
                             _hidden_gateway_activation_get,
                             _hidden_gateway_activation_put,
                             _hidden_gateway_conversation_key,
+                            _hidden_gateway_execution_context,
+                            _hidden_gateway_execution_context_policy,
                             _hidden_gateway_execution_messages,
                             _hidden_gateway_host_action,
+                            _hidden_gateway_initial_pagination_defaults,
                             _hidden_gateway_pagination_call,
                             _HiddenDecisionStream,
                             _hidden_gateway_decision_choice,
@@ -960,6 +963,70 @@ def test_hidden_gateway_execution_activation_changes_with_catalog():
         "plex_list", "plex_search"]
 
 
+def test_hidden_gateway_task_context_keeps_task_history_and_reports_omission():
+    messages = [
+        {"role": "system", "content": "global harness policy"},
+        {"role": "developer", "content": "global developer policy"},
+        {"role": "user", "content": "list Plex media and paginate"},
+        {"role": "assistant", "content": "", "tool_calls": []},
+        {"role": "tool", "content": "{\"movieHasMore\":true}"},
+    ]
+    full, full_omitted = _hidden_gateway_execution_context(messages, "full")
+    assert full == messages
+    assert full is not messages
+    assert full_omitted == 0
+
+    task, task_omitted = _hidden_gateway_execution_context(messages, "task")
+    assert [message["role"] for message in task] == [
+        "user", "assistant", "tool"]
+    assert task_omitted == len(
+        "global harness policyglobal developer policy")
+    try:
+        _hidden_gateway_execution_context(messages, "unknown")
+    except ValueError as error:
+        assert "full" in str(error) and "task" in str(error)
+    else:
+        raise AssertionError("an unknown execution context was accepted")
+
+
+def test_hidden_gateway_task_context_auto_is_narrow_and_read_only():
+    messages = [
+        {"role": "system", "content": "x" * 5000},
+        {"role": "user", "content": "list Plex media and paginate"},
+    ]
+    read_tool = _named_tool("plugin__plex__plex_list_library_media")
+    assert _hidden_gateway_execution_context_policy(
+        "auto", messages=messages, selected_tools=[read_tool],
+        mode="fast", model_type="qwen3_5_moe", host_route=True,
+        force_reason="external-action-imperative",
+    ) == ("task", "auto-read-only-large-system")
+
+    mutating = _named_tool("plugin__mail__mail_delete_message")
+    assert _hidden_gateway_execution_context_policy(
+        "auto", messages=messages, selected_tools=[mutating],
+        mode="fast", model_type="qwen3_5_moe", host_route=True,
+        force_reason="external-action-imperative",
+    )[0] == "full"
+    mixed = _named_tool("plugin__mail__mail_get_and_delete_message")
+    assert _hidden_gateway_execution_context_policy(
+        "auto", messages=messages, selected_tools=[mixed],
+        mode="fast", model_type="qwen3_5_moe", host_route=True,
+        force_reason="external-action-imperative",
+    )[0] == "full"
+    assert _hidden_gateway_execution_context_policy(
+        "auto", messages=[
+            *messages, {"role": "developer", "content": "keep me"}],
+        selected_tools=[read_tool], mode="fast",
+        model_type="qwen3_5_moe", host_route=True,
+        force_reason="external-action-imperative",
+    )[0] == "full"
+    assert _hidden_gateway_execution_context_policy(
+        "auto", messages=messages, selected_tools=[read_tool],
+        mode="lossless", model_type="qwen3_5_moe", host_route=True,
+        force_reason="external-action-imperative",
+    )[0] == "full"
+
+
 def test_qwen_chunked_delta_auto_is_lossy_only_and_overridable():
     assert _qwen_chunked_delta_policy(
         "auto", mode="fast", model_type="qwen3_5_moe",
@@ -1105,6 +1172,44 @@ def test_hidden_gateway_host_pagination_advances_offset_from_schema_defaults():
         "name": "plugin__plex__plex_list_library_media",
         "arguments": {"query": "kids", "limit": 100, "offset": 100},
     }
+
+
+def test_hidden_gateway_initial_pagination_defaults_preserve_model_arguments():
+    tool = _named_tool("plugin__plex__plex_list_library_media")
+    tool["function"]["parameters"] = {
+        "type": "object",
+        "properties": {
+            "limit": {"type": "integer", "default": 100},
+            "offset": {"anyOf": [
+                {"type": "integer", "default": 0}, {"type": "null"}]},
+            "query": {"type": "string"},
+        },
+    }
+    messages = [{
+        "role": "user",
+        "content": "Pull the full list from Plex and make sure to paginate.",
+    }]
+    empty_call = {"function": {
+        "name": "plugin__plex__plex_list_library_media",
+        "arguments": "{}",
+    }}
+    assert _hidden_gateway_initial_pagination_defaults(
+        messages, [tool], empty_call) == {
+            "name": "plugin__plex__plex_list_library_media",
+            "arguments": {"limit": 100, "offset": 0},
+        }
+    authored_call = {"function": {
+        "name": "plugin__plex__plex_list_library_media",
+        "arguments": "{\"limit\":500}",
+    }}
+    assert _hidden_gateway_initial_pagination_defaults(
+        messages, [tool], authored_call) == {
+            "name": "plugin__plex__plex_list_library_media",
+            "arguments": {"limit": 500, "offset": 0},
+        }
+    assert _hidden_gateway_initial_pagination_defaults(
+        [{"role": "user", "content": "Search Plex for Dune."}],
+        [tool], empty_call) is None
 
 
 def test_hidden_gateway_host_pagination_falls_back_for_ambiguous_contracts():
@@ -1303,7 +1408,9 @@ def test_qwen36_profiles_bound_experts_and_use_hybrid_endpoint_cache():
     assert not fast.quant_attention
     assert not fast.quant_router
     assert not fast.quant_lm_head
-    assert fast.max_weight_cache_mb == 7000
+    # The real 35B lossy capture crossed the paging cliff at 5.5/7.0 GB.
+    # 5.0 GB completed safely at 7.24 GB Metal; lossless remains unchanged.
+    assert fast.max_weight_cache_mb == 5000
 
 
 def test_qwen_native_mtp_auto_policy_targets_only_out_of_core_dense_models():
@@ -3096,6 +3203,27 @@ def test_engine_generate_uses_plain_targets_own_retry_method():
     assert result == {"via": "target-retry"}
     assert target.retry_calls == 1
     assert target.plain_calls == 0
+
+
+def test_engine_generate_scopes_and_restores_qwen_expert_top_k():
+    class Target:
+        def __init__(self):
+            self.cfg = SimpleNamespace(
+                model_type="qwen3_5_moe", num_hidden_layers=3,
+                num_experts_per_tok=8, expert_top_k_by_layer=())
+            self.rc = SimpleNamespace(expert_top_k_by_layer=())
+
+        def generate_with_memory_retry(self, *args, **kwargs):
+            assert self.cfg.expert_top_k_by_layer == (2, 2, 2)
+            assert self.rc.expert_top_k_by_layer == (2, 2, 2)
+            return {"via": "request-top-k"}
+
+    target = Target()
+    assert _engine_generate(
+        target, "prompt", 16, expert_top_k=2,
+    ) == {"via": "request-top-k"}
+    assert target.cfg.expert_top_k_by_layer == ()
+    assert target.rc.expert_top_k_by_layer == ()
 
 
 def _run_all():

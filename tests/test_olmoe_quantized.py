@@ -61,7 +61,7 @@ def test_layer_top_k_schedule_is_complete_and_fails_closed():
             raise AssertionError(f"invalid top-k schedule was accepted: {invalid}")
 
 
-def test_runtime_top_k_schedule_defaults_exact_and_is_olmoe_only():
+def test_runtime_top_k_schedule_defaults_exact_and_supports_qwen_moe():
     cfg = SimpleNamespace(
         model_type="olmoe",
         num_hidden_layers=4,
@@ -79,6 +79,18 @@ def test_runtime_top_k_schedule_defaults_exact_and_is_olmoe_only():
     assert selected.expert_top_k_by_layer == (7, 7, 8, 8)
     assert cfg.expert_top_k_by_layer == (7, 7, 8, 8)
 
+    qwen = SimpleNamespace(
+        model_type="qwen3_5_moe",
+        num_hidden_layers=4,
+        num_experts=256,
+        num_experts_per_tok=8,
+        expert_top_k_by_layer=(),
+    )
+    qwen_selected = RuntimeConfig(expert_top_k_by_layer=[4, 4, 4, 4])
+    _apply_runtime_expert_top_k(qwen_selected, qwen)
+    assert qwen_selected.expert_top_k_by_layer == (4, 4, 4, 4)
+    assert qwen.expert_top_k_by_layer == (4, 4, 4, 4)
+
     try:
         _apply_runtime_expert_top_k(
             RuntimeConfig(expert_top_k_by_layer=(7,)), cfg)
@@ -92,7 +104,7 @@ def test_runtime_top_k_schedule_defaults_exact_and_is_olmoe_only():
         _apply_runtime_expert_top_k(
             RuntimeConfig(expert_top_k_by_layer=(7,)), dense)
     except ValueError as error:
-        assert "only for OLMoE" in str(error)
+        assert "only for OLMoE and Qwen3.5/3.6 MoE" in str(error)
     else:
         raise AssertionError("a non-OLMoE schedule was accepted")
 

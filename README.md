@@ -202,14 +202,27 @@ live memory governor can still clamp individual layers below that value.
 Dense Qwen keeps layer-stationary prefill off by default because a deterministic
 9B captured-boundary A/B measured a small regression.
 
-Fast/lossy routes can opt into string-level grammar jump-forward for
-constrained tool/JSON scaffolding with
-`VMODEL_GRAMMAR_JUMP_FORWARD_LOSSY=1`. It remains off by default because the
-speed path can change free-choice arguments even when forced scaffolding stays
-valid. With the hidden tool gateway enabled, high-confidence forced actions
-and conventional activated pagination bypass redundant private model-routing
-generation by default; `VMODEL_FAST_TOOL_GATEWAY_HOST_ROUTE=0` restores the
-model decision A/B.
+Fast/lossy routes automatically use string-level grammar jump-forward for
+constrained tool/JSON scaffolding. This can change free-choice token IDs even
+when forced scaffolding remains valid, so it never applies to lossless model
+IDs; `VMODEL_GRAMMAR_JUMP_FORWARD_LOSSY=0` is the lossy-route rollback and
+`=1` is the explicit override. With the hidden tool gateway enabled,
+high-confidence forced actions and conventional activated pagination bypass
+redundant private model-routing generation by default;
+`VMODEL_FAST_TOOL_GATEWAY_HOST_ROUTE=0` restores the model decision A/B.
+
+For a fast Qwen3.5/3.6 MoE request, the gateway also selects a measured
+task-execution capsule when all of these gates hold: exactly one host-routed
+read-only tool, an explicit external-action request, at least 4K characters of
+system scaffolding, and no developer message. That private phase keeps the
+user/assistant/tool history and selected schema, uses a request-local top-2
+expert schedule, and owns a separate prompt-cache namespace. Mutating or
+ambiguous tools, developer-scoped requests, smaller prompts, ordinary
+generation, and every lossless route preserve the full context and released
+top-k. Rollbacks are
+`VMODEL_FAST_TOOL_GATEWAY_EXECUTION_CONTEXT=full`,
+`VMODEL_FAST_TOOL_GATEWAY_QWEN_MOE_TOP_K=released`, and
+`VMODEL_FAST_TOOL_GATEWAY_EXECUTION_PROSE=1`.
 
 Native Qwen MTP defaults to `auto`: it is considered only for dense checkpoints
 whose payload exceeds vOOM's weight-cache budget, and only for output budgets
@@ -313,8 +326,15 @@ embedding, attention/DeltaNet trunk, routers, shared experts, normalization,
 and output head remain in their converted checkpoint dtypes; only routed expert
 matrices are MXFP4. Standard MLX weight/scale triplets work from raw
 safetensors, vpack, and verified vpack2, including atomic fast-tier pages that
-stage each expert's weights and scales together. To reproduce the derived
-checkpoint and its packed archive:
+stage each expert's weights and scales together.
+
+The lossy 35B path defaults to a 5.0 GB evictable weight-cache budget. On the
+real 134-tool captured request, 5.0 GB completed at 7.24 GB peak Metal, while
+5.5 GB crossed the macOS paging cliff and failed; the lossless profile retains
+its previous 7.0 GB default. `VMODEL_QWEN35_WEIGHT_CACHE_MB` remains the
+explicit operator override.
+
+To reproduce the derived checkpoint and its packed archive:
 
 ```bash
 .venv/bin/python -m formats.quantize_mlx \

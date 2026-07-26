@@ -1065,7 +1065,7 @@ class EngineManager:
             (rc.grammar_jump_forward_lossy,
              grammar_jump_forward_reason) = _grammar_jump_forward_policy(
                 os.environ.get(
-                    "VMODEL_GRAMMAR_JUMP_FORWARD_LOSSY", "0"),
+                    "VMODEL_GRAMMAR_JUMP_FORWARD_LOSSY", "auto"),
                 mode=mode)
             if mtype == "jet_nemotron":
                 # F97: Jet-Nemotron (jet-ai/Jet-Nemotron-4B/2B) -- a third,
@@ -1278,7 +1278,8 @@ class EngineManager:
                     "VMODEL_QWEN35_HOT_KV_PERSIST_DIR", "")
                 try:
                     rc.max_weight_cache_mb = int(os.environ.get(
-                        "VMODEL_QWEN35_WEIGHT_CACHE_MB", "7000"))
+                        "VMODEL_QWEN35_WEIGHT_CACHE_MB",
+                        "5000" if mode in ("fast", "fast-long") else "7000"))
                 except ValueError as error:
                     raise ValueError(
                         "VMODEL_QWEN35_WEIGHT_CACHE_MB must be an integer") from error
@@ -1461,6 +1462,25 @@ class EngineManager:
                     rc.quant_attention = False
                     rc.quant_router = False
                     rc.quant_lm_head = False
+                    qwen_moe_top_k = os.environ.get(
+                        "VMODEL_QWEN_MOE_EXPERT_TOP_K", "released"
+                    ).strip().lower()
+                    if qwen_moe_top_k not in ("", "released"):
+                        try:
+                            selected_top_k = int(qwen_moe_top_k)
+                        except ValueError as error:
+                            raise ValueError(
+                                "VMODEL_QWEN_MOE_EXPERT_TOP_K must be "
+                                "'released' or an integer") from error
+                        released_top_k = int(
+                            getattr(cfg_probe, "num_experts_per_tok", 0) or 0)
+                        if not 1 <= selected_top_k <= released_top_k:
+                            raise ValueError(
+                                "VMODEL_QWEN_MOE_EXPERT_TOP_K must be within "
+                                f"[1, {released_top_k}]")
+                        rc.expert_top_k_by_layer = (
+                            selected_top_k,
+                        ) * int(cfg_probe.num_hidden_layers)
                     # SQ26: zmlx's fused DeltaNet decode kernels. Gated to
                     # fast/lossy mode ONLY, never lossless -- a real bf16
                     # precision difference exists per-call even though a real
@@ -3931,7 +3951,7 @@ def _has_own_method(obj, name: str) -> bool:
     return any(name in cls.__dict__ for cls in type(obj).__mro__)
 
 
-def _engine_generate(engine, *args, **kwargs):
+def _engine_generate(engine, *args, expert_top_k: int = 0, **kwargs):
     """Use fail-slow prefill retry when the concrete engine supports it.
 
     2026-07-22: a plain ``getattr(engine, "generate_with_memory_retry",
@@ -3946,11 +3966,37 @@ def _engine_generate(engine, *args, **kwargs):
     confirmed MTP speculation never actually engaged despite being
     "enabled" for the whole time it existed. Only take the retry path when
     the object genuinely implements it itself.
+
+    ``expert_top_k`` is a request-scoped lossy Qwen-MoE override used by the
+    private tool-execution capsule. INFER_LOCK serializes server generation,
+    and that capsule owns a distinct prompt-cache namespace, so its approximate
+    recurrent/KV state cannot be reused by a released-top-k request. Restore
+    both config witnesses even when generation raises.
     """
     generate = (engine.generate_with_memory_retry
                 if _has_own_method(engine, "generate_with_memory_retry")
                 else engine.generate)
-    result = generate(*args, **kwargs)
+    cfg = getattr(engine, "cfg", None)
+    rc = getattr(engine, "rc", None)
+    old_cfg_schedule = getattr(cfg, "expert_top_k_by_layer", ())
+    old_rc_schedule = getattr(rc, "expert_top_k_by_layer", ())
+    if expert_top_k:
+        if (cfg is None or cfg.model_type != "qwen3_5_moe"
+                or not 1 <= expert_top_k <= cfg.num_experts_per_tok):
+            raise ValueError(
+                "request-scoped expert_top_k requires a Qwen3.5/3.6 MoE "
+                "checkpoint and a value within its released top-k")
+        schedule = (expert_top_k,) * int(cfg.num_hidden_layers)
+        cfg.expert_top_k_by_layer = schedule
+        if rc is not None:
+            rc.expert_top_k_by_layer = schedule
+    try:
+        result = generate(*args, **kwargs)
+    finally:
+        if expert_top_k:
+            cfg.expert_top_k_by_layer = old_cfg_schedule
+            if rc is not None:
+                rc.expert_top_k_by_layer = old_rc_schedule
     if os.environ.get("VMODEL_DEBUG_ENGINE_REPORT", "0") == "1":
         print("[debug] engine.report():\n" + engine.report(), flush=True)
     return result
@@ -3995,6 +4041,9 @@ _GATEWAY_EXTERNAL_STATE_RE = re.compile(
     r"files? (?:in|inside|under) (?:this|the|our|my) |"
     r"(?:this|our|my) (?:workspace|repository|repo|filesystem|folder|directory)|"
     r"https?://|browser tab|terminal|shell command)\b",
+    re.IGNORECASE)
+_GATEWAY_PAGINATION_REQUEST_RE = re.compile(
+    r"\b(?:paginate|pagination|paging|all pages|full list|entire list)\b",
     re.IGNORECASE)
 
 
@@ -4209,6 +4258,63 @@ def _hidden_gateway_pagination_call(
     return {"name": name, "arguments": arguments}
 
 
+def _hidden_gateway_initial_pagination_defaults(
+        messages: list[dict], selected_tools: list[dict],
+        call: dict) -> dict | None:
+    """Apply declared first-page defaults to one model-selected real call.
+
+    This is narrower than natural-language argument extraction. The model must
+    already have selected and completed a real tool call, the latest user turn
+    must explicitly request pagination/the full list, and the selected schema
+    must declare conventional numeric ``limit`` and ``offset`` defaults.
+    Existing model-authored arguments always win. Unknown cursor/page contracts
+    and missing/non-numeric defaults are left untouched.
+    """
+    user_text = next(
+        (_gateway_message_text(message) for message in reversed(messages)
+         if message.get("role") == "user"),
+        "",
+    )
+    if not _GATEWAY_PAGINATION_REQUEST_RE.search(user_text):
+        return None
+    function = call.get("function", {}) if isinstance(call, dict) else {}
+    name = str(function.get("name", ""))
+    selected = {
+        _tool_function_name(tool): tool for tool in selected_tools
+        if _tool_function_name(tool)}
+    if name not in selected:
+        return None
+    raw_arguments = function.get("arguments", "{}")
+    try:
+        arguments = (
+            json.loads(raw_arguments)
+            if isinstance(raw_arguments, str) else dict(raw_arguments))
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(arguments, dict):
+        return None
+    tool = selected[name]
+    properties = (
+        tool.get("function", tool).get(
+            "parameters", {}).get("properties", {}))
+    if not isinstance(properties, dict) or not {
+            "limit", "offset"}.issubset(properties):
+        return None
+    changed = False
+    for field in ("limit", "offset"):
+        if field in arguments:
+            continue
+        value = _tool_property_default(tool, field)
+        if (isinstance(value, bool) or not isinstance(value, (int, float))
+                or (field == "limit" and value <= 0)):
+            return None
+        arguments[field] = value
+        changed = True
+    return (
+        {"name": name, "arguments": arguments}
+        if changed else None)
+
+
 def _hidden_tool_search_pair():
     """Return wrapped/raw copies of the gateway-only catalog search tool."""
     raw = {
@@ -4388,6 +4494,83 @@ def _hidden_gateway_execution_messages(
             insert_at = index
             break
     return [*messages[:insert_at], *pair, *messages[insert_at:]]
+
+
+def _hidden_gateway_execution_context(
+        messages: list[dict], profile: str) -> tuple[list[dict], int]:
+    """Project private execution onto task-local history when requested.
+
+    ``full`` preserves the caller's transcript byte-for-byte. ``task`` is an
+    explicitly lossy latency experiment for the hidden execution phase: host
+    routing has already selected a bounded real-tool catalog, so retain user,
+    assistant, and tool turns (including the private activation pair) while
+    omitting global system/developer scaffolding. The execution policy and
+    selected schemas are injected after this projection. This must never affect
+    lossless routes or ordinary non-gateway generation.
+
+    Return the projected messages and the number of omitted content characters
+    so request telemetry makes the semantic/latency trade explicit.
+    """
+    if profile == "full":
+        return [dict(message) for message in messages], 0
+    if profile != "task":
+        raise ValueError(
+            "gateway execution context profile must be 'full' or 'task'")
+    projected = []
+    omitted_chars = 0
+    for message in messages:
+        if message.get("role") in ("system", "developer"):
+            omitted_chars += len(_gateway_message_text(message))
+            continue
+        projected.append(dict(message))
+    return projected, omitted_chars
+
+
+def _hidden_gateway_execution_context_policy(
+        requested: str, *, messages: list[dict], selected_tools: list[dict],
+        mode: str, model_type: str, host_route: bool,
+        force_reason: str | None) -> tuple[str, str]:
+    """Choose the measured task capsule only for a narrow read-only route."""
+    requested = str(requested or "auto").strip().lower()
+    if requested not in ("auto", "full", "task"):
+        raise ValueError(
+            "gateway execution context must be auto, full, or task")
+    if requested == "full":
+        return "full", "operator-full"
+    if requested == "task":
+        if mode not in ("fast", "fast-long"):
+            raise ValueError(
+                "task-scoped gateway execution context is available only in "
+                "lossy fast modes")
+        return "task", "operator-task"
+
+    if mode not in ("fast", "fast-long"):
+        return "full", "lossless-route"
+    if model_type != "qwen3_5_moe":
+        return "full", "unmeasured-architecture"
+    if not host_route or force_reason != "external-action-imperative":
+        return "full", "model-routed-or-continuation"
+    if len(selected_tools) != 1:
+        return "full", "ambiguous-tool-selection"
+    if any(message.get("role") == "developer" for message in messages):
+        return "full", "developer-context-present"
+    name = _tool_function_name(selected_tools[0]).rsplit("__", 1)[-1]
+    if re.search(
+            r"(?:^|_)(?:create|delete|deploy|edit|execute|install|kill|merge|"
+            r"move|purchase|push|remove|rename|run|schedule|send|update|upload|"
+            r"write)(?:_|$)",
+            name, re.IGNORECASE):
+        return "full", "possibly-mutating-tool"
+    if not re.search(
+            r"(?:^|_)(?:list|get|search|read|inspect|query|fetch)(?:_|$)",
+            name, re.IGNORECASE):
+        return "full", "possibly-mutating-tool"
+    system_chars = sum(
+        len(_gateway_message_text(message)) for message in messages
+        if message.get("role") == "system")
+    if system_chars < 4096:
+        return "full", "small-system-context"
+    return "task", "auto-read-only-large-system"
 
 
 def _hidden_gateway_activation_clear() -> None:
@@ -6218,6 +6401,9 @@ class Handler(BaseHTTPRequestHandler):
         gateway_max_activated = 64
         gateway_search_results = 4
         gateway_host_route = False
+        gateway_execution_prose_request = "auto"
+        gateway_execution_context_request = "auto"
+        gateway_qwen_moe_top_k_request = "auto"
         gateway_virtual_tools = []
         gateway_virtual_raw = []
         if gateway_enabled:
@@ -6253,6 +6439,37 @@ class Handler(BaseHTTPRequestHandler):
                 raise RequestValidationError(
                     "VMODEL_FAST_TOOL_GATEWAY_HOST_ROUTE must be 0 or 1")
             gateway_host_route = gateway_host_route_value == "1"
+            gateway_execution_prose_request = os.environ.get(
+                "VMODEL_FAST_TOOL_GATEWAY_EXECUTION_PROSE", "auto"
+            ).strip().lower()
+            if gateway_execution_prose_request not in ("auto", "0", "1"):
+                raise RequestValidationError(
+                    "VMODEL_FAST_TOOL_GATEWAY_EXECUTION_PROSE must be "
+                    "auto, 0, or 1")
+            gateway_execution_context_request = os.environ.get(
+                "VMODEL_FAST_TOOL_GATEWAY_EXECUTION_CONTEXT", "auto"
+            ).strip().lower()
+            if gateway_execution_context_request not in (
+                    "auto", "full", "task"):
+                raise RequestValidationError(
+                    "VMODEL_FAST_TOOL_GATEWAY_EXECUTION_CONTEXT must be "
+                    "auto, full, or task")
+            gateway_qwen_moe_top_k_request = os.environ.get(
+                "VMODEL_FAST_TOOL_GATEWAY_QWEN_MOE_TOP_K", "auto"
+            ).strip().lower()
+            if gateway_qwen_moe_top_k_request not in (
+                    "auto", "released"):
+                try:
+                    parsed_gateway_top_k = int(
+                        gateway_qwen_moe_top_k_request)
+                except ValueError as error:
+                    raise RequestValidationError(
+                        "VMODEL_FAST_TOOL_GATEWAY_QWEN_MOE_TOP_K must be "
+                        "auto, released, or an integer") from error
+                if parsed_gateway_top_k <= 0:
+                    raise RequestValidationError(
+                        "VMODEL_FAST_TOOL_GATEWAY_QWEN_MOE_TOP_K must be "
+                        "positive")
             gateway_activation_key = _hidden_gateway_conversation_key(
                 model_id, all_tools, msgs)
             gateway_activated_names = _hidden_gateway_activation_get(
@@ -6579,8 +6796,55 @@ class Handler(BaseHTTPRequestHandler):
                     max_activated=gateway_max_activated)
             _hidden_gateway_activation_put(
                 gateway_activation_key, selected_tools)
+            try:
+                (gateway_execution_context,
+                 gateway_execution_context_reason) = \
+                    _hidden_gateway_execution_context_policy(
+                        gateway_execution_context_request,
+                        messages=msgs, selected_tools=selected_tools,
+                        mode=mode, model_type=engine.cfg.model_type,
+                        host_route=gateway_host_route,
+                        force_reason=gateway_force_reason)
+            except ValueError as error:
+                raise RequestValidationError(str(error)) from error
             internal_messages = _hidden_gateway_execution_messages(
                 msgs, selected_tools, gateway_activation_key)
+            internal_messages, execution_context_omitted_chars = \
+                _hidden_gateway_execution_context(
+                    internal_messages, gateway_execution_context)
+            gateway_execution_prose = (
+                gateway_execution_context != "task"
+                if gateway_execution_prose_request == "auto"
+                else gateway_execution_prose_request == "1")
+            configured_schedule = tuple(
+                getattr(engine.cfg, "expert_top_k_by_layer", ()))
+            gateway_execution_expert_top_k = 0
+            gateway_execution_expert_top_k_reason = "released"
+            if gateway_qwen_moe_top_k_request == "auto":
+                if configured_schedule:
+                    gateway_execution_expert_top_k_reason = "engine-profile"
+                elif (gateway_execution_context == "task"
+                      and engine.cfg.model_type == "qwen3_5_moe"):
+                    gateway_execution_expert_top_k = min(
+                        2, int(engine.cfg.num_experts_per_tok))
+                    gateway_execution_expert_top_k_reason = "auto-task-capsule"
+            elif gateway_qwen_moe_top_k_request != "released":
+                gateway_execution_expert_top_k = int(
+                    gateway_qwen_moe_top_k_request)
+                if (engine.cfg.model_type != "qwen3_5_moe"
+                        or gateway_execution_expert_top_k
+                        > int(engine.cfg.num_experts_per_tok)):
+                    raise RequestValidationError(
+                        "VMODEL_FAST_TOOL_GATEWAY_QWEN_MOE_TOP_K exceeds "
+                        "this checkpoint's released Qwen-MoE top-k")
+                gateway_execution_expert_top_k_reason = "operator-forced"
+            effective_gateway_top_k = (
+                gateway_execution_expert_top_k
+                or (configured_schedule[0] if configured_schedule
+                    else int(engine.cfg.num_experts_per_tok or 0)))
+            gateway_execution_cache_namespace = (
+                f"gateway_execution_{gateway_execution_context}"
+                f"_top{effective_gateway_top_k or 'released'}")
             execution_messages = _prepend_system_content(
                 internal_messages, _HIDDEN_GATEWAY_REAL_TOOL_POLICY)
             abstain_tool, abstain_raw = _hidden_tool_abstain_pair()
@@ -6592,7 +6856,7 @@ class Handler(BaseHTTPRequestHandler):
                     execution_tools, execution_raw, mode, max_output_tokens,
                     enable_thinking=self._enable_thinking,
                     reasoning_requested=self._reasoning_requested,
-                    cache_namespace="gateway_execution",
+                    cache_namespace=gateway_execution_cache_namespace,
                     # The search pass needs tiny schemas because it reasons
                     # over the whole catalog. Once retrieval has reduced that
                     # catalog to a handful of execution candidates, restore
@@ -6602,7 +6866,7 @@ class Handler(BaseHTTPRequestHandler):
                     # dispensable prose. Canonical ordering and compact JSON
                     # remain enabled, so this does not restore the 130+ tool
                     # prompt that the hidden gateway was built to avoid.
-                    preserve_tool_parameter_prose=True)
+                    preserve_tool_parameter_prose=gateway_execution_prose)
             self._constraint = _configure_constraint(
                 engine, self._structured_output, prompt_tools, "required",
                 False)
@@ -6631,12 +6895,35 @@ class Handler(BaseHTTPRequestHandler):
                 result = _engine_generate(engine,
                     prompt, max_output_tokens, stop=stop,
                     on_progress=on_progress, sampling=self._sampling,
-                    constraint=self._constraint)
+                    constraint=self._constraint,
+                    expert_top_k=gateway_execution_expert_top_k)
             execution_cache_phase = _cache_phase_telemetry(
                 "gateway_execution", result)
             _execution_content, execution_calls = _parse_request_tool_calls(
                 result["text"], prompt_tools, engine.cfg.model_type,
                 allow_parallel=False)
+            argument_defaults_applied = False
+            real_calls = [
+                call for call in execution_calls
+                if call["function"]["name"] != _HIDDEN_TOOL_ABSTAIN_NAME
+            ]
+            defaulted_call = (
+                _hidden_gateway_initial_pagination_defaults(
+                    msgs, selected_tools, real_calls[0])
+                if gateway_host_route and len(real_calls) == 1
+                else None)
+            if defaulted_call is not None:
+                result["text"] = (
+                    "<tool_call>\n"
+                    + json.dumps(
+                        defaulted_call, ensure_ascii=False,
+                        separators=(",", ":"))
+                    + "\n</tool_call>")
+                _execution_content, execution_calls = \
+                    _parse_request_tool_calls(
+                        result["text"], prompt_tools, engine.cfg.model_type,
+                        allow_parallel=False)
+                argument_defaults_applied = True
             abstain_call = next(
                 (call for call in execution_calls
                  if call["function"]["name"] == _HIDDEN_TOOL_ABSTAIN_NAME),
@@ -6695,6 +6982,22 @@ class Handler(BaseHTTPRequestHandler):
                 "gateway_execution_outcome": execution_outcome,
                 "gateway_pagination_host_routed": int(
                     pagination_call is not None),
+                "gateway_initial_pagination_defaults_applied": int(
+                    argument_defaults_applied),
+                "gateway_execution_context_profile": (
+                    gateway_execution_context),
+                "gateway_execution_context_reason": (
+                    gateway_execution_context_reason),
+                "gateway_execution_context_omitted_chars": int(
+                    execution_context_omitted_chars),
+                "gateway_execution_parameter_prose": int(
+                    gateway_execution_prose),
+                "gateway_execution_expert_top_k": int(
+                    effective_gateway_top_k),
+                "gateway_execution_expert_top_k_reason": (
+                    gateway_execution_expert_top_k_reason),
+                "gateway_execution_cache_namespace": (
+                    gateway_execution_cache_namespace),
                 "gateway_query_sha256": (
                     hashlib.sha256(query.encode("utf-8")).hexdigest()[:16]
                     if query else None),

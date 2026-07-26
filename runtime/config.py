@@ -474,7 +474,7 @@ def validate_expert_top_k_by_layer(
 
 
 def effective_expert_top_k(cfg: ModelConfig, layer: int) -> int:
-    """Return the active OLMoE expert count for ``layer``.
+    """Return the active routed-expert count for ``layer``.
 
     An empty per-layer schedule preserves the checkpoint's released top-k.  A
     nonempty schedule is deliberately strict: it must cover every layer and may
