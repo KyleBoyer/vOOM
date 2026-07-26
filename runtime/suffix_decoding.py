@@ -510,11 +510,19 @@ def fallback_reason(engine, kv, sampling, constraint, *, terminal: bool) -> str 
     # MoE (48B/3B active) but forward_tokens_serial_positions's kimi_family
     # dispatch was verified byte-identical against the REAL checkpoint's
     # own MoE routing (_kimi_linear_mlp_residual's _route_experts), not
-    # just its dense/full-attention layers -- stronger evidence than
-    # qwen3_5_moe currently has (that one was only tested dense), so it is
-    # exempted here alongside glm_family rather than left blocked.
+    # just its dense/full-attention layers.
+    #
+    # F113 follow-on (2026-07-26, later same day): qwen3_5_moe closed the
+    # same gap its own comment below used to flag -- a standalone
+    # diagnostic against the real Qwen3.5-35B-A3B-mlx-expert-mxfp4
+    # checkpoint (256 experts) exercising its actual MoE routing through
+    # this same per-position dispatch came back byte-identical (0.0 max
+    # abs diff, logits AND all 30 kda_cache layers) vs true sequential
+    # decode, exactly mirroring the standard kimi_linear's own diagnostic
+    # just met. Both are exempted here alongside glm_family.
     kimi_linear_family = engine.cfg.model_type == "kimi_linear"
-    if not glm_family and not kimi_linear_family and (
+    qwen_moe_family = engine.cfg.model_type == "qwen3_5_moe"
+    if not glm_family and not kimi_linear_family and not qwen_moe_family and (
             engine.cfg.num_experts or engine.cfg.model_type == "gpt_oss"):
         return "non-dense-target"
     # 2026-07-25: real Qwen3.5/3.6 text checkpoints (e.g. Qwen3.5-9B) carry a
@@ -535,7 +543,8 @@ def fallback_reason(engine, kv, sampling, constraint, *, terminal: bool) -> str 
     if getattr(kv, "compressed_mla", False):
         return "compressed-kv"
     if (getattr(kv, "kda_cache", None) is not None
-            and engine.cfg.model_type not in ("qwen3_5", "kimi_linear")):
+            and engine.cfg.model_type not in (
+                "qwen3_5", "qwen3_5_moe", "kimi_linear")):
         # F94: KVCache.trim() has no kda_cache branch -- a partially-accepted
         # round would silently roll back only the ordinary KV, leaving the
         # DeltaNet/KDA recurrent state polluted by the rejected suffix with
@@ -551,10 +560,6 @@ def fallback_reason(engine, kv, sampling, constraint, *, terminal: bool) -> str 
         # extended with a real per-position qwen_family dispatch, verified
         # byte-identical (logits AND kda_cache state, every layer) against
         # true sequential decode on the real Qwen3.5-9B checkpoint.
-        # qwen3_5_moe is NOT exempted here -- it's already excluded above
-        # via the num_experts/"non-dense-target" check, since per-position
-        # MoE routing safety for Qwen hasn't been separately verified the
-        # way GLM's was.
         #
         # F113 follow-on (2026-07-26, Kimi K3 readiness): kimi_linear
         # (KDA+MLA hybrid) gets the same real fix -- forward_tokens_
@@ -562,10 +567,19 @@ def fallback_reason(engine, kv, sampling, constraint, *, terminal: bool) -> str 
         # residual/_kimi_linear_mlp_residual, which internally dispatch
         # KDA vs MLA per layer) was verified byte-identical, both logits
         # and kda_cache state across all KDA layers, against the real
-        # Kimi-Linear-48B-A3B-Instruct checkpoint. The SAME round-loop
-        # fork/restore code below already handles any kda_cache-bearing
-        # target generically (it never branched on model_type), so no
-        # separate fork/restore logic was needed for this target.
+        # Kimi-Linear-48B-A3B-Instruct checkpoint.
+        #
+        # F113 follow-on (2026-07-26, later same day): qwen3_5_moe closed
+        # its own previously-open gap -- verified byte-identical (logits
+        # AND kda_cache state, all 30 layers) against the real
+        # Qwen3.5-35B-A3B-mlx-expert-mxfp4 checkpoint (256 experts),
+        # exercising its actual MoE routing through the same per-position
+        # dispatch, not just dense layers.
+        #
+        # The SAME round-loop fork/restore code below already handles any
+        # kda_cache-bearing target generically (it never branched on
+        # model_type), so no separate fork/restore logic was needed for
+        # either of these targets.
         return "recurrent-state-target"
     if engine._embed_rows is not None or engine._streamed_lm_head is not None:
         return "streamed-embedding-or-head"
