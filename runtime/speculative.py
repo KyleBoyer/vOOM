@@ -649,6 +649,17 @@ class SpeculativeDecoder:
             "speculative_draft_oov_fallbacks": stats.draft_oov_fallbacks,
             "speculative_resident_draft_rounds": stats.resident_draft_rounds,
             "speculative_resident_draft_tokens": stats.resident_draft_tokens,
+            # F48 (2026-07-25): the adaptive controller's own disabled-round
+            # count was tracked (self.controller_disabled_rounds) but never
+            # surfaced anywhere a caller could observe it -- no way to tell
+            # "the controller correctly backed off N times" from "the
+            # controller never backs off" without reading the instance
+            # attribute directly. Real gap found while investigating whether
+            # GLM's native MTP path was slower because its cost/benefit
+            # controller wasn't working -- it was working (backed off half
+            # the rounds in that test), but only instance-attribute
+            # inspection could show that.
+            "speculative_controller_disabled_rounds": self.controller_disabled_rounds,
         }
         return {
             "text": final_text,
