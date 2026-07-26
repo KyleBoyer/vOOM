@@ -131,20 +131,39 @@ def test_forward_tokens_serial_positions_excludes_hybrid_model_types():
     forward_tokens_serial_positions) is a plain dense-transformer block with
     no awareness of qwen3_5/kimi_linear's hybrid DeltaNet/full-attention
     layer_types -- it would KeyError on 'model.layers.N.self_attn.*' tensor
-    names that don't exist on a linear_attention layer. num_experts already
-    excludes qwen3_5_moe (MoE); dense qwen3_5 (Qwen3.5-4B/9B, Qwen3.6-27B)
-    was NOT excluded before this fix, and this reproduced live against a
-    real Qwen3.6-27B checkpoint (qwen35_mtp_gate.py)."""
+    names that don't exist on a linear_attention layer. This reproduced live
+    against a real Qwen3.6-27B checkpoint (qwen35_mtp_gate.py).
+
+    F113 follow-on (2026-07-25): qwen3_5/qwen3_5_moe were given a real
+    per-position qwen_family dispatch (_qwen35_attention_residual /
+    _qwen35_mlp_residual, verified byte-identical against real Qwen3.5-9B
+    sequential decode) and are no longer refused by this guard --
+    kimi_linear (KDA + MLA hybrid, same recurrent-state shape) still is,
+    since it was not given an equivalent dispatch this session."""
     from runtime.engine import StreamingEngine
 
-    for model_type in ("qwen3_5", "qwen3_5_moe", "kimi_linear"):
+    engine = object.__new__(StreamingEngine)
+    engine.cfg = SimpleNamespace(num_experts=0, model_type="kimi_linear")
+    try:
+        engine.forward_tokens_serial_positions([1, 2], kv=None)
+        raised = False
+    except ValueError:
+        raised = True
+    assert raised, "forward_tokens_serial_positions must refuse kimi_linear"
+
+    for model_type in ("qwen3_5", "qwen3_5_moe"):
         engine = object.__new__(StreamingEngine)
         engine.cfg = SimpleNamespace(num_experts=0, model_type=model_type)
         try:
             engine.forward_tokens_serial_positions([1, 2], kv=None)
-            raised = False
         except ValueError:
-            raised = True
-        assert raised, (
-            f"forward_tokens_serial_positions must refuse model_type="
-            f"{model_type!r}")
+            raise AssertionError(
+                f"forward_tokens_serial_positions must no longer refuse "
+                f"model_type={model_type!r} via the guard clause"
+            )
+        except AttributeError:
+            # Expected: this fake engine has no real weights/kv, so it
+            # proceeds past the guard into the qwen_family dispatch and
+            # fails there instead -- proving the guard itself let it
+            # through, which is what this test is checking.
+            pass

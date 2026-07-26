@@ -2658,19 +2658,18 @@ class StreamingEngine:
         fetches each layer only once for the complete verify window.
         """
         glm_family = self.cfg.model_type in ("glm_moe_dsa", "kimi_k25", "glm4_moe_lite")
-        if not glm_family and (self.cfg.num_experts or self.cfg.model_type in (
-                "gpt_oss", "qwen3_5", "qwen3_5_moe", "kimi_linear")):
+        qwen_family = self.cfg.model_type in ("qwen3_5", "qwen3_5_moe")
+        if not glm_family and not qwen_family and (
+                self.cfg.num_experts or self.cfg.model_type in ("gpt_oss", "kimi_linear")):
             # F94: layer_runner.run_block (this function's per-layer call
             # below) is a plain dense-transformer block with no awareness of
             # the hybrid DeltaNet/full-attention layer_types these model
             # types use -- it silently looked up "model.layers.N.self_attn.*"
             # tensor names that don't exist on a linear_attention layer,
-            # KeyError'ing rather than misrouting quietly. qwen3_5_moe/
-            # kimi_linear are already excluded via num_experts (MoE); dense
-            # qwen3_5 (Qwen3.5-4B/9B, Qwen3.6-27B) is not, so it needed an
-            # explicit exclusion here too. forward_tokens (via _sweep, which
-            # DOES have correct model_type dispatch) is the working
-            # alternative for these targets -- see runtime/qwen35_mtp.py.
+            # KeyError'ing rather than misrouting quietly. forward_tokens
+            # (via _sweep, which DOES have correct model_type dispatch) is
+            # the working alternative for these targets -- see
+            # runtime/qwen35_mtp.py.
             #
             # F113 (2026-07-25): GLM-family (glm_moe_dsa/kimi_k25/
             # glm4_moe_lite) targets get the real fix instead of exclusion
@@ -2681,6 +2680,20 @@ class StreamingEngine:
             # decode uses, matching this function's whole purpose (exact
             # per-position match with true sequential decode) instead of
             # the batched-GEMM-can-diverge risk forward_tokens carries.
+            #
+            # F113 follow-on (2026-07-25, later): qwen3_5/qwen3_5_moe
+            # (Qwen3.5-4B/9B, Qwen3.6-27B/35B-A3B) get the same real fix,
+            # reusing _qwen35_attention_residual/_qwen35_mlp_residual
+            # (split out for F106). This ALSO makes DeltaNet's recurrent
+            # state (kda_cache) update position-by-position through this
+            # function exactly as real sequential decode would -- the
+            # per-position dispatch isn't just avoiding batched-GEMM
+            # divergence here, it's the SAME mechanism that makes ordinary
+            # decode's own KDA state evolution correct, applied to a
+            # verify window instead of one live token at a time. kimi_linear
+            # (KDA + MLA hybrid, same recurrent-state shape) is NOT yet
+            # extended here -- not attempted this session, no real caller
+            # needs it yet.
             raise ValueError(
                 "serial-position verification currently supports dense models only")
         if not tokens:
@@ -2704,6 +2717,8 @@ class StreamingEngine:
         n = self.cfg.num_hidden_layers
         if glm_family:
             from .glm import _glm_attention_residual, _glm_mlp_residual
+        if qwen_family:
+            from .qwen35 import _qwen35_attention_residual, _qwen35_mlp_residual
         for layer in range(n):
             if self.prefetcher:
                 for nxt in range(
@@ -2736,6 +2751,21 @@ class StreamingEngine:
                         hidden, weights, prefix, self.cfg, kv, layer,
                         offset + position)
                     hidden = _glm_mlp_residual(
+                        attn_out, weights, prefix, self.cfg, layer,
+                        self._get_experts,
+                        iter_expert_batches=self._iter_expert_batches)
+                elif qwen_family:
+                    # F113 follow-on: DeltaNet-or-full-attention + MoE (if
+                    # any) computed one position at a time, in order --
+                    # kv.kda_cache (when present) updates exactly as it
+                    # would during real sequential decode, since this IS
+                    # a real per-position sequential call, not a batched
+                    # multi-position one.
+                    prefix = f"model.layers.{layer}"
+                    attn_out = _qwen35_attention_residual(
+                        hidden, weights, prefix, self.cfg, kv, layer,
+                        offset + position)
+                    hidden = _qwen35_mlp_residual(
                         attn_out, weights, prefix, self.cfg, layer,
                         self._get_experts,
                         iter_expert_batches=self._iter_expert_batches)
