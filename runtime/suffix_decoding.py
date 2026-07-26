@@ -506,7 +506,16 @@ def fallback_reason(engine, kv, sampling, constraint, *, terminal: bool) -> str 
     if engine.rc.resident_fast_decode or engine.rc.resident_moe_decode:
         return "resident-decode"
     glm_family = engine.cfg.model_type in ("glm_moe_dsa", "kimi_k25", "glm4_moe_lite")
-    if not glm_family and (engine.cfg.num_experts or engine.cfg.model_type == "gpt_oss"):
+    # F113 follow-on (2026-07-26, Kimi K3 readiness): kimi_linear is real
+    # MoE (48B/3B active) but forward_tokens_serial_positions's kimi_family
+    # dispatch was verified byte-identical against the REAL checkpoint's
+    # own MoE routing (_kimi_linear_mlp_residual's _route_experts), not
+    # just its dense/full-attention layers -- stronger evidence than
+    # qwen3_5_moe currently has (that one was only tested dense), so it is
+    # exempted here alongside glm_family rather than left blocked.
+    kimi_linear_family = engine.cfg.model_type == "kimi_linear"
+    if not glm_family and not kimi_linear_family and (
+            engine.cfg.num_experts or engine.cfg.model_type == "gpt_oss"):
         return "non-dense-target"
     # 2026-07-25: real Qwen3.5/3.6 text checkpoints (e.g. Qwen3.5-9B) carry a
     # non-empty `vision_config` sub-dict in their raw config.json (inherited
@@ -526,7 +535,7 @@ def fallback_reason(engine, kv, sampling, constraint, *, terminal: bool) -> str 
     if getattr(kv, "compressed_mla", False):
         return "compressed-kv"
     if (getattr(kv, "kda_cache", None) is not None
-            and engine.cfg.model_type != "qwen3_5"):
+            and engine.cfg.model_type not in ("qwen3_5", "kimi_linear")):
         # F94: KVCache.trim() has no kda_cache branch -- a partially-accepted
         # round would silently roll back only the ordinary KV, leaving the
         # DeltaNet/KDA recurrent state polluted by the rejected suffix with
@@ -545,8 +554,18 @@ def fallback_reason(engine, kv, sampling, constraint, *, terminal: bool) -> str 
         # qwen3_5_moe is NOT exempted here -- it's already excluded above
         # via the num_experts/"non-dense-target" check, since per-position
         # MoE routing safety for Qwen hasn't been separately verified the
-        # way GLM's was; kimi_linear (KDA+MLA hybrid) is also not exempted,
-        # since forward_tokens_serial_positions has no dispatch for it.
+        # way GLM's was.
+        #
+        # F113 follow-on (2026-07-26, Kimi K3 readiness): kimi_linear
+        # (KDA+MLA hybrid) gets the same real fix -- forward_tokens_
+        # serial_positions' kimi_family dispatch (_kimi_linear_attention_
+        # residual/_kimi_linear_mlp_residual, which internally dispatch
+        # KDA vs MLA per layer) was verified byte-identical, both logits
+        # and kda_cache state across all KDA layers, against the real
+        # Kimi-Linear-48B-A3B-Instruct checkpoint. The SAME round-loop
+        # fork/restore code below already handles any kda_cache-bearing
+        # target generically (it never branched on model_type), so no
+        # separate fork/restore logic was needed for this target.
         return "recurrent-state-target"
     if engine._embed_rows is not None or engine._streamed_lm_head is not None:
         return "streamed-embedding-or-head"

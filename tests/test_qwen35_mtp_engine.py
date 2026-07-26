@@ -134,24 +134,26 @@ def test_forward_tokens_serial_positions_excludes_hybrid_model_types():
     names that don't exist on a linear_attention layer. This reproduced live
     against a real Qwen3.6-27B checkpoint (qwen35_mtp_gate.py).
 
-    F113 follow-on (2026-07-25): qwen3_5/qwen3_5_moe were given a real
-    per-position qwen_family dispatch (_qwen35_attention_residual /
-    _qwen35_mlp_residual, verified byte-identical against real Qwen3.5-9B
-    sequential decode) and are no longer refused by this guard --
-    kimi_linear (KDA + MLA hybrid, same recurrent-state shape) still is,
-    since it was not given an equivalent dispatch this session."""
+    F113 follow-on (2026-07-25/26): qwen3_5/qwen3_5_moe and kimi_linear
+    were each given a real per-position dispatch (_qwen35_attention_residual/
+    _qwen35_mlp_residual and _kimi_linear_attention_residual/
+    _kimi_linear_mlp_residual respectively, both verified byte-identical
+    against real checkpoints -- Qwen3.5-9B and Kimi-Linear-48B-A3B-
+    Instruct) and are no longer refused by this guard. gpt_oss (plain
+    MoE, no hybrid/recurrent layers, never given an equivalent dispatch)
+    still is."""
     from runtime.engine import StreamingEngine
 
     engine = object.__new__(StreamingEngine)
-    engine.cfg = SimpleNamespace(num_experts=0, model_type="kimi_linear")
+    engine.cfg = SimpleNamespace(num_experts=8, model_type="gpt_oss")
     try:
         engine.forward_tokens_serial_positions([1, 2], kv=None)
         raised = False
     except ValueError:
         raised = True
-    assert raised, "forward_tokens_serial_positions must refuse kimi_linear"
+    assert raised, "forward_tokens_serial_positions must refuse gpt_oss"
 
-    for model_type in ("qwen3_5", "qwen3_5_moe"):
+    for model_type in ("qwen3_5", "qwen3_5_moe", "kimi_linear"):
         engine = object.__new__(StreamingEngine)
         engine.cfg = SimpleNamespace(num_experts=0, model_type=model_type)
         try:
@@ -163,7 +165,7 @@ def test_forward_tokens_serial_positions_excludes_hybrid_model_types():
             )
         except AttributeError:
             # Expected: this fake engine has no real weights/kv, so it
-            # proceeds past the guard into the qwen_family dispatch and
+            # proceeds past the guard into the per-position dispatch and
             # fails there instead -- proving the guard itself let it
             # through, which is what this test is checking.
             pass

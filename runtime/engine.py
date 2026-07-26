@@ -2659,8 +2659,9 @@ class StreamingEngine:
         """
         glm_family = self.cfg.model_type in ("glm_moe_dsa", "kimi_k25", "glm4_moe_lite")
         qwen_family = self.cfg.model_type in ("qwen3_5", "qwen3_5_moe")
-        if not glm_family and not qwen_family and (
-                self.cfg.num_experts or self.cfg.model_type in ("gpt_oss", "kimi_linear")):
+        kimi_family = self.cfg.model_type == "kimi_linear"
+        if not glm_family and not qwen_family and not kimi_family and (
+                self.cfg.num_experts or self.cfg.model_type == "gpt_oss"):
             # F94: layer_runner.run_block (this function's per-layer call
             # below) is a plain dense-transformer block with no awareness of
             # the hybrid DeltaNet/full-attention layer_types these model
@@ -2690,10 +2691,17 @@ class StreamingEngine:
             # per-position dispatch isn't just avoiding batched-GEMM
             # divergence here, it's the SAME mechanism that makes ordinary
             # decode's own KDA state evolution correct, applied to a
-            # verify window instead of one live token at a time. kimi_linear
-            # (KDA + MLA hybrid, same recurrent-state shape) is NOT yet
-            # extended here -- not attempted this session, no real caller
-            # needs it yet.
+            # verify window instead of one live token at a time.
+            #
+            # F113 follow-on (2026-07-26, Kimi K3 readiness): kimi_linear
+            # (3:1 KDA-to-MLA hybrid, same recurrent-state shape as
+            # qwen_family plus GLM-shaped MLA/MoE on its full_attn_layers)
+            # reuses _kimi_linear_attention_residual/_kimi_linear_mlp_residual
+            # (already split out for F35-prep, kimi_linear.py) unchanged --
+            # that split already internally dispatches KDA vs MLA per
+            # layer via cfg.full_attn_layers/cfg.kda_layers, so this
+            # function only needed to call it per-position, mirroring the
+            # qwen_family branch above.
             raise ValueError(
                 "serial-position verification currently supports dense models only")
         if not tokens:
@@ -2719,6 +2727,9 @@ class StreamingEngine:
             from .glm import _glm_attention_residual, _glm_mlp_residual
         if qwen_family:
             from .qwen35 import _qwen35_attention_residual, _qwen35_mlp_residual
+        if kimi_family:
+            from .kimi_linear import (
+                _kimi_linear_attention_residual, _kimi_linear_mlp_residual)
         for layer in range(n):
             if self.prefetcher:
                 for nxt in range(
@@ -2766,6 +2777,21 @@ class StreamingEngine:
                         hidden, weights, prefix, self.cfg, kv, layer,
                         offset + position)
                     hidden = _qwen35_mlp_residual(
+                        attn_out, weights, prefix, self.cfg, layer,
+                        self._get_experts,
+                        iter_expert_batches=self._iter_expert_batches)
+                elif kimi_family:
+                    # F113 follow-on (Kimi K3 readiness): same one-
+                    # position-at-a-time contract as qwen_family above --
+                    # _kimi_linear_attention_residual itself picks KDA vs
+                    # MLA per layer (cfg.kda_layers/full_attn_layers), so
+                    # kda_cache and MLA KV both evolve exactly as real
+                    # sequential decode would.
+                    prefix = f"model.layers.{layer}"
+                    attn_out = _kimi_linear_attention_residual(
+                        hidden, weights, prefix, self.cfg, kv, layer,
+                        offset + position)
+                    hidden = _kimi_linear_mlp_residual(
                         attn_out, weights, prefix, self.cfg, layer,
                         self._get_experts,
                         iter_expert_batches=self._iter_expert_batches)
