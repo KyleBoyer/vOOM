@@ -202,27 +202,45 @@ live memory governor can still clamp individual layers below that value.
 Dense Qwen keeps layer-stationary prefill off by default because a deterministic
 9B captured-boundary A/B measured a small regression.
 
-Fast/lossy routes automatically use string-level grammar jump-forward for
-constrained tool/JSON scaffolding. This can change free-choice token IDs even
-when forced scaffolding remains valid, so it never applies to lossless model
-IDs; `VMODEL_GRAMMAR_JUMP_FORWARD_LOSSY=0` is the lossy-route rollback and
-`=1` is the explicit override. With the hidden tool gateway enabled,
+Fast/lossy routes can use string-level grammar jump-forward for constrained
+tool/JSON scaffolding via `VMODEL_GRAMMAR_JUMP_FORWARD_LOSSY=1`; it never
+applies to lossless model IDs. **2026-07-26 correction**: `auto` briefly
+defaulted this on for every lossy request, but it can change free-choice
+token IDs even when forced scaffolding remains valid — on the pinned
+134-tool captured request it changed a real pagination `limit` argument.
+That is exactly why it was originally documented as "rejected as an
+automatic default, remains opt-in," a decision a later commit silently
+reversed. `auto` now matches that original behavior again (disabled);
+`=1` is the explicit, still-available override for anyone who has validated
+it against their own request shapes. With the hidden tool gateway enabled,
 high-confidence forced actions and conventional activated pagination bypass
 redundant private model-routing generation by default;
 `VMODEL_FAST_TOOL_GATEWAY_HOST_ROUTE=0` restores the model decision A/B.
+This host-routed pagination bypass is deterministic host-side logic (advance
+a literal numeric offset/limit only after the tool result reports
+`hasMore: true`), not a model-quality trade-off, so it stays on by default.
 
-For a fast Qwen3.5/3.6 MoE request, the gateway also selects a measured
-task-execution capsule when all of these gates hold: exactly one host-routed
-read-only tool, an explicit external-action request, at least 4K characters of
-system scaffolding, and no developer message. That private phase keeps the
-user/assistant/tool history and selected schema, uses a request-local top-2
-expert schedule, and owns a separate prompt-cache namespace. Mutating or
-ambiguous tools, developer-scoped requests, smaller prompts, ordinary
-generation, and every lossless route preserve the full context and released
-top-k. Rollbacks are
-`VMODEL_FAST_TOOL_GATEWAY_EXECUTION_CONTEXT=full`,
-`VMODEL_FAST_TOOL_GATEWAY_QWEN_MOE_TOP_K=released`, and
-`VMODEL_FAST_TOOL_GATEWAY_EXECUTION_PROSE=1`.
+For a fast Qwen3.5/3.6 MoE request, the gateway can also select a measured
+task-execution capsule — keeping only the user/assistant/tool history and
+selected schema, a request-local top-2 expert schedule, and a separate
+prompt-cache namespace — via explicit
+`VMODEL_FAST_TOOL_GATEWAY_EXECUTION_CONTEXT=task`.
+**2026-07-26 correction**: `auto` used to select this capsule automatically
+for a narrow read-only/host-routed/large-system-prompt shape. That shape was
+validated only against one pinned captured request, replayed through a test
+harness that also substituted a compact planner tool schema for the real
+one — the unmodified capture (and a real live session replaying it) either
+never satisfies the gate or does and still fails to produce a usable tool
+call, so the measured latency win has not been shown to generalize. `auto`
+now always stays on the safe, full-context path
+(`VMODEL_FAST_TOOL_GATEWAY_EXECUTION_CONTEXT=full` is the equivalent
+explicit form); the narrow path, its top-2 expert routing
+(`VMODEL_FAST_TOOL_GATEWAY_QWEN_MOE_TOP_K`), and its prose stripping
+(`VMODEL_FAST_TOOL_GATEWAY_EXECUTION_PROSE`) remain fully implemented and
+available via explicit opt-in for anyone who validates them against a
+broad replay corpus of real request shapes first — see "Avoiding overfit
+defaults" in `CLAUDE.md`/`AGENTS.md` before re-enabling any of these by
+default again.
 
 Native Qwen MTP defaults to `auto`: it is considered only for dense checkpoints
 whose payload exceeds vOOM's weight-cache budget, and only for output budgets

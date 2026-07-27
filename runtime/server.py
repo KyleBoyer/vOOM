@@ -93,6 +93,8 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import heapq
+import itertools
 import json
 import math
 import os
@@ -894,7 +896,20 @@ def _qwen_chunked_delta_policy(
 
 
 def _grammar_jump_forward_policy(requested: str, *, mode: str) -> tuple[bool, str]:
-    """Use string-level grammar jumps automatically only in lossy modes."""
+    """Use string-level grammar jumps only when explicitly requested.
+
+    2026-07-26 correction: a prior change made ``auto`` resolve to enabled for
+    every lossy fast-mode request. That reproduces a real correctness risk
+    this same jump-forward path was already measured to cause on the pinned
+    134-tool captured request -- it changed the model's free-choice tool
+    arguments (e.g. a pagination ``limit``) even while forced scaffolding
+    stayed valid, which is exactly why it was originally documented as
+    "rejected as an automatic default, remains opt-in" before a later commit
+    silently reversed that decision. ``auto`` now matches that original,
+    tested-safe behavior; explicit opt-in remains available via
+    ``VMODEL_GRAMMAR_JUMP_FORWARD_LOSSY=1`` for anyone who has separately
+    validated it against their own request shapes.
+    """
     requested = str(requested or "auto").strip().lower()
     if requested not in ("auto", "0", "1"):
         raise ValueError(
@@ -905,7 +920,7 @@ def _grammar_jump_forward_policy(requested: str, *, mode: str) -> tuple[bool, st
         return False, "operator-disabled"
     if requested == "1":
         return True, "operator-forced"
-    return True, "auto-lossy"
+    return False, "auto-disabled-pending-argument-fidelity-validation"
 
 
 class EngineManager:
@@ -2807,11 +2822,82 @@ class EngineManager:
                 mx.clear_cache()
 
 
+class PriorityLock:
+    """A mutex granted to the lowest-priority-value waiter next, not FIFO.
+
+    2026-07-26: added after a real captured-request incident where one huge,
+    slow request left small, unrelated requests (health checks, short
+    follow-ups) waiting behind it for 10+ minutes under strict FIFO. This
+    does NOT fix that case -- an already-running request still holds the
+    lock until it finishes or fails; see
+    docs/future_lossless_techniques.md F124 for why true preemption would
+    require isolating StreamingEngine.generate()'s per-request state (today
+    it lives on shared `self.*` attributes) before it could be done safely.
+    What this DOES fix: when multiple requests are simultaneously WAITING
+    for a busy lock, the cheapest-estimated one is served first instead of
+    whichever happened to call first -- a real, safe, general scheduling
+    improvement that needs no engine changes at all.
+
+    Ties broken by arrival order (stable, no starvation among equal
+    priorities). Same context-manager protocol as threading.Lock, so
+    existing ``with INFER_LOCK:`` call sites are unchanged and get the
+    default (neutral) priority.
+    """
+
+    _DEFAULT_PRIORITY = 0.0
+
+    def __init__(self):
+        self._cond = threading.Condition()
+        self._locked = False
+        self._waiters: list[list] = []  # heap of [priority, seq, ready]
+        self._counter = itertools.count()
+
+    def acquire(self, priority: float = _DEFAULT_PRIORITY, blocking: bool = True) -> bool:
+        with self._cond:
+            if not blocking:
+                # Same contract as threading.Lock.acquire(blocking=False):
+                # succeed only if immediately free, never wait in the queue.
+                if self._locked or self._waiters:
+                    return False
+                self._locked = True
+                return True
+            entry = [float(priority), next(self._counter)]
+            heapq.heappush(self._waiters, entry)
+            try:
+                while self._locked or self._waiters[0] is not entry:
+                    self._cond.wait()
+                heapq.heappop(self._waiters)
+                self._locked = True
+                return True
+            except BaseException:
+                # A waiter that never gets to acquire (e.g. interrupted)
+                # must not leave a phantom entry blocking everyone behind it.
+                if entry in self._waiters:
+                    self._waiters.remove(entry)
+                    heapq.heapify(self._waiters)
+                raise
+
+    def release(self) -> None:
+        with self._cond:
+            self._locked = False
+            self._cond.notify_all()
+
+    def __enter__(self):
+        self.acquire()
+        return self
+
+    def __exit__(self, *exc_info):
+        self.release()
+
+
 MANAGER = EngineManager()
 # 2026-07-12 audit: ThreadingHTTPServer would otherwise run CONCURRENT Metal
 # inference (competing for the same sampled unified-memory headroom) and could swap/close an engine out
 # from under an in-flight request. One inference at a time, engine held.
-INFER_LOCK = threading.Lock()
+# 2026-07-26: upgraded to PriorityLock (see its docstring) so a small waiting
+# request can be served before a large one that arrived earlier but hasn't
+# started yet -- plain `with INFER_LOCK:` is unchanged and unaffected.
+INFER_LOCK = PriorityLock()
 
 
 class PackManager:
@@ -4530,7 +4616,23 @@ def _hidden_gateway_execution_context_policy(
         requested: str, *, messages: list[dict], selected_tools: list[dict],
         mode: str, model_type: str, host_route: bool,
         force_reason: str | None) -> tuple[str, str]:
-    """Choose the measured task capsule only for a narrow read-only route."""
+    """Choose the measured task capsule only when explicitly requested.
+
+    2026-07-26 correction: this "auto" branch used to resolve to "task" (the
+    narrow capsule, plus its downstream top-2 expert routing and prose
+    stripping) for a specific read-only/host-routed/large-system-prompt
+    shape. That shape was validated against exactly one pinned captured
+    request via a test harness that also substituted a compact planner tool
+    schema for the real one -- the unmodified capture (and a real live
+    session replaying it) never actually satisfies this gate, or does but
+    still fails to produce a usable tool call, so the measured "24.9s
+    automatic path" win has not been shown to generalize. Auto now stays on
+    the safe "full" context unconditionally; the narrow path remains fully
+    implemented and available via explicit
+    ``VMODEL_FAST_TOOL_GATEWAY_EXECUTION_CONTEXT=task`` for anyone who has
+    validated it against a broader replay corpus of real request shapes, not
+    just this one capture.
+    """
     requested = str(requested or "auto").strip().lower()
     if requested not in ("auto", "full", "task"):
         raise ValueError(
@@ -4544,33 +4646,7 @@ def _hidden_gateway_execution_context_policy(
                 "lossy fast modes")
         return "task", "operator-task"
 
-    if mode not in ("fast", "fast-long"):
-        return "full", "lossless-route"
-    if model_type != "qwen3_5_moe":
-        return "full", "unmeasured-architecture"
-    if not host_route or force_reason != "external-action-imperative":
-        return "full", "model-routed-or-continuation"
-    if len(selected_tools) != 1:
-        return "full", "ambiguous-tool-selection"
-    if any(message.get("role") == "developer" for message in messages):
-        return "full", "developer-context-present"
-    name = _tool_function_name(selected_tools[0]).rsplit("__", 1)[-1]
-    if re.search(
-            r"(?:^|_)(?:create|delete|deploy|edit|execute|install|kill|merge|"
-            r"move|purchase|push|remove|rename|run|schedule|send|update|upload|"
-            r"write)(?:_|$)",
-            name, re.IGNORECASE):
-        return "full", "possibly-mutating-tool"
-    if not re.search(
-            r"(?:^|_)(?:list|get|search|read|inspect|query|fetch)(?:_|$)",
-            name, re.IGNORECASE):
-        return "full", "possibly-mutating-tool"
-    system_chars = sum(
-        len(_gateway_message_text(message)) for message in messages
-        if message.get("role") == "system")
-    if system_chars < 4096:
-        return "full", "small-system-context"
-    return "task", "auto-read-only-large-system"
+    return "full", "auto-disabled-pending-broad-corpus-validation"
 
 
 def _hidden_gateway_activation_clear() -> None:
@@ -5652,8 +5728,16 @@ class Handler(BaseHTTPRequestHandler):
         previous_timeout = self.connection.gettimeout()
         try:
             self.connection.settimeout(write_timeout)
-            with INFER_LOCK:
+            # 2026-07-26: priority is just the raw body size -- a cheap, always
+            # -available proxy for expected cost, computable before any model
+            # work starts. Smaller requests are served first when several are
+            # simultaneously waiting for a busy engine; does not preempt one
+            # already running (see PriorityLock's docstring).
+            INFER_LOCK.acquire(priority=len(parsed[0]))
+            try:
                 return self._do_post_locked()
+            finally:
+                INFER_LOCK.release()
         except (BrokenPipeError, ConnectionResetError, TimeoutError):
             # No response can be recovered once a streamed socket has failed;
             # close it and, critically, leave the lock context immediately.

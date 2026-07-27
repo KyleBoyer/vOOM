@@ -1,5 +1,20 @@
 # Qwen3.6-35B-A3B: next optimizations after the sub-30 cold gate
 
+**Correction, 2026-07-26 (later same day)**: the "24.9163 seconds cold"
+result below depended on two `auto`-default gateway behaviors
+(`_grammar_jump_forward_policy`, `_hidden_gateway_execution_context_policy`
+in `runtime/server.py`) that have since been reverted to opt-in — see
+STATUS.md's top entry. Neither a byte-for-byte replay of the real capture nor
+a live Kai session ever reproduced this narrow automatic path; it was
+validated against exactly one pinned capture via a test harness that also
+substituted a compact tool schema for the real one. The queue below is still
+a reasonable execution order for genuinely general work (P1/P2 items
+especially), but any item whose "current measured envelope" depends on the
+now-reverted automatic path should be re-baselined against the safe
+(`full`-context, jump-forward-off) default before being trusted, and any new
+automatic-by-default behavior should be validated against a broad replay
+corpus of real request shapes — not one pinned capture — before shipping.
+
 Updated 2026-07-26. This is the execution queue after the real 178,616-byte,
 134-tool captured request reached **24.9163 seconds cold** and the host-routed
 pagination continuation reached **0.2533 seconds warm**.

@@ -6,12 +6,14 @@ import json
 import os
 import sys
 import tempfile
+import threading
+import time
 from types import SimpleNamespace
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from runtime.server import (Handler, INFER_LOCK, PreparedPrompt, RequestValidationError,
+from runtime.server import (Handler, INFER_LOCK, PreparedPrompt, PriorityLock, RequestValidationError,
                             _TokenOffsetIndex,
                             _active_context_limit,
                             _advertised_model_ids,
@@ -989,7 +991,15 @@ def test_hidden_gateway_task_context_keeps_task_history_and_reports_omission():
         raise AssertionError("an unknown execution context was accepted")
 
 
-def test_hidden_gateway_task_context_auto_is_narrow_and_read_only():
+def test_hidden_gateway_task_context_auto_always_stays_full():
+    # 2026-07-26 correction: this narrow "task" capsule (plus its downstream
+    # top-2 expert routing and prose stripping) was only ever validated
+    # against one pinned captured request via a test harness that also
+    # substituted a compact tool schema for the real one -- the unmodified
+    # capture does not reliably reproduce its claimed win. `auto` no longer
+    # activates it automatically for any shape, read-only or not; explicit
+    # `VMODEL_FAST_TOOL_GATEWAY_EXECUTION_CONTEXT=task` still does (covered
+    # below), preserving the code for future validated opt-in use.
     messages = [
         {"role": "system", "content": "x" * 5000},
         {"role": "user", "content": "list Plex media and paginate"},
@@ -999,7 +1009,7 @@ def test_hidden_gateway_task_context_auto_is_narrow_and_read_only():
         "auto", messages=messages, selected_tools=[read_tool],
         mode="fast", model_type="qwen3_5_moe", host_route=True,
         force_reason="external-action-imperative",
-    ) == ("task", "auto-read-only-large-system")
+    ) == ("full", "auto-disabled-pending-broad-corpus-validation")
 
     mutating = _named_tool("plugin__mail__mail_delete_message")
     assert _hidden_gateway_execution_context_policy(
@@ -1027,6 +1037,28 @@ def test_hidden_gateway_task_context_auto_is_narrow_and_read_only():
     )[0] == "full"
 
 
+def test_hidden_gateway_task_context_explicit_operator_request_still_works():
+    messages = [
+        {"role": "system", "content": "x" * 5000},
+        {"role": "user", "content": "list Plex media and paginate"},
+    ]
+    read_tool = _named_tool("plugin__plex__plex_list_library_media")
+    assert _hidden_gateway_execution_context_policy(
+        "task", messages=messages, selected_tools=[read_tool],
+        mode="fast", model_type="qwen3_5_moe", host_route=True,
+        force_reason="external-action-imperative",
+    ) == ("task", "operator-task")
+    try:
+        _hidden_gateway_execution_context_policy(
+            "task", messages=messages, selected_tools=[read_tool],
+            mode="lossless", model_type="qwen3_5_moe", host_route=True,
+            force_reason="external-action-imperative")
+    except ValueError as error:
+        assert "lossy fast modes" in str(error)
+    else:
+        raise AssertionError("task context was accepted for a lossless mode")
+
+
 def test_qwen_chunked_delta_auto_is_lossy_only_and_overridable():
     assert _qwen_chunked_delta_policy(
         "auto", mode="fast", model_type="qwen3_5_moe",
@@ -1042,9 +1074,17 @@ def test_qwen_chunked_delta_auto_is_lossy_only_and_overridable():
     ) == (False, "unsupported-architecture")
 
 
-def test_grammar_jump_forward_auto_is_lossy_only_and_overridable():
+def test_grammar_jump_forward_auto_is_disabled_pending_validation():
+    # 2026-07-26 correction: this used to default-enable for every lossy
+    # fast-mode request. That reproduces a real measured correctness risk
+    # (it can change free-choice tool arguments, e.g. a pagination `limit`)
+    # that was already documented as "rejected as an automatic default,
+    # remains opt-in" before a later commit silently reversed it. `auto` now
+    # matches that original, tested-safe behavior again; explicit opt-in via
+    # `VMODEL_GRAMMAR_JUMP_FORWARD_LOSSY=1` is unchanged.
     assert _grammar_jump_forward_policy(
-        "auto", mode="fast") == (True, "auto-lossy")
+        "auto", mode="fast"
+    ) == (False, "auto-disabled-pending-argument-fidelity-validation")
     assert _grammar_jump_forward_policy(
         "0", mode="fast") == (False, "operator-disabled")
     assert _grammar_jump_forward_policy(
@@ -3224,6 +3264,91 @@ def test_engine_generate_scopes_and_restores_qwen_expert_top_k():
     ) == {"via": "request-top-k"}
     assert target.cfg.expert_top_k_by_layer == ()
     assert target.rc.expert_top_k_by_layer == ()
+
+
+def test_priority_lock_serves_waiters_in_priority_order_not_arrival_order():
+    lock = PriorityLock()
+    lock.acquire()  # hold it so every thread below queues up as a waiter
+
+    order = []
+    order_lock = threading.Lock()
+    # Deliberately spawned in an order that does NOT match priority, so a
+    # pass here can only be explained by real priority-based scheduling.
+    priorities = [30, 10, 20, 0]
+
+    def worker(priority):
+        lock.acquire(priority=priority)
+        with order_lock:
+            order.append(priority)
+        lock.release()
+
+    threads = [threading.Thread(target=worker, args=(p,)) for p in priorities]
+    for thread in threads:
+        thread.start()
+
+    deadline = time.monotonic() + 5.0
+    while len(lock._waiters) < len(priorities) and time.monotonic() < deadline:
+        time.sleep(0.005)
+    assert len(lock._waiters) == len(priorities), (
+        "not all threads registered as waiters before the deadline")
+
+    lock.release()  # let the queued waiters run, lowest priority first
+    for thread in threads:
+        thread.join(timeout=5.0)
+        assert not thread.is_alive()
+
+    assert order == sorted(priorities), (
+        f"expected priority order {sorted(priorities)}, got {order}")
+
+
+def test_priority_lock_ties_broken_by_arrival_order():
+    lock = PriorityLock()
+    lock.acquire()
+
+    order = []
+    order_lock = threading.Lock()
+
+    def worker(label):
+        lock.acquire(priority=5)  # same priority for every waiter
+        with order_lock:
+            order.append(label)
+        lock.release()
+
+    labels = ["first", "second", "third"]
+    threads = []
+    for label in labels:
+        thread = threading.Thread(target=worker, args=(label,))
+        threads.append(thread)
+        thread.start()
+        # Register one at a time so arrival order is deterministic; the
+        # heap's secondary (seq) key is what this test actually verifies.
+        deadline = time.monotonic() + 5.0
+        while (len(lock._waiters) < len(threads)
+               and time.monotonic() < deadline):
+            time.sleep(0.005)
+
+    lock.release()
+    for thread in threads:
+        thread.join(timeout=5.0)
+        assert not thread.is_alive()
+
+    assert order == labels
+
+
+def test_priority_lock_nonblocking_matches_threading_lock_contract():
+    lock = PriorityLock()
+    assert lock.acquire(blocking=False) is True
+    assert lock.acquire(blocking=False) is False
+    lock.release()
+    assert lock.acquire(blocking=False) is True
+    lock.release()
+
+
+def test_priority_lock_context_manager_uses_default_priority():
+    lock = PriorityLock()
+    with lock:
+        assert lock._locked is True
+    assert lock._locked is False
 
 
 def _run_all():
