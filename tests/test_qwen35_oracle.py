@@ -10,7 +10,7 @@ import torch
 
 from runtime.config import ModelConfig
 from runtime.kda_state import KDAStateCache
-from runtime.kv_cache import KVCache
+from runtime.kv_cache import Fp8KVCache, KVCache
 from runtime.qwen35 import (
     _full_attention,
     _gated_delta_net,
@@ -227,6 +227,80 @@ def test_gated_full_attention_matches_reference():
         mx.array(hidden.numpy()), weights, prefix, _runtime_config(),
         KVCache(2), 1, 0)
     _assert_close(actual, expected, tolerance=1e-3)
+
+
+def test_fp8_kv_cache_full_attention_precision_impact_is_bounded():
+    """Fp8KVCache is explicitly lossy -- this does not assert it matches the
+    real reference at the same 1e-3 tolerance as the lossless KVCache case
+    above. It measures the ACTUAL precision cost (both against the real HF
+    reference and, more directly, against vOOM's own full-precision output)
+    and asserts it stays within a bounded, expected-for-fp8-e4m3 range,
+    across an incremental multi-call sequence (prefill-then-decode shaped),
+    not just one one-shot call."""
+    config = _hf_config()
+    real = Qwen3_5MoeAttention(config, layer_idx=1)
+    _randomize(real, 5)
+    torch.manual_seed(6)
+    hidden = torch.randn(1, LENGTH, HIDDEN)
+    positions = torch.arange(LENGTH).unsqueeze(0)
+    rope = Qwen3_5MoeTextRotaryEmbedding(config)
+    embeddings = rope(hidden, positions)
+    causal = torch.where(
+        torch.arange(LENGTH)[None, :] <= torch.arange(LENGTH)[:, None],
+        0.0, float("-inf"),
+    )[None, None, :, :]
+    with torch.no_grad():
+        expected, _ = real(
+            hidden, position_embeddings=embeddings,
+            attention_mask=causal, past_key_values=None)
+    prefix = "model.layers.1"
+    weights = _mx_state(real, f"{prefix}.self_attn")
+    rcfg = _runtime_config()
+
+    # Incremental: a 4-token "prefill" call followed by 3 one-at-a-time
+    # "decode" calls into the SAME cache, mirroring real production use --
+    # a one-shot-only test would miss bugs in the incremental concatenate
+    # path specifically.
+    lossless_cache = KVCache(2)
+    lossless_chunks = [
+        _full_attention(mx.array(hidden[:, :4].numpy()), weights, prefix,
+                         rcfg, lossless_cache, 1, 0)]
+    for position in range(4, LENGTH):
+        lossless_chunks.append(_full_attention(
+            mx.array(hidden[:, position:position + 1].numpy()), weights,
+            prefix, rcfg, lossless_cache, 1, position))
+    lossless = mx.concatenate(lossless_chunks, axis=1)
+
+    fp8_cache = Fp8KVCache(2)
+    fp8_chunks = [
+        _full_attention(mx.array(hidden[:, :4].numpy()), weights, prefix,
+                         rcfg, fp8_cache, 1, 0)]
+    for position in range(4, LENGTH):
+        fp8_chunks.append(_full_attention(
+            mx.array(hidden[:, position:position + 1].numpy()), weights,
+            prefix, rcfg, fp8_cache, 1, position))
+    fp8 = mx.concatenate(fp8_chunks, axis=1)
+    mx.eval(lossless, fp8)
+
+    lossless_np = np.array(lossless)
+    fp8_np = np.array(fp8)
+    expected_np = expected.detach().numpy()
+    assert lossless_np.shape == fp8_np.shape == expected_np.shape
+
+    vs_lossless = float(np.max(np.abs(fp8_np - lossless_np)))
+    vs_reference = float(np.max(np.abs(fp8_np - expected_np)))
+    lossless_vs_reference = float(np.max(np.abs(lossless_np - expected_np)))
+    # e4m3 has 3 mantissa bits (~12.5% max relative step); bound generously
+    # above that on this tiny random-weight fixture rather than pin an exact
+    # number, but a real bug (wrong axis, wrong dtype, stale cache) would
+    # blow through this by orders of magnitude, not stay within it.
+    assert vs_lossless < 0.35, (
+        f"fp8 cache diverged from vOOM's own full-precision output by "
+        f"{vs_lossless} -- larger than e4m3 precision alone should explain")
+    assert vs_reference < lossless_vs_reference + 0.35, (
+        f"fp8 cache's gap to the real reference ({vs_reference}) grew far "
+        f"beyond the lossless implementation's own baseline gap "
+        f"({lossless_vs_reference})")
 
 
 def test_multimodal_partial_interleaved_attention_matches_reference():

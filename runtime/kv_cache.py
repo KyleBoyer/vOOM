@@ -71,6 +71,47 @@ class KVCache:
             dsa.trim(length)
 
 
+class Fp8KVCache(KVCache):
+    """Same interface and math-facing contract as KVCache, but the resident
+    storage for keys/values is native MLX fp8 (e4m3, packed as uint8) instead
+    of the model's bf16 compute dtype -- halves ordinary full-attention KV
+    memory. Deliberately NOT applied to any hybrid recurrent (DeltaNet/KDA)
+    state: that state is small and fixed-size regardless of context length,
+    so there is little memory to save there and this class never touches it.
+
+    2026-07-27: added after independently checking TurboQuant (Zandieh et
+    al., ICLR 2026) against real-world evaluation reports rather than its
+    own paper numbers -- 3-bit modes showed 15-25 point drops on hard
+    reasoning benchmarks (AIME25/LiveCodeBench) at long context despite the
+    paper's own "quality neutral" framing, and the community's own practical
+    default converged on plain FP8, not the fancier rotation+codebook
+    scheme. FP8 needs no calibration, no codebook, and no residual
+    correction -- mx.to_fp8/mx.from_fp8 are a direct, stateless format
+    conversion. See tests/test_qwen35_oracle.py's FP8 case and
+    tests/test_fp8_kv_cache_real_model.py for the actual measured precision
+    impact; this is genuinely lossy and defaults OFF
+    (VMODEL_QWEN35_FP8_KV_CACHE=1 to opt in) until validated more broadly,
+    per CLAUDE.md/AGENTS.md's "Avoiding overfit defaults" rule.
+    """
+
+    def __init__(self, num_layers: int, compute_dtype=mx.bfloat16):
+        super().__init__(num_layers)
+        self._compute_dtype = compute_dtype
+
+    def update(self, layer: int, k: mx.array, v: mx.array) -> tuple[mx.array, mx.array]:
+        k8 = mx.to_fp8(k.astype(self._compute_dtype))
+        v8 = mx.to_fp8(v.astype(self._compute_dtype))
+        if self.keys[layer] is None:
+            self.keys[layer], self.values[layer] = k8, v8
+        else:
+            self.keys[layer] = mx.concatenate([self.keys[layer], k8], axis=2)
+            self.values[layer] = mx.concatenate([self.values[layer], v8], axis=2)
+        return (
+            mx.from_fp8(self.keys[layer], self._compute_dtype),
+            mx.from_fp8(self.values[layer], self._compute_dtype),
+        )
+
+
 def fork_hybrid_kv_endpoint(kv: "KVCache") -> "KVCache":
     """Share an evaluated hybrid (DeltaNet/KDA + attention) endpoint cheaply.
 

@@ -416,6 +416,14 @@ class RuntimeConfig:
     # activation-identical across arbitrary checkpoint splits, so server.py
     # admits it automatically only for fast/lossy Qwen3.5/3.6 routes.
     qwen_chunked_delta_prefill: bool = False
+    # 2026-07-27: fp8 (e4m3) storage for Qwen3.5/3.6's ordinary full-attention
+    # KV cache (never the DeltaNet/KDA recurrent state -- that's small and
+    # fixed-size regardless of context length). Genuinely lossy; explicit
+    # opt-in only (VMODEL_QWEN35_FP8_KV_CACHE=1), no auto-default, per
+    # CLAUDE.md/AGENTS.md's "Avoiding overfit defaults" rule -- this has not
+    # been validated broadly enough to default on. See
+    # tests/test_qwen35_oracle.py's fp8 case for the measured precision cost.
+    qwen_fp8_kv_cache: bool = False
     # F11: prompt-lookup (n-gram) speculative decoding, mutually exclusive
     # with qwen_mtp_speculative above for this first version (see
     # EngineManager.get()'s construction site in server.py). Zero-model --
@@ -3133,6 +3141,11 @@ class StreamingEngine:
             from .kv_cache import SteppedKVCache
 
             kv = SteppedKVCache(self.cfg.num_hidden_layers)
+        elif (self.rc.qwen_fp8_kv_cache
+                and self.cfg.model_type in ("qwen3_5", "qwen3_5_moe")):
+            from .kv_cache import Fp8KVCache
+
+            kv = Fp8KVCache(self.cfg.num_hidden_layers)
         else:
             kv = KVCache(self.cfg.num_hidden_layers)
         if self.rc.mla_compressed_kv and self.cfg.model_type == "glm_moe_dsa":

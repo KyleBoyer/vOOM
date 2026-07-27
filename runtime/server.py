@@ -2393,6 +2393,16 @@ class EngineManager:
                     chunked_delta_request, mode=mode, model_type=mtype)
             except ValueError as error:
                 raise RequestValidationError(str(error)) from error
+            fp8_kv_request = os.environ.get(
+                "VMODEL_QWEN35_FP8_KV_CACHE", "0")
+            if fp8_kv_request not in ("0", "1"):
+                raise RequestValidationError(
+                    "VMODEL_QWEN35_FP8_KV_CACHE must be 0 or 1")
+            # Explicit opt-in only -- no "auto" resolution. Genuinely lossy,
+            # not yet validated broadly enough to ever default on; see
+            # CLAUDE.md/AGENTS.md's "Avoiding overfit defaults" rule.
+            rc.qwen_fp8_kv_cache = (
+                fp8_kv_request == "1" and mtype in ("qwen3_5", "qwen3_5_moe"))
             rc.execution_profile = execution_profile
             from .resident_mlx_lm import (
                 ResidentMLXLMEngine, choose_resident_backend)

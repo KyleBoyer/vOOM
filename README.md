@@ -202,6 +202,18 @@ live memory governor can still clamp individual layers below that value.
 Dense Qwen keeps layer-stationary prefill off by default because a deterministic
 9B captured-boundary A/B measured a small regression.
 
+Qwen3.5/3.6's ordinary full-attention KV cache (never the DeltaNet/KDA
+recurrent state) can be stored in native fp8 (e4m3) instead of bf16 via
+`VMODEL_QWEN35_FP8_KV_CACHE=1` -- halves that cache's memory. Off by default:
+genuinely lossy, and not validated broadly enough yet to auto-enable per
+CLAUDE.md/AGENTS.md's "Avoiding overfit defaults" rule. What has been
+measured: a real-weight tiny oracle bounds the precision cost
+(`tests/test_qwen35_oracle.py`), and two independent real greedy generations
+against locally-hosted Qwen3.5-4B (different prompts, 80-100 output tokens
+each) produced byte-identical output with the flag on vs off -- encouraging,
+but two prompts on one model is not a broad-corpus proof; treat it as a
+promising opt-in, not a default candidate yet.
+
 Fast/lossy routes can use string-level grammar jump-forward for constrained
 tool/JSON scaffolding via `VMODEL_GRAMMAR_JUMP_FORWARD_LOSSY=1`; it never
 applies to lossless model IDs. **2026-07-26 correction**: `auto` briefly
