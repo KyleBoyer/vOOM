@@ -253,6 +253,19 @@ class MemoryGovernor:
             mx.clear_cache()
             active, available, ceiling, projected = sample()
 
+        # psutil's instantaneous "available" reading has been measured swinging
+        # several GB within a fraction of a second on this hardware (unrelated
+        # processes' own allocation/reclaim churn). Right at the floor, with
+        # nothing left to shed, a single unlucky sample would otherwise discard
+        # the entire request. Give it a brief chance to resettle before
+        # treating one reading as ground truth -- far cheaper than the
+        # request-level retry-from-scratch this refusal would otherwise trigger.
+        resample_attempts = 0
+        while projected > ceiling and resample_attempts < 3:
+            time.sleep(0.15)
+            active, available, ceiling, projected = sample()
+            resample_attempts += 1
+
         # Eviction may still be insufficient because pinned/current tensors and
         # the operation's own scratch are not reclaimable cache pages. Refuse at
         # the floor instead of weakening the reserve or continuing fail-open.
