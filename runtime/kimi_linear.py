@@ -182,6 +182,52 @@ def _kimi_expert_swiglu(h: mx.array, w: dict, prefix: str) -> mx.array:
     return _linear(activated, w, f"{prefix}.w2")
 
 
+def _situ_and_mul(gate: mx.array, up: mx.array, beta: float, linear_beta: float) -> mx.array:
+    """Kimi K3's real "situ" activation (hidden_act="situ"), verbatim from the
+    real modeling_kimi_linear.py's SituAndMul.forward: both halves are
+    upcast to float32 for the tanh/sigmoid, result cast back to the input
+    dtype. `linear_beta` of 0.0 means "unset" (`up` passes through
+    untransformed), matching the real code's `if self.linear_beta is not
+    None`. NOT used by Kimi Linear 48B or Kimi K2.5 (both plain swiglu,
+    cfg.hidden_act defaults to "silu" for them) -- Kimi K3 only."""
+    gate32 = gate.astype(mx.float32)
+    up32 = up.astype(mx.float32)
+    situ_a = beta * mx.tanh(gate32 / beta) * mx.sigmoid(gate32)
+    if linear_beta:
+        up32 = linear_beta * mx.tanh(up32 / linear_beta)
+    return (situ_a * up32).astype(gate.dtype)
+
+
+def _kimi_expert_mlp(h: mx.array, w: dict, prefix: str, cfg: ModelConfig) -> mx.array:
+    """Per-routed-expert MLP, dispatching activation by cfg.hidden_act.
+    Kimi Linear/K2.5 (hidden_act="silu") take the exact same swiglu path as
+    _kimi_expert_swiglu above (kept separate so that function's existing
+    real-oracle test import/call sites are untouched); Kimi K3
+    (hidden_act="situ") uses _situ_and_mul instead."""
+    if cfg.hidden_act != "situ":
+        return _kimi_expert_swiglu(h, w, prefix)
+    gate = _linear(h, w, f"{prefix}.w1")
+    up = _linear(h, w, f"{prefix}.w3")
+    activated = _situ_and_mul(
+        gate, up, cfg.activation_situ_beta, cfg.activation_situ_linear_beta)
+    return _linear(activated, w, f"{prefix}.w2")
+
+
+def _kimi_dense_mlp(h: mx.array, w: dict, prefix: str, cfg: ModelConfig) -> mx.array:
+    """gate_proj/up_proj/down_proj MLP (dense layer-0, and shared_experts),
+    dispatching activation by cfg.hidden_act. Kimi Linear/K2.5 take the
+    exact same path as the existing layer_runner._swiglu call sites (kept
+    unchanged so their own real-oracle tests are untouched); Kimi K3 uses
+    _situ_and_mul instead."""
+    if cfg.hidden_act != "situ":
+        return _swiglu(h, w, prefix)
+    gate = _linear(h, w, f"{prefix}.gate_proj")
+    up = _linear(h, w, f"{prefix}.up_proj")
+    activated = _situ_and_mul(
+        gate, up, cfg.activation_situ_beta, cfg.activation_situ_linear_beta)
+    return _linear(activated, w, f"{prefix}.down_proj")
+
+
 def _kda_attention(
     h: mx.array, w: dict, prefix: str, cfg: ModelConfig, kda_cache: KDAStateCache | None, layer: int,
     native_fused_decode: bool = False,
@@ -219,9 +265,33 @@ def _kda_attention(
     dt_bias = w[f"{prefix}.self_attn.dt_bias"].reshape(H, D).astype(mx.float32)
     g_raw = _linear(_linear(h, w, f"{prefix}.self_attn.f_a_proj"), w, f"{prefix}.self_attn.f_b_proj")
     g_raw = g_raw.reshape(B, L, H, D).astype(mx.float32) + dt_bias
-    softplus_g = mx.logaddexp(g_raw, mx.zeros_like(g_raw))  # log(1 + exp(x)), numerically stable
-    A = mx.exp(w[f"{prefix}.self_attn.A_log"].astype(mx.float32)).reshape(1, 1, H, 1)
-    gate = -A * softplus_g  # (B, L, H, D) log-decay, <= 0
+    # F128: Kimi K3's real checkpoint saves A_log with head_dim elements
+    # (128), not num_heads (96) -- confirmed directly against a real
+    # downloaded layer's shard (b_proj/dt_bias both correctly reflect
+    # num_heads=96 elsewhere in the SAME layer, so this is A_log-specific,
+    # not a wrong num_heads reading). Fetched fla-org/flash-linear-
+    # attention's real kda/gate.py Triton kernel source (2026-07-27) shows
+    # A_log is indexed strictly `A_log + i_h` for i_h in [0, H) -- H passed
+    # explicitly by the caller, never inferred from A_log's own tensor
+    # size -- so the real kernel silently reads only the first H=96
+    # elements regardless of the buffer's true (over-allocated) length.
+    # Not runtime-verified against the real Triton kernel itself (no
+    # CUDA/Triton on this machine), but this is the only interpretation
+    # consistent with every real source available: the kernel's own
+    # indexing, and the original Kimi Linear 48B's A_log (no over-
+    # allocation, exactly num_heads elements, unaffected by this slice).
+    A = mx.exp(w[f"{prefix}.self_attn.A_log"][:H].astype(mx.float32)).reshape(1, 1, H, 1)
+    if cfg.kda_gate_lower_bound:
+        # F128: Kimi K3's real linear_attn_config sets gate_lower_bound=-5.0
+        # (safe_gate=True in the real KimiDeltaAttention.forward) -- ported
+        # verbatim from the real kda_gate_fwd_kernel's USE_LOWER_BOUND
+        # branch: `lower_bound * sigmoid(exp(A_log) * (g + dt_bias))`, using
+        # the RAW g_raw directly (no softplus at all in this branch, unlike
+        # the no-lower-bound formula below).
+        gate = cfg.kda_gate_lower_bound * mx.sigmoid(A * g_raw)
+    else:
+        softplus_g = mx.logaddexp(g_raw, mx.zeros_like(g_raw))  # log(1 + exp(x)), numerically stable
+        gate = -A * softplus_g  # (B, L, H, D) log-decay, <= 0
 
     beta = mx.sigmoid(_linear(h, w, f"{prefix}.self_attn.b_proj").astype(mx.float32))  # (B, L, H)
 
@@ -259,7 +329,15 @@ def _kda_attention(
         kda_cache.set_state(layer, state)
         kda_cache.set_conv_history(layer, (q_hist_new, k_hist_new, v_hist_new))
 
-    g_out = _linear(_linear(h, w, f"{prefix}.self_attn.g_a_proj"), w, f"{prefix}.self_attn.g_b_proj")
+    # F128: Kimi K3's real KimiDeltaAttention.forward picks a single
+    # full-rank g_proj instead of the low-rank g_a_proj/g_b_proj split when
+    # config.linear_attn_config.use_full_rank_gate is true (confirmed
+    # present -- true -- on the real checkpoint; absent/false for the
+    # original Kimi Linear 48B, which only ever ships g_a_proj/g_b_proj).
+    if cfg.kda_use_full_rank_gate:
+        g_out = _linear(h, w, f"{prefix}.self_attn.g_proj")
+    else:
+        g_out = _linear(_linear(h, w, f"{prefix}.self_attn.g_a_proj"), w, f"{prefix}.self_attn.g_b_proj")
     g_out = g_out.reshape(B, L, H, D)
     o = _gated_rms_norm(o, g_out, w[f"{prefix}.self_attn.o_norm.weight"], cfg.rms_norm_eps)
     o = o.reshape(B, L, H * D)
@@ -320,8 +398,22 @@ def _kimi_linear_mlp_residual(
     h = mx.fast.rms_norm(x, w[f"{prefix}.post_attention_layernorm.weight"], cfg.rms_norm_eps)
 
     if layer < cfg.first_k_dense_replace:
-        return x + _swiglu(h, w, f"{prefix}.mlp")
+        return x + _kimi_dense_mlp(h, w, f"{prefix}.mlp", cfg)
 
+    return x + _kimi_moe_output(h, w, prefix, cfg, layer, get_experts, iter_expert_batches, profile)
+
+
+def _kimi_moe_output(
+    h: mx.array, w: dict, prefix: str, cfg: ModelConfig, layer: int,
+    get_experts, iter_expert_batches=None, profile=None,
+) -> mx.array:
+    """Routed-experts + shared-experts MoE output ONLY -- no residual add,
+    and the caller must already have checked `layer >= cfg.first_k_dense_replace`
+    (the dense layer-0 case is not handled here). Factored out of
+    `_kimi_linear_mlp_residual` (which just does `x + this`) so the
+    AttnRes-aware K3 block runner below can reuse the exact same MoE math
+    without duplicating it -- AttnRes replaces what happens to the residual
+    stream around each sublayer, not the sublayer's own computation."""
     moe_prefix = f"{prefix}.block_sparse_moe"
     router_t0 = profile.start_substep() if profile is not None else None
     idx, pw = _route_experts(h, w, moe_prefix, cfg)
@@ -331,7 +423,19 @@ def _kimi_linear_mlp_residual(
         mx.eval(idx, pw)
     groups = _group_routes(idx, pw)
 
-    out = mx.zeros_like(h)
+    # F128: Kimi K3's real KimiSparseMoeBlock routes on the FULL hidden
+    # state (h, above) but runs each expert in a smaller "latent" space
+    # (config.routed_expert_hidden_size) when cfg.moe_latent_hidden_size is
+    # set -- confirmed by the real routed_expert_down_proj/_norm/_up_proj
+    # tensors on a real downloaded shard. Kimi Linear/K2.5 leave this 0, so
+    # h_latent is just h unchanged for them (identical behavior to before
+    # this branch existed).
+    if cfg.moe_latent_hidden_size:
+        h_latent = _linear(h, w, f"{moe_prefix}.routed_expert_down_proj")
+    else:
+        h_latent = h
+
+    out = mx.zeros_like(h_latent)
     expert_ids = sorted(groups)
     positions_by_expert = {e: [pt for pt, _ in groups[e]] for e in expert_ids}
     if iter_expert_batches is None:
@@ -346,15 +450,21 @@ def _kimi_linear_mlp_residual(
             plist = groups[e]
             positions = [p for p, _ in plist]
             route_weights = mx.array([wt for _, wt in plist]).astype(mx.float32)
-            y = _kimi_expert_swiglu(h[:, positions, :], experts[e], f"{moe_prefix}.experts.{e}")
-            contribution = (y * route_weights[None, :, None]).astype(h.dtype)
+            y = _kimi_expert_mlp(h_latent[:, positions, :], experts[e], f"{moe_prefix}.experts.{e}", cfg)
+            contribution = (y * route_weights[None, :, None]).astype(h_latent.dtype)
             out = out.at[:, positions, :].add(contribution)
         mx.eval(out)
         del contribution, y, route_weights
 
     consume_expert_batches(batches, consume_batch)
-    out = out + _swiglu(h, w, f"{moe_prefix}.shared_experts")
-    return x + out
+
+    if cfg.moe_latent_hidden_size:
+        if cfg.moe_latent_use_norm:
+            out = mx.fast.rms_norm(
+                out, w[f"{moe_prefix}.routed_expert_norm.weight"], cfg.rms_norm_eps)
+        out = _linear(out, w, f"{moe_prefix}.routed_expert_up_proj")
+
+    return out + _kimi_dense_mlp(h, w, f"{moe_prefix}.shared_experts", cfg)
 
 
 def run_kimi_linear_block(
@@ -383,3 +493,161 @@ def run_kimi_linear_block(
         profile.finish_substep(
             "mlp", layer, mlp_t0, x, positions=int(x.shape[1]))
     return x
+
+
+def _apply_attn_res(
+    prefix_sum: mx.array, block_residual: mx.array,
+    proj_weight: mx.array, norm_weight: mx.array, eps: float,
+) -> mx.array:
+    """F128: Kimi K3's "Attention Residuals" (AttnRes, arXiv 2603.15031),
+    ported verbatim from the real modeling_kimi_linear.py's module-level
+    `_apply_attn_res`: a softmax-attention readout over `block_residual`
+    (residual-stream snapshots taken every `cfg.attn_res_block_size`
+    layers, one column per snapshot so far) PLUS the current running
+    `prefix_sum`, using a shared RMSNorm + single learned scalar projection
+    per query/key ("proj"/"norm" are `nn.Linear(hidden,1,bias=False)` and
+    an RMSNorm respectively -- NOT the usual QK attention shapes, there is
+    only one score per snapshot, not a per-head/per-dim breakdown).
+
+    prefix_sum: (N, hidden). block_residual: (N, num_blocks, hidden), where
+    N = batch*positions and num_blocks may be 0 (no snapshot taken yet --
+    callers must skip calling this entirely in that case, matching the real
+    code's `if block_residual.shape[1] > 0` guard around its first call
+    site only; every other call site always has num_blocks >= 1 by
+    construction). Returns (N, hidden).
+    """
+    v = mx.concatenate([block_residual, prefix_sum[:, None, :]], axis=1)
+    v32 = v.astype(mx.float32)
+    variance = mx.mean(v32 * v32, axis=-1, keepdims=True)
+    k = v32 * mx.rsqrt(variance + eps)
+    score_weight = norm_weight.astype(mx.float32) * proj_weight.reshape(-1).astype(mx.float32)
+    scores = mx.sum(k * score_weight, axis=-1)
+    probs = mx.softmax(scores, axis=-1)[:, None, :]
+    out = (probs @ v32)[:, 0, :]
+    return out.astype(v.dtype)
+
+
+def attn_res_wrap_layer(
+    x: mx.array, block_residual: mx.array, w: dict, prefix: str,
+    cfg: ModelConfig, layer: int, attn_fn, mlp_fn,
+) -> tuple[mx.array, mx.array]:
+    """The AttnRes bookkeeping itself, ported verbatim from the real
+    `KimiDecoderLayer._forward_attn_residual`'s control flow, factored out
+    from any particular attention/MLP math so it can be unit-tested against
+    a real-reference torch transcription with trivial stand-in
+    `attn_fn`/`mlp_fn` (see tests/test_f128_k3_attn_res_oracle.py) --
+    KDA/MLA/MoE math is already independently oracle-verified elsewhere
+    (F92/F93), so this isolates the genuinely new risk: getting the
+    block-boundary reset/snapshot bookkeeping itself right.
+
+    `attn_fn`/`mlp_fn` each take the appropriately-normed hidden state and
+    return the sublayer's raw output (pre-residual) -- `run_kimi_k3_block`
+    below supplies the real KDA/MLA/dense/MoE closures; the oracle test
+    supplies simple deterministic stand-ins instead.
+
+    Returns `(new_prefix_sum, new_block_residual)`, both to be threaded
+    into the next layer's call exactly like `x` itself already is.
+    """
+    B, L, H = x.shape
+    prefix_sum = x
+    hidden_states = x
+
+    if block_residual.shape[1] > 0:
+        hidden_states = _apply_attn_res(
+            prefix_sum.reshape(-1, H), block_residual,
+            w[f"{prefix}.self_attention_res_proj.weight"],
+            w[f"{prefix}.self_attention_res_norm.weight"], cfg.rms_norm_eps,
+        ).reshape(B, L, H)
+
+    if layer % cfg.attn_res_block_size == 0:
+        block_residual = mx.concatenate(
+            [block_residual, prefix_sum.reshape(-1, H)[:, None, :]], axis=1)
+        prefix_sum = None
+
+    attn_out = attn_fn(mx.fast.rms_norm(
+        hidden_states, w[f"{prefix}.input_layernorm.weight"], cfg.rms_norm_eps))
+    prefix_sum = (prefix_sum + attn_out) if prefix_sum is not None else attn_out
+
+    hidden_states = _apply_attn_res(
+        prefix_sum.reshape(-1, H), block_residual,
+        w[f"{prefix}.mlp_res_proj.weight"],
+        w[f"{prefix}.mlp_res_norm.weight"], cfg.rms_norm_eps,
+    ).reshape(B, L, H)
+
+    mlp_out = mlp_fn(mx.fast.rms_norm(
+        hidden_states, w[f"{prefix}.post_attention_layernorm.weight"], cfg.rms_norm_eps))
+    prefix_sum = prefix_sum + mlp_out
+    return prefix_sum, block_residual
+
+
+def run_kimi_k3_block(
+    x: mx.array, w: dict, prefix: str, cfg: ModelConfig, kv,
+    layer: int, offset: int, block_residual: mx.array, get_experts,
+    mlp_last_only: bool = False, iter_expert_batches=None,
+    native_fused_decode: bool = False, profile=None,
+) -> tuple[mx.array, mx.array]:
+    """One Kimi K3 decoder block WITH AttnRes -- thin wrapper supplying the
+    real KDA/MLA attention and dense/MoE MLP closures to
+    `attn_res_wrap_layer` above (see its docstring for the AttnRes mechanism
+    itself). Unlike `run_kimi_linear_block` (whose `x = x + sublayer_out`
+    residual this does NOT use), the running accumulator is `prefix_sum`:
+    it resets to just the sublayer's own output at every block boundary
+    instead of adding onto the prior value. `block_residual` is this
+    function's extra piece of state, threaded by the caller exactly like
+    `x` itself -- purely an intra-forward-pass, depth-wise accumulator (the
+    real reference re-inits it fresh at the top of every `forward()` call
+    and never persists it via any KV/cache mechanism), so chunk-major
+    callers must start a fresh empty `block_residual` at the top of each
+    chunk's layer loop, never carrying it across chunks or decode steps.
+    Returns `(x, block_residual)`, both to be threaded into the next
+    layer's call.
+    """
+    def attn_fn(h):
+        if layer in cfg.full_attn_layers:
+            return _mla_attention(h, w, prefix, cfg, kv, layer, offset)
+        if layer in cfg.kda_layers:
+            kda_cache = getattr(kv, "kda_cache", None)
+            return _kda_attention(
+                h, w, prefix, cfg, kda_cache, layer,
+                native_fused_decode=native_fused_decode)
+        raise ValueError(
+            f"layer {layer} is in neither cfg.full_attn_layers nor cfg.kda_layers")
+
+    def mlp_fn(h2):
+        if layer < cfg.first_k_dense_replace:
+            return _kimi_dense_mlp(h2, w, f"{prefix}.mlp", cfg)
+        return _kimi_moe_output(
+            h2, w, prefix, cfg, layer, get_experts,
+            iter_expert_batches=iter_expert_batches, profile=profile)
+
+    # F128: unlike run_kimi_linear_block's mlp_last_only (which trims BETWEEN
+    # attention and MLP to skip MLP compute for positions whose logits are
+    # never needed), this function deliberately ignores `mlp_last_only` and
+    # always processes the full L positions through both attention and MLP.
+    # Trimming here would shrink x's row count out from under block_residual
+    # (built up over ALL positions across every earlier layer in this same
+    # sweep) with no matching trim on block_residual's own rows, breaking
+    # the row-alignment attn_res_wrap_layer's concatenation depends on. The
+    # caller (Engine._sweep) trims AFTER the whole layer loop AND
+    # apply_output_attn_res have both run instead -- see its own comment.
+    # `mlp_last_only` is accepted only so this function's call signature
+    # matches run_kimi_linear_block's; wasted MLP compute on discarded
+    # positions is a real, un-optimized cost here, not a correctness issue.
+    del mlp_last_only
+    return attn_res_wrap_layer(
+        x, block_residual, w, prefix, cfg, layer, attn_fn, mlp_fn)
+
+
+def apply_output_attn_res(
+    x: mx.array, w: dict, block_residual: mx.array, cfg: ModelConfig,
+) -> mx.array:
+    """The final AttnRes readout applied once after ALL layers (real
+    `KimiLinearModel._apply_output_attn_res`), before the model's final
+    RMSNorm -- uses its own dedicated `model.output_attn_res_proj`/
+    `model.output_attn_res_norm` weights, distinct from any per-layer ones."""
+    B, L, H = x.shape
+    return _apply_attn_res(
+        x.reshape(-1, H), block_residual,
+        w["model.output_attn_res_proj.weight"],
+        w["model.output_attn_res_norm.weight"], cfg.rms_norm_eps,
+    ).reshape(B, L, H)

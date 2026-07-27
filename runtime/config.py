@@ -107,6 +107,11 @@ class ModelConfig:
     kda_head_dim: int = 0
     kda_num_heads: int = 0
     kda_conv_kernel_size: int = 4
+    # F128: see the real fla-org/flash-linear-attention kda/gate.py source
+    # (fetched 2026-07-27) for exactly what these change -- Kimi K3-only,
+    # both default to "off"/matching Kimi Linear 48B's original behavior.
+    kda_use_full_rank_gate: bool = False
+    kda_gate_lower_bound: float = 0.0
     # Qwen3.5/Qwen3.6 Gated DeltaNet hybrid.  These checkpoints use one
     # combined causal convolution over Q/K/V, scalar decay/write gates per
     # value head, and periodic gated full-attention layers.  Keep the fields
@@ -155,6 +160,37 @@ class ModelConfig:
     # comes only from the KDA layers' inherent sequential recurrence). GLM-5.2
     # always applies real RoPE; default False preserves that unchanged.
     mla_use_nope: bool = False
+    # F128: Kimi K3's real config.json hidden_act is "situ" (Kimi's own
+    # gated activation, `SituAndMul` in the real modeling_kimi_linear.py),
+    # not the "silu"/swiglu every other model this project supports uses.
+    # activation_situ_linear_beta of 0.0 means "unset" (the real HF default
+    # is None/absent, meaning `up` passes through un-tanh'd) -- matches the
+    # real `_get_situ_activation_params` reading `config.activation_situ_*`
+    # with fallback default beta=1.0.
+    hidden_act: str = "silu"
+    activation_situ_beta: float = 1.0
+    activation_situ_linear_beta: float = 0.0
+    # F128: Kimi K3's real config.json sets routed_expert_hidden_size=3584
+    # (half hidden_size=7168) with latent_moe_use_norm=true -- confirmed by
+    # directly inspecting a real downloaded shard, which has
+    # routed_expert_down_proj/routed_expert_norm/routed_expert_up_proj
+    # tensors alongside the usual gate/experts/shared_experts ones. Routed
+    # experts run in this smaller "latent" space (down_proj before routing,
+    # optional RMSNorm, up_proj after combining); the MoE gate itself and
+    # shared_experts still operate on the FULL hidden_size, per the real
+    # KimiSparseMoeBlock.forward. 0 (this field's default) means "no latent
+    # projection", matching every other MoE model this project supports.
+    moe_latent_hidden_size: int = 0
+    moe_latent_use_norm: bool = False
+    # F128: Kimi K3's real config.json sets attn_res_block_size=12 (active,
+    # not a no-op -- confirmed on the real downloaded checkpoint). This is
+    # "Attention Residuals" (AttnRes, arXiv 2603.15031): every layer mixes
+    # its input with a softmax-attention-weighted combination of residual-
+    # stream snapshots taken every attn_res_block_size layers, replacing
+    # the plain `x = x + sublayer_out` residual entirely. 0 (default) means
+    # disabled, matching every other model this project supports (including
+    # Kimi Linear 48B and Kimi K2.5, neither of which sets this field).
+    attn_res_block_size: int = 0
 
     @classmethod
     def from_dir(cls, model_dir: str | Path) -> "ModelConfig":
@@ -244,6 +280,26 @@ class ModelConfig:
             t["model_type"] = raw["model_type"]
             t.setdefault("tie_word_embeddings", raw.get("tie_word_embeddings", False))
             raw = t
+        elif "text_config" in raw and raw.get("model_type", "") == "kimi_k3":
+            # F128: Kimi K3's real config.json (checked 2026-07-27, hours
+            # after weights landed) is a LLaVA-style multimodal wrapper
+            # ("architectures": ["KimiK3ForConditionalGeneration"]) whose
+            # text_config is itself a real KimiLinearForCausalLM config --
+            # same linear_attn_config (kda_layers/full_attn_layers),
+            # kv_lora_rank MLA shape, and block_sparse_moe naming already
+            # handled for the standalone "kimi_linear" model_type in
+            # runtime/kimi_linear.py. Preserve the outer "kimi_k3" as
+            # model_type (distinct dispatch from bare "kimi_linear") the
+            # same way "kimi_k25" is preserved over bare "kimi_k2".
+            # Checkpoint tensors are additionally prefixed
+            # "language_model.model.layers.N...." (vision wrapper), and MoE
+            # expert weights are compressed-tensors mxfp4-pack-quantized
+            # (.weight_packed/.weight_scale, no .weight_shape) -- both
+            # WeightStore/loader-side concerns, not handled here.
+            t = dict(raw["text_config"])
+            t["model_type"] = raw["model_type"]
+            t.setdefault("tie_word_embeddings", raw.get("tie_word_embeddings", False))
+            raw = t
         elif ("text_config" in raw
               and raw.get("model_type", "") in ("qwen3_5_moe", "qwen3_5")):
             # Qwen3.6 deliberately retains Qwen3.5's architecture identifier.
@@ -290,6 +346,8 @@ class ModelConfig:
         kda_head_dim = 0
         kda_num_heads = 0
         kda_conv_kernel_size = 4
+        kda_use_full_rank_gate = False
+        kda_gate_lower_bound = 0.0
         if linear_attn_config is not None:
             # F92: config.json lists are 1-indexed layer numbers; the rest of
             # this codebase (mlp_layer_types, indexer_types, ...) is 0-indexed.
@@ -300,6 +358,18 @@ class ModelConfig:
             kda_head_dim = linear_attn_config.get("head_dim", 0)
             kda_num_heads = linear_attn_config.get("num_heads", 0)
             kda_conv_kernel_size = linear_attn_config.get("short_conv_kernel_size", 4)
+            # F128: Kimi K3's real linear_attn_config sets
+            # use_full_rank_gate=true and gate_lower_bound=-5.0 -- both
+            # genuinely NEW vs the original Kimi Linear 48B/F92's checkpoint
+            # (confirmed absent -- None -- there). Neither key present means
+            # "off", matching the original's behavior unchanged. See
+            # runtime/kimi_linear.py's _kda_attention for how these change
+            # the real fla-core KDA gate formula (ported from the real,
+            # fetched fla-org/flash-linear-attention kda/gate.py source).
+            kda_use_full_rank_gate = bool(
+                linear_attn_config.get("use_full_rank_gate", False))
+            kda_gate_lower_bound = linear_attn_config.get(
+                "gate_lower_bound", 0.0) or 0.0
 
         # Jet-Nemotron (jet-ai/Jet-Nemotron-4B/2B): a THIRD, distinct hybrid
         # layout alongside kda_layers/linear_attn_config above -- see
@@ -413,6 +483,8 @@ class ModelConfig:
             kda_head_dim=kda_head_dim,
             kda_num_heads=kda_num_heads,
             kda_conv_kernel_size=kda_conv_kernel_size,
+            kda_use_full_rank_gate=kda_use_full_rank_gate,
+            kda_gate_lower_bound=kda_gate_lower_bound,
             linear_num_key_heads=raw.get("linear_num_key_heads", 0),
             linear_num_value_heads=raw.get("linear_num_value_heads", 0),
             linear_key_head_dim=raw.get("linear_key_head_dim", 0),
@@ -442,9 +514,16 @@ class ModelConfig:
             # applied Kimi Linear's naming to kimi_k25/kimi_k2 as well.
             moe_expert_prefix=(
                 "block_sparse_moe.experts"
-                if raw.get("model_type") == "kimi_linear"
+                if raw.get("model_type") in ("kimi_linear", "kimi_k3")
                 else "mlp.experts"
             ),
+            hidden_act=raw.get("hidden_act", "silu"),
+            activation_situ_beta=raw.get("activation_situ_beta", 1.0),
+            activation_situ_linear_beta=raw.get(
+                "activation_situ_linear_beta", 0.0) or 0.0,
+            moe_latent_hidden_size=raw.get("routed_expert_hidden_size", 0) or 0,
+            moe_latent_use_norm=raw.get("latent_moe_use_norm", False),
+            attn_res_block_size=raw.get("attn_res_block_size", 0) or 0,
         )
 
 

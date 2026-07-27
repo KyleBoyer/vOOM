@@ -125,7 +125,7 @@ class SpeculativeDecoder:
         periodically re-probes after falling back to plain decoding."""
         self.target, self.draft, self.k = target, draft, k
         if draft != "mtp" and getattr(target.cfg, "model_type", None) in (
-                "qwen3_5", "qwen3_5_moe", "kimi_linear"):
+                "qwen3_5", "qwen3_5_moe", "kimi_linear", "kimi_k3"):
             # F94: KVCache.trim() has no kda_cache branch, so a partially
             # accepted draft-model/n-gram round would silently roll back
             # only the ordinary KV, leaving the DeltaNet/KDA recurrent state
@@ -145,7 +145,7 @@ class SpeculativeDecoder:
         if not _unsafe_allow_moe_verify and not target_glm_family and (
                 getattr(target.cfg, "num_experts", 0) or getattr(
                     target.cfg, "model_type", None) in (
-                    "gpt_oss", "qwen3_5", "qwen3_5_moe", "kimi_linear")):
+                    "gpt_oss", "qwen3_5", "qwen3_5_moe", "kimi_linear", "kimi_k3")):
             # F113 (2026-07-25): this class's multi-position verify sweep
             # uses forward_tokens_serial_positions() when eligible, but that
             # method explicitly refuses most MoE/hybrid targets (their

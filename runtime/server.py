@@ -4894,7 +4894,7 @@ def _hidden_gateway_catalogs(tools, raw_tools, messages, query: str | None = Non
     )
 
 
-_HYBRID_RECURRENT_MODEL_TYPES = ("qwen3_5", "qwen3_5_moe", "kimi_linear")
+_HYBRID_RECURRENT_MODEL_TYPES = ("qwen3_5", "qwen3_5_moe", "kimi_linear", "kimi_k3")
 
 
 def _hybrid_stable_boundary_tokens(

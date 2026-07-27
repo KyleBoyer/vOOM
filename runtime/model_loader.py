@@ -48,6 +48,20 @@ class _CTInt4Aux:
     shape: str
 
 
+@dataclass(frozen=True)
+class _CTMXFP4Aux:
+    """F128: Kimi K3's real "mxfp4-pack-quantized" compressed-tensors pair
+    (.weight_packed/.weight_scale, no .weight_shape -- confirmed by directly
+    inspecting a real downloaded K3 shard; unlike K2.5's INT4 triplet, MXFP4
+    ships no shape tensor at all). Dequantized eagerly to a dense array at
+    fetch time via dequantize_compressed_tensors_mxfp4, same eager-not-lazy
+    convention as _CTInt4Aux for the same reason (prefetch-thread stream
+    binding, see the mx.eval call at its own dequant call site)."""
+
+    packed: str
+    scale: str
+
+
 def _quant_params(value) -> tuple[int, int, str] | None:
     """Normalize one standard-MLX quantization descriptor."""
     if not isinstance(value, dict):
@@ -265,6 +279,31 @@ class WeightStore:
                 quant_aux_names.add(scale)
                 quant_aux_names.add(shape)
 
+        # F128: vllm-project/compressed-tensors "mxfp4-pack-quantized" --
+        # confirmed on Kimi K3's real checkpoint, MoE expert weights only
+        # (config.json's quantization_config.ignore excludes self_attn).
+        # Distinguished from K2.5's INT4 triplet above by the ABSENCE of a
+        # .weight_shape tensor (K3 ships none at all; confirmed by directly
+        # inspecting a real downloaded shard) rather than by dtype, which
+        # would require opening a shard header per candidate at index time.
+        # Logical shape is inferred at fetch time from packed.shape[1]*2,
+        # safe because MXFP4 always packs exactly 2 FP4 values per uint8 byte.
+        self._ct_mxfp4_aux: dict[str, _CTMXFP4Aux] = {}
+        if not self.packed:
+            for name in list(self.weight_map):
+                if not name.endswith(".weight_packed") or name in quant_aux_names:
+                    continue
+                stem = name[:-len(".weight_packed")]
+                scale = f"{stem}.weight_scale"
+                shape = f"{stem}.weight_shape"
+                if scale not in self.weight_map or shape in self.weight_map:
+                    continue
+                logical = f"{stem}.weight"
+                self._ct_mxfp4_aux[logical] = _CTMXFP4Aux(name, scale)
+                self.weight_map[logical] = self.weight_map[name]
+                quant_aux_names.add(name)
+                quant_aux_names.add(scale)
+
         self.on_disk_quantized = bool(self._quant_aux)
         if self.on_disk_quantized:
             identity = {
@@ -307,6 +346,24 @@ class WeightStore:
             # fallback when the physical format cannot be priced here.
             if candidates:
                 self.expert_storage_bytes_per_weight = max(candidates)
+        elif self._ct_mxfp4_aux:
+            # F128: compressed-tensors MXFP4 stores 4 payload bits/weight
+            # plus one E8M0 (uint8, 1 byte) scale per group -- half the
+            # scale cost of K2.5's INT4 BF16 (2-byte) scale. Read the
+            # released descriptor rather than hard-coding K3's currently
+            # observed group size 32.
+            candidates = []
+            for group in self.quantization.get("config_groups", {}).values():
+                weights = group.get("weights", {}) if isinstance(group, dict) else {}
+                try:
+                    bits = int(weights["num_bits"])
+                    group_size = int(weights["group_size"])
+                except (KeyError, TypeError, ValueError):
+                    continue
+                if bits > 0 and group_size > 0:
+                    candidates.append(bits / 8 + 1 / group_size)
+            if candidates:
+                self.expert_storage_bytes_per_weight = max(candidates)
         elif self.config.model_type == "gpt_oss":
             # Released MXFP4 blocks plus scales/metadata. Match the existing
             # conservative resident/admission estimate used by engine.py.
@@ -314,14 +371,18 @@ class WeightStore:
         elif (self.quantization and self.config.model_type != "gpt_oss"
                 and not (self.quantization.get("quant_method") == "compressed-tensors"
                          and self.quantization.get("format") == "pack-quantized"
-                         and self._ct_int4_aux)):
-            # F93: vllm-project/compressed-tensors pack-quantized INT4 is now
-            # a supported on-disk layout (see _ct_int4_aux above and
-            # fetch()'s dequantize_compressed_tensors_int4 call) -- only
+                         and self._ct_int4_aux)
+                and not (self.quantization.get("quant_method") == "compressed-tensors"
+                         and self.quantization.get("format") == "mxfp4-pack-quantized"
+                         and self._ct_mxfp4_aux)):
+            # F93/F128: vllm-project/compressed-tensors pack-quantized INT4
+            # and mxfp4-pack-quantized are now supported on-disk layouts
+            # (see _ct_int4_aux/_ct_mxfp4_aux above and fetch()'s
+            # dequantize_compressed_tensors_int4/_mxfp4 calls) -- only
             # reaches this branch, and still raises, if the declared
-            # quantization method ISN'T that exact one, or claims to be but
-            # no matching .weight_packed/.weight_scale/.weight_shape
-            # triplets were actually found (config/checkpoint mismatch).
+            # quantization method/format isn't one of those two exact
+            # combinations, or claims to be but no matching tensors were
+            # actually found (config/checkpoint mismatch).
             method = self.quantization.get("quant_method", "unknown")
             standard_declared = (
                 _quant_params(self.quantization) is not None
@@ -661,12 +722,17 @@ class WeightStore:
         seen: set[str] = set()
         for n in names:
             ct_aux = self._ct_int4_aux.get(n)
+            ct_mxfp4_aux = self._ct_mxfp4_aux.get(n)
             if ct_aux is not None:
                 # F93: the logical "<stem>.weight" name has NO physical
                 # tensor of its own here (unlike _quant_aux, where the
                 # logical name IS a real quantized weight tensor plus
                 # sidecars) -- only packed/scale/shape physically exist.
                 expanded = (ct_aux.packed, ct_aux.scale, ct_aux.shape)
+            elif ct_mxfp4_aux is not None:
+                # F128: same reasoning as the INT4 case above, minus the
+                # shape sidecar (K3's MXFP4 pairs ship none).
+                expanded = (ct_mxfp4_aux.packed, ct_mxfp4_aux.scale)
             else:
                 aux = self._quant_aux.get(n)
                 expanded = ((n, aux.scales, aux.biases) if aux is not None else (n,))
@@ -692,8 +758,10 @@ class WeightStore:
                         out[n] = lazy[self._real_name.get(n, n)]
                 mx.eval(list(out.values()))
                 nbytes = sum(a.nbytes for a in out.values())
-                if self._quant_aux or self._ct_int4_aux:
-                    from .quant import QTensor, dequantize_compressed_tensors_int4
+                if self._quant_aux or self._ct_int4_aux or self._ct_mxfp4_aux:
+                    from .quant import (
+                        QTensor, dequantize_compressed_tensors_int4,
+                        dequantize_compressed_tensors_mxfp4)
 
                     logical: dict = {}
                     for name in names:
@@ -719,6 +787,21 @@ class WeightStore:
                             # registered there: "RuntimeError: There is no
                             # Stream(gpu, N) in current thread." Force eval
                             # here, on the thread that built the graph.
+                            mx.eval(dequant)
+                            logical[name] = dequant
+                            continue
+                        ct_mxfp4_aux = self._ct_mxfp4_aux.get(name)
+                        if ct_mxfp4_aux is not None:
+                            # F128: no .weight_shape tensor exists for K3's
+                            # MXFP4 pairs (confirmed on the real checkpoint);
+                            # logical shape is inferred, safe because MXFP4
+                            # always packs exactly 2 FP4 values per byte.
+                            packed_arr = out[ct_mxfp4_aux.packed]
+                            shape = (packed_arr.shape[0], packed_arr.shape[1] * 2)
+                            dequant = dequantize_compressed_tensors_mxfp4(
+                                packed_arr, out[ct_mxfp4_aux.scale], shape)
+                            # Same thread-stream reasoning as the INT4 branch
+                            # above applies identically here.
                             mx.eval(dequant)
                             logical[name] = dequant
                             continue

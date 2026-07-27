@@ -835,7 +835,7 @@ class StreamingEngine:
         self._model_dir = self.store.dir
         self.cfg = self.store.config
         _apply_runtime_expert_top_k(self.rc, self.cfg)
-        if (self.cfg.model_type in ("kimi_linear", "qwen3_5_moe", "qwen3_5")
+        if (self.cfg.model_type in ("kimi_linear", "kimi_k3", "qwen3_5_moe", "qwen3_5")
                 and self.rc.prompt_kv_dir):
             raise ValueError(
                 f"{self.cfg.model_type} recurrent attention state is not "
@@ -907,7 +907,7 @@ class StreamingEngine:
                     f"{len(self.cfg.indexer_types)} != {self.cfg.num_hidden_layers}"
                 )
         if (self.cfg.model_type in (
-                "glm_moe_dsa", "kimi_linear", "kimi_k25", "qwen3_5_moe")
+                "glm_moe_dsa", "kimi_linear", "kimi_k3", "kimi_k25", "qwen3_5_moe")
                 and self.rc.expert_fetch_batch <= 0):
             # F74-v2 is a safety default for every construction path, including
             # direct experiments and YAML. Leaving zero as "unbounded" silently
@@ -1097,11 +1097,20 @@ class StreamingEngine:
                 and self._streamed_lm_head is None
                 and not self.cfg.tie_word_embeddings and self.store.has("lm_head.weight")):
             pin_names.append("lm_head.weight")
+        # F128: kimi_k3's AttnRes needs one final readout applied once after
+        # ALL layers, before model.norm (real KimiLinearModel._apply_output_
+        # attn_res) -- its two weights are tiny ((1,H) and (H,)) top-level
+        # tensors, same pinning treatment as model.norm.weight itself.
+        if self.cfg.model_type == "kimi_k3":
+            pin_names.append("model.output_attn_res_proj.weight")
+            pin_names.append("model.output_attn_res_norm.weight")
         persistent = self.cache.pin("persistent", pin_names)
 
         self._embed_w = persistent.get("model.embed_tokens.weight")
         self._norm_w = persistent["model.norm.weight"]
         self._lm_head_w = persistent.get("lm_head.weight")
+        self._output_attn_res_proj_w = persistent.get("model.output_attn_res_proj.weight")
+        self._output_attn_res_norm_w = persistent.get("model.output_attn_res_norm.weight")
         self._reranked_lm_head_bytes = 0
         if self.rc.rerank_lm_head:
             from .quant import QTensor, make_reranked_q_head
@@ -1370,7 +1379,7 @@ class StreamingEngine:
                     and not self._dsa_elided),
                 require_recurrent=(
                     self.cfg.model_type in (
-                        "kimi_linear", "qwen3_5_moe", "qwen3_5")),
+                        "kimi_linear", "kimi_k3", "qwen3_5_moe", "qwen3_5")),
             )
             if not self._defer_persisted_kv_until_bootstrap:
                 for (tokens, kv, logits, prompt_length, prompt_logits,
@@ -2251,6 +2260,16 @@ class StreamingEngine:
             return x
         if profiler is not None:
             profiler.begin_sweep(position_count, path="streamed")
+        # F128: Kimi K3's real AttnRes mechanism needs one extra piece of
+        # state (block_residual) threaded through every layer of THIS sweep
+        # only -- the real reference re-inits it fresh at the top of every
+        # forward() call and never persists it across calls, so a fresh
+        # empty block_residual here (one per _sweep call = one per chunk,
+        # exactly matching a chunk-major caller's own "one forward-call per
+        # chunk" mapping) is correct; see run_kimi_k3_block's own docstring.
+        block_residual = (
+            mx.zeros((x.shape[0] * x.shape[1], 0, x.shape[2]), dtype=x.dtype)
+            if self.cfg.model_type == "kimi_k3" else None)
         for i in range(n):
             # F36: on the last layer of a prefill whose only consumer is the last
             # position's logits, MLP outputs for earlier positions are dead —
@@ -2323,10 +2342,32 @@ class StreamingEngine:
                     profile=profiler,
                 )
             elif self.cfg.model_type == "kimi_linear":
+                # kimi_k3 dispatches separately below -- run_kimi_linear_block
+                # has no AttnRes awareness, which kimi_k3's real checkpoint
+                # (attn_res_block_size=12, confirmed active) genuinely needs.
                 from .kimi_linear import run_kimi_linear_block
 
                 x = run_kimi_linear_block(
                     x, w, f"model.layers.{i}", self.cfg, kv, i, offset, self._get_experts,
+                    mlp_last_only=last_only,
+                    iter_expert_batches=self._iter_expert_batches,
+                    native_fused_decode=self.rc.native_fused_deltanet_decode,
+                    profile=profiler,
+                )
+            elif self.cfg.model_type == "kimi_k3":
+                # F128: AttnRes-aware block runner -- see run_kimi_k3_block's
+                # docstring. block_residual (initialized above, before this
+                # loop) is threaded layer-to-layer exactly like x itself;
+                # mlp_last_only is honored only AFTER the full layer
+                # (attention+MLP) completes, not between them like
+                # run_kimi_linear_block's version, so block_residual's
+                # row count (batch*positions) never mismatches x's across
+                # this loop -- see run_kimi_k3_block's own docstring for why.
+                from .kimi_linear import run_kimi_k3_block
+
+                x, block_residual = run_kimi_k3_block(
+                    x, w, f"model.layers.{i}", self.cfg, kv, i, offset,
+                    block_residual, self._get_experts,
                     mlp_last_only=last_only,
                     iter_expert_batches=self._iter_expert_batches,
                     native_fused_decode=self.rc.native_fused_deltanet_decode,
@@ -2406,6 +2447,24 @@ class StreamingEngine:
                 # cache and halved hit rates (measured; see benchmark_results)
                 self._router_lookahead(x, i + 1)
             del w
+        if self.cfg.model_type == "kimi_k3" and block_residual is not None:
+            # F128: the real KimiLinearModel.forward applies this ONCE,
+            # after every layer, before its own final model.norm -- which
+            # this function's caller (_final_logits/_all_logits) applies
+            # right after _sweep returns. run_kimi_k3_block deliberately
+            # never trims x mid-loop (see its own docstring) so x and
+            # block_residual stay row-aligned through this call; the
+            # final_mlp_last_only trim vOOM's OTHER model types apply mid-
+            # loop happens here instead, after the real readout, once.
+            from .kimi_linear import apply_output_attn_res
+
+            x = apply_output_attn_res(
+                x, {
+                    "model.output_attn_res_proj.weight": self._output_attn_res_proj_w,
+                    "model.output_attn_res_norm.weight": self._output_attn_res_norm_w,
+                }, block_residual, self.cfg)
+            if final_mlp_last_only and x.shape[1] > 1:
+                x = x[:, -1:, :]
         return x
 
     def _layer_stationary_qwen35_sweep(
@@ -2867,6 +2926,10 @@ class StreamingEngine:
         """
         glm_family = self.cfg.model_type in ("glm_moe_dsa", "kimi_k25", "glm4_moe_lite")
         qwen_family = self.cfg.model_type in ("qwen3_5", "qwen3_5_moe")
+        # F128: kimi_k3 deliberately excluded -- its real AttnRes mechanism
+        # is not yet implemented in _kimi_linear_attention_residual/
+        # _kimi_linear_mlp_residual (same reasoning as the run_kimi_linear_block
+        # dispatch a few hundred lines up).
         kimi_family = self.cfg.model_type == "kimi_linear"
         if not glm_family and not qwen_family and not kimi_family and (
                 self.cfg.num_experts or self.cfg.model_type == "gpt_oss"):
@@ -3156,7 +3219,7 @@ class StreamingEngine:
 
                 kv.dsa = DSAState(self.cfg)
         if self.cfg.model_type in (
-                "kimi_linear", "qwen3_5_moe", "qwen3_5", "jet_nemotron"):
+                "kimi_linear", "kimi_k3", "qwen3_5_moe", "qwen3_5", "jet_nemotron"):
             # KDA's recurrent state is fixed-size and not token-indexed. Exact
             # endpoint/extension retention and durable restore carry this
             # companion cache alongside attention KV; arbitrary prefix trims
@@ -3362,7 +3425,7 @@ class StreamingEngine:
         # endpoint and extended with a suffix. Candidate selection below
         # limits hybrid models to those two no-trim cases.
         recurrent_exact_only = self.cfg.model_type in (
-            "kimi_linear", "qwen3_5_moe", "qwen3_5", "jet_nemotron")
+            "kimi_linear", "kimi_k3", "qwen3_5_moe", "qwen3_5", "jet_nemotron")
         hot_eligible = (self.rc.hot_prompt_kv and not self.rc.max_kv_mb
                         and not force_adaptive_paged)
         resident_prompt_kv_bytes = self._project_dense_text_kv_bytes(len(tokens))
@@ -4050,6 +4113,10 @@ class StreamingEngine:
                     # to the boundary range when its ordinary eligibility
                     # conditions hold; the resulting endpoint state is the
                     # same state forked below.
+                    # F128: kimi_k3 deliberately excluded -- see the same
+                    # note on run_kimi_linear_block's dispatch above;
+                    # _layer_stationary_kimi_linear_sweep has no AttnRes
+                    # awareness either.
                     boundary_layer_stationary = (
                         self.rc.layer_stationary_prefill
                         and self.cfg.model_type in (
@@ -4152,6 +4219,10 @@ class StreamingEngine:
             # already-safe chunk-major loop unchanged. Eligibility is checked
             # fresh every call (never cached), so a request that later needs
             # one of those features is simply never routed here.
+            # F128: kimi_k3 deliberately excluded -- see the
+            # run_kimi_linear_block dispatch note above; its real AttnRes
+            # mechanism is not yet implemented in either this fast path or
+            # _layer_stationary_kimi_linear_sweep.
             layer_stationary_eligible = (
                 bool(chunk)
                 and self.rc.layer_stationary_prefill
