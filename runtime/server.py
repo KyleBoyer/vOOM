@@ -1683,6 +1683,30 @@ class EngineManager:
                     # Engine validation now fails closed if a caller tries to
                     # persist only the ordinary KV half of this hybrid state.
                     rc.prompt_kv_dir = ""
+                    # 2026-07-27: a real VMODEL_EXECUTION_PROFILE=ops request
+                    # (31 input / 40 output tokens against the real
+                    # Kimi-Linear-48B-A3B-Instruct checkpoint) measured
+                    # expert_fetch_s at 64.5% of total compute time
+                    # (79.25s of 122.9s) with only a 20% resident-cache hit
+                    # rate at the generic 6000MB budget above -- unlike
+                    # tonight's Qwen work, this model genuinely is disk-bound
+                    # on MoE expert paging, matching CLAUDE.md's own existing
+                    # note. Explicit override so this can be measured against
+                    # live headroom without a code change each time; stays at
+                    # the unchanged 6000MB default until a real paired A/B
+                    # justifies moving it (same discipline as every other
+                    # cache-budget number in this codebase).
+                    try:
+                        rc.max_weight_cache_mb = int(os.environ.get(
+                            "VMODEL_KIMI_LINEAR_WEIGHT_CACHE_MB", "6000"))
+                    except ValueError as error:
+                        raise ValueError(
+                            "VMODEL_KIMI_LINEAR_WEIGHT_CACHE_MB must be an "
+                            "integer") from error
+                    if not 1500 <= rc.max_weight_cache_mb <= 8500:
+                        raise ValueError(
+                            "VMODEL_KIMI_LINEAR_WEIGHT_CACHE_MB must be in "
+                            "[1500, 8500]")
                 if mode in ("fast", "fast-long"):  # side-quest: lossy 4-bit resident cache
                     rc.quant_bits = 4
                     # Local Qwen A/B: MXFP4 retained coherent math/chat/code
