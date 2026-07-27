@@ -113,8 +113,34 @@ def test_real_engine_generate_end_to_end():
     from runtime.engine import RuntimeConfig, StreamingEngine
     from runtime.sampler import SamplingParams
 
+    # F128: K3's real num_experts_per_tok=16 (vs. e.g. Kimi Linear/K2.5's
+    # smaller top-k) means a multi-position chunk routes to a much larger
+    # per-layer distinct-expert union than other checkpoints this project
+    # has run end to end -- prefill_chunk_size=1 keeps each layer's routing
+    # union bounded to one position's 16 experts (~1GB dequantized) instead
+    # of compounding across several positions at once, which measurably
+    # exceeded this machine's real available memory during this test's
+    # first attempt (a genuine resource constraint, not a correctness bug).
+    # F128: pin_embeddings defaults True, permanently pinning
+    # model.embed_tokens.weight -- a reasonable default for most
+    # checkpoints, but K3's real hidden_size=7168 x vocab_size=163840
+    # makes that table 2.35GB (confirmed), a big fixed cost on this 16GB
+    # machine on top of K3's already-large per-layer weights (full-rank
+    # g_proj etc.). Disabling the pin alone just moved the SAME 2.35GB
+    # single allocation into the ordinary weight cache's fetch path
+    # instead (still failed, same MemoryError) -- embed_rows=True instead
+    # uses EmbedRows' row-paged sidecar (raw byte-level file copy at
+    # materialization time, never loading the whole table into MLX/Metal
+    # memory at once, per its own module docstring), which is the real
+    # fix for an untied-embedding checkpoint (tie_word_embeddings=False
+    # for K3, confirmed) this large.
+    # lm_head.weight is the same 2.35GB size and also untied -- stream it
+    # too (StreamedLMHead, block-streamed matmul, never materializes the
+    # whole matrix) to avoid hitting the identical issue one step later,
+    # at final-logits time.
     rc = RuntimeConfig(
-        prefill_chunk_size=8, min_weight_cache_mb=500, max_weight_cache_mb=6000)
+        prefill_chunk_size=1, min_weight_cache_mb=150, max_weight_cache_mb=3000,
+        embed_rows=True, stream_lm_head=True)
     engine = StreamingEngine(str(MODEL_DIR), rc)
     try:
         result = engine.generate(

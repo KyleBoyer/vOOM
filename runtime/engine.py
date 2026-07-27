@@ -1002,6 +1002,14 @@ class StreamingEngine:
         # moe_intermediate_size when the config has it, else the dense size
         # (over-estimate = conservative); MXFP4 stores ~0.53 B/weight.
         inter = getattr(self.cfg, "moe_intermediate_size", None) or self.cfg.intermediate_size
+        # F128: Kimi K3's real Stable LatentMoE runs routed experts on a
+        # compressed latent width (config.routed_expert_hidden_size, 3584
+        # for the real checkpoint), not the full hidden_size (7168) --
+        # confirmed against real downloaded expert tensor shapes. Using
+        # hidden_size here doubled this estimate for K3 specifically (every
+        # other model this project supports leaves moe_latent_hidden_size
+        # at its 0 default, so this is unchanged for them).
+        expert_hidden = self.cfg.moe_latent_hidden_size or self.cfg.hidden_size
         if self.store.on_disk_quantized:
             resident_bytes_per_weight = self.store.quantized_bytes_per_weight
         elif self.rc.quant_bits:
@@ -1014,11 +1022,11 @@ class StreamingEngine:
             resident_bytes_per_weight = (
                 0.6 if self.cfg.model_type == "gpt_oss" else 2)
         dense_expert_page_bytes = int(
-            3 * self.cfg.hidden_size * inter * 2)
+            3 * expert_hidden * inter * 2)
         self._expert_page_bytes = int(
-            3 * self.cfg.hidden_size * inter * resident_bytes_per_weight)
+            3 * expert_hidden * inter * resident_bytes_per_weight)
         self._expert_storage_page_bytes = int(
-            3 * self.cfg.hidden_size * inter
+            3 * expert_hidden * inter
             * self.store.expert_storage_bytes_per_weight)
         self._expert_storage_page_bytes = (
             self.store.estimate_expert_storage_page_bytes(
