@@ -294,6 +294,100 @@ def dequantize_compressed_tensors_int4(
     return out
 
 
+_MXFP4_E2M1_MAGNITUDE_LUT = mx.array(
+    [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0], dtype=mx.float32)
+
+
+def dequantize_compressed_tensors_mxfp4(
+    packed: mx.array, scale: mx.array, shape: tuple[int, int],
+    packed_dim: int = 1, out_dtype=mx.bfloat16,
+) -> mx.array:
+    """Dequantize a vllm-project/compressed-tensors "mxfp4-pack-quantized"
+    weight -- Kimi K3's real, as-released expert-weight format on Hugging
+    Face (`moonshotai/Kimi-K3`, checked directly from its real config.json
+    `quantization_config` block: ``format: "mxfp4-pack-quantized"``,
+    ``quant_method: "compressed-tensors"``, ``group_size: 32``,
+    ``num_bits: 4``, ``symmetric: true``, ``scale_dtype: torch.uint8``, and
+    ``ignore: ["re:.*self_attn.*", ...]`` confirming only MoE expert FFN
+    weights use this format -- attention stays ordinary BF16, matching
+    K2.5's own "experts only" pattern). This is a DIFFERENT numeric format
+    from K2.5's `dequantize_compressed_tensors_int4` (integer, group_size
+    128 there) despite both being "compressed-tensors" family: MXFP4 packs
+    FP4 E2M1 codes, not signed integers, at group_size=32.
+
+    Algorithm verified 2026-07-27 against the real, installed
+    `compressed-tensors==0.17.1` library source (pip-installed for this
+    verification only, not a core runtime dependency), specifically:
+    - `compressed_tensors.compressors.nvfp4.helpers.unpack_fp4_from_uint8`
+      (MXFP4PackedCompressor inherits NVFP4's packing/unpacking unchanged --
+      only scale compression differs) -- 2 E2M1 4-bit codes per uint8 byte,
+      low nibble first: bit 3 (0x08) is sign, bits 0-2 (0x07) index a fixed
+      8-entry magnitude lookup table `[0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0,
+      6.0]` (this IS the OCP E2M1 format's exact representable value set,
+      not something K3-specific).
+    - `compressed_tensors.compressors.mx_utils.decompress_mx_scale` -- each
+      uint8 scale byte is a biased E8M0 exponent: `2 ** (byte - 127)`.
+    - `compressed_tensors.quantization.lifecycle.forward_helpers._dequantize`
+      -- final value = unpacked_e2m1 * scale (no zero_point, since
+      symmetric=true omits that tensor entirely; no division by a
+      `global_scale`, confirmed EMPIRICALLY by inspecting a real downloaded
+      K3 shard directly -- no `.weight_global_scale` tensor exists
+      alongside `.weight_packed`/`.weight_scale` for any real expert layer
+      checked, even though NVFP4PackedCompressor's generic
+      `compression_param_names` classmethod always lists it; Moonshot's own
+      export omits it for this single-level MXFP4 scaling, unlike NVFP4's
+      real two-level design).
+
+    Real shapes confirmed from `moonshotai/Kimi-K3`'s actual downloaded
+    checkpoint (layer 4, expert 0, w1): `weight_packed` (3072, 1792) uint8,
+    `weight_scale` (3072, 112) uint8 -- 1792*2=3584 logical columns,
+    3584/112=32 group_size, matching config exactly.
+
+    :param packed: uint8 tensor, the `.weight_packed` tensor as loaded,
+        shape (rows, cols // 2) for packed_dim=1 (2 FP4 values/byte)
+    :param scale: uint8 tensor, the `.weight_scale` tensor as loaded (E8M0
+        biased exponents), shape (rows, cols // group_size)
+    :param shape: the true logical (pre-pack) shape, from `.weight_shape`
+        if present, or the checkpoint's own declared logical shape
+    :param packed_dim: which logical axis was packed; K3's real experts use 1
+    :param out_dtype: output float dtype (K3's own config.json declares its
+        overall model dtype as bfloat16, matching this default)
+    :returns: dequantized weight, shape `shape`, dtype `out_dtype`
+    """
+    if packed_dim != 1:
+        raise NotImplementedError(
+            "F128: only packed_dim=1 verified/needed for Kimi K3 so far")
+    rows, cols = shape
+    if packed.shape != (rows, cols // 2) or cols % 2:
+        raise ValueError(
+            f"packed shape {packed.shape} inconsistent with logical shape "
+            f"{shape} for 2-values-per-uint8 (E2M1 FP4) packing")
+    if cols % scale.shape[1]:
+        raise ValueError(
+            f"weight_scale shape {scale.shape} does not evenly divide "
+            f"logical cols {cols} (implied group_size {cols / scale.shape[1]})")
+    group_size = cols // scale.shape[1]
+
+    packed_u8 = packed.astype(mx.uint8)
+    low = packed_u8 & 0x0F
+    high = (packed_u8 >> 4) & 0x0F
+    # Interleave low/high back into logical column order: byte j holds
+    # logical columns 2j (low nibble) and 2j+1 (high nibble), matching the
+    # real unpack_fp4_from_uint8's stack-then-flatten order exactly.
+    nibbles = mx.stack([low, high], axis=-1).reshape(rows, cols)
+
+    sign = (nibbles & 0x08).astype(mx.bool_)
+    magnitude_index = (nibbles & 0x07).astype(mx.uint32)
+    magnitude = _MXFP4_E2M1_MAGNITUDE_LUT[magnitude_index]
+    values = mx.where(sign, -magnitude, magnitude)
+
+    scale_exp = scale.astype(mx.int32) - 127
+    scale_float = 2.0 ** scale_exp.astype(mx.float32)
+    scale_expanded = mx.repeat(scale_float, group_size, axis=1)
+
+    return (values * scale_expanded).astype(out_dtype)
+
+
 def matmul(x: mx.array, w) -> mx.array:
     """x @ w.T for a plain, quantized, or candidate-reranked weight."""
     if isinstance(w, RerankedQHead):
