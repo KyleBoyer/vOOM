@@ -1707,6 +1707,39 @@ class EngineManager:
                         raise ValueError(
                             "VMODEL_KIMI_LINEAR_WEIGHT_CACHE_MB must be in "
                             "[1500, 8500]")
+                    # 2026-07-27: MarkovExpertPredictor + Prefetcher already
+                    # exist (runtime/predictor.py, runtime/prefetcher.py) and
+                    # the prefetcher worker is already constructed by default
+                    # (prefetch_depth=2 above) -- only this expert-hint
+                    # scheduling gate had never been turned on for any real
+                    # model before today. Measured with a real paired A/B
+                    # against Kimi-Linear-48B-A3B-Instruct (same exact
+                    # prompt, 1.24M real learned transitions already in
+                    # models/Kimi-Linear-48B-A3B-Instruct/
+                    # expert_transitions.json from this session's own prior
+                    # requests): enabling it made things WORSE, not better --
+                    # 128.39s -> 179.69s wall (+40%), 123.85 -> 208.48GB
+                    # physical reads (+68%), resident-cache hit rate 20% ->
+                    # 6%. Output stayed byte-identical, so this is a pure
+                    # performance regression, not a correctness issue: the
+                    # predictor's speculative fetches evict correctly-needed
+                    # demand-fetched experts before they're used, exactly the
+                    # uncertainty predictor.py's own docstring already
+                    # flagged ("measured predictor recall does not prove...
+                    # a wall-clock win"). Stays off by default and is not
+                    # recommended -- kept only as a documented, tested,
+                    # explicit opt-in for anyone who wants to re-investigate
+                    # with better admission control (e.g. a confidence
+                    # threshold, or the existing only_if_idle gate actually
+                    # enforced) rather than re-discover this the hard way.
+                    # See docs/future_lossless_techniques.md F126.
+                    expert_prefetch_request = os.environ.get(
+                        "VMODEL_KIMI_LINEAR_EXPERT_PREFETCH", "0")
+                    if expert_prefetch_request not in ("0", "1"):
+                        raise ValueError(
+                            "VMODEL_KIMI_LINEAR_EXPERT_PREFETCH must be 0 or 1")
+                    rc.expert_predictive_prefetch = (
+                        expert_prefetch_request == "1")
                 if mode in ("fast", "fast-long"):  # side-quest: lossy 4-bit resident cache
                     rc.quant_bits = 4
                     # Local Qwen A/B: MXFP4 retained coherent math/chat/code
