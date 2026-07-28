@@ -160,6 +160,16 @@ class ModelConfig:
     # comes only from the KDA layers' inherent sequential recurrence). GLM-5.2
     # always applies real RoPE; default False preserves that unchanged.
     mla_use_nope: bool = False
+    # F128: Kimi K3's real config.json sets mla_use_output_gate=true for its
+    # 24 real MLA layers ("Gated MLA" per Moonshot's own model card, distinct
+    # from GLM-5.2/K2.5/Kimi Linear's plain MLA, none of which set this).
+    # Ported verbatim from the real KimiMLAAttention.forward: a fresh
+    # sigmoid(g_proj(hidden_states)) gate (g_proj: hidden_size -> num_heads *
+    # v_head_dim, NOT derived from the attention output) multiplies the
+    # attention output BEFORE o_proj. Confirmed present on the real
+    # checkpoint (layers.3.self_attn.g_proj.weight, shape (12288, 7168) =
+    # (96*128, 7168), matching num_heads=96 * v_head_dim=128 exactly).
+    mla_use_output_gate: bool = False
     # F128: Kimi K3's real config.json hidden_act is "situ" (Kimi's own
     # gated activation, `SituAndMul` in the real modeling_kimi_linear.py),
     # not the "silu"/swiglu every other model this project supports uses.
@@ -506,6 +516,7 @@ class ModelConfig:
             attn_output_gate=raw.get("attn_output_gate", False),
             moe_layer_freq=raw.get("moe_layer_freq", 1),
             mla_use_nope=raw.get("mla_use_nope", False),
+            mla_use_output_gate=raw.get("mla_use_output_gate", False),
             # F93 correction (2026-07-19): only Kimi Linear's MoE module is
             # actually named "block_sparse_moe" -- confirmed against the
             # real Kimi-K2.5 checkpoint that it uses the standard

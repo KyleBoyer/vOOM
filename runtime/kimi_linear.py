@@ -124,7 +124,20 @@ def _route_experts(h: mx.array, w: dict, moe_prefix: str, cfg: ModelConfig) -> t
     biased = scores + w[f"{moe_prefix}.gate.e_score_correction_bias"]
     k = cfg.num_experts_per_tok
     idx = mx.argpartition(-biased, kth=k - 1, axis=-1)[..., :k]
-    pw = mx.take_along_axis(biased, idx, axis=-1)  # F92: biased, not scores -- see docstring
+    if cfg.model_type == "kimi_k3":
+        # F128: K3's real bundled modeling_kimi_linear.py FIXED this aliasing
+        # bug -- its KimiMoEGate.forward computes
+        #     scores_for_choice = scores + self.e_score_correction_bias.unsqueeze(0)
+        # using regular `+` (a fresh tensor), never `+=` on a `.view()`, so
+        # `scores` itself is never mutated; `topk_weight = scores.gather(...)`
+        # genuinely reads the UNBIASED scores -- bias affects selection only,
+        # matching GLM's noaux_tc design intent. Confirmed by directly
+        # reading the real, bundled modeling_kimi_linear.py shipped with the
+        # actual downloaded K3 checkpoint (not re-derived/assumed from the
+        # original Kimi Linear 48B's own real aliasing bug below).
+        pw = mx.take_along_axis(scores, idx, axis=-1)
+    else:
+        pw = mx.take_along_axis(biased, idx, axis=-1)  # F92: biased, not scores -- see docstring
     if cfg.norm_topk_prob:
         pw = pw / (pw.sum(axis=-1, keepdims=True) + 1e-20)
     pw = pw * cfg.routed_scaling_factor

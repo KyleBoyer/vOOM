@@ -3,7 +3,8 @@
 Not a numerical oracle (no real transformers modeling_kimi_linear_k3.py
 forward pass is feasible at 2.8T/896-expert scale on this machine) -- this
 drives `run_kimi_k3_block` for the first few real layers of the actual
-downloaded ~1.4TB checkpoint (dense layer 0, then KDA layer 1) through
+downloaded ~1.4TB checkpoint (dense layer 0, KDA layers 1-2, then real
+"Gated MLA" layer 3) through
 StreamingEngine's own real disk-tier weight/expert paging, and checks the
 result is finite and correctly shaped. This is the same "coherence/
 plumbing gate, not byte-identical proof" category as
@@ -29,7 +30,7 @@ _model_skip = pytest.mark.skipif(
 
 
 @_model_skip
-def test_first_three_real_layers_produce_finite_output():
+def test_first_four_real_layers_produce_finite_output():
     from runtime.engine import RuntimeConfig, StreamingEngine
     from runtime.kimi_linear import run_kimi_k3_block
 
@@ -49,8 +50,7 @@ def test_first_three_real_layers_produce_finite_output():
         # even 4 tokens (up to 64 distinct experts, ~4-8GB) exceed this
         # test's deliberately small cache budget on a 16GB machine. This
         # is a real memory-governor constraint, not a correctness concern
-        # this test is trying to exercise -- see test_first_three_real_
-        # layers_produce_finite_output's docstring.
+        # this test is trying to exercise -- see this test's own docstring.
         tokens = [3]
         x = engine._embed(tokens)
         assert x.shape == (1, len(tokens), engine.cfg.hidden_size)
@@ -62,7 +62,12 @@ def test_first_three_real_layers_produce_finite_output():
         block_residual = mx.zeros(
             (x.shape[0] * x.shape[1], 0, x.shape[2]), dtype=x.dtype)
 
-        num_layers_to_run = 3
+        # F128: layer 3 (0-indexed) is one of K3's real 24 "Gated MLA"
+        # layers (confirmed: 3 in cfg.full_attn_layers) -- running through
+        # it exercises the mla_use_output_gate fix directly, not just
+        # dense layer 0 + KDA layers 1-2 like this test originally covered.
+        assert 3 in engine.cfg.full_attn_layers
+        num_layers_to_run = 4
         for layer in range(num_layers_to_run):
             w = engine.cache.get(
                 engine._layer_key(layer), engine._layer_names(layer))

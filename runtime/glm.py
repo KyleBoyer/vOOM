@@ -186,6 +186,8 @@ def _mla_attention(
             weighted_c = mx.einsum("bhls,bsc->bhlc", attn_w, c_all)     # (B,n_h,1,kv_lora)
             out = mx.einsum("bhlc,hdc->bhld", weighted_c, w_uv)          # (B,n_h,1,dv)
             attn = out.transpose(0, 2, 1, 3).reshape(B, L, n_h * dv)
+            if cfg.mla_use_output_gate:
+                attn = attn * mx.sigmoid(_linear(h, w, f"{prefix}.self_attn.g_proj"))
             return _linear(attn, w, f"{prefix}.self_attn.o_proj")
 
         kvb = _linear(c_all, w, f"{prefix}.self_attn.kv_b_proj").reshape(B, S, n_h, dn + dv).transpose(0, 2, 1, 3)
@@ -209,6 +211,14 @@ def _mla_attention(
         queries, keys, values, scale=(dn + dr) ** -0.5 * softmax_scale_mult, mask=mask
     )
     attn = attn.transpose(0, 2, 1, 3).reshape(B, L, n_h * dv)
+    if cfg.mla_use_output_gate:
+        # F128: Kimi K3's real "Gated MLA" -- ported verbatim from the real
+        # KimiMLAAttention.forward: a fresh sigmoid(g_proj(h)) gate (from
+        # the ORIGINAL hidden_states input, not derived from attn itself)
+        # multiplies the attention output before o_proj. False for every
+        # other model this function serves (GLM-5.2/K2.5/Kimi Linear),
+        # unaffected.
+        attn = attn * mx.sigmoid(_linear(h, w, f"{prefix}.self_attn.g_proj"))
     return _linear(attn, w, f"{prefix}.self_attn.o_proj")
 
 
