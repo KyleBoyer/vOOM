@@ -121,6 +121,16 @@ class WeightStore:
         self.parallel_tier_fetches = 0
         self.parallel_tier_fast_bytes = 0
         self.parallel_tier_archive_bytes = 0
+        # F128: a SECOND, distinct fast-tier mechanism from the vpack2
+        # overlay above -- for a RAW (unpacked) safetensors checkpoint
+        # like Kimi K3's, mirroring a deterministic (not learned-heat-
+        # predicted) subset of always-touched tensors as individual raw-
+        # byte files, built by formats/kimi_k3_fast_tier.py. Populated
+        # lazily on first fetch() call, not here, so constructing a
+        # WeightStore never does directory I/O for a model that has no
+        # fast tier staged (the common case).
+        self._raw_fast_tier_manifest: dict[str, dict] | None = None
+        self._raw_fast_tier_root: Path | None = None
         self.config = ModelConfig.from_dir(self.dir)
         raw_config = json.loads(_read_text_retry(self.dir / "config.json"))
         text_config = raw_config.get("text_config", {})
@@ -604,6 +614,53 @@ class WeightStore:
             return False
         return bool(overlay_devices) and archive_device not in overlay_devices
 
+    def _ensure_raw_fast_tier_loaded(self) -> None:
+        """Lazily find and load a raw-safetensors fast-tier manifest, if any
+        of self.fast_dirs has one staged for this model (see
+        formats/kimi_k3_fast_tier.py). Idempotent -- safe to call every
+        fetch(); after the first call this is ALWAYS a real dict (empty
+        when no fast_dirs were configured, or none of them has a manifest
+        for this model), never None -- fetch()'s `n in
+        self._raw_fast_tier_manifest` membership check depends on that."""
+        if self._raw_fast_tier_manifest is not None:
+            return
+        self._raw_fast_tier_manifest = {}
+        for root in self.fast_dirs:
+            candidate = root / self.dir.name
+            manifest_path = candidate / "fast_tier_manifest.json"
+            if manifest_path.is_file():
+                self._raw_fast_tier_manifest = json.loads(
+                    manifest_path.read_text())
+                self._raw_fast_tier_root = candidate
+                return
+
+    def _read_raw_fast_tier_tensors(
+        self, names: list[str],
+    ) -> tuple[dict[str, mx.array], int]:
+        """Read raw bytes directly from the fast-tier mirror -- no shard
+        file, no MLX lazy-load machinery, just the exact byte range
+        formats/kimi_k3_fast_tier.py copied verbatim from the real
+        checkpoint. dtype/shape come from the manifest it wrote at
+        extraction time (from the SAME real safetensors header the slow
+        path would have read), not re-derived here."""
+        from formats.packed import to_mx
+
+        out: dict[str, mx.array] = {}
+        nbytes = 0
+        for n in names:
+            entry = self._raw_fast_tier_manifest[n]
+            path = self._raw_fast_tier_root / entry["file"]
+            raw = path.read_bytes()
+            if len(raw) != entry["nbytes"]:
+                raise IOError(
+                    f"fast-tier tensor {n} size mismatch: expected "
+                    f"{entry['nbytes']}, got {len(raw)} (stale/corrupt "
+                    f"mirror at {path})")
+            out[n] = to_mx({"dtype": entry["dtype"], "shape": entry["shape"]}, raw)
+            nbytes += len(raw)
+        mx.eval(list(out.values()))
+        return out, nbytes
+
     def fetch(self, names: list[str]) -> tuple[dict[str, mx.array], float, int]:
         """Materialize tensors; return arrays, wall seconds, store-accounted bytes.
 
@@ -741,8 +798,20 @@ class WeightStore:
                     physical_names.append(physical)
                     seen.add(physical)
 
+        # F128: a deterministic raw-safetensors fast tier (see
+        # formats/kimi_k3_fast_tier.py) -- distinct from the vpack2 overlay
+        # above, for checkpoints that were never packed at all. Partition
+        # BEFORE grouping by shard so the slow-tier by_shard loop below
+        # never even opens a shard file for a name the fast tier already
+        # covers.
+        self._ensure_raw_fast_tier_loaded()
+        fast_names = [
+            n for n in physical_names if n in self._raw_fast_tier_manifest]
+        slow_names = [
+            n for n in physical_names if n not in self._raw_fast_tier_manifest]
+
         by_shard: dict[str, list[str]] = defaultdict(list)
-        for n in physical_names:
+        for n in slow_names:
             by_shard[self.weight_map[n]].append(n)
 
         # mx.load() only creates lazy file-backed arrays. The SMB read that can
@@ -752,11 +821,38 @@ class WeightStore:
         for attempt in range(4):
             out: dict[str, mx.array] = {}
             try:
-                for shard, shard_names in by_shard.items():
-                    lazy = self._load_shard(self.dir / shard)
-                    for n in shard_names:
-                        out[n] = lazy[self._real_name.get(n, n)]
-                mx.eval(list(out.values()))
+                if fast_names and by_shard:
+                    # Two independent physical devices (verified once at
+                    # extraction time by construction -- the fast tier lives
+                    # under a fast_dirs root, never under self.dir); read
+                    # both concurrently, same "background thread does one
+                    # tier's I/O, main thread does the other's" pattern the
+                    # vpack2 overlay above already uses.
+                    import concurrent.futures as cf
+
+                    with cf.ThreadPoolExecutor(max_workers=1) as pool:
+                        fast_future = pool.submit(
+                            self._read_raw_fast_tier_tensors, fast_names)
+                        for shard, shard_names in by_shard.items():
+                            lazy = self._load_shard(self.dir / shard)
+                            for n in shard_names:
+                                out[n] = lazy[self._real_name.get(n, n)]
+                        mx.eval(list(out.values()))
+                        fast_out, fast_bytes = fast_future.result()
+                    out.update(fast_out)
+                    self.fast_tier_bytes += fast_bytes
+                    self.fast_tier_tensors += len(fast_names)
+                elif fast_names:
+                    fast_out, fast_bytes = self._read_raw_fast_tier_tensors(fast_names)
+                    out.update(fast_out)
+                    self.fast_tier_bytes += fast_bytes
+                    self.fast_tier_tensors += len(fast_names)
+                else:
+                    for shard, shard_names in by_shard.items():
+                        lazy = self._load_shard(self.dir / shard)
+                        for n in shard_names:
+                            out[n] = lazy[self._real_name.get(n, n)]
+                    mx.eval(list(out.values()))
                 nbytes = sum(a.nbytes for a in out.values())
                 if self._quant_aux or self._ct_int4_aux or self._ct_mxfp4_aux:
                     from .quant import (
