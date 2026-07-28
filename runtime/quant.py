@@ -418,3 +418,152 @@ def matmul(x: mx.array, w) -> mx.array:
             transpose=True, group_size=w.group_size, bits=w.bits, mode=w.mode,
         )
     return x @ w.T
+
+
+def _fp16_bytes_to_f32(raw: mx.array) -> mx.array:
+    """raw: uint8 array whose LAST axis has size 2 (one little-endian fp16
+    per pair). Same bitcast-via-uint16 trick formats/packed.py's `to_mx`
+    already uses for BF16/F16 tensors elsewhere in this codebase."""
+    u16 = raw[..., 0].astype(mx.uint16) | (raw[..., 1].astype(mx.uint16) << 8)
+    return u16.view(mx.float16).astype(mx.float32)
+
+
+def dequantize_gguf_q4_k(
+    packed: mx.array, shape: tuple[int, int], out_dtype=mx.bfloat16,
+) -> mx.array:
+    """GGUF/ggml Q4_K ("4-bit K-quant", used for most tensors in a
+    "Q4_K_M"-quantized file): super-blocks of 256 values (8 sub-blocks of
+    32), each sub-block's 4-bit codes scaled/offset by a 6-bit
+    (scale, min) pair, those pairs themselves scaled by one shared fp16
+    (d, dmin) per super-block. Ported verbatim from the real
+    ggml-org/ggml `dequantize_row_q4_K`/`get_scale_min_k4`
+    (`src/ggml-quants.c`, fetched 2026-07-28) -- see
+    tests/test_gguf_quant_oracle.py for the byte-for-byte verification
+    against that real source (both a direct transcription and, where
+    available, real downloaded GGUF tensor bytes).
+
+    `packed`: raw uint8 bytes for this tensor, shape
+    `(out_features, n_super_blocks * 144)` -- GGUF lays out one tensor as
+    consecutive rows, each row as consecutive 144-byte block_q4_K structs
+    covering that row's full in_features length. `shape` is the PyTorch-
+    convention logical shape `(out_features, in_features)`; GGUF's own
+    `ne[]`/gguf-py `.shape` reports the reverse (in_features,
+    out_features) -- callers must pass the PyTorch-convention tuple here,
+    already corrected.
+    """
+    out_features, in_features = shape
+    QK_K = 256
+    if in_features % QK_K:
+        raise ValueError(
+            f"Q4_K requires in_features ({in_features}) divisible by {QK_K}")
+    n_super = in_features // QK_K
+    block_bytes = 144
+    if packed.shape != (out_features, n_super * block_bytes):
+        raise ValueError(
+            f"packed shape {packed.shape} inconsistent with logical shape "
+            f"{shape} for Q4_K's {block_bytes}-byte super-blocks")
+
+    blocks = packed.reshape(out_features, n_super, block_bytes).astype(mx.uint8)
+    d = _fp16_bytes_to_f32(blocks[..., 0:2])       # (out, n_super)
+    dmin = _fp16_bytes_to_f32(blocks[..., 2:4])    # (out, n_super)
+    scales = blocks[..., 4:16]                     # (out, n_super, 12)
+    qs = blocks[..., 16:16 + 128]                  # (out, n_super, 128)
+
+    # get_scale_min_k4(j, scales) for j in 0..7 -- unrolled (cheap, fixed
+    # 8 iterations at graph-construction time, not per-element).
+    sc_list, m_list = [], []
+    for j in range(8):
+        if j < 4:
+            sc_list.append(scales[..., j] & 63)
+            m_list.append(scales[..., j + 4] & 63)
+        else:
+            sc_list.append((scales[..., j + 4] & 0xF) | ((scales[..., j - 4] >> 6) << 4))
+            m_list.append((scales[..., j + 4] >> 4) | ((scales[..., j - 0] >> 6) << 4))
+    sc = mx.stack(sc_list, axis=-1).astype(mx.float32)  # (out, n_super, 8)
+    m = mx.stack(m_list, axis=-1).astype(mx.float32)    # (out, n_super, 8)
+
+    # qs: 128 bytes -> 4 chunks of 32 bytes; chunk k's low nibbles use
+    # sc[2k]/m[2k], high nibbles use sc[2k+1]/m[2k+1] -- exactly
+    # dequantize_row_q4_K's four `for (n = 0; n < QK_K; n += 128)`-outer /
+    # `is += 2`-per-iteration steps, unrolled.
+    qs_r = qs.reshape(out_features, n_super, 4, 32)
+    low = (qs_r & 0xF).astype(mx.float32)
+    high = (qs_r >> 4).astype(mx.float32)
+    sc_pairs = sc.reshape(out_features, n_super, 4, 2)
+    m_pairs = m.reshape(out_features, n_super, 4, 2)
+    d_b = d[..., None, None]
+    dmin_b = dmin[..., None, None]
+    y_low = d_b * sc_pairs[..., 0:1] * low - dmin_b * m_pairs[..., 0:1]
+    y_high = d_b * sc_pairs[..., 1:2] * high - dmin_b * m_pairs[..., 1:2]
+    y_chunks = mx.concatenate([y_low, y_high], axis=-1)  # (out, n_super, 4, 64)
+    return y_chunks.reshape(out_features, in_features).astype(out_dtype)
+
+
+def dequantize_gguf_q6_k(
+    packed: mx.array, shape: tuple[int, int], out_dtype=mx.bfloat16,
+) -> mx.array:
+    """GGUF/ggml Q6_K ("6-bit K-quant", used for embedding/select tensors
+    in a "Q4_K_M"-quantized file): super-blocks of 256 values (16 sub-
+    blocks of 16), 6-bit codes (4 low bits + 2 high bits, separately
+    packed) times one signed 8-bit scale per sub-block, times one shared
+    fp16 super-block scale. Ported verbatim from the real ggml-org/ggml
+    `dequantize_row_q6_K` (`src/ggml-quants.c`, fetched 2026-07-28) -- see
+    tests/test_gguf_quant_oracle.py.
+
+    `packed`/`shape` conventions match `dequantize_gguf_q4_k` exactly
+    (PyTorch-convention `(out_features, in_features)`, GGUF's own
+    ne-order reversed).
+    """
+    out_features, in_features = shape
+    QK_K = 256
+    if in_features % QK_K:
+        raise ValueError(
+            f"Q6_K requires in_features ({in_features}) divisible by {QK_K}")
+    n_super = in_features // QK_K
+    block_bytes = 210  # ql(128) + qh(64) + scales(16) + d(2)
+    if packed.shape != (out_features, n_super * block_bytes):
+        raise ValueError(
+            f"packed shape {packed.shape} inconsistent with logical shape "
+            f"{shape} for Q6_K's {block_bytes}-byte super-blocks")
+
+    blocks = packed.reshape(out_features, n_super, block_bytes)
+    ql = blocks[..., 0:128].astype(mx.uint8)               # (out, n_super, 128)
+    qh = blocks[..., 128:128 + 64].astype(mx.uint8)        # (out, n_super, 64)
+    scales_u8 = blocks[..., 192:208].astype(mx.uint8)      # (out, n_super, 16)
+    # scales are signed int8 in the real struct -- reinterpret, not cast.
+    scales = mx.where(scales_u8 >= 128,
+                       scales_u8.astype(mx.float32) - 256.0,
+                       scales_u8.astype(mx.float32))       # (out, n_super, 16)
+    d = _fp16_bytes_to_f32(blocks[..., 208:210])           # (out, n_super)
+
+    # Real dequantize_row_q6_K: 2 outer iterations (n=0,128), each handling
+    # 128 output values from ql[64 bytes]/qh[32 bytes]/8 of the 16 scales.
+    # Critically, within each outer iteration `is = l/16` (l=0..31) itself
+    # flips mid-group: the first 16 of each 32-wide q1..q4 group use one
+    # scale, the last 16 use the next one -- so each 32-wide group is
+    # actually two 16-wide sub-blocks, matching QK_K/16=16 scales total.
+    def _two_scale_halves(bits, sc_lo, sc_hi):
+        # bits: (out, n_super, 32); first 16 cols use sc_lo, last 16 use sc_hi.
+        lo = bits[..., :16] * sc_lo[..., None]
+        hi = bits[..., 16:] * sc_hi[..., None]
+        return mx.concatenate([lo, hi], axis=-1)  # (out, n_super, 32)
+
+    outputs = [None, None]
+    for outer in range(2):  # n = 0, 128
+        ql_o = ql[..., outer * 64:(outer + 1) * 64].reshape(out_features, n_super, 2, 32)
+        qh_o = qh[..., outer * 32:(outer + 1) * 32]  # (out, n_super, 32)
+        is_base = outer * 8
+        sc = [scales[..., is_base + k] for k in range(8)]  # each (out, n_super)
+        ql_lo, ql_hi = ql_o[..., 0, :], ql_o[..., 1, :]  # (out, n_super, 32) each
+        q1 = ((ql_lo & 0xF) | (((qh_o >> 0) & 3) << 4)).astype(mx.float32) - 32.0
+        q2 = ((ql_hi & 0xF) | (((qh_o >> 2) & 3) << 4)).astype(mx.float32) - 32.0
+        q3 = ((ql_lo >> 4) | (((qh_o >> 4) & 3) << 4)).astype(mx.float32) - 32.0
+        q4 = ((ql_hi >> 4) | (((qh_o >> 6) & 3) << 4)).astype(mx.float32) - 32.0
+        d_b = d[..., None]  # (out, n_super, 1)
+        y1 = d_b * _two_scale_halves(q1, sc[0], sc[1])  # (out, n_super, 32)
+        y2 = d_b * _two_scale_halves(q2, sc[2], sc[3])
+        y3 = d_b * _two_scale_halves(q3, sc[4], sc[5])
+        y4 = d_b * _two_scale_halves(q4, sc[6], sc[7])
+        outputs[outer] = mx.concatenate([y1, y2, y3, y4], axis=-1)  # (out, n_super, 128)
+    y = mx.concatenate(outputs, axis=-1)  # (out, n_super, 256)
+    return y.reshape(out_features, in_features).astype(out_dtype)

@@ -424,7 +424,14 @@ class ModelConfig:
             rope_theta=raw.get("rope_theta") or raw.get("rope_parameters", {}).get("rope_theta", 10000.0),
             max_position_embeddings=raw.get("max_position_embeddings", 4096),
             tie_word_embeddings=raw.get("tie_word_embeddings", False),
-            attention_bias=raw.get("attention_bias", False),
+            # Qwen2's real modeling_qwen2.py hardcodes bias=True on q/k/v_proj
+            # (and bias=False on o_proj, matching _linear's default None-bias
+            # no-op) unconditionally -- there is no "attention_bias" key in
+            # Qwen2's own config.json schema at all (confirmed against the
+            # real downloaded VibeThinker-3B config, 2026-07-28), unlike
+            # Llama-family configs that gate q/k/v bias on this flag.
+            attention_bias=raw.get(
+                "attention_bias", raw.get("model_type") == "qwen2"),
             head_dim=raw.get("head_dim") or raw["hidden_size"] // n_heads,
             eos_token_ids=tuple(eos),
             torch_dtype=raw.get("torch_dtype", raw.get("dtype", "bfloat16")),

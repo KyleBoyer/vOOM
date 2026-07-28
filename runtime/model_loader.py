@@ -131,6 +131,12 @@ class WeightStore:
         # fast tier staged (the common case).
         self._raw_fast_tier_manifest: dict[str, dict] | None = None
         self._raw_fast_tier_root: Path | None = None
+        # A model released GGUF-only (e.g. VibeThinker-3B's tool-calling
+        # fine-tune -- no safetensors release exists at all) -- see
+        # formats/gguf_reader.py. Populated below, alongside the ordinary
+        # weight_map construction; None for every other checkpoint format.
+        self.gguf = None
+        self._gguf_pending_real_names: dict[str, str] = {}
         self.config = ModelConfig.from_dir(self.dir)
         raw_config = json.loads(_read_text_retry(self.dir / "config.json"))
         text_config = raw_config.get("text_config", {})
@@ -194,10 +200,34 @@ class WeightStore:
             self.weight_map = json.loads(_read_text_retry(self.vpack / "manifest.json"))
         else:
             index_path = self.dir / "model.safetensors.index.json"
+            single = self.dir / "model.safetensors"
+            gguf_candidates = sorted(self.dir.glob("*.gguf"))
             if index_path.exists():
                 self.weight_map: dict[str, str] = json.loads(_read_text_retry(index_path))["weight_map"]
+            elif not single.exists() and gguf_candidates:
+                # VibeThinker-3B's tool-calling fine-tune ships GGUF-only.
+                # Tensor names use llama.cpp's own naming scheme
+                # (blk.N.attn_q.weight, ...); canonicalize to this engine's
+                # HF-style names the same way Qwen3-VL/K2.5's
+                # language_model.* prefix is rewritten just below, via
+                # self._real_name (populated after that loop runs, since it
+                # re-initializes the dict fresh).
+                if len(gguf_candidates) > 1:
+                    raise ValueError(
+                        f"multiple .gguf files in {self.dir}, expected exactly one: "
+                        f"{[p.name for p in gguf_candidates]}")
+                from formats.gguf_reader import (
+                    GGUFFile, canonicalize_llama_cpp_tensor_name)
+
+                self.gguf = GGUFFile(gguf_candidates[0])
+                self.weight_map = {}
+                for real_name in self.gguf.tensors:
+                    canon = canonicalize_llama_cpp_tensor_name(real_name)
+                    if canon is None:
+                        continue
+                    self.weight_map[canon] = gguf_candidates[0].name
+                    self._gguf_pending_real_names[canon] = real_name
             else:
-                single = self.dir / "model.safetensors"
                 self.weight_map = {name: single.name for name in mx.load(str(single))}
 
         # Qwen3-VL-class checkpoints nest the text model under
@@ -234,6 +264,7 @@ class WeightStore:
                 continue
             self._real_name[canon] = n
             self.weight_map[canon] = self.weight_map.pop(n)
+        self._real_name.update(self._gguf_pending_real_names)
 
         # Standard MLX quantized checkpoints store one logical matrix as
         # ``name.weight`` plus row/group metadata in ``name.scales`` and,
@@ -669,6 +700,20 @@ class WeightStore:
         backends may account compressed extents. Callers must not label this
         field "physical bytes" without independent process/device counters.
         """
+        if self.gguf is not None:
+            # Dequantize eagerly to a dense bf16 array at fetch time -- same
+            # convention as the compressed-tensors INT4/MXFP4 paths below,
+            # not the lazy QTensor path standard MLX quantization uses.
+            t0 = time.perf_counter()
+            out: dict[str, mx.array] = {}
+            nbytes = 0
+            for name in names:
+                real_name = self._real_name.get(name, name)
+                arr = self.gguf.load(real_name, out_dtype=mx.bfloat16)
+                mx.eval(arr)
+                out[name] = arr
+                nbytes += arr.nbytes
+            return out, time.perf_counter() - t0, nbytes
         if self.vpack2 is not None or self.packed:
             # Packed reads perform real I/O and decode inside the call. Retry the
             # whole transaction just like raw safetensors, reopening vpack2 after
