@@ -84,6 +84,36 @@ def _quant_params(value) -> tuple[int, int, str] | None:
     return bits, group_size, mode
 
 
+def _undo_llama_cpp_gguf_rope_permute(
+        weights: mx.array, n_head: int, n_head_kv: int) -> mx.array:
+    """Reverse llama.cpp's real HF-to-GGUF q_proj/k_proj row permutation.
+
+    llama.cpp's own converter (`conversion/llama.py`'s `LlamaModel`, real
+    source fetched 2026-07-28) applies `permute()` to q_proj/k_proj
+    weights (and biases, when present) for EVERY Llama-family GGUF export
+    -- its own rope kernel wants each head's dimension pairs interleaved,
+    unlike HF's native rotate-half layout this codebase's `_attention`
+    (runtime/layer_runner.py, `traditional=False`) assumes. Left
+    unreversed, this measured as real, large error against the actual
+    unquantized bf16 weights specifically on q_proj/k_proj (mean abs error
+    ~0.014 against an original whose std is ~0.018 -- roughly 100% of
+    signal, vs ~1-8% for every other tensor, matching ordinary Q4_K/Q6_K
+    quantization noise) and produced fluent-but-incoherent decode output
+    end to end (confirmed 2026-07-28, Llama-3-Groq-8B-Tool-Use). Verified
+    to be the exact inverse of the real `permute()` via numeric round-trip
+    on random data before use here -- Qwen2's own conversion module has no
+    such step at all (confirmed against the real source), so this must
+    stay scoped to model_type == "llama" GGUF checkpoints specifically,
+    not applied generically.
+    """
+    if n_head_kv and n_head != n_head_kv:
+        n_head = n_head_kv
+    d = weights.shape[0] // n_head // 2
+    return (weights.reshape(n_head, d, 2, *weights.shape[1:])
+                    .swapaxes(1, 2)
+                    .reshape(weights.shape))
+
+
 def _read_text_retry(path: Path, attempts: int = 4) -> str:
     """F24: metadata reads on externally-hosted models survive transient
     mount drops (same failure class that killed a GLM run at config-read
@@ -710,6 +740,18 @@ class WeightStore:
             for name in names:
                 real_name = self._real_name.get(name, name)
                 arr = self.gguf.load(real_name, out_dtype=mx.bfloat16)
+                if (self.config.model_type == "llama"
+                        and name.endswith(("self_attn.q_proj.weight",
+                                            "self_attn.q_proj.bias"))):
+                    arr = _undo_llama_cpp_gguf_rope_permute(
+                        arr, self.config.num_attention_heads,
+                        self.config.num_attention_heads)
+                elif (self.config.model_type == "llama"
+                        and name.endswith(("self_attn.k_proj.weight",
+                                            "self_attn.k_proj.bias"))):
+                    arr = _undo_llama_cpp_gguf_rope_permute(
+                        arr, self.config.num_attention_heads,
+                        self.config.num_key_value_heads)
                 mx.eval(arr)
                 out[name] = arr
                 nbytes += arr.nbytes
