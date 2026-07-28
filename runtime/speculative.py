@@ -149,10 +149,21 @@ class SpeculativeDecoder:
         # MLP), verified near-identical (float32-rounding-only diff, <1e-3
         # max abs logit diff) against forward_tokens() on real downloaded
         # K3 weights (tests/test_f128_k3_verify_positions_oracle.py).
-        # kimi_linear itself is deliberately NOT exempted here -- that is a
-        # separate, pre-existing gap this pass did not investigate or fix.
         target_kimi_k3_family = getattr(target.cfg, "model_type", None) == "kimi_k3"
-        if not _unsafe_allow_moe_verify and not target_glm_family and not target_kimi_k3_family and (
+        # F116 follow-on (2026-07-27, closing the previously-noted gap):
+        # kimi_linear's own kimi_family per-position dispatch in
+        # forward_tokens_serial_positions (reusing
+        # _kimi_linear_attention_residual/_kimi_linear_mlp_residual,
+        # already in place since F113's Kimi K3-readiness pass) had never
+        # actually been exempted from THIS guard, even though the
+        # underlying per-position dispatch it protects against already
+        # existed -- an oversight, not a deliberate exclusion. Verified the
+        # same way glm_family was: byte-identical greedy argmax tokens
+        # (all 6 positions) against true sequential decode, on the real
+        # Kimi-Linear-48B-A3B-Instruct checkpoint's full 27-layer stack
+        # (tests/test_f116_kimi_linear_verify_positions_oracle.py).
+        target_kimi_linear_family = getattr(target.cfg, "model_type", None) == "kimi_linear"
+        if not _unsafe_allow_moe_verify and not target_glm_family and not target_kimi_k3_family and not target_kimi_linear_family and (
                 getattr(target.cfg, "num_experts", 0) or getattr(
                     target.cfg, "model_type", None) in (
                     "gpt_oss", "qwen3_5", "qwen3_5_moe", "kimi_linear", "kimi_k3")):
@@ -176,14 +187,18 @@ class SpeculativeDecoder:
             # unsafe verify path is the same regardless of where proposals
             # come from.
             #
-            # glm_moe_dsa/kimi_k25/glm4_moe_lite are EXEMPT from this guard
-            # (same day, later): forward_tokens_serial_positions gained a
-            # real MoE-aware per-position dispatch for exactly these model
-            # types (reusing _glm_attention_residual/_glm_mlp_residual),
-            # verified byte-identical (0.0 max abs logit diff, all
-            # positions) against true sequential decode on the real
-            # Kimi-K2.5 checkpoint -- the underlying bug is fixed for this
-            # architecture family specifically, not just gated around.
+            # glm_moe_dsa/kimi_k25/glm4_moe_lite/kimi_linear/kimi_k3 are all
+            # EXEMPT from this guard: forward_tokens_serial_positions has a
+            # real MoE/hybrid-aware per-position dispatch for each of these
+            # families, individually verified against true sequential
+            # decode on real weights (byte-identical greedy tokens for
+            # glm_moe_dsa/kimi_k25's Kimi-K2.5 checkpoint and kimi_linear's
+            # own 48B checkpoint; <1e-3 max abs logit diff for kimi_k3,
+            # whose real checkpoint's much larger per-layer scale made
+            # exact byte-identical float comparison impractical to test at
+            # -- see each family's own test file) -- the underlying bug is
+            # fixed for these architecture families specifically, not just
+            # gated around.
             raise ValueError(
                 f"SpeculativeDecoder does not support MoE/hybrid targets "
                 f"({target.cfg.model_type}) -- their multi-position verify "
