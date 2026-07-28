@@ -3284,6 +3284,50 @@ def _prepend_system_content(messages: list[dict], content: str) -> list[dict]:
     return copied
 
 
+def _special_token_strings(model_dir: Path) -> dict[str, str]:
+    """bos_token/eos_token string values for native chat-template rendering.
+
+    HF's own `apply_chat_template` always injects these two Jinja variables
+    (their real per-tokenizer strings, e.g. "<|begin_of_text|>", not IDs).
+    This codebase's own templates so far only ever referenced `eos_token` in
+    a plain `{{ }}` output (Jinja's default Undefined renders that as an
+    empty string, so it silently "worked" without ever being supplied) --
+    Groq's real Llama-3-Groq-8B-Tool-Use template does
+    `{% set content = bos_token + content %}`, a string CONCATENATION on an
+    undefined value, which Jinja's default Undefined class genuinely raises
+    on (`UndefinedError: 'bos_token' is undefined`, live-confirmed
+    2026-07-28). Each of `bos_token`/`eos_token` may be a plain string or an
+    HF `AddedToken`-shaped dict (`{"content": ..., ...}`) in
+    tokenizer_config.json; special_tokens_map.json is the same convention
+    and is tried as a fallback for checkpoints that omit these keys from
+    tokenizer_config.json specifically.
+    """
+    def _string_value(raw) -> str | None:
+        if isinstance(raw, str):
+            return raw
+        if isinstance(raw, dict):
+            content = raw.get("content")
+            return content if isinstance(content, str) else None
+        return None
+
+    tokens: dict[str, str] = {}
+    for filename in ("tokenizer_config.json", "special_tokens_map.json"):
+        path = model_dir / filename
+        if not path.exists():
+            continue
+        try:
+            data = json.loads(path.read_text())
+        except (OSError, ValueError):
+            continue
+        for key in ("bos_token", "eos_token"):
+            if key in tokens:
+                continue
+            value = _string_value(data.get(key))
+            if value is not None:
+                tokens[key] = value
+    return tokens
+
+
 def _chat_prompt(engine, model_dir: Path, messages: list[dict], reasoning: str,
                  tools: list[dict] | None = None, *, compact_json: bool = False,
                  enable_thinking: bool | None = None,
@@ -3342,6 +3386,7 @@ def _chat_prompt(engine, model_dir: Path, messages: list[dict], reasoning: str,
             "add_generation_prompt": add_generation_prompt,
             "reasoning_effort": reasoning,
             "tools": template_tools,
+            **_special_token_strings(model_dir),
         }
         if enable_thinking is not None:
             context["enable_thinking"] = enable_thinking

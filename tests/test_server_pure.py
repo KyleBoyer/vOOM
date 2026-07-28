@@ -301,6 +301,56 @@ def test_fast_qwen35_tool_history_uses_one_canonical_hermes_prefix(tmp_path):
     assert followup.startswith(str(first) + canonical_call)
 
 
+def test_native_template_bos_token_concatenation_does_not_raise():
+    # Groq's real Llama-3-Groq-8B-Tool-Use chat_template.jinja does exactly
+    # this: `{% set content = bos_token + content %}` for the first message
+    # only. bos_token was never supplied anywhere in this codebase's
+    # template-rendering context, so this previously raised
+    # `UndefinedError: 'bos_token' is undefined` (live-confirmed 2026-07-28)
+    # -- Jinja's default Undefined tolerates a bare `{{ bos_token }}` output
+    # (renders empty) but not a `+` concatenation.
+    template = (
+        "{% for message in messages %}"
+        "{% set content = message.role + ':' + message.content %}"
+        "{% if loop.index0 == 0 %}{% set content = bos_token + content %}{% endif %}"
+        "{{ content }}"
+        "{% endfor %}"
+    )
+    messages = [{"role": "user", "content": "hi"}]
+    with tempfile.TemporaryDirectory() as directory:
+        model_dir = Path(directory)
+        (model_dir / "chat_template.jinja").write_text(template)
+        (model_dir / "tokenizer_config.json").write_text(
+            json.dumps({"bos_token": "<|begin_of_text|>"}))
+        rendered = _chat_prompt(_fake_engine(), model_dir, messages, "low")
+    assert rendered == "<|begin_of_text|>user:hi"
+
+
+def test_bos_token_accepts_added_token_dict_shape():
+    template = "{{ bos_token }}{{ messages[0].content }}"
+    messages = [{"role": "user", "content": "hi"}]
+    with tempfile.TemporaryDirectory() as directory:
+        model_dir = Path(directory)
+        (model_dir / "chat_template.jinja").write_text(template)
+        (model_dir / "tokenizer_config.json").write_text(json.dumps({
+            "bos_token": {"content": "<s>", "lstrip": False}}))
+        rendered = _chat_prompt(_fake_engine(), model_dir, messages, "low")
+    assert rendered == "<s>hi"
+
+
+def test_bos_token_falls_back_to_special_tokens_map():
+    template = "{{ bos_token }}{{ messages[0].content }}"
+    messages = [{"role": "user", "content": "hi"}]
+    with tempfile.TemporaryDirectory() as directory:
+        model_dir = Path(directory)
+        (model_dir / "chat_template.jinja").write_text(template)
+        (model_dir / "tokenizer_config.json").write_text(json.dumps({}))
+        (model_dir / "special_tokens_map.json").write_text(
+            json.dumps({"bos_token": "<s>"}))
+        rendered = _chat_prompt(_fake_engine(), model_dir, messages, "low")
+    assert rendered == "<s>hi"
+
+
 def test_standalone_jinja_template_receives_reasoning_and_thinking_controls():
     template = (
         "{{ reasoning_effort }}|"
