@@ -1082,7 +1082,8 @@ class StreamingEngine:
         # it is pinned unconditionally alongside them.
         self._embed_rows = None
         if (self.rc.embed_rows and not self.cfg.tie_word_embeddings
-                and not self.store.is_quantized("model.embed_tokens.weight")):
+                and not self.store.is_quantized("model.embed_tokens.weight")
+                and self.store.gguf is None):
             from .embed_rows import EmbedRows
 
             self._embed_rows = EmbedRows(self._model_dir, self.store, self.cfg.hidden_size)
@@ -1091,7 +1092,8 @@ class StreamingEngine:
         if (self.rc.stream_lm_head and not self.cfg.tie_word_embeddings
                 and not self.store.is_quantized("lm_head.weight")
                 and self.store.has("lm_head.weight")
-                and not self.store.vpack2 and not self.store.packed):
+                and not self.store.vpack2 and not self.store.packed
+                and self.store.gguf is None):
             from .lm_head_stream import StreamedLMHead
 
             self._streamed_lm_head = StreamedLMHead(
