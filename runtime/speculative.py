@@ -142,7 +142,17 @@ class SpeculativeDecoder:
                 f"rejection. Use QwenMTPSpeculativeEngine instead.")
         target_glm_family = getattr(target.cfg, "model_type", None) in (
             "glm_moe_dsa", "kimi_k25", "glm4_moe_lite")
-        if not _unsafe_allow_moe_verify and not target_glm_family and (
+        # F128: kimi_k3 gets the SAME exemption treatment as glm_family
+        # below -- forward_tokens_serial_positions gained a real kimi_k3_
+        # family per-position dispatch (AttnRes-aware, batching only the
+        # per-position-independent _apply_attn_res mixing, never attention/
+        # MLP), verified near-identical (float32-rounding-only diff, <1e-3
+        # max abs logit diff) against forward_tokens() on real downloaded
+        # K3 weights (tests/test_f128_k3_verify_positions_oracle.py).
+        # kimi_linear itself is deliberately NOT exempted here -- that is a
+        # separate, pre-existing gap this pass did not investigate or fix.
+        target_kimi_k3_family = getattr(target.cfg, "model_type", None) == "kimi_k3"
+        if not _unsafe_allow_moe_verify and not target_glm_family and not target_kimi_k3_family and (
                 getattr(target.cfg, "num_experts", 0) or getattr(
                     target.cfg, "model_type", None) in (
                     "gpt_oss", "qwen3_5", "qwen3_5_moe", "kimi_linear", "kimi_k3")):

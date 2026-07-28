@@ -2907,6 +2907,159 @@ class StreamingEngine:
             del w
         return x
 
+    def _layer_stationary_kimi_k3_sweep(
+            self, x: mx.array, kv, offset: int, tile_width: int,
+            on_progress=None) -> mx.array:
+        """F128: AttnRes-aware layer-stationary prefill for Kimi K3 -- same
+        motivation and per-layer weight-fetch mechanism as
+        `_layer_stationary_kimi_linear_sweep` above (each layer's weights
+        fetched exactly once for the whole prefill range, not once per
+        chunk), generalized for AttnRes's extra `block_residual` state.
+
+        `attn_res_wrap_layer` (runtime/kimi_linear.py) already accepts
+        arbitrary `attn_fn`/`mlp_fn` closures that receive/return the FULL
+        `(B, L, H)` tensor for whatever positions are passed in -- nothing
+        about it assumes attention runs in one shot. This reuses that
+        directly: `attn_fn` here tiles internally (attention must still see
+        tiles in causal order, exactly like the plain kimi_linear sweep
+        above), while `mlp_fn` runs once over the whole layer's positions
+        as before. The AttnRes pre/post mixing itself
+        (`_apply_attn_res`) is a per-position, row-independent operation
+        with no causal-order requirement, so applying it ONCE over all of
+        `x` (inside `attn_res_wrap_layer`, called once per LAYER here, not
+        once per tile) is exactly equivalent to applying it per-tile --
+        only the block-boundary snapshot/reset bookkeeping needs to happen
+        at layer granularity, which calling `attn_res_wrap_layer` exactly
+        once per outer-loop iteration already gives for free.
+        """
+        from .kimi_linear import (
+            _kda_attention, _mla_attention, _kimi_dense_mlp, _kimi_moe_output,
+            attn_res_wrap_layer, apply_output_attn_res)
+
+        if tile_width <= 0:
+            raise ValueError("tile_width must be positive")
+        n = self.cfg.num_hidden_layers
+        total = int(x.shape[1])
+        (self._layer_transient,
+         self._layer_transient_margin) = _layer_transient_for_positions(
+             total,
+             getattr(
+                 self, "_prefill_layer_transient_by_positions", {}
+             ).get(total, 0),
+             getattr(self, "_decode_layer_transient", 0))
+        profiler = self._request_profiler
+        if profiler is not None:
+            profiler.begin_sweep(total, path="layer_stationary_kimi_k3")
+        block_residual = mx.zeros((x.shape[0] * total, 0, x.shape[2]), dtype=x.dtype)
+        for i in range(n):
+            if self.prefetcher:
+                for j in range(i + 1, min(i + 1 + self.rc.prefetch_depth, n)):
+                    self.prefetcher.schedule(self._layer_key(j), self._layer_names(j))
+
+            cache_before = (
+                profiler.cache_snapshot(self.cache)
+                if profiler is not None else None)
+            t0 = time.perf_counter()
+            layer_key = self._layer_key(i)
+            layer_names = self._layer_names(i)
+            if not self.cache.contains(layer_key):
+                incoming_page = self._layer_fetch_bytes_estimate(i)
+                if incoming_page:
+                    self.cache.prepare_for(incoming_page)
+                    if self.governor is not None:
+                        self.governor.reserve(incoming_page)
+            w = self.cache.get(layer_key, layer_names)
+            weight_wait_s = time.perf_counter() - t0
+            self.timer.add("weights_wait", weight_wait_s)
+
+            active_before = mx.get_active_memory()
+            mx.reset_peak_memory()
+            t0 = time.perf_counter()
+            prefix = f"model.layers.{i}"
+
+            def attn_fn(hidden_states, i=i, prefix=prefix):
+                tiles = []
+                pos = 0
+                while pos < total:
+                    end = min(pos + tile_width, total)
+                    if self.governor is not None and self._layer_transient:
+                        self.governor.reserve(
+                            self._layer_transient,
+                            margin=self._layer_transient_margin)
+                    ht = hidden_states[:, pos:end, :]
+                    attention_t0 = time.perf_counter()
+                    if i in self.cfg.full_attn_layers:
+                        yt = _mla_attention(
+                            ht, w, prefix, self.cfg, kv, i, offset + pos)
+                    elif i in self.cfg.kda_layers:
+                        kda_cache = getattr(kv, "kda_cache", None)
+                        yt = _kda_attention(
+                            ht, w, prefix, self.cfg, kda_cache, i,
+                            native_fused_decode=self.rc.native_fused_deltanet_decode)
+                    else:
+                        raise ValueError(
+                            f"layer {i} is in neither cfg.full_attn_layers nor cfg.kda_layers")
+                    mx.eval(yt)
+                    if profiler is not None and profiler.sync_substeps:
+                        profiler.record_substep(
+                            "attention", i, time.perf_counter() - attention_t0,
+                            positions=end - pos)
+                    tiles.append(yt)
+                    pos = end
+                return tiles[0] if len(tiles) == 1 else mx.concatenate(tiles, axis=1)
+
+            def mlp_fn(h2, i=i, prefix=prefix):
+                mlp_t0 = time.perf_counter()
+                if i < self.cfg.first_k_dense_replace:
+                    out = _kimi_dense_mlp(h2, w, f"{prefix}.mlp", self.cfg)
+                else:
+                    out = _kimi_moe_output(
+                        h2, w, prefix, self.cfg, i, self._get_experts,
+                        iter_expert_batches=self._iter_expert_batches,
+                        profile=profiler)
+                mx.eval(out)
+                if profiler is not None and profiler.sync_substeps:
+                    profiler.record_substep(
+                        "mlp", i, time.perf_counter() - mlp_t0, positions=total)
+                return out
+
+            x, block_residual = attn_res_wrap_layer(
+                x, block_residual, w, prefix, self.cfg, i, attn_fn, mlp_fn)
+            mx.eval(x)
+            compute_s = time.perf_counter() - t0
+            self.timer.add("layer_compute", compute_s)
+            if profiler is not None:
+                profiler.record_layer(
+                    i, positions=total, weight_wait_s=weight_wait_s,
+                    compute_s=compute_s, cache_before=cache_before,
+                    cache_after=profiler.cache_snapshot(self.cache),
+                    layer_type=self._profile_layer_type(i),
+                )
+            if on_progress is not None:
+                on_progress({
+                    "phase": "prefill_layer",
+                    "completed_layers": i + 1,
+                    "total_layers": n,
+                    "total_tokens": total,
+                    "cache_source": "cold",
+                })
+            self._layer_transient = max(
+                self._layer_transient,
+                _resident_adjusted_transient(
+                    active_before, mx.get_active_memory(), mx.get_peak_memory()))
+            by_positions = self._prefill_layer_transient_by_positions
+            by_positions[total] = max(
+                int(by_positions.get(total, 0)), self._layer_transient)
+            self._prefill_layer_transient = max(by_positions.values())
+            self._note_true_peak()
+            del w
+        x = apply_output_attn_res(
+            x, {
+                "model.output_attn_res_proj.weight": self._output_attn_res_proj_w,
+                "model.output_attn_res_norm.weight": self._output_attn_res_norm_w,
+            }, block_residual, self.cfg)
+        return x
+
     def forward_tokens(self, tokens: list[int], kv, tap_layers=None) -> mx.array:
         """Feed tokens through the streamed model against an existing KV cache.
         Returns logits (len(tokens), vocab) — one distribution per fed position.
@@ -2934,12 +3087,16 @@ class StreamingEngine:
         """
         glm_family = self.cfg.model_type in ("glm_moe_dsa", "kimi_k25", "glm4_moe_lite")
         qwen_family = self.cfg.model_type in ("qwen3_5", "qwen3_5_moe")
-        # F128: kimi_k3 deliberately excluded -- its real AttnRes mechanism
-        # is not yet implemented in _kimi_linear_attention_residual/
-        # _kimi_linear_mlp_residual (same reasoning as the run_kimi_linear_block
-        # dispatch a few hundred lines up).
         kimi_family = self.cfg.model_type == "kimi_linear"
-        if not glm_family and not qwen_family and not kimi_family and (
+        # F128: kimi_k3 gets its OWN branch below (kimi_k3_family), not
+        # folded into kimi_family -- block_residual's per-layer boundary
+        # snapshot must span ALL positions in this verify window at once,
+        # not one position at a time like attention/MLP below do, so it
+        # needs different bookkeeping around the same per-position calls,
+        # not just a reused _kimi_linear_attention_residual/_mlp_residual
+        # dispatch.
+        kimi_k3_family = self.cfg.model_type == "kimi_k3"
+        if not glm_family and not qwen_family and not kimi_family and not kimi_k3_family and (
                 self.cfg.num_experts or self.cfg.model_type == "gpt_oss"):
             # F94: layer_runner.run_block (this function's per-layer call
             # below) is a plain dense-transformer block with no awareness of
@@ -3009,6 +3166,13 @@ class StreamingEngine:
         if kimi_family:
             from .kimi_linear import (
                 _kimi_linear_attention_residual, _kimi_linear_mlp_residual)
+        if kimi_k3_family:
+            from .kimi_linear import (
+                _apply_attn_res, _kda_attention, _mla_attention,
+                _kimi_dense_mlp, _kimi_moe_output)
+            block_residual = mx.zeros(
+                (embedded.shape[0] * len(tokens), 0, embedded.shape[2]),
+                dtype=embedded.dtype)
         for layer in range(n):
             if self.prefetcher:
                 for nxt in range(
@@ -3027,63 +3191,141 @@ class StreamingEngine:
 
             active_before = mx.get_active_memory()
             mx.reset_peak_memory()
-            next_positions = []
-            for position, hidden in enumerate(positions):
-                if glm_family:
-                    # F113: MLA attention + MoE routing/experts computed at
-                    # the SAME one-position-at-a-time granularity ordinary
-                    # decode uses -- routing for position i sees only
-                    # position i's own hidden state, exactly matching what
-                    # true sequential decode would compute, unlike a
-                    # batched multi-position routing call.
-                    prefix = f"model.layers.{layer}"
-                    attn_out = _glm_attention_residual(
-                        hidden, weights, prefix, self.cfg, kv, layer,
-                        offset + position)
-                    hidden = _glm_mlp_residual(
-                        attn_out, weights, prefix, self.cfg, layer,
-                        self._get_experts,
-                        iter_expert_batches=self._iter_expert_batches)
-                elif qwen_family:
-                    # F113 follow-on: DeltaNet-or-full-attention + MoE (if
-                    # any) computed one position at a time, in order --
-                    # kv.kda_cache (when present) updates exactly as it
-                    # would during real sequential decode, since this IS
-                    # a real per-position sequential call, not a batched
-                    # multi-position one.
-                    prefix = f"model.layers.{layer}"
-                    attn_out = _qwen35_attention_residual(
-                        hidden, weights, prefix, self.cfg, kv, layer,
-                        offset + position,
-                        chunked_delta_prefill=(
-                            self.rc.qwen_chunked_delta_prefill))
-                    hidden = _qwen35_mlp_residual(
-                        attn_out, weights, prefix, self.cfg, layer,
-                        self._get_experts,
-                        iter_expert_batches=self._iter_expert_batches)
-                elif kimi_family:
-                    # F113 follow-on (Kimi K3 readiness): same one-
-                    # position-at-a-time contract as qwen_family above --
-                    # _kimi_linear_attention_residual itself picks KDA vs
-                    # MLA per layer (cfg.kda_layers/full_attn_layers), so
-                    # kda_cache and MLA KV both evolve exactly as real
-                    # sequential decode would.
-                    prefix = f"model.layers.{layer}"
-                    attn_out = _kimi_linear_attention_residual(
-                        hidden, weights, prefix, self.cfg, kv, layer,
-                        offset + position)
-                    hidden = _kimi_linear_mlp_residual(
-                        attn_out, weights, prefix, self.cfg, layer,
-                        self._get_experts,
-                        iter_expert_batches=self._iter_expert_batches)
-                else:
-                    hidden = layer_runner.run_block(
-                        hidden, weights, f"model.layers.{layer}", self.cfg,
-                        kv, layer, offset + position,
-                        rope_freqs=self._rope_freqs, rope_mscale=self._mscale,
-                        fused_swiglu=self.rc.fused_swiglu,
-                    )
-                next_positions.append(hidden)
+            if kimi_k3_family:
+                # F128: block_residual's per-layer boundary snapshot must
+                # span ALL positions in this verify window at once (it is
+                # built ONCE per layer, not once per position -- see
+                # attn_res_wrap_layer's own docstring), so the AttnRes
+                # pre/post mixing (_apply_attn_res) is batched across all N
+                # positions here. This does not weaken this function's
+                # "avoid batched-GEMM divergence" guarantee: _apply_attn_res
+                # has no hidden_size-sized reduction (softmax/matmul over
+                # the tiny num_blocks axis only, per-position independent),
+                # unlike a real hidden_size GEMM. Attention and MLP/MoE
+                # still run one position at a time, in order, exactly like
+                # every other family above.
+                prefix = f"model.layers.{layer}"
+                x_layer = mx.concatenate(positions, axis=1)
+                B, N, H = x_layer.shape
+                prefix_sum_layer = x_layer
+                hidden_layer = x_layer
+                if block_residual.shape[1] > 0:
+                    hidden_layer = _apply_attn_res(
+                        prefix_sum_layer.reshape(-1, H), block_residual,
+                        weights[f"{prefix}.self_attention_res_proj.weight"],
+                        weights[f"{prefix}.self_attention_res_norm.weight"],
+                        self.cfg.rms_norm_eps,
+                    ).reshape(B, N, H)
+                if layer % self.cfg.attn_res_block_size == 0:
+                    block_residual = mx.concatenate(
+                        [block_residual, prefix_sum_layer.reshape(-1, H)[:, None, :]],
+                        axis=1)
+                    prefix_sum_layer = None
+
+                attn_outputs = []
+                for position in range(N):
+                    h_normed = mx.fast.rms_norm(
+                        hidden_layer[:, position:position + 1, :],
+                        weights[f"{prefix}.input_layernorm.weight"],
+                        self.cfg.rms_norm_eps)
+                    if layer in self.cfg.full_attn_layers:
+                        attn_out = _mla_attention(
+                            h_normed, weights, prefix, self.cfg, kv, layer,
+                            offset + position)
+                    else:
+                        kda_cache = getattr(kv, "kda_cache", None)
+                        attn_out = _kda_attention(
+                            h_normed, weights, prefix, self.cfg, kda_cache, layer)
+                    attn_outputs.append(attn_out)
+                attn_out_layer = mx.concatenate(attn_outputs, axis=1)
+                prefix_sum_layer = (
+                    (prefix_sum_layer + attn_out_layer)
+                    if prefix_sum_layer is not None else attn_out_layer)
+
+                hidden_layer2 = _apply_attn_res(
+                    prefix_sum_layer.reshape(-1, H), block_residual,
+                    weights[f"{prefix}.mlp_res_proj.weight"],
+                    weights[f"{prefix}.mlp_res_norm.weight"],
+                    self.cfg.rms_norm_eps,
+                ).reshape(B, N, H)
+
+                mlp_outputs = []
+                for position in range(N):
+                    h2_normed = mx.fast.rms_norm(
+                        hidden_layer2[:, position:position + 1, :],
+                        weights[f"{prefix}.post_attention_layernorm.weight"],
+                        self.cfg.rms_norm_eps)
+                    if layer < self.cfg.first_k_dense_replace:
+                        mlp_out = _kimi_dense_mlp(
+                            h2_normed, weights, f"{prefix}.mlp", self.cfg)
+                    else:
+                        mlp_out = _kimi_moe_output(
+                            h2_normed, weights, prefix, self.cfg, layer,
+                            self._get_experts,
+                            iter_expert_batches=self._iter_expert_batches)
+                    mlp_outputs.append(mlp_out)
+                mlp_out_layer = mx.concatenate(mlp_outputs, axis=1)
+                prefix_sum_layer = prefix_sum_layer + mlp_out_layer
+                next_positions = [
+                    prefix_sum_layer[:, p:p + 1, :] for p in range(N)]
+            else:
+                next_positions = []
+                for position, hidden in enumerate(positions):
+                    if glm_family:
+                        # F113: MLA attention + MoE routing/experts computed at
+                        # the SAME one-position-at-a-time granularity ordinary
+                        # decode uses -- routing for position i sees only
+                        # position i's own hidden state, exactly matching what
+                        # true sequential decode would compute, unlike a
+                        # batched multi-position routing call.
+                        prefix = f"model.layers.{layer}"
+                        attn_out = _glm_attention_residual(
+                            hidden, weights, prefix, self.cfg, kv, layer,
+                            offset + position)
+                        hidden = _glm_mlp_residual(
+                            attn_out, weights, prefix, self.cfg, layer,
+                            self._get_experts,
+                            iter_expert_batches=self._iter_expert_batches)
+                    elif qwen_family:
+                        # F113 follow-on: DeltaNet-or-full-attention + MoE (if
+                        # any) computed one position at a time, in order --
+                        # kv.kda_cache (when present) updates exactly as it
+                        # would during real sequential decode, since this IS
+                        # a real per-position sequential call, not a batched
+                        # multi-position one.
+                        prefix = f"model.layers.{layer}"
+                        attn_out = _qwen35_attention_residual(
+                            hidden, weights, prefix, self.cfg, kv, layer,
+                            offset + position,
+                            chunked_delta_prefill=(
+                                self.rc.qwen_chunked_delta_prefill))
+                        hidden = _qwen35_mlp_residual(
+                            attn_out, weights, prefix, self.cfg, layer,
+                            self._get_experts,
+                            iter_expert_batches=self._iter_expert_batches)
+                    elif kimi_family:
+                        # F113 follow-on (Kimi K3 readiness): same one-
+                        # position-at-a-time contract as qwen_family above --
+                        # _kimi_linear_attention_residual itself picks KDA vs
+                        # MLA per layer (cfg.kda_layers/full_attn_layers), so
+                        # kda_cache and MLA KV both evolve exactly as real
+                        # sequential decode would.
+                        prefix = f"model.layers.{layer}"
+                        attn_out = _kimi_linear_attention_residual(
+                            hidden, weights, prefix, self.cfg, kv, layer,
+                            offset + position)
+                        hidden = _kimi_linear_mlp_residual(
+                            attn_out, weights, prefix, self.cfg, layer,
+                            self._get_experts,
+                            iter_expert_batches=self._iter_expert_batches)
+                    else:
+                        hidden = layer_runner.run_block(
+                            hidden, weights, f"model.layers.{layer}", self.cfg,
+                            kv, layer, offset + position,
+                            rope_freqs=self._rope_freqs, rope_mscale=self._mscale,
+                            fused_swiglu=self.rc.fused_swiglu,
+                        )
+                    next_positions.append(hidden)
             # Keep every block call at the ordinary one-token shape, but use a
             # single layer barrier for the position outputs. The lazy KV chain
             # still orders position N before N+1.
@@ -3104,6 +3346,18 @@ class StreamingEngine:
             self._decode_layer_transient = self._layer_transient
             self._note_true_peak()
             del weights
+
+        if kimi_k3_family:
+            from .kimi_linear import apply_output_attn_res
+
+            x_all = mx.concatenate(positions, axis=1)
+            x_all = apply_output_attn_res(
+                x_all, {
+                    "model.output_attn_res_proj.weight": self._output_attn_res_proj_w,
+                    "model.output_attn_res_norm.weight": self._output_attn_res_norm_w,
+                }, block_residual, self.cfg)
+            mx.eval(x_all)
+            positions = [x_all[:, p:p + 1, :] for p in range(x_all.shape[1])]
 
         head = self._lm_head_weight()
         logits = []
@@ -4122,13 +4376,14 @@ class StreamingEngine:
                     # conditions hold; the resulting endpoint state is the
                     # same state forked below.
                     # F128: kimi_k3 deliberately excluded -- see the same
-                    # note on run_kimi_linear_block's dispatch above;
-                    # _layer_stationary_kimi_linear_sweep has no AttnRes
-                    # awareness either.
+                    # F128: _layer_stationary_kimi_k3_sweep now exists and
+                    # is oracle-verified (tests/test_f128_k3_layer_
+                    # stationary_oracle.py) against a scoped real-weight
+                    # equivalence check, so kimi_k3 is included here too.
                     boundary_layer_stationary = (
                         self.rc.layer_stationary_prefill
                         and self.cfg.model_type in (
-                            "qwen3_5", "qwen3_5_moe", "kimi_linear",
+                            "qwen3_5", "qwen3_5_moe", "kimi_linear", "kimi_k3",
                             "glm_moe_dsa", "kimi_k25", "glm4_moe_lite")
                         and not self.rc.adaptive_chunk_size
                         and not (
@@ -4145,6 +4400,11 @@ class StreamingEngine:
                         bx = self._embed(list(tokens[pos:stable_boundary]))
                         if self.cfg.model_type == "kimi_linear":
                             bx = self._layer_stationary_kimi_linear_sweep(
+                                bx, kv, offset=pos,
+                                tile_width=boundary_chunk,
+                                on_progress=on_progress)
+                        elif self.cfg.model_type == "kimi_k3":
+                            bx = self._layer_stationary_kimi_k3_sweep(
                                 bx, kv, offset=pos,
                                 tile_width=boundary_chunk,
                                 on_progress=on_progress)
@@ -4228,14 +4488,14 @@ class StreamingEngine:
             # fresh every call (never cached), so a request that later needs
             # one of those features is simply never routed here.
             # F128: kimi_k3 deliberately excluded -- see the
-            # run_kimi_linear_block dispatch note above; its real AttnRes
-            # mechanism is not yet implemented in either this fast path or
-            # _layer_stationary_kimi_linear_sweep.
+            # F128: _layer_stationary_kimi_k3_sweep now exists and is
+            # oracle-verified against a scoped real-weight equivalence
+            # check, so kimi_k3 is included here too.
             layer_stationary_eligible = (
                 bool(chunk)
                 and self.rc.layer_stationary_prefill
                 and self.cfg.model_type in (
-                    "qwen3_5", "qwen3_5_moe", "kimi_linear",
+                    "qwen3_5", "qwen3_5_moe", "kimi_linear", "kimi_k3",
                     "glm_moe_dsa", "kimi_k25", "glm4_moe_lite")
                 and adaptive is None
                 and not (ckpt and kv_store is not None)
@@ -4248,7 +4508,7 @@ class StreamingEngine:
                 if not self.rc.layer_stationary_prefill:
                     blockers.append("disabled")
                 if self.cfg.model_type not in (
-                        "qwen3_5", "qwen3_5_moe", "kimi_linear",
+                        "qwen3_5", "qwen3_5_moe", "kimi_linear", "kimi_k3",
                         "glm_moe_dsa", "kimi_k25", "glm4_moe_lite"):
                     blockers.append("architecture")
                 if adaptive is not None:
@@ -4298,6 +4558,10 @@ class StreamingEngine:
                     xc = self._embed(list(tokens[pos:stop_before]))
                     if self.cfg.model_type == "kimi_linear":
                         xc = self._layer_stationary_kimi_linear_sweep(
+                            xc, kv, offset=pos, tile_width=chunk,
+                            on_progress=on_progress)
+                    elif self.cfg.model_type == "kimi_k3":
+                        xc = self._layer_stationary_kimi_k3_sweep(
                             xc, kv, offset=pos, tile_width=chunk,
                             on_progress=on_progress)
                     elif self.cfg.model_type in (
