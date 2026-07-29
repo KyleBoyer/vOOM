@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -170,6 +171,16 @@ class ModelConfig:
     # checkpoint (layers.3.self_attn.g_proj.weight, shape (12288, 7168) =
     # (96*128, 7168), matching num_heads=96 * v_head_dim=128 exactly).
     mla_use_output_gate: bool = False
+    # Side-Quest 3 (2026-07-28): opt-in, lossy REAP-style expert pruning for
+    # Kimi K3 -- a runtime routing POLICY, not part of the released
+    # architecture, so unlike every other field on this dataclass it is
+    # never populated from config.json. {layer: (pruned_expert_indices,)},
+    # loaded from an external manifest JSON (VMODEL_KIMI_K3_EXPERT_PRUNE_MANIFEST,
+    # see ModelConfig.from_dir) produced by
+    # experiments/kimi_k3_reap_calibrate.py. None (the default, and the
+    # only state any checkpoint's own config.json can produce) is a
+    # byte-for-byte no-op in runtime.kimi_linear._route_experts.
+    expert_prune_masks: dict[int, tuple[int, ...]] | None = None
     # F128: Kimi K3's real config.json hidden_act is "situ" (Kimi's own
     # gated activation, `SituAndMul` in the real modeling_kimi_linear.py),
     # not the "silu"/swiglu every other model this project supports uses.
@@ -405,7 +416,7 @@ class ModelConfig:
             jet_sliding_window = efficient_attention_config.get(
                 "swa", {}).get("window_size", 0)
 
-        return cls(
+        config = cls(
             model_type=raw.get("model_type", "llama"),
             hidden_size=raw["hidden_size"],
             # Pure-MoE checkpoints need no dense intermediate_size and Qwen3.6
@@ -543,6 +554,24 @@ class ModelConfig:
             moe_latent_use_norm=raw.get("latent_moe_use_norm", False),
             attn_res_block_size=raw.get("attn_res_block_size", 0) or 0,
         )
+        if config.model_type == "kimi_k3":
+            manifest_path = os.environ.get(
+                "VMODEL_KIMI_K3_EXPERT_PRUNE_MANIFEST", "")
+            if manifest_path:
+                # Side-Quest 3: opt-in, lossy REAP-style pruning -- see
+                # expert_prune_masks's own field docstring above and
+                # experiments/kimi_k3_reap_calibrate.py, which produces
+                # this exact manifest shape ({"<layer>": [pruned_ids]}).
+                # Deliberately NOT wrapped in a try/except: an operator who
+                # set this env var explicitly asking for pruning should see
+                # a real error for a missing/malformed manifest, not silently
+                # fall back to unpruned (and unexpectedly slower) serving.
+                manifest = json.loads(Path(manifest_path).read_text())
+                config.expert_prune_masks = {
+                    int(layer): tuple(int(e) for e in experts)
+                    for layer, experts in manifest.items()
+                }
+        return config
 
 
 def validate_expert_top_k_by_layer(

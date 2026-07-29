@@ -89,7 +89,9 @@ from .kda_state import KDAStateCache
 from .layer_runner import _linear, _swiglu
 
 
-def _route_experts(h: mx.array, w: dict, moe_prefix: str, cfg: ModelConfig) -> tuple[mx.array, mx.array]:
+def _route_experts(
+        h: mx.array, w: dict, moe_prefix: str, cfg: ModelConfig,
+        layer: int | None = None) -> tuple[mx.array, mx.array]:
     """Kimi's MoE router. NOT the same weight math as runtime.glm._route_experts.
 
     Gate weight path differs from GLM's hardcoded f"{prefix}.mlp.gate.*"
@@ -97,6 +99,16 @@ def _route_experts(h: mx.array, w: dict, moe_prefix: str, cfg: ModelConfig) -> t
     this is a local duplicate rather than a reparametrized import -- avoids
     touching glm._route_experts's existing call sites
     (tests/test_f33_router_oracle.py calls it directly).
+
+    `layer` (optional, defaults to None -- every existing call site that
+    doesn't pass it keeps its exact prior behavior) is only consulted for
+    `cfg.model_type == "kimi_k3"` with `cfg.expert_prune_masks` set: an
+    opt-in, lossy REAP-style pruning policy (see
+    experiments/kimi_k3_reap_calibrate.py and
+    docs/future_sidequest_techniques.md) that masks specific expert
+    indices out of top-k selection for that layer, so a pruned expert is
+    never chosen and therefore never fetched from disk. Unset (the
+    default for every checkpoint) is a byte-for-byte no-op.
 
     F92 oracle finding (2026-07-18, real modeling_kimi.py, verified to 6
     decimal places against the actual released KimiMoEGate): unlike GLM's
@@ -122,6 +134,13 @@ def _route_experts(h: mx.array, w: dict, moe_prefix: str, cfg: ModelConfig) -> t
         router_logits = h.astype(mx.float32) @ gate_weight.astype(mx.float32).T
     scores = mx.sigmoid(router_logits)
     biased = scores + w[f"{moe_prefix}.gate.e_score_correction_bias"]
+    if (cfg.model_type == "kimi_k3" and layer is not None
+            and cfg.expert_prune_masks and layer in cfg.expert_prune_masks):
+        pruned = cfg.expert_prune_masks[layer]
+        penalty = [0.0] * biased.shape[-1]
+        for e in pruned:
+            penalty[e] = -1e9
+        biased = biased + mx.array(penalty, dtype=mx.float32)
     k = cfg.num_experts_per_tok
     idx = mx.argpartition(-biased, kth=k - 1, axis=-1)[..., :k]
     if cfg.model_type == "kimi_k3":
@@ -418,7 +437,7 @@ def _kimi_linear_mlp_residual(
 
 def _kimi_moe_output(
     h: mx.array, w: dict, prefix: str, cfg: ModelConfig, layer: int,
-    get_experts, iter_expert_batches=None, profile=None,
+    get_experts, iter_expert_batches=None, profile=None, stat_collector=None,
 ) -> mx.array:
     """Routed-experts + shared-experts MoE output ONLY -- no residual add,
     and the caller must already have checked `layer >= cfg.first_k_dense_replace`
@@ -426,10 +445,21 @@ def _kimi_moe_output(
     `_kimi_linear_mlp_residual` (which just does `x + this`) so the
     AttnRes-aware K3 block runner below can reuse the exact same MoE math
     without duplicating it -- AttnRes replaces what happens to the residual
-    stream around each sublayer, not the sublayer's own computation."""
+    stream around each sublayer, not the sublayer's own computation.
+
+    `stat_collector`, when given, is called as
+    `stat_collector(layer, expert_id, route_weights, raw_expert_output)` for
+    every routed expert actually executed this call -- `route_weights` is
+    the router's gate weight per selected token (g_j(x)) and
+    `raw_expert_output` is that expert's output BEFORE the gate multiply
+    (e_j(x)), i.e. exactly the two REAP saliency-score ingredients
+    (S_j = mean(g_j(x) * ||e_j(x)||_2), see experiments/
+    kimi_k3_reap_calibrate.py). None (the default) adds zero overhead to
+    the ordinary forward path -- calibration is opt-in instrumentation,
+    never on by default."""
     moe_prefix = f"{prefix}.block_sparse_moe"
     router_t0 = profile.start_substep() if profile is not None else None
-    idx, pw = _route_experts(h, w, moe_prefix, cfg)
+    idx, pw = _route_experts(h, w, moe_prefix, cfg, layer=layer)
     if not (profile is not None and profile.finish_substep(
             "router", layer, router_t0, idx, pw,
             positions=int(h.shape[1]))):
@@ -464,6 +494,8 @@ def _kimi_moe_output(
             positions = [p for p, _ in plist]
             route_weights = mx.array([wt for _, wt in plist]).astype(mx.float32)
             y = _kimi_expert_mlp(h_latent[:, positions, :], experts[e], f"{moe_prefix}.experts.{e}", cfg)
+            if stat_collector is not None:
+                stat_collector(layer, e, route_weights, y)
             contribution = (y * route_weights[None, :, None]).astype(h_latent.dtype)
             out = out.at[:, positions, :].add(contribution)
         mx.eval(out)
@@ -597,7 +629,7 @@ def run_kimi_k3_block(
     x: mx.array, w: dict, prefix: str, cfg: ModelConfig, kv,
     layer: int, offset: int, block_residual: mx.array, get_experts,
     mlp_last_only: bool = False, iter_expert_batches=None,
-    native_fused_decode: bool = False, profile=None,
+    native_fused_decode: bool = False, profile=None, stat_collector=None,
 ) -> tuple[mx.array, mx.array]:
     """One Kimi K3 decoder block WITH AttnRes -- thin wrapper supplying the
     real KDA/MLA attention and dense/MoE MLP closures to
@@ -631,7 +663,8 @@ def run_kimi_k3_block(
             return _kimi_dense_mlp(h2, w, f"{prefix}.mlp", cfg)
         return _kimi_moe_output(
             h2, w, prefix, cfg, layer, get_experts,
-            iter_expert_batches=iter_expert_batches, profile=profile)
+            iter_expert_batches=iter_expert_batches, profile=profile,
+            stat_collector=stat_collector)
 
     # F128: unlike run_kimi_linear_block's mlp_last_only (which trims BETWEEN
     # attention and MLP to skip MLP compute for positions whose logits are
