@@ -20,7 +20,8 @@ def _bare_engine(model_type: str, hot_kv_persist, hot_prompt_kv_chunk_size: int 
     engine = StreamingEngine.__new__(StreamingEngine)
     engine.cfg = SimpleNamespace(model_type=model_type)
     engine._hot_kv_persist = hot_kv_persist
-    engine.rc = SimpleNamespace(hot_prompt_kv_chunk_size=hot_prompt_kv_chunk_size)
+    engine.rc = SimpleNamespace(
+        hot_prompt_kv_chunk_size=hot_prompt_kv_chunk_size, adaptive_chunk_size=False)
     return engine
 
 
@@ -176,9 +177,75 @@ def test_memory_retry_also_applies_to_lossy_dense_qwen_without_persistence():
     engine.cfg = SimpleNamespace(model_type="qwen2")
     engine._hot_kv_persist = None
     engine.rc = SimpleNamespace(
-        hot_prompt_kv=True, quant_bits=4,
+        hot_prompt_kv=True, quant_bits=4, adaptive_chunk_size=False,
         prefill_chunk_size=32, hot_prompt_kv_chunk_size=32)
     assert engine._memory_prefill_retry_applies()
 
     engine.rc.quant_bits = 0
     assert not engine._memory_prefill_retry_applies()
+
+
+def test_memory_retry_also_applies_to_any_adaptive_chunk_model():
+    """F68's AdaptiveChunkController is used by gpt_oss/GLM/Kimi K3/etc, not
+    just the qwen3_5 hybrid family _hybrid_chunk_size_applies covers -- an
+    unstarted prefill is equally safe to discard and replay slower
+    regardless of which model type enabled adaptive chunking. Live-
+    confirmed 2026-07-29 (EpistemeAI/VibeCoder-20B, real gpt_oss checkpoint):
+    a MemoryError from _fetch_experts' independent governor.reserve() call
+    killed a whole request with zero retry coverage before this fix."""
+    from runtime.engine import StreamingEngine
+
+    engine = StreamingEngine.__new__(StreamingEngine)
+    engine.cfg = SimpleNamespace(model_type="gpt_oss")
+    engine._hot_kv_persist = None
+    engine.rc = SimpleNamespace(
+        hot_prompt_kv=False, quant_bits=0, adaptive_chunk_size=True,
+        prefill_chunk_size=64, hot_prompt_kv_chunk_size=64)
+    assert engine._memory_prefill_retry_applies()
+
+    engine.rc.adaptive_chunk_size = False
+    assert not engine._memory_prefill_retry_applies()
+
+    # Durable persistence still locks out retry even with adaptive chunking
+    # on, same invariant as every other branch of this method.
+    engine.rc.adaptive_chunk_size = True
+    engine._hot_kv_persist = object()
+    assert not engine._memory_prefill_retry_applies()
+
+
+def test_memory_retry_disables_adaptive_chunk_size_after_expert_fetch_failure():
+    """The retry ladder alone is not enough for adaptive-chunk models: a
+    fresh AdaptiveChunkController would just grow back out from a smaller
+    seed and can re-hit the same _fetch_experts reservation ceiling, since
+    that budget is invisible to the controller's own compute-scratch check.
+    Pin a hard, non-adaptive chunk once this retry fires, matching F68's
+    own "never auto-restore after a shrink" stance."""
+    from runtime.engine import StreamingEngine
+
+    engine = StreamingEngine.__new__(StreamingEngine)
+    engine.cfg = SimpleNamespace(model_type="gpt_oss")
+    engine._hot_kv_persist = None
+    engine.rc = SimpleNamespace(
+        hot_prompt_kv=False, quant_bits=0, adaptive_chunk_size=True,
+        prefill_chunk_size=64, hot_prompt_kv_chunk_size=64)
+    engine._hybrid_retry_chunk_ceiling = 0
+    attempts = []
+
+    def generate(*_args, **_kwargs):
+        attempts.append(engine.rc.prefill_chunk_size)
+        engine._generation_sampled_tokens = 0
+        if len(attempts) < 2:
+            raise MemoryError("synthetic expert-fetch reservation refusal")
+        return {
+            "prefill_s": 1.0, "first_token_s": 1.5, "total_s": 2.0,
+            "path_stats": {},
+        }
+
+    engine.generate = generate
+    engine.discard_failed_request_state = lambda: None
+    with patch("runtime.engine.mx.clear_cache"):
+        result = StreamingEngine.generate_with_memory_retry(engine, "prompt")
+
+    assert attempts == [64, 32]
+    assert engine.rc.adaptive_chunk_size is False
+    assert result["path_stats"]["memory_prefill_retries"] == 1

@@ -5362,6 +5362,22 @@ class StreamingEngine:
                     self._hybrid_retry_chunk_ceiling = next_chunk
                     self.rc.prefill_chunk_size = next_chunk
                     self.rc.hot_prompt_kv_chunk_size = next_chunk
+                    if self.rc.adaptive_chunk_size:
+                        # F68's AdaptiveChunkController only bounds the
+                        # sweep's own compute-scratch peak -- it has no
+                        # visibility into _fetch_experts' separate
+                        # governor.reserve() call, which can refuse even a
+                        # chunk the controller judged safe (more distinct
+                        # tokens in a bigger chunk route to more distinct
+                        # experts, inflating that unrelated one-shot
+                        # reservation). A MemoryError reaching here means
+                        # growth already outran that other budget once, so
+                        # pin a hard, non-adaptive ceiling instead of
+                        # handing a fresh controller a smaller seed it will
+                        # just grow back out of -- consistent with this
+                        # file's existing "never auto-restore after a
+                        # shrink" stance elsewhere (see adaptive_chunk.py).
+                        self.rc.adaptive_chunk_size = False
                     print(
                         f"[prefill] governor refusal before first sample; "
                         f"retrying from scratch at chunk={next_chunk}",
@@ -5451,6 +5467,20 @@ class StreamingEngine:
     def _memory_prefill_retry_applies(self) -> bool:
         """Whether a fresh, unsampled prefill can be replayed more slowly."""
         if self._hybrid_chunk_size_applies():
+            return True
+        if self._hot_kv_persist is None and self.rc.adaptive_chunk_size:
+            # Any F68 adaptive-chunk model (gpt_oss, GLM, Kimi K3, ...) can
+            # hit a MemoryError from _fetch_experts' independent
+            # governor.reserve() call even when the adaptive controller's
+            # own compute-scratch budget judged the chunk safe -- see the
+            # comment at this method's retry call site. Live-confirmed
+            # 2026-07-29 (EpistemeAI/VibeCoder-20B, real gpt_oss checkpoint,
+            # tight real memory conditions): an uncaught MemoryError from
+            # this exact path killed a whole prefill request outright, with
+            # no retry coverage before this fix (gpt_oss is not qwen3_5/
+            # qwen3_5_moe, the only families this method previously
+            # covered). Same "unstarted prefill, safe to discard and replay
+            # slower" invariant applies regardless of model family.
             return True
         return bool(
             self._hot_kv_persist is None
