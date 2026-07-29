@@ -166,6 +166,47 @@ def test_moe_routing_spike_does_not_break_safety_or_get_masked() -> None:
     assert any("BAD" in e for e in ctrl2.events), "a genuine overshoot left no BAD event in the log"
 
 
+def test_bad_first_observation_does_not_permanently_poison_growth() -> None:
+    """Live-confirmed 2026-07-28 (EpistemeAI/VibeCoder-20B, a real 32-expert
+    gpt_oss checkpoint): the very first chunk overshot (a cold-start
+    expert-fetch spike -- nothing to do with steady-state per-token cost).
+    Because the padded upper-envelope fit must cover EVERY history point
+    forever (no aging/windowing), that one anomalous measurement inflated
+    the fitted slope ~30-50x too high; it decayed back down only very
+    slowly as later GREEN chunks accumulated, and the dead-band (added for
+    a DIFFERENT problem, oscillation) then suppressed the still-too-small
+    proposals -- across a real 4,000+ token prefill the chunk size never
+    recovered past ~13-23 tokens from a starting point of 64.
+
+    Reproduces the same shape here: one bad first observation with a huge
+    delta relative to a subsequent honest, cheap, steady-state cost, then
+    checks growth actually recovers within a handful of GREEN chunks
+    instead of staying anchored near the bad observation's implied slope.
+    """
+    safe_bytes = 10_000_000_000  # 10 GB, matching real Metal-scale ceilings
+    true_cost_per_pos = 50_000  # steady-state, once experts/caches are warm
+
+    ctrl = AdaptiveChunkController(safe_bytes=safe_bytes, initial_chunk=64, margin_bytes=int(1e9))
+    # Chunk 1: a cold-start spike that genuinely overshoots (64 tokens costs
+    # as much as a real cold expert-fetch storm would).
+    ctrl.observe(64, peak=safe_bytes + 1, active_before=0, kv_before=0, governor_event=False)
+    assert any("BAD" in e for e in ctrl.events)
+    assert ctrl._history == [], (
+        "a bad/overshoot observation must not be added to the growth-fit history")
+
+    # Subsequent chunks are honest, cheap, and safe -- the controller should
+    # learn the TRUE slope from these, unpolluted by the first outlier.
+    chunk_sizes_seen = []
+    for _ in range(10):
+        chunk = ctrl.next_chunk_size()
+        chunk_sizes_seen.append(chunk)
+        peak = chunk * true_cost_per_pos
+        ctrl.observe(chunk, peak=peak, active_before=0, kv_before=0, governor_event=False)
+
+    assert max(chunk_sizes_seen) > 200, (
+        f"chunk size failed to recover after the bad first observation: {chunk_sizes_seen}")
+
+
 def _run_all() -> None:
     tests = [
         test_kv_telemetry_not_double_counted,
@@ -173,6 +214,7 @@ def _run_all() -> None:
         test_padded_fit_covers_every_observation,
         test_growing_kv_overshoot_is_detected_and_shrinks_not_stays_wrong,
         test_moe_routing_spike_does_not_break_safety_or_get_masked,
+        test_bad_first_observation_does_not_permanently_poison_growth,
     ]
     for test in tests:
         test()

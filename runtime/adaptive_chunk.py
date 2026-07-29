@@ -131,12 +131,31 @@ class AdaptiveChunkController:
         """Feed back one chunk's real measurements; updates self.chunk for
         the NEXT chunk. No-op once failed (caller should stop asking and use
         its already-reduced frozen chunk size). ``kv_before`` is intentionally
-        ignored because it is included in ``active_before``."""
-        delta = max(0, peak - active_before)
-        self._history.append((chunk_size, delta))
+        ignored because it is included in ``active_before``.
 
+        A bad/overshoot observation is deliberately NOT added to the growth-
+        fit history (below), only used to trigger the immediate halving it
+        already does. Live-confirmed 2026-07-28 (EpistemeAI/VibeCoder-20B,
+        a real 32-expert gpt_oss checkpoint): the very first chunk overshot
+        (a cold-start expert-fetch spike, nothing to do with steady-state
+        per-token cost), and because the upper-envelope fit in
+        `_fit_alpha_beta` must cover EVERY history point forever (no aging/
+        windowing), that one anomalous measurement permanently inflated the
+        fitted slope ~30-50x too high -- alpha drifted back down only very
+        slowly as later GREEN chunks accumulated, and the dead-band (added
+        for a DIFFERENT problem, oscillation) then suppressed the
+        still-too-small proposals it produced, so the chunk size never
+        recovered past ~13-23 tokens across 4,000+ real prefill tokens.
+        Excluding bad observations from the fit lets it learn the true
+        steady-state slope from GREEN chunks only, unpolluted by a cold-start
+        or mid-run outlier; the immediate-halve-on-bad and 3-bad-streak-
+        freeze safety behavior below is completely unchanged."""
         overshoot = peak > self.safe_bytes
         bad = overshoot or governor_event
+        if not bad:
+            delta = max(0, peak - active_before)
+            self._history.append((chunk_size, delta))
+
         if self.failed:
             if bad and self.chunk <= 1:
                 self.unsafe_at_minimum = True
