@@ -207,6 +207,63 @@ def test_bad_first_observation_does_not_permanently_poison_growth() -> None:
         f"chunk size failed to recover after the bad first observation: {chunk_sizes_seen}")
 
 
+def test_expert_fetch_noise_does_not_collapse_chunk_size_when_residualized():
+    """Live-confirmed 2026-07-29 (EpistemeAI/VibeCoder-20B, real 32-expert/
+    4-active-per-token gpt_oss checkpoint): even with ONLY green/safe
+    observations (the same-day bad-observation-exclusion fix already
+    applied), the chunk collapsed 128->64->32->16->8->4->2->1 over ~60 real
+    seconds while measured active memory stayed completely flat, nowhere
+    near the safety ceiling. Root mechanism reproduced directly here: a
+    SMALL chunk that luckily hit mostly-cached experts can show a SMALLER
+    real (peak - active_before) delta than a BIGGER chunk that unluckily
+    hit several cold ones -- exactly backwards from what the affine fit
+    assumes (cost grows with chunk_size). Left inside `delta`, that single
+    adversarial pair alone inflates the fitted per-token cost by >100,000x
+    in this test's real numbers. Passing each chunk's own real
+    `expert_fetch_bytes` lets the fit residualize that confound out and
+    recover the true, much smaller per-token compute cost instead.
+    """
+    safe_bytes = 10_000_000_000
+    margin = int(1e9)
+    true_cost_per_token = 100  # real compute-scratch cost: small, stable
+    expert_page_bytes = 75_000_000  # ~real per-expert page size scale
+    # (chunk_size, expert_misses): the small chunk got lucky (few cold
+    # experts), the bigger chunk got unlucky (many) -- both are real,
+    # physically possible outcomes for the SAME model, since which experts
+    # a chunk's tokens route to isn't a function of chunk_size at all.
+    adversarial_pair = [(128, 2), (256, 25)]
+
+    def fit_after(residualize: bool):
+        ctrl = AdaptiveChunkController(
+            safe_bytes=safe_bytes, initial_chunk=128, margin_bytes=margin)
+        for chunk_size, misses in adversarial_pair:
+            expert_bytes = misses * expert_page_bytes
+            peak = chunk_size * true_cost_per_token + expert_bytes
+            assert peak <= safe_bytes, "test setup itself must stay safe"
+            ctrl.observe(
+                chunk_size, peak=peak, active_before=0, kv_before=0,
+                governor_event=False,
+                expert_fetch_bytes=expert_bytes if residualize else 0)
+        alpha, beta = ctrl._fit_alpha_beta()
+        budget = safe_bytes - margin - beta
+        proposed = int(budget / alpha) if alpha > 0 else None
+        return alpha, proposed
+
+    alpha_without, proposed_without = fit_after(residualize=False)
+    alpha_with, proposed_with = fit_after(residualize=True)
+
+    assert alpha_without > 1_000_000, (
+        "test setup did not reproduce a spuriously inflated per-token cost "
+        f"estimate without residualizing: alpha={alpha_without:.1f}")
+    # 1.25x safety pad on the true 100 bytes/token still leaves real room.
+    assert 100 <= alpha_with <= 200, (
+        f"residualized alpha should track the true per-token cost: {alpha_with:.1f}")
+    assert proposed_with >= proposed_without * 1000, (
+        "residualizing expert-fetch noise out of the fit should let a much "
+        f"larger, still-safe chunk be proposed: without={proposed_without} "
+        f"with={proposed_with}")
+
+
 def _run_all() -> None:
     tests = [
         test_kv_telemetry_not_double_counted,
@@ -215,6 +272,7 @@ def _run_all() -> None:
         test_growing_kv_overshoot_is_detected_and_shrinks_not_stays_wrong,
         test_moe_routing_spike_does_not_break_safety_or_get_masked,
         test_bad_first_observation_does_not_permanently_poison_growth,
+        test_expert_fetch_noise_does_not_collapse_chunk_size_when_residualized,
     ]
     for test in tests:
         test()

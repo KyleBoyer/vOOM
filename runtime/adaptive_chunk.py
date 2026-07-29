@@ -45,6 +45,34 @@ when the proposal clears a meaningful threshold. This directly damps the
 observed oscillation (most of those swings were <20% of the chunk size)
 without needing to model routing at all.
 
+2026-07-29 refinement (found live on real EpistemeAI/VibeCoder-20B, a
+32-expert/4-active-per-token gpt_oss checkpoint, AFTER the same-day fix
+excluding bad observations from history -- see `observe`'s docstring):
+even with ONLY green/safe observations feeding the fit, the chunk
+collapsed 128->64->32->16->8->4->2->1 over ~60 real seconds while
+measured active memory stayed completely flat (~6.56GB the whole time,
+nowhere near the safety ceiling). Root cause: for a SMALL total expert
+pool, a chunk's expert-fetch cost does not scale smoothly with chunk
+size the way the dead-band above assumes -- it depends on which experts
+happen to still be cache-cold at that moment, which is closer to noise
+than signal with respect to chunk_size. A big chunk that luckily hit
+already-cached experts can show a SMALLER measured delta than a small
+chunk that unluckily hit a cold one; the naive fit reads that as "cost
+grows steeply as chunk size shrinks" and chases the phantom signal to
+the floor, well outside what the 20% dead-band (built for smaller,
+genuinely-noisy oscillation) suppresses. The 2026-07-14 note above
+predicted needing expert-union size as a second regressor and dismissed
+it only because the UPCOMING chunk's union isn't knowable in advance --
+but the PAST chunk's real expert-fetch cost (missed-page count times a
+known per-page byte size, real and available once a chunk's sweep
+completes) is exactly the confound polluting the fit, and can be
+measured and subtracted before that data point ever enters `_history`,
+without needing to predict anything. See `observe`'s and the growth
+branch's own comments for how `expert_fetch_bytes`/
+`worst_case_expert_bytes_per_token` do this; both default to 0 (exact
+prior behavior) for callers that don't pass them, i.e. every non-MoE
+model and every existing test.
+
 This is intended to change scheduling only, but different chunk shapes can select
 different floating-point kernels/reduction shapes. Therefore every enabled shape
 needs F33 block-output plus greedy-token gates; prior finite token agreement is E
@@ -56,7 +84,7 @@ from __future__ import annotations
 
 class AdaptiveChunkController:
     def __init__(self, safe_bytes: int, initial_chunk: int, margin_bytes: int = int(1e9),
-                dead_band: float = 0.2):
+                dead_band: float = 0.2, worst_case_expert_bytes_per_token: int = 0):
         if safe_bytes <= 0:
             raise ValueError("safe_bytes must be positive")
         self.safe_bytes = int(safe_bytes)
@@ -69,6 +97,18 @@ class AdaptiveChunkController:
         self._green_streak = 0
         self._bad_streak = 0
         self.failed = False
+        # 2026-07-29: a per-token worst-case expert-fetch byte cost (missed-
+        # page count this chunk could plausibly need times a known
+        # per-page byte size), folded into the growth budget as an extra
+        # additive slope alongside the regression's own alpha. Default 0
+        # (exact prior behavior) for dense models and any caller that
+        # doesn't pass it. See this module's docstring and `observe`'s for
+        # why this is needed on top of (not instead of) residualizing the
+        # PAST chunk's real expert-fetch cost out of `_history`: the fit
+        # alone has no way to know a LARGER, not-yet-tried chunk would
+        # touch more experts too, and growing into that blind spot is
+        # exactly the bug the 2026-07-29 memory-retry fix also had to catch.
+        self.worst_case_expert_bytes_per_token = worst_case_expert_bytes_per_token
         self.unsafe_at_minimum = False
         self.events: list[str] = []  # human-readable log of controller decisions
 
@@ -127,7 +167,7 @@ class AdaptiveChunkController:
         return alpha_upper, beta_upper
 
     def observe(self, chunk_size: int, peak: int, active_before: int, kv_before: int,
-               governor_event: bool):
+               governor_event: bool, expert_fetch_bytes: int = 0):
         """Feed back one chunk's real measurements; updates self.chunk for
         the NEXT chunk. No-op once failed (caller should stop asking and use
         its already-reduced frozen chunk size). ``kv_before`` is intentionally
@@ -149,11 +189,27 @@ class AdaptiveChunkController:
         Excluding bad observations from the fit lets it learn the true
         steady-state slope from GREEN chunks only, unpolluted by a cold-start
         or mid-run outlier; the immediate-halve-on-bad and 3-bad-streak-
-        freeze safety behavior below is completely unchanged."""
+        freeze safety behavior below is completely unchanged.
+
+        ``expert_fetch_bytes`` (default 0, exact prior behavior for callers
+        that omit it) is this SAME chunk's own real expert-page-miss cost
+        (missed-page count times a known per-page byte size), if the caller
+        tracks one -- see this module's 2026-07-29 docstring refinement.
+        Even among GREEN-only observations, this component is closer to
+        noise than signal with respect to chunk_size for a small expert
+        pool (it depends on which experts happened to still be cache-cold,
+        not on how many tokens were in the chunk), and left inside `delta`
+        it can drive the growth-fit's slope to spurious, ever-increasing
+        values that collapse the chunk size toward 1 with active memory
+        nowhere near the safety ceiling. Subtracting it out here keeps
+        `_history` focused on the genuinely chunk-size-linear component
+        (compute scratch); the real, unadjusted `peak` is still what
+        decides `overshoot` above, so safety is unaffected."""
         overshoot = peak > self.safe_bytes
         bad = overshoot or governor_event
         if not bad:
             delta = max(0, peak - active_before)
+            delta = max(0, delta - max(0, expert_fetch_bytes))
             self._history.append((chunk_size, delta))
 
         if self.failed:
@@ -182,8 +238,21 @@ class AdaptiveChunkController:
             if self._green_streak >= 2:
                 self._green_streak = 0
                 alpha, beta = self._fit_alpha_beta()
+                # Worst case: every additional token in a LARGER, not-yet-
+                # tried chunk brings entirely new (cache-miss) experts. This
+                # is what `_history` deliberately no longer teaches alpha
+                # (see `observe`'s docstring) -- growth still needs to
+                # budget for it, or a proposal can grow straight back into
+                # the same _fetch_experts reservation failure the 2026-07-29
+                # memory-retry fix had to catch. Real behavior saturates
+                # once a chunk's token count already covers the whole
+                # expert pool (union can't exceed it), making this
+                # deliberately pessimistic beyond that point -- safe, just
+                # not maximally tight, which matches this file's existing
+                # safety-over-optimism stance throughout.
+                effective_alpha = alpha + self.worst_case_expert_bytes_per_token
                 budget = self.safe_bytes - active_before - self.margin - beta
-                proposed = int(budget / alpha) if alpha > 0 else self.chunk
+                proposed = int(budget / effective_alpha) if effective_alpha > 0 else self.chunk
                 proposed = max(1, proposed)
                 old = self.chunk
                 new_chunk = min(proposed, self.chunk * 2)  # clamp growth to 2x/step

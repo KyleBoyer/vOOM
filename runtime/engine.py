@@ -4471,7 +4471,9 @@ class StreamingEngine:
                     else self.rc.adaptive_chunk_safe_bytes
                 )
                 adaptive = AdaptiveChunkController(
-                    safe_bytes=adaptive_safe_bytes, initial_chunk=chunk)
+                    safe_bytes=adaptive_safe_bytes, initial_chunk=chunk,
+                    worst_case_expert_bytes_per_token=(
+                        self.cfg.num_experts_per_tok * self._expert_fetch_page_bytes))
                 path_stats["adaptive_chunk_events"] = adaptive.events
                 path_stats["adaptive_chunk_dynamic_ceiling"] = int(
                     adaptive_dynamic_ceiling)
@@ -4649,6 +4651,7 @@ class StreamingEngine:
                     reservations_before = gov.reservations if gov is not None else 0
                     if adaptive is not None:
                         self._chunk_peak_metal_bytes = active_before
+                        expert_misses_before = self.expert_misses
                     xc = self._embed(list(tokens[pos:end]))
                     xc = self._sweep(xc, kv, offset=pos,
                                      final_mlp_last_only=self.rc.final_dead_token_elim)
@@ -4656,10 +4659,18 @@ class StreamingEngine:
                     if adaptive is not None:
                         gov_event = gov is not None and (
                             gov.shrinks > shrinks_before or gov.reservations > reservations_before)
+                        # This chunk's own real expert-page-miss cost --
+                        # residualized out of the growth-fit's training data
+                        # below (see AdaptiveChunkController.observe's
+                        # docstring for why this confound otherwise collapses
+                        # the chunk size on a small-expert-pool model).
+                        chunk_expert_misses = self.expert_misses - expert_misses_before
                         adaptive.observe(
                             chunk_size=end - pos, peak=self._chunk_peak_metal_bytes,
                             active_before=active_before, kv_before=kv_before,
-                            governor_event=gov_event)
+                            governor_event=gov_event,
+                            expert_fetch_bytes=(
+                                chunk_expert_misses * self._expert_fetch_page_bytes))
                         if adaptive.failed:
                             # Fail closed: keep asking the frozen controller for
                             # its already-halved size. The old behavior set it to
