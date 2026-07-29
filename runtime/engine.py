@@ -4467,7 +4467,8 @@ class StreamingEngine:
             # F33 and greedy-token gates remain required.
             adaptive = None
             adaptive_dynamic_ceiling = False
-            if chunk and self.rc.adaptive_chunk_size:
+            if (chunk and self.rc.adaptive_chunk_size
+                    and not getattr(self, "_adaptive_chunk_pinned_after_retry", False)):
                 from .adaptive_chunk import AdaptiveChunkController
 
                 adaptive_dynamic_ceiling = self.rc.adaptive_chunk_safe_bytes == 0
@@ -5395,7 +5396,20 @@ class StreamingEngine:
                         # just grow back out of -- consistent with this
                         # file's existing "never auto-restore after a
                         # shrink" stance elsewhere (see adaptive_chunk.py).
-                        self.rc.adaptive_chunk_size = False
+                        #
+                        # A dedicated flag, NOT self.rc.adaptive_chunk_size
+                        # itself: live-confirmed 2026-07-29 that flipping
+                        # the config field directly breaks retry eligibility
+                        # for any SUBSEQUENT failure in this same loop, since
+                        # _memory_prefill_retry_applies() (below) reads that
+                        # same field -- a real MemoryError on the pinned
+                        # retry attempt silently lost retry coverage instead
+                        # of continuing down the chunk ladder. This flag is
+                        # request-independent (survives for the engine's
+                        # lifetime, matching prefill_chunk_size's own
+                        # never-restored reduction above) but orthogonal to
+                        # the config field eligibility depends on.
+                        self._adaptive_chunk_pinned_after_retry = True
                     print(
                         f"[prefill] governor refusal before first sample; "
                         f"retrying from scratch at chunk={next_chunk}",

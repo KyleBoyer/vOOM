@@ -213,13 +213,19 @@ def test_memory_retry_also_applies_to_any_adaptive_chunk_model():
     assert not engine._memory_prefill_retry_applies()
 
 
-def test_memory_retry_disables_adaptive_chunk_size_after_expert_fetch_failure():
+def test_memory_retry_pins_non_adaptive_chunk_after_expert_fetch_failure():
     """The retry ladder alone is not enough for adaptive-chunk models: a
     fresh AdaptiveChunkController would just grow back out from a smaller
     seed and can re-hit the same _fetch_experts reservation ceiling, since
     that budget is invisible to the controller's own compute-scratch check.
     Pin a hard, non-adaptive chunk once this retry fires, matching F68's
-    own "never auto-restore after a shrink" stance."""
+    own "never auto-restore after a shrink" stance.
+
+    Uses a DEDICATED flag (_adaptive_chunk_pinned_after_retry), not
+    rc.adaptive_chunk_size itself -- live-confirmed 2026-07-29 that
+    flipping the config field directly breaks retry eligibility for any
+    SUBSEQUENT failure in this same loop (see the next test), since
+    _memory_prefill_retry_applies reads that same field."""
     from runtime.engine import StreamingEngine
 
     engine = StreamingEngine.__new__(StreamingEngine)
@@ -247,5 +253,47 @@ def test_memory_retry_disables_adaptive_chunk_size_after_expert_fetch_failure():
         result = StreamingEngine.generate_with_memory_retry(engine, "prompt")
 
     assert attempts == [64, 32]
-    assert engine.rc.adaptive_chunk_size is False
+    assert engine.rc.adaptive_chunk_size is True
+    assert engine._adaptive_chunk_pinned_after_retry is True
     assert result["path_stats"]["memory_prefill_retries"] == 1
+
+
+def test_memory_retry_continues_ladder_after_pinned_chunk_also_fails():
+    """Real bug live-confirmed 2026-07-29 (EpistemeAI/VibeCoder-20B): the
+    first fix for the expert-fetch crash disabled rc.adaptive_chunk_size
+    directly to pin a hard ceiling after the first retry -- but
+    _memory_prefill_retry_applies() also reads that same field, so a
+    SECOND real MemoryError (at the now-fixed, non-adaptive chunk size)
+    silently lost retry eligibility and re-raised instead of continuing
+    down the ladder (64->32->8->1). Verifies the ladder now continues
+    through multiple real failures regardless of the pin."""
+    from runtime.engine import StreamingEngine
+
+    engine = StreamingEngine.__new__(StreamingEngine)
+    engine.cfg = SimpleNamespace(model_type="gpt_oss")
+    engine._hot_kv_persist = None
+    engine.rc = SimpleNamespace(
+        hot_prompt_kv=False, quant_bits=0, adaptive_chunk_size=True,
+        prefill_chunk_size=64, hot_prompt_kv_chunk_size=64)
+    engine._hybrid_retry_chunk_ceiling = 0
+    attempts = []
+
+    def generate(*_args, **_kwargs):
+        attempts.append(engine.rc.prefill_chunk_size)
+        engine._generation_sampled_tokens = 0
+        if len(attempts) < 3:
+            raise MemoryError("synthetic expert-fetch reservation refusal")
+        return {
+            "prefill_s": 1.0, "first_token_s": 1.5, "total_s": 2.0,
+            "path_stats": {},
+        }
+
+    engine.generate = generate
+    engine.discard_failed_request_state = lambda: None
+    with patch("runtime.engine.mx.clear_cache"):
+        result = StreamingEngine.generate_with_memory_retry(engine, "prompt")
+
+    assert attempts == [64, 32, 8], (
+        "retry ladder stopped early after the pin took effect -- a second "
+        f"real failure lost retry coverage: {attempts}")
+    assert result["path_stats"]["memory_prefill_retries"] == 2
