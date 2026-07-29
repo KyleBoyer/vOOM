@@ -1151,6 +1151,34 @@ class EngineManager:
                     pass
             elif mtype == "gpt_oss":
                 rc.max_weight_cache_mb, rc.pin_first_layers = 6500, 36
+                # Live-confirmed 2026-07-28 (EpistemeAI/VibeCoder-20B-RL1.0,
+                # a real gpt_oss checkpoint, 64 attention heads x 2880
+                # hidden, on a real ~21K-token prompt): the generic
+                # `prefill_chunk_size` default (4096) sized one chunk's
+                # attention/router allocation at ~14.77 GB, which the
+                # governor correctly refused outright (bigger than this
+                # machine's own ceiling, not merely tight) -- a hard crash
+                # on the very first chunk, before any per-request retry
+                # could even measure real headroom. Same fix GLM-5.2's own
+                # dispatch already uses for the identical failure class
+                # (a chunk's attention/MoE allocation scaling with a wide
+                # head/expert dimension, not prompt length): start from a
+                # conservative chunk and let F68 grow/shrink it from live
+                # measured headroom instead of a fixed guess sized for one
+                # host. This is a safety fix against a real crash, not a
+                # narrow performance tuning -- it does not need the
+                # broad-request-shape validation a new default-on latency
+                # optimization would.
+                rc.prefill_chunk_size = 64
+                rc.adaptive_chunk_size = True
+                rc.adaptive_chunk_safe_bytes = 0
+                # adaptive_chunk_size and a durable prompt-KV fingerprint are
+                # mutually exclusive (StreamingEngine.__init__ raises
+                # otherwise: an adaptive schedule's kernel/reduction path can
+                # differ between two "identical" requests, which a static
+                # fingerprint can't certify) -- every other adaptive_chunk_size
+                # branch already clears this same default.
+                rc.prompt_kv_dir = ""
             elif mtype == "glm_moe_dsa":
                 rc.max_weight_cache_mb = 5000
                 if mode in ("fast", "fast-long"):
