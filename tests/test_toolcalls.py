@@ -748,6 +748,34 @@ def test_prose_preserving_prompt_schema_honors_x_optional_arguments():
     assert original["parameters"]["x-optional"] == ["query"]
 
 
+def test_prompt_schema_fills_missing_parameter_descriptions_with_empty_string():
+    # Real, common wire shape (301 of 134 real captured Plex tools' own
+    # parameters, live-checked 2026-07-28): a JSON Schema property with no
+    # "description" key at all -- valid per spec, OpenAI's own included.
+    # gpt-oss/Harmony's real chat_template.jinja unconditionally
+    # concatenates `param_spec.description` while rendering TypeScript-
+    # style tool signatures with no presence guard, raising
+    # `UndefinedError: 'dict object' has no attribute 'description'` the
+    # moment a real request includes one. Filling an empty string here
+    # (not touching the model's own released template) conveys the same
+    # "no description given" information a null-checking template would
+    # show anyway.
+    from runtime.toolcalls import effective_tool_prompt_schema
+
+    original = {"type": "function", "name": "list_media", "parameters": {
+        "type": "object",
+        "properties": {
+            "query": {"type": "string", "description": "Keep this prose."},
+            "limit": {"type": "integer"},  # no "description" key at all
+        },
+    }}
+    effective = effective_tool_prompt_schema(original)
+    props = effective["parameters"]["properties"]
+    assert props["query"]["description"] == "Keep this prose."
+    assert props["limit"]["description"] == ""
+    assert "description" not in original["parameters"]["properties"]["limit"]
+
+
 def test_explicit_plugin_namespace_requires_user_mention_and_offered_tools():
     from runtime.toolcalls import explicit_tool_namespaces
 

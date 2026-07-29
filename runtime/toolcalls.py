@@ -485,6 +485,27 @@ def effective_tool_prompt_schema(tool: dict) -> dict:
 
         normalized_fn[parameter_key] = effective_tool_schema(
             normalized_fn[parameter_key] or {"type": "object"})
+        # Real, common wire shape: plenty of real tool schemas (301 of 134
+        # real Plex-capture tools' parameters, live-checked 2026-07-28) omit
+        # a per-PARAMETER description entirely -- valid JSON Schema, and
+        # OpenAI's own spec never requires it. Several real native chat
+        # templates (gpt-oss/Harmony's included) unconditionally concatenate
+        # `param_spec.description` while rendering TypeScript-style tool
+        # signatures with no presence guard, raising
+        # `UndefinedError: 'dict object' has no attribute 'description'` the
+        # instant a real request includes one -- not a malformed-request
+        # edge case, the ordinary common one. The official reference
+        # `transformers.apply_chat_template` would hit the identical crash
+        # on the same real request; this is a template fragility this
+        # project's own prompt-preparation step can absorb without touching
+        # the model's own released template at all. An empty string in the
+        # slot the template already prints conveys the same "no description
+        # given" information a null-checking template would show anyway.
+        properties = (normalized_fn[parameter_key] or {}).get("properties")
+        if isinstance(properties, dict):
+            for spec in properties.values():
+                if isinstance(spec, dict) and "description" not in spec:
+                    spec["description"] = ""
     if wrapped:
         return {**tool, "function": normalized_fn}
     return normalized_fn
