@@ -3107,18 +3107,29 @@ def _compiled_template(template_text: str, compact_json: bool):
     def _raise_exception(msg):
         raise RequestValidationError(str(msg))
 
-    if not compact_json:
-        from jinja2 import Template
-
-        tmpl = Template(template_text, extensions=["jinja2.ext.loopcontrols"])
-        tmpl.globals["raise_exception"] = _raise_exception
-        return tmpl
-
     from jinja2 import Environment
     from jinja2.utils import htmlsafe_json_dumps
 
     env = Environment(autoescape=False, extensions=["jinja2.ext.loopcontrols"])
     env.globals["raise_exception"] = _raise_exception
+
+    if not compact_json:
+        # Real chat templates commonly call `tojson(ensure_ascii=False)` --
+        # a standard kwarg HF's own `apply_chat_template` Jinja environment
+        # supports that Jinja2's bare built-in `tojson` filter does not (it
+        # only accepts `indent`), raising `TypeError: do_tojson() got an
+        # unexpected keyword argument 'ensure_ascii'` (live-confirmed
+        # 2026-07-28, ai9stars/G9v3-3B's real template). Match HF's actual
+        # supported kwargs; every default here matches Jinja2's own
+        # built-in filter's behavior for a caller that passes none of
+        # them, so no already-working template's rendering changes.
+        env.filters["tojson"] = (
+            lambda value, indent=None, ensure_ascii=True, sort_keys=False,
+            separators=None: htmlsafe_json_dumps(
+                value, dumps=json.dumps, indent=indent, ensure_ascii=ensure_ascii,
+                sort_keys=sort_keys, separators=separators))
+        return env.from_string(template_text)
+
     # Preserve Jinja's tojson escaping contract while changing only key order
     # and insignificant JSON whitespace. Raw json.dumps would allow strings
     # such as ``</tools>`` to escape a template's tool delimiter.

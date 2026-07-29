@@ -326,6 +326,30 @@ def test_native_template_bos_token_concatenation_does_not_raise():
     assert rendered == "<|begin_of_text|>user:hi"
 
 
+def test_native_template_tojson_ensure_ascii_kwarg_does_not_raise():
+    # ai9stars/G9v3-3B's real chat_template.jinja does exactly this:
+    # `{{ tool | tojson(ensure_ascii=False) }}` when rendering its tool
+    # definitions. Jinja2's own built-in `tojson` filter only accepts
+    # `indent` -- passing `ensure_ascii` previously raised
+    # `TypeError: do_tojson() got an unexpected keyword argument
+    # 'ensure_ascii'` (live-confirmed 2026-07-28) on the ordinary (lossless,
+    # non-compact_json) rendering path, which had no custom `tojson`
+    # override at all.
+    from runtime.server import _render_template
+
+    template = "{{ value | tojson(ensure_ascii=False) }}"
+    rendered = _render_template(template, value={"city": "北京"})
+    assert rendered == '{"city": "北京"}'
+
+
+def test_native_template_tojson_default_ensure_ascii_matches_jinja_builtin():
+    from runtime.server import _render_template
+
+    template = "{{ value | tojson }}"
+    rendered = _render_template(template, value={"city": "北京"})
+    assert rendered == '{"city": "\\u5317\\u4eac"}'
+
+
 def test_bos_token_accepts_added_token_dict_shape():
     template = "{{ bos_token }}{{ messages[0].content }}"
     messages = [{"role": "user", "content": "hi"}]
