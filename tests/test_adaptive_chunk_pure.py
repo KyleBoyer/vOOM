@@ -207,6 +207,43 @@ def test_bad_first_observation_does_not_permanently_poison_growth() -> None:
         f"chunk size failed to recover after the bad first observation: {chunk_sizes_seen}")
 
 
+def test_escalate_growth_cap_converges_faster_without_overshooting():
+    """Opt-in growth-cap escalation (default off, identical behavior to the
+    plain 2x/step cap when disabled): when the fit repeatedly wants to grow
+    MORE than the current cap allows, several steps in a row, that's real
+    signal the model is under-confident, not noise -- escalate the
+    multiplier (2x -> 3x -> ...) so it reaches a good steady-state size in
+    fewer GREEN-streak cycles. Must never actually overshoot `safe_bytes`
+    regardless -- the escalation only affects how fast growth CAN happen
+    when a chunk has already been measured safe, never the safety check
+    itself."""
+    safe_bytes = 10_000_000_000
+    true_cost_per_pos = 50_000
+    # The true safe chunk size is safe_bytes/true_cost_per_pos = 200,000 --
+    # deliberately far above what a plain 2x/step cap can reach quickly from
+    # a small starting point, so escalation has real room to help.
+
+    def run(escalate: bool, steps: int = 30) -> list[int]:
+        ctrl = AdaptiveChunkController(
+            safe_bytes=safe_bytes, initial_chunk=64, margin_bytes=int(1e9),
+            escalate_growth_cap=escalate)
+        sizes = []
+        for _ in range(steps):
+            chunk = ctrl.next_chunk_size()
+            sizes.append(chunk)
+            peak = chunk * true_cost_per_pos
+            assert peak <= safe_bytes, (
+                f"escalation caused a real overshoot: chunk={chunk} peak={peak}")
+            ctrl.observe(chunk, peak=peak, active_before=0, kv_before=0, governor_event=False)
+        return sizes
+
+    baseline = run(escalate=False)
+    escalated = run(escalate=True)
+    assert max(escalated) > max(baseline), (
+        f"escalation did not converge faster: baseline max={max(baseline)}, "
+        f"escalated max={max(escalated)}")
+
+
 def test_expert_fetch_noise_does_not_collapse_chunk_size_when_residualized():
     """Live-confirmed 2026-07-29 (EpistemeAI/VibeCoder-20B, real 32-expert/
     4-active-per-token gpt_oss checkpoint): even with ONLY green/safe
@@ -273,6 +310,7 @@ def _run_all() -> None:
         test_moe_routing_spike_does_not_break_safety_or_get_masked,
         test_bad_first_observation_does_not_permanently_poison_growth,
         test_expert_fetch_noise_does_not_collapse_chunk_size_when_residualized,
+        test_escalate_growth_cap_converges_faster_without_overshooting,
     ]
     for test in tests:
         test()

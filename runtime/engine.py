@@ -490,6 +490,10 @@ class RuntimeConfig:
     # every enabled shape still needs block-output and greedy-token gates.
     adaptive_chunk_safe_bytes: int = 0  # 0 = resample the governor's live ceiling per chunk;
     # a positive value is an explicit experiment/replay target
+    adaptive_chunk_escalate_growth_cap: bool = False  # opt-in, default matches prior
+    # behavior exactly when False. See AdaptiveChunkController's own docstring/comment:
+    # escalates the per-step growth cap (2x -> up to 8x) after two consecutive
+    # ceiling-clamped GREEN proposals, resetting to 2x immediately on any bad event.
     embed_rows: bool = False  # F02: row-paged embeddings from a raw sidecar (untied models only)
     stream_lm_head: bool = False  # F02: block-streamed lm_head matmul, never materializes the
     # full (vocab, hidden) tensor (GLM: ~1.9GB). Bit-identical (only the output/vocab dim is
@@ -641,6 +645,8 @@ class RuntimeConfig:
             prefill_checkpoint_every=run.get("prefill_checkpoint_every", 0),
             adaptive_chunk_size=run.get("adaptive_chunk_size", False),
             adaptive_chunk_safe_bytes=run.get("adaptive_chunk_safe_bytes", 0),
+            adaptive_chunk_escalate_growth_cap=run.get(
+                "adaptive_chunk_escalate_growth_cap", False),
             embed_rows=run.get("embed_rows", False),
             stream_lm_head=run.get("stream_lm_head", False),
             governor=run.get("governor", True),
@@ -4472,6 +4478,7 @@ class StreamingEngine:
                 )
                 adaptive = AdaptiveChunkController(
                     safe_bytes=adaptive_safe_bytes, initial_chunk=chunk,
+                    escalate_growth_cap=self.rc.adaptive_chunk_escalate_growth_cap,
                     worst_case_expert_bytes_per_token=(
                         self.cfg.num_experts_per_tok * self._expert_fetch_page_bytes))
                 path_stats["adaptive_chunk_events"] = adaptive.events

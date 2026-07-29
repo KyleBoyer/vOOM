@@ -84,7 +84,9 @@ from __future__ import annotations
 
 class AdaptiveChunkController:
     def __init__(self, safe_bytes: int, initial_chunk: int, margin_bytes: int = int(1e9),
-                dead_band: float = 0.2, worst_case_expert_bytes_per_token: int = 0):
+                dead_band: float = 0.2, escalate_growth_cap: bool = False,
+                max_growth_multiplier: float = 8.0,
+                worst_case_expert_bytes_per_token: int = 0):
         if safe_bytes <= 0:
             raise ValueError("safe_bytes must be positive")
         self.safe_bytes = int(safe_bytes)
@@ -97,6 +99,24 @@ class AdaptiveChunkController:
         self._green_streak = 0
         self._bad_streak = 0
         self.failed = False
+        # Opt-in (default off, matches this codebase's existing behavior
+        # exactly when disabled): the fixed 2x-per-step growth clamp below
+        # was live-confirmed 2026-07-28 (EpistemeAI/VibeCoder-20B, real
+        # 32-expert gpt_oss) to often be the BINDING constraint during a
+        # confident growth phase -- the fit repeatedly wanted to propose
+        # more than 2x but got capped, several steps in a row. When the fit
+        # keeps hitting the ceiling like that, it's real signal the model
+        # is under-confident, not noise -- escalate the growth multiplier
+        # (2x -> 3x -> 4x, capped at `max_growth_multiplier`) after two
+        # consecutive ceiling-clamped proposals, and reset it to 2x
+        # IMMEDIATELY on any bad/shrink event (the escalation only ever
+        # affects how fast growth CAN happen when things are already
+        # measured safe; it never weakens the existing shrink-on-bad or
+        # 3-bad-streak-freeze safety behavior at all).
+        self.escalate_growth_cap = escalate_growth_cap
+        self._growth_cap_multiplier = 2.0
+        self.max_growth_multiplier = max_growth_multiplier
+        self._ceiling_clamped_streak = 0
         # 2026-07-29: a per-token worst-case expert-fetch byte cost (missed-
         # page count this chunk could plausibly need times a known
         # per-page byte size), folded into the growth budget as an extra
@@ -107,7 +127,7 @@ class AdaptiveChunkController:
         # PAST chunk's real expert-fetch cost out of `_history`: the fit
         # alone has no way to know a LARGER, not-yet-tried chunk would
         # touch more experts too, and growing into that blind spot is
-        # exactly the bug the 2026-07-29 memory-retry fix also had to catch.
+        # exactly the bug F129/the 2026-07-29 memory-retry fix hit.
         self.worst_case_expert_bytes_per_token = worst_case_expert_bytes_per_token
         self.unsafe_at_minimum = False
         self.events: list[str] = []  # human-readable log of controller decisions
@@ -220,6 +240,8 @@ class AdaptiveChunkController:
         if bad:
             self._bad_streak += 1
             self._green_streak = 0
+            self._growth_cap_multiplier = 2.0
+            self._ceiling_clamped_streak = 0
             old = self.chunk
             self.chunk = max(1, int(self.chunk * 0.5))
             self.events.append(
@@ -255,7 +277,18 @@ class AdaptiveChunkController:
                 proposed = int(budget / effective_alpha) if effective_alpha > 0 else self.chunk
                 proposed = max(1, proposed)
                 old = self.chunk
-                new_chunk = min(proposed, self.chunk * 2)  # clamp growth to 2x/step
+                growth_cap = int(self.chunk * self._growth_cap_multiplier)
+                if self.escalate_growth_cap:
+                    if proposed > growth_cap:
+                        self._ceiling_clamped_streak += 1
+                        if self._ceiling_clamped_streak >= 2:
+                            self._growth_cap_multiplier = min(
+                                self._growth_cap_multiplier + 1.0, self.max_growth_multiplier)
+                            growth_cap = int(self.chunk * self._growth_cap_multiplier)
+                    else:
+                        self._ceiling_clamped_streak = 0
+                        self._growth_cap_multiplier = 2.0
+                new_chunk = min(proposed, growth_cap)  # clamp growth (2x/step, or more once escalated)
                 new_chunk = max(new_chunk, int(self.chunk * 0.5))  # clamp shrink to 0.5x/step
                 new_chunk = max(1, new_chunk)
                 # Dead-band: a proposal within `dead_band` of the current chunk is
