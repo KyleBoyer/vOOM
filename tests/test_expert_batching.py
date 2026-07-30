@@ -7,14 +7,98 @@ coexist during the fetch of the next one) -- this test exercises the real
 exported function against that exact failure mode, not just the manual
 iterator pattern in isolation.
 """
+import concurrent.futures as cf
 import gc
 import sys
+import threading
 import weakref
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from runtime.expert_batching import consume_expert_batches
+
+
+def test_exact_expert_batch_pipeline_remains_explicit_opt_in():
+    from runtime.engine import RuntimeConfig
+
+    assert not RuntimeConfig().expert_batch_prefetch
+    assert not RuntimeConfig().expert_route_overlap_telemetry
+
+
+def test_route_overlap_summary_separates_union_and_cross_sweep_reuse():
+    from runtime.engine import expert_route_overlap_summary
+
+    # Positions 0/1 route {1,2}/{2,3}; the previous sweep ended on {0,2}.
+    summary, last = expert_route_overlap_summary(
+        {
+            1: [0],
+            2: [0, 1],
+            3: [1],
+        },
+        previous_route=(0, 2),
+    )
+
+    assert last == (2, 3)
+    assert summary == {
+        "calls": 1,
+        "positions": 2,
+        "selected_slots": 4,
+        "union_experts": 3,
+        "adjacent_pairs": 2,
+        "within_call_pairs": 1,
+        "cross_call_pairs": 1,
+        "adjacent_intersection_experts": 2,
+        "adjacent_union_experts": 6,
+        "adjacent_current_experts": 4,
+        "exact_adjacent_pairs": 0,
+        "cross_call_intersection_experts": 1,
+        "cross_call_current_experts": 2,
+    }
+
+
+def test_route_overlap_summary_without_prior_has_only_within_call_pairs():
+    from runtime.engine import expert_route_overlap_summary
+
+    summary, last = expert_route_overlap_summary(
+        {4: [0, 1], 5: [0, 1], 6: [1]}
+    )
+
+    assert last == (4, 5, 6)
+    assert summary["within_call_pairs"] == 1
+    assert summary["cross_call_pairs"] == 0
+    assert summary["adjacent_intersection_experts"] == 2
+    assert summary["adjacent_union_experts"] == 3
+
+
+def test_compact_expert_io_batch_uses_representation_bytes_not_model_identity():
+    from runtime.engine import compact_expert_io_batch_size
+
+    # K3's released native MXFP4 expert page is ~17.5 MB: sixteen pages reach
+    # the 256 MiB coalescing neighborhood without approaching a 3 GB cache.
+    assert compact_expert_io_batch_size(
+        17_550_000, 3_000_000_000) == 16
+    # A smaller compact expert reaches the same byte target with the explicit
+    # page-count ceiling; a BF16-sized expert remains conservative.
+    assert compact_expert_io_batch_size(
+        6_300_000, 3_000_000_000) == 16
+    assert compact_expert_io_batch_size(
+        75_500_000, 3_000_000_000) == 4
+
+
+def test_compact_expert_io_batch_respects_tight_cache_and_validates_inputs():
+    import pytest
+
+    from runtime.engine import compact_expert_io_batch_size
+
+    assert compact_expert_io_batch_size(
+        17_550_000, 150_000_000) == 2
+    assert compact_expert_io_batch_size(
+        17_550_000, 3_000_000_000, max_batch=4) == 4
+    with pytest.raises(ValueError, match="page_bytes"):
+        compact_expert_io_batch_size(0, 3_000_000_000)
+    with pytest.raises(ValueError, match="cache_bytes"):
+        compact_expert_io_batch_size(1, -1)
 
 
 def test_decode_only_expert_batch_can_be_larger_than_prefill_batch():
@@ -45,6 +129,93 @@ def test_decode_only_expert_batch_can_be_larger_than_prefill_batch():
 
     assert [len(ids) for ids, _pages in decode] == [8]
     assert [len(ids) for ids, _pages in prefill] == [1] * 8
+
+
+def test_expert_io_batch_can_exceed_compute_materialization_batch():
+    """Storage coalescing must not silently change arithmetic boundaries."""
+    from types import SimpleNamespace
+
+    from runtime.engine import StreamingEngine
+
+    fetches = []
+
+    class FakeEngine:
+        rc = SimpleNamespace(
+            expert_fetch_batch=8,
+            expert_compute_batch=4,
+            decode_expert_fetch_batch=0,
+        )
+        governor = None
+        _expert_compute_batches = 0
+        _max_experts_per_compute_batch = 0
+        _adaptive_expert_batch_clamps = 0
+        _min_adaptive_expert_batch = 0
+
+        def _record_expert_route(self, *_args, **_kwargs):
+            pass
+
+        def _fetch_experts(self, _layer, expert_ids):
+            fetches.append(list(expert_ids))
+            return {expert: f"page-{expert}" for expert in expert_ids}
+
+    engine = FakeEngine()
+    batches = list(StreamingEngine._iter_expert_batches(
+        engine, 4, list(range(10)),
+        positions={expert: [expert % 2] for expert in range(10)}))
+
+    assert fetches == [list(range(8)), [8, 9]]
+    assert [ids for ids, _pages in batches] == [
+        [0, 1, 2, 3], [4, 5, 6, 7], [8, 9]]
+    assert all(
+        pages[expert] == f"page-{expert}"
+        for ids, pages in batches for expert in ids
+    )
+    assert engine._expert_compute_batches == 3
+    assert engine._max_experts_per_compute_batch == 4
+
+
+def test_governor_clamp_preserves_expert_compute_batch_alignment():
+    from types import SimpleNamespace
+
+    from runtime.engine import StreamingEngine
+
+    class FakeGovernor:
+        def admissible_units(
+                self, *, unit_bytes, fixed_bytes, max_units, margin):
+            return min(6, max_units)
+
+    fetches = []
+
+    class FakeEngine:
+        rc = SimpleNamespace(
+            expert_fetch_batch=8,
+            expert_compute_batch=4,
+            decode_expert_fetch_batch=0,
+        )
+        governor = FakeGovernor()
+        _expert_fetch_page_bytes = 100
+        _layer_transient = 200
+        _layer_transient_margin = 0
+        _expert_compute_batches = 0
+        _max_experts_per_compute_batch = 0
+        _adaptive_expert_batch_clamps = 0
+        _min_adaptive_expert_batch = 0
+
+        def _record_expert_route(self, *_args, **_kwargs):
+            pass
+
+        def _fetch_experts(self, _layer, expert_ids):
+            fetches.append(list(expert_ids))
+            return {expert: object() for expert in expert_ids}
+
+    engine = FakeEngine()
+    batches = list(StreamingEngine._iter_expert_batches(
+        engine, 4, list(range(12)),
+        positions={expert: [expert % 2] for expert in range(12)}))
+
+    assert [len(ids) for ids in fetches] == [4, 4, 4]
+    assert [len(ids) for ids, _pages in batches] == [4, 4, 4]
+    assert engine._adaptive_expert_batch_clamps == 2
 
 
 def test_governor_clamps_validated_decode_cap_using_live_headroom():
@@ -88,6 +259,76 @@ def test_governor_clamps_validated_decode_cap_using_live_headroom():
     assert [len(ids) for ids, _pages in decode] == [3, 3, 2]
     assert engine._adaptive_expert_batch_clamps == 2
     assert engine._min_adaptive_expert_batch == 2
+
+
+def test_exact_next_expert_batch_fetch_overlaps_current_batch_consumer():
+    """The pipeline knows every expert from the authoritative router first.
+
+    While batch zero's consumer is active, batch one's fetch must already be
+    running. Expert order and page identity remain unchanged.
+    """
+    from types import SimpleNamespace
+
+    from runtime.engine import StreamingEngine
+
+    second_started = threading.Event()
+    release_second = threading.Event()
+    fetched = []
+    consumed = []
+
+    class FakeEngine:
+        rc = SimpleNamespace(
+            expert_fetch_batch=1,
+            decode_expert_fetch_batch=0,
+        )
+        governor = None
+        _expert_compute_batches = 0
+        _max_experts_per_compute_batch = 0
+        _adaptive_expert_batch_clamps = 0
+        _min_adaptive_expert_batch = 0
+        _expert_batch_prefetch_submitted = 0
+        _expert_batch_prefetch_wait_s = 0.0
+        _expert_batch_prefetch_hidden_s = 0.0
+
+        def _record_expert_route(self, *_args, **_kwargs):
+            pass
+
+        def _fetch_experts(self, _layer, expert_ids):
+            expert = expert_ids[0]
+            fetched.append(expert)
+            if expert == 1:
+                second_started.set()
+                assert release_second.wait(timeout=2)
+            return {expert: f"page-{expert}"}
+
+    engine = FakeEngine()
+    engine._expert_batch_executor = cf.ThreadPoolExecutor(max_workers=1)
+    try:
+        batches = StreamingEngine._iter_expert_batches(
+            engine, 4, [0, 1, 2],
+            positions={0: [0], 1: [1], 2: [0]})
+
+        def consume(batch_ids, pages):
+            expert = batch_ids[0]
+            consumed.append((expert, pages[expert]))
+            if expert == 0:
+                assert second_started.wait(timeout=2)
+                # Model useful current-batch compute while the next fetch is
+                # active, making the hidden-time witness deterministic.
+                assert not release_second.wait(timeout=0.02)
+                release_second.set()
+
+        consume_expert_batches(batches, consume)
+    finally:
+        release_second.set()
+        engine._expert_batch_executor.shutdown(
+            wait=True, cancel_futures=True)
+
+    assert fetched == [0, 1, 2]
+    assert consumed == [
+        (0, "page-0"), (1, "page-1"), (2, "page-2")]
+    assert engine._expert_batch_prefetch_submitted == 3
+    assert engine._expert_batch_prefetch_hidden_s > 0
 
 
 def test_k25_layer_page_estimate_distinguishes_dense_and_sparse_pages():

@@ -93,6 +93,45 @@ TOOL_RESULT_TURNS = [
     },
 ]
 
+DEVELOPER_ACTION_INPUT = [
+    {
+        "role": "system",
+        "content": "You are a tool-using assistant. Never guess live workspace state.",
+    },
+    {
+        "role": "developer",
+        "content": (
+            "When the user asks to inspect the workspace, call the most "
+            "relevant available workspace tool."),
+    },
+    {
+        "role": "user",
+        "content": [{
+            "type": "input_text",
+            "text": "List the files in the current workspace root now.",
+        }],
+    },
+]
+
+SHORT_DIRECT_NO_TOOLS_INPUT = [
+    {
+        "role": "system",
+        "content": "Answer directly and concisely.",
+    },
+    {
+        "role": "user",
+        "content": [{
+            "type": "input_text",
+            "text": "Tell me a one-sentence joke about databases.",
+        }],
+    },
+]
+
+
+def _tool_name(tool: dict) -> str:
+    function = tool.get("function", tool) if isinstance(tool, dict) else {}
+    return str(function.get("name", "")) if isinstance(function, dict) else ""
+
 
 @dataclass(frozen=True)
 class Pressure:
@@ -127,8 +166,10 @@ def _safe_selection(value) -> dict:
         "gateway_direct_streaming", "gateway_late_search_suppressed",
         "gateway_late_catalog_action_suppressed",
         "gateway_search_forced", "gateway_force_reason",
+        "gateway_query_context_profile",
         "gateway_execution_choice_required", "gateway_real_tool_required",
-        "gateway_abstention_available", "gateway_execution_outcome",
+        "gateway_abstention_available", "gateway_abstention_policy_reason",
+        "gateway_execution_outcome",
         "tool_embedding_profile", "tool_embedding_status",
         "tool_embedding_catalog_id", "tool_embedding_tool_cache_hits",
         "tool_embedding_tool_cache_misses", "tool_embedding_query_cache_hit",
@@ -401,6 +442,9 @@ def main() -> int:
     parser.add_argument("--omit-max-output-tokens", action="store_true")
     parser.add_argument("--timeout", type=float, default=300.0)
     parser.add_argument("--stream", action="store_true")
+    parser.add_argument(
+        "--preserve-stream", action="store_true",
+        help="preserve the captured stream field instead of overriding it")
     parser.add_argument("--expected-selected-tools", type=int)
     parser.add_argument("--expected-max-input-tokens", type=int)
     parser.add_argument("--expected-embedding-status")
@@ -410,6 +454,17 @@ def main() -> int:
         "--expected-gateway-phase", choices=("direct", "search", "enable"))
     parser.add_argument("--expected-execution-outcome")
     parser.add_argument("--expected-min-output-tokens", type=int)
+    parser.add_argument("--expected-function-call-name")
+    parser.add_argument("--expected-backend")
+    parser.add_argument("--expected-max-first-wall-seconds", type=float)
+    parser.add_argument("--expected-max-repeat-wall-seconds", type=float)
+    parser.add_argument("--expected-first-cache-source")
+    parser.add_argument("--expected-repeat-cache-source")
+    parser.add_argument("--expected-min-repeat-cached-tokens", type=int)
+    parser.add_argument("--expected-max-peak-metal-gb", type=float)
+    parser.add_argument(
+        "--expected-gateway-real-tool-required",
+        choices=("true", "false"))
     parser.add_argument(
         "--expected-response-status", choices=("completed", "incomplete"))
     parser.add_argument(
@@ -418,7 +473,14 @@ def main() -> int:
         "--replacement-user-text",
         help="replace only the final user turn after capture identity validation")
     parser.add_argument(
-        "--scenario", choices=("deferred-action", "tool-result-answer"),
+        "--append-final-user-text",
+        help=(
+            "append text to the captured final user turn after identity "
+            "validation; useful for a small cached-prefix extension gate"))
+    parser.add_argument(
+        "--scenario", choices=(
+            "deferred-action", "tool-result-answer",
+            "developer-action", "short-direct-no-tools"),
         help="replace conversation turns with a tracked regression scenario")
     parser.add_argument(
         "--kai-conversation", type=Path,
@@ -431,6 +493,8 @@ def main() -> int:
         parser.error("repeats, max-output-tokens, and timeout must be positive")
     if args.temperature is not None and args.temperature < 0:
         parser.error("temperature must be non-negative")
+    if args.stream and args.preserve_stream:
+        parser.error("stream and preserve-stream are mutually exclusive")
     if (args.expected_min_output_tokens is not None
             and args.expected_min_output_tokens <= 0):
         parser.error("expected-min-output-tokens must be positive")
@@ -439,12 +503,25 @@ def main() -> int:
             parser.error("expected-min-text-deltas must be positive")
         if not args.stream:
             parser.error("expected-min-text-deltas requires --stream")
+    for name, value in (
+        ("expected-max-first-wall-seconds",
+         args.expected_max_first_wall_seconds),
+        ("expected-max-repeat-wall-seconds",
+         args.expected_max_repeat_wall_seconds),
+        ("expected-max-peak-metal-gb", args.expected_max_peak_metal_gb),
+    ):
+        if value is not None and value <= 0:
+            parser.error(f"{name} must be positive")
+    if (args.expected_min_repeat_cached_tokens is not None
+            and args.expected_min_repeat_cached_tokens <= 0):
+        parser.error("expected-min-repeat-cached-tokens must be positive")
     mutations = sum(value is not None for value in (
-        args.replacement_user_text, args.scenario, args.kai_conversation))
+        args.replacement_user_text, args.append_final_user_text,
+        args.scenario, args.kai_conversation))
     if mutations > 1:
         parser.error(
-            "replacement-user-text, scenario, and kai-conversation are "
-            "mutually exclusive")
+            "replacement-user-text, append-final-user-text, scenario, and "
+            "kai-conversation are mutually exclusive")
 
     raw = args.capture.read_bytes()
     digest = hashlib.sha256(raw).hexdigest()
@@ -468,15 +545,36 @@ def main() -> int:
             parser.error("model must not be empty")
         request_value["model"] = args.model
     replacement_sha256 = None
+    final_user_append_sha256 = None
     if args.scenario is not None:
         inputs = request_value.get("input")
         if (not isinstance(inputs, list) or not inputs
                 or inputs[-1].get("role") != "user"):
             raise SystemExit("capture has no replaceable conversation")
-        scenario_turns = (
-            DEFERRED_ACTION_TURNS
-            if args.scenario == "deferred-action" else TOOL_RESULT_TURNS)
-        request_value["input"] = [*inputs[:-1], *scenario_turns]
+        if args.scenario == "deferred-action":
+            scenario_turns = DEFERRED_ACTION_TURNS
+            request_value["input"] = [*inputs[:-1], *scenario_turns]
+        elif args.scenario == "tool-result-answer":
+            scenario_turns = TOOL_RESULT_TURNS
+            request_value["input"] = [*inputs[:-1], *scenario_turns]
+        elif args.scenario == "developer-action":
+            scenario_turns = DEVELOPER_ACTION_INPUT
+            request_value["input"] = scenario_turns
+            retained = {
+                "mastra_workspace_list_files",
+                "mastra_workspace_read_file",
+            }
+            request_value["tools"] = [
+                tool for tool in request_value.get("tools", ())
+                if _tool_name(tool) in retained]
+            if len(request_value["tools"]) != len(retained):
+                raise SystemExit(
+                    "developer-action scenario is missing workspace tools")
+        else:
+            scenario_turns = SHORT_DIRECT_NO_TOOLS_INPUT
+            request_value["input"] = scenario_turns
+            request_value["tools"] = []
+            request_value["tool_choice"] = "none"
         replacement_sha256 = hashlib.sha256(json.dumps(
             scenario_turns, ensure_ascii=False,
             separators=(",", ":"), sort_keys=True).encode("utf-8")).hexdigest()
@@ -490,6 +588,26 @@ def main() -> int:
         }]
         replacement_sha256 = hashlib.sha256(
             args.replacement_user_text.encode("utf-8")).hexdigest()
+    elif args.append_final_user_text is not None:
+        inputs = request_value.get("input")
+        if (not isinstance(inputs, list) or not inputs
+                or inputs[-1].get("role") != "user"):
+            raise SystemExit("capture has no appendable final user turn")
+        content = inputs[-1].get("content")
+        if not isinstance(content, list):
+            raise SystemExit("capture final user content is not a parts list")
+        text_part = next(
+            (part for part in reversed(content)
+             if isinstance(part, dict)
+             and part.get("type") == "input_text"
+             and isinstance(part.get("text"), str)),
+            None,
+        )
+        if text_part is None:
+            raise SystemExit("capture final user turn has no input_text part")
+        text_part["text"] += args.append_final_user_text
+        final_user_append_sha256 = hashlib.sha256(
+            args.append_final_user_text.encode("utf-8")).hexdigest()
     if args.kai_conversation is not None:
         request_values = _kai_request_snapshots(
             request_value, args.kai_conversation)
@@ -497,9 +615,13 @@ def main() -> int:
         request_values = [
             (f"repeat_{index + 1}", dict(request_value))
             for index in range(args.repeats)]
+    request_stream = (
+        bool(request_value.get("stream"))
+        if args.preserve_stream else bool(args.stream))
     payloads = []
     for label, value in request_values:
-        value["stream"] = args.stream
+        if not args.preserve_stream:
+            value["stream"] = request_stream
         if args.temperature is not None:
             value["temperature"] = args.temperature
         if args.seed is not None:
@@ -509,7 +631,7 @@ def main() -> int:
             value.pop("max_tokens", None)
         else:
             value["max_output_tokens"] = args.max_output_tokens
-        if args.stream:
+        if request_stream and not args.preserve_stream:
             value["vmodel_progress_events"] = True
         payloads.append((label, json.dumps(
             value, ensure_ascii=False, separators=(",", ":"),
@@ -520,7 +642,7 @@ def main() -> int:
     failures = []
     for index, (label, payload) in enumerate(payloads):
         before = _pressure()
-        row = _post(args.url, payload, args.timeout, args.stream)
+        row = _post(args.url, payload, args.timeout, request_stream)
         after = _pressure()
         row["repeat"] = index + 1
         row["request_label"] = label
@@ -574,7 +696,7 @@ def main() -> int:
             failures.append(
                 f"repeat {index + 1}: received {delta_events} text deltas, "
                 f"expected at least {args.expected_min_text_deltas}")
-        if args.stream and row.get("streamed_text_matches_final") is not True:
+        if request_stream and row.get("streamed_text_matches_final") is not True:
             failures.append(
                 f"repeat {index + 1}: streamed text does not match final output_text")
         if row.get("virtual_search_marker_exposed") is True:
@@ -589,7 +711,70 @@ def main() -> int:
             failures.append(
                 f"repeat {index + 1}: output types {output_types!r} do not "
                 f"include {args.expected_output_type!r}")
+        function_names = row.get("function_call_names") or []
+        if (args.expected_function_call_name is not None
+                and args.expected_function_call_name not in function_names):
+            failures.append(
+                f"repeat {index + 1}: function calls {function_names!r} do not "
+                f"include {args.expected_function_call_name!r}")
+        if (args.expected_backend is not None
+                and row.get("backend") != args.expected_backend):
+            failures.append(
+                f"repeat {index + 1}: backend {row.get('backend')!r}, "
+                f"expected {args.expected_backend!r}")
+        wall_s = float(row.get("wall_seconds", float("inf")))
+        if (index == 0
+                and args.expected_max_first_wall_seconds is not None
+                and wall_s >= args.expected_max_first_wall_seconds):
+            failures.append(
+                f"repeat 1: wall_seconds {wall_s} is not below "
+                f"{args.expected_max_first_wall_seconds}")
+        if (index > 0
+                and args.expected_max_repeat_wall_seconds is not None
+                and wall_s >= args.expected_max_repeat_wall_seconds):
+            failures.append(
+                f"repeat {index + 1}: wall_seconds {wall_s} is not below "
+                f"{args.expected_max_repeat_wall_seconds}")
+        timing = row.get("timing") or {}
+        if (index == 0 and args.expected_first_cache_source is not None
+                and timing.get("cache_source")
+                != args.expected_first_cache_source):
+            failures.append(
+                f"repeat 1: cache source {timing.get('cache_source')!r}, "
+                f"expected {args.expected_first_cache_source!r}")
+        if (index > 0 and args.expected_repeat_cache_source is not None
+                and timing.get("cache_source")
+                != args.expected_repeat_cache_source):
+            failures.append(
+                f"repeat {index + 1}: cache source "
+                f"{timing.get('cache_source')!r}, expected "
+                f"{args.expected_repeat_cache_source!r}")
+        cached_tokens = int(
+            ((usage.get("input_tokens_details") or {}).get(
+                "cached_tokens", 0)) or 0)
+        if (index > 0
+                and args.expected_min_repeat_cached_tokens is not None
+                and cached_tokens < args.expected_min_repeat_cached_tokens):
+            failures.append(
+                f"repeat {index + 1}: cached_tokens {cached_tokens} is below "
+                f"{args.expected_min_repeat_cached_tokens}")
+        peak_bytes = int(timing.get("true_peak_metal_bytes", 0) or 0)
+        if (args.expected_max_peak_metal_gb is not None
+                and peak_bytes >= int(
+                    args.expected_max_peak_metal_gb * 1_000_000_000)):
+            failures.append(
+                f"repeat {index + 1}: true peak Metal "
+                f"{peak_bytes / 1e9:.4f}GB is not below "
+                f"{args.expected_max_peak_metal_gb}GB")
         selection = row.get("tool_selection") or {}
+        if args.expected_gateway_real_tool_required is not None:
+            expected_required = (
+                args.expected_gateway_real_tool_required == "true")
+            if selection.get("gateway_real_tool_required") is not expected_required:
+                failures.append(
+                    f"repeat {index + 1}: gateway_real_tool_required "
+                    f"{selection.get('gateway_real_tool_required')!r}, "
+                    f"expected {expected_required!r}")
         if (args.expected_gateway_phase is not None
                 and selection.get("gateway_phase") != args.expected_gateway_phase):
             failures.append(
@@ -623,7 +808,8 @@ def main() -> int:
             "model_override": args.model,
             "temperature_override": args.temperature,
             "seed_override": args.seed,
-            "stream": args.stream,
+            "stream": request_stream,
+            "stream_preserved": args.preserve_stream,
             "max_output_tokens": (
                 None if args.omit_max_output_tokens else args.max_output_tokens),
             "max_output_tokens_omitted": args.omit_max_output_tokens,
@@ -634,6 +820,30 @@ def main() -> int:
                 if args.kai_conversation is not None else None),
             "request_snapshots": len(payloads),
             "replacement_user_sha256": replacement_sha256,
+            "final_user_append_sha256": final_user_append_sha256,
+            "effective_input_items": len(request_value.get("input") or ()),
+            "effective_tool_count": len(request_value.get("tools") or ()),
+            "effective_developer_messages": sum(
+                item.get("role") == "developer"
+                for item in (request_value.get("input") or ())
+                if isinstance(item, dict)),
+            "effective_system_chars": sum(
+                len(str(item.get("content", "")))
+                for item in (request_value.get("input") or ())
+                if isinstance(item, dict) and item.get("role") == "system"),
+        },
+        "expectations": {
+            "max_first_wall_seconds": args.expected_max_first_wall_seconds,
+            "max_repeat_wall_seconds": args.expected_max_repeat_wall_seconds,
+            "first_cache_source": args.expected_first_cache_source,
+            "repeat_cache_source": args.expected_repeat_cache_source,
+            "min_repeat_cached_tokens": (
+                args.expected_min_repeat_cached_tokens),
+            "max_peak_metal_gb": args.expected_max_peak_metal_gb,
+            "function_call_name": args.expected_function_call_name,
+            "backend": args.expected_backend,
+            "gateway_real_tool_required": (
+                args.expected_gateway_real_tool_required),
         },
         "initial_pressure": asdict(initial),
         "runs": rows,

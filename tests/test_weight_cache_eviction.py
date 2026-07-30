@@ -21,6 +21,7 @@ class FakeStore:
     def __init__(self, *, delay=0.0):
         self.delay = delay
         self.calls = 0
+        self.released = []
         self._lock = threading.Lock()
 
     def fetch(self, names):
@@ -30,6 +31,9 @@ class FakeStore:
             time.sleep(self.delay)
         tensors = {name: FakeTensor(name) for name in names}
         return tensors, 0.0, sum(tensor.nbytes for tensor in tensors.values())
+
+    def release_cache_pages(self, names):
+        self.released.append(tuple(names))
 
 
 class RecordingWarmTier:
@@ -151,6 +155,66 @@ def test_replacing_a_pinned_page_keeps_byte_counters_exact(monkeypatch):
     assert cache.resident_keys == ["shared"]
     assert not cache.would_fit(81)
     assert cache.would_fit(80)
+
+
+def test_clear_releases_all_pages_and_reservations_once(monkeypatch):
+    clears = []
+    monkeypatch.setattr(cache_module, "_clear_device_cache",
+                        lambda: clears.append(True))
+    cache = WeightCache(FakeStore(), max_bytes=100)
+    cache.pin("pinned", ["pinned.weight"])
+    cache.get("prefetched", ["prefetched.weight"], origin="prefetch")
+    cache.get("demand", ["demand.weight"])
+
+    assert cache.total_bytes == 30
+    assert not cache.would_fit(81)
+
+    cache.clear()
+
+    assert cache.total_bytes == 0
+    assert cache.resident_keys == []
+    assert cache.would_fit(100)
+    assert clears == [True]
+    assert cache.store.released == [
+        (
+            "pinned.weight",
+            "prefetched.weight",
+            "demand.weight",
+        )
+    ]
+
+
+def test_clear_refuses_to_race_an_inflight_fetch(monkeypatch):
+    monkeypatch.setattr(cache_module, "_clear_device_cache", lambda: None)
+    cache = WeightCache(FakeStore(), max_bytes=100)
+    with cache._lock:
+        cache._inflight["loading"] = threading.Event()
+
+    try:
+        cache.clear()
+    except RuntimeError as exc:
+        assert "fetches are in flight" in str(exc)
+    else:
+        raise AssertionError("clear must reject an in-flight producer")
+
+
+def test_discard_retries_store_release_after_budget_evicted_page(monkeypatch):
+    clears = []
+    monkeypatch.setattr(cache_module, "_clear_device_cache",
+                        lambda: clears.append(True))
+    cache = WeightCache(FakeStore(), max_bytes=5)
+    values = cache.get("layer.0", ["model.layers.0.weight"])
+
+    # The page is pass-through because it exceeds the budget, but the caller
+    # still owns the values. The true consumer boundary must retry the store
+    # release even though the cache entry is already absent.
+    assert values
+    assert not cache.contains("layer.0")
+    assert cache.discard(
+        "layer.0", ["model.layers.0.weight"]
+    ) is False
+    assert cache.store.released[-1] == ("model.layers.0.weight",)
+    assert len(clears) == 2
 
 
 def test_concurrent_same_key_fetch_keeps_single_page_and_exact_accounting(

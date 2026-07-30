@@ -718,19 +718,28 @@ class SteppedKVCache(KVCache):
 
     @classmethod
     def from_cache(cls, cache: KVCache) -> "KVCache":
-        if isinstance(cache, cls) or cache.compressed_mla:
+        if isinstance(cache, cls):
             return cache
         result = cls(len(cache.keys))
         result.keys = list(cache.keys)
         result.values = list(cache.values)
+        result.compressed_mla = cache.compressed_mla
         for layer, key in enumerate(result.keys):
             if key is not None:
-                result._lengths[layer] = key.shape[2]
+                result._lengths[layer] = (
+                    key.shape[1] if result.compressed_mla else key.shape[2]
+                )
         # F92: kda_cache is a KDAStateCache (Kimi Linear), structurally
         # unrelated to the token-indexed key/value arrays this method
         # rebuilds -- must be carried over unchanged or it's silently
         # dropped, leaving KDA layers stateless with no error.
-        for attribute in ("dsa", "mla_absorbed", "kda_cache"):
+        for attribute in (
+            "dsa",
+            "mla_absorbed",
+            "mla_absorbed_prefill",
+            "mla_absorbed_key_tile_size",
+            "kda_cache",
+        ):
             if hasattr(cache, attribute):
                 setattr(result, attribute, getattr(cache, attribute))
         return result
@@ -770,6 +779,40 @@ class SteppedKVCache(KVCache):
             self.values[layer][..., :end, :],
         )
 
+    def update_latent(self, layer: int, lat: mx.array) -> mx.array:
+        """Append exact compressed MLA latents into spare axis-1 capacity.
+
+        Compressed MLA stores ``[c_kv | k_rope]`` as ``(B, positions,
+        latent_width)`` rather than ordinary per-head K/V.  The previous
+        :class:`KVCache` implementation concatenated the complete prefix for
+        every prefill tile and decode token.  Supporting the architecture's
+        native axis here preserves the exact latent bytes while reducing that
+        quadratic copy schedule to one growth copy per ``step`` positions.
+        """
+        if not self.compressed_mla:
+            raise ValueError(
+                "update_latent requires compressed_mla=True"
+            )
+        previous = self._layer_length(layer)
+        incoming = int(lat.shape[1])
+        end = previous + incoming
+        current = self.keys[layer]
+        if current is None or end > current.shape[1]:
+            blocks = (self.step + incoming - 1) // self.step
+            grown = mx.zeros(
+                (lat.shape[0], blocks * self.step, lat.shape[2]),
+                dtype=lat.dtype,
+            )
+            if current is not None:
+                old = current
+                if previous % self.step:
+                    old = old[:, :previous, :]
+                grown = mx.concatenate([old, grown], axis=1)
+            self.keys[layer] = grown
+        self.keys[layer][:, previous:end, :] = lat
+        self._lengths[layer] = end
+        return self.keys[layer][:, :end, :]
+
     @property
     def offset(self) -> int:
         first = next((i for i, value in enumerate(self.keys)
@@ -782,8 +825,11 @@ class SteppedKVCache(KVCache):
             if key is None:
                 continue
             length = self._layer_length(layer)
-            total += key[..., :length, :].nbytes
-            total += self.values[layer][..., :length, :].nbytes
+            if self.compressed_mla:
+                total += key[:, :length, :].nbytes
+            else:
+                total += key[..., :length, :].nbytes
+                total += self.values[layer][..., :length, :].nbytes
         recurrent = getattr(self, "kda_cache", None)
         if recurrent is not None:
             total += recurrent.nbytes()
@@ -801,10 +847,14 @@ class SteppedKVCache(KVCache):
         for layer, key in enumerate(self.keys):
             if key is None or self._layer_length(layer) <= length:
                 continue
-            self.keys[layer] = key[..., :length, :]
-            self.values[layer] = self.values[layer][..., :length, :]
+            if self.compressed_mla:
+                self.keys[layer] = key[:, :length, :]
+                pending.append(self.keys[layer])
+            else:
+                self.keys[layer] = key[..., :length, :]
+                self.values[layer] = self.values[layer][..., :length, :]
+                pending.extend((self.keys[layer], self.values[layer]))
             self._lengths[layer] = length
-            pending.extend((self.keys[layer], self.values[layer]))
         if pending:
             mx.eval(*pending)
         dsa = getattr(self, "dsa", None)

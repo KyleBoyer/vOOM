@@ -269,6 +269,62 @@ class WeightCache:
         with self._lock:
             return list(self._pages)
 
+    def clear(self) -> None:
+        """Release all resident pages after producers have been joined.
+
+        Engine shutdown previously relied on cyclic-GC timing to destroy the
+        cache object. Large decoded sidecar pages made back-to-back cold-engine
+        gates retain several GiB until a later collection, even though every
+        worker had already stopped. Explicit close-time release is safe once
+        prefetch/expert producers are joined and changes no live-engine policy.
+        """
+        released_names: list[str] = []
+        with self._lock:
+            if self._inflight:
+                raise RuntimeError(
+                    "cannot clear WeightCache while fetches are in flight"
+                )
+            for page in self._pages.values():
+                released_names.extend(page.tensors)
+            self._pages.clear()
+            self._total_bytes = 0
+            self._reserved_bytes = 0
+        _clear_device_cache()
+        release = getattr(self.store, "release_cache_pages", None)
+        if release is not None and released_names:
+            release(tuple(released_names))
+
+    def discard(self, key: str, names: list[str] | tuple[str, ...] = ()) -> bool:
+        """Release one consumed unpinned page at its caller-known lifetime end.
+
+        Budget eviction can occur while the consumer still owns the returned
+        tensor mapping, so it is not a sufficient file-mapping lifetime signal.
+        Layer-stationary sidecar paths call this only after their synchronized
+        compute and local weight reference are gone. The optional ``names`` let
+        the store retry source-file invalidation even if ordinary pressure
+        already removed the cache entry earlier.
+        """
+        released_names = list(names)
+        removed = False
+        with self._lock:
+            page = self._pages.get(key)
+            if page is not None:
+                if page.pinned:
+                    return False
+                if not released_names:
+                    released_names.extend(page.tensors)
+                self._remove_page_locked(key)
+                self.stats.evictions += 1
+                removed = True
+        # The explicit consumer boundary warrants a clear even when ordinary
+        # budget pressure removed the page first: evaluated MLX graph/cache
+        # state can outlive the WeightPage object itself.
+        _clear_device_cache()
+        release = getattr(self.store, "release_cache_pages", None)
+        if release is not None and released_names:
+            release(tuple(released_names))
+        return removed
+
     def would_fit(self, nbytes: int) -> bool:
         """True if a page of this size can be admitted by evicting only *consumed*
         pages — i.e. pinned pages plus not-yet-used prefetched pages plus the new
@@ -346,6 +402,7 @@ class WeightCache:
                 candidate)
         victims = sorted(ordinary) + sorted(prefetched)
         evicted = False
+        released_names: list[str] = []
         try:
             for _frequency, _age, key in victims:
                 if self._total_bytes <= target_bytes:
@@ -353,7 +410,10 @@ class WeightCache:
                 page = self._pages[key]
                 if self.warm is not None:
                     self.warm.admit(key, page.tensors)
+                else:
+                    released_names.extend(page.tensors)
                 self._remove_page_locked(key)
+                del page
                 self.stats.evictions += 1
                 evicted = True
         finally:
@@ -361,3 +421,6 @@ class WeightCache:
                 # Device cleanup is lazy/import-isolated so coordination and
                 # failure handling remain testable without importing MLX.
                 _clear_device_cache()
+                release = getattr(self.store, "release_cache_pages", None)
+                if release is not None and released_names:
+                    release(tuple(released_names))

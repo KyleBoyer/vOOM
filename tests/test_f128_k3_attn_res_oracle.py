@@ -177,6 +177,65 @@ def test_apply_attn_res_matches_real_reference_zero_blocks_edge_case():
     np.testing.assert_allclose(np.array(mine), ref, atol=1e-5, rtol=1e-5)
 
 
+@pytest.mark.skipif(
+    not mx.metal.is_available(), reason="fused AttnRes requires Metal"
+)
+@pytest.mark.parametrize("dtype,atol", [
+    (mx.float32, 5e-5),
+    (mx.bfloat16, 1.6e-2),
+])
+def test_fused_tiled_attn_res_matches_composite(dtype, atol):
+    """Exercise multiple position tiles and a non-warp-aligned hidden size."""
+    rng = np.random.default_rng(128)
+    rows, blocks, hidden = 37, 6, 95
+    prefix = mx.array(
+        rng.standard_normal((rows, hidden)).astype(np.float32)
+    ).astype(dtype)
+    residual = mx.array(
+        rng.standard_normal((rows, blocks, hidden)).astype(np.float32)
+    ).astype(dtype)
+    proj = mx.array(
+        rng.standard_normal((1, hidden)).astype(np.float32)
+    ).astype(dtype)
+    norm = mx.array(
+        rng.standard_normal(hidden).astype(np.float32)
+    ).astype(dtype)
+
+    reference = _apply_attn_res(
+        prefix, residual, proj, norm, 1e-5
+    )
+    fused = _apply_attn_res(
+        prefix,
+        residual,
+        proj,
+        norm,
+        1e-5,
+        fused_tile_size=7,
+    )
+    fused_list = _apply_attn_res(
+        prefix,
+        [residual[:, block, :] for block in range(blocks)],
+        proj,
+        norm,
+        1e-5,
+        fused_tile_size=7,
+    )
+    mx.eval(reference, fused, fused_list)
+
+    np.testing.assert_allclose(
+        np.asarray(fused.astype(mx.float32)),
+        np.asarray(reference.astype(mx.float32)),
+        atol=atol,
+        rtol=atol,
+    )
+    np.testing.assert_allclose(
+        np.asarray(fused_list.astype(mx.float32)),
+        np.asarray(reference.astype(mx.float32)),
+        atol=atol,
+        rtol=atol,
+    )
+
+
 @_torch_skip
 def test_situ_and_mul_matches_real_reference():
     rng = np.random.default_rng(2)

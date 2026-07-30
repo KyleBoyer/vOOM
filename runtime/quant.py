@@ -390,6 +390,10 @@ def dequantize_compressed_tensors_mxfp4(
 
 def matmul(x: mx.array, w) -> mx.array:
     """x @ w.T for a plain, quantized, or candidate-reranked weight."""
+    from .bf16_nf12_linear import NF12Tensor
+
+    if isinstance(w, NF12Tensor):
+        return w.matmul(x)
     if isinstance(w, RerankedQHead):
         approx = matmul(x, w.approx)
         k = w.candidates

@@ -422,6 +422,44 @@ def test_merge_leading_system_messages_merges_instructions_with_in_band_system()
         "You are a helpful assistant.\n\nBe extra concise.")
 
 
+def test_merge_leading_developer_instruction_into_native_system_role():
+    canonical = responses_input_to_messages([
+        {"role": "system", "content": "Never guess live state."},
+        {"role": "developer", "content": "Use a tool for workspace inspection."},
+        {"role": "user", "content": "List the workspace."},
+    ])
+    msgs, _ = normalize_messages(canonical)
+    merged = merge_leading_system_messages(msgs)
+    assert merged == [
+        {
+            "role": "system",
+            "content": (
+                "Never guess live state.\n\n"
+                "Use a tool for workspace inspection."),
+        },
+        {"role": "user", "content": "List the workspace."},
+    ]
+
+
+def test_single_leading_developer_instruction_becomes_system():
+    msgs = [
+        {"role": "developer", "content": "Be concise."},
+        {"role": "user", "content": "Hello."},
+    ]
+    assert merge_leading_system_messages(msgs) == [
+        {"role": "system", "content": "Be concise."},
+        {"role": "user", "content": "Hello."},
+    ]
+
+
+def test_nonleading_developer_instruction_is_not_silently_reordered():
+    msgs = [
+        {"role": "user", "content": "Hello."},
+        {"role": "developer", "content": "New policy."},
+    ]
+    assert merge_leading_system_messages(msgs) == msgs
+
+
 def test_merge_leading_system_messages_is_noop_for_single_system_message():
     msgs = [{"role": "system", "content": "hi"}, {"role": "user", "content": "hey"}]
     assert merge_leading_system_messages(msgs) == msgs

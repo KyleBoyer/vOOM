@@ -75,6 +75,141 @@ def _yarn_rope_params(cfg: ModelConfig, dr: int) -> tuple[mx.array, float, float
     return freqs, cos_sin_scale, softmax_scale_mult
 
 
+def _mla_absorbed_attention(
+    q_nope: mx.array,
+    q_rope: mx.array,
+    lat_all: mx.array,
+    w: dict,
+    prefix: str,
+    cfg: ModelConfig,
+    h: mx.array,
+    offset: int,
+    *,
+    softmax_scale_mult: float = 1.0,
+    key_tile_size: int = 0,
+) -> mx.array:
+    """Compute exact MLA attention without expanding cached per-head K/V.
+
+    This is the DeepSeek/Moonshot weight-absorption identity expressed in
+    MLX.  If ``W_K`` and ``W_V`` are the per-head slices of ``kv_b_proj``,
+
+    ``q @ (c @ W_K.T).T == (q @ W_K) @ c.T``
+
+    and
+
+    ``softmax(scores) @ (c @ W_V.T)
+       == (softmax(scores) @ c) @ W_V.T``.
+
+    Consequently the cache remains the released ``[c_kv | k_rope]`` latent:
+    no ``S x heads x (K+V)`` expansion is ever materialized.  For long
+    prefills, ``key_tile_size`` applies online log-sum-exp over key tiles so
+    the score working set is ``O(heads * query_tile * key_tile)`` instead of
+    ``O(heads * query_tile * full_context)``.  Both transformations are
+    content-independent architecture math; floating-point association differs
+    from expand-then-attend and is therefore guarded by numerical/greedy gates.
+    """
+    B, n_h, L, dn = q_nope.shape
+    dr = q_rope.shape[-1]
+    dv = cfg.v_head_dim
+    S = lat_all.shape[1]
+    kv_lora = lat_all.shape[-1] - dr
+    if kv_lora <= 0:
+        raise ValueError("compressed MLA latent has no c_kv component")
+
+    kv_b = w[f"{prefix}.self_attn.kv_b_proj.weight"]
+    if isinstance(kv_b, quant.QTensor):
+        raise ValueError(
+            "absorbed MLA currently requires a dense kv_b_proj weight"
+        )
+    w_kvb = kv_b.reshape(n_h, dn + dv, kv_lora)
+    w_uk, w_uv = w_kvb[:, :dn, :], w_kvb[:, dn:, :]
+
+    # Fold the per-head K up-projection into Q once per query, then append the
+    # ordinary shared rope/nope slice so one latent dot covers both score terms.
+    q_nope_abs = mx.einsum(
+        "bhld,hdc->bhlc", q_nope, w_uk
+    )
+    q_latent = mx.concatenate([q_nope_abs, q_rope], axis=-1)
+    scale = (dn + dr) ** -0.5 * softmax_scale_mult
+
+    def score_tile(start: int, end: int) -> mx.array:
+        latent = lat_all[:, start:end, :]
+        scores = mx.matmul(
+            q_latent,
+            latent[:, None, :, :].swapaxes(-1, -2),
+        ).astype(mx.float32)
+        scores = scores * scale
+        if L > 1:
+            query_positions = mx.arange(
+                offset, offset + L, dtype=mx.int32
+            )[:, None]
+            key_positions = mx.arange(
+                start, end, dtype=mx.int32
+            )[None, :]
+            causal = mx.where(
+                key_positions <= query_positions,
+                0.0,
+                float("-inf"),
+            ).astype(mx.float32)
+            scores = scores + causal[None, None, :, :]
+        return scores
+
+    if key_tile_size <= 0 or key_tile_size >= S:
+        scores = score_tile(0, S)
+        attn_weights = mx.softmax(
+            scores, axis=-1
+        ).astype(q_nope.dtype)
+        weighted_c = mx.matmul(
+            attn_weights, lat_all[:, None, :, :-dr]
+        )
+    else:
+        running_max = mx.full(
+            (B, n_h, L, 1), float("-inf"), dtype=mx.float32
+        )
+        running_sum = mx.zeros(
+            (B, n_h, L, 1), dtype=mx.float32
+        )
+        running_c = mx.zeros(
+            (B, n_h, L, kv_lora), dtype=mx.float32
+        )
+        for start in range(0, S, key_tile_size):
+            end = min(start + key_tile_size, S)
+            scores = score_tile(start, end)
+            tile_max = mx.max(scores, axis=-1, keepdims=True)
+            next_max = mx.maximum(running_max, tile_max)
+            old_scale = mx.exp(running_max - next_max)
+            tile_weights = mx.exp(scores - next_max)
+            running_sum = (
+                running_sum * old_scale
+                + mx.sum(tile_weights, axis=-1, keepdims=True)
+            )
+            c_tile = lat_all[
+                :, None, start:end, :-dr
+            ].astype(mx.float32)
+            running_c = (
+                running_c * old_scale
+                + mx.matmul(tile_weights, c_tile)
+            )
+            running_max = next_max
+        weighted_c = (
+            running_c / running_sum
+        ).astype(q_nope.dtype)
+
+    # Fold the V projection after the weighted latent reduction: this projects
+    # B*heads*L rows, not B*S*heads rows.
+    out = mx.einsum(
+        "bhlc,hdc->bhld", weighted_c, w_uv
+    )
+    attn = out.transpose(0, 2, 1, 3).reshape(
+        B, L, n_h * dv
+    )
+    if cfg.mla_use_output_gate:
+        attn = attn * mx.sigmoid(
+            _linear(h, w, f"{prefix}.self_attn.g_proj")
+        )
+    return _linear(attn, w, f"{prefix}.self_attn.o_proj")
+
+
 def _mla_attention(
     h: mx.array, w: dict, prefix: str, cfg: ModelConfig, kv, layer: int, offset: int
 ) -> mx.array:
@@ -155,8 +290,13 @@ def _mla_attention(
 
         c_all, kr_all = lat_all[..., :-dr], lat_all[..., -dr:]
 
-        if L == 1 and getattr(kv, "mla_absorbed", False):
-            # F34: MLA weight absorption (DeepSeek-V3.2 decode path,
+        absorbed = (
+            getattr(kv, "mla_absorbed_prefill", False)
+            or (L == 1 and getattr(kv, "mla_absorbed", False))
+        )
+        if absorbed:
+            # F34/F176: MLA weight absorption (the DeepSeek-V3.2 decode
+            # identity,
             # https://huggingface.co/deepseek-ai/DeepSeek-V3.2/blob/main/inference/model.py).
             # The naive path above expands ALL S selected latents through
             # kv_b_proj — an (S x kv_lora x n_h*(dn+dv)) GEMM — to get
@@ -167,28 +307,27 @@ def _mla_attention(
             # ever materialized), and its V up-projection into the FINAL
             # output (so the attention-weighted SUM happens in latent space,
             # projected to full width only once, not once per cached
-            # position). Floating-point association changes vs the naive
+            # position). The same identity covers causal L>1 K3 prefill; the
+            # helper applies online key tiling there. Floating-point
+            # association changes vs the naive
             # path (different summation order) — greedy-token-identity is
             # the gate (tests/test_mla_absorbed.py), not bit-identical
             # logits, matching this doc's own note that reassociation is
             # expected here.
-            kv_lora = c_all.shape[-1]
-            w_kvb = w[f"{prefix}.self_attn.kv_b_proj.weight"].reshape(n_h, dn + dv, kv_lora)
-            w_uk, w_uv = w_kvb[:, :dn, :], w_kvb[:, dn:, :]
-
-            q_nope_abs = mx.einsum("bhld,hdc->bhlc", q_nope, w_uk)      # (B,n_h,1,kv_lora)
-            score_nope = mx.einsum("bhlc,bsc->bhls", q_nope_abs, c_all)  # (B,n_h,1,S)
-            score_rope = mx.einsum("bhld,bsd->bhls", q_rope, kr_all)     # (B,n_h,1,S)
-            scale = (dn + dr) ** -0.5
-            scores = (score_nope + score_rope).astype(mx.float32) * scale
-            attn_w = mx.softmax(scores, axis=-1).astype(q_nope.dtype)
-
-            weighted_c = mx.einsum("bhls,bsc->bhlc", attn_w, c_all)     # (B,n_h,1,kv_lora)
-            out = mx.einsum("bhlc,hdc->bhld", weighted_c, w_uv)          # (B,n_h,1,dv)
-            attn = out.transpose(0, 2, 1, 3).reshape(B, L, n_h * dv)
-            if cfg.mla_use_output_gate:
-                attn = attn * mx.sigmoid(_linear(h, w, f"{prefix}.self_attn.g_proj"))
-            return _linear(attn, w, f"{prefix}.self_attn.o_proj")
+            return _mla_absorbed_attention(
+                q_nope,
+                q_rope,
+                lat_all,
+                w,
+                prefix,
+                cfg,
+                h,
+                offset,
+                softmax_scale_mult=softmax_scale_mult,
+                key_tile_size=int(
+                    getattr(kv, "mla_absorbed_key_tile_size", 0)
+                ),
+            )
 
         kvb = _linear(c_all, w, f"{prefix}.self_attn.kv_b_proj").reshape(B, S, n_h, dn + dv).transpose(0, 2, 1, 3)
         k_nope, values = kvb[..., :dn], kvb[..., dn:]

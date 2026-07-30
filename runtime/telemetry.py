@@ -81,6 +81,12 @@ class RequestProfiler:
     LEVELS = ("", "layers", "ops")
     _CACHE_FIELDS = (
         "hits", "misses", "evictions", "bytes_read", "disk_s",
+        "ct_mxfp4_transform_ns", "ct_mxfp4_transform_calls",
+        "ct_mxfp4_input_bytes", "ct_mxfp4_resident_bytes",
+        "k3_scale_sidecar_read_bytes", "k3_scale_sidecar_output_bytes",
+        "k3_scale_sidecar_decode_ns", "k3_scale_sidecar_decode_calls",
+        "bf16_nf12_read_bytes", "bf16_nf12_output_bytes",
+        "bf16_nf12_decode_ns", "bf16_nf12_decode_calls",
     )
 
     def __init__(self, level: str):
@@ -112,6 +118,18 @@ class RequestProfiler:
             "cache_evictions": 0,
             "store_bytes_read": 0,
             "store_disk_s": 0.0,
+            "ct_mxfp4_transform_ns": 0,
+            "ct_mxfp4_transform_calls": 0,
+            "ct_mxfp4_input_bytes": 0,
+            "ct_mxfp4_resident_bytes": 0,
+            "k3_scale_sidecar_read_bytes": 0,
+            "k3_scale_sidecar_output_bytes": 0,
+            "k3_scale_sidecar_decode_ns": 0,
+            "k3_scale_sidecar_decode_calls": 0,
+            "bf16_nf12_read_bytes": 0,
+            "bf16_nf12_output_bytes": 0,
+            "bf16_nf12_decode_ns": 0,
+            "bf16_nf12_decode_calls": 0,
             "substeps": defaultdict(lambda: {
                 "calls": 0, "positions": 0, "wall_s": 0.0,
             }),
@@ -138,9 +156,34 @@ class RequestProfiler:
     @classmethod
     def cache_snapshot(cls, cache) -> tuple:
         stats = cache.stats
+        stage_snapshot = getattr(getattr(cache, "store", None),
+                                 "stage_snapshot", None)
+        store_stages = (
+            stage_snapshot() if callable(stage_snapshot) else (0, 0, 0, 0))
+        scale_snapshot = getattr(
+            getattr(cache, "store", None),
+            "k3_scale_sidecar_snapshot",
+            None,
+        )
+        scale_stages = (
+            scale_snapshot()
+            if callable(scale_snapshot)
+            else (0, 0, 0, 0)
+        )
+        nf12_snapshot = getattr(
+            getattr(cache, "store", None), "bf16_nf12_snapshot", None
+        )
+        nf12_stages = (
+            nf12_snapshot()
+            if callable(nf12_snapshot)
+            else (0, 0, 0, 0)
+        )
         return (
             int(stats.hits), int(stats.misses), int(stats.evictions),
             int(stats.bytes_read), float(stats.disk_s),
+            *store_stages,
+            *scale_stages,
+            *nf12_stages,
         )
 
     @staticmethod
@@ -164,13 +207,31 @@ class RequestProfiler:
         bucket["weight_wait_s"] += max(0.0, float(weight_wait_s))
         bucket["compute_s"] += max(0.0, float(compute_s))
         bucket["layer_type"] = str(layer_type)
-        (hits, misses, evictions, bytes_read,
-         disk_s) = self._cache_delta(cache_before, cache_after)
+        (hits, misses, evictions, bytes_read, disk_s,
+         ct_transform_ns, ct_transform_calls, ct_input_bytes,
+         ct_resident_bytes, scale_read_bytes, scale_output_bytes,
+         scale_decode_ns, scale_decode_calls,
+         nf12_read_bytes, nf12_output_bytes,
+         nf12_decode_ns, nf12_decode_calls) = self._cache_delta(
+             cache_before, cache_after
+         )
         bucket["cache_hits"] += int(hits)
         bucket["cache_misses"] += int(misses)
         bucket["cache_evictions"] += int(evictions)
         bucket["store_bytes_read"] += int(bytes_read)
         bucket["store_disk_s"] += float(disk_s)
+        bucket["ct_mxfp4_transform_ns"] += int(ct_transform_ns)
+        bucket["ct_mxfp4_transform_calls"] += int(ct_transform_calls)
+        bucket["ct_mxfp4_input_bytes"] += int(ct_input_bytes)
+        bucket["ct_mxfp4_resident_bytes"] += int(ct_resident_bytes)
+        bucket["k3_scale_sidecar_read_bytes"] += int(scale_read_bytes)
+        bucket["k3_scale_sidecar_output_bytes"] += int(scale_output_bytes)
+        bucket["k3_scale_sidecar_decode_ns"] += int(scale_decode_ns)
+        bucket["k3_scale_sidecar_decode_calls"] += int(scale_decode_calls)
+        bucket["bf16_nf12_read_bytes"] += int(nf12_read_bytes)
+        bucket["bf16_nf12_output_bytes"] += int(nf12_output_bytes)
+        bucket["bf16_nf12_decode_ns"] += int(nf12_decode_ns)
+        bucket["bf16_nf12_decode_calls"] += int(nf12_decode_calls)
 
     def record_stack(
         self, *, positions: int, path: str, wall_s: float,
@@ -288,6 +349,29 @@ class RequestProfiler:
                 "cache_evictions": int(raw["cache_evictions"]),
                 "store_bytes_read": int(raw["store_bytes_read"]),
                 "store_disk_s": self._round(raw["store_disk_s"]),
+                "ct_mxfp4_transform_s": self._round(
+                    raw["ct_mxfp4_transform_ns"] / 1_000_000_000),
+                "ct_mxfp4_transform_calls": int(
+                    raw["ct_mxfp4_transform_calls"]),
+                "ct_mxfp4_input_bytes": int(raw["ct_mxfp4_input_bytes"]),
+                "ct_mxfp4_resident_bytes": int(
+                    raw["ct_mxfp4_resident_bytes"]),
+                "k3_scale_sidecar_read_bytes": int(
+                    raw["k3_scale_sidecar_read_bytes"]),
+                "k3_scale_sidecar_output_bytes": int(
+                    raw["k3_scale_sidecar_output_bytes"]),
+                "k3_scale_sidecar_decode_s": self._round(
+                    raw["k3_scale_sidecar_decode_ns"] / 1_000_000_000),
+                "k3_scale_sidecar_decode_calls": int(
+                    raw["k3_scale_sidecar_decode_calls"]),
+                "bf16_nf12_read_bytes": int(
+                    raw["bf16_nf12_read_bytes"]),
+                "bf16_nf12_output_bytes": int(
+                    raw["bf16_nf12_output_bytes"]),
+                "bf16_nf12_decode_s": self._round(
+                    raw["bf16_nf12_decode_ns"] / 1_000_000_000),
+                "bf16_nf12_decode_calls": int(
+                    raw["bf16_nf12_decode_calls"]),
             }
             if substeps:
                 item["substeps"] = substeps
@@ -326,6 +410,16 @@ class RequestProfiler:
                 "store_disk_s": (
                     "nested store-accounted fetch/decode time; parallel work "
                     "may overlap"),
+                "ct_mxfp4_transform_s": (
+                    "nested inside store_disk_s/weight wait; eager dense "
+                    "dequantization or native packed-view materialization, "
+                    "depending on the active representation"),
+                "k3_scale_sidecar_decode_s": (
+                    "nested inside store_disk_s/weight wait; exact fused "
+                    "E8M0 scale reconstruction, excluding sidecar file reads"),
+                "bf16_nf12_decode_s": (
+                    "nested inside store_disk_s/weight wait; exact fixed-width "
+                    "BF16 bit reconstruction from a mapped sidecar"),
                 "substeps": (
                     "nested inside compute_s; ops level adds synchronization "
                     "and is diagnostic, not an uninstrumented speed result"),

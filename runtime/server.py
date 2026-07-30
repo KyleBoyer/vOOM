@@ -971,11 +971,105 @@ class EngineManager:
             "VMODEL_QWEN_MOE_PREFILL_EXPERT_BATCH", "16").strip()
         qwen_moe_decode_batch_request = os.environ.get(
             "VMODEL_QWEN_MOE_DECODE_EXPERT_BATCH", "8").strip()
+        native_ct_mxfp4_request = os.environ.get(
+            "VMODEL_CT_MXFP4_NATIVE", "0").strip()
+        if native_ct_mxfp4_request not in ("0", "1"):
+            raise RequestValidationError(
+                "VMODEL_CT_MXFP4_NATIVE must be 0 or 1")
+        k3_scale_sidecar_request = os.environ.get(
+            "VMODEL_K3_SCALE_SIDECAR_DIR", "").strip()
+        if k3_scale_sidecar_request and native_ct_mxfp4_request != "1":
+            raise RequestValidationError(
+                "VMODEL_K3_SCALE_SIDECAR_DIR requires "
+                "VMODEL_CT_MXFP4_NATIVE=1")
+        bf16_nf12_sidecar_request = os.environ.get(
+            "VMODEL_K3_NF12_SIDECAR_DIR", "").strip()
+        if bf16_nf12_sidecar_request and native_ct_mxfp4_request != "1":
+            raise RequestValidationError(
+                "VMODEL_K3_NF12_SIDECAR_DIR requires "
+                "VMODEL_CT_MXFP4_NATIVE=1")
+        bf16_nf12_uncached_request = os.environ.get(
+            "VMODEL_K3_NF12_UNCACHED", "0").strip()
+        if bf16_nf12_uncached_request not in ("0", "1"):
+            raise RequestValidationError(
+                "VMODEL_K3_NF12_UNCACHED must be 0 or 1"
+            )
+        if (
+            bf16_nf12_uncached_request == "1"
+            and not bf16_nf12_sidecar_request
+        ):
+            raise RequestValidationError(
+                "VMODEL_K3_NF12_UNCACHED=1 requires "
+                "VMODEL_K3_NF12_SIDECAR_DIR"
+            )
+        k3_compressed_mla_request = os.environ.get(
+            "VMODEL_K3_COMPRESSED_MLA", "0"
+        ).strip()
+        k3_absorbed_mla_request = os.environ.get(
+            "VMODEL_K3_ABSORBED_MLA", "0"
+        ).strip()
+        for name, value in (
+            ("VMODEL_K3_COMPRESSED_MLA", k3_compressed_mla_request),
+            ("VMODEL_K3_ABSORBED_MLA", k3_absorbed_mla_request),
+        ):
+            if value not in ("0", "1"):
+                raise RequestValidationError(f"{name} must be 0 or 1")
+        if (
+            k3_absorbed_mla_request == "1"
+            and k3_compressed_mla_request != "1"
+        ):
+            raise RequestValidationError(
+                "VMODEL_K3_ABSORBED_MLA=1 requires "
+                "VMODEL_K3_COMPRESSED_MLA=1"
+            )
+        try:
+            k3_mla_key_tile_size = int(os.environ.get(
+                "VMODEL_K3_MLA_KEY_TILE_SIZE", "2048"
+            ))
+            k3_fused_attnres_tile_size = int(os.environ.get(
+                "VMODEL_K3_FUSED_ATTNRES_TILE_SIZE", "0"
+            ))
+            k3_dense_mlp_tile_size = int(os.environ.get(
+                "VMODEL_K3_DENSE_MLP_TILE_SIZE", "0"
+            ))
+            k3_prefill_tile_width = int(os.environ.get(
+                "VMODEL_K3_PREFILL_TILE_WIDTH", "1"
+            ))
+        except ValueError as error:
+            raise RequestValidationError(
+                "VMODEL_K3_* tile settings must be integers"
+            ) from error
+        if not 0 <= k3_mla_key_tile_size <= 8192:
+            raise RequestValidationError(
+                "VMODEL_K3_MLA_KEY_TILE_SIZE must be in [0, 8192]"
+            )
+        if not 0 <= k3_fused_attnres_tile_size <= 4096:
+            raise RequestValidationError(
+                "VMODEL_K3_FUSED_ATTNRES_TILE_SIZE must be in [0, 4096]"
+            )
+        if not 0 <= k3_dense_mlp_tile_size <= 4096:
+            raise RequestValidationError(
+                "VMODEL_K3_DENSE_MLP_TILE_SIZE must be in [0, 4096]"
+            )
+        if not 1 <= k3_prefill_tile_width <= 4096:
+            raise RequestValidationError(
+                "VMODEL_K3_PREFILL_TILE_WIDTH must be in [1, 4096]"
+            )
         key = (
             str(model_dir), mode, yarn_factor.hex(),
             bool(requires_vision), resident_backend_request,
             qwen_mtp_request, qwen_moe_prefill_batch_request,
             qwen_moe_decode_batch_request,
+            native_ct_mxfp4_request,
+            k3_scale_sidecar_request,
+            bf16_nf12_sidecar_request,
+            bf16_nf12_uncached_request,
+            k3_compressed_mla_request,
+            k3_absorbed_mla_request,
+            k3_mla_key_tile_size,
+            k3_fused_attnres_tile_size,
+            k3_dense_mlp_tile_size,
+            k3_prefill_tile_width,
         )
         # A healthy resident engine owns all state it needs. Return before
         # touching model storage so a transient NAS disconnect cannot stall or
@@ -990,6 +1084,10 @@ class EngineManager:
             bool(requires_vision), resident_backend_request,
             qwen_mtp_request, qwen_moe_prefill_batch_request,
             qwen_moe_decode_batch_request,
+            native_ct_mxfp4_request,
+            k3_scale_sidecar_request,
+            bf16_nf12_sidecar_request,
+            bf16_nf12_uncached_request,
         )
         # Validate the requested profile before evicting a healthy resident
         # engine. ModelConfig.from_dir is read-only and has the same remount
@@ -1074,6 +1172,16 @@ class EngineManager:
                 raise ValueError(
                     "VMODEL_GRAMMAR_FAST_FORWARD must be 0 or 1")
             rc.grammar_fast_forward = grammar_fast_forward == "1"
+            # F137: exact routed-batch I/O/compute overlap. This is a generic
+            # scheduling flag (no prompt/tool/subject fields participate), but
+            # remains explicit opt-in until more released MoE architectures
+            # clear paired real-weight gates.
+            expert_batch_prefetch = os.environ.get(
+                "VMODEL_EXPERT_BATCH_PREFETCH", "0")
+            if expert_batch_prefetch not in ("0", "1"):
+                raise ValueError(
+                    "VMODEL_EXPERT_BATCH_PREFETCH must be 0 or 1")
+            rc.expert_batch_prefetch = expert_batch_prefetch == "1"
             # String-level jump-forward changes token ids (not rendered
             # text) versus per-token masked argmax, so it is fast/lossy
             # profile ONLY -- never the lossless target.
@@ -1267,6 +1375,29 @@ class EngineManager:
                 # floor when system headroom requires it.
                 rc.max_weight_cache_mb = 1500
                 rc.prefetch_depth = 0
+            elif mtype == "kimi_k3":
+                # F132/F134/F135: K3's untied 2.35GB embedding/head pair and
+                # 2.8T streamed MoE need the same row-paged embedding and
+                # block-streamed exact head treatment as K2.5, plus the
+                # AttnRes-aware layer-stationary sweep. The released native
+                # MXFP4 representation is still explicit opt-in below.
+                rc.pin_lm_head = False
+                rc.stream_lm_head = True
+                rc.prompt_kv_dir = ""
+                rc.prefill_chunk_size = k3_prefill_tile_width
+                rc.layer_stationary_prefill = True
+                rc.min_weight_cache_mb = 150
+                rc.max_weight_cache_mb = 3000
+                # F135 re-tested the existing model-agnostic trunk prefetch
+                # after F132/F134 changed K3's residency economics. On the
+                # complete correct 93-layer native path, depth=1 reduced
+                # 260.392s -> 223.160s with identical token/bytes and a lower
+                # 6.528GB peak. Keep dense expand-on-load fallback at q=1 and
+                # demand-only; only the already-explicit native path receives
+                # this newly validated overlap schedule.
+                rc.prefetch_depth = (
+                    1 if native_ct_mxfp4_request == "1" else 0)
+                rc.prefetch_workers = 1
             elif mtype == "qwen3_5_moe":
                 # Qwen3.6-35B-A3B retains Qwen3.5's architecture id. Thirty
                 # DeltaNet layers carry fixed recurrent+conv state that the
@@ -2244,8 +2375,16 @@ class EngineManager:
             # and other packed models instead of leaving it family-locked.
             fast_tier_candidate = (
                 Path.home() / "vmodel_fast_tier" / model_dir.name)
-            if (not rc.fast_dirs and fast_tier_candidate.is_dir()
-                    and next(fast_tier_candidate.glob("*.vt"), None) is not None):
+            if (
+                not rc.fast_dirs
+                and fast_tier_candidate.is_dir()
+                and (
+                    next(fast_tier_candidate.glob("*.vt"), None) is not None
+                    or (
+                        fast_tier_candidate / "fast_tier_manifest.json"
+                    ).is_file()
+                )
+            ):
                 rc.fast_dirs = (str(fast_tier_candidate),)
             tier_overlap = os.environ.get(
                 "VMODEL_PARALLEL_STORAGE_READS", "auto").strip().lower()
@@ -2470,6 +2609,31 @@ class EngineManager:
             if execution_profile not in ("", "layers", "ops"):
                 raise RequestValidationError(
                     "VMODEL_EXECUTION_PROFILE must be '', 'layers', or 'ops'")
+            # Explicit opt-in until a real full-model token gate and broader
+            # checkpoint-format corpus prove the native representation path.
+            rc.native_ct_mxfp4 = native_ct_mxfp4_request == "1"
+            # Explicit path only: no auto-discovery and no default-on behavior
+            # before a complete full-model token/timing gate.
+            rc.kimi_k3_scale_sidecar_dir = k3_scale_sidecar_request
+            rc.bf16_nf12_sidecar_dir = bf16_nf12_sidecar_request
+            rc.bf16_nf12_uncached_reads = (
+                bf16_nf12_uncached_request == "1"
+            )
+            rc.kimi_k3_compressed_mla = bool(
+                mtype == "kimi_k3"
+                and k3_compressed_mla_request == "1"
+            )
+            rc.kimi_k3_absorbed_mla = bool(
+                mtype == "kimi_k3"
+                and k3_absorbed_mla_request == "1"
+            )
+            rc.kimi_k3_mla_key_tile_size = k3_mla_key_tile_size
+            rc.kimi_k3_fused_attnres_tile_size = (
+                k3_fused_attnres_tile_size if mtype == "kimi_k3" else 0
+            )
+            rc.kimi_k3_dense_mlp_tile_size = (
+                k3_dense_mlp_tile_size if mtype == "kimi_k3" else 0
+            )
             chunked_delta_request = os.environ.get(
                 "VMODEL_QWEN35_CHUNKED_DELTA", "auto")
             try:
@@ -4175,6 +4339,13 @@ _HIDDEN_GATEWAY_REAL_TOOL_POLICY = (
     "not answer with a plan, a promise to act later, guessed external state, "
     "or an unrelated tool call."
 )
+_HIDDEN_GATEWAY_REQUIRED_REAL_TOOL_POLICY = (
+    "Private tool-execution phase: catalog search has already selected the "
+    "most relevant real tools for a request that requires external action. "
+    "Call exactly one provided real tool now. Do not answer with prose, a "
+    "plan, a promise to act later, guessed external state, or an unrelated "
+    "tool call."
+)
 _HIDDEN_GATEWAY_ABSTAIN_TEXT = (
     "I couldn't find a suitable available tool for this request."
 )
@@ -4371,6 +4542,45 @@ def _hidden_gateway_force_reason(messages: list[dict]) -> str | None:
         if _GATEWAY_COMMITMENT_RE.search(previous_assistant):
             return "confirmed-deferred-action"
     return None
+
+
+def _hidden_gateway_semantic_query(
+        messages: list[dict], force_reason: str | None,
+) -> tuple[str, str]:
+    """Ground catalog retrieval in the actionable conversational intent.
+
+    A bare confirmation such as ``do it`` is sufficient to authorize an
+    already-proposed external action, but it contains no capability words for
+    tool retrieval. In that one protocol state, fold the preceding user intent
+    and assistant commitment into a synthetic user query. All other requests
+    retain the ordinary latest-user query. This depends only on roles and the
+    already-classified confirmation state, never on a subject, provider, tool
+    name, or captured-request fingerprint.
+    """
+    from .toolcalls import semantic_tool_capability_query
+
+    if force_reason == "confirmed-deferred-action":
+        user_indices = [
+            index for index, message in enumerate(messages)
+            if message.get("role") == "user"]
+        if len(user_indices) >= 2:
+            start = user_indices[-2]
+            end = user_indices[-1] + 1
+            context = "\n".join(
+                _gateway_message_text(message).strip()
+                for message in messages[start:end]
+                if message.get("role") in ("user", "assistant")
+                and _gateway_message_text(message).strip())
+            if context:
+                query = semantic_tool_capability_query([
+                    {"role": "user", "content": context},
+                ])
+                if query:
+                    return query, "confirmed-action-context"
+    return (
+        semantic_tool_capability_query(messages),
+        "latest-user-intent",
+    )
 
 
 def _hidden_gateway_decision_choice(
@@ -4833,6 +5043,44 @@ def _hidden_tool_abstain_pair():
         "parameters": raw["parameters"],
     }}
     return wrapped, raw
+
+
+def _hidden_gateway_abstention_policy(requested: str) -> tuple[bool, str]:
+    """Resolve the execution-phase safety alternative.
+
+    ``auto`` deliberately retains the existing safe abstention until a broad
+    replay corpus proves that requiring the retrieval winner is appropriate as
+    a default.  The explicit off mode is a general operator contract for
+    workloads where the gateway is entered only for externally actionable
+    requests and one retrieved real tool must be selected.
+    """
+    requested = str(requested).strip().lower()
+    if requested == "auto":
+        return True, "auto-safe-abstention"
+    if requested == "1":
+        return True, "operator-enabled"
+    if requested == "0":
+        return False, "operator-required-real-tool"
+    raise ValueError(
+        "VMODEL_FAST_TOOL_GATEWAY_ABSTAIN must be auto, 0, or 1")
+
+
+def _hidden_gateway_execution_abstention_policy(
+        configured_enabled: bool, configured_reason: str,
+        force_reason: str | None) -> tuple[bool, str]:
+    """Keep an abstention escape hatch for model-voluntary catalog search.
+
+    Operator-required real-tool mode is meaningful only when the client or the
+    conservative host classifier already established that external action is
+    required. If an ordinary ``auto`` request voluntarily wanders into search,
+    forcing an arbitrary retrieval winner can turn a harmless direct question
+    into an unrelated external action. Preserve abstention in that case.
+    """
+    if configured_enabled:
+        return True, configured_reason
+    if force_reason is not None:
+        return False, f"{configured_reason}:{force_reason}"
+    return True, "unforced-search-safety-fallback"
 
 
 def _hidden_tool_gateway_enabled(mode: str, tool_count: int, tool_choice: str) -> bool:
@@ -5759,6 +6007,14 @@ def _execution_profile_fields(engine) -> dict[str, str]:
             f"-q{rc.resident_attention_bits}"
             f"-g{rc.resident_attention_group_size}"
         )
+    if rc is not None and getattr(rc, "native_ct_mxfp4", False):
+        weight_profile += "+ct-mxfp4-native"
+    if rc is not None and getattr(rc, "kimi_k3_scale_sidecar_dir", ""):
+        weight_profile += "+k3-scale-sidecar"
+    if rc is not None and getattr(rc, "bf16_nf12_sidecar_dir", ""):
+        weight_profile += "+bf16-nf12-sidecar"
+        if getattr(rc, "bf16_nf12_uncached_reads", False):
+            weight_profile += "-uncached"
     expert_top_k_by_layer = (
         tuple(getattr(rc, "expert_top_k_by_layer", ()))
         if rc is not None else ())
@@ -6639,6 +6895,8 @@ class Handler(BaseHTTPRequestHandler):
         gateway_execution_prose_request = "auto"
         gateway_execution_context_request = "auto"
         gateway_qwen_moe_top_k_request = "auto"
+        gateway_abstention_enabled = True
+        gateway_abstention_reason = "gateway-disabled"
         gateway_virtual_tools = []
         gateway_virtual_raw = []
         if gateway_enabled:
@@ -6705,6 +6963,13 @@ class Handler(BaseHTTPRequestHandler):
                     raise RequestValidationError(
                         "VMODEL_FAST_TOOL_GATEWAY_QWEN_MOE_TOP_K must be "
                         "positive")
+            try:
+                (gateway_abstention_enabled,
+                 gateway_abstention_reason) = \
+                    _hidden_gateway_abstention_policy(os.environ.get(
+                        "VMODEL_FAST_TOOL_GATEWAY_ABSTAIN", "auto"))
+            except ValueError as error:
+                raise RequestValidationError(str(error)) from error
             gateway_activation_key = _hidden_gateway_conversation_key(
                 model_id, all_tools, msgs)
             gateway_activated_names = _hidden_gateway_activation_get(
@@ -6854,10 +7119,8 @@ class Handler(BaseHTTPRequestHandler):
             nonlocal prompt, prompt_tokens, prompt_tools, selected_raw_tools
             nonlocal tool_selection
 
-            from .toolcalls import (
-                semantic_tool_capability_query, semantic_tool_query)
-
-            host_query = semantic_tool_capability_query(msgs)
+            host_query, gateway_query_context_profile = \
+                _hidden_gateway_semantic_query(msgs, gateway_force_reason)
             host_action = (
                 _hidden_gateway_host_action(
                     gateway_force_reason,
@@ -6957,6 +7220,8 @@ class Handler(BaseHTTPRequestHandler):
                 "gateway_search_rounds": 0,
                 "gateway_search_forced": int(gateway_force_reason is not None),
                 "gateway_force_reason": gateway_force_reason,
+                "gateway_query_context_profile": (
+                    gateway_query_context_profile),
                 "gateway_decision_branch": decision_branch,
                 "gateway_host_routed": int(host_action is not None),
                 "gateway_direct_streaming": bool(
@@ -7009,8 +7274,8 @@ class Handler(BaseHTTPRequestHandler):
                 else:
                     # An initial/expired activation cannot be enabled. Preserve
                     # the model's action decision and perform a normal semantic
-                    # lookup against the latest user intent.
-                    query = semantic_tool_query(msgs)
+                    # lookup against the same grounded conversational intent.
+                    query = host_query
                 if not query:
                     raise RuntimeError(
                         "hidden tool gateway produced an empty search query")
@@ -7080,11 +7345,25 @@ class Handler(BaseHTTPRequestHandler):
             gateway_execution_cache_namespace = (
                 f"gateway_execution_{gateway_execution_context}"
                 f"_top{effective_gateway_top_k or 'released'}")
+            (execution_abstention_enabled,
+             execution_abstention_reason) = \
+                _hidden_gateway_execution_abstention_policy(
+                    gateway_abstention_enabled,
+                    gateway_abstention_reason,
+                    gateway_force_reason)
+            execution_policy = (
+                _HIDDEN_GATEWAY_REAL_TOOL_POLICY
+                if execution_abstention_enabled
+                else _HIDDEN_GATEWAY_REQUIRED_REAL_TOOL_POLICY)
             execution_messages = _prepend_system_content(
-                internal_messages, _HIDDEN_GATEWAY_REAL_TOOL_POLICY)
-            abstain_tool, abstain_raw = _hidden_tool_abstain_pair()
-            execution_tools = [*selected_tools, abstain_tool]
-            execution_raw = [*selected_raw, abstain_raw]
+                internal_messages, execution_policy)
+            if execution_abstention_enabled:
+                abstain_tool, abstain_raw = _hidden_tool_abstain_pair()
+                execution_tools = [*selected_tools, abstain_tool]
+                execution_raw = [*selected_raw, abstain_raw]
+            else:
+                execution_tools = list(selected_tools)
+                execution_raw = list(selected_raw)
             prompt, prompt_tokens, prompt_tools, selected_raw_tools, phase_meta = \
                 _prepare_chat_prompt(
                     engine, model_dir, execution_messages, self._reasoning_effort,
@@ -7212,8 +7491,12 @@ class Handler(BaseHTTPRequestHandler):
                 "gateway_catalog_action": gateway_call_name,
                 "gateway_activated_tools": len(selected_tools),
                 "gateway_execution_choice_required": True,
-                "gateway_real_tool_required": False,
-                "gateway_abstention_available": True,
+                "gateway_real_tool_required": (
+                    not execution_abstention_enabled),
+                "gateway_abstention_available": (
+                    execution_abstention_enabled),
+                "gateway_abstention_policy_reason": (
+                    execution_abstention_reason),
                 "gateway_execution_outcome": execution_outcome,
                 "gateway_pagination_host_routed": int(
                     pagination_call is not None),

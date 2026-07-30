@@ -764,7 +764,7 @@ def responses_input_to_messages(input_val, instructions: str | None = None) -> l
 
 
 def merge_leading_system_messages(messages: list[dict]) -> list[dict]:
-    """Collapse a leading run of role="system" messages into one.
+    """Collapse leading system/developer instructions into one system turn.
 
     Real chat templates (Qwen's included) hard-reject any system message
     that isn't first in the conversation
@@ -777,13 +777,23 @@ def merge_leading_system_messages(messages: list[dict]) -> list[dict]:
     items, a main system prompt and a distinct "WORKING_MEMORY_SYSTEM_
     INSTRUCTION" turn, no top-level `instructions` involved at all).
     Applied once, uniformly, after building canonical messages for any
-    of the three protocols, rather than special-cased per producer."""
-    if not messages or messages[0].get("role") != "system":
+    of the three protocols, rather than special-cased per producer.
+
+    OpenAI's ``developer`` role is an instruction role too, but released
+    checkpoint templates generally know only ``system``. A leading developer
+    turn is therefore folded into the same instruction block in request order.
+    This is role-level protocol normalization, not prompt-content routing.
+    Non-leading developer turns remain untouched and fail closed in templates
+    that cannot represent their chronology safely.
+    """
+    instruction_roles = ("system", "developer")
+    if not messages or messages[0].get("role") not in instruction_roles:
         return messages
     end = 1
-    while end < len(messages) and messages[end].get("role") == "system":
+    while (end < len(messages)
+           and messages[end].get("role") in instruction_roles):
         end += 1
-    if end == 1:
+    if end == 1 and messages[0].get("role") == "system":
         return messages
     merged_content = None
     for message in messages[:end]:
@@ -795,7 +805,11 @@ def merge_leading_system_messages(messages: list[dict]) -> list[dict]:
             isinstance(part, dict) and part.get("type") == "text"
             for part in merged_content):
         merged_content = "\n\n".join(part["text"] for part in merged_content)
-    return [{**messages[0], "content": merged_content}] + messages[end:]
+    return [{
+        **messages[0],
+        "role": "system",
+        "content": merged_content,
+    }] + messages[end:]
 
 
 def anthropic_messages_to_canonical(messages: list[dict], system=None) -> list[dict]:

@@ -23,8 +23,15 @@ GLM_FIXTURE = str(
 
 def test_profiler_aggregates_nested_expert_and_substep_metrics():
     profiler = RequestProfiler("ops")
-    cache = SimpleNamespace(stats=SimpleNamespace(
-        hits=1, misses=2, evictions=3, bytes_read=4, disk_s=0.5))
+    stages = [1_000_000, 1, 256, 1_024]
+    scale_stages = [2_048, 8_192, 500_000, 3]
+    cache = SimpleNamespace(
+        stats=SimpleNamespace(
+            hits=1, misses=2, evictions=3, bytes_read=4, disk_s=0.5),
+        store=SimpleNamespace(
+            stage_snapshot=lambda: tuple(stages),
+            k3_scale_sidecar_snapshot=lambda: tuple(scale_stages),
+        ))
     before = profiler.cache_snapshot(cache)
     profiler.set_phase("prefill")
     profiler.begin_sweep(8, path="streamed")
@@ -36,6 +43,14 @@ def test_profiler_aggregates_nested_expert_and_substep_metrics():
     cache.stats.evictions += 1
     cache.stats.bytes_read += 4096
     cache.stats.disk_s += 0.125
+    stages[0] += 2_000_000
+    stages[1] += 2
+    stages[2] += 512
+    stages[3] += 2_048
+    scale_stages[0] += 4_096
+    scale_stages[1] += 16_384
+    scale_stages[2] += 1_500_000
+    scale_stages[3] += 2
     profiler.record_layer(
         2, positions=8, weight_wait_s=1.0, compute_s=2.0,
         cache_before=before, cache_after=profiler.cache_snapshot(cache),
@@ -52,6 +67,14 @@ def test_profiler_aggregates_nested_expert_and_substep_metrics():
     assert row["cache_hits"] == 2
     assert row["cache_misses"] == 3
     assert row["store_bytes_read"] == 4096
+    assert row["ct_mxfp4_transform_s"] == 0.002
+    assert row["ct_mxfp4_transform_calls"] == 2
+    assert row["ct_mxfp4_input_bytes"] == 512
+    assert row["ct_mxfp4_resident_bytes"] == 2048
+    assert row["k3_scale_sidecar_read_bytes"] == 4096
+    assert row["k3_scale_sidecar_output_bytes"] == 16384
+    assert row["k3_scale_sidecar_decode_s"] == 0.0015
+    assert row["k3_scale_sidecar_decode_calls"] == 2
     assert row["substeps"]["attention"]["wall_s"] == 0.5
     assert "do not add" in result["semantics"]["expert_fetch_s"]
 

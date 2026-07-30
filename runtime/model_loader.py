@@ -11,6 +11,10 @@ from __future__ import annotations
 from bisect import bisect_left
 import hashlib
 import json
+import os
+import re
+import struct
+import threading
 import time
 from collections import defaultdict
 from dataclasses import dataclass
@@ -23,6 +27,12 @@ from .local_config import get_storage_config
 
 
 _QUANT_MODES = {"affine", "mxfp4", "nvfp4", "mxfp8"}
+_K3_EXPERT_SCALE_RE = re.compile(
+    r"^model\.layers\.(\d+)\.block_sparse_moe\.experts\."
+    r"(\d+)\.(w1|w2|w3)\.weight_scale$"
+)
+_LAYER_PARAM_RE = re.compile(r"^model\.layers\.(\d+)\.")
+_RAW_FAST_TIER_MAX_RUN_BYTES = 128_000_000
 
 
 @dataclass(frozen=True)
@@ -53,10 +63,10 @@ class _CTMXFP4Aux:
     """F128: Kimi K3's real "mxfp4-pack-quantized" compressed-tensors pair
     (.weight_packed/.weight_scale, no .weight_shape -- confirmed by directly
     inspecting a real downloaded K3 shard; unlike K2.5's INT4 triplet, MXFP4
-    ships no shape tensor at all). Dequantized eagerly to a dense array at
-    fetch time via dequantize_compressed_tensors_mxfp4, same eager-not-lazy
-    convention as _CTInt4Aux for the same reason (prefetch-thread stream
-    binding, see the mx.eval call at its own dequant call site)."""
+    ships no shape tensor at all). The conservative path dequantizes eagerly
+    to a dense array at fetch time. The opt-in native path instead exposes the
+    same bytes as an MLX QTensor after a zero-copy uint8-to-uint32 view; both
+    representations are materialized on the fetch thread before returning."""
 
     packed: str
     scale: str
@@ -137,7 +147,13 @@ class WeightStore:
     def __init__(self, model_dir: str | Path, fast_dirs: list[str | Path] | None = None,
                  *, require_vpack_hashes: bool = False,
                  require_raw_weight_hashes: bool = False,
-                 parallel_storage_reads: bool = False):
+                 parallel_storage_reads: bool = False,
+                 native_ct_mxfp4: bool = False,
+                 kimi_k3_scale_sidecar_dir: str | Path | None = None,
+                 bf16_nf12_sidecar_dir: str | Path | None = None,
+                 bf16_nf12_uncached_reads: bool = False,
+                 bf16_nf12_direct_linear: bool = False,
+                 safetensors_offset_order: bool = False):
         """fast_dirs: optional overlay directories on faster disks, ordered
         fastest-first (split placement across N drives). Packed tensor files found
         in an earlier tier are read from there instead of the primary store —
@@ -151,6 +167,73 @@ class WeightStore:
         self.parallel_tier_fetches = 0
         self.parallel_tier_fast_bytes = 0
         self.parallel_tier_archive_bytes = 0
+        self.safetensors_offset_order = bool(safetensors_offset_order)
+        self._safetensors_headers: dict[str, dict] = {}
+        self._safetensors_header_lock = threading.Lock()
+        # Experimental lossless representation switch for published
+        # compressed-tensors MXFP4 pairs. The format probe and runtime fetch
+        # path fail closed unless the descriptor and physical dtypes match
+        # MLX's native OCP MXFP4 contract exactly.
+        self.native_ct_mxfp4 = bool(native_ct_mxfp4)
+        self.expert_resident_bytes_per_weight = 2.0
+        # Cumulative, thread-safe transform telemetry. Fetch time already
+        # includes these operations; callers must treat transform time as
+        # nested rather than add it to WeightCache's store time.
+        self._stage_lock = threading.Lock()
+        self.ct_mxfp4_transform_ns = 0
+        self.ct_mxfp4_transform_calls = 0
+        self.ct_mxfp4_input_bytes = 0
+        self.ct_mxfp4_resident_bytes = 0
+        self.k3_scale_sidecar = None
+        self.k3_scale_sidecar_read_bytes = 0
+        self.k3_scale_sidecar_output_bytes = 0
+        self.k3_scale_sidecar_decode_ns = 0
+        self.k3_scale_sidecar_decode_calls = 0
+        self._k3_scale_sidecar_request = (
+            Path(kimi_k3_scale_sidecar_dir).expanduser()
+            if kimi_k3_scale_sidecar_dir else None
+        )
+        self.bf16_nf12_sidecar = None
+        self.bf16_nf12_read_bytes = 0
+        self.bf16_nf12_output_bytes = 0
+        self.bf16_nf12_decode_ns = 0
+        self.bf16_nf12_decode_calls = 0
+        self.bf16_nf12_invalidation_attempts = 0
+        self.bf16_nf12_invalidation_successes = 0
+        self.bf16_nf12_invalidation_failures = 0
+        self._bf16_nf12_pending_invalidations: set[int] = set()
+        self._bf16_nf12_sidecar_request = (
+            Path(bf16_nf12_sidecar_dir).expanduser()
+            if bf16_nf12_sidecar_dir else None
+        )
+        self.bf16_nf12_uncached_reads = bool(
+            bf16_nf12_uncached_reads
+        )
+        self.bf16_nf12_direct_linear = bool(
+            bf16_nf12_direct_linear
+        )
+        if (
+            self.bf16_nf12_uncached_reads
+            and self._bf16_nf12_sidecar_request is None
+        ):
+            raise ValueError(
+                "bf16_nf12_uncached_reads requires a BF16 NF12 sidecar"
+            )
+        if (
+            self.bf16_nf12_direct_linear
+            and self._bf16_nf12_sidecar_request is None
+        ):
+            raise ValueError(
+                "bf16_nf12_direct_linear requires a BF16 NF12 sidecar"
+            )
+        if (
+            self.bf16_nf12_direct_linear
+            and self.bf16_nf12_uncached_reads
+        ):
+            raise ValueError(
+                "bf16_nf12_direct_linear is incompatible with uncached "
+                "whole-layer reads"
+            )
         # F128: a SECOND, distinct fast-tier mechanism from the vpack2
         # overlay above -- for a RAW (unpacked) safetensors checkpoint
         # like Kimi K3's, mirroring a deterministic (not learned-heat-
@@ -424,6 +507,7 @@ class WeightStore:
             # released descriptor rather than hard-coding K3's currently
             # observed group size 32.
             candidates = []
+            native_params = set()
             for group in self.quantization.get("config_groups", {}).values():
                 weights = group.get("weights", {}) if isinstance(group, dict) else {}
                 try:
@@ -433,8 +517,29 @@ class WeightStore:
                     continue
                 if bits > 0 and group_size > 0:
                     candidates.append(bits / 8 + 1 / group_size)
+                    native_params.add((
+                        bits,
+                        group_size,
+                        str(weights.get("scale_dtype", "")),
+                        bool(weights.get("symmetric", False)),
+                        str(weights.get("type", "")),
+                    ))
             if candidates:
                 self.expert_storage_bytes_per_weight = max(candidates)
+            if self.native_ct_mxfp4:
+                if (
+                    self.quantization.get("quant_method") != "compressed-tensors"
+                    or self.quantization.get("format")
+                    != "mxfp4-pack-quantized"
+                    or native_params
+                    != {(4, 32, "torch.uint8", True, "float")}
+                ):
+                    raise NotImplementedError(
+                        "native compressed-tensors MXFP4 requires the published "
+                        "mxfp4-pack-quantized OCP E2M1/E8M0 descriptor with "
+                        "bits=4 and group_size=32"
+                    )
+                self.expert_resident_bytes_per_weight = max(candidates)
         elif self.config.model_type == "gpt_oss":
             # Released MXFP4 blocks plus scales/metadata. Match the existing
             # conservative resident/admission estimate used by engine.py.
@@ -470,9 +575,315 @@ class WeightStore:
                     "the checkpoint to standard MLX weight/scales/biases triplets"
                 )
 
+        if self._k3_scale_sidecar_request is not None:
+            if not self.native_ct_mxfp4:
+                raise ValueError(
+                    "Kimi K3 scale sidecars require native_ct_mxfp4=True"
+                )
+            if self.config.model_type not in ("kimi_k3", "kimi_linear"):
+                raise ValueError(
+                    "Kimi K3 scale sidecars are valid only for Kimi K3 "
+                    "compressed-tensors checkpoints"
+                )
+            from formats.kimi_k3_scale_sidecar import KimiK3ScaleSidecar
+
+            self.k3_scale_sidecar = KimiK3ScaleSidecar(
+                self.dir, self._k3_scale_sidecar_request
+            )
+        if self._bf16_nf12_sidecar_request is not None:
+            if self.config.model_type not in ("kimi_k3", "kimi_linear"):
+                raise ValueError(
+                    "the initial BF16 NF12 runtime gate is scoped to Kimi "
+                    "K3/Kimi Linear checkpoints"
+                )
+            from formats.bf16_nf12_sidecar import BF16NF12Sidecar
+
+            self.bf16_nf12_sidecar = BF16NF12Sidecar(
+                self.dir, self._bf16_nf12_sidecar_request
+            )
+
         self._names = sorted(n for n in self.weight_map if n not in quant_aux_names)
 
     # ---- name queries -------------------------------------------------
+
+    def _record_ct_mxfp4_transform(
+        self, *, elapsed_ns: int, input_bytes: int, resident_bytes: int,
+    ) -> None:
+        with self._stage_lock:
+            self.ct_mxfp4_transform_ns += max(0, int(elapsed_ns))
+            self.ct_mxfp4_transform_calls += 1
+            self.ct_mxfp4_input_bytes += max(0, int(input_bytes))
+            self.ct_mxfp4_resident_bytes += max(0, int(resident_bytes))
+
+    def stage_snapshot(self) -> tuple[int, int, int, int]:
+        """Return cumulative representation-transform counters atomically."""
+        with self._stage_lock:
+            return (
+                int(self.ct_mxfp4_transform_ns),
+                int(self.ct_mxfp4_transform_calls),
+                int(self.ct_mxfp4_input_bytes),
+                int(self.ct_mxfp4_resident_bytes),
+            )
+
+    def k3_scale_sidecar_snapshot(self) -> tuple[int, int, int, int]:
+        """Return cumulative exact scale-overlay counters atomically."""
+        with self._stage_lock:
+            return (
+                int(self.k3_scale_sidecar_read_bytes),
+                int(self.k3_scale_sidecar_output_bytes),
+                int(self.k3_scale_sidecar_decode_ns),
+                int(self.k3_scale_sidecar_decode_calls),
+            )
+
+    def bf16_nf12_snapshot(self) -> tuple[int, int, int, int]:
+        """Return cumulative exact BF16-sidecar counters atomically."""
+        with self._stage_lock:
+            return (
+                int(self.bf16_nf12_read_bytes),
+                int(self.bf16_nf12_output_bytes),
+                int(self.bf16_nf12_decode_ns),
+                int(self.bf16_nf12_decode_calls),
+            )
+
+    def bf16_nf12_invalidation_snapshot(self) -> tuple[int, int, int]:
+        """Return deferred Darwin UBC invalidation counters atomically."""
+        with self._stage_lock:
+            return (
+                int(self.bf16_nf12_invalidation_attempts),
+                int(self.bf16_nf12_invalidation_successes),
+                int(self.bf16_nf12_invalidation_failures),
+            )
+
+    def _safetensors_physical_offset(
+        self, shard: str, canonical_name: str
+    ) -> int:
+        """Return one tensor's payload-relative byte offset.
+
+        Headers are cached per shard and read only for the explicit physical-
+        order experiment. The mapping is checkpoint metadata; it contains no
+        prompt-, route-, layer-policy-, or model-name heuristic.
+        """
+        with self._safetensors_header_lock:
+            header = self._safetensors_headers.get(shard)
+            if header is None:
+                path = self.dir / shard
+                fd = os.open(path, os.O_RDONLY)
+                try:
+                    length_raw = os.pread(fd, 8, 0)
+                    if len(length_raw) != 8:
+                        raise EOFError(
+                            f"truncated safetensors header length: {path}"
+                        )
+                    length = struct.unpack("<Q", length_raw)[0]
+                    raw = os.pread(fd, length, 8)
+                    if len(raw) != length:
+                        raise EOFError(
+                            f"truncated safetensors header: {path}"
+                        )
+                finally:
+                    os.close(fd)
+                header = json.loads(raw)
+                self._safetensors_headers[shard] = header
+        real_name = self._real_name.get(
+            canonical_name, canonical_name
+        )
+        metadata = header.get(real_name)
+        if not isinstance(metadata, dict):
+            raise KeyError(
+                f"{real_name!r} missing from safetensors header {shard}"
+            )
+        return int(metadata["data_offsets"][0])
+
+    def _decode_bf16_nf12_layer(
+        self, layer: int, requested_names: list[str],
+    ) -> tuple[dict[str, mx.array], int]:
+        if self.bf16_nf12_sidecar is None:
+            return {}, 0
+        entry = self.bf16_nf12_sidecar.layer_entry(layer)
+        specs = {
+            tensor["name"]: tensor for tensor in entry["tensors"]
+        }
+        direct_names = []
+        if self.bf16_nf12_direct_linear:
+            from .bf16_nf12_linear import direct_linear_eligible
+
+            direct_names = [
+                name for name in requested_names
+                if direct_linear_eligible(specs[name])
+            ]
+        direct_set = set(direct_names)
+        decoded_names = [
+            name for name in requested_names if name not in direct_set
+        ]
+        output = {}
+        direct_read_bytes = 0
+        lazy = None
+        encoded = None
+        # The sidecar is one mmap-backed uint8 array. Materialize that compact
+        # source once on the ordinary weight-prefetch worker, then share the
+        # evaluated MLX array across every direct tensor in this cache page.
+        # Evaluated arrays are safe across the worker/main-thread boundary;
+        # lazy arrays are not, because MLX CPU streams are thread-local.
+        direct_source = None
+        if direct_names:
+            path = self.bf16_nf12_sidecar.layer_path(layer)
+            direct_lazy = mx.load(str(path))
+            direct_source = direct_lazy.get("encoded")
+            if direct_source is None:
+                raise ValueError(
+                    f"layer {layer}: NF12 file has no encoded tensor"
+                )
+            mx.eval(direct_source)
+            direct_lazy.clear()
+        if decoded_names and not self.bf16_nf12_uncached_reads:
+            path = self.bf16_nf12_sidecar.layer_path(layer)
+            lazy = mx.load(str(path))
+            encoded = lazy.get("encoded")
+            if encoded is None:
+                raise ValueError(
+                    f"layer {layer}: NF12 file has no encoded tensor"
+                )
+        if direct_names:
+            from .bf16_nf12_linear import NF12Tensor
+
+            for name in direct_names:
+                output[name] = NF12Tensor(
+                    direct_source, entry, specs[name]
+                )
+                direct_read_bytes += int(specs[name]["encoded_bytes"])
+
+        physical_read_bytes = 0
+        if decoded_names and self.bf16_nf12_uncached_reads:
+            raw_encoded, physical_read_bytes = (
+                self.bf16_nf12_sidecar.read_layer(
+                    layer, uncached=True
+                )
+            )
+            # ``mx.array(np.frombuffer(bytes))`` is lazy: if fed directly into
+            # the decoder, its source node can retain the nearly-1GB Python
+            # ``bytes`` object throughout layer compute. Materialize the
+            # compressed input first, then drop both host references before
+            # constructing the decoder graph. Unified-memory Metal still owns
+            # only the exact encoded stream, and that input dies after decode.
+            import numpy as np
+
+            host_view = np.frombuffer(raw_encoded, dtype=np.uint8)
+            encoded = mx.array(host_view)
+            mx.eval(encoded)
+            del host_view, raw_encoded
+        elif decoded_names:
+            physical_read_bytes = int(entry["file_bytes"])
+        from .bf16_nf12_sidecar import decode_names
+
+        started = time.perf_counter_ns()
+        decoded = (
+            decode_names(encoded, entry, decoded_names)
+            if decoded_names else {}
+        )
+        decode_ns = time.perf_counter_ns() - started
+        # The output is materialized by decode_layer. Drop this direct source
+        # handle now, but defer Darwin UBC invalidation until WeightCache evicts
+        # the decoded page. MLX's evaluated Metal output retains its source graph;
+        # invalidating here can report success while the cache still owns that
+        # graph/mapping, letting one-shot compressed pages accumulate during a
+        # full sweep. ``release_cache_pages`` is the actual lifetime boundary.
+        if encoded is not None:
+            del encoded
+        if lazy is not None:
+            lazy.clear()
+        output.update(decoded)
+        output_bytes = sum(
+            value.nbytes for value in decoded.values()
+        )
+        if self.bf16_nf12_uncached_reads:
+            read_bytes = physical_read_bytes
+        else:
+            read_bytes = direct_read_bytes + sum(
+                int(specs[name]["encoded_bytes"])
+                for name in decoded_names
+            )
+        with self._stage_lock:
+            self.bf16_nf12_read_bytes += read_bytes
+            self.bf16_nf12_output_bytes += output_bytes
+            self.bf16_nf12_decode_ns += decode_ns
+            self.bf16_nf12_decode_calls += 1
+        return output, read_bytes
+
+    def release_cache_pages(self, names: tuple[str, ...]) -> None:
+        """Invalidate evicted NF12 files only after decoded arrays lose ownership.
+
+        Failed invalidations remain queued and are retried on later evictions.
+        Failure is non-fatal because the memory governor remains authoritative.
+        This hook is representation/lifetime based; it is independent of prompt
+        contents, routing, tools, sampling, and layer identity.
+        """
+        sidecar = self.bf16_nf12_sidecar
+        if sidecar is None or self.bf16_nf12_uncached_reads:
+            return
+        for name in names:
+            match = _LAYER_PARAM_RE.match(name)
+            if match is None:
+                continue
+            layer = int(match.group(1))
+            if (
+                sidecar.has_layer(layer)
+                and name in sidecar.encoded_names(layer)
+            ):
+                self._bf16_nf12_pending_invalidations.add(layer)
+        for layer in tuple(sorted(self._bf16_nf12_pending_invalidations)):
+            succeeded = sidecar.invalidate_layer_cache(layer)
+            with self._stage_lock:
+                self.bf16_nf12_invalidation_attempts += 1
+                if succeeded:
+                    self.bf16_nf12_invalidation_successes += 1
+                else:
+                    self.bf16_nf12_invalidation_failures += 1
+            if succeeded:
+                self._bf16_nf12_pending_invalidations.discard(layer)
+
+    def _decode_k3_scale_sidecars(
+        self, scale_names: list[str],
+    ) -> tuple[dict[str, mx.array], int]:
+        """Read requested expert records and fuse each layer's scale decode."""
+        if self.k3_scale_sidecar is None or not scale_names:
+            return {}, 0
+        by_layer: dict[int, list[tuple[str, int, str]]] = defaultdict(list)
+        for name in scale_names:
+            match = _K3_EXPERT_SCALE_RE.fullmatch(name)
+            if match is None:
+                raise ValueError(f"invalid K3 expert scale name {name!r}")
+            layer, expert, projection = match.groups()
+            by_layer[int(layer)].append((name, int(expert), projection))
+
+        output: dict[str, mx.array] = {}
+        physical_bytes = 0
+        output_bytes = 0
+        decode_ns = 0
+        decode_calls = 0
+        for layer, requested in by_layer.items():
+            expert_ids = list(dict.fromkeys(expert for _, expert, _ in requested))
+            records, read_bytes = self.k3_scale_sidecar.read_records(
+                layer, expert_ids
+            )
+            from .kimi_k3_scale_sidecar import decode_records
+
+            decode_started = time.perf_counter_ns()
+            decoded = decode_records(
+                records, self.k3_scale_sidecar.projection_shapes(layer)
+            )
+            decode_ns += time.perf_counter_ns() - decode_started
+            for name, expert, projection in requested:
+                value = decoded[(expert, projection)]
+                output[name] = value
+                output_bytes += value.nbytes
+            physical_bytes += read_bytes
+            decode_calls += 1
+        with self._stage_lock:
+            self.k3_scale_sidecar_read_bytes += physical_bytes
+            self.k3_scale_sidecar_output_bytes += output_bytes
+            self.k3_scale_sidecar_decode_ns += decode_ns
+            self.k3_scale_sidecar_decode_calls += decode_calls
+        return output, physical_bytes
 
     def layer_param_names(self, layer: int) -> list[str]:
         return self.names_with_prefix(f"model.layers.{layer}.")
@@ -708,19 +1119,139 @@ class WeightStore:
 
         out: dict[str, mx.array] = {}
         nbytes = 0
-        for n in names:
-            entry = self._raw_fast_tier_manifest[n]
-            path = self._raw_fast_tier_root / entry["file"]
-            raw = path.read_bytes()
-            if len(raw) != entry["nbytes"]:
-                raise IOError(
-                    f"fast-tier tensor {n} size mismatch: expected "
-                    f"{entry['nbytes']}, got {len(raw)} (stale/corrupt "
-                    f"mirror at {path})")
-            out[n] = to_mx({"dtype": entry["dtype"], "shape": entry["shape"]}, raw)
-            nbytes += len(raw)
+        by_file: dict[str, list[tuple[str, dict]]] = defaultdict(list)
+        for name in names:
+            entry = self._raw_fast_tier_manifest[name]
+            by_file[entry["file"]].append((name, entry))
+
+        for filename, requested in by_file.items():
+            path = self._raw_fast_tier_root / filename
+            if path.suffix == ".safetensors":
+                lazy = mx.load(str(path))
+                dtype_names = {
+                    "bfloat16": "BF16",
+                    "float16": "F16",
+                    "float32": "F32",
+                    "uint8": "U8",
+                    "int8": "I8",
+                    "int32": "I32",
+                    "uint32": "U32",
+                    "int64": "I64",
+                }
+                for name, entry in requested:
+                    try:
+                        array = lazy[name]
+                    except KeyError as error:
+                        raise IOError(
+                            f"fast-tier container {path} is missing {name}"
+                        ) from error
+                    if (
+                        tuple(int(value) for value in array.shape)
+                        != tuple(int(value) for value in entry["shape"])
+                        or dtype_names.get(
+                            str(array.dtype).split(".")[-1]
+                        )
+                        != str(entry["dtype"]).upper()
+                    ):
+                        raise IOError(
+                            f"fast-tier tensor metadata mismatch: {name}"
+                        )
+                    out[name] = array
+                    nbytes += int(array.nbytes)
+                mx.eval([out[name] for name, _entry in requested])
+                continue
+
+            ordered = sorted(
+                requested,
+                key=lambda item: int(item[1].get("offset", 0)),
+            )
+            runs: list[list[tuple[str, dict]]] = []
+            for item in ordered:
+                offset = int(item[1].get("offset", 0))
+                item_end = offset + int(item[1]["nbytes"])
+                if runs:
+                    run_start = int(
+                        runs[-1][0][1].get("offset", 0)
+                    )
+                    previous = runs[-1][-1][1]
+                    previous_end = (
+                        int(previous.get("offset", 0))
+                        + int(previous["nbytes"])
+                    )
+                else:
+                    previous_end = -1
+                if (
+                    runs
+                    and offset == previous_end
+                    and item_end - run_start
+                    <= _RAW_FAST_TIER_MAX_RUN_BYTES
+                ):
+                    runs[-1].append(item)
+                else:
+                    runs.append([item])
+
+            fd = os.open(path, os.O_RDONLY)
+            try:
+                file_size = os.fstat(fd).st_size
+                for run in runs:
+                    run_start = int(run[0][1].get("offset", 0))
+                    run_end = (
+                        int(run[-1][1].get("offset", 0))
+                        + int(run[-1][1]["nbytes"])
+                    )
+                    if run_start < 0 or run_end > file_size:
+                        raise IOError(
+                            f"fast-tier extent [{run_start}, {run_end}) "
+                            f"exceeds {path} ({file_size} bytes)"
+                        )
+                    raw = os.pread(fd, run_end - run_start, run_start)
+                    if len(raw) != run_end - run_start:
+                        raise IOError(
+                            f"truncated fast-tier read from {path}: expected "
+                            f"{run_end - run_start}, got {len(raw)}"
+                        )
+                    nbytes += len(raw)
+                    view = memoryview(raw)
+                    for name, entry in run:
+                        relative = (
+                            int(entry.get("offset", 0)) - run_start
+                        )
+                        length = int(entry["nbytes"])
+                        tensor_raw = view[relative:relative + length]
+                        out[name] = to_mx(
+                            {
+                                "dtype": entry["dtype"],
+                                "shape": entry["shape"],
+                            },
+                            tensor_raw,
+                        )
+            finally:
+                os.close(fd)
         mx.eval(list(out.values()))
         return out, nbytes
+
+    def _raw_fast_tier_is_independent(self, names: list[str]) -> bool:
+        """Prove selected raw-overlay files live off the checkpoint device.
+
+        A configured directory is not enough: it may be a symlink or another
+        path on the same APFS volume.  Parallel reads on one physical device
+        create contention, so fail closed to the serial path unless every
+        selected file resolves to a different ``st_dev``.
+        """
+        if not names or self._raw_fast_tier_root is None:
+            return False
+        try:
+            source_device = self.dir.stat().st_dev
+            devices = {
+                (
+                    self._raw_fast_tier_root
+                    / self._raw_fast_tier_manifest[name]["file"]
+                ).stat().st_dev
+                for name in names
+            }
+        except (KeyError, OSError):
+            return False
+        return bool(devices) and source_device not in devices
 
     def fetch(self, names: list[str]) -> tuple[dict[str, mx.array], float, int]:
         """Materialize tensors; return arrays, wall seconds, store-accounted bytes.
@@ -885,6 +1416,71 @@ class WeightStore:
                     physical_names.append(physical)
                     seen.add(physical)
 
+        # F139: an explicit, checkpoint-fingerprinted scale overlay replaces
+        # only eligible expert .weight_scale tensors. Packed FP4 payloads and
+        # every non-expert tensor retain the ordinary released-checkpoint path.
+        # Partial generations are valid: missing layers fall back to their raw
+        # safetensors scales, so a bounded gate never requires a 25GB build.
+        sidecar_scale_names: list[str] = []
+        if self.k3_scale_sidecar is not None:
+            for physical in physical_names:
+                match = _K3_EXPERT_SCALE_RE.fullmatch(physical)
+                if (
+                    match is not None
+                    and self.k3_scale_sidecar.has_layer(int(match.group(1)))
+                ):
+                    sidecar_scale_names.append(physical)
+        sidecar_scale_set = set(sidecar_scale_names)
+        nf12_names_by_layer: dict[int, list[str]] = defaultdict(list)
+        if self.bf16_nf12_sidecar is not None:
+            encoded_by_layer: dict[int, set[str]] = {}
+            specs_by_layer: dict[int, dict[str, dict]] = {}
+            direct_linear_eligible = None
+            if self.bf16_nf12_direct_linear:
+                from .bf16_nf12_linear import (
+                    direct_linear_eligible as _direct_linear_eligible,
+                )
+
+                direct_linear_eligible = _direct_linear_eligible
+            for physical in physical_names:
+                match = _LAYER_PARAM_RE.match(physical)
+                if match is None:
+                    continue
+                layer = int(match.group(1))
+                if not self.bf16_nf12_sidecar.has_layer(layer):
+                    continue
+                encoded = encoded_by_layer.get(layer)
+                if encoded is None:
+                    encoded = self.bf16_nf12_sidecar.encoded_names(layer)
+                    encoded_by_layer[layer] = encoded
+                if physical in encoded:
+                    # Direct mode uses NF12 only where the fused consumer can
+                    # actually avoid dense reconstruction. Small norms and
+                    # unsupported matrix shapes are cheaper to read directly
+                    # from their released BF16 tensors than to fault/map an
+                    # entire layer sidecar for a tiny exact decode.
+                    if direct_linear_eligible is not None:
+                        specs = specs_by_layer.get(layer)
+                        if specs is None:
+                            specs = {
+                                tensor["name"]: tensor
+                                for tensor in self.bf16_nf12_sidecar
+                                .layer_entry(layer)["tensors"]
+                            }
+                            specs_by_layer[layer] = specs
+                        if not direct_linear_eligible(specs[physical]):
+                            continue
+                    nf12_names_by_layer[layer].append(physical)
+        nf12_name_set = {
+            name
+            for layer_names in nf12_names_by_layer.values()
+            for name in layer_names
+        }
+        source_physical_names = [
+            name for name in physical_names
+            if name not in sidecar_scale_set and name not in nf12_name_set
+        ]
+
         # F128: a deterministic raw-safetensors fast tier (see
         # formats/kimi_k3_fast_tier.py) -- distinct from the vpack2 overlay
         # above, for checkpoints that were never packed at all. Partition
@@ -893,13 +1489,22 @@ class WeightStore:
         # covers.
         self._ensure_raw_fast_tier_loaded()
         fast_names = [
-            n for n in physical_names if n in self._raw_fast_tier_manifest]
+            n for n in source_physical_names
+            if n in self._raw_fast_tier_manifest]
         slow_names = [
-            n for n in physical_names if n not in self._raw_fast_tier_manifest]
+            n for n in source_physical_names
+            if n not in self._raw_fast_tier_manifest]
 
         by_shard: dict[str, list[str]] = defaultdict(list)
         for n in slow_names:
             by_shard[self.weight_map[n]].append(n)
+        if self.safetensors_offset_order:
+            for shard, shard_names in by_shard.items():
+                shard_names.sort(
+                    key=lambda name: self._safetensors_physical_offset(
+                        shard, name
+                    )
+                )
 
         # mx.load() only creates lazy file-backed arrays. The SMB read that can
         # fail happens in mx.eval(), so retry the complete load+select+eval
@@ -907,40 +1512,90 @@ class WeightStore:
         t0 = time.perf_counter()
         for attempt in range(4):
             out: dict[str, mx.array] = {}
+            sidecar_pool = None
+            sidecar_future = None
             try:
-                if fast_names and by_shard:
-                    # Two independent physical devices (verified once at
-                    # extraction time by construction -- the fast tier lives
-                    # under a fast_dirs root, never under self.dir); read
-                    # both concurrently, same "background thread does one
-                    # tier's I/O, main thread does the other's" pattern the
-                    # vpack2 overlay above already uses.
+                if sidecar_scale_names:
+                    # The encoded scale stream lives in a distinct immutable
+                    # file. Read and reconstruct it on one worker while the
+                    # main thread faults the much larger released FP4 payloads.
+                    # Routing is already authoritative and the same exact
+                    # scales are joined before QTensor construction; this is
+                    # scheduling overlap, not speculative data access.
+                    import concurrent.futures as cf
+
+                    sidecar_pool = cf.ThreadPoolExecutor(max_workers=1)
+                    sidecar_future = sidecar_pool.submit(
+                        self._decode_k3_scale_sidecars,
+                        sidecar_scale_names,
+                    )
+                raw_parallel_tiers = bool(
+                    self.parallel_storage_reads
+                    and fast_names
+                    and by_shard
+                    and self._raw_fast_tier_is_independent(fast_names)
+                )
+
+                def load_slow_names() -> tuple[dict[str, mx.array], int]:
+                    slow_out: dict[str, mx.array] = {}
+                    for shard, shard_names in by_shard.items():
+                        lazy = self._load_shard(self.dir / shard)
+                        for name in shard_names:
+                            slow_out[name] = lazy[
+                                self._real_name.get(name, name)
+                            ]
+                    mx.eval(list(slow_out.values()))
+                    return (
+                        slow_out,
+                        sum(int(array.nbytes) for array in slow_out.values()),
+                    )
+
+                if raw_parallel_tiers:
+                    # The worker handles the independently-mounted raw overlay
+                    # while this thread faults the checkpoint arrays.  Device
+                    # identity and the explicit scheduling gate were both
+                    # checked above; same-device and A/B-control paths remain
+                    # serial.
                     import concurrent.futures as cf
 
                     with cf.ThreadPoolExecutor(max_workers=1) as pool:
                         fast_future = pool.submit(
                             self._read_raw_fast_tier_tensors, fast_names)
-                        for shard, shard_names in by_shard.items():
-                            lazy = self._load_shard(self.dir / shard)
-                            for n in shard_names:
-                                out[n] = lazy[self._real_name.get(n, n)]
-                        mx.eval(list(out.values()))
+                        slow_out, slow_bytes = load_slow_names()
                         fast_out, fast_bytes = fast_future.result()
+                    out.update(slow_out)
                     out.update(fast_out)
                     self.fast_tier_bytes += fast_bytes
                     self.fast_tier_tensors += len(fast_names)
+                    self.parallel_tier_fetches += 1
+                    self.parallel_tier_fast_bytes += fast_bytes
+                    self.parallel_tier_archive_bytes += slow_bytes
                 elif fast_names:
-                    fast_out, fast_bytes = self._read_raw_fast_tier_tensors(fast_names)
+                    fast_out, fast_bytes = (
+                        self._read_raw_fast_tier_tensors(fast_names)
+                    )
                     out.update(fast_out)
                     self.fast_tier_bytes += fast_bytes
                     self.fast_tier_tensors += len(fast_names)
-                else:
-                    for shard, shard_names in by_shard.items():
-                        lazy = self._load_shard(self.dir / shard)
-                        for n in shard_names:
-                            out[n] = lazy[self._real_name.get(n, n)]
-                    mx.eval(list(out.values()))
+                    if by_shard:
+                        slow_out, _slow_bytes = load_slow_names()
+                        out.update(slow_out)
+                elif by_shard:
+                    slow_out, _slow_bytes = load_slow_names()
+                    out.update(slow_out)
                 nbytes = sum(a.nbytes for a in out.values())
+                for layer, nf12_names in nf12_names_by_layer.items():
+                    nf12_out, nf12_bytes = self._decode_bf16_nf12_layer(
+                        layer, nf12_names
+                    )
+                    out.update(nf12_out)
+                    nbytes += nf12_bytes
+                if sidecar_future is not None:
+                    sidecar_out, sidecar_bytes = sidecar_future.result()
+                    out.update(sidecar_out)
+                    nbytes += sidecar_bytes
+                    sidecar_pool.shutdown(wait=True)
+                    sidecar_pool = None
                 if self._quant_aux or self._ct_int4_aux or self._ct_mxfp4_aux:
                     from .quant import (
                         QTensor, dequantize_compressed_tensors_int4,
@@ -981,12 +1636,47 @@ class WeightStore:
                             # always packs exactly 2 FP4 values per byte.
                             packed_arr = out[ct_mxfp4_aux.packed]
                             shape = (packed_arr.shape[0], packed_arr.shape[1] * 2)
-                            dequant = dequantize_compressed_tensors_mxfp4(
-                                packed_arr, out[ct_mxfp4_aux.scale], shape)
-                            # Same thread-stream reasoning as the INT4 branch
-                            # above applies identically here.
-                            mx.eval(dequant)
-                            logical[name] = dequant
+                            scale_arr = out[ct_mxfp4_aux.scale]
+                            transform_t0 = time.perf_counter_ns()
+                            if self.native_ct_mxfp4:
+                                if (
+                                    packed_arr.dtype != mx.uint8
+                                    or scale_arr.dtype != mx.uint8
+                                    or packed_arr.shape[1] % 4
+                                ):
+                                    raise ValueError(
+                                        "native compressed-tensors MXFP4 needs "
+                                        "uint8 packed/scale tensors and a packed "
+                                        "row width divisible by four bytes")
+                                # MLX packs eight E2M1 nibbles per uint32 lane,
+                                # low-to-high bits. compressed-tensors stores the
+                                # identical nibble stream as four adjacent uint8
+                                # bytes; this view changes neither bytes nor order.
+                                qtensor = QTensor(
+                                    packed_arr.reshape(
+                                        packed_arr.shape[0], -1).view(mx.uint32),
+                                    scale_arr, None, 4, 32, "mxfp4")
+                                # A fetch may execute on the prefetch thread.
+                                # Materialize the view there so no lazy graph is
+                                # first evaluated on another thread's MLX stream.
+                                mx.eval(qtensor.wq, qtensor.scales)
+                                logical[name] = qtensor
+                                resident_bytes = qtensor.nbytes
+                            else:
+                                dequant = dequantize_compressed_tensors_mxfp4(
+                                    packed_arr, scale_arr, shape)
+                                # Same thread-stream reasoning as the INT4 branch
+                                # above applies identically here.
+                                mx.eval(dequant)
+                                logical[name] = dequant
+                                resident_bytes = dequant.nbytes
+                            self._record_ct_mxfp4_transform(
+                                elapsed_ns=(
+                                    time.perf_counter_ns() - transform_t0),
+                                input_bytes=(
+                                    packed_arr.nbytes + scale_arr.nbytes),
+                                resident_bytes=resident_bytes,
+                            )
                             continue
                         aux = self._quant_aux.get(name)
                         if aux is None:
@@ -1000,6 +1690,8 @@ class WeightStore:
                     out = logical
                 return out, time.perf_counter() - t0, nbytes
             except (OSError, RuntimeError):
+                if sidecar_pool is not None:
+                    sidecar_pool.shutdown(wait=True, cancel_futures=True)
                 # Discard every partially materialized/lazy array before retry;
                 # otherwise stale file descriptors and half-read allocations can
                 # survive into the next attempt.
@@ -1009,6 +1701,10 @@ class WeightStore:
                     raise
                 self._recover_nas_mount()
                 time.sleep(5 * (2 ** attempt))
+            except BaseException:
+                if sidecar_pool is not None:
+                    sidecar_pool.shutdown(wait=True, cancel_futures=True)
+                raise
 
         raise AssertionError("unreachable raw fetch retry state")
 

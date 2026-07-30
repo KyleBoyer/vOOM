@@ -90,72 +90,197 @@ def test_layer_stationary_matches_chunk_major_for_first_three_layers():
         # _layer_stationary_kimi_k3_sweep's own logic (which needs a live
         # HTTP-style request/profiler context this test does not set up),
         # exercising the exact same attn_res_wrap_layer + tiled-attn_fn +
-        # once-per-layer-mlp_fn shape.
-        kv_layer_stationary = engine.new_kv()
-        block_residual = mx.zeros((x_full.shape[0] * x_full.shape[1], 0, H), dtype=x_full.dtype)
-        x = x_full
-        for layer in range(num_layers):
-            w = engine.cache.get(
-                engine._layer_key(layer), engine._layer_names(layer))
+        # once-per-layer-mlp_fn shape. Exercise split and single-shot tiles:
+        # the tile width is a scheduling/memory parameter, never model math.
+        for tile_width in (1, 2, len(tokens)):
+            kv_layer_stationary = engine.new_kv()
+            block_residual = mx.zeros(
+                (x_full.shape[0] * x_full.shape[1], 0, H),
+                dtype=x_full.dtype,
+            )
+            x = x_full
+            for layer in range(num_layers):
+                w = engine.cache.get(
+                    engine._layer_key(layer), engine._layer_names(layer))
 
-            def attn_fn(hidden_states, layer=layer, w=w):
-                from runtime.kimi_linear import _kda_attention, _mla_attention
-                tiles = []
-                p = 0
-                while p < hidden_states.shape[1]:
-                    e = min(p + chunk, hidden_states.shape[1])
-                    ht = hidden_states[:, p:e, :]
-                    if layer in engine.cfg.full_attn_layers:
-                        yt = _mla_attention(
-                            ht, w, f"model.layers.{layer}", engine.cfg,
-                            kv_layer_stationary, layer, p)
-                    else:
-                        kda_cache = getattr(kv_layer_stationary, "kda_cache", None)
-                        yt = _kda_attention(
-                            ht, w, f"model.layers.{layer}", engine.cfg,
-                            kda_cache, layer)
-                    mx.eval(yt)
-                    tiles.append(yt)
-                    p = e
-                return tiles[0] if len(tiles) == 1 else mx.concatenate(tiles, axis=1)
+                def attn_fn(
+                    hidden_states, layer=layer, w=w,
+                    kv_layer_stationary=kv_layer_stationary,
+                    tile_width=tile_width,
+                ):
+                    from runtime.kimi_linear import _kda_attention, _mla_attention
+                    tiles = []
+                    p = 0
+                    while p < hidden_states.shape[1]:
+                        e = min(p + tile_width, hidden_states.shape[1])
+                        ht = hidden_states[:, p:e, :]
+                        if layer in engine.cfg.full_attn_layers:
+                            yt = _mla_attention(
+                                ht, w, f"model.layers.{layer}", engine.cfg,
+                                kv_layer_stationary, layer, p)
+                        else:
+                            kda_cache = getattr(
+                                kv_layer_stationary, "kda_cache", None)
+                            yt = _kda_attention(
+                                ht, w, f"model.layers.{layer}", engine.cfg,
+                                kda_cache, layer)
+                        mx.eval(yt)
+                        tiles.append(yt)
+                        p = e
+                    return (
+                        tiles[0]
+                        if len(tiles) == 1
+                        else mx.concatenate(tiles, axis=1)
+                    )
 
-            def mlp_fn(h2, layer=layer, w=w):
-                from runtime.kimi_linear import _kimi_dense_mlp, _kimi_moe_output
-                if layer < engine.cfg.first_k_dense_replace:
-                    return _kimi_dense_mlp(h2, w, f"model.layers.{layer}.mlp", engine.cfg)
-                return _kimi_moe_output(
-                    h2, w, f"model.layers.{layer}", engine.cfg, layer,
-                    engine._get_experts, iter_expert_batches=engine._iter_expert_batches)
+                def mlp_fn(h2, layer=layer, w=w):
+                    from runtime.kimi_linear import (
+                        _kimi_dense_mlp, _kimi_moe_output)
+                    if layer < engine.cfg.first_k_dense_replace:
+                        return _kimi_dense_mlp(
+                            h2, w, f"model.layers.{layer}.mlp", engine.cfg)
+                    return _kimi_moe_output(
+                        h2, w, f"model.layers.{layer}", engine.cfg, layer,
+                        engine._get_experts,
+                        iter_expert_batches=engine._iter_expert_batches)
 
-            x, block_residual = attn_res_wrap_layer(
-                x, block_residual, w, f"model.layers.{layer}", engine.cfg,
-                layer, attn_fn, mlp_fn)
-            mx.eval(x, block_residual)
+                x, block_residual = attn_res_wrap_layer(
+                    x, block_residual, w, f"model.layers.{layer}", engine.cfg,
+                    layer, attn_fn, mlp_fn)
+                mx.eval(x, block_residual)
 
-        layer_stationary_result = apply_output_attn_res(
-            x, {
-                "model.output_attn_res_proj.weight": engine._output_attn_res_proj_w,
-                "model.output_attn_res_norm.weight": engine._output_attn_res_norm_w,
-            }, block_residual, engine.cfg)
-        mx.eval(layer_stationary_result)
+            layer_stationary_result = apply_output_attn_res(
+                x, {
+                    "model.output_attn_res_proj.weight":
+                        engine._output_attn_res_proj_w,
+                    "model.output_attn_res_norm.weight":
+                        engine._output_attn_res_norm_w,
+                }, block_residual, engine.cfg)
+            mx.eval(layer_stationary_result)
 
-        # F128: NOT byte-identical to the last bit -- computing MoE/MLP over
-        # 4 positions in one batched matmul vs. 2+2 positions in two
-        # separate calls hits a different (still mathematically equivalent)
-        # BLAS/Metal reduction order, a well-known floating-point non-
-        # associativity artifact, not a logic bug. Max diff observed here
-        # is 2.4e-07 -- exactly float32 machine epsilon scale. F35's own
-        # precedent test for kimi_linear guards against this the same way
-        # real deployments care about it: byte-identical GREEDY TOKENS at
-        # the logits/argmax level, not exact intermediate hidden-state
-        # float equality (a much stricter, physically-unrealistic bar for
-        # batched floating point).
-        max_diff = mx.max(mx.abs(
-            chunk_major_result.astype(mx.float32)
-            - layer_stationary_result.astype(mx.float32)))
-        mx.eval(max_diff)
-        assert max_diff.item() < 1e-5, (
-            "layer-stationary and chunk-major decompositions must produce "
-            f"near-identical output (float32 rounding only); max abs diff {max_diff.item()}")
+            # F128: NOT byte-identical to the last bit -- computing MoE/MLP
+            # over 4 positions in one batched matmul vs. 2+2 positions in two
+            # separate calls hits a different (still mathematically
+            # equivalent) BLAS/Metal reduction order. Guard the real semantic
+            # invariant at float32 machine-epsilon scale for every tile width.
+            max_diff = mx.max(mx.abs(
+                chunk_major_result.astype(mx.float32)
+                - layer_stationary_result.astype(mx.float32)))
+            mx.eval(max_diff)
+            assert max_diff.item() < 1e-5, (
+                "layer-stationary and chunk-major decompositions must produce "
+                "near-identical output (float32 rounding only); "
+                f"tile_width={tile_width}, max abs diff {max_diff.item()}")
     finally:
         engine.close()
+
+
+@_model_skip
+def test_layer_stationary_endpoint_avoids_second_real_weight_sweep():
+    """F136: retain the already-computed prompt endpoint for logits.
+
+    Four real K3 layers cover dense, KDA, MLA, MoE, native MXFP4, and
+    AttnRes while keeping this regression much shorter than a 93-layer gate.
+    """
+    from runtime.engine import RuntimeConfig, StreamingEngine
+    from runtime.sampler import SamplingParams
+
+    def run(separate: bool):
+        engine = StreamingEngine(str(MODEL_DIR), RuntimeConfig(
+            prefill_chunk_size=1,
+            min_weight_cache_mb=150,
+            max_weight_cache_mb=3000,
+            embed_rows=True,
+            stream_lm_head=True,
+            expert_fetch_batch=16,
+            native_ct_mxfp4=True,
+            prefetch_depth=1,
+            prefetch_workers=1,
+            layer_stationary_prefill=True,
+            prefill_last_token_separate=separate,
+            execution_profile="layers",
+        ))
+        try:
+            engine.cfg.num_hidden_layers = 4
+            result = engine.generate(
+                "Explain why fused kernels help",
+                max_tokens=1,
+                sampling=SamplingParams(temperature=0.0),
+            )
+            return result, engine.last_kv.offset
+        finally:
+            engine.close()
+            mx.clear_cache()
+
+    control, control_offset = run(True)
+    fused, fused_offset = run(False)
+
+    assert fused["tokens"] == control["tokens"]
+    assert fused["text"] == control["text"]
+    assert fused_offset == control_offset == fused["prompt_tokens"]
+    assert control["execution_profile"]["phases"]["prefill"]["sweeps"] == 2
+    assert fused["execution_profile"]["phases"]["prefill"]["sweeps"] == 1
+    assert control["path_stats"]["layer_stationary_endpoint_fused"] == 0
+    assert fused["path_stats"]["layer_stationary_endpoint_fused"] == 1
+    assert (
+        fused["path_stats"]["weight_store_bytes_read"]
+        < control["path_stats"]["weight_store_bytes_read"]
+    )
+    assert (
+        fused["path_stats"]["expert_cache_misses"]
+        <= control["path_stats"]["expert_cache_misses"]
+    )
+
+
+@_model_skip
+def test_exact_expert_batch_prefetch_matches_serial_real_weights():
+    """F137 candidate: overlap only already-routed expert batch I/O.
+
+    The prompt is intentionally unrelated to the endpoint-fusion regression.
+    Four real K3 layers cover native MXFP4 routed math and the background
+    materialization path without turning this unit gate into a 93-layer job.
+    """
+    from runtime.engine import RuntimeConfig, StreamingEngine
+    from runtime.sampler import SamplingParams
+
+    def run(pipelined: bool):
+        engine = StreamingEngine(str(MODEL_DIR), RuntimeConfig(
+            prefill_chunk_size=1,
+            min_weight_cache_mb=150,
+            max_weight_cache_mb=3000,
+            embed_rows=True,
+            stream_lm_head=True,
+            expert_fetch_batch=16,
+            native_ct_mxfp4=True,
+            prefetch_depth=1,
+            prefetch_workers=1,
+            layer_stationary_prefill=True,
+            expert_batch_prefetch=pipelined,
+            execution_profile="layers",
+        ))
+        try:
+            engine.cfg.num_hidden_layers = 4
+            result = engine.generate(
+                "Compare sculpture and orbital mechanics",
+                max_tokens=1,
+                sampling=SamplingParams(temperature=0.0),
+            )
+            return result, engine.last_kv.offset
+        finally:
+            engine.close()
+            mx.clear_cache()
+
+    serial, serial_offset = run(False)
+    pipelined, pipelined_offset = run(True)
+
+    assert pipelined["tokens"] == serial["tokens"]
+    assert pipelined["text"] == serial["text"]
+    assert pipelined_offset == serial_offset == pipelined["prompt_tokens"]
+    assert (
+        pipelined["path_stats"]["weight_store_bytes_read"]
+        == serial["path_stats"]["weight_store_bytes_read"]
+    )
+    assert serial["path_stats"]["expert_batch_prefetch"] == 0
+    assert pipelined["path_stats"]["expert_batch_prefetch"] == 1
+    assert pipelined["path_stats"]["expert_batch_prefetch_submitted"] > 0
+    assert pipelined["path_stats"]["expert_batch_prefetch_hidden_s"] > 0

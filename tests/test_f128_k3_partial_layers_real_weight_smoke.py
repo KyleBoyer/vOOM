@@ -18,6 +18,7 @@ from __future__ import annotations
 from pathlib import Path
 
 import mlx.core as mx
+import numpy as np
 import pytest
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -98,6 +99,60 @@ def test_first_four_real_layers_produce_finite_output():
         assert not bool(mx.any(mx.isnan(out)).item())
     finally:
         engine.close()
+
+
+@_model_skip
+def test_native_mxfp4_matches_dense_for_first_four_real_layers():
+    """Representation A/B through routing, three real MoE layers, KDA, MLA,
+    Stable LatentMoE, and AttnRes—not merely one isolated matrix."""
+    from runtime.engine import RuntimeConfig, StreamingEngine
+    from runtime.kimi_linear import run_kimi_k3_block
+
+    def run(native: bool):
+        rc = RuntimeConfig(
+            prefill_chunk_size=1,
+            min_weight_cache_mb=150,
+            max_weight_cache_mb=3000,
+            embed_rows=True,
+            stream_lm_head=True,
+            expert_fetch_batch=1,
+            native_ct_mxfp4=native,
+        )
+        engine = StreamingEngine(str(MODEL_DIR), rc)
+        try:
+            x = engine._embed([3])
+            mx.eval(x)
+            kv = engine.new_kv()
+            block_residual = mx.zeros(
+                (x.shape[0] * x.shape[1], 0, x.shape[2]), dtype=x.dtype)
+            for layer in range(4):
+                w = engine.cache.get(
+                    engine._layer_key(layer), engine._layer_names(layer))
+                x, block_residual = run_kimi_k3_block(
+                    x, w, f"model.layers.{layer}", engine.cfg, kv, layer, 0,
+                    block_residual, engine._get_experts,
+                    iter_expert_batches=engine._iter_expert_batches)
+                mx.eval(x, block_residual)
+            return (
+                np.array(x.astype(mx.float32)),
+                engine.store.stage_snapshot(),
+                engine.cache.total_bytes,
+            )
+        finally:
+            engine.close()
+            mx.clear_cache()
+
+    dense, dense_stages, dense_resident = run(False)
+    native, native_stages, native_resident = run(True)
+    max_abs = float(np.max(np.abs(native - dense)))
+    assert max_abs < 1e-6, (
+        "native packed and eager-dense MXFP4 paths must differ only at "
+        f"floating reduction-order scale; max abs diff {max_abs}")
+    assert dense_stages[1] > 0
+    assert native_stages[1] == dense_stages[1]
+    assert native_stages[2] == dense_stages[2]
+    assert native_stages[3] < dense_stages[3]
+    assert native_resident < dense_resident
 
 
 @_model_skip

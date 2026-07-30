@@ -1,4 +1,5 @@
 import threading
+import time
 
 from runtime.prefetcher import Prefetcher
 
@@ -9,6 +10,7 @@ class BlockingCache:
         self.release = threading.Event()
         self.second_loaded = threading.Event()
         self.loaded = []
+        self.max_fit = 1_000_000
 
     def contains(self, _key):
         return False
@@ -16,8 +18,8 @@ class BlockingCache:
     def inflight(self, _key):
         return False
 
-    def would_fit(self, _nbytes):
-        return True
+    def would_fit(self, nbytes):
+        return nbytes <= self.max_fit
 
     def get(self, key, _names, origin="demand"):
         assert origin == "prefetch"
@@ -57,3 +59,38 @@ def test_aggressive_mode_can_queue_for_explicit_ab():
         cache.release.set()
         prefetcher.close()
     assert cache.loaded == ["first", "second"]
+
+
+def test_worker_rechecks_page_hint_after_live_budget_shrink():
+    cache = BlockingCache()
+    cache.max_fit = 100
+    prefetcher = Prefetcher(cache, page_size_hint=10, workers=1)
+    try:
+        assert prefetcher.schedule(
+            "first", ["a"], page_size_hint=100)
+        assert cache.started.wait(timeout=2)
+        assert prefetcher.schedule(
+            "second", ["b"], page_size_hint=100)
+        cache.max_fit = 50
+        cache.release.set()
+        deadline = time.monotonic() + 2
+        while prefetcher.skipped_budget == 0 and time.monotonic() < deadline:
+            time.sleep(0.005)
+    finally:
+        cache.release.set()
+        prefetcher.close()
+
+    assert cache.loaded == ["first"]
+    assert prefetcher.skipped_budget == 1
+
+
+def test_per_page_hint_rejects_oversized_page_before_enqueue():
+    cache = BlockingCache()
+    cache.max_fit = 150
+    prefetcher = Prefetcher(cache, page_size_hint=10, workers=1)
+    try:
+        assert not prefetcher.schedule(
+            "oversized", ["a"], page_size_hint=200)
+    finally:
+        prefetcher.close()
+    assert prefetcher.skipped_budget == 1

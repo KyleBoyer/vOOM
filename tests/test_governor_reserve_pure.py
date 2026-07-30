@@ -181,6 +181,29 @@ def test_unreclaimable_projection_fails_before_allocation():
     assert gov.prefetcher.paused
 
 
+def test_floor_reservation_waits_for_short_available_memory_dip():
+    module, mx = load_pressure(int(5e9))
+    gov = make_governor(
+        module, mx, cache_max=int(1.5e9), floor=int(1.5e9))
+    samples = iter(
+        [int(2.5e9)] * 5 + [int(2.7e9)]
+    )
+    original_virtual_memory = module.psutil.virtual_memory
+    original_sleep = module.time.sleep
+    try:
+        module.psutil.virtual_memory = lambda: types.SimpleNamespace(
+            available=next(samples)
+        )
+        module.time.sleep = lambda _seconds: None
+        gov.reserve(int(1e9), margin=int(0.4e9))
+    finally:
+        module.psutil.virtual_memory = original_virtual_memory
+        module.time.sleep = original_sleep
+
+    assert gov.reservation_failures == 0
+    assert gov.cache.max_bytes == int(1.5e9)
+
+
 def test_reclaim_stops_at_floor_and_refuses_when_memory_does_not_release():
     module, mx = load_pressure(int(9.9e9))
     gov = make_governor(

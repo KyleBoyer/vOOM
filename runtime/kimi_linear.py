@@ -79,10 +79,12 @@ Architecture (from the real downloaded modeling_kimi.py / config.json):
 
 from __future__ import annotations
 
+from functools import lru_cache
+
 import mlx.core as mx
 
 from . import quant
-from .config import ModelConfig
+from .config import ModelConfig, effective_expert_top_k
 from .expert_batching import consume_expert_batches
 from .glm import _group_routes, _mla_attention
 from .kda_state import KDAStateCache
@@ -101,14 +103,13 @@ def _route_experts(
     (tests/test_f33_router_oracle.py calls it directly).
 
     `layer` (optional, defaults to None -- every existing call site that
-    doesn't pass it keeps its exact prior behavior) is only consulted for
-    `cfg.model_type == "kimi_k3"` with `cfg.expert_prune_masks` set: an
-    opt-in, lossy REAP-style pruning policy (see
-    experiments/kimi_k3_reap_calibrate.py and
-    docs/future_sidequest_techniques.md) that masks specific expert
-    indices out of top-k selection for that layer, so a pruned expert is
-    never chosen and therefore never fetched from disk. Unset (the
-    default for every checkpoint) is a byte-for-byte no-op.
+    doesn't pass it keeps its exact prior behavior) selects two explicit,
+    lossy K3 policies when configured: `expert_prune_masks` can exclude
+    calibrated REAP-style expert IDs, and `expert_top_k_by_layer` can lower
+    the released routed budget uniformly or by layer. Both are numeric
+    runtime schedules independent of prompt/tool/subject content. With both
+    schedules unset (the default for every checkpoint), this is a
+    byte-for-byte no-op.
 
     F92 oracle finding (2026-07-18, real modeling_kimi.py, verified to 6
     decimal places against the actual released KimiMoEGate): unlike GLM's
@@ -128,7 +129,9 @@ def _route_experts(
     "fix" this to look like GLM's version.
     """
     gate_weight = w[f"{moe_prefix}.gate.weight"]
-    if isinstance(gate_weight, quant.QTensor):
+    from .bf16_nf12_linear import NF12Tensor
+
+    if isinstance(gate_weight, (quant.QTensor, NF12Tensor)):
         router_logits = quant.matmul(h.astype(mx.float32), gate_weight)
     else:
         router_logits = h.astype(mx.float32) @ gate_weight.astype(mx.float32).T
@@ -141,7 +144,11 @@ def _route_experts(
         for e in pruned:
             penalty[e] = -1e9
         biased = biased + mx.array(penalty, dtype=mx.float32)
-    k = cfg.num_experts_per_tok
+    k = (
+        effective_expert_top_k(cfg, layer)
+        if layer is not None
+        else cfg.num_experts_per_tok
+    )
     idx = mx.argpartition(-biased, kth=k - 1, axis=-1)[..., :k]
     if cfg.model_type == "kimi_k3":
         # F128: K3's real bundled modeling_kimi_linear.py FIXED this aliasing
@@ -258,6 +265,38 @@ def _kimi_dense_mlp(h: mx.array, w: dict, prefix: str, cfg: ModelConfig) -> mx.a
     activated = _situ_and_mul(
         gate, up, cfg.activation_situ_beta, cfg.activation_situ_linear_beta)
     return _linear(activated, w, f"{prefix}.down_proj")
+
+
+def _kimi_dense_mlp_tiled(
+    h: mx.array,
+    w: dict,
+    prefix: str,
+    cfg: ModelConfig,
+    tile_size: int,
+) -> mx.array:
+    """Evaluate a row-independent dense Kimi MLP in bounded position tiles.
+
+    K3's first layer has intermediate width 33,792. At 46K positions, keeping
+    gate and up projections for the complete prompt would require more than
+    6GB before the down projection. Position tiling preserves every row's
+    released MLP equation and reduction dimension while retaining one loaded
+    weight page for the whole layer-stationary sweep.
+    """
+    if tile_size <= 0 or h.shape[1] <= tile_size:
+        return _kimi_dense_mlp(h, w, prefix, cfg)
+    output = mx.zeros(
+        (h.shape[0], h.shape[1], cfg.hidden_size), dtype=h.dtype
+    )
+    mx.eval(output)
+    for start in range(0, h.shape[1], tile_size):
+        end = min(start + tile_size, h.shape[1])
+        value = _kimi_dense_mlp(
+            h[:, start:end, :], w, prefix, cfg
+        )
+        mx.eval(value)
+        output[:, start:end, :] = value
+        mx.eval(output)
+    return output
 
 
 def _kda_attention(
@@ -438,6 +477,7 @@ def _kimi_linear_mlp_residual(
 def _kimi_moe_output(
     h: mx.array, w: dict, prefix: str, cfg: ModelConfig, layer: int,
     get_experts, iter_expert_batches=None, profile=None, stat_collector=None,
+    overlap_shared_expert: bool = False,
 ) -> mx.array:
     """Routed-experts + shared-experts MoE output ONLY -- no residual add,
     and the caller must already have checked `layer >= cfg.first_k_dense_replace`
@@ -465,6 +505,20 @@ def _kimi_moe_output(
             positions=int(h.shape[1]))):
         mx.eval(idx, pw)
     groups = _group_routes(idx, pw)
+    expert_ids = sorted(groups)
+    positions_by_expert = {
+        e: [pt for pt, _ in groups[e]] for e in expert_ids
+    }
+    # Routing is authoritative now. A pipelined engine submits exact batch
+    # zero while the resident latent/shared branches below run; an ordinary
+    # non-pipelined iterator remains lazy and preserves its prior schedule.
+    batches = (
+        iter_expert_batches(
+            layer, expert_ids, positions=positions_by_expert
+        )
+        if iter_expert_batches is not None
+        else None
+    )
 
     # F128: Kimi K3's real KimiSparseMoeBlock routes on the FULL hidden
     # state (h, above) but runs each expert in a smaller "latent" space
@@ -475,17 +529,30 @@ def _kimi_moe_output(
     # this branch existed).
     if cfg.moe_latent_hidden_size:
         h_latent = _linear(h, w, f"{moe_prefix}.routed_expert_down_proj")
+        if batches is not None:
+            mx.async_eval(h_latent)
     else:
         h_latent = h
 
+    # The routed and shared branches are independent functions of the same
+    # immutable h:
+    #
+    #     MoE(h) = R(h) + S(h).
+    #
+    # Submit S(h) before the first routed-weight fetch so Metal can consume the
+    # resident shared weights while storage materializes routed batch zero.
+    # The final addition and every routed accumulation remain in their original
+    # order, so this is a scheduling identity rather than a math approximation.
+    shared = None
+    if overlap_shared_expert:
+        shared = _kimi_dense_mlp(
+            h, w, f"{moe_prefix}.shared_experts", cfg)
+        mx.async_eval(shared)
+
     out = mx.zeros_like(h_latent)
-    expert_ids = sorted(groups)
-    positions_by_expert = {e: [pt for pt, _ in groups[e]] for e in expert_ids}
-    if iter_expert_batches is None:
+    if batches is None:
         experts = get_experts(layer, expert_ids, positions=positions_by_expert)
         batches = ((expert_ids, experts),)
-    else:
-        batches = iter_expert_batches(layer, expert_ids, positions=positions_by_expert)
 
     def consume_batch(batch_ids, experts):
         nonlocal out
@@ -509,7 +576,12 @@ def _kimi_moe_output(
                 out, w[f"{moe_prefix}.routed_expert_norm.weight"], cfg.rms_norm_eps)
         out = _linear(out, w, f"{moe_prefix}.routed_expert_up_proj")
 
-    return out + _kimi_dense_mlp(h, w, f"{moe_prefix}.shared_experts", cfg)
+    if shared is None:
+        shared = _kimi_dense_mlp(
+            h, w, f"{moe_prefix}.shared_experts", cfg)
+    else:
+        mx.eval(shared)
+    return out + shared
 
 
 def run_kimi_linear_block(
@@ -540,8 +612,120 @@ def run_kimi_linear_block(
     return x
 
 
-def _apply_attn_res(
-    prefix_sum: mx.array, block_residual: mx.array,
+_FUSED_ATTNRES_SOURCE = r"""
+    constexpr float NEG_INF = -3.402823466e+38f;
+
+    const uint row = threadgroup_position_in_grid.y;
+    const uint tid = thread_index_in_threadgroup;
+    const uint lane = thread_index_in_simdgroup;
+    const uint group = simdgroup_index_in_threadgroup;
+    const int blocks = counts[0];
+    const int sources = blocks + 1;
+    const float epsilon = eps[0];
+
+    threadgroup float partial_square[GROUPS];
+    threadgroup float partial_score[GROUPS];
+    threadgroup float logits[MAX_SOURCES];
+    threadgroup float probabilities[MAX_SOURCES];
+
+    // Moonshot/FLA's fused formulation: compute the RMS statistic and the
+    // learned scalar logit while each source row is resident in the kernel.
+    // A second source pass emits the weighted residual.  Keeping H/BCOUNT out
+    // of global float32 temporaries is the important Metal-memory property;
+    // caching every H-wide source in registers is not viable at K3 H=7168.
+    for (int source = 0; source < sources; ++source) {
+        float square = 0.0f;
+        float score = 0.0f;
+        for (uint dim = tid; dim < HIDDEN; dim += THREADS) {
+            const size_t index = source < blocks
+                ? ((size_t)row * blocks + source) * HIDDEN + dim
+                : (size_t)row * HIDDEN + dim;
+            const float value = source < blocks
+                ? static_cast<float>(residual[index])
+                : static_cast<float>(prefix[(size_t)row * HIDDEN + dim]);
+            square += value * value;
+            score += value
+                * static_cast<float>(norm_weight[dim])
+                * static_cast<float>(proj_weight[dim]);
+        }
+        square = simd_sum(square);
+        score = simd_sum(score);
+        if (lane == 0) {
+            partial_square[group] = square;
+            partial_score[group] = score;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (group == 0) {
+            const float square_part =
+                lane < GROUPS ? partial_square[lane] : 0.0f;
+            const float score_part =
+                lane < GROUPS ? partial_score[lane] : 0.0f;
+            const float square_sum = simd_sum(square_part);
+            const float score_sum = simd_sum(score_part);
+            if (lane == 0) {
+                logits[source] = score_sum * rsqrt(
+                    square_sum / static_cast<float>(HIDDEN) + epsilon
+                );
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    if (tid == 0) {
+        float maximum = NEG_INF;
+        for (int source = 0; source < sources; ++source) {
+            maximum = max(maximum, logits[source]);
+        }
+        float denominator = 0.0f;
+        for (int source = 0; source < sources; ++source) {
+            const float value = exp(logits[source] - maximum);
+            probabilities[source] = value;
+            denominator += value;
+        }
+        for (int source = 0; source < sources; ++source) {
+            probabilities[source] /= denominator;
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint dim = tid; dim < HIDDEN; dim += THREADS) {
+        float value = 0.0f;
+        for (int source = 0; source < sources; ++source) {
+            const size_t index = source < blocks
+                ? ((size_t)row * blocks + source) * HIDDEN + dim
+                : (size_t)row * HIDDEN + dim;
+            const float source_value = source < blocks
+                ? static_cast<float>(residual[index])
+                : static_cast<float>(prefix[(size_t)row * HIDDEN + dim]);
+            value += probabilities[source] * source_value;
+        }
+        out[(size_t)row * HIDDEN + dim] = static_cast<T>(value);
+    }
+"""
+
+
+@lru_cache(maxsize=1)
+def _fused_attnres_kernel():
+    if not mx.metal.is_available():
+        return None
+    return mx.fast.metal_kernel(
+        name="voom_kimi_k3_fused_attnres",
+        input_names=[
+            "prefix",
+            "residual",
+            "proj_weight",
+            "norm_weight",
+            "eps",
+            "counts",
+        ],
+        output_names=["out"],
+        source=_FUSED_ATTNRES_SOURCE,
+    )
+
+
+def _apply_attn_res_reference(
+    prefix_sum: mx.array, block_residual,
     proj_weight: mx.array, norm_weight: mx.array, eps: float,
 ) -> mx.array:
     """F128: Kimi K3's "Attention Residuals" (AttnRes, arXiv 2603.15031),
@@ -561,6 +745,15 @@ def _apply_attn_res(
     site only; every other call site always has num_blocks >= 1 by
     construction). Returns (N, hidden).
     """
+    if isinstance(block_residual, (list, tuple)):
+        block_residual = (
+            mx.stack(block_residual, axis=1)
+            if block_residual
+            else mx.zeros(
+                (prefix_sum.shape[0], 0, prefix_sum.shape[1]),
+                dtype=prefix_sum.dtype,
+            )
+        )
     v = mx.concatenate([block_residual, prefix_sum[:, None, :]], axis=1)
     v32 = v.astype(mx.float32)
     variance = mx.mean(v32 * v32, axis=-1, keepdims=True)
@@ -572,9 +765,197 @@ def _apply_attn_res(
     return out.astype(v.dtype)
 
 
+def _apply_attn_res_fused_tiled(
+    prefix_sum: mx.array,
+    block_residual,
+    proj_weight: mx.array,
+    norm_weight: mx.array,
+    eps: float,
+    tile_size: int,
+) -> mx.array:
+    """Bounded-memory MLX/Metal port of FLA's fused AttnRes forward.
+
+    One Metal threadgroup owns one position row and fuses RMS statistics,
+    learned logits, stable softmax, and residual mixing.  Position tiling
+    bounds command/lazy-graph lifetime and, crucially, never constructs the
+    composite path's ``(tile, sources, hidden)`` float32 ``v/k`` tensors.
+    """
+    kernel = _fused_attnres_kernel()
+    if kernel is None:
+        return _apply_attn_res_reference(
+            prefix_sum, block_residual, proj_weight, norm_weight, eps
+        )
+    if tile_size <= 0:
+        raise ValueError("fused AttnRes tile_size must be positive")
+    if prefix_sum.ndim != 2:
+        raise ValueError("fused AttnRes expects a rank-2 prefix")
+    rows, hidden = prefix_sum.shape
+    residual_list = (
+        list(block_residual)
+        if isinstance(block_residual, (list, tuple))
+        else None
+    )
+    if residual_list is None:
+        if block_residual.ndim != 3:
+            raise ValueError("fused AttnRes expects rank-3 residuals")
+        if (
+            block_residual.shape[0] != rows
+            or block_residual.shape[2] != hidden
+        ):
+            raise ValueError(
+                "fused AttnRes residual shape does not match prefix"
+            )
+        blocks = int(block_residual.shape[1])
+    else:
+        for residual in residual_list:
+            if residual.ndim != 2 or residual.shape != prefix_sum.shape:
+                raise ValueError(
+                    "fused AttnRes residual list does not match prefix"
+                )
+        blocks = len(residual_list)
+    if blocks + 1 > 16:
+        # K3 has far fewer residual sources, but keep arbitrary compatible
+        # models correct instead of indexing beyond fixed threadgroup storage.
+        return _apply_attn_res_reference(
+            prefix_sum, block_residual, proj_weight, norm_weight, eps
+        )
+    threads = min(
+        1024,
+        max(32, ((int(hidden) + 31) // 32) * 32),
+    )
+    groups = threads // 32
+    epsilon = mx.array([float(eps)], dtype=mx.float32)
+    counts = mx.array([blocks], dtype=mx.int32)
+    output = mx.zeros(prefix_sum.shape, dtype=prefix_sum.dtype)
+    mx.eval(output)
+    for start in range(0, rows, tile_size):
+        end = min(start + tile_size, rows)
+        prefix_tile = prefix_sum[start:end]
+        if residual_list is None:
+            residual_tile = block_residual[start:end]
+        elif residual_list:
+            # FLA's list-input/pointer-table idea expressed with MLX views:
+            # snapshots remain independent full-position buffers, while only
+            # this bounded tile is stacked into one contiguous kernel operand.
+            # This removes every full-context snapshot concatenation/copy.
+            residual_tile = mx.stack(
+                [value[start:end] for value in residual_list],
+                axis=1,
+            )
+        else:
+            residual_tile = mx.zeros(
+                (end - start, 0, hidden), dtype=prefix_sum.dtype
+            )
+        value = kernel(
+            inputs=[
+                prefix_tile,
+                residual_tile,
+                proj_weight.reshape(-1),
+                norm_weight.reshape(-1),
+                epsilon,
+                counts,
+            ],
+            template=[
+                ("T", prefix_sum.dtype),
+                ("HIDDEN", int(hidden)),
+                ("THREADS", threads),
+                ("GROUPS", groups),
+                ("MAX_SOURCES", 16),
+            ],
+            grid=(threads, end - start, 1),
+            threadgroup=(threads, 1, 1),
+            output_shapes=[(end - start, hidden)],
+            output_dtypes=[prefix_sum.dtype],
+        )[0]
+        mx.eval(value)
+        output[start:end] = value
+        mx.eval(output)
+    return output
+
+
+def _apply_attn_res(
+    prefix_sum: mx.array, block_residual,
+    proj_weight: mx.array, norm_weight: mx.array, eps: float,
+    *, fused_tile_size: int = 0,
+) -> mx.array:
+    if fused_tile_size:
+        return _apply_attn_res_fused_tiled(
+            prefix_sum,
+            block_residual,
+            proj_weight,
+            norm_weight,
+            eps,
+            fused_tile_size,
+        )
+    return _apply_attn_res_reference(
+        prefix_sum, block_residual, proj_weight, norm_weight, eps
+    )
+
+
+def attn_res_attention_input(
+    x: mx.array, block_residual, w: dict, prefix: str,
+    cfg: ModelConfig, layer: int, *, fused_tile_size: int = 0,
+) -> tuple[mx.array | None, mx.array, mx.array]:
+    """Apply AttnRes bookkeeping through the normalized attention input."""
+    B, L, H = x.shape
+    prefix_sum = x
+    hidden_states = x
+
+    block_count = (
+        len(block_residual)
+        if isinstance(block_residual, (list, tuple))
+        else block_residual.shape[1]
+    )
+    if block_count > 0:
+        hidden_states = _apply_attn_res(
+            prefix_sum.reshape(-1, H), block_residual,
+            w[f"{prefix}.self_attention_res_proj.weight"],
+            w[f"{prefix}.self_attention_res_norm.weight"], cfg.rms_norm_eps,
+            fused_tile_size=fused_tile_size,
+        ).reshape(B, L, H)
+
+    if layer % cfg.attn_res_block_size == 0:
+        snapshot = prefix_sum.reshape(-1, H)
+        if isinstance(block_residual, list):
+            block_residual.append(snapshot)
+        elif isinstance(block_residual, tuple):
+            block_residual = [*block_residual, snapshot]
+        else:
+            block_residual = mx.concatenate(
+                [block_residual, snapshot[:, None, :]], axis=1)
+        prefix_sum = None
+
+    attention_input = mx.fast.rms_norm(
+        hidden_states,
+        w[f"{prefix}.input_layernorm.weight"],
+        cfg.rms_norm_eps,
+    )
+    return prefix_sum, block_residual, attention_input
+
+
+def attn_res_mlp_input(
+    prefix_sum: mx.array, block_residual, w: dict,
+    prefix: str, cfg: ModelConfig, *, fused_tile_size: int = 0,
+) -> mx.array:
+    """Apply the post-attention AttnRes read and MLP normalization."""
+    B, L, H = prefix_sum.shape
+    hidden_states = _apply_attn_res(
+        prefix_sum.reshape(-1, H), block_residual,
+        w[f"{prefix}.mlp_res_proj.weight"],
+        w[f"{prefix}.mlp_res_norm.weight"], cfg.rms_norm_eps,
+        fused_tile_size=fused_tile_size,
+    ).reshape(B, L, H)
+    return mx.fast.rms_norm(
+        hidden_states,
+        w[f"{prefix}.post_attention_layernorm.weight"],
+        cfg.rms_norm_eps,
+    )
+
+
 def attn_res_wrap_layer(
-    x: mx.array, block_residual: mx.array, w: dict, prefix: str,
+    x: mx.array, block_residual, w: dict, prefix: str,
     cfg: ModelConfig, layer: int, attn_fn, mlp_fn,
+    *, fused_tile_size: int = 0,
 ) -> tuple[mx.array, mx.array]:
     """The AttnRes bookkeeping itself, ported verbatim from the real
     `KimiDecoderLayer._forward_attn_residual`'s control flow, factored out
@@ -593,43 +974,31 @@ def attn_res_wrap_layer(
     Returns `(new_prefix_sum, new_block_residual)`, both to be threaded
     into the next layer's call exactly like `x` itself already is.
     """
-    B, L, H = x.shape
-    prefix_sum = x
-    hidden_states = x
-
-    if block_residual.shape[1] > 0:
-        hidden_states = _apply_attn_res(
-            prefix_sum.reshape(-1, H), block_residual,
-            w[f"{prefix}.self_attention_res_proj.weight"],
-            w[f"{prefix}.self_attention_res_norm.weight"], cfg.rms_norm_eps,
-        ).reshape(B, L, H)
-
-    if layer % cfg.attn_res_block_size == 0:
-        block_residual = mx.concatenate(
-            [block_residual, prefix_sum.reshape(-1, H)[:, None, :]], axis=1)
-        prefix_sum = None
-
-    attn_out = attn_fn(mx.fast.rms_norm(
-        hidden_states, w[f"{prefix}.input_layernorm.weight"], cfg.rms_norm_eps))
+    prefix_sum, block_residual, attention_input = (
+        attn_res_attention_input(
+            x, block_residual, w, prefix, cfg, layer,
+            fused_tile_size=fused_tile_size,
+        )
+    )
+    attn_out = attn_fn(attention_input)
     prefix_sum = (prefix_sum + attn_out) if prefix_sum is not None else attn_out
 
-    hidden_states = _apply_attn_res(
-        prefix_sum.reshape(-1, H), block_residual,
-        w[f"{prefix}.mlp_res_proj.weight"],
-        w[f"{prefix}.mlp_res_norm.weight"], cfg.rms_norm_eps,
-    ).reshape(B, L, H)
-
-    mlp_out = mlp_fn(mx.fast.rms_norm(
-        hidden_states, w[f"{prefix}.post_attention_layernorm.weight"], cfg.rms_norm_eps))
+    mlp_out = mlp_fn(
+        attn_res_mlp_input(
+            prefix_sum, block_residual, w, prefix, cfg,
+            fused_tile_size=fused_tile_size,
+        )
+    )
     prefix_sum = prefix_sum + mlp_out
     return prefix_sum, block_residual
 
 
 def run_kimi_k3_block(
     x: mx.array, w: dict, prefix: str, cfg: ModelConfig, kv,
-    layer: int, offset: int, block_residual: mx.array, get_experts,
+    layer: int, offset: int, block_residual, get_experts,
     mlp_last_only: bool = False, iter_expert_batches=None,
     native_fused_decode: bool = False, profile=None, stat_collector=None,
+    fused_attnres_tile_size: int = 0,
 ) -> tuple[mx.array, mx.array]:
     """One Kimi K3 decoder block WITH AttnRes -- thin wrapper supplying the
     real KDA/MLA attention and dense/MoE MLP closures to
@@ -681,11 +1050,13 @@ def run_kimi_k3_block(
     # positions is a real, un-optimized cost here, not a correctness issue.
     del mlp_last_only
     return attn_res_wrap_layer(
-        x, block_residual, w, prefix, cfg, layer, attn_fn, mlp_fn)
+        x, block_residual, w, prefix, cfg, layer, attn_fn, mlp_fn,
+        fused_tile_size=fused_attnres_tile_size)
 
 
 def apply_output_attn_res(
-    x: mx.array, w: dict, block_residual: mx.array, cfg: ModelConfig,
+    x: mx.array, w: dict, block_residual, cfg: ModelConfig,
+    *, fused_tile_size: int = 0,
 ) -> mx.array:
     """The final AttnRes readout applied once after ALL layers (real
     `KimiLinearModel._apply_output_attn_res`), before the model's final
@@ -696,4 +1067,5 @@ def apply_output_attn_res(
         x.reshape(-1, H), block_residual,
         w["model.output_attn_res_proj.weight"],
         w["model.output_attn_res_norm.weight"], cfg.rms_norm_eps,
+        fused_tile_size=fused_tile_size,
     ).reshape(B, L, H)

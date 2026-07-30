@@ -8,11 +8,14 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import mlx.core as mx
 import pytest
 
 from runtime.resident_mlx_lm import (
     ResidentBackendDecision,
     _exact_extension_prefix,
+    _exact_prompt_cache_match,
+    _fork_prompt_cache,
     _prompt_cache_nbytes,
     _qwen35_request_incremental_bytes,
     choose_resident_backend,
@@ -150,6 +153,46 @@ def test_prompt_cache_reuse_requires_a_strict_exact_token_extension():
     assert _exact_extension_prefix([1, 2, 3], [1, 2, 3]) == 0
     assert _exact_extension_prefix([1, 2, 3], [1, 9, 3, 4]) == 0
     assert _exact_extension_prefix([], [1, 2]) == 0
+
+
+def test_prompt_endpoint_match_allows_only_exact_or_forward_extension():
+    assert _exact_prompt_cache_match([1, 2, 3], [1, 2, 3]) == (3, "exact")
+    assert _exact_prompt_cache_match(
+        [1, 2, 3], [1, 2, 3, 4]) == (3, "extension")
+    assert _exact_prompt_cache_match(
+        [1, 2, 3], [1, 2, 9, 4]) == (0, "miss")
+    assert _exact_prompt_cache_match(
+        [1, 2, 3], [1, 2]) == (0, "miss")
+    assert _exact_prompt_cache_match([], [1]) == (0, "miss")
+
+
+def test_prompt_cache_fork_copies_wrappers_but_shares_array_payloads():
+    class ArraysCache:
+        def __init__(self):
+            self.cache = [mx.array([1]), mx.array([2])]
+
+    class KVCache:
+        def __init__(self):
+            self.keys = mx.zeros((1, 1, 8, 2))
+            self.values = mx.zeros((1, 1, 8, 2))
+            self.offset = 3
+
+    recurrent = ArraysCache()
+    attention = KVCache()
+    forked_recurrent, forked_attention = _fork_prompt_cache(
+        [recurrent, attention])
+
+    assert forked_recurrent is not recurrent
+    assert forked_recurrent.cache is not recurrent.cache
+    assert forked_recurrent.cache[0] is recurrent.cache[0]
+    forked_recurrent.cache[0] = mx.array([9])
+    assert recurrent.cache[0].item() == 1
+
+    assert forked_attention is not attention
+    assert forked_attention.keys is attention.keys
+    assert forked_attention.values is attention.values
+    forked_attention.offset += 1
+    assert attention.offset == 3
 
 
 def test_engine_manager_returns_admitted_mlx_lm_backend_before_voom_load(

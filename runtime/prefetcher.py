@@ -21,7 +21,9 @@ class Prefetcher:
         workers=2 overlaps one thread's zstd decode with the other's disk read."""
         self.cache = cache
         self.page_size_hint = page_size_hint  # bytes; used for budget check before size is known
-        self._q: "queue.Queue[tuple[str, list[str]] | None]" = queue.Queue()
+        self._q: "queue.Queue[tuple[str, list[str], int] | None]" = (
+            queue.Queue()
+        )
         self._scheduled: set[str] = set()
         self._lock = threading.Lock()
         self.scheduled_count = 0
@@ -33,7 +35,14 @@ class Prefetcher:
         for w in self._workers:
             w.start()
 
-    def schedule(self, key: str, names: list[str], *, only_if_idle: bool = False) -> bool:
+    def schedule(
+        self,
+        key: str,
+        names: list[str],
+        *,
+        only_if_idle: bool = False,
+        page_size_hint: int | None = None,
+    ) -> bool:
         """Schedule one hint and report whether it was accepted.
 
         ``only_if_idle`` is for speculative expert traffic.  Existing queued or
@@ -54,12 +63,17 @@ class Prefetcher:
                 return False
             if self.cache.contains(key) or self.cache.inflight(key):
                 return False
-            if not self.cache.would_fit(self.page_size_hint):
+            hint = (
+                self.page_size_hint
+                if page_size_hint is None
+                else max(0, int(page_size_hint))
+            )
+            if not self.cache.would_fit(hint):
                 self.skipped_budget += 1
                 return False
             self._scheduled.add(key)
             self.scheduled_count += 1
-        self._q.put((key, names))
+        self._q.put((key, names, hint))
         return True
 
     def _run(self):
@@ -67,10 +81,18 @@ class Prefetcher:
             item = self._q.get()
             if item is None:
                 return
-            key, names = item
+            key, names, hint = item
             try:
-                if not self._closing.is_set():
+                # The live governor can shrink the cache after enqueue. Recheck
+                # at materialization so an oversized page is never fetched only
+                # to be evicted before its authoritative demand.
+                if (
+                    not self._closing.is_set()
+                    and self.cache.would_fit(hint)
+                ):
                     self.cache.get(key, names, origin="prefetch")
+                else:
+                    self.skipped_budget += 1
             except Exception:
                 pass  # demand path will retry and surface the real error
             finally:
@@ -87,7 +109,7 @@ class Prefetcher:
             except queue.Empty:
                 break
             if item is not None:
-                key, _ = item
+                key, _, _ = item
                 with self._lock:
                     self._scheduled.discard(key)
         for _ in self._workers:

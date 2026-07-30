@@ -89,6 +89,69 @@ def test_compressed_mla_keeps_axis_one_semantics():
     assert combined.reshape(-1).tolist() == list(range(9))
 
 
+def test_stepped_compressed_mla_grows_without_per_append_concat():
+    cache = SteppedKVCache(1)
+    cache.compressed_mla = True
+    first = mx.arange(cache.step * 3).reshape(1, cache.step, 3)
+    combined = cache.update_latent(0, first)
+    mx.eval(combined)
+    original = cache.keys[0]
+
+    tail = mx.arange(9).reshape(1, 3, 3) + first.size
+    combined = cache.update_latent(0, tail)
+    mx.eval(combined)
+
+    assert cache.keys[0] is not original
+    assert cache.offset == cache.step + 3
+    assert cache.keys[0].shape == (1, cache.step * 2, 3)
+    assert combined.reshape(-1).tolist() == list(
+        range((cache.step + 3) * 3)
+    )
+    assert cache.nbytes() == combined.nbytes
+    assert cache.allocated_nbytes() == cache.keys[0].nbytes
+
+
+def test_stepped_compressed_mla_reuses_capacity_and_trims_axis_one():
+    cache = SteppedKVCache(1)
+    cache.compressed_mla = True
+    first = mx.arange(12).reshape(1, 4, 3)
+    cache.update_latent(0, first)
+    mx.eval(cache.keys[0])
+    backing = cache.keys[0]
+
+    combined = cache.update_latent(
+        0, mx.arange(6).reshape(1, 2, 3) + 12
+    )
+    mx.eval(combined)
+    assert cache.keys[0] is backing
+    assert cache.offset == 6
+    assert combined.reshape(-1).tolist() == list(range(18))
+
+    cache.trim(3)
+    assert cache.offset == 3
+    assert cache.keys[0].shape == (1, 3, 3)
+    assert cache.values[0] is None
+    assert cache.keys[0].reshape(-1).tolist() == list(range(9))
+
+
+def test_from_cache_converts_compressed_mla_and_preserves_policy():
+    plain = KVCache(1)
+    plain.compressed_mla = True
+    plain.mla_absorbed = True
+    plain.mla_absorbed_prefill = True
+    plain.mla_absorbed_key_tile_size = 17
+    plain.update_latent(0, mx.arange(12).reshape(1, 4, 3))
+
+    stepped = SteppedKVCache.from_cache(plain)
+
+    assert isinstance(stepped, SteppedKVCache)
+    assert stepped.compressed_mla is True
+    assert stepped.offset == 4
+    assert stepped.mla_absorbed is True
+    assert stepped.mla_absorbed_prefill is True
+    assert stepped.mla_absorbed_key_tile_size == 17
+
+
 def test_dense_trim_uses_one_barrier_for_every_layer(monkeypatch):
     cache = KVCache(4)
     for layer in range(4):

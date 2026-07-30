@@ -11,6 +11,8 @@ import time
 from types import SimpleNamespace
 from pathlib import Path
 
+import pytest
+
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from runtime.server import (Handler, INFER_LOCK, PreparedPrompt, PriorityLock, RequestValidationError,
@@ -21,6 +23,8 @@ from runtime.server import (Handler, INFER_LOCK, PreparedPrompt, PriorityLock, R
                             _execution_profile_fields,
                             _fast_dense_resident_kv_projection,
                             _hidden_gateway_catalogs,
+                            _hidden_gateway_abstention_policy,
+                            _hidden_gateway_execution_abstention_policy,
                             _hidden_gateway_activation_clear,
                             _hidden_gateway_activation_get,
                             _hidden_gateway_activation_put,
@@ -34,6 +38,7 @@ from runtime.server import (Handler, INFER_LOCK, PreparedPrompt, PriorityLock, R
                             _HiddenDecisionStream,
                             _hidden_gateway_decision_choice,
                             _hidden_gateway_force_reason,
+                            _hidden_gateway_semantic_query,
                             _hidden_gateway_search_result_limit,
                             _hidden_tool_gateway_enabled,
                             _hidden_tool_abstain_pair,
@@ -873,6 +878,33 @@ def test_hidden_tool_gateway_starts_virtual_only_then_retrieves_real_tools():
         assert not _hidden_tool_gateway_enabled("fast", len(tools), "specific:browser_open")
 
 
+def test_hidden_gateway_abstention_defaults_safe_and_real_tool_mode_is_explicit():
+    assert _hidden_gateway_abstention_policy("auto") == (
+        True, "auto-safe-abstention")
+    assert _hidden_gateway_abstention_policy("1") == (
+        True, "operator-enabled")
+    assert _hidden_gateway_abstention_policy("0") == (
+        False, "operator-required-real-tool")
+    with pytest.raises(ValueError, match="must be auto, 0, or 1"):
+        _hidden_gateway_abstention_policy("required")
+
+
+def test_required_real_tool_mode_applies_only_to_forced_external_actions():
+    assert _hidden_gateway_execution_abstention_policy(
+        False, "operator-required-real-tool",
+        "external-action-imperative",
+    ) == (
+        False,
+        "operator-required-real-tool:external-action-imperative",
+    )
+    assert _hidden_gateway_execution_abstention_policy(
+        False, "operator-required-real-tool", None,
+    ) == (True, "unforced-search-safety-fallback")
+    assert _hidden_gateway_execution_abstention_policy(
+        True, "auto-safe-abstention", "external-action-imperative",
+    ) == (True, "auto-safe-abstention")
+
+
 def test_plex_transcript_keeps_fixed_decision_catalog_and_pinned_execution_set():
     """Regression for the user's real 2026-07-19 Plex pagination transcript."""
     from unittest.mock import patch
@@ -1215,6 +1247,27 @@ def test_hidden_gateway_forces_confirmed_deferred_action_but_not_bare_ack():
     ]) is None
 
 
+def test_confirmed_action_query_uses_prior_intent_not_bare_ack():
+    messages = [
+        {"role": "user", "content": "Which workspace directory is largest?"},
+        {
+            "role": "assistant",
+            "content": "I'll run a shell command to inspect directory sizes.",
+        },
+        {"role": "user", "content": "do it"},
+    ]
+    query, profile = _hidden_gateway_semantic_query(
+        messages, "confirmed-deferred-action")
+    assert profile == "confirmed-action-context"
+    assert "directory" in query
+    assert "command" in query
+    assert query != "do it"
+
+    latest, latest_profile = _hidden_gateway_semantic_query(messages, None)
+    assert latest_profile == "latest-user-intent"
+    assert latest == "do it"
+
+
 def test_hidden_gateway_does_not_force_again_after_tool_result():
     assert _hidden_gateway_force_reason([
         {"role": "user", "content": "What folder are we in?"},
@@ -1459,6 +1512,190 @@ def test_k25_lossless_uses_demand_paging_without_speculative_prefetch():
     assert rc.stream_lm_head
     assert not rc.pin_lm_head
     assert rc.quant_bits == 0
+
+
+def test_k3_native_profile_uses_proven_layer_stationary_prefetch_schedule():
+    from unittest.mock import patch
+
+    from runtime.server import EngineManager
+
+    captured = []
+
+    class FakeEngine:
+        def __init__(self, _path, rc):
+            captured.append(rc)
+
+        def close(self):
+            pass
+
+    cfg = SimpleNamespace(
+        model_type="kimi_k3", tie_word_embeddings=False,
+        index_topk=0, vision_config=None)
+    with patch.dict(
+            "os.environ", {
+                "VMODEL_CT_MXFP4_NATIVE": "1",
+                "VMODEL_EXPERT_BATCH_PREFETCH": "1",
+                "VMODEL_K3_SCALE_SIDECAR_DIR": "/tmp/k3-scales",
+            }), \
+         patch("runtime.config.ModelConfig.from_dir", return_value=cfg), \
+         patch("runtime.path_resolver.resolve_model_dir",
+               side_effect=lambda path: path), \
+         patch("runtime.engine.StreamingEngine", FakeEngine):
+        EngineManager().get(Path("/tmp/fake-k3"), "lossless")
+
+    rc = captured[0]
+    assert rc.native_ct_mxfp4
+    assert rc.kimi_k3_scale_sidecar_dir == "/tmp/k3-scales"
+    assert rc.layer_stationary_prefill
+    assert rc.prefill_chunk_size == 1
+    assert rc.max_weight_cache_mb == 3000
+    assert rc.min_weight_cache_mb == 150
+    assert rc.prefetch_depth == 1
+    assert rc.prefetch_workers == 1
+    assert rc.expert_batch_prefetch
+    assert rc.prompt_kv_dir == ""
+    assert rc.stream_lm_head
+    assert not rc.pin_lm_head
+
+
+def test_k3_long_context_math_candidates_are_explicit_and_forwarded():
+    from unittest.mock import patch
+
+    from runtime.server import EngineManager
+
+    captured = []
+
+    class FakeEngine:
+        def __init__(self, _path, rc):
+            captured.append(rc)
+
+        def close(self):
+            pass
+
+    cfg = SimpleNamespace(
+        model_type="kimi_k3",
+        tie_word_embeddings=False,
+        index_topk=0,
+        vision_config=None,
+    )
+    with patch.dict(
+        "os.environ",
+        {
+            "VMODEL_K3_COMPRESSED_MLA": "1",
+            "VMODEL_K3_ABSORBED_MLA": "1",
+            "VMODEL_K3_MLA_KEY_TILE_SIZE": "1024",
+            "VMODEL_K3_FUSED_ATTNRES_TILE_SIZE": "128",
+            "VMODEL_K3_DENSE_MLP_TILE_SIZE": "256",
+            "VMODEL_K3_PREFILL_TILE_WIDTH": "256",
+        },
+        clear=True,
+    ), patch(
+        "runtime.config.ModelConfig.from_dir", return_value=cfg
+    ), patch(
+        "runtime.path_resolver.resolve_model_dir",
+        side_effect=lambda path: path,
+    ), patch(
+        "runtime.engine.StreamingEngine", FakeEngine
+    ):
+        EngineManager().get(Path("/tmp/fake-k3"), "lossless")
+
+    rc = captured[0]
+    assert rc.kimi_k3_compressed_mla
+    assert rc.kimi_k3_absorbed_mla
+    assert rc.kimi_k3_mla_key_tile_size == 1024
+    assert rc.kimi_k3_fused_attnres_tile_size == 128
+    assert rc.kimi_k3_dense_mlp_tile_size == 256
+    assert rc.prefill_chunk_size == 256
+
+
+def test_k3_absorbed_mla_requires_compressed_mla():
+    from unittest.mock import patch
+
+    from runtime.server import EngineManager, RequestValidationError
+
+    with patch.dict(
+        "os.environ",
+        {"VMODEL_K3_ABSORBED_MLA": "1"},
+        clear=True,
+    ):
+        with pytest.raises(
+            RequestValidationError,
+            match="requires VMODEL_K3_COMPRESSED_MLA=1",
+        ):
+            EngineManager().get(Path("/tmp/fake-k3"), "lossless")
+
+
+def test_k3_scale_sidecar_server_setting_requires_native_mxfp4():
+    from unittest.mock import patch
+
+    from runtime.server import EngineManager, RequestValidationError
+
+    with patch.dict(
+        "os.environ",
+        {
+            "VMODEL_CT_MXFP4_NATIVE": "0",
+            "VMODEL_K3_SCALE_SIDECAR_DIR": "/tmp/k3-scales",
+        },
+        clear=True,
+    ):
+        with pytest.raises(
+            RequestValidationError, match="requires VMODEL_CT_MXFP4_NATIVE=1"
+        ):
+            EngineManager().get(Path("/tmp/fake-k3"), "lossless")
+
+
+def test_k3_nf12_uncached_profile_is_explicit_and_carried_to_runtime():
+    from unittest.mock import patch
+
+    from runtime.server import EngineManager
+
+    captured = []
+
+    class FakeEngine:
+        def __init__(self, _path, rc):
+            captured.append(rc)
+
+        def close(self):
+            pass
+
+    cfg = SimpleNamespace(
+        model_type="kimi_k3", tie_word_embeddings=False,
+        index_topk=0, vision_config=None)
+    with patch.dict(
+            "os.environ", {
+                "VMODEL_CT_MXFP4_NATIVE": "1",
+                "VMODEL_K3_NF12_SIDECAR_DIR": "/tmp/k3-nf12",
+                "VMODEL_K3_NF12_UNCACHED": "1",
+            }, clear=True), \
+         patch("runtime.config.ModelConfig.from_dir", return_value=cfg), \
+         patch("runtime.path_resolver.resolve_model_dir",
+               side_effect=lambda path: path), \
+         patch("runtime.engine.StreamingEngine", FakeEngine):
+        EngineManager().get(Path("/tmp/fake-k3"), "lossless")
+
+    rc = captured[0]
+    assert rc.bf16_nf12_sidecar_dir == "/tmp/k3-nf12"
+    assert rc.bf16_nf12_uncached_reads
+
+
+def test_k3_nf12_uncached_setting_requires_sidecar():
+    from unittest.mock import patch
+
+    from runtime.server import EngineManager, RequestValidationError
+
+    with patch.dict(
+        "os.environ",
+        {
+            "VMODEL_CT_MXFP4_NATIVE": "1",
+            "VMODEL_K3_NF12_UNCACHED": "1",
+        },
+        clear=True,
+    ):
+        with pytest.raises(
+            RequestValidationError,
+            match="requires VMODEL_K3_NF12_SIDECAR_DIR",
+        ):
+            EngineManager().get(Path("/tmp/fake-k3"), "lossless")
 
 
 def test_qwen36_profiles_bound_experts_and_use_hybrid_endpoint_cache():
@@ -2929,6 +3166,24 @@ def test_execution_profile_discloses_olmoe_top_k_schedule(tmp_path):
         "released+olmoe-topk-7.7.8.8")
 
 
+def test_execution_profile_discloses_native_compressed_tensors_mxfp4(tmp_path):
+    (tmp_path / "config.json").write_text("{}")
+    engine = SimpleNamespace(
+        _model_dir=tmp_path,
+        store=SimpleNamespace(quantization={}, on_disk_quantized=False),
+        rc=SimpleNamespace(
+            quant_bits=0,
+            rerank_lm_head=False,
+            resident_attention_mode="",
+            expert_top_k_by_layer=(),
+            native_ct_mxfp4=True,
+        ),
+    )
+
+    assert _execution_profile_fields(engine)["vmodel_weight_profile"] == (
+        "released+ct-mxfp4-native")
+
+
 def test_mxfp8_olmoe_profile_gets_resident_admission_budget(tmp_path):
     from unittest.mock import patch
 
@@ -3209,6 +3464,88 @@ def test_resident_adjusted_transient_excludes_persistent_cache_growth():
         1_280, 400_000_000)
 
 
+def test_layer_transient_isolated_by_architecture_signature():
+    """A dense-layer outlier must not poison an adjacent routed MoE reserve."""
+    from types import SimpleNamespace
+
+    from runtime.engine import StreamingEngine
+
+    engine = object.__new__(StreamingEngine)
+    engine.cfg = SimpleNamespace(
+        model_type="synthetic_hybrid",
+        layer_types=(),
+        kda_layers=(0, 1, 2),
+        full_attn_layers=(),
+        indexer_types=(),
+        num_experts=256,
+        mlp_layer_types=(),
+        first_k_dense_replace=1,
+    )
+    engine._layer_transient = 0
+    engine._prefill_layer_transient = 0
+    engine._prefill_layer_transient_by_positions = {}
+    engine._decode_layer_transient = 0
+    engine._layer_transient_by_signature = {}
+    engine._layer_transient_margin = 0
+
+    # The first layer uses a large dense MLP; following layers use routed MoE.
+    StreamingEngine._record_layer_transient(
+        engine, 1, 0, 3_200_000_000)
+    assert StreamingEngine._select_layer_transient(engine, 1, 1) == 0
+
+    # Once one MoE layer has been measured, another layer with the same
+    # architecture signature reuses that narrower observation.
+    StreamingEngine._record_layer_transient(engine, 1, 1, 125_000_000)
+    assert StreamingEngine._select_layer_transient(
+        engine, 1, 2) == 125_000_000
+
+    # Request-level admission remains conservative and sees the aggregate.
+    assert StreamingEngine._restore_aggregate_layer_transient(
+        engine, 1) == 3_200_000_000
+
+
+def test_layer_transient_drops_one_time_signature_warmup_peak():
+    from types import SimpleNamespace
+
+    from runtime.engine import StreamingEngine
+
+    engine = object.__new__(StreamingEngine)
+    engine.cfg = SimpleNamespace(
+        model_type="synthetic_moe",
+        layer_types=(),
+        kda_layers=(0, 1, 2, 3),
+        full_attn_layers=(),
+        indexer_types=(),
+        num_experts=256,
+        mlp_layer_types=(),
+        first_k_dense_replace=0,
+    )
+    engine._layer_transient = 0
+    engine._prefill_layer_transient = 0
+    engine._prefill_layer_transient_by_positions = {}
+    engine._decode_layer_transient = 0
+    engine._layer_transient_by_signature = {}
+    engine._layer_transient_observation_counts = {}
+    engine._layer_transient_recurring_max = {}
+    engine._layer_transient_margin = 0
+
+    StreamingEngine._record_layer_transient(
+        engine, 5, 0, 3_200_000_000)
+    assert StreamingEngine._select_layer_transient(
+        engine, 5, 1) == 3_200_000_000
+
+    # The second execution establishes the recurring high-water; later
+    # recurring increases remain monotonic and therefore fail closed.
+    StreamingEngine._record_layer_transient(
+        engine, 5, 1, 900_000_000)
+    assert StreamingEngine._select_layer_transient(
+        engine, 5, 2) == 900_000_000
+    StreamingEngine._record_layer_transient(
+        engine, 5, 2, 1_200_000_000)
+    assert StreamingEngine._select_layer_transient(
+        engine, 5, 3) == 1_200_000_000
+
+
 def test_cache_io_delta_reports_only_current_request():
     from types import SimpleNamespace
 
@@ -3216,10 +3553,15 @@ def test_cache_io_delta_reports_only_current_request():
 
     cache_stats = SimpleNamespace(
         hits=10, misses=20, evictions=3, bytes_read=1_000)
+    store_stages = [1_000, 2, 3_000, 4_000]
+    scale_stages = [5_000, 6_000, 7_000, 8]
     engine = SimpleNamespace(
         cache=SimpleNamespace(
             stats=cache_stats, total_bytes=400, max_bytes=800),
-        store=SimpleNamespace(fast_tier_bytes=100, archive_bytes=900),
+        store=SimpleNamespace(
+            fast_tier_bytes=100, archive_bytes=900,
+            stage_snapshot=lambda: tuple(store_stages),
+            k3_scale_sidecar_snapshot=lambda: tuple(scale_stages)),
         governor=SimpleNamespace(reservations=2, reservation_failures=1),
         expert_hits=4, expert_misses=5,
         _layer_transient=60, _token_transient=70,
@@ -3234,6 +3576,14 @@ def test_cache_io_delta_reports_only_current_request():
     engine.governor.reservations += 8
     engine.store.fast_tier_bytes += 9
     engine.store.archive_bytes += 10
+    store_stages[0] += 11
+    store_stages[1] += 12
+    store_stages[2] += 13
+    store_stages[3] += 14
+    scale_stages[0] += 15
+    scale_stages[1] += 16
+    scale_stages[2] += 17
+    scale_stages[3] += 18
     stats = {}
     _record_cache_io_delta(engine, before, stats)
 
@@ -3246,6 +3596,14 @@ def test_cache_io_delta_reports_only_current_request():
     assert stats["governor_reservations"] == 8
     assert stats["weight_fast_tier_bytes"] == 9
     assert stats["weight_archive_bytes"] == 10
+    assert stats["ct_mxfp4_transform_ns"] == 11
+    assert stats["ct_mxfp4_transform_calls"] == 12
+    assert stats["ct_mxfp4_input_bytes"] == 13
+    assert stats["ct_mxfp4_resident_bytes"] == 14
+    assert stats["k3_scale_sidecar_read_bytes"] == 15
+    assert stats["k3_scale_sidecar_output_bytes"] == 16
+    assert stats["k3_scale_sidecar_decode_ns"] == 17
+    assert stats["k3_scale_sidecar_decode_calls"] == 18
     assert stats["weight_cache_resident_bytes"] == 400
     assert stats["layer_transient_bytes"] == 60
 

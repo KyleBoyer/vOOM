@@ -15,6 +15,7 @@ the concurrent ThreadPoolExecutor path.
 from __future__ import annotations
 
 from pathlib import Path
+import json
 
 import mlx.core as mx
 import pytest
@@ -34,6 +35,95 @@ _fast_tier_skip = pytest.mark.skipif(
     reason="Kimi-K3 fast tier is not staged locally "
            "(run formats/kimi_k3_fast_tier.py first)",
 )
+
+
+def test_k3_fast_tier_budget_fails_before_writing(tmp_path):
+    from formats.kimi_k3_fast_tier import build_fast_tier
+
+    model_dir = tmp_path / "model"
+    model_dir.mkdir()
+    shard = model_dir / "model-00001-of-00001.safetensors"
+    name = "language_model.model.layers.0.self_attn.q_proj.weight"
+    mx.save_safetensors(
+        str(shard), {name: mx.ones((8, 8), dtype=mx.bfloat16)})
+    (model_dir / "model.safetensors.index.json").write_text(json.dumps({
+        "weight_map": {name: shard.name},
+    }))
+    target_root = tmp_path / "fast"
+
+    with pytest.raises(ValueError, match="no files were written"):
+        build_fast_tier(
+            model_dir, target_root, max_bytes=1)
+    assert not (target_root / model_dir.name).exists()
+
+
+def test_budgeted_selection_balances_layers():
+    from formats.kimi_k3_fast_tier import _select_budgeted
+
+    candidates = [
+        {
+            "name": f"model.layers.{layer}.tensor.{index}",
+            "shard": f"{layer}.safetensors",
+            "offset": index * 60,
+            "nbytes": size,
+        }
+        for layer in (0, 1)
+        for index, size in enumerate((60, 40))
+    ]
+    selected = _select_budgeted(candidates, 120)
+    selected_by_layer = {
+        layer: sum(
+            item["nbytes"]
+            for item in selected
+            if f"layers.{layer}." in item["name"]
+        )
+        for layer in (0, 1)
+    }
+    assert selected_by_layer == {0: 60, 1: 60}
+
+
+def test_fast_tier_packs_selected_tensors_per_shard(tmp_path):
+    from formats.kimi_k3_fast_tier import build_fast_tier
+
+    model_dir = tmp_path / "model"
+    model_dir.mkdir()
+    shard = model_dir / "model-00001-of-00001.safetensors"
+    names = [
+        "language_model.model.layers.0.self_attn.q_proj.weight",
+        "language_model.model.layers.0.self_attn.k_proj.weight",
+    ]
+    mx.save_safetensors(
+        str(shard),
+        {
+            names[0]: mx.arange(64, dtype=mx.uint8),
+            names[1]: mx.arange(64, dtype=mx.uint8) + 1,
+        },
+    )
+    (model_dir / "model.safetensors.index.json").write_text(json.dumps({
+        "weight_map": {name: shard.name for name in names},
+    }))
+    fast_root = tmp_path / "fast"
+
+    report = build_fast_tier(
+        model_dir, fast_root, max_bytes=3_000_000,
+        min_free_bytes=0, container_format="safetensors",
+    )
+    target = fast_root / model_dir.name
+    manifest = json.loads(
+        (target / "fast_tier_manifest.json").read_text()
+    )
+    entries = list(manifest.values())
+
+    assert report["selected_tensors"] == 2
+    assert len({entry["file"] for entry in entries}) == 1
+    assert sorted(entry["offset"] for entry in entries) == [0, 64]
+    containers = list(target.glob("*.safetensors"))
+    assert len(containers) == 1
+    packed = mx.load(str(containers[0]))
+    for raw_name in names:
+        canonical = raw_name.removeprefix("language_model.")
+        mx.eval(packed[canonical])
+        assert packed[canonical].shape == (64,)
 
 
 @_model_skip
@@ -82,11 +172,18 @@ def test_mixed_fast_and_slow_tier_fetch_matches_slow_only():
     out_slow, _elapsed, _nbytes = store_slow.fetch([fast_name, slow_name])
     mx.eval(out_slow[fast_name], out_slow[slow_name])
 
-    store_mixed = WeightStore(MODEL_DIR, fast_dirs=[FAST_ROOT])
+    store_mixed = WeightStore(
+        MODEL_DIR,
+        fast_dirs=[FAST_ROOT],
+        parallel_storage_reads=True,
+    )
     out_mixed, _elapsed, _nbytes = store_mixed.fetch([fast_name, slow_name])
     mx.eval(out_mixed[fast_name], out_mixed[slow_name])
 
     assert store_mixed.fast_tier_tensors == 1
+    assert store_mixed.parallel_tier_fetches == 1
+    assert store_mixed.parallel_tier_fast_bytes > 0
+    assert store_mixed.parallel_tier_archive_bytes > 0
 
     for key in (fast_name, slow_name):
         a, b = out_slow[key], out_mixed[key]

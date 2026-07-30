@@ -15,6 +15,7 @@ prefetch:
 
 from __future__ import annotations
 
+import concurrent.futures as cf
 import time
 import math
 from dataclasses import dataclass, field
@@ -100,6 +101,48 @@ def hybrid_min_weight_cache_floor_mb(available_bytes: int) -> int:
     return 64
 
 
+def compact_expert_io_batch_size(
+        page_bytes: int, cache_bytes: int, *,
+        target_bytes: int = 268_435_456, max_batch: int = 16) -> int:
+    """Choose a bounded I/O coalescing batch from representation byte size.
+
+    The old fail-closed MoE default fetched one expert at a time. That was
+    necessary for ~75 MB BF16 expert pages, but it needlessly turns a native
+    compact checkpoint into hundreds of small ``store.fetch`` transactions.
+    Pick the smallest integer batch whose payload reaches a useful coalescing
+    target, while limiting that target to one eighth of the configured
+    weight-cache budget and retaining a hard page-count ceiling.
+
+    With page size ``P`` and byte goal
+    ``G = max(P, min(target, cache/8))``, ``B = ceil(G/P)`` gives
+    ``G <= B*P < G+P`` before the page-count cap. The existing live governor
+    remains authoritative and may reduce ``B`` further at every compute batch;
+    this helper only raises the attempted ceiling when the checkpoint already
+    stores the expert in a compact native representation.
+    """
+    page_bytes = int(page_bytes)
+    cache_bytes = int(cache_bytes)
+    target_bytes = int(target_bytes)
+    max_batch = int(max_batch)
+    if page_bytes <= 0:
+        raise ValueError("page_bytes must be positive")
+    if cache_bytes < 0:
+        raise ValueError("cache_bytes must be non-negative")
+    if target_bytes <= 0:
+        raise ValueError("target_bytes must be positive")
+    if max_batch <= 0:
+        raise ValueError("max_batch must be positive")
+
+    byte_goal = max(
+        page_bytes,
+        min(target_bytes, cache_bytes // 8),
+    )
+    return min(
+        max_batch,
+        max(1, (byte_goal + page_bytes - 1) // page_bytes),
+    )
+
+
 def _resident_adjusted_transient(
     start_active: int, end_active: int, peak_active: int,
 ) -> int:
@@ -147,6 +190,19 @@ def _cache_io_snapshot(engine) -> tuple[int, ...]:
     """Cumulative counters used to derive one request's physical work."""
     stats = engine.cache.stats
     governor = getattr(engine, "governor", None)
+    stage_snapshot = getattr(engine.store, "stage_snapshot", None)
+    store_stages = (
+        stage_snapshot() if callable(stage_snapshot) else (0, 0, 0, 0))
+    scale_snapshot = getattr(
+        engine.store, "k3_scale_sidecar_snapshot", None
+    )
+    scale_stages = (
+        scale_snapshot() if callable(scale_snapshot) else (0, 0, 0, 0)
+    )
+    nf12_snapshot = getattr(engine.store, "bf16_nf12_snapshot", None)
+    nf12_stages = (
+        nf12_snapshot() if callable(nf12_snapshot) else (0, 0, 0, 0)
+    )
     return (
         int(stats.hits), int(stats.misses), int(stats.evictions),
         int(stats.bytes_read), int(engine.expert_hits),
@@ -163,6 +219,9 @@ def _cache_io_snapshot(engine) -> tuple[int, ...]:
         int(getattr(engine.store, "parallel_tier_fetches", 0) or 0),
         int(getattr(engine.store, "parallel_tier_fast_bytes", 0) or 0),
         int(getattr(engine.store, "parallel_tier_archive_bytes", 0) or 0),
+        *store_stages,
+        *scale_stages,
+        *nf12_stages,
     )
 
 
@@ -183,6 +242,12 @@ def _record_cache_io_delta(
         "weight_fast_tier_bytes", "weight_archive_bytes",
         "parallel_tier_fetches", "parallel_tier_fast_bytes",
         "parallel_tier_archive_bytes",
+        "ct_mxfp4_transform_ns", "ct_mxfp4_transform_calls",
+        "ct_mxfp4_input_bytes", "ct_mxfp4_resident_bytes",
+        "k3_scale_sidecar_read_bytes", "k3_scale_sidecar_output_bytes",
+        "k3_scale_sidecar_decode_ns", "k3_scale_sidecar_decode_calls",
+        "bf16_nf12_read_bytes", "bf16_nf12_output_bytes",
+        "bf16_nf12_decode_ns", "bf16_nf12_decode_calls",
     )
     for key, start, end in zip(keys, before, after, strict=True):
         stats[prefix + key] = max(0, end - start)
@@ -230,7 +295,74 @@ def _quantization_cache_identity(rc: "RuntimeConfig", store) -> str:
     if rc.expert_top_k_by_layer:
         identity += "+olmoe-topk-" + ".".join(
             str(top_k) for top_k in rc.expert_top_k_by_layer)
+    if getattr(rc, "native_ct_mxfp4", False):
+        identity += "+ct-mxfp4-native"
     return identity
+
+
+def expert_route_overlap_summary(
+    positions_by_expert: dict[int, list[int]],
+    previous_route: tuple[int, ...] | None = None,
+) -> tuple[dict[str, int], tuple[int, ...]]:
+    """Summarize route union growth and adjacent-position reuse.
+
+    The input already exists after authoritative routing. No expert is
+    predicted and no model decision changes. ``previous_route`` is the last
+    committed position for this same layer from the prior sweep, so the
+    boundary pair is the exact quantity a one-token warm expert cache could
+    reuse.
+    """
+    routes: dict[int, set[int]] = {}
+    for expert, positions in positions_by_expert.items():
+        for position in positions:
+            routes.setdefault(int(position), set()).add(int(expert))
+    ordered = [routes[position] for position in sorted(routes)]
+    if not ordered:
+        raise ValueError("expert route overlap requires at least one position")
+
+    union = set().union(*ordered)
+    selected_slots = sum(len(route) for route in ordered)
+    adjacent_intersection = 0
+    adjacent_union = 0
+    adjacent_current = 0
+    exact_pairs = 0
+    within_pairs = 0
+    cross_pairs = 0
+    cross_intersection = 0
+    cross_current = 0
+
+    previous = set(previous_route) if previous_route is not None else None
+    for index, current in enumerate(ordered):
+        if previous is not None:
+            intersection = len(previous & current)
+            adjacent_intersection += intersection
+            adjacent_union += len(previous | current)
+            adjacent_current += len(current)
+            exact_pairs += int(previous == current)
+            if index == 0:
+                cross_pairs = 1
+                cross_intersection = intersection
+                cross_current = len(current)
+            else:
+                within_pairs += 1
+        previous = current
+
+    summary = {
+        "calls": 1,
+        "positions": len(ordered),
+        "selected_slots": selected_slots,
+        "union_experts": len(union),
+        "adjacent_pairs": within_pairs + cross_pairs,
+        "within_call_pairs": within_pairs,
+        "cross_call_pairs": cross_pairs,
+        "adjacent_intersection_experts": adjacent_intersection,
+        "adjacent_union_experts": adjacent_union,
+        "adjacent_current_experts": adjacent_current,
+        "exact_adjacent_pairs": exact_pairs,
+        "cross_call_intersection_experts": cross_intersection,
+        "cross_call_current_experts": cross_current,
+    }
+    return summary, tuple(sorted(ordered[-1]))
 
 
 def _system_allocation_preserves_floor(
@@ -262,6 +394,26 @@ class RuntimeConfig:
     # runtime's existing materialization boundaries; "ops" adds diagnostic
     # attention/router/MLP barriers for supported Qwen/Kimi/GLM hybrid blocks.
     execution_profile: str = ""
+    # Opt-in, lossless representation path for published compressed-tensors
+    # MXFP4 weights. It retains the released E2M1/E8M0 bytes and feeds them
+    # directly to MLX's native packed matmul instead of eagerly expanding BF16.
+    native_ct_mxfp4: bool = False
+    # Explicit lossless Kimi K3 E8M0 scale overlay. Empty disables it. The
+    # immutable sidecar generation is checkpoint-fingerprinted and may cover a
+    # subset of layers; uncovered layers use released safetensors unchanged.
+    kimi_k3_scale_sidecar_dir: str = ""
+    # Explicit exact BF16 trunk representation. Empty disables it; partial
+    # generations fall back to the released safetensors tensors.
+    bf16_nf12_sidecar_dir: str = ""
+    # Descriptor-level Darwin F_NOCACHE reads for the exact NF12 stream.
+    # Avoids one-shot compressed pages competing with live Metal allocations.
+    bf16_nf12_uncached_reads: bool = False
+    # Consume eligible exact NF12 rank-2 operands inside a small-M linear
+    # kernel instead of first materializing dense BF16 matrices.
+    bf16_nf12_direct_linear: bool = False
+    # Explicit raw-safetensors read-order experiment. Sort each requested
+    # shard group by immutable payload offset before MLX evaluation.
+    safetensors_offset_order: bool = False
     # Lowest cache budget the live governor may shrink to before refusing an
     # imminent allocation.  Long dense prompts can devote several GiB to exact
     # BF16 KV, so the historical global 1.5 GB floor needlessly made otherwise
@@ -509,6 +661,23 @@ class RuntimeConfig:
     # in the compressed latent space (the DeepSeek MLA "absorption" trick — algebraically fold
     # kv_b_proj into the query/output projections) instead of re-expanding K/V for every cached
     # position every step. Opt-in pending the strict equivalence gate (see tests/test_mla_absorbed.py).
+    # K3-specific activation remains separate and default-off until the real
+    # long-context gates clear.  The implementation itself is generic MLA
+    # algebra: no prompt, tool, subject, route, or request-shape branch enters
+    # either decision.
+    kimi_k3_compressed_mla: bool = False
+    kimi_k3_absorbed_mla: bool = False
+    # Maximum cached latent rows in one online-softmax score tile.  This value
+    # is inert unless kimi_k3_absorbed_mla is explicitly enabled.
+    kimi_k3_mla_key_tile_size: int = 2048
+    # Fused Metal AttnRes readout, evaluated in bounded position tiles. Zero
+    # retains the released composite MLX path. Explicit opt-in pending a full
+    # real-model greedy gate and broader prompt-shape corpus.
+    kimi_k3_fused_attnres_tile_size: int = 0
+    # Bound K3's 33,792-wide dense MLP gate/up activations during a
+    # layer-stationary long prefill. Zero preserves the existing full-position
+    # call; explicit for the same rollout/generality reasons as fused AttnRes.
+    kimi_k3_dense_mlp_tile_size: int = 0
     warm_mb: int = 0  # F04: compressed-RAM warm tier budget (0=off; bf16 pages only)
     final_dead_token_elim: bool = True  # F36: last layer's MLP runs only on the last prefill position
     router_lookahead: bool = False  # F45: measured NEGATIVE on local disk (pollutes LFU, competes with demand reads); retry over NAS only
@@ -529,8 +698,22 @@ class RuntimeConfig:
     # actual spike is the complete routed union staying strongly referenced by
     # the caller. Cache-only fetch sub-batching is insufficient: GLM must compute
     # and materialize each sub-batch before fetching the next one.
+    expert_compute_batch: int = 0  # optional arithmetic/materialization boundary
+    # inside an expert I/O batch. 0 preserves the historical coupled behavior.
+    # A smaller positive value lets storage fetch/coalesce more pages while
+    # retaining the already-validated floating-point accumulation grouping.
     decode_expert_fetch_batch: int = 0  # optional larger batch when routing covers
     # exactly one position; unlike prefill, decode's union is bounded by top-k
+    # Lossless one-batch I/O/compute pipeline. After the authoritative router
+    # has produced the complete expert union, fetch batch N+1 on one worker
+    # while Metal consumes batch N. This predicts no routes and never changes
+    # their order; the only extra residency is one governor-admitted batch.
+    expert_batch_prefetch: bool = False
+    # Explicit measurement-only route analysis. Reconstruct adjacent-position
+    # expert sets from the authoritative router output to quantify cache reuse
+    # and speculative multi-position union growth. Disabled by default because
+    # walking every route in Python is material at very large contexts.
+    expert_route_overlap_telemetry: bool = False
 
     @classmethod
     def from_yaml(cls, path: str | Path) -> "RuntimeConfig":
@@ -546,6 +729,22 @@ class RuntimeConfig:
             max_weight_cache_mb=mem.get("max_weight_cache_mb", 6000),
             mlx_cache_limit_mb=mem.get("mlx_cache_limit_mb", 1024),
             execution_profile=run.get("execution_profile", ""),
+            native_ct_mxfp4=run.get("native_ct_mxfp4", False),
+            kimi_k3_scale_sidecar_dir=run.get(
+                "kimi_k3_scale_sidecar_dir", ""
+            ),
+            bf16_nf12_sidecar_dir=run.get(
+                "bf16_nf12_sidecar_dir", ""
+            ),
+            bf16_nf12_uncached_reads=run.get(
+                "bf16_nf12_uncached_reads", False
+            ),
+            bf16_nf12_direct_linear=run.get(
+                "bf16_nf12_direct_linear", False
+            ),
+            safetensors_offset_order=run.get(
+                "safetensors_offset_order", False
+            ),
             min_weight_cache_mb=mem.get("min_weight_cache_mb", 1500),
             pin_embeddings=pinned.get("embeddings", True),
             pin_lm_head=pinned.get("lm_head", False),
@@ -654,6 +853,16 @@ class RuntimeConfig:
             warm_start=run.get("warm_start", 0),
             mla_compressed_kv=run.get("mla_compressed_kv", True),
             mla_absorbed_decode=run.get("mla_absorbed_decode", False),
+            kimi_k3_compressed_mla=run.get(
+                "kimi_k3_compressed_mla", False),
+            kimi_k3_absorbed_mla=run.get(
+                "kimi_k3_absorbed_mla", False),
+            kimi_k3_mla_key_tile_size=run.get(
+                "kimi_k3_mla_key_tile_size", 2048),
+            kimi_k3_fused_attnres_tile_size=run.get(
+                "kimi_k3_fused_attnres_tile_size", 0),
+            kimi_k3_dense_mlp_tile_size=run.get(
+                "kimi_k3_dense_mlp_tile_size", 0),
             warm_mb=run.get("warm_mb", 0),
             final_dead_token_elim=run.get("final_dead_token_elim", True),
             router_lookahead=run.get("router_lookahead", False),
@@ -663,7 +872,12 @@ class RuntimeConfig:
                 "expert_prefetch_idle_only", True),
             context_bound=run.get("context_bound", 0),
             expert_fetch_batch=run.get("expert_fetch_batch", 0),
+            expert_compute_batch=run.get("expert_compute_batch", 0),
             decode_expert_fetch_batch=run.get("decode_expert_fetch_batch", 0),
+            expert_batch_prefetch=run.get("expert_batch_prefetch", False),
+            expert_route_overlap_telemetry=run.get(
+                "expert_route_overlap_telemetry", False
+            ),
         )
 
 
@@ -673,11 +887,11 @@ def _apply_runtime_expert_top_k(rc: RuntimeConfig, cfg) -> None:
     if not isinstance(raw_schedule, (list, tuple)):
         raise ValueError(
             "expert_top_k_by_layer must be a list or tuple of integers")
-    supported = cfg.model_type in ("olmoe", "qwen3_5_moe")
+    supported = cfg.model_type in ("olmoe", "qwen3_5_moe", "kimi_k3")
     if raw_schedule and not supported:
         raise ValueError(
-            "expert_top_k_by_layer is supported only for OLMoE and "
-            "Qwen3.5/3.6 MoE checkpoints")
+            "expert_top_k_by_layer is supported only for OLMoE, "
+            "Qwen3.5/3.6 MoE, and Kimi K3 checkpoints")
     schedule = (
         validate_expert_top_k_by_layer(cfg, raw_schedule)
         if supported else ()
@@ -748,6 +962,24 @@ class StreamingEngine:
         mx.set_cache_limit(self.rc.mlx_cache_limit_mb * 1_000_000)
         if self.rc.stepped_kv_threshold < 0:
             raise ValueError("stepped_kv_threshold must be >= 0")
+        if self.rc.kimi_k3_mla_key_tile_size < 0:
+            raise ValueError("kimi_k3_mla_key_tile_size must be >= 0")
+        if self.rc.kimi_k3_fused_attnres_tile_size < 0:
+            raise ValueError(
+                "kimi_k3_fused_attnres_tile_size must be >= 0"
+            )
+        if self.rc.kimi_k3_dense_mlp_tile_size < 0:
+            raise ValueError(
+                "kimi_k3_dense_mlp_tile_size must be >= 0"
+            )
+        if (
+            self.rc.kimi_k3_absorbed_mla
+            and not self.rc.kimi_k3_compressed_mla
+        ):
+            raise ValueError(
+                "kimi_k3_absorbed_mla requires "
+                "kimi_k3_compressed_mla"
+            )
         if self.rc.min_weight_cache_mb <= 0:
             raise ValueError("min_weight_cache_mb must be positive")
         if self.rc.prefetch_workers < 0:
@@ -833,6 +1065,18 @@ class StreamingEngine:
             require_vpack_hashes=self.rc.require_vpack_hashes,
             require_raw_weight_hashes=self.rc.require_raw_weight_hashes,
             parallel_storage_reads=self.rc.parallel_storage_reads,
+            native_ct_mxfp4=self.rc.native_ct_mxfp4,
+            kimi_k3_scale_sidecar_dir=self.rc.kimi_k3_scale_sidecar_dir,
+            bf16_nf12_sidecar_dir=self.rc.bf16_nf12_sidecar_dir,
+            bf16_nf12_uncached_reads=(
+                self.rc.bf16_nf12_uncached_reads
+            ),
+            bf16_nf12_direct_linear=(
+                self.rc.bf16_nf12_direct_linear
+            ),
+            safetensors_offset_order=(
+                self.rc.safetensors_offset_order
+            ),
         )
         # WeightStore may have re-resolved a stale SMB mount from Plex to
         # Plex-N.  Every later checkpoint-relative path must follow that same
@@ -918,17 +1162,47 @@ class StreamingEngine:
             # F74-v2 is a safety default for every construction path, including
             # direct experiments and YAML. Leaving zero as "unbounded" silently
             # bypassed the server's GLM-specific protection and recreated the
-            # 16-22 GB union lifetime. q=1 is the fail-closed default until the
-            # q=2/8 lazy-graph peak and arithmetic-order gates exist; explicit
-            # validation scripts may request those larger batches. Other
-            # architectures retain zero semantics. F92: Kimi Linear/K2.5 have
+            # 16-22 GB union lifetime. q=1 remains the fail-closed default for
+            # dense or expand-on-load representations. Other architectures
+            # retain zero semantics. F92: Kimi Linear/K2.5 have
             # 256/384 experts each, the same "prefill floods the union" risk
             # GLM was fixed for here (measured 2026-07-18: an unbounded fetch
             # on a 15-token prompt requested ~2.8GB in one shot and was
             # correctly refused by the governor). Qwen3.6 likewise has 256
             # experts per layer and can route a near-complete union during a
             # multi-position prefill, so the same lifetime bound applies.
-            self.rc.expert_fetch_batch = 1
+            #
+            # F134: native compressed-tensors MXFP4 is different: the compact
+            # page is the released representation that survives in cache, not
+            # a temporary BF16 expansion. Derive a bounded coalescing batch
+            # from those physical resident bytes instead of model identity or
+            # one prompt's routed union. Real K3 five-position, first-four-
+            # layer A/B: q=8 -> q=16 also won on two unrelated prompts with
+            # identical hidden bytes and the same 5.650GB Metal peak. Full
+            # 93-layer q=1/q=8/q=16 gates measured 317.299/265.037/260.392s
+            # with the same token, bytes, and 6.744GB peak. Native MXFP4 itself
+            # remains explicit opt-in, so this does not turn a narrow result
+            # into a new automatic public-server path.
+            self._auto_compact_expert_batch = 0
+            if self.store.native_ct_mxfp4:
+                inter = (
+                    getattr(self.cfg, "moe_intermediate_size", None)
+                    or self.cfg.intermediate_size)
+                expert_hidden = (
+                    self.cfg.moe_latent_hidden_size or self.cfg.hidden_size)
+                compact_page_bytes = int(
+                    3 * expert_hidden * inter
+                    * self.store.expert_resident_bytes_per_weight)
+                self.rc.expert_fetch_batch = compact_expert_io_batch_size(
+                    compact_page_bytes,
+                    self.rc.max_weight_cache_mb * 1_000_000,
+                )
+                self._auto_compact_expert_batch = (
+                    self.rc.expert_fetch_batch)
+            else:
+                self.rc.expert_fetch_batch = 1
+        else:
+            self._auto_compact_expert_batch = 0
         tokenizer_json = self._model_dir / "tokenizer.json"
         if tokenizer_json.exists():
             self.tokenizer = Tokenizer.from_file(str(tokenizer_json))
@@ -1018,6 +1292,9 @@ class StreamingEngine:
         expert_hidden = self.cfg.moe_latent_hidden_size or self.cfg.hidden_size
         if self.store.on_disk_quantized:
             resident_bytes_per_weight = self.store.quantized_bytes_per_weight
+        elif self.store.native_ct_mxfp4:
+            resident_bytes_per_weight = (
+                self.store.expert_resident_bytes_per_weight)
         elif self.rc.quant_bits:
             resident_bytes_per_weight = self.rc.quant_bits / 8 + (
                 8 / self.rc.quant_group_size
@@ -1049,13 +1326,32 @@ class StreamingEngine:
         # lands on the dense resident estimate here.
         self._expert_fetch_page_bytes = (
             self._expert_page_bytes
-            if self.store.on_disk_quantized or not self.rc.quant_bits
+            if (self.store.on_disk_quantized
+                or self.store.native_ct_mxfp4
+                or not self.rc.quant_bits)
             else dense_expert_page_bytes + self._expert_page_bytes
         )
         self._layer_transient = 0  # F42: measured compute-scratch high-water mark
         self._prefill_layer_transient = 0
         self._prefill_layer_transient_by_positions: dict[int, int] = {}
         self._decode_layer_transient = 0
+        # F132: heterogeneous stacks can have radically different compute
+        # scratch requirements.  Kimi K3's first dense MLP, for example, has
+        # no relationship to the packed routed-expert path used by every
+        # following MoE layer.  Keep the aggregate high-water marks above for
+        # request/KV admission, but use this operation-signature map for the
+        # imminent per-layer reservation.
+        self._layer_transient_by_signature: dict[tuple[int, str], int] = {}
+        # The first execution of an operation signature includes one-time
+        # Metal/JIT setup. Keep it as the bootstrap reserve for the second
+        # occurrence, then use the maximum of recurring observations so a
+        # compile-only spike cannot poison all remaining layers.
+        self._layer_transient_observation_counts: dict[
+            tuple[int, str], int
+        ] = {}
+        self._layer_transient_recurring_max: dict[
+            tuple[int, str], int
+        ] = {}
         self._layer_transient_margin = 400_000_000
         self._token_transient = 0  # F42: whole-token transient (greedy sync point)
         # 2026-07-13: F42's own per-layer/per-token mx.reset_peak_memory() calls
@@ -1178,10 +1474,17 @@ class StreamingEngine:
         self.expert_hits = 0
         self.expert_misses = 0
         self.expert_trace: list[tuple[int, tuple[int, ...]]] = []  # (layer, routed ids) per fetch, in sweep order
+        self.expert_route_overlap_trace: list[dict] = []
+        self._expert_route_last_by_layer: dict[int, tuple[int, ...]] = {}
+        self._expert_route_overlap_totals: dict[str, int] = {}
         self._expert_compute_batches = 0
         self._max_experts_per_compute_batch = 0
         self._adaptive_expert_batch_clamps = 0
         self._min_adaptive_expert_batch = 0
+        self._expert_batch_prefetch_submitted = 0
+        self._expert_batch_prefetch_wait_s = 0.0
+        self._expert_batch_prefetch_hidden_s = 0.0
+        self._expert_shared_overlap_layers = 0
         self._resident_fast_decode_sweeps = 0
         self._resident_fast_prefill_sweeps = 0
         self._disable_resident_fast_for_request = False
@@ -1316,6 +1619,15 @@ class StreamingEngine:
         self.prefetcher = (
             Prefetcher(self.cache, page_size_hint=layer_bytes, workers=workers)
             if self.rc.prefetch_depth and self._resident_moe_layers is None
+            else None
+        )
+        # Separate from the trunk prefetch queue: this worker carries only the
+        # next authoritative routed batch and is awaited before that batch can
+        # execute. A persistent single worker avoids per-layer thread startup.
+        self._expert_batch_executor = (
+            cf.ThreadPoolExecutor(
+                max_workers=1, thread_name_prefix="vmodel-expert-batch")
+            if self.rc.expert_batch_prefetch and self.cfg.num_experts
             else None
         )
 
@@ -1693,6 +2005,91 @@ class StreamingEngine:
             return "mla"
         return "attention"
 
+    def _transient_layer_signature(self, i: int) -> str:
+        """Architecture-level compute class used for scratch admission.
+
+        Attention implementations and dense/routed MLPs have different
+        allocation shapes even when they are adjacent in one model.  The
+        signature intentionally contains no model name, prompt property, or
+        layer number: observations generalize to every layer with the same
+        operations without leaking an outlier across unlike operations.
+        """
+        attention = self._profile_layer_type(i)
+        if not self.cfg.num_experts:
+            mlp = "dense"
+        elif i < len(self.cfg.mlp_layer_types):
+            mlp = str(self.cfg.mlp_layer_types[i])
+        else:
+            mlp = (
+                "dense"
+                if i < self.cfg.first_k_dense_replace
+                else "moe"
+            )
+        return f"{attention}+{mlp}"
+
+    def _select_layer_transient(self, position_count: int, layer: int) -> int:
+        """Select the learned scratch reserve for one imminent layer."""
+        if position_count <= 0:
+            raise ValueError("position_count must be positive")
+        signature = self._transient_layer_signature(layer)
+        learned = int(getattr(
+            self, "_layer_transient_by_signature", {}
+        ).get((position_count, signature), 0))
+        self._layer_transient = max(0, learned)
+        self._layer_transient_margin = _layer_transient_reserve_margin(
+            position_count)
+        return self._layer_transient
+
+    def _record_layer_transient(
+            self, position_count: int, layer: int, measured_bytes: int,
+    ) -> int:
+        """Record one layer and retain both typed and aggregate high-waters."""
+        signature = self._transient_layer_signature(layer)
+        by_signature = self._layer_transient_by_signature
+        key = (position_count, signature)
+        measured = max(0, int(measured_bytes))
+        counts = getattr(
+            self, "_layer_transient_observation_counts", None
+        )
+        if counts is None:
+            counts = {}
+            self._layer_transient_observation_counts = counts
+        recurring = getattr(
+            self, "_layer_transient_recurring_max", None
+        )
+        if recurring is None:
+            recurring = {}
+            self._layer_transient_recurring_max = recurring
+        count = int(counts.get(key, 0))
+        if count == 0:
+            learned = measured
+        else:
+            learned = max(int(recurring.get(key, 0)), measured)
+            recurring[key] = learned
+        counts[key] = count + 1
+        by_signature[key] = learned
+        self._layer_transient = learned
+        if position_count == 1:
+            self._decode_layer_transient = max(
+                int(self._decode_layer_transient), learned)
+        else:
+            by_positions = self._prefill_layer_transient_by_positions
+            by_positions[position_count] = max(
+                int(by_positions.get(position_count, 0)), learned)
+            self._prefill_layer_transient = max(by_positions.values())
+        return learned
+
+    def _restore_aggregate_layer_transient(self, position_count: int) -> int:
+        """Restore the request-level high-water after a typed layer loop."""
+        (self._layer_transient,
+         self._layer_transient_margin) = _layer_transient_for_positions(
+             position_count,
+             getattr(
+                 self, "_prefill_layer_transient_by_positions", {}
+             ).get(position_count, 0),
+             getattr(self, "_decode_layer_transient", 0))
+        return self._layer_transient
+
     def _layer_names(self, i: int) -> list[str]:
         """Names for the always-needed part of a layer. For MoE layers this is
         attention + norms + router — experts page separately, after routing."""
@@ -1706,7 +2103,33 @@ class StreamingEngine:
             names = [n for n in names if ".self_attn.indexer." not in n]
         return names
 
-    def _layer_fetch_bytes_estimate(self, layer: int) -> int:
+    def _k3_nf12_split_layer_names(
+        self, layer: int
+    ) -> tuple[list[str], list[str]]:
+        """Partition K3 trunk weights at the exact attention/MLP lifetime."""
+        prefix = f"model.layers.{layer}."
+        attention = []
+        mlp = []
+        for name in self._layer_names(layer):
+            suffix = name.removeprefix(prefix)
+            if (
+                suffix.startswith("self_attn.")
+                or suffix == "input_layernorm.weight"
+                or suffix.startswith("self_attention_res_")
+            ):
+                attention.append(name)
+            else:
+                mlp.append(name)
+        if not attention or not mlp:
+            raise RuntimeError(
+                f"layer {layer}: invalid K3 NF12 attention/MLP split "
+                f"({len(attention)}/{len(mlp)})"
+            )
+        return attention, mlp
+
+    def _layer_fetch_bytes_estimate(
+        self, layer: int, names: list[str] | None = None
+    ) -> int:
         """Conservative materialized trunk-page estimate for pre-fetch eviction.
 
         K2.5's checkpoint stores its trunk/router/shared-expert tensors as BF16;
@@ -1715,6 +2138,51 @@ class StreamingEngine:
         inventing unsafe generic estimates for packed/fused formats whose load
         representation differs from their logical shapes.
         """
+        nf12 = getattr(
+            getattr(self, "store", None), "bf16_nf12_sidecar", None
+        )
+        if nf12 is not None and nf12.has_layer(layer):
+            entry = nf12.layer_entry(layer)
+            # Admission must use the decoded cache representation, not the
+            # smaller file stream. ``all_bf16_raw_bytes`` also covers tensors
+            # omitted from NF12 as raw fallbacks; pad small controls by 5%.
+            if names is None:
+                decoded_bytes = int(entry["all_bf16_raw_bytes"])
+            else:
+                specs = {
+                    tensor["name"]: tensor
+                    for tensor in entry["tensors"]
+                }
+                if self.store.bf16_nf12_direct_linear:
+                    from .bf16_nf12_linear import (
+                        direct_linear_eligible,
+                    )
+
+                    decoded_bytes = sum(
+                        int(
+                            specs[name][
+                                "encoded_bytes"
+                                if direct_linear_eligible(specs[name])
+                                else "raw_bytes"
+                            ]
+                        )
+                        for name in names
+                        if name in specs
+                    )
+                else:
+                    decoded_bytes = sum(
+                        int(specs[name]["raw_bytes"])
+                        for name in names
+                        if name in specs
+                    )
+                # Small raw fallbacks/controls are not represented in the
+                # NF12 manifest's selected tensor list.
+                decoded_bytes += max(
+                    0,
+                    int(entry["all_bf16_raw_bytes"])
+                    - int(entry["selected_raw_bytes"]),
+                )
+            return math.ceil(decoded_bytes * 1.05)
         if self.cfg.model_type != "kimi_k25":
             return 0
         c = self.cfg
@@ -1880,6 +2348,23 @@ class StreamingEngine:
             if provisional is None:
                 self.expert_usage[(layer, e)] = self.expert_usage.get((layer, e), 0) + 1
         self.expert_trace.append((layer, tuple(expert_ids)))
+        if (
+            self.rc.expert_route_overlap_telemetry
+            and provisional is None
+            and positions
+        ):
+            summary, last_route = expert_route_overlap_summary(
+                positions,
+                self._expert_route_last_by_layer.get(layer),
+            )
+            self._expert_route_last_by_layer[layer] = last_route
+            trace_entry = {"layer": int(layer), **summary}
+            self.expert_route_overlap_trace.append(trace_entry)
+            for key, value in summary.items():
+                self._expert_route_overlap_totals[key] = (
+                    self._expert_route_overlap_totals.get(key, 0)
+                    + int(value)
+                )
         # Phase 8: learn routing transitions and prefetch next layer's likely experts
         # (F55: during a provisional sweep, observation is deferred to commit)
         if self.predictor is not None:
@@ -1954,12 +2439,18 @@ class StreamingEngine:
 
     def _iter_expert_batches(self, layer: int, expert_ids: list[int],
                              positions: dict[int, list[int]] | None = None):
-        """Yield bounded expert pages for immediate compute and release.
+        """Return bounded expert pages for immediate compute and release.
 
         This is F74-v2's actual lifetime boundary. ``WeightCache.get_many`` may
         split disk fetches, but returning a dict for the whole union leaves every
         evicted tensor strongly referenced. The GLM runner consumes one yielded
         mapping, ``mx.eval`` materializes its accumulated output, then advances.
+
+        With ``expert_batch_prefetch``, the authoritative routed union is still
+        divided in the same order and at the same live-governor boundary. The
+        exact batch-zero fetch is submitted before this method returns, and
+        batch N+1 runs while batch N computes. At most one future exists, so
+        residency remains bounded to the current and one successor batch.
         """
         self._record_expert_route(layer, expert_ids, positions)
         position_union = {
@@ -1967,15 +2458,20 @@ class StreamingEngine:
             for position in expert_positions
         }
         single_position = bool(positions) and len(position_union) == 1
-        configured_batch_size = (
+        configured_fetch_batch_size = (
             self.rc.decode_expert_fetch_batch
             if single_position and self.rc.decode_expert_fetch_batch > 0
             else self.rc.expert_fetch_batch
         ) or len(expert_ids) or 1
-        start = 0
+        configured_compute_batch_size = (
+            getattr(self.rc, "expert_compute_batch", 0)
+            or configured_fetch_batch_size
+        )
         governor = getattr(self, "governor", None)
-        while start < len(expert_ids):
-            batch_size = min(configured_batch_size, len(expert_ids) - start)
+
+        def plan_batch(start: int) -> tuple[list[int], int]:
+            remaining = len(expert_ids) - start
+            batch_size = min(configured_fetch_batch_size, remaining)
             if governor is not None and batch_size > 1:
                 admitted = governor.admissible_units(
                     unit_bytes=self._expert_fetch_page_bytes,
@@ -1986,17 +2482,106 @@ class StreamingEngine:
                 if admitted < batch_size:
                     self._adaptive_expert_batch_clamps += 1
                 batch_size = admitted
+                # Preserve compute/materialization boundaries when a larger
+                # storage batch is pressure-clamped. For example, a fetch cap
+                # of 32 with a compute boundary of 16 may safely shrink to 16,
+                # but not 24: 16+8 would change the floating accumulation
+                # grouping relative to the validated 16-wide path.
+                if (
+                    remaining > configured_compute_batch_size
+                    and batch_size >= configured_compute_batch_size
+                    and configured_fetch_batch_size
+                    > configured_compute_batch_size
+                ):
+                    batch_size = max(
+                        configured_compute_batch_size,
+                        (
+                            batch_size // configured_compute_batch_size
+                        ) * configured_compute_batch_size,
+                    )
                 self._min_adaptive_expert_batch = (
                     batch_size if self._min_adaptive_expert_batch == 0
                     else min(self._min_adaptive_expert_batch, batch_size)
                 )
             batch_ids = expert_ids[start:start + batch_size]
-            self._expert_compute_batches += 1
-            self._max_experts_per_compute_batch = max(
-                self._max_experts_per_compute_batch, len(batch_ids)
-            )
-            yield batch_ids, self._fetch_experts(layer, batch_ids)
-            start += batch_size
+            return batch_ids, start + batch_size
+
+        def compute_chunks(batch_ids: list[int], pages: dict):
+            for offset in range(0, len(batch_ids), configured_compute_batch_size):
+                compute_ids = batch_ids[
+                    offset:offset + configured_compute_batch_size
+                ]
+                self._expert_compute_batches += 1
+                self._max_experts_per_compute_batch = max(
+                    self._max_experts_per_compute_batch, len(compute_ids)
+                )
+                # The producer deliberately retains the complete fetched page
+                # mapping across these sub-batches. The consumer materializes
+                # and drops each arithmetic group before requesting the next;
+                # only after the final group may the next storage batch become
+                # authoritative.
+                yield compute_ids, pages
+
+        def timed_fetch(batch_ids: list[int]):
+            started = time.perf_counter()
+            pages = self._fetch_experts(layer, batch_ids)
+            return pages, time.perf_counter() - started
+
+        if not expert_ids:
+            return iter(())
+        executor = getattr(self, "_expert_batch_executor", None)
+        if executor is None:
+            def synchronous_batches():
+                start = 0
+                while start < len(expert_ids):
+                    batch_ids, start = plan_batch(start)
+                    pages = self._fetch_experts(layer, batch_ids)
+                    yield from compute_chunks(batch_ids, pages)
+                    del pages
+
+            return synchronous_batches()
+
+        batch_ids, start = plan_batch(0)
+        first_future = executor.submit(timed_fetch, batch_ids)
+        self._expert_batch_prefetch_submitted += 1
+
+        def pipelined_batches():
+            current_ids = batch_ids
+            current_start = start
+            future = first_future
+            try:
+                wait_started = time.perf_counter()
+                pages, fetch_s = future.result()
+                wait_s = time.perf_counter() - wait_started
+                self._expert_batch_prefetch_wait_s += wait_s
+                self._expert_batch_prefetch_hidden_s += max(
+                    0.0, fetch_s - wait_s)
+                future = None
+                while True:
+                    if current_start < len(expert_ids):
+                        next_ids, next_start = plan_batch(current_start)
+                        future = executor.submit(timed_fetch, next_ids)
+                        self._expert_batch_prefetch_submitted += 1
+                    yield from compute_chunks(current_ids, pages)
+                    # The consumer deletes its reference before resuming us.
+                    # Drop the producer's reference before awaiting successor.
+                    del pages
+                    if future is None:
+                        return
+                    wait_started = time.perf_counter()
+                    pages, fetch_s = future.result()
+                    wait_s = time.perf_counter() - wait_started
+                    self._expert_batch_prefetch_wait_s += wait_s
+                    self._expert_batch_prefetch_hidden_s += max(
+                        0.0, fetch_s - wait_s)
+                    current_ids = next_ids
+                    current_start = next_start
+                    future = None
+            finally:
+                if future is not None:
+                    future.cancel()
+
+        return pipelined_batches()
 
     def _router_lookahead(self, x: mx.array, nxt: int) -> None:
         """F45 (MoE-SpeQ class; lossless — prefetch is only a cache hint):
@@ -2284,9 +2869,17 @@ class StreamingEngine:
         # exactly matching a chunk-major caller's own "one forward-call per
         # chunk" mapping) is correct; see run_kimi_k3_block's own docstring.
         block_residual = (
-            mx.zeros((x.shape[0] * x.shape[1], 0, x.shape[2]), dtype=x.dtype)
+            (
+                []
+                if self.rc.kimi_k3_fused_attnres_tile_size
+                else mx.zeros(
+                    (x.shape[0] * x.shape[1], 0, x.shape[2]),
+                    dtype=x.dtype,
+                )
+            )
             if self.cfg.model_type == "kimi_k3" else None)
         for i in range(n):
+            self._select_layer_transient(position_count, i)
             # F36: on the last layer of a prefill whose only consumer is the last
             # position's logits, MLP outputs for earlier positions are dead —
             # attention still runs full-width so the KV cache stays complete.
@@ -2388,6 +2981,8 @@ class StreamingEngine:
                     iter_expert_batches=self._iter_expert_batches,
                     native_fused_decode=self.rc.native_fused_deltanet_decode,
                     profile=profiler,
+                    fused_attnres_tile_size=(
+                        self.rc.kimi_k3_fused_attnres_tile_size),
                 )
             elif self.cfg.model_type in ("qwen3_5_moe", "qwen3_5"):
                 from .qwen35 import run_qwen35_block
@@ -2431,19 +3026,11 @@ class StreamingEngine:
                                            rope_mscale=self._mscale,
                                            fused_swiglu=self.rc.fused_swiglu)
             mx.eval(x)
-            self._layer_transient = max(
-                self._layer_transient,
+            self._record_layer_transient(
+                position_count, i,
                 _resident_adjusted_transient(
                     active_before, mx.get_active_memory(),
                     mx.get_peak_memory()))
-            if position_count == 1:
-                self._decode_layer_transient = self._layer_transient
-            else:
-                by_positions = self._prefill_layer_transient_by_positions
-                by_positions[position_count] = max(
-                    int(by_positions.get(position_count, 0)),
-                    self._layer_transient)
-                self._prefill_layer_transient = max(by_positions.values())
             self._note_true_peak()
             compute_s = time.perf_counter() - t0
             self.timer.add("layer_compute", compute_s)
@@ -2463,6 +3050,7 @@ class StreamingEngine:
                 # cache and halved hit rates (measured; see benchmark_results)
                 self._router_lookahead(x, i + 1)
             del w
+        self._restore_aggregate_layer_transient(position_count)
         if self.cfg.model_type == "kimi_k3" and block_residual is not None:
             # F128: the real KimiLinearModel.forward applies this ONCE,
             # after every layer, before its own final model.norm -- which
@@ -2478,7 +3066,9 @@ class StreamingEngine:
                 x, {
                     "model.output_attn_res_proj.weight": self._output_attn_res_proj_w,
                     "model.output_attn_res_norm.weight": self._output_attn_res_norm_w,
-                }, block_residual, self.cfg)
+                }, block_residual, self.cfg,
+                fused_tile_size=(
+                    self.rc.kimi_k3_fused_attnres_tile_size))
             if final_mlp_last_only and x.shape[1] > 1:
                 x = x[:, -1:, :]
         return x
@@ -2551,6 +3141,7 @@ class StreamingEngine:
         if profiler is not None:
             profiler.begin_sweep(total, path="layer_stationary_qwen35")
         for i in range(n):
+            self._select_layer_transient(total, i)
             if self.prefetcher:
                 for j in range(i + 1, min(i + 1 + self.rc.prefetch_depth, n)):
                     self.prefetcher.schedule(self._layer_key(j), self._layer_names(j))
@@ -2633,16 +3224,14 @@ class StreamingEngine:
                     "total_tokens": total,
                     "cache_source": "cold",
                 })
-            self._layer_transient = max(
-                self._layer_transient,
+            self._record_layer_transient(
+                total, i,
                 _resident_adjusted_transient(
-                    active_before, mx.get_active_memory(), mx.get_peak_memory()))
-            by_positions = self._prefill_layer_transient_by_positions
-            by_positions[total] = max(
-                int(by_positions.get(total, 0)), self._layer_transient)
-            self._prefill_layer_transient = max(by_positions.values())
+                    active_before, mx.get_active_memory(),
+                    mx.get_peak_memory()))
             self._note_true_peak()
             del w
+        self._restore_aggregate_layer_transient(total)
         return x
 
     def _layer_stationary_glm_sweep(
@@ -2684,6 +3273,7 @@ class StreamingEngine:
         if profiler is not None:
             profiler.begin_sweep(total, path="layer_stationary_glm")
         for i in range(n):
+            self._select_layer_transient(total, i)
             if self.prefetcher:
                 for j in range(i + 1, min(i + 1 + self.rc.prefetch_depth, n)):
                     self.prefetcher.schedule(self._layer_key(j), self._layer_names(j))
@@ -2757,16 +3347,14 @@ class StreamingEngine:
                     "total_tokens": total,
                     "cache_source": "cold",
                 })
-            self._layer_transient = max(
-                self._layer_transient,
+            self._record_layer_transient(
+                total, i,
                 _resident_adjusted_transient(
-                    active_before, mx.get_active_memory(), mx.get_peak_memory()))
-            by_positions = self._prefill_layer_transient_by_positions
-            by_positions[total] = max(
-                int(by_positions.get(total, 0)), self._layer_transient)
-            self._prefill_layer_transient = max(by_positions.values())
+                    active_before, mx.get_active_memory(),
+                    mx.get_peak_memory()))
             self._note_true_peak()
             del w
+        self._restore_aggregate_layer_transient(total)
         return x
 
     def _layer_stationary_kimi_linear_sweep(
@@ -2829,6 +3417,7 @@ class StreamingEngine:
         if profiler is not None:
             profiler.begin_sweep(total, path="layer_stationary_kimi_linear")
         for i in range(n):
+            self._select_layer_transient(total, i)
             if self.prefetcher:
                 for j in range(i + 1, min(i + 1 + self.rc.prefetch_depth, n)):
                     self.prefetcher.schedule(self._layer_key(j), self._layer_names(j))
@@ -2903,16 +3492,14 @@ class StreamingEngine:
                     "total_tokens": total,
                     "cache_source": "cold",
                 })
-            self._layer_transient = max(
-                self._layer_transient,
+            self._record_layer_transient(
+                total, i,
                 _resident_adjusted_transient(
-                    active_before, mx.get_active_memory(), mx.get_peak_memory()))
-            by_positions = self._prefill_layer_transient_by_positions
-            by_positions[total] = max(
-                int(by_positions.get(total, 0)), self._layer_transient)
-            self._prefill_layer_transient = max(by_positions.values())
+                    active_before, mx.get_active_memory(),
+                    mx.get_peak_memory()))
             self._note_true_peak()
             del w
+        self._restore_aggregate_layer_transient(total)
         return x
 
     def _layer_stationary_kimi_k3_sweep(
@@ -2941,11 +3528,19 @@ class StreamingEngine:
         once per outer-loop iteration already gives for free.
         """
         from .kimi_linear import (
-            _kda_attention, _mla_attention, _kimi_dense_mlp, _kimi_moe_output,
+            _kda_attention, _mla_attention, _kimi_dense_mlp_tiled,
+            _kimi_moe_output,
             attn_res_wrap_layer, apply_output_attn_res)
 
         if tile_width <= 0:
             raise ValueError("tile_width must be positive")
+        if (
+            self.store.bf16_nf12_sidecar is not None
+            and not self.store.bf16_nf12_uncached_reads
+        ):
+            return self._layer_stationary_kimi_k3_nf12_split_sweep(
+                x, kv, offset, tile_width, on_progress=on_progress
+            )
         n = self.cfg.num_hidden_layers
         total = int(x.shape[1])
         (self._layer_transient,
@@ -2958,11 +3553,23 @@ class StreamingEngine:
         profiler = self._request_profiler
         if profiler is not None:
             profiler.begin_sweep(total, path="layer_stationary_kimi_k3")
-        block_residual = mx.zeros((x.shape[0] * total, 0, x.shape[2]), dtype=x.dtype)
+        block_residual = (
+            []
+            if self.rc.kimi_k3_fused_attnres_tile_size
+            else mx.zeros(
+                (x.shape[0] * total, 0, x.shape[2]), dtype=x.dtype
+            )
+        )
         for i in range(n):
+            self._select_layer_transient(total, i)
             if self.prefetcher:
                 for j in range(i + 1, min(i + 1 + self.rc.prefetch_depth, n)):
-                    self.prefetcher.schedule(self._layer_key(j), self._layer_names(j))
+                    hint = self._layer_fetch_bytes_estimate(j)
+                    self.prefetcher.schedule(
+                        self._layer_key(j),
+                        self._layer_names(j),
+                        page_size_hint=hint or None,
+                    )
 
             cache_before = (
                 profiler.cache_snapshot(self.cache)
@@ -3019,12 +3626,22 @@ class StreamingEngine:
             def mlp_fn(h2, i=i, prefix=prefix):
                 mlp_t0 = time.perf_counter()
                 if i < self.cfg.first_k_dense_replace:
-                    out = _kimi_dense_mlp(h2, w, f"{prefix}.mlp", self.cfg)
+                    out = _kimi_dense_mlp_tiled(
+                        h2,
+                        w,
+                        f"{prefix}.mlp",
+                        self.cfg,
+                        self.rc.kimi_k3_dense_mlp_tile_size,
+                    )
                 else:
+                    if self.rc.expert_batch_prefetch:
+                        self._expert_shared_overlap_layers += 1
                     out = _kimi_moe_output(
                         h2, w, prefix, self.cfg, i, self._get_experts,
                         iter_expert_batches=self._iter_expert_batches,
-                        profile=profiler)
+                        profile=profiler,
+                        overlap_shared_expert=(
+                            self.rc.expert_batch_prefetch))
                 mx.eval(out)
                 if profiler is not None and profiler.sync_substeps:
                     profiler.record_substep(
@@ -3032,7 +3649,9 @@ class StreamingEngine:
                 return out
 
             x, block_residual = attn_res_wrap_layer(
-                x, block_residual, w, prefix, self.cfg, i, attn_fn, mlp_fn)
+                x, block_residual, w, prefix, self.cfg, i, attn_fn, mlp_fn,
+                fused_tile_size=(
+                    self.rc.kimi_k3_fused_attnres_tile_size))
             mx.eval(x)
             compute_s = time.perf_counter() - t0
             self.timer.add("layer_compute", compute_s)
@@ -3051,22 +3670,338 @@ class StreamingEngine:
                     "total_tokens": total,
                     "cache_source": "cold",
                 })
-            self._layer_transient = max(
-                self._layer_transient,
-                _resident_adjusted_transient(
-                    active_before, mx.get_active_memory(), mx.get_peak_memory()))
-            by_positions = self._prefill_layer_transient_by_positions
-            by_positions[total] = max(
-                int(by_positions.get(total, 0)), self._layer_transient)
-            self._prefill_layer_transient = max(by_positions.values())
+            end_active = mx.get_active_memory()
+            peak_active = mx.get_peak_memory()
+            measured_transient = _resident_adjusted_transient(
+                active_before, end_active, peak_active)
+            self._last_k3_transient_observation = {
+                "layer": i,
+                "signature": self._transient_layer_signature(i),
+                "start_active_bytes": int(active_before),
+                "end_active_bytes": int(end_active),
+                "peak_active_bytes": int(peak_active),
+                "measured_transient_bytes": int(measured_transient),
+            }
+            self._record_layer_transient(
+                total, i, measured_transient)
             self._note_true_peak()
             del w
+            if self.store.bf16_nf12_sidecar is not None:
+                # F140: cache-budget eviction may precede the actual consumer
+                # boundary. The exact decoded trunk and its mapped NF12 source
+                # become disposable only after this layer's synchronized
+                # compute, transient accounting, and local weight reference
+                # have all completed. Explicitly drop the one-pass page now,
+                # then let WeightStore retry Darwin UBC invalidation.
+                self.cache.discard(layer_key, layer_names)
+        self._restore_aggregate_layer_transient(total)
         x = apply_output_attn_res(
             x, {
                 "model.output_attn_res_proj.weight": self._output_attn_res_proj_w,
                 "model.output_attn_res_norm.weight": self._output_attn_res_norm_w,
-            }, block_residual, self.cfg)
+            }, block_residual, self.cfg,
+            fused_tile_size=(
+                self.rc.kimi_k3_fused_attnres_tile_size))
         return x
+
+    def _layer_stationary_kimi_k3_nf12_split_sweep(
+            self, x: mx.array, kv, offset: int, tile_width: int,
+            on_progress=None) -> mx.array:
+        """K3 layer-major prefill with exact attention/MLP NF12 lifetimes.
+
+        The released operation order is unchanged. Only storage/materialization
+        is split: attention tensors are decoded, consumed, and released before
+        the router/shared-expert tensors become the live page. This keeps the
+        authoritative q16 routed-expert pipeline from competing with a decoded
+        whole-layer BF16 buffer.
+        """
+        from .kimi_linear import (
+            _kda_attention,
+            _kimi_dense_mlp_tiled,
+            _kimi_moe_output,
+            _mla_attention,
+            apply_output_attn_res,
+            attn_res_attention_input,
+            attn_res_mlp_input,
+        )
+
+        n = self.cfg.num_hidden_layers
+        total = int(x.shape[1])
+        (
+            self._layer_transient,
+            self._layer_transient_margin,
+        ) = _layer_transient_for_positions(
+            total,
+            getattr(
+                self, "_prefill_layer_transient_by_positions", {}
+            ).get(total, 0),
+            getattr(self, "_decode_layer_transient", 0),
+        )
+        profiler = self._request_profiler
+        if profiler is not None:
+            profiler.begin_sweep(
+                total, path="layer_stationary_kimi_k3_nf12_split"
+            )
+        block_residual = (
+            []
+            if self.rc.kimi_k3_fused_attnres_tile_size
+            else mx.zeros(
+                (x.shape[0] * total, 0, x.shape[2]), dtype=x.dtype
+            )
+        )
+
+        for i in range(n):
+            self._select_layer_transient(total, i)
+
+            cache_before = (
+                profiler.cache_snapshot(self.cache)
+                if profiler is not None
+                else None
+            )
+            prefix = f"model.layers.{i}"
+            layer_key = self._layer_key(i)
+            attention_names, mlp_names = (
+                self._k3_nf12_split_layer_names(i)
+            )
+            attention_key = f"{layer_key}.attn"
+            mlp_key = f"{layer_key}.mlp"
+
+            wait_started = time.perf_counter()
+            if not self.cache.contains(attention_key):
+                incoming = self._layer_fetch_bytes_estimate(
+                    i, attention_names
+                )
+                self.cache.prepare_for(incoming)
+                if self.governor is not None:
+                    self.governor.reserve(incoming)
+            attention_w = self.cache.get(
+                attention_key, attention_names
+            )
+            attention_wait_s = time.perf_counter() - wait_started
+            self.timer.add("weights_wait", attention_wait_s)
+
+            # The MLP stream is authoritative for this same layer. Let its
+            # mapped decode overlap attention only when the decoded page can
+            # survive under the current cache budget.
+            if self.prefetcher:
+                self.prefetcher.schedule(
+                    mlp_key,
+                    mlp_names,
+                    page_size_hint=self._layer_fetch_bytes_estimate(
+                        i, mlp_names
+                    ),
+                )
+
+            active_before = mx.get_active_memory()
+            mx.reset_peak_memory()
+            compute_started = time.perf_counter()
+
+            prefix_sum, block_residual, attention_input = (
+                attn_res_attention_input(
+                    x,
+                    block_residual,
+                    attention_w,
+                    prefix,
+                    self.cfg,
+                    i,
+                    fused_tile_size=(
+                        self.rc.kimi_k3_fused_attnres_tile_size),
+                )
+            )
+            tiles = []
+            pos = 0
+            while pos < total:
+                end = min(pos + tile_width, total)
+                if self.governor is not None and self._layer_transient:
+                    self.governor.reserve(
+                        self._layer_transient,
+                        margin=self._layer_transient_margin,
+                    )
+                ht = attention_input[:, pos:end, :]
+                attention_t0 = time.perf_counter()
+                if i in self.cfg.full_attn_layers:
+                    yt = _mla_attention(
+                        ht,
+                        attention_w,
+                        prefix,
+                        self.cfg,
+                        kv,
+                        i,
+                        offset + pos,
+                    )
+                elif i in self.cfg.kda_layers:
+                    kda_cache = getattr(kv, "kda_cache", None)
+                    yt = _kda_attention(
+                        ht,
+                        attention_w,
+                        prefix,
+                        self.cfg,
+                        kda_cache,
+                        i,
+                        native_fused_decode=(
+                            self.rc.native_fused_deltanet_decode
+                        ),
+                    )
+                else:
+                    raise ValueError(
+                        f"layer {i} is in neither cfg.full_attn_layers "
+                        "nor cfg.kda_layers"
+                    )
+                mx.eval(yt)
+                if profiler is not None and profiler.sync_substeps:
+                    profiler.record_substep(
+                        "attention",
+                        i,
+                        time.perf_counter() - attention_t0,
+                        positions=end - pos,
+                    )
+                tiles.append(yt)
+                pos = end
+            attention_out = (
+                tiles[0]
+                if len(tiles) == 1
+                else mx.concatenate(tiles, axis=1)
+            )
+            prefix_sum = (
+                prefix_sum + attention_out
+                if prefix_sum is not None
+                else attention_out
+            )
+            mx.eval(prefix_sum)
+            del attention_input, attention_out, tiles, attention_w
+            self.cache.discard(attention_key, attention_names)
+
+            mlp_wait_started = time.perf_counter()
+            if not self.cache.contains(mlp_key):
+                incoming = self._layer_fetch_bytes_estimate(i, mlp_names)
+                self.cache.prepare_for(incoming)
+                if self.governor is not None:
+                    self.governor.reserve(incoming)
+            mlp_w = self.cache.get(mlp_key, mlp_names)
+            mlp_wait_s = time.perf_counter() - mlp_wait_started
+            self.timer.add("weights_wait", mlp_wait_s)
+
+            # The current MLP page is now authoritative and cannot be displaced
+            # by speculation. Only at this boundary may the worker start the
+            # next attention page, overlapping its sequential decode with the
+            # much longer routed-expert MLP rather than delaying this layer's
+            # MLP behind speculative work.
+            if self.prefetcher and i + 1 < n:
+                next_attention, _ = (
+                    self._k3_nf12_split_layer_names(i + 1)
+                )
+                self.prefetcher.schedule(
+                    f"{self._layer_key(i + 1)}.attn",
+                    next_attention,
+                    page_size_hint=self._layer_fetch_bytes_estimate(
+                        i + 1, next_attention
+                    ),
+                )
+
+            mlp_input = attn_res_mlp_input(
+                prefix_sum,
+                block_residual,
+                mlp_w,
+                prefix,
+                self.cfg,
+                fused_tile_size=(
+                    self.rc.kimi_k3_fused_attnres_tile_size),
+            )
+            mlp_t0 = time.perf_counter()
+            if i < self.cfg.first_k_dense_replace:
+                mlp_out = _kimi_dense_mlp_tiled(
+                    mlp_input,
+                    mlp_w,
+                    f"{prefix}.mlp",
+                    self.cfg,
+                    self.rc.kimi_k3_dense_mlp_tile_size,
+                )
+            else:
+                if self.rc.expert_batch_prefetch:
+                    self._expert_shared_overlap_layers += 1
+                mlp_out = _kimi_moe_output(
+                    mlp_input,
+                    mlp_w,
+                    prefix,
+                    self.cfg,
+                    i,
+                    self._get_experts,
+                    iter_expert_batches=self._iter_expert_batches,
+                    profile=profiler,
+                    overlap_shared_expert=(
+                        self.rc.expert_batch_prefetch
+                    ),
+                )
+            mx.eval(mlp_out)
+            if profiler is not None and profiler.sync_substeps:
+                profiler.record_substep(
+                    "mlp",
+                    i,
+                    time.perf_counter() - mlp_t0,
+                    positions=total,
+                )
+            x = prefix_sum + mlp_out
+            mx.eval(x)
+            total_compute_wall = time.perf_counter() - compute_started
+            compute_s = max(0.0, total_compute_wall - mlp_wait_s)
+            weight_wait_s = attention_wait_s + mlp_wait_s
+            self.timer.add("layer_compute", compute_s)
+
+            if profiler is not None:
+                profiler.record_layer(
+                    i,
+                    positions=total,
+                    weight_wait_s=weight_wait_s,
+                    compute_s=compute_s,
+                    cache_before=cache_before,
+                    cache_after=profiler.cache_snapshot(self.cache),
+                    layer_type=self._profile_layer_type(i),
+                )
+            if on_progress is not None:
+                on_progress({
+                    "phase": "prefill_layer",
+                    "completed_layers": i + 1,
+                    "total_layers": n,
+                    "total_tokens": total,
+                    "cache_source": "cold",
+                })
+
+            end_active = mx.get_active_memory()
+            peak_active = mx.get_peak_memory()
+            measured_transient = _resident_adjusted_transient(
+                active_before, end_active, peak_active
+            )
+            self._last_k3_transient_observation = {
+                "layer": i,
+                "signature": self._transient_layer_signature(i),
+                "start_active_bytes": int(active_before),
+                "end_active_bytes": int(end_active),
+                "peak_active_bytes": int(peak_active),
+                "measured_transient_bytes": int(measured_transient),
+            }
+            self._record_layer_transient(
+                total, i, measured_transient
+            )
+            self._note_true_peak()
+            del mlp_input, mlp_out, mlp_w, prefix_sum
+            self.cache.discard(mlp_key, mlp_names)
+
+        self._restore_aggregate_layer_transient(total)
+        return apply_output_attn_res(
+            x,
+            {
+                "model.output_attn_res_proj.weight": (
+                    self._output_attn_res_proj_w
+                ),
+                "model.output_attn_res_norm.weight": (
+                    self._output_attn_res_norm_w
+                ),
+            },
+            block_residual,
+            self.cfg,
+            fused_tile_size=(
+                self.rc.kimi_k3_fused_attnres_tile_size),
+        )
 
     def forward_tokens(self, tokens: list[int], kv, tap_layers=None) -> mx.array:
         """Feed tokens through the streamed model against an existing KV cache.
@@ -3178,10 +4113,20 @@ class StreamingEngine:
             from .kimi_linear import (
                 _apply_attn_res, _kda_attention, _mla_attention,
                 _kimi_dense_mlp, _kimi_moe_output)
-            block_residual = mx.zeros(
-                (embedded.shape[0] * len(tokens), 0, embedded.shape[2]),
-                dtype=embedded.dtype)
+            block_residual = (
+                []
+                if self.rc.kimi_k3_fused_attnres_tile_size
+                else mx.zeros(
+                    (
+                        embedded.shape[0] * len(tokens),
+                        0,
+                        embedded.shape[2],
+                    ),
+                    dtype=embedded.dtype,
+                )
+            )
         for layer in range(n):
+            self._select_layer_transient(1, layer)
             if self.prefetcher:
                 for nxt in range(
                         layer + 1,
@@ -3217,17 +4162,29 @@ class StreamingEngine:
                 B, N, H = x_layer.shape
                 prefix_sum_layer = x_layer
                 hidden_layer = x_layer
-                if block_residual.shape[1] > 0:
+                block_count = (
+                    len(block_residual)
+                    if isinstance(block_residual, list)
+                    else block_residual.shape[1]
+                )
+                if block_count > 0:
                     hidden_layer = _apply_attn_res(
                         prefix_sum_layer.reshape(-1, H), block_residual,
                         weights[f"{prefix}.self_attention_res_proj.weight"],
                         weights[f"{prefix}.self_attention_res_norm.weight"],
                         self.cfg.rms_norm_eps,
+                        fused_tile_size=(
+                            self.rc.kimi_k3_fused_attnres_tile_size),
                     ).reshape(B, N, H)
                 if layer % self.cfg.attn_res_block_size == 0:
-                    block_residual = mx.concatenate(
-                        [block_residual, prefix_sum_layer.reshape(-1, H)[:, None, :]],
-                        axis=1)
+                    snapshot = prefix_sum_layer.reshape(-1, H)
+                    if isinstance(block_residual, list):
+                        block_residual.append(snapshot)
+                    else:
+                        block_residual = mx.concatenate(
+                            [block_residual, snapshot[:, None, :]],
+                            axis=1,
+                        )
                     prefix_sum_layer = None
 
                 attn_outputs = []
@@ -3255,6 +4212,8 @@ class StreamingEngine:
                     weights[f"{prefix}.mlp_res_proj.weight"],
                     weights[f"{prefix}.mlp_res_norm.weight"],
                     self.cfg.rms_norm_eps,
+                    fused_tile_size=(
+                        self.rc.kimi_k3_fused_attnres_tile_size),
                 ).reshape(B, N, H)
 
                 mlp_outputs = []
@@ -3346,15 +4305,15 @@ class StreamingEngine:
                 # verifier arithmetic, while DSpark receives one ordinary
                 # (1, positions, hidden) context tensor per requested layer.
                 self._tap_hidden[layer] = mx.concatenate(positions, axis=1)
-            self._layer_transient = max(
-                self._layer_transient,
+            self._record_layer_transient(
+                1, layer,
                 _resident_adjusted_transient(
                     active_before, mx.get_active_memory(),
                     mx.get_peak_memory()))
-            self._decode_layer_transient = self._layer_transient
             self._note_true_peak()
             del weights
 
+        self._restore_aggregate_layer_transient(1)
         if kimi_k3_family:
             from .kimi_linear import apply_output_attn_res
 
@@ -3363,7 +4322,9 @@ class StreamingEngine:
                 x_all, {
                     "model.output_attn_res_proj.weight": self._output_attn_res_proj_w,
                     "model.output_attn_res_norm.weight": self._output_attn_res_norm_w,
-                }, block_residual, self.cfg)
+                }, block_residual, self.cfg,
+                fused_tile_size=(
+                    self.rc.kimi_k3_fused_attnres_tile_size))
             mx.eval(x_all)
             positions = [x_all[:, p:p + 1, :] for p in range(x_all.shape[1])]
 
@@ -3432,6 +4393,11 @@ class StreamingEngine:
             quant = _quantization_cache_identity(self.rc, self.store)
             arithmetic = (
                 f"abs{int(self.rc.mla_absorbed_decode)}"
+                f"k3cmla{int(self.rc.kimi_k3_compressed_mla)}"
+                f"k3abs{int(self.rc.kimi_k3_absorbed_mla)}"
+                f"k3mlakt{self.rc.kimi_k3_mla_key_tile_size}"
+                f"k3ar{self.rc.kimi_k3_fused_attnres_tile_size}"
+                f"k3dmlp{self.rc.kimi_k3_dense_mlp_tile_size}"
                 f"dead{int(self.rc.final_dead_token_elim)}"
                 f"head{int(self.rc.stream_lm_head)}"
                 f"tiedhead{int(self.rc.quantize_tied_lm_head)}"
@@ -3440,7 +4406,14 @@ class StreamingEngine:
                 f"residentmoe{int(self.rc.resident_moe_decode)}"
                 f"fswiglu{int(self.rc.fused_swiglu)}"
                 f"chunk{self.rc.prefill_chunk_size}"
+                f"layerstationary{int(self.rc.layer_stationary_prefill)}"
                 f"lastsep{int(self.rc.prefill_last_token_separate)}"
+                # The v2 schedule retains a layer-stationary prompt
+                # endpoint's hidden state for logits instead of recomputing
+                # its last token in a second streamed sweep. Batch shapes can
+                # change floating reduction order, so old endpoint logits
+                # must not share a persistence namespace.
+                "layerstationaryendpointv2"
                 f"ckpt{self.rc.prefill_checkpoint_every}"
                 f"expertbatch{self.rc.expert_fetch_batch}"
                 f"decodeexpertbatch{self.rc.decode_expert_fetch_batch}"
@@ -3470,7 +4443,11 @@ class StreamingEngine:
                     self.cfg.head_dim,
                 )
             return PositionFreeKVCache(self._position_free_pool)
-        if stepped:
+        k3_compressed_mla = bool(
+            self.rc.kimi_k3_compressed_mla
+            and self.cfg.model_type == "kimi_k3"
+        )
+        if stepped or k3_compressed_mla:
             from .kv_cache import SteppedKVCache
 
             kv = SteppedKVCache(self.cfg.num_hidden_layers)
@@ -3488,6 +4465,16 @@ class StreamingEngine:
                 from .glm_dsa import DSAState
 
                 kv.dsa = DSAState(self.cfg)
+        if k3_compressed_mla:
+            # Explicit K3 candidate: retain only Moonshot's released
+            # [c_kv | k_rope] latent, and use the capacity-stepped axis-1
+            # cache so long prefill does not recopy the full prefix per tile.
+            kv.compressed_mla = True
+            kv.mla_absorbed = self.rc.kimi_k3_absorbed_mla
+            kv.mla_absorbed_prefill = self.rc.kimi_k3_absorbed_mla
+            kv.mla_absorbed_key_tile_size = int(
+                self.rc.kimi_k3_mla_key_tile_size
+            )
         if self.cfg.model_type in (
                 "kimi_linear", "kimi_k3", "qwen3_5_moe", "qwen3_5", "jet_nemotron"):
             # KDA's recurrent state is fixed-size and not token-indexed. Exact
@@ -3542,6 +4529,13 @@ class StreamingEngine:
         self._max_experts_per_compute_batch = 0
         self._adaptive_expert_batch_clamps = 0
         self._min_adaptive_expert_batch = 0
+        self._expert_batch_prefetch_submitted = 0
+        self._expert_batch_prefetch_wait_s = 0.0
+        self._expert_batch_prefetch_hidden_s = 0.0
+        self._expert_shared_overlap_layers = 0
+        self.expert_route_overlap_trace = []
+        self._expert_route_last_by_layer = {}
+        self._expert_route_overlap_totals = {}
         request_cache_before = _cache_io_snapshot(self)
         # F69 proof-carrying execution telemetry: validation harnesses can assert
         # that the feature under test actually ran instead of inferring it from a
@@ -3616,6 +4610,7 @@ class StreamingEngine:
             "sampling_seed": sampling.seed,
             "constraint_profile": getattr(constraint, "profile", "none"),
             "prefill_chunks": 0,
+            "layer_stationary_endpoint_fused": 0,
             "prefill_checkpoints_saved": 0,
             "paged_kv_chunk_cache_clears": 0,
             "adaptive_kv_spill": 0,
@@ -3656,8 +4651,17 @@ class StreamingEngine:
         force_adaptive_paged = bool(
             adaptive_spill_mb and getattr(prompt, "force_paged_kv", False))
         use_stepped_kv = bool(
-            self.rc.stepped_kv_threshold
-            and len(tokens) + max_tokens > self.rc.stepped_kv_threshold
+            (
+                (
+                    self.rc.stepped_kv_threshold
+                    and len(tokens) + max_tokens
+                    > self.rc.stepped_kv_threshold
+                )
+                or (
+                    self.rc.kimi_k3_compressed_mla
+                    and self.cfg.model_type == "kimi_k3"
+                )
+            )
             and not self.rc.max_kv_mb
             and not force_adaptive_paged
             and not self.rc.tool_pic_shared_pages
@@ -4350,6 +5354,14 @@ class StreamingEngine:
             logits = precomputed_prompt_logits
         else:
             pos = matched
+            # A layer-stationary sweep returns the hidden states for every
+            # position it consumes.  When that sweep reaches the prompt
+            # endpoint, retain its final hidden state for logits instead of
+            # throwing it away and streaming the last prompt token through a
+            # second complete weight sweep.  The ordinary chunk-major path
+            # still needs its historical final-tail sweep because earlier
+            # chunks intentionally discard their hidden states.
+            layer_stationary_endpoint_x = None
             # Fork a retention checkpoint at this turn's stable boundary for
             # recurrent_exact_only models. The released chat template
             # re-renders any but the LATEST assistant turn without its own
@@ -4551,9 +5563,6 @@ class StreamingEngine:
                 stop_before = pos
                 while stop_before < prefill_limit:
                     end = min(stop_before + chunk, prefill_limit)
-                    if (not self.rc.prefill_last_token_separate
-                            and end >= len(tokens)):
-                        break
                     stop_before = end
                 if stop_before > pos:
                     # F96 hot-KV bookkeeping: the ordinary loop advances
@@ -4585,7 +5594,11 @@ class StreamingEngine:
                         xc = self._layer_stationary_qwen35_sweep(
                             xc, kv, offset=pos, tile_width=chunk,
                             on_progress=on_progress)
-                    del xc
+                    if stop_before == len(tokens):
+                        layer_stationary_endpoint_x = xc
+                        path_stats["layer_stationary_endpoint_fused"] = 1
+                    else:
+                        del xc
                     if self.rc.max_kv_mb or force_adaptive_paged:
                         mx.clear_cache()
                     path_stats["prefill_chunks"] += -(-(stop_before - pos) // chunk)
@@ -4739,12 +5752,16 @@ class StreamingEngine:
                                 getattr(prompt, "tool_capsules", ()),
                                 cache_namespace)
                             raise
-            x = self._embed(list(tokens[pos:]))
-            # F36 applies here because generate() consumes only the last position;
-            # forward_tokens (speculative verify) must NOT use it — it needs
-            # logits and trunk states at every fed position.
-            x = self._sweep(x, kv, offset=pos,
-                            final_mlp_last_only=self.rc.final_dead_token_elim)
+            if layer_stationary_endpoint_x is not None:
+                x = layer_stationary_endpoint_x
+            else:
+                x = self._embed(list(tokens[pos:]))
+                # F36 applies here because generate() consumes only the last
+                # position; forward_tokens (speculative verify) must NOT use
+                # it — it needs logits and trunk states at every fed position.
+                x = self._sweep(
+                    x, kv, offset=pos,
+                    final_mlp_last_only=self.rc.final_dead_token_elim)
             if (hot_eligible
                     and pos == reusable_watermark
                     and len(tokens) - pos == self.rc.hot_prompt_kv_chunk_size):
@@ -5188,10 +6205,62 @@ class StreamingEngine:
         path_stats["max_experts_per_compute_batch"] = self._max_experts_per_compute_batch
         path_stats["adaptive_expert_batch_clamps"] = self._adaptive_expert_batch_clamps
         path_stats["min_adaptive_expert_batch"] = self._min_adaptive_expert_batch
+        path_stats["expert_batch_prefetch"] = int(
+            self._expert_batch_executor is not None)
+        path_stats["expert_batch_prefetch_submitted"] = (
+            self._expert_batch_prefetch_submitted)
+        path_stats["expert_batch_prefetch_wait_s"] = (
+            self._expert_batch_prefetch_wait_s)
+        path_stats["expert_batch_prefetch_hidden_s"] = (
+            self._expert_batch_prefetch_hidden_s)
+        path_stats["expert_shared_overlap_layers"] = (
+            self._expert_shared_overlap_layers)
+        overlap = self._expert_route_overlap_totals
+        for key in (
+            "calls",
+            "positions",
+            "selected_slots",
+            "union_experts",
+            "adjacent_pairs",
+            "within_call_pairs",
+            "cross_call_pairs",
+            "adjacent_intersection_experts",
+            "adjacent_union_experts",
+            "adjacent_current_experts",
+            "exact_adjacent_pairs",
+            "cross_call_intersection_experts",
+            "cross_call_current_experts",
+        ):
+            path_stats[f"expert_route_{key}"] = int(overlap.get(key, 0))
+        path_stats["expert_route_adjacent_reuse_fraction"] = (
+            overlap.get("adjacent_intersection_experts", 0)
+            / max(1, overlap.get("adjacent_current_experts", 0))
+        )
+        path_stats["expert_route_adjacent_jaccard"] = (
+            overlap.get("adjacent_intersection_experts", 0)
+            / max(1, overlap.get("adjacent_union_experts", 0))
+        )
+        path_stats["expert_route_union_efficiency"] = (
+            overlap.get("selected_slots", 0)
+            / max(1, overlap.get("union_experts", 0))
+        )
+        path_stats["expert_route_cross_call_reuse_fraction"] = (
+            overlap.get("cross_call_intersection_experts", 0)
+            / max(1, overlap.get("cross_call_current_experts", 0))
+        )
+        path_stats["expert_route_cross_call_reusable_storage_bytes_upper_bound"] = (
+            int(overlap.get("cross_call_intersection_experts", 0))
+            * int(self._expert_storage_page_bytes)
+        )
         path_stats["expert_resident_page_bytes_estimate"] = self._expert_page_bytes
         path_stats["expert_storage_page_bytes_estimate"] = (
             self._expert_storage_page_bytes)
         path_stats["expert_fetch_page_bytes_estimate"] = self._expert_fetch_page_bytes
+        path_stats["configured_expert_fetch_batch"] = self.rc.expert_fetch_batch
+        path_stats["configured_expert_compute_batch"] = (
+            self.rc.expert_compute_batch)
+        path_stats["auto_compact_expert_fetch_batch"] = (
+            self._auto_compact_expert_batch)
         path_stats["resident_fast_decode_sweeps"] = self._resident_fast_decode_sweeps
         path_stats["resident_fast_prefill_sweeps"] = self._resident_fast_prefill_sweeps
         path_stats["resident_moe_sweeps"] = self._resident_moe_sweeps
@@ -5672,6 +6741,11 @@ class StreamingEngine:
             self._position_free_pool.close()
             self._position_free_pool = None
         self._prompt_kv_store = None
+        # An in-flight exact expert fetch can still consult the governor and
+        # cache. Join it before closing either dependency.
+        if self._expert_batch_executor is not None:
+            self._expert_batch_executor.shutdown(wait=True, cancel_futures=True)
+            self._expert_batch_executor = None
         if self.governor is not None:
             self.governor.close()
         if self.prefetcher:
@@ -5682,3 +6756,4 @@ class StreamingEngine:
             self._streamed_lm_head.close()
         if self._embed_rows is not None:
             self._embed_rows.close()
+        self.cache.clear()

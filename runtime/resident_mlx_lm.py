@@ -8,6 +8,7 @@ Missing/incompatible MLX-LM therefore never makes the core runtime unusable.
 
 from __future__ import annotations
 
+import copy
 import gc
 import importlib
 import json
@@ -273,6 +274,53 @@ def _exact_extension_prefix(
     return 0
 
 
+def _exact_prompt_cache_match(
+    cached_token_ids: list[int] | tuple[int, ...] | None,
+    prompt_ids: list[int] | tuple[int, ...],
+) -> tuple[int, str]:
+    """Match only an identical prompt endpoint or its strict extension.
+
+    Qwen3.5's DeltaNet state is a recurrent fold, so an arbitrary LCP cannot
+    be rewound safely.  Exact endpoint reuse and forward-only extension are
+    both released-model-correct and independent of prompt contents.
+    """
+    cached = tuple(cached_token_ids or ())
+    current = tuple(prompt_ids)
+    if not cached:
+        return 0, "miss"
+    if current == cached:
+        return len(cached), "exact"
+    prefix = _exact_extension_prefix(cached, current)
+    if prefix:
+        return prefix, "extension"
+    return 0, "miss"
+
+
+def _fork_prompt_cache(prompt_cache):
+    """Fork MLX-LM cache wrappers without copying evaluated array payloads.
+
+    Qwen3.5 ``ArraysCache`` updates replace recurrent arrays, while
+    ``KVCache`` appends only after its numeric offset.  A shallow wrapper fork
+    therefore gives copy-on-write recurrent state and a stable attention
+    prefix: decode may write spare KV capacity after the saved endpoint, but
+    the retained fork never exposes positions beyond its own offset.
+    """
+    forked = []
+    for entry in prompt_cache or ():
+        clone = copy.copy(entry)
+        cache_list = getattr(entry, "cache", None)
+        if isinstance(cache_list, list):
+            clone.cache = list(cache_list)
+        child_caches = getattr(entry, "caches", None)
+        if isinstance(child_caches, (tuple, list)):
+            children = _fork_prompt_cache(child_caches)
+            clone.caches = (
+                tuple(children)
+                if isinstance(child_caches, tuple) else children)
+        forked.append(clone)
+    return forked
+
+
 class ResidentMLXLMEngine:
     """Server-compatible text engine backed by a fully resident MLX-LM model."""
 
@@ -295,6 +343,7 @@ class ResidentMLXLMEngine:
         self._prepared_prompt_token_cache = None
         self.last_kv = None
         self._last_cache_token_ids: tuple[int, ...] = ()
+        self._last_prompt_logits = None
         self._generation_sampled_tokens = 0
 
         tokenizer_path = self._model_dir / "tokenizer.json"
@@ -334,12 +383,14 @@ class ResidentMLXLMEngine:
             del model
         self.last_kv = None
         self._last_cache_token_ids = ()
+        self._last_prompt_logits = None
         gc.collect()
         mx.clear_cache()
 
     def discard_failed_request_state(self) -> None:
         self.last_kv = None
         self._last_cache_token_ids = ()
+        self._last_prompt_logits = None
         mx.clear_cache()
 
     def report(self) -> str:
@@ -378,6 +429,7 @@ class ResidentMLXLMEngine:
         self, prompt_ids: list[int], max_tokens: int, sampling: SamplingParams,
         constraint, generated: list[int], prompt_cache, progress,
         prefill_step_size: int, prefix_len: int = 0,
+        exact_prompt_logits=None, on_prompt_endpoint=None,
     ):
         prompt = mx.array(prompt_ids, dtype=mx.int32)
         total = len(prompt_ids)
@@ -392,10 +444,32 @@ class ResidentMLXLMEngine:
             progress(processed, total)
             mx.clear_cache()
 
-        current = prompt[processed:]
+        if exact_prompt_logits is not None:
+            values = exact_prompt_logits
+            if constraint is not None:
+                values = constraint.mask_logits(values)
+            token = sample(
+                values, sampling, history=[*prompt_ids, *generated])
+            progress(total, total)
+            yield token
+            current = mx.array([token], dtype=mx.int32)
+        else:
+            current = prompt[processed:]
+        endpoint_pending = exact_prompt_logits is None
         while True:
             logits = self.model(current[None], cache=prompt_cache)[:, -1, :]
-            values = logits.reshape(-1)
+            raw_values = logits.reshape(-1)
+            if endpoint_pending:
+                # Materialize both the raw endpoint distribution and every
+                # cache state before sharing their array references with the
+                # retained prompt snapshot.
+                mx.eval(
+                    raw_values,
+                    [entry.state for entry in prompt_cache])
+                if on_prompt_endpoint is not None:
+                    on_prompt_endpoint(prompt_cache, raw_values)
+                endpoint_pending = False
+            values = raw_values
             if constraint is not None:
                 values = constraint.mask_logits(values)
             token = sample(
@@ -454,12 +528,31 @@ class ResidentMLXLMEngine:
             "VMODEL_MLX_LM_PROMPT_CACHE", "1")
         if cache_setting not in ("0", "1"):
             raise ValueError("VMODEL_MLX_LM_PROMPT_CACHE must be 0 or 1")
-        prefix_len = (
-            _exact_extension_prefix(self._last_cache_token_ids, prompt_ids)
-            if cache_setting == "1" and self.last_kv is not None else 0)
+        prefix_len = 0
+        cache_match = "miss"
+        matched_cache = None
+        exact_prompt_logits = None
+        full_candidate_tokens = len(self._last_cache_token_ids)
+        full_candidate_lcp = 0
+        for old, new in zip(self._last_cache_token_ids, prompt_ids):
+            if old != new:
+                break
+            full_candidate_lcp += 1
+        if cache_setting == "1":
+            if self.last_kv is not None:
+                full_prefix, full_match = _exact_prompt_cache_match(
+                    self._last_cache_token_ids, prompt_ids)
+                if full_match != "exact" or self._last_prompt_logits is not None:
+                    prefix_len = full_prefix
+                    cache_match = full_match
+                    matched_cache = self.last_kv if full_prefix else None
+                    exact_prompt_logits = (
+                        self._last_prompt_logits
+                        if full_match == "exact" else None)
         if not prefix_len:
             self.last_kv = None
             self._last_cache_token_ids = ()
+            self._last_prompt_logits = None
             gc.collect()
             mx.clear_cache()
         request_reserve_mb = _positive_env_mb(
@@ -497,12 +590,23 @@ class ResidentMLXLMEngine:
                     "completed_tokens": int(done),
                     "total_tokens": int(total),
                     "cache_source": (
-                        "hot-exact-extension" if prefix_len else "cold"),
+                        f"hot-prompt-{cache_match}"
+                        if prefix_len else "cold"),
                 })
 
         prompt_cache = (
-            self.last_kv if prefix_len else self._make_prompt_cache())
-        self.last_kv = prompt_cache
+            _fork_prompt_cache(matched_cache)
+            if prefix_len else self._make_prompt_cache())
+        retained_prompt_cache = (
+            self.last_kv if prefix_len else None)
+        retained_prompt_logits = (
+            self._last_prompt_logits if prefix_len else None)
+
+        def capture_prompt_endpoint(cache, logits):
+            nonlocal retained_prompt_cache, retained_prompt_logits
+            retained_prompt_cache = _fork_prompt_cache(cache)
+            retained_prompt_logits = logits
+
         generated: list[int] = []
         stream_decoder = (
             IncrementalDetokenizer(self.tokenizer, stop)
@@ -510,37 +614,23 @@ class ResidentMLXLMEngine:
         active_before = mx.get_active_memory()
         mx.reset_peak_memory()
 
-        direct = (
-            constraint is not None
-            or sampling.repetition_penalty != 1.0
-            or prefix_len > 0)
-        if direct:
-            token_iterator = self._direct_tokens(
-                prompt_ids, max_tokens, sampling, constraint, generated,
-                prompt_cache, progress, prefill_step_size, prefix_len)
-            execution_path = (
-                "mlx_lm_exact_extension"
-                if prefix_len else "mlx_lm_direct_constrained")
-        else:
-            generate_module = importlib.import_module("mlx_lm.generate")
-
-            if sampling.is_greedy:
-                sampler = lambda values: mx.argmax(values, axis=-1)
-            else:
-                sampler = lambda values: mx.array(sample(values, sampling))
-            token_iterator = (
-                int(token)
-                for token, _logprobs in generate_module.generate_step(
-                    mx.array(prompt_ids, dtype=mx.int32),
-                    self.model,
-                    max_tokens=max_tokens,
-                    sampler=sampler,
-                    prompt_cache=prompt_cache,
-                    prefill_step_size=prefill_step_size,
-                    prompt_progress_callback=progress,
-                )
-            )
-            execution_path = "mlx_lm_generate_step"
+        # Use one direct loop for cold and cached requests.  Besides keeping
+        # sampling/constraint behavior identical across both paths, this gives
+        # us the exact raw distribution and cache state at the prompt endpoint
+        # before decode advances either one.
+        token_iterator = self._direct_tokens(
+            prompt_ids, max_tokens, sampling, constraint, generated,
+            prompt_cache, progress, prefill_step_size, prefix_len,
+            exact_prompt_logits=exact_prompt_logits,
+            on_prompt_endpoint=(
+                None if cache_match == "exact"
+                else capture_prompt_endpoint))
+        execution_path = (
+            "mlx_lm_prompt_exact"
+            if cache_match == "exact"
+            else "mlx_lm_prompt_extension"
+            if cache_match == "extension"
+            else "mlx_lm_direct")
 
         first_token_s = 0.0
         prefill_s = 0.0
@@ -602,12 +692,13 @@ class ResidentMLXLMEngine:
         total_s = time.perf_counter() - request_started
         decode_s = sum(decode_intervals)
         kv_bytes = _prompt_cache_nbytes(prompt_cache)
-        # Generation caches all prompt tokens and all generated tokens except
-        # the final yielded token.  That exact endpoint can seed a later strict
-        # extension; no trim, LCP branch, or approximate recurrent state is
-        # accepted.
-        self._last_cache_token_ids = tuple(
-            [*prompt_ids, *generated[:-1]])
+        # Retain the state and raw logits exactly at the prompt endpoint, not
+        # the post-generation endpoint.  Identical prompts can resample from
+        # the same distribution at any temperature; strict extensions advance
+        # the saved recurrent fold.  Arbitrary LCP branches remain ineligible.
+        self.last_kv = retained_prompt_cache
+        self._last_cache_token_ids = tuple(prompt_ids)
+        self._last_prompt_logits = retained_prompt_logits
         true_peak = max(
             active_before, mx.get_active_memory(), mx.get_peak_memory())
         result = {
@@ -631,7 +722,12 @@ class ResidentMLXLMEngine:
                 "execution_path": execution_path,
                 "prompt_cache_prefix_tokens": prefix_len,
                 "prompt_cache_source": (
-                    "hot-exact-extension" if prefix_len else "cold"),
+                    f"hot-prompt-{cache_match}"
+                    if prefix_len else "cold"),
+                "retained_prompt_kv_bytes": _prompt_cache_nbytes(
+                    retained_prompt_cache),
+                "prompt_cache_full_candidate_tokens": full_candidate_tokens,
+                "prompt_cache_full_candidate_lcp_tokens": full_candidate_lcp,
                 "constraint_profile": getattr(constraint, "profile", "none"),
                 "resident_model_payload_bytes": (
                     self._resident_backend_decision.payload_bytes),
@@ -647,6 +743,7 @@ class ResidentMLXLMEngine:
         if cache_setting == "0":
             self.last_kv = None
             self._last_cache_token_ids = ()
+            self._last_prompt_logits = None
             del prompt_cache
             mx.clear_cache()
         return result

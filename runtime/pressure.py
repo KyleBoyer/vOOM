@@ -32,6 +32,8 @@ import psutil
 _DEFAULT_CRITICAL_AVAILABLE = int(1.2e9)
 _SWAP_WINDOW_SECONDS = 30.0
 _SWAP_GROWTH_LIMIT = 16_000_000
+_RESERVE_SETTLE_ATTEMPTS = 12
+_RESERVE_SETTLE_SECONDS = 0.15
 
 
 def _swap_growth(
@@ -261,8 +263,11 @@ class MemoryGovernor:
         # treating one reading as ground truth -- far cheaper than the
         # request-level retry-from-scratch this refusal would otherwise trigger.
         resample_attempts = 0
-        while projected > ceiling and resample_attempts < 3:
-            time.sleep(0.15)
+        while (
+            projected > ceiling
+            and resample_attempts < _RESERVE_SETTLE_ATTEMPTS
+        ):
+            time.sleep(_RESERVE_SETTLE_SECONDS)
             active, available, ceiling, projected = sample()
             resample_attempts += 1
 
