@@ -99,6 +99,20 @@ def ngram_propose(tokens: list[int], k: int, max_ngram: int = 6, min_ngram: int 
     return []
 
 
+def serial_position_verifier_supported(cfg) -> bool:
+    """Whether a verify window can retain one-token arithmetic layer-major."""
+    return (
+        not int(getattr(cfg, "num_experts", 0) or 0)
+        or getattr(cfg, "model_type", None) in (
+            "glm_moe_dsa",
+            "kimi_k25",
+            "glm4_moe_lite",
+            "kimi_linear",
+            "kimi_k3",
+        )
+    )
+
+
 class SpeculativeDecoder:
     def __init__(self, target: StreamingEngine, draft: StreamingEngine | None, k: int = 6,
                  min_tokens_per_sweep: float | None = None,
@@ -511,9 +525,10 @@ class SpeculativeDecoder:
                 # since the whole reason this dispatch exists is to avoid
                 # the batched-GEMM verify divergence confirmed for these
                 # architectures.
-                glm_family = tgt.cfg.model_type in (
-                    "glm_moe_dsa", "kimi_k25", "glm4_moe_lite")
-                if (not tgt.cfg.num_experts or glm_family) and len(verify_tokens) > 1:
+                if (
+                    serial_position_verifier_supported(tgt.cfg)
+                    and len(verify_tokens) > 1
+                ):
                     logits = tgt.forward_tokens_serial_positions(
                         verify_tokens, t_kv)
                 else:

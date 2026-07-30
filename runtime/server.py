@@ -1055,6 +1055,59 @@ class EngineManager:
             raise RequestValidationError(
                 "VMODEL_K3_PREFILL_TILE_WIDTH must be in [1, 4096]"
             )
+        k3_suffix_request = os.environ.get(
+            "VMODEL_K3_SUFFIX_DECODING", "0"
+        ).strip()
+        if k3_suffix_request not in ("0", "1"):
+            raise RequestValidationError(
+                "VMODEL_K3_SUFFIX_DECODING must be 0 or 1"
+            )
+        try:
+            k3_suffix_k = int(os.environ.get(
+                "VMODEL_K3_SUFFIX_K", "2"
+            ))
+            k3_suffix_max_depth = int(os.environ.get(
+                "VMODEL_K3_SUFFIX_MAX_DEPTH", "8"
+            ))
+            k3_suffix_factor = float(os.environ.get(
+                "VMODEL_K3_SUFFIX_FACTOR", "2.0"
+            ))
+            k3_suffix_min_probability = float(os.environ.get(
+                "VMODEL_K3_SUFFIX_MIN_PROBABILITY", "0.75"
+            ))
+            k3_suffix_max_local_tokens = int(os.environ.get(
+                "VMODEL_K3_SUFFIX_MAX_LOCAL_TOKENS", "65536"
+            ))
+        except ValueError as error:
+            raise RequestValidationError(
+                "VMODEL_K3_SUFFIX_* settings must be numeric"
+            ) from error
+        if k3_suffix_k <= 0:
+            raise RequestValidationError(
+                "VMODEL_K3_SUFFIX_K must be positive"
+            )
+        if k3_suffix_max_depth < 2:
+            raise RequestValidationError(
+                "VMODEL_K3_SUFFIX_MAX_DEPTH must be at least 2"
+            )
+        if (
+            not math.isfinite(k3_suffix_factor)
+            or k3_suffix_factor < 0
+        ):
+            raise RequestValidationError(
+                "VMODEL_K3_SUFFIX_FACTOR must be finite and non-negative"
+            )
+        if (
+            not math.isfinite(k3_suffix_min_probability)
+            or not 0 <= k3_suffix_min_probability <= 1
+        ):
+            raise RequestValidationError(
+                "VMODEL_K3_SUFFIX_MIN_PROBABILITY must be in [0, 1]"
+            )
+        if k3_suffix_max_local_tokens <= 0:
+            raise RequestValidationError(
+                "VMODEL_K3_SUFFIX_MAX_LOCAL_TOKENS must be positive"
+            )
         key = (
             str(model_dir), mode, yarn_factor.hex(),
             bool(requires_vision), resident_backend_request,
@@ -1070,6 +1123,12 @@ class EngineManager:
             k3_fused_attnres_tile_size,
             k3_dense_mlp_tile_size,
             k3_prefill_tile_width,
+            k3_suffix_request,
+            k3_suffix_k,
+            k3_suffix_max_depth,
+            k3_suffix_factor.hex(),
+            k3_suffix_min_probability.hex(),
+            k3_suffix_max_local_tokens,
         )
         # A healthy resident engine owns all state it needs. Return before
         # touching model storage so a transient NAS disconnect cannot stall or
@@ -1088,6 +1147,18 @@ class EngineManager:
             k3_scale_sidecar_request,
             bf16_nf12_sidecar_request,
             bf16_nf12_uncached_request,
+            k3_compressed_mla_request,
+            k3_absorbed_mla_request,
+            k3_mla_key_tile_size,
+            k3_fused_attnres_tile_size,
+            k3_dense_mlp_tile_size,
+            k3_prefill_tile_width,
+            k3_suffix_request,
+            k3_suffix_k,
+            k3_suffix_max_depth,
+            k3_suffix_factor.hex(),
+            k3_suffix_min_probability.hex(),
+            k3_suffix_max_local_tokens,
         )
         # Validate the requested profile before evicting a healthy resident
         # engine. ModelConfig.from_dir is read-only and has the same remount
@@ -1388,6 +1459,30 @@ class EngineManager:
                 rc.layer_stationary_prefill = True
                 rc.min_weight_cache_mb = 150
                 rc.max_weight_cache_mb = 3000
+                # F188: exact target-verified suffix drafting. K3 has no
+                # released MTP head, so a bounded engine-local suffix model is
+                # the zero-weight draft source. The verifier runs positions
+                # serially inside one layer-major sweep, preserving ordinary
+                # one-token arithmetic while amortizing trunk and LM-head I/O.
+                # Explicit opt-in only: acceptance and net speed still need a
+                # multi-domain corpus, especially for stochastic requests
+                # (which correctly fall back to ordinary sampling).
+                rc.suffix_decoding = k3_suffix_request == "1"
+                if rc.suffix_decoding:
+                    rc.suffix_decoding_k = k3_suffix_k
+                    rc.suffix_decoding_max_depth = k3_suffix_max_depth
+                    rc.suffix_decoding_factor = k3_suffix_factor
+                    rc.suffix_decoding_min_probability = (
+                        k3_suffix_min_probability
+                    )
+                    rc.suffix_decoding_max_local_tokens = (
+                        k3_suffix_max_local_tokens
+                    )
+                    # With depth 8 this bounded budget retains roughly 50K
+                    # prompt tokens in the local trie without approaching the
+                    # multi-GB target-weight working set.
+                    rc.suffix_decoding_max_nodes = 800_000
+                    rc.suffix_decoding_max_bytes = 256_000_000
                 # F135 re-tested the existing model-agnostic trunk prefetch
                 # after F132/F134 changed K3's residency economics. On the
                 # complete correct 93-layer native path, depth=1 reduced

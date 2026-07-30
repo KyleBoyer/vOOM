@@ -33,7 +33,7 @@ from typing import Iterable, Sequence
 
 import mlx.core as mx
 
-from .kv_cache import KVCache
+from .kv_cache import KVCache, SteppedKVCache
 
 
 # Measured by the standalone audit at about 260 B/node on its small corpus.
@@ -42,6 +42,11 @@ from .kv_cache import KVCache
 _ACCOUNTED_NODE_BYTES = 320
 _ACCOUNTED_SEQUENCE_BYTES = 80
 _ACCOUNTED_TOKEN_BYTES = 8
+# K3 retains about 465 MB per strict-prefix recurrent endpoint. Its default
+# two-token draft therefore fits below this cap, while wider explicit windows
+# fail back to the pre-F189 restore/refeed path instead of risking the 8.5 GB
+# Metal working-set ceiling.
+_MAX_RETAINED_KDA_ENDPOINT_BYTES = 1_000_000_000
 
 
 class _Node:
@@ -70,6 +75,11 @@ class SuffixDecodeStats:
     lookup_match_tokens: int = 0
     local_rounds: int = 0
     global_rounds: int = 0
+    kda_endpoint_capture_rounds: int = 0
+    kda_endpoint_restore_rounds: int = 0
+    kda_endpoint_retained_peak_bytes: int = 0
+    kda_refeed_sweeps: int = 0
+    kda_refeed_sweeps_saved: int = 0
 
 
 @dataclass
@@ -493,6 +503,14 @@ def select_verified_tokens(proposed: Sequence[int],
     return accepted, draft[:accepted] + [target[accepted]]
 
 
+def kda_endpoint_capture_bytes(kda_cache, verifier_positions: int) -> int:
+    """Conservative extra Metal bytes for strict-prefix KDA endpoints."""
+    positions = int(verifier_positions)
+    if positions <= 1 or kda_cache is None:
+        return 0
+    return int(kda_cache.nbytes()) * (positions - 1)
+
+
 def fallback_reason(engine, kv, sampling, constraint, *, terminal: bool) -> str | None:
     """Return why shared-prefill suffix decode is ineligible, else ``None``."""
     if not engine.rc.suffix_decoding:
@@ -520,10 +538,24 @@ def fallback_reason(engine, kv, sampling, constraint, *, terminal: bool) -> str 
     # abs diff, logits AND all 30 kda_cache layers) vs true sequential
     # decode, exactly mirroring the standard kimi_linear's own diagnostic
     # just met. Both are exempted here alongside glm_family.
+    #
+    # F188: K3's released checkpoint has no native MTP head. Its existing
+    # one-position, layer-major verifier passed the real-weight oracle and
+    # now handles the released SteppedKVCache, compressed MLA, KDA state,
+    # and streamed embedding/head path below. The suffix source only
+    # proposes; every committed token still comes from this target verifier.
     kimi_linear_family = engine.cfg.model_type == "kimi_linear"
+    kimi_k3_family = engine.cfg.model_type == "kimi_k3"
     qwen_moe_family = engine.cfg.model_type == "qwen3_5_moe"
-    if not glm_family and not kimi_linear_family and not qwen_moe_family and (
-            engine.cfg.num_experts or engine.cfg.model_type == "gpt_oss"):
+    if (
+        not glm_family
+        and not kimi_linear_family
+        and not kimi_k3_family
+        and not qwen_moe_family
+        and (
+            engine.cfg.num_experts or engine.cfg.model_type == "gpt_oss"
+        )
+    ):
         return "non-dense-target"
     # 2026-07-25: real Qwen3.5/3.6 text checkpoints (e.g. Qwen3.5-9B) carry a
     # non-empty `vision_config` sub-dict in their raw config.json (inherited
@@ -538,13 +570,18 @@ def fallback_reason(engine, kv, sampling, constraint, *, terminal: bool) -> str 
     if (getattr(engine.cfg, "vision_config", None)
             and engine.cfg.model_type.startswith("qwen3_vl")):
         return "vision-target"
-    if type(kv) is not KVCache:
+    k3_stepped_latent = bool(
+        kimi_k3_family
+        and type(kv) is SteppedKVCache
+        and getattr(kv, "compressed_mla", False)
+    )
+    if type(kv) is not KVCache and not k3_stepped_latent:
         return "unproven-kv-layout"
-    if getattr(kv, "compressed_mla", False):
+    if getattr(kv, "compressed_mla", False) and not kimi_k3_family:
         return "compressed-kv"
     if (getattr(kv, "kda_cache", None) is not None
             and engine.cfg.model_type not in (
-                "qwen3_5", "qwen3_5_moe", "kimi_linear")):
+                "qwen3_5", "qwen3_5_moe", "kimi_linear", "kimi_k3")):
         # F94: KVCache.trim() has no kda_cache branch -- a partially-accepted
         # round would silently roll back only the ordinary KV, leaving the
         # DeltaNet/KDA recurrent state polluted by the rejected suffix with
@@ -576,12 +613,20 @@ def fallback_reason(engine, kv, sampling, constraint, *, terminal: bool) -> str 
         # exercising its actual MoE routing through the same per-position
         # dispatch, not just dense layers.
         #
+        # F188: K3 uses the same generic round fork/restore contract for its
+        # KDA layers. Its SteppedKVCache carries compressed MLA separately and
+        # is accepted only by the exact type/layout check above.
+        #
         # The SAME round-loop fork/restore code below already handles any
         # kda_cache-bearing target generically (it never branched on
         # model_type), so no separate fork/restore logic was needed for
-        # either of these targets.
+        # all of these targets.
         return "recurrent-state-target"
-    if engine._embed_rows is not None or engine._streamed_lm_head is not None:
+    if (
+        (engine._embed_rows is not None
+         or engine._streamed_lm_head is not None)
+        and not kimi_k3_family
+    ):
         return "streamed-embedding-or-head"
     if engine.rc.rerank_lm_head:
         return "reranked-head"
@@ -632,17 +677,13 @@ def run_shared_prefill_suffix_decode(
         catchup_tok = generated[-1]
         # F113 follow-on (2026-07-25): checkpoint DeltaNet/KDA recurrent
         # state before this round's speculative feed -- cheap (no array
-        # copies, see kda_state.py). Ordinary KV can be trimmed back to any
-        # offset below; kda_cache cannot (KVCache.trim() has no kda_cache
-        # branch), so a rejected or stop-cut-short round must instead
-        # restore this fork and re-feed exactly the tokens that end up
-        # committed. Mirrors runtime/qwen35_ngram.py's own proven pattern
-        # for the same problem in its own (simpler, single-request) round
-        # loop. This module previously refused any kda_cache target
-        # entirely (see fallback_reason's recurrent-state-target check,
-        # now conditioned on this actually being safe);
-        # forward_tokens_serial_positions itself was also just extended to
-        # support qwen3_5/qwen3_5_moe's hybrid layers for the same reason.
+        # copies, see kda_state.py). Ordinary KV can be trimmed to any
+        # offset, while recurrent state needs an exact endpoint.
+        #
+        # F189 retains every strict-prefix KDA endpoint inside the same
+        # layer-major verifier sweep. Once acceptance is known, the matching
+        # endpoint can be installed directly. This pre-round fork remains the
+        # exact fallback when the bounded endpoint budget declines capture.
         kda_checkpoint = (
             kv.kda_cache.fork() if getattr(kv, "kda_cache", None) is not None
             else None)
@@ -650,9 +691,37 @@ def run_shared_prefill_suffix_decode(
         if engine.governor is not None and engine._token_transient:
             engine.governor.reserve(engine._token_transient)
         mx.reset_peak_memory()
+        capture_bytes = kda_endpoint_capture_bytes(
+            kda_checkpoint, 1 + len(draft)
+        )
+        capture_kda_endpoints = bool(
+            capture_bytes
+            and capture_bytes <= _MAX_RETAINED_KDA_ENDPOINT_BYTES
+        )
+        if capture_kda_endpoints:
+            stats.kda_endpoint_capture_rounds += 1
+        retained_kda_bytes = 0
         try:
-            window_logits = engine.forward_tokens_serial_positions(
-                [catchup_tok] + draft, kv)
+            verify_tokens = [catchup_tok] + draft
+            if capture_kda_endpoints:
+                window_logits = engine.forward_tokens_serial_positions(
+                    verify_tokens,
+                    kv,
+                    capture_kda_endpoints=True,
+                )
+                retained_kda_bytes = int(getattr(
+                    engine,
+                    "_serial_kda_endpoint_retained_bytes",
+                    capture_bytes,
+                ))
+                stats.kda_endpoint_retained_peak_bytes = max(
+                    stats.kda_endpoint_retained_peak_bytes,
+                    retained_kda_bytes,
+                )
+            else:
+                window_logits = engine.forward_tokens_serial_positions(
+                    verify_tokens, kv
+                )
             greedy = [int(value) for value in mx.argmax(
                 window_logits, axis=-1).reshape(-1)]
             accepted, verified = select_verified_tokens(draft, greedy)
@@ -664,6 +733,11 @@ def run_shared_prefill_suffix_decode(
                 kv.trim(base)
             if kda_checkpoint is not None:
                 kv.kda_cache = kda_checkpoint
+            consume_endpoint = getattr(
+                engine, "consume_serial_kda_endpoint", None
+            )
+            if consume_endpoint is not None:
+                consume_endpoint(None)
             raise
         stats.sweeps += 1
 
@@ -698,38 +772,70 @@ def run_shared_prefill_suffix_decode(
         if kv.offset > endpoint:
             kv.trim(endpoint)
 
-        # F113 follow-on: kda_cache correction. The forward call above fed
+        # F113/F189: kda_cache correction. The forward call above fed
         # the FULL [catchup_tok] + draft window into the recurrent state
         # regardless of how much of it ends up accepted/committed (a
         # partial reject, or a stop/eos mid-window, both leave it "ahead"
-        # of the true endpoint) -- restore the fork and re-feed exactly
-        # [catchup_tok] + emitted_this_round[:-1] (the same "final token
-        # never fed" endpoint convention every other path in this project
-        # already uses) whenever that's shorter than what was actually fed.
+        # of the true endpoint). Select the retained strict-prefix endpoint
+        # whenever available; otherwise restore the fork and re-feed exactly
+        # [catchup_tok] + emitted_this_round[:-1]. Both preserve the standard
+        # "final returned token is never fed" endpoint convention.
         if kda_checkpoint is not None:
             true_feed_len = 1 + max(0, len(emitted_this_round) - 1)
             if true_feed_len < 1 + len(draft):
-                # Ordinary KV was already trimmed (above) to reflect only
-                # the true committed tokens, but its write position
-                # (kv.offset) now sits at `endpoint` -- past `base`, where
-                # kda_checkpoint's own state logically belongs. Trim KV
-                # back to `base` too before refeeding, or this call would
-                # try to *append* the refeed window starting at `endpoint`
-                # instead of overwriting from `base`, desyncing kv.offset
-                # from len(generated) on the very next round.
-                kv.trim(base)
-                kv.kda_cache = kda_checkpoint
-                refeed = [catchup_tok] + emitted_this_round[:-1]
-                refeed_logits = engine.forward_tokens_serial_positions(refeed, kv)
-                mx.eval(refeed_logits)
-                stats.sweeps += 1
+                consume_endpoint = getattr(
+                    engine, "consume_serial_kda_endpoint", None
+                )
+                retained_endpoint = (
+                    consume_endpoint(true_feed_len)
+                    if capture_kda_endpoints
+                    and consume_endpoint is not None
+                    else None
+                )
+                if retained_endpoint is not None:
+                    # Ordinary MLA/KV was already trimmed to this endpoint.
+                    # Install the layer-complete recurrent snapshot assembled
+                    # during verification without touching target weights.
+                    kv.kda_cache = retained_endpoint
+                    stats.kda_endpoint_restore_rounds += 1
+                    stats.kda_refeed_sweeps_saved += 1
+                else:
+                    if consume_endpoint is not None:
+                        consume_endpoint(None)
+                    # Memory-bounded fallback: restore the pre-round state and
+                    # replay the accepted prefix exactly as before F189.
+                    kv.trim(base)
+                    kv.kda_cache = kda_checkpoint
+                    refeed = [catchup_tok] + emitted_this_round[:-1]
+                    refeed_logits = engine.forward_tokens_serial_positions(
+                        refeed, kv
+                    )
+                    mx.eval(refeed_logits)
+                    stats.sweeps += 1
+                    stats.kda_refeed_sweeps += 1
+            else:
+                consume_endpoint = getattr(
+                    engine, "consume_serial_kda_endpoint", None
+                )
+                if consume_endpoint is not None:
+                    consume_endpoint(None)
 
         from .engine import _resident_adjusted_transient
 
+        measured_token_transient = _resident_adjusted_transient(
+            boundary, mx.get_active_memory(), mx.get_peak_memory()
+        )
+        # Strict-prefix endpoints are deliberate resident state, not scratch.
+        # They have already been consumed/dropped above; excluding their known
+        # bytes prevents the next ordinary token from reserving them again and
+        # evicting target weights unnecessarily.
+        measured_token_transient = max(
+            0, measured_token_transient - retained_kda_bytes
+        )
         engine._token_transient = max(
             engine._token_transient,
-            _resident_adjusted_transient(
-                boundary, mx.get_active_memory(), mx.get_peak_memory()))
+            measured_token_transient,
+        )
         engine._note_true_peak()
         elapsed = time.perf_counter() - round_started
         if emitted_this_round:

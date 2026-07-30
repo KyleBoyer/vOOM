@@ -153,6 +153,151 @@ def test_shared_prefill_round_rolls_back_rejected_tail(
     assert kv.trim_calls[-1] == kv.offset
 
 
+class _EndpointKDA:
+    def __init__(self, value=0, *, bytes_per_endpoint=16):
+        self.value = int(value)
+        self._bytes = int(bytes_per_endpoint)
+
+    def fork(self):
+        return _EndpointKDA(
+            self.value, bytes_per_endpoint=self._bytes
+        )
+
+    def nbytes(self):
+        return self._bytes
+
+
+class _EndpointKV(_FakeKV):
+    def __init__(self, offset, *, bytes_per_endpoint=16):
+        super().__init__(offset)
+        self.kda_cache = _EndpointKDA(
+            10, bytes_per_endpoint=bytes_per_endpoint
+        )
+
+
+class _EndpointEngine(_FakeEngine):
+    def __init__(self, target_tokens):
+        super().__init__(target_tokens)
+        self.forward_calls = []
+        self._serial_kda_endpoints = None
+        self._serial_kda_endpoint_retained_bytes = 0
+
+    def forward_tokens_serial_positions(
+        self, tokens, kv, *, capture_kda_endpoints=False
+    ):
+        self.forward_calls.append(list(tokens))
+        start = kv.kda_cache.value
+        endpoints = []
+        for index, _token in enumerate(tokens):
+            endpoints.append(_EndpointKDA(
+                start + index + 1,
+                bytes_per_endpoint=kv.kda_cache.nbytes(),
+            ))
+        kv.kda_cache = endpoints[-1]
+        kv.offset += len(tokens)
+        if capture_kda_endpoints:
+            self._serial_kda_endpoints = endpoints[:-1]
+            self._serial_kda_endpoint_retained_bytes = sum(
+                endpoint.nbytes()
+                for endpoint in self._serial_kda_endpoints
+            )
+
+        target = (
+            self.target_tokens
+            if len(self.forward_calls) == 1
+            else [0] * len(tokens)
+        )
+        vocab = max(32, max(target, default=0) + 1)
+        logits = mx.full((len(tokens), vocab), -10.0)
+        rows = mx.arange(len(tokens))
+        logits[rows, mx.array(target)] = 10.0
+        return logits
+
+    def consume_serial_kda_endpoint(self, fed_positions):
+        endpoints = self._serial_kda_endpoints
+        self._serial_kda_endpoints = None
+        self._serial_kda_endpoint_retained_bytes = 0
+        if fed_positions is None or endpoints is None:
+            return None
+        return endpoints[int(fed_positions) - 1]
+
+
+@pytest.mark.parametrize(
+    ("target", "max_tokens", "expected_state", "restores"),
+    [
+        ([7, 8, 9], 2, 11, 1),  # accept none: catchup only
+        ([5, 7, 9], 3, 12, 1),  # partial: catchup + one draft
+        ([5, 6, 7], 4, 13, 0),  # accept all: complete verifier endpoint
+    ],
+)
+def test_kda_accept_none_partial_all_select_retained_endpoint_without_refeed(
+    target, max_tokens, expected_state, restores
+):
+    from runtime.suffix_decoding import run_shared_prefill_suffix_decode
+
+    prompt = [10, 11, 12]
+    generated = [3]
+    kv = _EndpointKV(len(prompt))
+    engine = _EndpointEngine(target)
+    result = run_shared_prefill_suffix_decode(
+        engine,
+        _FakeProposalCache([5, 6]),
+        _FakeState(),
+        prompt_tokens=prompt,
+        generated=generated,
+        kv=kv,
+        logits=mx.zeros((1, 32)),
+        max_tokens=max_tokens,
+        stop=[],
+        stream_decoder=None,
+        on_token=lambda _delta: None,
+        stop_match=lambda _text: None,
+    )
+
+    assert kv.kda_cache.value == expected_state
+    assert len(engine.forward_calls) == 1
+    assert result.stats.sweeps == 1
+    assert result.stats.kda_endpoint_capture_rounds == 1
+    assert result.stats.kda_endpoint_restore_rounds == restores
+    assert result.stats.kda_refeed_sweeps == 0
+    assert result.stats.kda_refeed_sweeps_saved == restores
+    assert result.stats.kda_endpoint_retained_peak_bytes == 32
+    assert engine._serial_kda_endpoints is None
+
+
+def test_kda_endpoint_memory_cap_preserves_exact_refeed_fallback():
+    from runtime.suffix_decoding import run_shared_prefill_suffix_decode
+
+    prompt = [10, 11, 12]
+    generated = [3]
+    # Two retained prefixes would require 1.2 GB, above the bounded 1 GB
+    # endpoint budget, so the established restore/refeed path must remain.
+    kv = _EndpointKV(len(prompt), bytes_per_endpoint=600_000_000)
+    engine = _EndpointEngine([5, 7, 9])
+    result = run_shared_prefill_suffix_decode(
+        engine,
+        _FakeProposalCache([5, 6]),
+        _FakeState(),
+        prompt_tokens=prompt,
+        generated=generated,
+        kv=kv,
+        logits=mx.zeros((1, 32)),
+        max_tokens=3,
+        stop=[],
+        stream_decoder=None,
+        on_token=lambda _delta: None,
+        stop_match=lambda _text: None,
+    )
+
+    assert kv.kda_cache.value == 12
+    assert len(engine.forward_calls) == 2
+    assert result.stats.sweeps == 2
+    assert result.stats.kda_endpoint_capture_rounds == 0
+    assert result.stats.kda_endpoint_restore_rounds == 0
+    assert result.stats.kda_refeed_sweeps == 1
+    assert result.stats.kda_refeed_sweeps_saved == 0
+
+
 @pytest.mark.parametrize(("stop", "eos", "expected_stop"), [
     (("STOP",), (), "3A"),
     ((), (6,), None),
@@ -278,6 +423,31 @@ def test_suffix_vision_config_alone_does_not_disqualify_text_only_qwen():
     engine.cfg.model_type = "qwen3_vl"
     assert fallback_reason(
         engine, kv, greedy, None, terminal=False) == "vision-target"
+
+
+def test_k3_exact_stepped_latent_and_streamed_io_are_verifier_eligible():
+    from runtime.kda_state import KDAStateCache
+    from runtime.kv_cache import SteppedKVCache
+    from runtime.sampler import SamplingParams
+    from runtime.suffix_decoding import fallback_reason
+
+    engine = _fallback_engine(enabled=True)
+    engine.cfg.model_type = "kimi_k3"
+    engine.cfg.num_experts = 896
+    engine._embed_rows = object()
+    engine._streamed_lm_head = object()
+    kv = SteppedKVCache(3)
+    kv.compressed_mla = True
+    kv.kda_cache = KDAStateCache(3)
+
+    assert fallback_reason(
+        engine, kv, SamplingParams(), None, terminal=False
+    ) is None
+
+    engine.cfg.model_type = "other_moe"
+    assert fallback_reason(
+        engine, kv, SamplingParams(), None, terminal=False
+    ) == "non-dense-target"
 
 
 def test_runtime_config_yaml_is_explicit_and_default_off(tmp_path):

@@ -45,6 +45,20 @@ class _Engine:
         self.closes += 1
 
 
+def test_serial_position_verifier_includes_k3_moe_family():
+    from runtime.speculative import serial_position_verifier_supported
+
+    assert serial_position_verifier_supported(SimpleNamespace(
+        model_type="kimi_k3", num_experts=896
+    ))
+    assert serial_position_verifier_supported(SimpleNamespace(
+        model_type="qwen2", num_experts=0
+    ))
+    assert not serial_position_verifier_supported(SimpleNamespace(
+        model_type="unsupported_moe", num_experts=8
+    ))
+
+
 def test_speculative_adapter_falls_back_for_limits_and_vocab():
     from runtime.speculative import SpeculativeEngine
 

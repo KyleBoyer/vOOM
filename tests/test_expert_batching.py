@@ -71,6 +71,35 @@ def test_route_overlap_summary_without_prior_has_only_within_call_pairs():
     assert summary["adjacent_union_experts"] == 3
 
 
+def test_serial_verify_route_rows_are_offset_before_provisional_commit():
+    from types import SimpleNamespace
+
+    from runtime.engine import (
+        StreamingEngine,
+        offset_expert_route_positions,
+    )
+
+    first = offset_expert_route_positions(
+        {4: [0], 7: [0, 0]}, 3
+    )
+    assert first == {
+        4: [3],
+        7: [3, 3],
+    }
+    assert offset_expert_route_positions(None, 9) is None
+
+    engine = SimpleNamespace(
+        _provisional=[
+            (5, {1: [0]}),
+            (5, offset_expert_route_positions({2: [0]}, 2)),
+        ],
+        expert_usage={},
+        predictor=None,
+    )
+    StreamingEngine.commit_provisional(engine, accepted_positions=2)
+    assert engine.expert_usage == {(5, 1): 1}
+
+
 def test_compact_expert_io_batch_uses_representation_bytes_not_model_identity():
     from runtime.engine import compact_expert_io_batch_size
 

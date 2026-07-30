@@ -365,6 +365,23 @@ def expert_route_overlap_summary(
     return summary, tuple(sorted(ordered[-1]))
 
 
+def offset_expert_route_positions(
+    positions_by_expert: dict[int, list[int]] | None,
+    position_offset: int,
+) -> dict[int, list[int]] | None:
+    """Move slice-local router rows into their enclosing verifier window."""
+    if positions_by_expert is None:
+        return None
+    offset = int(position_offset)
+    return {
+        int(expert): [
+            offset + int(position)
+            for position in positions
+        ]
+        for expert, positions in positions_by_expert.items()
+    }
+
+
 def _system_allocation_preserves_floor(
         incoming_bytes: int, floor_mb: int) -> tuple[bool, int, int]:
     """Sample whether one allocation leaves the configured unified-RAM floor."""
@@ -1352,6 +1369,19 @@ class StreamingEngine:
         self._layer_transient_recurring_max: dict[
             tuple[int, str], int
         ] = {}
+        # Serial speculative verification executes one-position arithmetic but
+        # retains several position outputs/endpoints. Its high-water must not
+        # train the ordinary one-token decode reserve, or the following token
+        # over-evicts useful weights.
+        self._serial_verify_layer_transient: dict[
+            tuple[int, str], int
+        ] = {}
+        self._serial_verify_layer_transient_counts: dict[
+            tuple[int, str], int
+        ] = {}
+        self._serial_verify_layer_transient_recurring_max: dict[
+            tuple[int, str], int
+        ] = {}
         self._layer_transient_margin = 400_000_000
         self._token_transient = 0  # F42: whole-token transient (greedy sync point)
         # 2026-07-13: F42's own per-layer/per-token mx.reset_peak_memory() calls
@@ -1372,6 +1402,11 @@ class StreamingEngine:
         # whole-call tracker above, by resetting this one before each chunk.
         self._chunk_peak_metal_bytes = 0
         self._tap_hidden: dict[int, mx.array] = {}  # F62: optional hidden-state taps
+        # F189: optional exact recurrent endpoints retained by the most recent
+        # layer-major verify sweep. They are consumed immediately after target
+        # acceptance is known; ordinary calls leave this empty.
+        self._serial_kda_endpoints = None
+        self._serial_kda_endpoint_retained_bytes = 0
         # F43: a declared context bound <= index_topk means the DSA indexer can
         # never deselect anything — elide its weights and state entirely.
         self._dsa_elided = bool(
@@ -2077,6 +2112,52 @@ class StreamingEngine:
             by_positions[position_count] = max(
                 int(by_positions.get(position_count, 0)), learned)
             self._prefill_layer_transient = max(by_positions.values())
+        return learned
+
+    def _select_serial_verify_layer_transient(
+        self, verifier_positions: int, layer: int
+    ) -> int:
+        """Select scratch learned only from the same verifier-window width."""
+        width = int(verifier_positions)
+        if width <= 1:
+            return self._select_layer_transient(1, layer)
+        signature = self._transient_layer_signature(layer)
+        learned = self._serial_verify_layer_transient.get(
+            (width, signature)
+        )
+        if learned is None:
+            learned = self._layer_transient_by_signature.get(
+                (1, signature), 0
+            )
+        self._layer_transient = max(0, int(learned))
+        self._layer_transient_margin = _layer_transient_reserve_margin(1)
+        return self._layer_transient
+
+    def _record_serial_verify_layer_transient(
+        self, verifier_positions: int, layer: int, measured_bytes: int
+    ) -> int:
+        """Record verifier scratch without polluting ordinary decode state."""
+        width = int(verifier_positions)
+        if width <= 1:
+            return self._record_layer_transient(
+                1, layer, measured_bytes
+            )
+        key = (width, self._transient_layer_signature(layer))
+        measured = max(0, int(measured_bytes))
+        count = int(self._serial_verify_layer_transient_counts.get(key, 0))
+        if count == 0:
+            learned = measured
+        else:
+            learned = max(
+                int(self._serial_verify_layer_transient_recurring_max.get(
+                    key, 0
+                )),
+                measured,
+            )
+            self._serial_verify_layer_transient_recurring_max[key] = learned
+        self._serial_verify_layer_transient_counts[key] = count + 1
+        self._serial_verify_layer_transient[key] = learned
+        self._layer_transient = learned
         return learned
 
     def _restore_aggregate_layer_transient(self, position_count: int) -> int:
@@ -4018,8 +4099,34 @@ class StreamingEngine:
         mx.eval(logits)
         return logits
 
+    def consume_serial_kda_endpoint(
+        self, fed_positions: int | None
+    ):
+        """Consume one retained recurrent endpoint from the last verify call.
+
+        ``fed_positions`` is one-based within that verifier window. Passing
+        ``None`` discards every retained endpoint. The final/full-window KDA
+        state already lives in ``kv.kda_cache`` and is deliberately not
+        duplicated here, so only shorter accepted prefixes are selectable.
+        """
+        endpoints = getattr(self, "_serial_kda_endpoints", None)
+        self._serial_kda_endpoints = None
+        self._serial_kda_endpoint_retained_bytes = 0
+        if fed_positions is None or endpoints is None:
+            return None
+        count = int(fed_positions)
+        if not 1 <= count <= len(endpoints):
+            raise ValueError(
+                f"retained KDA endpoint {count} is outside "
+                f"[1, {len(endpoints)}]"
+            )
+        selected = endpoints[count - 1]
+        return selected if selected.nbytes() > 0 else None
+
     def forward_tokens_serial_positions(
-            self, tokens: list[int], kv, tap_layers=None) -> mx.array:
+        self, tokens: list[int], kv, tap_layers=None, *,
+        capture_kda_endpoints: bool = False,
+    ) -> mx.array:
         """Exact dense verification with one weight sweep for many positions.
 
         Batched ``(L, hidden)`` GEMMs can choose different reduction kernels
@@ -4028,6 +4135,10 @@ class StreamingEngine:
         every layer instead, but keep the loop layer-major so a streamed target
         fetches each layer only once for the complete verify window.
         """
+        # Never leave a prior verifier's large recurrent snapshots resident.
+        # A successful caller must consume the desired endpoint immediately.
+        self.consume_serial_kda_endpoint(None)
+
         glm_family = self.cfg.model_type in ("glm_moe_dsa", "kimi_k25", "glm4_moe_lite")
         qwen_family = self.cfg.model_type in ("qwen3_5", "qwen3_5_moe")
         kimi_family = self.cfg.model_type == "kimi_linear"
@@ -4089,6 +4200,7 @@ class StreamingEngine:
             return self.forward_tokens(tokens, kv, tap_layers=tap_layers)
 
         offset = kv.offset
+        verifier_positions = len(tokens)
         self._tap_hidden = {}
         # Every block invocation below has the ordinary one-position decode
         # shape even though several positions are retained across the
@@ -4102,6 +4214,20 @@ class StreamingEngine:
         embedded = self._embed(list(tokens))
         positions = [embedded[:, i:i + 1, :] for i in range(len(tokens))]
         n = self.cfg.num_hidden_layers
+        serial_kda_endpoints = None
+        if capture_kda_endpoints:
+            source_kda = getattr(kv, "kda_cache", None)
+            if source_kda is None:
+                raise ValueError(
+                    "KDA endpoint capture requires kv.kda_cache"
+                )
+            from .kda_state import KDAStateCache
+
+            # The complete-window endpoint remains installed in source_kda.
+            # Retain only the strict prefixes that a rejection/stop can select.
+            serial_kda_endpoints = [
+                KDAStateCache(n) for _ in range(len(tokens) - 1)
+            ]
         if glm_family:
             from .glm import _glm_attention_residual, _glm_mlp_residual
         if qwen_family:
@@ -4125,8 +4251,49 @@ class StreamingEngine:
                     dtype=embedded.dtype,
                 )
             )
+
+        def serial_expert_batches(position: int):
+            """Translate one-position-local route rows into verify-window rows.
+
+            Each architecture helper below sees a ``(1, 1, hidden)`` slice,
+            so its router labels the only row as position zero. Provisional
+            speculative bookkeeping, however, must know which window position
+            produced the route so rejected-tail observations are not committed.
+            """
+            def batches(layer, expert_ids, positions=None):
+                shifted = offset_expert_route_positions(
+                    positions, position
+                )
+                return self._iter_expert_batches(
+                    layer, expert_ids, positions=shifted
+                )
+
+            return batches
+
+        def capture_kda_position(layer: int, position: int) -> None:
+            """Retain this layer's exact recurrent endpoint for one prefix."""
+            if (
+                serial_kda_endpoints is None
+                or position >= len(serial_kda_endpoints)
+            ):
+                return
+            source = getattr(kv, "kda_cache", None)
+            if source is None:
+                return
+            state = source.state(layer)
+            history = source.conv_history(layer)
+            if state is None and history is None:
+                return
+            endpoint = serial_kda_endpoints[position]
+            if state is not None:
+                endpoint.set_state(layer, state)
+            if history is not None:
+                endpoint.set_conv_history(layer, tuple(history))
+
         for layer in range(n):
-            self._select_layer_transient(1, layer)
+            self._select_serial_verify_layer_transient(
+                verifier_positions, layer
+            )
             if self.prefetcher:
                 for nxt in range(
                         layer + 1,
@@ -4201,6 +4368,7 @@ class StreamingEngine:
                         kda_cache = getattr(kv, "kda_cache", None)
                         attn_out = _kda_attention(
                             h_normed, weights, prefix, self.cfg, kda_cache, layer)
+                        capture_kda_position(layer, position)
                     attn_outputs.append(attn_out)
                 attn_out_layer = mx.concatenate(attn_outputs, axis=1)
                 prefix_sum_layer = (
@@ -4229,7 +4397,9 @@ class StreamingEngine:
                         mlp_out = _kimi_moe_output(
                             h2_normed, weights, prefix, self.cfg, layer,
                             self._get_experts,
-                            iter_expert_batches=self._iter_expert_batches)
+                            iter_expert_batches=serial_expert_batches(
+                                position
+                            ))
                     mlp_outputs.append(mlp_out)
                 mlp_out_layer = mx.concatenate(mlp_outputs, axis=1)
                 prefix_sum_layer = prefix_sum_layer + mlp_out_layer
@@ -4252,7 +4422,9 @@ class StreamingEngine:
                         hidden = _glm_mlp_residual(
                             attn_out, weights, prefix, self.cfg, layer,
                             self._get_experts,
-                            iter_expert_batches=self._iter_expert_batches)
+                            iter_expert_batches=serial_expert_batches(
+                                position
+                            ))
                     elif qwen_family:
                         # F113 follow-on: DeltaNet-or-full-attention + MoE (if
                         # any) computed one position at a time, in order --
@@ -4266,10 +4438,13 @@ class StreamingEngine:
                             offset + position,
                             chunked_delta_prefill=(
                                 self.rc.qwen_chunked_delta_prefill))
+                        capture_kda_position(layer, position)
                         hidden = _qwen35_mlp_residual(
                             attn_out, weights, prefix, self.cfg, layer,
                             self._get_experts,
-                            iter_expert_batches=self._iter_expert_batches)
+                            iter_expert_batches=serial_expert_batches(
+                                position
+                            ))
                     elif kimi_family:
                         # F113 follow-on (Kimi K3 readiness): same one-
                         # position-at-a-time contract as qwen_family above --
@@ -4281,10 +4456,13 @@ class StreamingEngine:
                         attn_out = _kimi_linear_attention_residual(
                             hidden, weights, prefix, self.cfg, kv, layer,
                             offset + position)
+                        capture_kda_position(layer, position)
                         hidden = _kimi_linear_mlp_residual(
                             attn_out, weights, prefix, self.cfg, layer,
                             self._get_experts,
-                            iter_expert_batches=self._iter_expert_batches)
+                            iter_expert_batches=serial_expert_batches(
+                                position
+                            ))
                     else:
                         hidden = layer_runner.run_block(
                             hidden, weights, f"model.layers.{layer}", self.cfg,
@@ -4305,15 +4483,24 @@ class StreamingEngine:
                 # verifier arithmetic, while DSpark receives one ordinary
                 # (1, positions, hidden) context tensor per requested layer.
                 self._tap_hidden[layer] = mx.concatenate(positions, axis=1)
-            self._record_layer_transient(
-                1, layer,
+            self._record_serial_verify_layer_transient(
+                verifier_positions, layer,
                 _resident_adjusted_transient(
                     active_before, mx.get_active_memory(),
                     mx.get_peak_memory()))
             self._note_true_peak()
             del weights
 
-        self._restore_aggregate_layer_transient(1)
+        self._layer_transient = max(
+            (
+                value
+                for (width, _signature), value
+                in self._serial_verify_layer_transient.items()
+                if width == verifier_positions
+            ),
+            default=0,
+        )
+        self._layer_transient_margin = _layer_transient_reserve_margin(1)
         if kimi_k3_family:
             from .kimi_linear import apply_output_attn_res
 
@@ -4329,15 +4516,45 @@ class StreamingEngine:
             positions = [x_all[:, p:p + 1, :] for p in range(x_all.shape[1])]
 
         head = self._lm_head_weight()
-        logits = []
-        for hidden in positions:
-            value = self._final_logits(hidden, head=head)
-            mx.eval(value)
-            logits.append(value)
-        result = mx.stack(logits)
+        from .lm_head_stream import StreamedLMHead
+
+        if isinstance(head, StreamedLMHead):
+            # Preserve ordinary one-token contraction shapes while sharing
+            # each physical LM-head block read across the complete verifier
+            # window. A batched matmul is deliberately not substituted here:
+            # this method exists because its reduction choice can move logits.
+            if self.cfg.model_type in ("qwen3_5_moe", "qwen3_5"):
+                from .qwen35 import qwen35_rms_norm
+
+                normalize = qwen35_rms_norm
+            else:
+                normalize = mx.fast.rms_norm
+            normalized = mx.concatenate(
+                [
+                    normalize(
+                        hidden, self._norm_w, self.cfg.rms_norm_eps
+                    )
+                    for hidden in positions
+                ],
+                axis=1,
+            )
+            result = head.logits_serial_rows(normalized)[0]
+        else:
+            logits = []
+            for hidden in positions:
+                value = self._final_logits(hidden, head=head)
+                mx.eval(value)
+                logits.append(value)
+            result = mx.stack(logits)
         mx.eval(result)
         self._h_window = mx.concatenate(positions, axis=1)
         self._h_last = positions[-1]
+        self._serial_kda_endpoints = serial_kda_endpoints
+        self._serial_kda_endpoint_retained_bytes = (
+            sum(endpoint.nbytes() for endpoint in serial_kda_endpoints)
+            if serial_kda_endpoints is not None
+            else 0
+        )
         return result
 
     def _lazy_resident_decode_step(self, token: mx.array, kv):
@@ -4596,6 +4813,11 @@ class StreamingEngine:
             "suffix_decoding_lookup_match_tokens": 0,
             "suffix_decoding_local_rounds": 0,
             "suffix_decoding_global_rounds": 0,
+            "suffix_decoding_kda_endpoint_capture_rounds": 0,
+            "suffix_decoding_kda_endpoint_restore_rounds": 0,
+            "suffix_decoding_kda_endpoint_retained_peak_bytes": 0,
+            "suffix_decoding_kda_refeed_sweeps": 0,
+            "suffix_decoding_kda_refeed_sweeps_saved": 0,
             "suffix_decoding_prompt_approximate": 0,
             "suffix_decoding_single_tenant_required": int(
                 self.rc.suffix_decoding),
@@ -5939,6 +6161,21 @@ class StreamingEngine:
                 suffix_stats.local_rounds)
             path_stats["suffix_decoding_global_rounds"] = (
                 suffix_stats.global_rounds)
+            path_stats["suffix_decoding_kda_endpoint_capture_rounds"] = (
+                suffix_stats.kda_endpoint_capture_rounds
+            )
+            path_stats["suffix_decoding_kda_endpoint_restore_rounds"] = (
+                suffix_stats.kda_endpoint_restore_rounds
+            )
+            path_stats[
+                "suffix_decoding_kda_endpoint_retained_peak_bytes"
+            ] = suffix_stats.kda_endpoint_retained_peak_bytes
+            path_stats["suffix_decoding_kda_refeed_sweeps"] = (
+                suffix_stats.kda_refeed_sweeps
+            )
+            path_stats["suffix_decoding_kda_refeed_sweeps_saved"] = (
+                suffix_stats.kda_refeed_sweeps_saved
+            )
         elif can_pipeline:
             # Submit token N+1 before waiting for token N. The lazy token itself
             # is a valid gather index for the following graph, so CPU graph

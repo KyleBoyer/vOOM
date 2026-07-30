@@ -1556,6 +1556,7 @@ def test_k3_native_profile_uses_proven_layer_stationary_prefetch_schedule():
     assert rc.prompt_kv_dir == ""
     assert rc.stream_lm_head
     assert not rc.pin_lm_head
+    assert not rc.suffix_decoding
 
 
 def test_k3_long_context_math_candidates_are_explicit_and_forwarded():
@@ -1606,6 +1607,58 @@ def test_k3_long_context_math_candidates_are_explicit_and_forwarded():
     assert rc.kimi_k3_fused_attnres_tile_size == 128
     assert rc.kimi_k3_dense_mlp_tile_size == 256
     assert rc.prefill_chunk_size == 256
+
+
+def test_k3_suffix_verification_is_explicit_and_bounded():
+    from unittest.mock import patch
+
+    from runtime.server import EngineManager
+
+    captured = []
+
+    class FakeEngine:
+        def __init__(self, _path, rc):
+            captured.append(rc)
+
+        def close(self):
+            pass
+
+    cfg = SimpleNamespace(
+        model_type="kimi_k3",
+        tie_word_embeddings=False,
+        index_topk=0,
+        vision_config=None,
+    )
+    with patch.dict(
+        "os.environ",
+        {
+            "VMODEL_K3_SUFFIX_DECODING": "1",
+            "VMODEL_K3_SUFFIX_K": "3",
+            "VMODEL_K3_SUFFIX_MAX_DEPTH": "7",
+            "VMODEL_K3_SUFFIX_FACTOR": "1.5",
+            "VMODEL_K3_SUFFIX_MIN_PROBABILITY": "0.8",
+            "VMODEL_K3_SUFFIX_MAX_LOCAL_TOKENS": "32768",
+        },
+        clear=True,
+    ), patch(
+        "runtime.config.ModelConfig.from_dir", return_value=cfg
+    ), patch(
+        "runtime.path_resolver.resolve_model_dir",
+        side_effect=lambda path: path,
+    ), patch(
+        "runtime.engine.StreamingEngine", FakeEngine
+    ):
+        EngineManager().get(Path("/tmp/fake-k3"), "lossless")
+
+    rc = captured[0]
+    assert rc.suffix_decoding
+    assert rc.suffix_decoding_k == 3
+    assert rc.suffix_decoding_max_depth == 7
+    assert rc.suffix_decoding_factor == 1.5
+    assert rc.suffix_decoding_min_probability == 0.8
+    assert rc.suffix_decoding_max_local_tokens == 32768
+    assert rc.suffix_decoding_max_nodes == 800_000
+    assert rc.suffix_decoding_max_bytes == 256_000_000
 
 
 def test_k3_absorbed_mla_requires_compressed_mla():
@@ -3544,6 +3597,55 @@ def test_layer_transient_drops_one_time_signature_warmup_peak():
         engine, 5, 2, 1_200_000_000)
     assert StreamingEngine._select_layer_transient(
         engine, 5, 3) == 1_200_000_000
+
+
+def test_serial_verify_transient_does_not_poison_one_token_decode():
+    from types import SimpleNamespace
+
+    from runtime.engine import StreamingEngine
+
+    engine = object.__new__(StreamingEngine)
+    engine.cfg = SimpleNamespace(
+        model_type="synthetic_moe",
+        layer_types=(),
+        kda_layers=(0, 1),
+        full_attn_layers=(),
+        indexer_types=(),
+        num_experts=256,
+        mlp_layer_types=(),
+        first_k_dense_replace=0,
+    )
+    engine._layer_transient = 0
+    engine._layer_transient_margin = 0
+    engine._layer_transient_by_signature = {}
+    engine._layer_transient_observation_counts = {}
+    engine._layer_transient_recurring_max = {}
+    engine._decode_layer_transient = 0
+    engine._prefill_layer_transient = 0
+    engine._prefill_layer_transient_by_positions = {}
+    engine._serial_verify_layer_transient = {}
+    engine._serial_verify_layer_transient_counts = {}
+    engine._serial_verify_layer_transient_recurring_max = {}
+
+    StreamingEngine._record_layer_transient(
+        engine, 1, 0, 500_000_000
+    )
+    StreamingEngine._record_serial_verify_layer_transient(
+        engine, 3, 0, 1_400_000_000
+    )
+
+    assert StreamingEngine._select_serial_verify_layer_transient(
+        engine, 3, 1
+    ) == 1_400_000_000
+    StreamingEngine._record_serial_verify_layer_transient(
+        engine, 3, 1, 600_000_000
+    )
+    assert StreamingEngine._select_serial_verify_layer_transient(
+        engine, 3, 1
+    ) == 600_000_000
+    assert StreamingEngine._select_layer_transient(
+        engine, 1, 1
+    ) == 500_000_000
 
 
 def test_cache_io_delta_reports_only_current_request():

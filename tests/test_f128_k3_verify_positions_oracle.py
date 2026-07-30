@@ -19,6 +19,7 @@ from __future__ import annotations
 from pathlib import Path
 
 import mlx.core as mx
+import numpy as np
 import pytest
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -75,13 +76,56 @@ def test_forward_tokens_serial_positions_matches_forward_tokens_for_first_three_
         engine_batched.cfg.num_hidden_layers = 3
         engine_serial.cfg.num_hidden_layers = 3
 
+        # Ordinary one-token decode is the exact arithmetic contract the
+        # serial verifier preserves. Retain its position-1 recurrent endpoint
+        # before advancing to position 2.
         kv_batched = engine_batched.new_kv()
-        batched_logits = engine_batched.forward_tokens(tokens, kv_batched)
+        first_logits = engine_batched.forward_tokens(
+            tokens[:1], kv_batched
+        )
+        first_kda_endpoint = kv_batched.kda_cache.fork()
+        second_logits = engine_batched.forward_tokens(
+            tokens[1:], kv_batched
+        )
+        batched_logits = mx.concatenate(
+            [first_logits, second_logits], axis=0
+        )
         mx.eval(batched_logits)
 
         kv_serial = engine_serial.new_kv()
-        serial_logits = engine_serial.forward_tokens_serial_positions(tokens, kv_serial)
+        serial_logits = engine_serial.forward_tokens_serial_positions(
+            tokens, kv_serial, capture_kda_endpoints=True
+        )
         mx.eval(serial_logits)
+        retained = engine_serial.consume_serial_kda_endpoint(1)
+        assert retained is not None
+        assert engine_serial._serial_kda_endpoints is None
+        assert engine_serial._serial_kda_endpoint_retained_bytes == 0
+
+        captured_layers = 0
+        for layer in range(engine_serial.cfg.num_hidden_layers):
+            expected_state = first_kda_endpoint.state(layer)
+            actual_state = retained.state(layer)
+            if expected_state is None:
+                assert actual_state is None
+                continue
+            captured_layers += 1
+            assert actual_state is not None
+            assert np.array_equal(
+                np.array(actual_state),
+                np.array(expected_state),
+            ), f"KDA state endpoint differs at layer {layer}"
+            expected_history = first_kda_endpoint.conv_history(layer)
+            actual_history = retained.conv_history(layer)
+            assert expected_history is not None
+            assert actual_history is not None
+            for expected, actual in zip(
+                expected_history, actual_history, strict=True
+            ):
+                assert np.array_equal(
+                    np.array(actual), np.array(expected)
+                ), f"KDA conv endpoint differs at layer {layer}"
+        assert captured_layers > 0
 
         assert batched_logits.shape == serial_logits.shape
         max_diff = mx.max(mx.abs(
@@ -96,6 +140,10 @@ def test_forward_tokens_serial_positions_matches_forward_tokens_for_first_three_
         assert max_diff.item() < 1e-3, (
             "forward_tokens_serial_positions and forward_tokens must "
             f"produce near-identical logits; max abs diff {max_diff.item()}")
+        assert (
+            mx.argmax(batched_logits, axis=-1).tolist()
+            == mx.argmax(serial_logits, axis=-1).tolist()
+        )
     finally:
         engine_serial.close()
         engine_batched.close()

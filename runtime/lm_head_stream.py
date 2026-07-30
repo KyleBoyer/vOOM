@@ -101,3 +101,54 @@ class StreamedLMHead:
             mx.eval(c)
             chunks.append(c)
         return mx.concatenate(chunks, axis=-1)
+
+    def logits_serial_rows(self, h: mx.array) -> mx.array:
+        """Stream each vocab block once while preserving one-row matmul shapes.
+
+        Speculative verification deliberately evaluates target positions with
+        the same one-position GEMM shapes as ordinary greedy decode. Calling
+        :meth:`logits` once per position preserves that arithmetic but rereads
+        the complete LM head for every position. A single batched call reads
+        the head once, but can select a different reduction kernel.
+
+        This method keeps those concerns separate: each position remains an
+        independent ``(1, hidden) @ (hidden, block_rows)`` operation, while all
+        positions share the one physical read of each vocab-row block.
+        """
+        if h.shape[-1] != self.hidden:
+            raise ValueError(
+                f"LM-head hidden width {h.shape[-1]} != {self.hidden}"
+            )
+        mx.eval(h)
+        leading_shape = tuple(int(value) for value in h.shape[:-1])
+        flat = h.reshape(-1, self.hidden)
+        rows = int(flat.shape[0])
+        if rows == 0:
+            return mx.zeros((*leading_shape, self.vocab), dtype=h.dtype)
+
+        row_chunks: list[list[mx.array]] = [[] for _ in range(rows)]
+        for start in range(0, self.vocab, self.block_rows):
+            n_rows = min(self.block_rows, self.vocab - start)
+            raw = _pread_exact(
+                self._fd,
+                n_rows * self.row_bytes,
+                self.data_start + start * self.row_bytes,
+            )
+            block = np.frombuffer(
+                raw, dtype=_NP_STORAGE_DTYPE[self.dtype]
+            ).reshape(n_rows, self.hidden)
+            w_block = mx.array(block).view(_MX_DTYPE[self.dtype])
+            values = [
+                flat[row : row + 1] @ w_block.T
+                for row in range(rows)
+            ]
+            mx.eval(*values)
+            for chunks, value in zip(row_chunks, values, strict=True):
+                chunks.append(value)
+
+        result_rows = [
+            mx.concatenate(chunks, axis=-1)
+            for chunks in row_chunks
+        ]
+        result = mx.concatenate(result_rows, axis=0)
+        return result.reshape(*leading_shape, self.vocab)
