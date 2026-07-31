@@ -39,10 +39,11 @@ jobs:
           # xgrammar: token-level grammar constraints for required/specific
           # tool choice and JSON-schema structured outputs (runtime/structured.py).
           # av (PyAV): video-input tests decode a real short clip.
-          # 0.2.3's macOS arm64 native wheel exits with SIGSEGV in the hosted
-          # M1 runner (including with a one-thread compiler). 0.1.34 exposes
-          # the same APIs used here and passes the direct + protocol gates.
-          pip install jsonschema xgrammar==0.1.34 av
+          # apache-tvm-ffi 0.1.13 regresses XGrammar's static registration on
+          # GitHub's hosted M1 (SIGSEGV in xgrammar::__TVMFFIStaticInitFunc0).
+          # 0.1.12 is the exact passing local FFI layer; pin both halves of
+          # this native ABI instead of letting XGrammar resolve the latest.
+          pip install jsonschema xgrammar==0.2.3 apache-tvm-ffi==0.1.12 av
           # mlx_lm: tests/test_mlx_lm_shim.py pins a known mlx_lm/transformers
           # incompatibility and its shim -- it needs mlx_lm actually installed
           # to reproduce the bug it's guarding against, not just importable.
