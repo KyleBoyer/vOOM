@@ -155,6 +155,8 @@ def main() -> int:
     server_overrides = {
         "VMODEL_RESIDENT_BACKEND": "mlx-lm",
         "VMODEL_MLX_LM_PROMPT_CACHE": "1",
+        "VMODEL_MLX_LM_LOGIT_CHAIN": "1",
+        "VMODEL_MLX_LM_NATIVE_MTP": "0",
         "VMODEL_FAST_TOOL_GATEWAY": "1",
         "VMODEL_FAST_TOOL_GATEWAY_HOST_ROUTE": "1",
         "VMODEL_FAST_TOOL_GATEWAY_ABSTAIN": "0",
@@ -193,12 +195,45 @@ def main() -> int:
         label = _temperature_label(temperature)
         child_result = args.result_json.with_name(
             f"{args.result_json.stem}.temp{label}.json")
+        preflight_result = args.result_json.with_name(
+            f"{args.result_json.stem}.temp{label}.preflight.json")
         if child_result.exists():
             report["failures"].append(
                 f"temperature {temperature:g}: stale result exists: "
                 f"{child_result}")
             continue
+        if preflight_result.exists():
+            report["failures"].append(
+                f"temperature {temperature:g}: stale preflight exists: "
+                f"{preflight_result}")
+            continue
         _wait_for_release(6.0)
+        preflight_code = subprocess.run([
+            sys.executable, "-m", "runtime.memory_preflight",
+            "--result", str(preflight_result),
+            "--sample-seconds", "30",
+        ], cwd=ROOT).returncode
+        preflight_report = (
+            json.loads(preflight_result.read_text())
+            if preflight_result.is_file() else None)
+        if (preflight_code != 0
+                or not isinstance(preflight_report, dict)
+                or preflight_report.get("passed") is not True):
+            failure = (
+                f"temperature {temperature:g}: memory preflight failed")
+            report["runs"].append({
+                "temperature": temperature,
+                "memory_preflight_exit_code": preflight_code,
+                "memory_preflight_path": str(preflight_result),
+                "memory_preflight": preflight_report,
+                "fixture_exit_code": None,
+                "fixture_result_path": str(child_result),
+                "result": None,
+                "failure": failure,
+            })
+            report["failures"].append(failure)
+            _atomic_json(args.result_json, report)
+            continue
         server_env = os.environ.copy()
         server_env.update(server_overrides)
         print(
@@ -263,6 +298,9 @@ def main() -> int:
             _wait_for_release(6.0)
         report["runs"].append({
             "temperature": temperature,
+            "memory_preflight_exit_code": preflight_code,
+            "memory_preflight_path": str(preflight_result),
+            "memory_preflight": preflight_report,
             "fixture_exit_code": fixture_code,
             "fixture_result_path": str(child_result),
             "result": fixture_report,

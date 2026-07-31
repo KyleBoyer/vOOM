@@ -18,6 +18,7 @@ from runtime.resident_mlx_lm import (
     _fork_prompt_cache,
     _prompt_cache_nbytes,
     _qwen35_request_incremental_bytes,
+    _unique_retained_array_bytes,
     choose_resident_backend,
     import_mlx_lm,
 )
@@ -138,6 +139,24 @@ def test_prompt_cache_bytes_prefers_cache_owned_accounting():
             raise AssertionError("authoritative nbytes should avoid state views")
 
     assert _prompt_cache_nbytes([Cache(), Cache()]) == 246
+
+
+def test_retained_array_bytes_deduplicates_shared_checkpoint_payloads():
+    shared = mx.zeros((8,), dtype=mx.float16)
+    distinct = mx.zeros((4,), dtype=mx.float32)
+
+    class ArraysCache:
+        cache = [shared]
+
+    class KVCache:
+        keys = shared
+        values = distinct
+
+    assert _unique_retained_array_bytes(
+        [ArraysCache(), KVCache()],
+        {"prompt_logits": shared},
+        [(4, [ArraysCache(), KVCache()])],
+    ) == shared.nbytes + distinct.nbytes
 
 
 def test_qwen35_request_projection_includes_attention_state_and_scratch():

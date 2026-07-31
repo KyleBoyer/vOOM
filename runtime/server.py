@@ -6100,6 +6100,23 @@ def _vision_protocol_timing(result: dict) -> dict:
         "qwen_mtp_adaptive_disabled",
         "qwen_mtp_plain_decode_sweeps",
         "qwen_mtp_warmup_decode_sweeps",
+        "qwen_native_mtp_loaded",
+        "qwen_native_mtp_enabled",
+        "qwen_native_mtp_used",
+        "qwen_native_mtp_proposed",
+        "qwen_native_mtp_accepted",
+        "qwen_native_mtp_target_sweeps",
+        "qwen_native_mtp_rejection_refeeds",
+        "qwen_native_mtp_draft_head_calls",
+        "resident_logit_chain_enabled",
+        "resident_logit_chain_eligible",
+        "resident_logit_chain_candidate_tokens",
+        "resident_logit_chain_reused_step_logits",
+        "resident_logit_chain_catchup_sweeps",
+        "resident_logit_chain_candidate_checkpoints",
+        "resident_logit_chain_checkpoint_restored_tokens",
+        "resident_logit_chain_retained_step_logits",
+        "resident_logit_chain_retained_checkpoints",
     )
     for key in optional_integer_fields:
         if key in stats or key in result:

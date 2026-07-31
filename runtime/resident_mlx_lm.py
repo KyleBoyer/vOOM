@@ -240,6 +240,41 @@ def _prompt_cache_nbytes(prompt_cache) -> int:
     return total
 
 
+def _unique_retained_array_bytes(*values) -> int:
+    """Count unique arrays owned by retained prompt/generation artifacts."""
+    seen: set[int] = set()
+    total = 0
+
+    def add(array):
+        nonlocal total
+        if isinstance(array, mx.array) and id(array) not in seen:
+            seen.add(id(array))
+            total += int(array.nbytes)
+
+    def visit(value):
+        if isinstance(value, mx.array):
+            add(value)
+        elif isinstance(value, dict):
+            for item in value.values():
+                visit(item)
+        elif isinstance(value, (tuple, list)):
+            for item in value:
+                visit(item)
+        else:
+            cache_values = getattr(value, "cache", None)
+            if isinstance(cache_values, list):
+                visit(cache_values)
+            child_caches = getattr(value, "caches", None)
+            if isinstance(child_caches, (tuple, list)):
+                visit(child_caches)
+            add(getattr(value, "keys", None))
+            add(getattr(value, "values", None))
+
+    for value in values:
+        visit(value)
+    return total
+
+
 def _qwen35_request_incremental_bytes(
     cfg, positions: int, *, transient_bytes: int = 1_200_000_000,
 ) -> int:
@@ -342,9 +377,15 @@ class ResidentMLXLMEngine:
         self._xgrammar_compiler = None
         self._prepared_prompt_token_cache = None
         self.last_kv = None
+        self.last_mtp_kv = None
         self._last_cache_token_ids: tuple[int, ...] = ()
         self._last_prompt_logits = None
+        self._last_prompt_hidden = None
+        self._last_generation_tokens: tuple[int, ...] = ()
+        self._last_generation_step_logits: tuple = ()
+        self._last_generation_checkpoints: tuple = ()
         self._generation_sampled_tokens = 0
+        self._native_mtp = None
 
         tokenizer_path = self._model_dir / "tokenizer.json"
         if not tokenizer_path.is_file():
@@ -366,6 +407,16 @@ class ResidentMLXLMEngine:
         mlx_lm = import_mlx_lm()
         self.model, _ = mlx_lm.load(
             str(self._model_dir), lazy=False)
+        native_mtp_setting = os.environ.get(
+            "VMODEL_MLX_LM_NATIVE_MTP", "0")
+        if native_mtp_setting not in ("0", "1"):
+            raise ValueError(
+                "VMODEL_MLX_LM_NATIVE_MTP must be 0 or 1")
+        if native_mtp_setting == "1":
+            from .resident_qwen_mtp import ResidentQwenMTP
+
+            self._native_mtp = ResidentQwenMTP(
+                self.model, self._model_dir, quantization)
         self._load_s = time.perf_counter() - started
         self._model_active_bytes = max(0, mx.get_active_memory() - before)
         if mx.get_active_memory() > decision.metal_ceiling_bytes:
@@ -377,20 +428,34 @@ class ResidentMLXLMEngine:
                 f"{decision.metal_ceiling_bytes / 1e9:.2f}GB")
 
     def close(self) -> None:
+        native_mtp = getattr(self, "_native_mtp", None)
+        if native_mtp is not None:
+            self._native_mtp = None
+            native_mtp.close()
         model = getattr(self, "model", None)
         if model is not None:
             self.model = None
             del model
         self.last_kv = None
+        self.last_mtp_kv = None
         self._last_cache_token_ids = ()
         self._last_prompt_logits = None
+        self._last_prompt_hidden = None
+        self._last_generation_tokens = ()
+        self._last_generation_step_logits = ()
+        self._last_generation_checkpoints = ()
         gc.collect()
         mx.clear_cache()
 
     def discard_failed_request_state(self) -> None:
         self.last_kv = None
+        self.last_mtp_kv = None
         self._last_cache_token_ids = ()
         self._last_prompt_logits = None
+        self._last_prompt_hidden = None
+        self._last_generation_tokens = ()
+        self._last_generation_step_logits = ()
+        self._last_generation_checkpoints = ()
         mx.clear_cache()
 
     def report(self) -> str:
@@ -410,7 +475,15 @@ class ResidentMLXLMEngine:
         before projecting the next prompt instead of pessimistically counting
         both contexts at once.
         """
-        retained = _prompt_cache_nbytes(self.last_kv)
+        retained = _unique_retained_array_bytes(
+            self.last_kv,
+            self.last_mtp_kv,
+            self._last_prompt_logits,
+            self._last_prompt_hidden,
+            self._last_generation_step_logits,
+            [cache for _position, cache
+             in self._last_generation_checkpoints],
+        )
         active = max(0, int(mx.get_active_memory()))
         return {
             "active_metal_bytes": active,
@@ -429,55 +502,259 @@ class ResidentMLXLMEngine:
         self, prompt_ids: list[int], max_tokens: int, sampling: SamplingParams,
         constraint, generated: list[int], prompt_cache, progress,
         prefill_step_size: int, prefix_len: int = 0,
-        exact_prompt_logits=None, on_prompt_endpoint=None,
+        exact_prompt_logits=None, exact_prompt_hidden=None,
+        prompt_mtp_cache=None, native_mtp=None, mtp_stats=None,
+        cached_generation_tokens=(), cached_generation_step_logits=(),
+        cached_generation_checkpoints=(),
+        generation_step_logits=None, generation_logit_limit: int = 0,
+        logit_chain_stats=None,
+        on_generation_checkpoint=None,
+        on_prompt_endpoint=None,
     ):
         prompt = mx.array(prompt_ids, dtype=mx.int32)
         total = len(prompt_ids)
         processed = prefix_len
         progress(processed, total)
+        use_mtp = (
+            native_mtp is not None
+            and prompt_mtp_cache is not None
+            and constraint is None
+            and max_tokens > 1)
+
+        # A cached MTP endpoint for N prompt tokens contains transitions
+        # h[0]+tok[1] ... h[N-2]+tok[N-1].  Before forwarding a strict
+        # extension, add its first new transition from the retained h[N-1].
+        if use_mtp and prefix_len and total > prefix_len:
+            if exact_prompt_hidden is None:
+                raise RuntimeError(
+                    "native MTP extension requires retained prompt hidden state")
+            native_mtp.advance(
+                exact_prompt_hidden,
+                prompt[prefix_len:prefix_len + 1][None],
+                prompt_mtp_cache)
+            mx.eval([entry.state for entry in prompt_mtp_cache])
+
         while total - processed > 1:
             count = min(prefill_step_size, (total - processed) - 1)
-            self.model(prompt[processed:processed + count][None],
-                       cache=prompt_cache)
-            mx.eval([entry.state for entry in prompt_cache])
+            chunk = prompt[processed:processed + count][None]
+            if use_mtp:
+                _logits, hidden = native_mtp.trunk_forward(
+                    chunk, prompt_cache)
+                native_mtp.advance(
+                    hidden,
+                    prompt[
+                        processed + 1:processed + count + 1][None],
+                    prompt_mtp_cache)
+                mx.eval(
+                    [entry.state for entry in prompt_cache],
+                    [entry.state for entry in prompt_mtp_cache])
+            else:
+                self.model(chunk, cache=prompt_cache)
+                mx.eval([entry.state for entry in prompt_cache])
             processed += count
             progress(processed, total)
             mx.clear_cache()
 
         if exact_prompt_logits is not None:
-            values = exact_prompt_logits
-            if constraint is not None:
-                values = constraint.mask_logits(values)
-            token = sample(
-                values, sampling, history=[*prompt_ids, *generated])
-            progress(total, total)
-            yield token
-            current = mx.array([token], dtype=mx.int32)
+            raw_values = exact_prompt_logits
+            endpoint_hidden = exact_prompt_hidden
         else:
             current = prompt[processed:]
-        endpoint_pending = exact_prompt_logits is None
-        while True:
-            logits = self.model(current[None], cache=prompt_cache)[:, -1, :]
-            raw_values = logits.reshape(-1)
-            if endpoint_pending:
-                # Materialize both the raw endpoint distribution and every
-                # cache state before sharing their array references with the
-                # retained prompt snapshot.
-                mx.eval(
-                    raw_values,
-                    [entry.state for entry in prompt_cache])
-                if on_prompt_endpoint is not None:
-                    on_prompt_endpoint(prompt_cache, raw_values)
-                endpoint_pending = False
+            if use_mtp:
+                logits, endpoint_hidden = native_mtp.trunk_forward(
+                    current[None], prompt_cache)
+            else:
+                logits = self.model(current[None], cache=prompt_cache)
+                endpoint_hidden = None
+            raw_values = logits[:, -1, :].reshape(-1)
+            # Materialize the raw endpoint distribution, exact trunk hidden,
+            # and all cache state before retaining shallow array snapshots.
+            evaluation = [
+                raw_values,
+                [entry.state for entry in prompt_cache],
+            ]
+            if endpoint_hidden is not None:
+                evaluation.append(endpoint_hidden)
+            mx.eval(*evaluation)
+            if on_prompt_endpoint is not None:
+                on_prompt_endpoint(
+                    prompt_cache, raw_values, endpoint_hidden,
+                    prompt_mtp_cache if use_mtp else None)
+
+        progress(total, total)
+        values = raw_values
+        if constraint is not None:
+            values = constraint.mask_logits(values)
+        if (generation_step_logits is not None
+                and len(generation_step_logits) < generation_logit_limit):
+            generation_step_logits.append(raw_values)
+        token = sample(
+            values, sampling, history=[*prompt_ids, *generated])
+        yield token
+
+        if not use_mtp:
+            chain_stats = (
+                logit_chain_stats if logit_chain_stats is not None else {})
+            chain_limit = min(
+                len(cached_generation_tokens),
+                len(cached_generation_step_logits))
+            chain_position = 1
+            matched_prefix = 0
+            while chain_position < chain_limit:
+                if (len(generated) < chain_position
+                        or int(generated[chain_position - 1])
+                        != int(cached_generation_tokens[
+                            chain_position - 1])):
+                    chain_stats["diverged_at"] = chain_position - 1
+                    matched_prefix = chain_position - 1
+                    break
+                matched_prefix = chain_position
+                raw_values = cached_generation_step_logits[chain_position]
+                values = raw_values
+                if constraint is not None:
+                    values = constraint.mask_logits(values)
+                if (generation_step_logits is not None
+                        and len(generation_step_logits)
+                        < generation_logit_limit):
+                    generation_step_logits.append(raw_values)
+                token = sample(
+                    values, sampling, history=[*prompt_ids, *generated])
+                chain_stats["reused_step_logits"] = (
+                    int(chain_stats.get("reused_step_logits", 0)) + 1)
+                yield token
+                chain_position += 1
+            else:
+                matched_prefix = min(
+                    len(generated), len(cached_generation_tokens))
+
+            # The target cache is still at the prompt endpoint while cached
+            # logits are sampled.  If the branch diverges or exhausts the
+            # retained chain, restore the closest exact recurrent checkpoint
+            # and catch up only its unmatched tail one position at a time.
+            # Sequential catch-up preserves the established MXFP4 GEMV
+            # numerics; a multi-position refeed is not byte-identical.
+            catchup_start = 0
+            eligible_checkpoints = [
+                (int(position), cache)
+                for position, cache in cached_generation_checkpoints
+                if int(position) <= matched_prefix
+            ]
+            if eligible_checkpoints:
+                catchup_start, checkpoint = max(
+                    eligible_checkpoints, key=lambda item: item[0])
+                prompt_cache[:] = _fork_prompt_cache(checkpoint)
+                chain_stats["checkpoint_restored_tokens"] = catchup_start
+            raw_values = None
+            for position, catchup in enumerate(
+                    generated[catchup_start:], start=catchup_start + 1):
+                logits = self.model(
+                    mx.array([[int(catchup)]], dtype=mx.int32),
+                    cache=prompt_cache)
+                raw_values = logits[:, -1, :].reshape(-1)
+                chain_stats["catchup_sweeps"] = (
+                    int(chain_stats.get("catchup_sweeps", 0)) + 1)
+                if on_generation_checkpoint is not None:
+                    on_generation_checkpoint(position, prompt_cache)
+            if raw_values is None:
+                raise RuntimeError("logit-chain catch-up had no generated token")
             values = raw_values
             if constraint is not None:
                 values = constraint.mask_logits(values)
+            if (generation_step_logits is not None
+                    and len(generation_step_logits) < generation_logit_limit):
+                generation_step_logits.append(raw_values)
             token = sample(
                 values, sampling, history=[*prompt_ids, *generated])
-            if not generated:
-                progress(total, total)
             yield token
             current = mx.array([token], dtype=mx.int32)
+            while True:
+                logits = self.model(
+                    current[None], cache=prompt_cache)[:, -1, :]
+                raw_values = logits.reshape(-1)
+                if on_generation_checkpoint is not None:
+                    on_generation_checkpoint(len(generated), prompt_cache)
+                values = raw_values
+                if constraint is not None:
+                    values = constraint.mask_logits(values)
+                if (generation_step_logits is not None
+                        and len(generation_step_logits)
+                        < generation_logit_limit):
+                    generation_step_logits.append(raw_values)
+                token = sample(
+                    values, sampling, history=[*prompt_ids, *generated])
+                yield token
+                current = mx.array([token], dtype=mx.int32)
+
+        if endpoint_hidden is None:
+            raise RuntimeError(
+                "native MTP requires the exact pre-norm prompt hidden state")
+        stats = mtp_stats if mtp_stats is not None else {}
+        stats.update({
+            "enabled": 1,
+            "used": 0,
+            "proposed": 0,
+            "accepted": 0,
+            "target_sweeps": 0,
+            "rejection_refeeds": 0,
+            "draft_head_calls": 0,
+            "sampling_proof": (
+                "greedy-target-match"
+                if sampling.is_greedy
+                else "independent-target-draw"),
+        })
+
+        def propose(hidden, next_tokens):
+            stats["draft_head_calls"] += 1
+            ids = mx.array([next_tokens], dtype=mx.int32)
+            logits = native_mtp.draft_logits(
+                hidden, ids, prompt_mtp_cache)[:, -1, :].reshape(-1)
+            return sample(
+                logits, sampling, history=[*prompt_ids, *generated])
+
+        catchup = int(token)
+        draft = propose(endpoint_hidden, [catchup])
+        while True:
+            stats["used"] = 1
+            stats["proposed"] += 1
+            checkpoint = _fork_prompt_cache(prompt_cache)
+            verification = mx.array(
+                [[catchup, int(draft)]], dtype=mx.int32)
+            logits, hidden = native_mtp.trunk_forward(
+                verification, prompt_cache, confirmed_prefix=1)
+            stats["target_sweeps"] += 1
+            target = sample(
+                logits[:, 0, :].reshape(-1), sampling,
+                history=[*prompt_ids, *generated])
+
+            if int(target) == int(draft):
+                stats["accepted"] += 1
+                bonus = sample(
+                    logits[:, 1, :].reshape(-1), sampling,
+                    history=[*prompt_ids, *generated, int(draft)])
+                yield int(draft)
+                yield int(bonus)
+                # Commit both released MTP transitions in one two-position
+                # head call and use its final distribution as the next draft.
+                draft = propose(
+                    hidden, [int(draft), int(bonus)])
+                catchup = int(bonus)
+            else:
+                # ArraysCache updates replace arrays and KVCache appends beyond
+                # its numeric offset, so a shallow wrapper fork is an exact
+                # copy-on-write checkpoint for this hybrid trunk.
+                prompt_cache[:] = checkpoint
+                _confirmed_logits, confirmed_hidden = (
+                    native_mtp.trunk_forward(
+                        mx.array([[catchup]], dtype=mx.int32),
+                        prompt_cache))
+                mx.eval(
+                    confirmed_hidden,
+                    [entry.state for entry in prompt_cache])
+                stats["target_sweeps"] += 1
+                stats["rejection_refeeds"] += 1
+                yield int(target)
+                draft = propose(confirmed_hidden, [int(target)])
+                catchup = int(target)
 
     @staticmethod
     def _stop_match(text: str, stop: list[str]):
@@ -528,10 +805,57 @@ class ResidentMLXLMEngine:
             "VMODEL_MLX_LM_PROMPT_CACHE", "1")
         if cache_setting not in ("0", "1"):
             raise ValueError("VMODEL_MLX_LM_PROMPT_CACHE must be 0 or 1")
+        logit_chain_setting = os.environ.get(
+            "VMODEL_MLX_LM_LOGIT_CHAIN", "1")
+        if logit_chain_setting not in ("0", "1"):
+            raise ValueError("VMODEL_MLX_LM_LOGIT_CHAIN must be 0 or 1")
+        try:
+            logit_chain_limit = int(os.environ.get(
+                "VMODEL_MLX_LM_LOGIT_CHAIN_MAX_TOKENS", "128"))
+        except ValueError as error:
+            raise ValueError(
+                "VMODEL_MLX_LM_LOGIT_CHAIN_MAX_TOKENS must be an integer"
+            ) from error
+        if not 1 <= logit_chain_limit <= 512:
+            raise ValueError(
+                "VMODEL_MLX_LM_LOGIT_CHAIN_MAX_TOKENS must be 1..512")
+        try:
+            logit_checkpoint_stride = int(os.environ.get(
+                "VMODEL_MLX_LM_LOGIT_CHECKPOINT_STRIDE", "4"))
+            logit_checkpoint_limit = int(os.environ.get(
+                "VMODEL_MLX_LM_LOGIT_CHECKPOINT_MAX", "8"))
+        except ValueError as error:
+            raise ValueError(
+                "resident logit checkpoint controls must be integers"
+            ) from error
+        if not 1 <= logit_checkpoint_stride <= 128:
+            raise ValueError(
+                "VMODEL_MLX_LM_LOGIT_CHECKPOINT_STRIDE must be 1..128")
+        if not 0 <= logit_checkpoint_limit <= 32:
+            raise ValueError(
+                "VMODEL_MLX_LM_LOGIT_CHECKPOINT_MAX must be 0..32")
+        mtp_decode_default = "1" if self._native_mtp is not None else "0"
+        mtp_decode_setting = os.environ.get(
+            "VMODEL_MLX_LM_NATIVE_MTP_DECODE", mtp_decode_default)
+        if mtp_decode_setting not in ("0", "1"):
+            raise ValueError(
+                "VMODEL_MLX_LM_NATIVE_MTP_DECODE must be 0 or 1")
+        native_mtp = (
+            self._native_mtp
+            if mtp_decode_setting == "1"
+            and self._native_mtp is not None
+            and constraint is None
+            and max_tokens > 1
+            else None)
         prefix_len = 0
         cache_match = "miss"
         matched_cache = None
+        matched_mtp_cache = None
         exact_prompt_logits = None
+        exact_prompt_hidden = None
+        cached_generation_tokens = ()
+        cached_generation_step_logits = ()
+        cached_generation_checkpoints = ()
         full_candidate_tokens = len(self._last_cache_token_ids)
         full_candidate_lcp = 0
         for old, new in zip(self._last_cache_token_ids, prompt_ids):
@@ -542,23 +866,48 @@ class ResidentMLXLMEngine:
             if self.last_kv is not None:
                 full_prefix, full_match = _exact_prompt_cache_match(
                     self._last_cache_token_ids, prompt_ids)
+                if (native_mtp is not None and full_prefix
+                        and (self.last_mtp_kv is None
+                             or self._last_prompt_hidden is None)):
+                    full_prefix, full_match = 0, "miss"
                 if full_match != "exact" or self._last_prompt_logits is not None:
                     prefix_len = full_prefix
                     cache_match = full_match
                     matched_cache = self.last_kv if full_prefix else None
+                    matched_mtp_cache = (
+                        self.last_mtp_kv if full_prefix else None)
                     exact_prompt_logits = (
                         self._last_prompt_logits
                         if full_match == "exact" else None)
+                    exact_prompt_hidden = (
+                        self._last_prompt_hidden if full_prefix else None)
+                    if (logit_chain_setting == "1"
+                            and full_match == "exact"):
+                        cached_generation_tokens = (
+                            self._last_generation_tokens)
+                        cached_generation_step_logits = (
+                            self._last_generation_step_logits)
+                        cached_generation_checkpoints = (
+                            self._last_generation_checkpoints)
         if not prefix_len:
             self.last_kv = None
+            self.last_mtp_kv = None
             self._last_cache_token_ids = ()
             self._last_prompt_logits = None
+            self._last_prompt_hidden = None
+            self._last_generation_tokens = ()
+            self._last_generation_step_logits = ()
+            self._last_generation_checkpoints = ()
             gc.collect()
             mx.clear_cache()
         request_reserve_mb = _positive_env_mb(
             os.environ, "VMODEL_MLX_LM_REQUEST_SYSTEM_RESERVE_MB", 1_200)
         incremental_bytes = _qwen35_request_incremental_bytes(
             self.cfg, len(prompt_ids) + max_tokens - prefix_len)
+        if native_mtp is not None:
+            incremental_bytes += (
+                native_mtp.cache_bytes_per_token
+                * max(0, len(prompt_ids) + max_tokens - prefix_len))
         current_available = int(psutil.virtual_memory().available)
         required_available = (
             incremental_bytes + request_reserve_mb * 1_000_000)
@@ -597,15 +946,29 @@ class ResidentMLXLMEngine:
         prompt_cache = (
             _fork_prompt_cache(matched_cache)
             if prefix_len else self._make_prompt_cache())
+        prompt_mtp_cache = (
+            _fork_prompt_cache(matched_mtp_cache)
+            if native_mtp is not None and prefix_len
+            else native_mtp.make_cache()
+            if native_mtp is not None else None)
         retained_prompt_cache = (
             self.last_kv if prefix_len else None)
+        retained_prompt_mtp_cache = (
+            self.last_mtp_kv if prefix_len else None)
         retained_prompt_logits = (
             self._last_prompt_logits if prefix_len else None)
+        retained_prompt_hidden = (
+            self._last_prompt_hidden if prefix_len else None)
 
-        def capture_prompt_endpoint(cache, logits):
-            nonlocal retained_prompt_cache, retained_prompt_logits
+        def capture_prompt_endpoint(cache, logits, hidden, mtp_cache):
+            nonlocal retained_prompt_cache, retained_prompt_mtp_cache
+            nonlocal retained_prompt_logits, retained_prompt_hidden
             retained_prompt_cache = _fork_prompt_cache(cache)
+            retained_prompt_mtp_cache = (
+                _fork_prompt_cache(mtp_cache)
+                if mtp_cache is not None else None)
             retained_prompt_logits = logits
+            retained_prompt_hidden = hidden
 
         generated: list[int] = []
         stream_decoder = (
@@ -618,19 +981,67 @@ class ResidentMLXLMEngine:
         # sampling/constraint behavior identical across both paths, this gives
         # us the exact raw distribution and cache state at the prompt endpoint
         # before decode advances either one.
+        mtp_stats: dict = {}
+        logit_chain_stats = {
+            "eligible": int(bool(cached_generation_step_logits)),
+            "candidate_tokens": len(cached_generation_tokens),
+            "candidate_step_logits": len(
+                cached_generation_step_logits),
+            "reused_step_logits": 0,
+            "catchup_sweeps": 0,
+            "candidate_checkpoints": len(
+                cached_generation_checkpoints),
+            "checkpoint_restored_tokens": 0,
+        }
+        generation_step_logits = (
+            [] if logit_chain_setting == "1" else None)
+        generation_checkpoints: list = []
+
+        def capture_generation_checkpoint(position, cache):
+            if (logit_chain_setting != "1"
+                    or native_mtp is not None
+                    or logit_checkpoint_limit == 0
+                    or position % logit_checkpoint_stride
+                    or len(generation_checkpoints)
+                    >= logit_checkpoint_limit):
+                return
+            mx.eval([entry.state for entry in cache])
+            generation_checkpoints.append(
+                (int(position), _fork_prompt_cache(cache)))
+
         token_iterator = self._direct_tokens(
             prompt_ids, max_tokens, sampling, constraint, generated,
             prompt_cache, progress, prefill_step_size, prefix_len,
             exact_prompt_logits=exact_prompt_logits,
+            exact_prompt_hidden=exact_prompt_hidden,
+            prompt_mtp_cache=prompt_mtp_cache,
+            native_mtp=native_mtp,
+            mtp_stats=mtp_stats,
+            cached_generation_tokens=(
+                cached_generation_tokens
+                if native_mtp is None else ()),
+            cached_generation_step_logits=(
+                cached_generation_step_logits
+                if native_mtp is None else ()),
+            cached_generation_checkpoints=(
+                cached_generation_checkpoints
+                if native_mtp is None else ()),
+            generation_step_logits=generation_step_logits,
+            generation_logit_limit=logit_chain_limit,
+            logit_chain_stats=logit_chain_stats,
+            on_generation_checkpoint=capture_generation_checkpoint,
             on_prompt_endpoint=(
                 None if cache_match == "exact"
                 else capture_prompt_endpoint))
-        execution_path = (
+        base_execution_path = (
             "mlx_lm_prompt_exact"
             if cache_match == "exact"
             else "mlx_lm_prompt_extension"
             if cache_match == "extension"
             else "mlx_lm_direct")
+        execution_path = (
+            f"{base_execution_path}_native_mtp"
+            if native_mtp is not None else base_execution_path)
 
         first_token_s = 0.0
         prefill_s = 0.0
@@ -691,14 +1102,40 @@ class ResidentMLXLMEngine:
 
         total_s = time.perf_counter() - request_started
         decode_s = sum(decode_intervals)
-        kv_bytes = _prompt_cache_nbytes(prompt_cache)
+        kv_bytes = (
+            _prompt_cache_nbytes(prompt_cache)
+            + _prompt_cache_nbytes(prompt_mtp_cache))
         # Retain the state and raw logits exactly at the prompt endpoint, not
         # the post-generation endpoint.  Identical prompts can resample from
         # the same distribution at any temperature; strict extensions advance
         # the saved recurrent fold.  Arbitrary LCP branches remain ineligible.
         self.last_kv = retained_prompt_cache
+        self.last_mtp_kv = retained_prompt_mtp_cache
         self._last_cache_token_ids = tuple(prompt_ids)
         self._last_prompt_logits = retained_prompt_logits
+        self._last_prompt_hidden = retained_prompt_hidden
+        if (cache_setting == "1" and logit_chain_setting == "1"
+                and native_mtp is None):
+            retained_steps = min(
+                len(generated), len(generation_step_logits))
+            self._last_generation_tokens = tuple(
+                generated[:retained_steps])
+            self._last_generation_step_logits = tuple(
+                generation_step_logits[:retained_steps])
+            if generation_checkpoints:
+                self._last_generation_checkpoints = tuple(
+                    generation_checkpoints)
+            elif (cached_generation_checkpoints
+                    and tuple(generated[:retained_steps])
+                    == tuple(cached_generation_tokens[:retained_steps])):
+                self._last_generation_checkpoints = tuple(
+                    cached_generation_checkpoints)
+            else:
+                self._last_generation_checkpoints = ()
+        else:
+            self._last_generation_tokens = ()
+            self._last_generation_step_logits = ()
+            self._last_generation_checkpoints = ()
         true_peak = max(
             active_before, mx.get_active_memory(), mx.get_peak_memory())
         result = {
@@ -725,7 +1162,8 @@ class ResidentMLXLMEngine:
                     f"hot-prompt-{cache_match}"
                     if prefix_len else "cold"),
                 "retained_prompt_kv_bytes": _prompt_cache_nbytes(
-                    retained_prompt_cache),
+                    retained_prompt_cache)
+                + _prompt_cache_nbytes(retained_prompt_mtp_cache),
                 "prompt_cache_full_candidate_tokens": full_candidate_tokens,
                 "prompt_cache_full_candidate_lcp_tokens": full_candidate_lcp,
                 "constraint_profile": getattr(constraint, "profile", "none"),
@@ -738,12 +1176,60 @@ class ResidentMLXLMEngine:
                 "request_incremental_projection_bytes": incremental_bytes,
                 "request_system_available_bytes": current_available,
                 "request_system_required_bytes": required_available,
+                "qwen_native_mtp_loaded": int(self._native_mtp is not None),
+                "qwen_native_mtp_enabled": int(native_mtp is not None),
+                "qwen_native_mtp_used": int(mtp_stats.get("used", 0)),
+                "qwen_native_mtp_proposed": int(
+                    mtp_stats.get("proposed", 0)),
+                "qwen_native_mtp_accepted": int(
+                    mtp_stats.get("accepted", 0)),
+                "qwen_native_mtp_accept_rate": (
+                    int(mtp_stats.get("accepted", 0))
+                    / int(mtp_stats.get("proposed", 1))
+                    if int(mtp_stats.get("proposed", 0)) else 0.0),
+                "qwen_native_mtp_target_sweeps": int(
+                    mtp_stats.get("target_sweeps", 0)),
+                "qwen_native_mtp_rejection_refeeds": int(
+                    mtp_stats.get("rejection_refeeds", 0)),
+                "qwen_native_mtp_draft_head_calls": int(
+                    mtp_stats.get("draft_head_calls", 0)),
+                "qwen_native_mtp_sampling_proof": mtp_stats.get(
+                    "sampling_proof",
+                    "fallback-constrained-or-short"
+                    if self._native_mtp is not None else "not-loaded"),
+                "resident_logit_chain_enabled": int(
+                    logit_chain_setting == "1"),
+                "resident_logit_chain_eligible": int(
+                    logit_chain_stats["eligible"]),
+                "resident_logit_chain_candidate_tokens": int(
+                    logit_chain_stats["candidate_tokens"]),
+                "resident_logit_chain_reused_step_logits": int(
+                    logit_chain_stats["reused_step_logits"]),
+                "resident_logit_chain_catchup_sweeps": int(
+                    logit_chain_stats["catchup_sweeps"]),
+                "resident_logit_chain_candidate_checkpoints": int(
+                    logit_chain_stats["candidate_checkpoints"]),
+                "resident_logit_chain_checkpoint_restored_tokens": int(
+                    logit_chain_stats["checkpoint_restored_tokens"]),
+                "resident_logit_chain_diverged_at": (
+                    logit_chain_stats.get("diverged_at")),
+                "resident_logit_chain_retained_step_logits": len(
+                    self._last_generation_step_logits),
+                "resident_logit_chain_retained_checkpoints": len(
+                    self._last_generation_checkpoints),
             },
         }
         if cache_setting == "0":
             self.last_kv = None
+            self.last_mtp_kv = None
             self._last_cache_token_ids = ()
             self._last_prompt_logits = None
+            self._last_prompt_hidden = None
+            self._last_generation_tokens = ()
+            self._last_generation_step_logits = ()
+            self._last_generation_checkpoints = ()
             del prompt_cache
+            if prompt_mtp_cache is not None:
+                del prompt_mtp_cache
             mx.clear_cache()
         return result

@@ -111,6 +111,8 @@ def main() -> int:
     server_overrides = {
         "VMODEL_RESIDENT_BACKEND": "mlx-lm",
         "VMODEL_MLX_LM_PROMPT_CACHE": "1",
+        "VMODEL_MLX_LM_LOGIT_CHAIN": "1",
+        "VMODEL_MLX_LM_NATIVE_MTP": "0",
         "VMODEL_FAST_TOOL_GATEWAY": "1",
         "VMODEL_FAST_TOOL_GATEWAY_HOST_ROUTE": "1",
         "VMODEL_FAST_TOOL_GATEWAY_ABSTAIN": "0",
