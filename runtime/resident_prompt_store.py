@@ -115,6 +115,13 @@ class ResidentPromptStore:
 
     def load(self, prompt_ids):
         """Return the exact prompt endpoint and optional decode chain."""
+        # mlx-lm 0.31.3 registers a tokenizer with a string key that
+        # Transformers 5.13.0 rejects. ResidentMLXLMEngine normally applies
+        # the repository's narrow compatibility shim before this store is
+        # reached, but the store is also a public, independently tested
+        # component. Make that ordering guarantee explicit here too.
+        from .resident_mlx_lm import import_mlx_lm
+        import_mlx_lm()
         from mlx_lm.models.cache import load_prompt_cache
 
         key = self.key(prompt_ids)
@@ -202,6 +209,8 @@ class ResidentPromptStore:
         generation_step_logits=(),
     ) -> dict:
         """Publish one exact endpoint if it is not already committed."""
+        from .resident_mlx_lm import import_mlx_lm
+        import_mlx_lm()
         from mlx_lm.models.cache import save_prompt_cache
 
         key = self.key(prompt_ids)

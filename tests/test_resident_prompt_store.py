@@ -10,6 +10,8 @@ from runtime.resident_prompt_store import ResidentPromptStore
 
 
 def _endpoint():
+    from runtime.resident_mlx_lm import import_mlx_lm
+    import_mlx_lm()
     from mlx_lm.models.cache import ArraysCache, KVCache
 
     recurrent = ArraysCache(2)

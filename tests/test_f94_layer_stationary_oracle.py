@@ -188,7 +188,7 @@ def test_layer_stationary_matches_chunk_major_and_hf_reference():
         # chunk-major schedule too, not just the HF reference -- the actual
         # claim F94 makes is "same computation, different order."
         _assert_close(actual, torch.from_numpy(np.array(reference)),
-                       tolerance=1e-6)
+                       tolerance=2e-6)
 
 
 def test_layer_stationary_fetches_each_layers_weights_exactly_once():

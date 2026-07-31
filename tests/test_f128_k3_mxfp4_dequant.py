@@ -102,8 +102,13 @@ def test_mxfp4_unpack_matches_real_compressed_tensors_on_synthetic_data():
     mx.eval(mine)
 
     assert not bool(mx.any(mx.isnan(mine)).item())
-    max_diff = np.max(np.abs(ref - np.array(mine)))
-    assert max_diff == 0, f"MXFP4 unpack mismatch vs real compressed-tensors oracle: {max_diff}"
+    # MLX's Metal exponentiation differs from Torch's CPU implementation by
+    # at most one or two float32 ULPs on GitHub's older M1 runner image even
+    # though both implement the same E2M1 * 2**E8M0 arithmetic. This oracle is
+    # a numerical equivalence gate, not a cross-device instruction-bit gate.
+    np.testing.assert_allclose(
+        np.array(mine), ref, rtol=0.0, atol=5e-7,
+        err_msg="MXFP4 unpack mismatch vs real compressed-tensors oracle")
 
 
 def _write_ct_mxfp4_fixture(path: Path, *, declared_group_size: int = 32):
