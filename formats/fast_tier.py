@@ -1,10 +1,13 @@
-"""Bounded hot-expert staging for a second, faster local disk.
+"""Bounded static-weight staging for a second, faster local disk.
 
 The primary vpack2 archive remains authoritative and complete.  This module
-copies whole, lossless `.vt` expert pages from its sibling vpack store, or
-reconstructs them from the verified vpack2 archive after intermediate cleanup,
-into a small cache directory ranked by learned routing heat. WeightStore
-authenticates each staged body against the vpack2 index before using it.
+copies whole, lossless `.vt` pages from its sibling vpack store, or reconstructs
+them from the verified vpack2 archive after intermediate cleanup. Routed expert
+pages are ranked by learned routing heat. An explicit option gives the shared
+per-layer trunk first claim on the same fixed namespace budget; that trunk is
+used for every token regardless of topic or route and can overlap internal-SSD
+prefetch with external-NVMe expert demand. WeightStore authenticates every
+staged body against the vpack2 index before using it.
 """
 
 from __future__ import annotations
@@ -26,6 +29,7 @@ _EXPERT = re.compile(
     r"layers\.(\d+)\.mlp\.experts\.(\d+)\."
 )
 DEFAULT_GLOBAL_BUDGET = 3_000_000_000
+MAX_GLOBAL_BUDGET = 90_000_000_000
 
 
 def _routing_heat(path: Path) -> dict[tuple[int, int], int]:
@@ -62,6 +66,15 @@ def _expert_files(manifest: dict[str, str]) -> dict[tuple[int, int], list[str]]:
             continue
         complete[key] = sorted(filename for _name, filename in entries)
     return complete
+
+
+def _trunk_files(manifest: dict[str, str]) -> list[str]:
+    """Return model-layer files excluding independently paged routed experts."""
+    return sorted({
+        filename
+        for name, filename in manifest.items()
+        if ".layers." in name and ".mlp.experts." not in name
+    })
 
 
 def _atomic_copy(source: Path, destination: Path) -> None:
@@ -111,14 +124,15 @@ def stage_hot_experts(
     model_dir: str | Path,
     fast_root: str | Path = "~/vmodel_fast_tier",
     *, budget_bytes: int = DEFAULT_GLOBAL_BUDGET,
+    include_trunk: bool = False,
 ) -> dict:
     """Populate one model namespace while enforcing a global cache budget."""
     model_dir = Path(model_dir).resolve()
     fast_root = _safe_cache_root(Path(fast_root))
     budget_bytes = int(budget_bytes)
-    if budget_bytes <= 0 or budget_bytes > DEFAULT_GLOBAL_BUDGET:
+    if budget_bytes <= 0 or budget_bytes > MAX_GLOBAL_BUDGET:
         raise ValueError(
-            f"fast-tier budget must be in (0, {DEFAULT_GLOBAL_BUDGET}]")
+            f"fast-tier budget must be in (0, {MAX_GLOBAL_BUDGET}]")
     vpack = model_dir / "weights.vpack"
     manifest_path = vpack / "manifest.json"
     heat_path = model_dir / "expert_transitions.json"
@@ -129,6 +143,7 @@ def stage_hot_experts(
     manifest = json.loads(manifest_path.read_text())
     names_by_file = {filename: name for name, filename in manifest.items()}
     groups = _expert_files(manifest)
+    trunk_files = _trunk_files(manifest) if include_trunk else []
     heat = _routing_heat(heat_path)
     archive_reader = None
 
@@ -154,8 +169,12 @@ def stage_hot_experts(
 
     target = fast_root / model_dir.name
     target.mkdir(parents=True, exist_ok=True)
-    desired: set[str] = set()
-    desired_bytes = 0
+    desired: set[str] = set(trunk_files)
+    desired_bytes = sum(staged_size(filename) for filename in trunk_files)
+    if desired_bytes > budget_bytes:
+        raise RuntimeError(
+            "the complete shared trunk cannot fit the fast-tier budget: "
+            f"trunk={desired_bytes} budget={budget_bytes}")
     selected_experts = 0
     for key in ranked:
         if heat.get(key, 0) <= 0:
@@ -233,6 +252,9 @@ def stage_hot_experts(
         "budget_bytes": budget_bytes,
         "total_bytes": total_bytes,
         "selected_experts": selected_experts,
+        "selected_trunk_files": len(trunk_files),
+        "selected_trunk_bytes": sum(
+            staged_size(filename) for filename in trunk_files),
         "selected_files": len(desired),
         "selected_bytes": desired_bytes,
         "copied_files": copied_files,
@@ -252,9 +274,13 @@ def main() -> None:
     parser.add_argument("model_dir")
     parser.add_argument("--fast-root", default="~/vmodel_fast_tier")
     parser.add_argument("--budget-bytes", type=int, default=DEFAULT_GLOBAL_BUDGET)
+    parser.add_argument(
+        "--include-trunk", action="store_true",
+        help="stage the complete shared per-layer trunk before hot experts")
     args = parser.parse_args()
     report = stage_hot_experts(
-        args.model_dir, args.fast_root, budget_bytes=args.budget_bytes)
+        args.model_dir, args.fast_root, budget_bytes=args.budget_bytes,
+        include_trunk=args.include_trunk)
     print(json.dumps(report, indent=2))
 
 

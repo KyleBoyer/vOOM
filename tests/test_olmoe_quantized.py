@@ -363,6 +363,21 @@ def test_reranked_mxfp4_head_recovers_exact_greedy_candidate():
     )
     assert int(mx.sum(mx.isfinite(reranked_logits))) == head.candidates
 
+    excluded = int(candidate_ids.reshape(-1)[0])
+    allowed = (excluded + 1) % exact.shape[0]
+
+    def allow_one(logits):
+        mask = mx.arange(logits.size) == allowed
+        return mx.where(mask, logits.reshape(-1), float("-inf"))
+
+    constrained = quant.reranked_matmul(
+        hidden, head, logits_transform=allow_one)
+    mx.eval(constrained)
+    assert int(mx.argmax(constrained)) == allowed
+    # The second mask removes the arbitrary -inf-tie fillers when fewer than
+    # k grammar-legal candidates exist.
+    assert int(mx.sum(mx.isfinite(constrained))) == 1
+
 
 def test_reranked_head_rejects_an_impossible_candidate_count():
     exact = mx.zeros((32, 64), dtype=mx.bfloat16)

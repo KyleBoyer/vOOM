@@ -50,29 +50,92 @@ class _Engine:
         self.releases += 1
 
 
-def test_qwen_mtp_adapter_falls_back_for_constrained_decoding():
+def test_qwen_mtp_adaptive_break_even_uses_refeed_free_rejection_math():
+    from runtime.qwen35_mtp import (
+        _adaptive_mtp_should_disable,
+        _adaptive_stochastic_mtp_should_disable,
+    )
+
+    assert not _adaptive_mtp_should_disable(2, 0, 3)
+    assert _adaptive_mtp_should_disable(3, 0, 3)
+    assert not _adaptive_mtp_should_disable(3, 1, 3)
+    assert not _adaptive_mtp_should_disable(6, 3, 3)
+    assert _adaptive_stochastic_mtp_should_disable(3, 0.12, 3)
+    assert not _adaptive_stochastic_mtp_should_disable(3, 0.18, 3)
+    assert not _adaptive_stochastic_mtp_should_disable(2, 0.0, 3)
+
+
+def test_qwen_mtp_adapter_preserves_constraint_on_short_budget_fallback():
     from runtime.qwen35_mtp import QwenMTPSpeculativeEngine
 
     target = _Engine("/models/target")
-    engine = QwenMTPSpeculativeEngine(target, max_prompt_tokens=8)
+    engine = QwenMTPSpeculativeEngine(
+        target, max_prompt_tokens=8, min_output_tokens=8)
+    constraint = object()
 
-    result = engine.generate("x", 4, constraint=object())
-    assert result["path_stats"]["qwen_mtp_fallback_reason"] == "constrained-decoding"
+    result = engine.generate("x", 4, constraint=constraint)
+    assert result["path_stats"]["qwen_mtp_fallback_reason"] == (
+        "short-output-budget")
     assert len(target.calls) == 1
+    assert target.calls[0][-1] is constraint
 
 
-def test_qwen_mtp_adapter_falls_back_for_stochastic_sampling():
-    from runtime.qwen35_mtp import QwenMTPSpeculativeEngine
+def test_qwen_mtp_stochastic_rejection_uses_target_minus_draft_residual():
+    from runtime.qwen35_mtp import _verify_stochastic_mtp_token
     from runtime.sampler import SamplingParams
 
-    target = _Engine("/models/target")
-    engine = QwenMTPSpeculativeEngine(target, max_prompt_tokens=8)
-    sampling = SamplingParams(temperature=0.8)
-    assert not sampling.is_greedy
+    for temperature in (0.3, 0.5, 0.7, 1.0):
+        sampling = SamplingParams(temperature=temperature, seed=17)
+        sampling.seed_rng()
+        accepted, token, probabilities = _verify_stochastic_mtp_token(
+            0,
+            mx.array([1.0, 0.0, 0.0]),
+            mx.array([-100.0, 100.0, -100.0]),
+            sampling,
+            history=[2],
+        )
+        mx.eval(probabilities)
+        assert not accepted
+        assert token == 1
+        assert probabilities.tolist() == [0.0, 1.0, 0.0]
 
-    result = engine.generate("x", 4, sampling=sampling)
-    assert result["path_stats"]["qwen_mtp_fallback_reason"] == "stochastic-sampling"
-    assert len(target.calls) == 1
+        accepted, token, probabilities = _verify_stochastic_mtp_token(
+            0,
+            mx.array([0.5, 0.5, 0.0]),
+            mx.array([-100.0, -100.0, 100.0]),
+            sampling,
+            history=[2],
+        )
+        assert not accepted
+        assert token == 2
+
+
+def test_qwen_mtp_sparse_draft_survives_disjoint_grammar_support():
+    from runtime.qwen35_mtp import _flat_top_k_draft_probabilities
+    from runtime.sampler import SamplingParams
+
+    class Constraint:
+        def mask_logits(self, logits):
+            # Only token 2 is grammar-legal, while the candidate-reranked
+            # draft has finite scores only for tokens 0 and 1.
+            return mx.array([
+                float("-inf"), float("-inf"), logits[2], float("-inf")])
+
+    # Drafter final_logits returns a singleton batch axis; q must still be a
+    # flat vocabulary distribution matching the target verifier's row.
+    logits = mx.array([[4.0, 3.0, float("-inf"), float("-inf")]])
+    q = _flat_top_k_draft_probabilities(
+        logits, SamplingParams(temperature=0.7, seed=17), [], 2,
+        Constraint())
+    mx.eval(q)
+
+    assert bool(mx.allclose(q, mx.array([0.5, 0.5, 0.0, 0.0])))
+
+    uniform = _flat_top_k_draft_probabilities(
+        mx.full((4,), float("-inf")),
+        SamplingParams(temperature=0.7, seed=17), [], 2)
+    mx.eval(uniform)
+    assert bool(mx.allclose(uniform, mx.full((4,), 0.25)))
 
 
 def test_qwen_mtp_adapter_falls_back_for_prompt_limit():
@@ -214,6 +277,235 @@ def test_qwen_mtp_accepted_pair_stops_on_first_token_eos():
     assert result["tokens"] == [4, 9]
     assert result["termination_reason"] == "eos"
     assert result["kv_positions"] == 4
+
+
+def test_qwen_mtp_batches_grammar_forced_span_before_next_decision():
+    """Jump-forward and MTP compose: deterministic grammar tokens share one
+    target sweep and the draft head is reserved for genuinely free choices."""
+    from runtime.qwen35_mtp import QwenMTPSpeculativeEngine
+
+    class _Constraint:
+        profile = "required_tool"
+
+        def __init__(self):
+            self.completed = False
+            self.accepted = []
+            self.forced_calls = 0
+
+        def forced_run(self, _limit, encode=None):
+            assert encode is not None
+            self.forced_calls += 1
+            if self.forced_calls > 1:
+                return []
+            self.accepted.extend((8, 9))
+            return [8, 9]
+
+        def mask_logits(self, logits):
+            masked = mx.full(logits.shape, -1e9)
+            return masked.at[..., 5].add(1e9 + 1)
+
+        def accept_token(self, token):
+            self.accepted.append(int(token))
+
+    class _KV:
+        def __init__(self):
+            self.offset = 3
+            self.kda_cache = None
+
+        def trim(self, offset):
+            self.offset = offset
+
+        def nbytes(self):
+            return 0
+
+    class _Target(_Engine):
+        def __init__(self):
+            super().__init__("/models/target")
+            self.cfg = SimpleNamespace(num_experts=8, eos_token_ids=())
+            self.rc = SimpleNamespace(grammar_jump_forward_lossy=True)
+            self.cache = SimpleNamespace(
+                stats=SimpleNamespace(
+                    hits=0, misses=0, evictions=0, bytes_read=0),
+                total_bytes=0, max_bytes=1)
+            self.expert_hits = self.expert_misses = 0
+            for name in (
+                    "fast_tier_bytes", "archive_bytes",
+                    "parallel_tier_fetches", "parallel_tier_fast_bytes",
+                    "parallel_tier_archive_bytes"):
+                setattr(self.store, name, 0)
+            self.governor = None
+            self._layer_transient = 0
+            self._prefill_layer_transient = 0
+            self._decode_layer_transient = 0
+            self._layer_transient_margin = 0
+            self._token_transient = 0
+            self._true_peak_metal_bytes = 0
+            self._request_profiler = None
+            self._hot_prompt_slots = []
+            self._h_last = mx.zeros((1, 1, 1))
+            self.last_kv = None
+            self.serial_calls = []
+
+        def generate(self, prompt, max_tokens, **kwargs):
+            assert max_tokens == 1
+            kwargs["constraint"].accept_token(4)
+            self.last_kv = _KV()
+            return {
+                "text": "4", "tokens": [4], "prefill_s": 0.0,
+                "first_token_s": 0.0, "decode_s": 0.0, "total_s": 0.0,
+                "termination_reason": "length", "stop_sequence": None,
+                "path_stats": {}, "prompt_tokens": 3,
+            }
+
+        def forward_tokens_serial_positions(
+                self, tokens, kv, *, capture_kda_endpoints=False):
+            assert not capture_kda_endpoints
+            self.serial_calls.append(list(tokens))
+            kv.offset += len(tokens)
+            self._h_last = mx.zeros((1, 1, 1))
+            logits = mx.zeros((len(tokens), 10))
+            return logits.at[-1, 5].add(1)
+
+    target = _Target()
+    engine = QwenMTPSpeculativeEngine(
+        target, max_prompt_tokens=8, min_output_tokens=2,
+        plain_warmup_tokens=0)
+    engine.drafter = SimpleNamespace(
+        draft_token=lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("forced span must bypass the draft head")))
+    constraint = _Constraint()
+
+    result = engine.generate("x", 4, constraint=constraint)
+
+    assert result["tokens"] == [4, 8, 9, 5]
+    assert result["kv_positions"] == 6
+    assert target.serial_calls == [[4, 8, 9]]
+    assert constraint.accepted == [4, 8, 9, 5]
+    assert result["path_stats"]["qwen_mtp_proposed"] == 0
+    assert result["path_stats"]["qwen_mtp_grammar_forced_tokens"] == 2
+    assert result["path_stats"]["qwen_mtp_grammar_forced_sweeps"] == 1
+    assert result["path_stats"]["qwen_mtp_round_outcomes"] == "F2"
+
+
+def test_qwen_mtp_rejection_restores_serial_kda_midpoint_without_refeed():
+    from runtime.qwen35_mtp import QwenMTPSpeculativeEngine
+
+    midpoint = object()
+
+    class _Constraint:
+        profile = "test-grammar"
+
+        def __init__(self):
+            self.completed = False
+            self.accepted = []
+
+        def mask_logits(self, logits):
+            masked = mx.full(logits.shape, -1e9)
+            return masked.at[..., 5].add(1e9 + 1)
+
+        def accept_token(self, token):
+            self.accepted.append(int(token))
+
+    class _KV:
+        def __init__(self):
+            self.offset = 3
+            self.kda_cache = object()
+            self.lengths = [3, 1]
+
+        def trim(self, offset):
+            self.offset = offset
+
+        def layer_lengths(self):
+            return tuple(self.lengths)
+
+        def trim_layer_lengths(self, lengths):
+            self.lengths = list(lengths)
+            self.offset = self.lengths[0]
+
+        def nbytes(self):
+            return 0
+
+    class _Target(_Engine):
+        def __init__(self):
+            super().__init__("/models/target")
+            self.cfg = SimpleNamespace(num_experts=8, eos_token_ids=())
+            self.cache = SimpleNamespace(
+                stats=SimpleNamespace(
+                    hits=0, misses=0, evictions=0, bytes_read=0),
+                total_bytes=0, max_bytes=1)
+            self.expert_hits = self.expert_misses = 0
+            for name in (
+                    "fast_tier_bytes", "archive_bytes",
+                    "parallel_tier_fetches", "parallel_tier_fast_bytes",
+                    "parallel_tier_archive_bytes"):
+                setattr(self.store, name, 0)
+            self.governor = None
+            self._layer_transient = 0
+            self._prefill_layer_transient = 0
+            self._decode_layer_transient = 0
+            self._layer_transient_margin = 0
+            self._token_transient = 0
+            self._true_peak_metal_bytes = 0
+            self._request_profiler = None
+            self._hot_prompt_slots = []
+            self._h_last = mx.zeros((1, 1, 1))
+            self.last_kv = None
+            self.forward_calls = 0
+            self.endpoint_requests = []
+
+        def generate(self, prompt, max_tokens, **_kwargs):
+            assert max_tokens == 1
+            _kwargs["constraint"].accept_token(4)
+            self.last_kv = _KV()
+            return {
+                "text": "4", "tokens": [4], "prefill_s": 0.0,
+                "first_token_s": 0.0, "decode_s": 0.0, "total_s": 0.0,
+                "termination_reason": "length", "stop_sequence": None,
+                "path_stats": {}, "prompt_tokens": 3,
+            }
+
+        def forward_tokens(self, _tokens, _kv):
+            self.forward_calls += 1
+            raise AssertionError("rejection must not refeed the catchup token")
+
+        def forward_tokens_serial_positions(
+                self, tokens, kv, *, capture_kda_endpoints=False):
+            assert tokens == [4, 9]
+            assert capture_kda_endpoints
+            kv.offset += 2
+            kv.lengths = [value + 2 for value in kv.lengths]
+            self._h_window = mx.array([[[40.0], [90.0]]])
+            self._h_last = self._h_window[:, -1:, :]
+            logits = mx.zeros((2, 10))
+            logits = logits.at[0, 6].add(1)
+            logits = logits.at[1, 7].add(1)
+            return logits
+
+        def consume_serial_kda_endpoint(self, fed_positions):
+            self.endpoint_requests.append(fed_positions)
+            return midpoint if fed_positions == 1 else None
+
+    target = _Target()
+    engine = QwenMTPSpeculativeEngine(
+        target, max_prompt_tokens=8, min_output_tokens=2,
+        plain_warmup_tokens=0)
+    engine.drafter = SimpleNamespace(
+        draft_token=lambda *_args, **_kwargs: 9)
+
+    constraint = _Constraint()
+    result = engine.generate("x", 2, constraint=constraint)
+
+    assert result["tokens"] == [4, 5]
+    assert result["kv_positions"] == 4
+    assert target.last_kv.kda_cache is midpoint
+    assert target.last_kv.lengths == [4, 2]
+    assert target.forward_calls == 0
+    assert target.endpoint_requests == [1]
+    assert constraint.accepted == [4, 5]
+    assert result["path_stats"]["qwen_mtp_serial_verify_rounds"] == 1
+    assert result["path_stats"]["qwen_mtp_kda_endpoint_restores"] == 1
+    assert result["path_stats"]["qwen_mtp_refeed_sweeps_saved"] == 1
+    assert result["path_stats"]["qwen_mtp_constraint_verified"] == 1
 
 
 def test_forward_tokens_serial_positions_excludes_hybrid_model_types():

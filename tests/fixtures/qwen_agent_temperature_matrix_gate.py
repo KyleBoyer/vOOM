@@ -143,6 +143,9 @@ def main() -> int:
     parser.add_argument(
         "--grammar-jump-forward-lossy", choices=("0", "1"), default="0")
     parser.add_argument("--qwen35-weight-cache-mb", type=int)
+    parser.add_argument(
+        "--qwen-mtp-speculative", choices=("auto", "0", "1"), default="0")
+    parser.add_argument("--qwen-mtp-min-output-tokens", type=int, default=32)
     parser.add_argument("--expected-function-arguments-json")
     parser.add_argument(
         "--expected-positive-function-argument", action="append", default=[])
@@ -180,6 +183,7 @@ def main() -> int:
         args.max_cold_seconds, args.max_warm_seconds,
         args.min_available_gb, args.max_swap_growth_mb,
         args.system_reserve_mb, args.persistent_prompt_cache_max_mb,
+        args.qwen_mtp_min_output_tokens,
     ) <= 0 or args.min_cached_tokens <= 0:
         parser.error("timeouts, thresholds, and safety limits must be positive")
 
@@ -208,6 +212,10 @@ def main() -> int:
     if args.qwen35_weight_cache_mb is not None:
         server_overrides["VMODEL_QWEN35_WEIGHT_CACHE_MB"] = str(
             args.qwen35_weight_cache_mb)
+    server_overrides["VMODEL_QWEN_MTP_SPECULATIVE"] = (
+        args.qwen_mtp_speculative)
+    server_overrides["VMODEL_QWEN_MTP_MIN_OUTPUT_TOKENS"] = str(
+        args.qwen_mtp_min_output_tokens)
     expected_backend = (
         "mlx-lm" if args.backend == "mlx-lm" else "voom")
     expected_repeat_cache_source = (

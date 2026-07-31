@@ -147,6 +147,18 @@ def test_vision_protocol_timing_uses_generic_path_stats():
     }
 
 
+def test_vision_protocol_timing_exposes_qwen_mtp_round_trace():
+    timing = _vision_protocol_timing({
+        "path_stats": {
+            "qwen_mtp_used": 1,
+            "qwen_mtp_round_outcomes": "AARRA",
+        },
+    })
+
+    assert timing["qwen_mtp_used"] == 1
+    assert timing["qwen_mtp_round_outcomes"] == "AARRA"
+
+
 def test_response_write_timeout_releases_inference_lock(monkeypatch):
     class Connection:
         def __init__(self):
@@ -1858,6 +1870,91 @@ def test_qwen36_profiles_bound_experts_and_use_hybrid_endpoint_cache():
     assert fast.max_weight_cache_mb == 5000
 
 
+def test_qwen36_explicit_quantized_head_replaces_repeated_bf16_stream():
+    from unittest.mock import patch
+
+    from runtime.server import EngineManager
+
+    captured = []
+
+    class FakeEngine:
+        def __init__(self, _path, rc):
+            captured.append(rc)
+
+        def close(self):
+            pass
+
+    cfg = SimpleNamespace(
+        model_type="qwen3_5_moe", tie_word_embeddings=False,
+        index_topk=0, vision_config=None, num_hidden_layers=40,
+        num_experts=256, num_experts_per_tok=8,
+        layer_types=[
+            "linear_attention", "linear_attention", "linear_attention",
+            "full_attention",
+        ] * 10,
+    )
+    with patch.dict(
+            "os.environ", {"VMODEL_QWEN35_QUANT_LM_HEAD": "1"}), \
+         patch("runtime.config.ModelConfig.from_dir", return_value=cfg), \
+         patch("runtime.path_resolver.resolve_model_dir",
+               side_effect=lambda path: path), \
+         patch("runtime.engine.StreamingEngine", FakeEngine), \
+         patch("runtime.server.psutil.virtual_memory",
+               return_value=SimpleNamespace(available=8_000_000_000)):
+        EngineManager().get(Path("/tmp/fake-qwen36-qhead"), "fast")
+
+    rc = captured[0]
+    assert rc.quant_mode == "mxfp4"
+    assert rc.quant_lm_head
+    assert rc.pin_lm_head
+    assert not rc.stream_lm_head
+
+
+def test_qwen36_explicit_reranked_head_keeps_exact_candidate_scores():
+    from unittest.mock import patch
+
+    from runtime.server import EngineManager
+
+    captured = []
+
+    class FakeEngine:
+        def __init__(self, _path, rc):
+            captured.append(rc)
+
+        def close(self):
+            pass
+
+    cfg = SimpleNamespace(
+        model_type="qwen3_5_moe", tie_word_embeddings=False,
+        index_topk=0, vision_config=None, num_hidden_layers=40,
+        num_experts=256, num_experts_per_tok=8,
+        layer_types=[
+            "linear_attention", "linear_attention", "linear_attention",
+            "full_attention",
+        ] * 10,
+    )
+    with patch.dict("os.environ", {
+            "VMODEL_QWEN35_RERANK_LM_HEAD": "1",
+            "VMODEL_QWEN35_RERANK_LM_HEAD_CANDIDATES": "64",
+         }), \
+         patch("runtime.config.ModelConfig.from_dir", return_value=cfg), \
+         patch("runtime.path_resolver.resolve_model_dir",
+               side_effect=lambda path: path), \
+         patch("runtime.engine.StreamingEngine", FakeEngine), \
+         patch("runtime.server.psutil.virtual_memory",
+               return_value=SimpleNamespace(available=8_000_000_000)):
+        EngineManager().get(Path("/tmp/fake-qwen36-rerank-head"), "fast")
+
+    rc = captured[0]
+    assert not rc.quant_lm_head
+    assert rc.rerank_lm_head
+    assert rc.rerank_lm_head_candidates == 64
+    assert (rc.rerank_lm_head_mode, rc.rerank_lm_head_bits,
+            rc.rerank_lm_head_group_size) == ("mxfp4", 4, 32)
+    assert rc.pin_lm_head
+    assert not rc.stream_lm_head
+
+
 def test_qwen_native_mtp_auto_policy_targets_only_out_of_core_dense_models():
     from runtime.server import _qwen_native_mtp_policy
 
@@ -1877,7 +1974,13 @@ def test_qwen_native_mtp_auto_policy_targets_only_out_of_core_dense_models():
         "auto", model_type="qwen3_5_moe", num_experts=256,
         payload_bytes=23_400_000_000, cache_bytes=7_000_000_000)
     assert not enabled
-    assert reason == "moe-expert-io-regression"
+    assert reason == "moe-serial-verifier-not-auto-validated"
+
+    enabled, reason = _qwen_native_mtp_policy(
+        "1", model_type="qwen3_5_moe", num_experts=256,
+        payload_bytes=23_400_000_000, cache_bytes=7_000_000_000)
+    assert enabled
+    assert reason == "operator-forced"
 
     enabled, reason = _qwen_native_mtp_policy(
         "auto", model_type="qwen3_5", num_experts=0,
@@ -3341,6 +3444,26 @@ def test_execution_profile_discloses_reranked_head(tmp_path):
     assert _execution_profile_fields(engine)["vmodel_weight_profile"] == (
         "experts-mxfp4-q4-g32+head-mxfp4-q4-g32-rerank32"
         "+attn-mxfp8-q8-g32")
+
+
+def test_execution_profile_discloses_resident_quantized_head(tmp_path):
+    (tmp_path / "config.json").write_text(json.dumps({
+        "quantization": {"mode": "mxfp4", "bits": 4, "group_size": 32},
+        "voom_quantization": {"profile": "experts", "source": "/source"},
+    }))
+    engine = SimpleNamespace(
+        _model_dir=tmp_path,
+        store=SimpleNamespace(
+            quantization={"mode": "mxfp4", "bits": 4, "group_size": 32},
+            on_disk_quantized=True),
+        rc=SimpleNamespace(
+            quant_bits=4, quant_mode="mxfp4", quant_group_size=32,
+            quant_lm_head=True, pin_lm_head=True, stream_lm_head=False,
+            rerank_lm_head=False, resident_attention_mode=""),
+    )
+
+    assert _execution_profile_fields(engine)["vmodel_weight_profile"] == (
+        "experts-mxfp4-q4-g32+head-mxfp4-q4-g32")
 
 
 def test_execution_profile_discloses_olmoe_top_k_schedule(tmp_path):

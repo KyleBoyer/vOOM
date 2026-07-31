@@ -186,7 +186,9 @@ def _summary(response: dict, *, wall_s: float, events: list[str],
              progress: list[dict], deltas: list[str],
              expected_function_arguments: dict | None = None,
              expected_positive_function_arguments: tuple[str, ...] = (),
-             expected_nonempty_function_arguments: tuple[str, ...] = ()) -> dict:
+             expected_nonempty_function_arguments: tuple[str, ...] = (),
+             expected_output_text_terms: tuple[str, ...] = (),
+             expected_output_text_any_terms: tuple[str, ...] = ()) -> dict:
     output = response.get("output") or []
     stable_output = []
     for item in output:
@@ -247,6 +249,49 @@ def _summary(response: dict, *, wall_s: float, events: list[str],
             )
             for arguments in parsed_function_arguments)
     )
+    # Responses API servers are not required to synthesize the SDK's
+    # top-level ``output_text`` convenience property. Build the semantic
+    # witness from both that field and canonical message content, while still
+    # persisting only the boolean below.
+    private_text_parts = (
+        [final_output_text]
+        if isinstance(final_output_text, str) and final_output_text else []
+    )
+    for item in output:
+        if not isinstance(item, dict):
+            continue
+        content = item.get("content")
+        if not isinstance(content, list):
+            continue
+        for part in content:
+            if not isinstance(part, dict):
+                continue
+            text = part.get("text")
+            if isinstance(text, str):
+                private_text_parts.append(text)
+    folded_output_text = "\n".join(private_text_parts).casefold()
+    output_text_terms_match = (
+        None if not expected_output_text_terms else all(
+            term.casefold() in folded_output_text
+            for term in expected_output_text_terms
+        )
+    )
+    output_text_term_matches = (
+        None if not expected_output_text_terms else [
+            term.casefold() in folded_output_text
+            for term in expected_output_text_terms
+        ]
+    )
+    output_text_any_term_matches = (
+        None if not expected_output_text_any_terms else [
+            term.casefold() in folded_output_text
+            for term in expected_output_text_any_terms
+        ]
+    )
+    output_text_any_term_match = (
+        None if output_text_any_term_matches is None
+        else any(output_text_any_term_matches)
+    )
     return {
         "http_status": 200,
         "response_status": response.get("status"),
@@ -279,6 +324,12 @@ def _summary(response: dict, *, wall_s: float, events: list[str],
         "function_call_arguments_match": argument_match,
         "function_call_positive_arguments_match": positive_argument_match,
         "function_call_nonempty_arguments_match": nonempty_argument_match,
+        # Boolean only: terms are operator-supplied and neither the private
+        # response text nor matched spans are written to the artifact.
+        "output_text_terms_match": output_text_terms_match,
+        "output_text_term_matches": output_text_term_matches,
+        "output_text_any_term_match": output_text_any_term_match,
+        "output_text_any_term_matches": output_text_any_term_matches,
         "output_sha256": hashlib.sha256(private_output).hexdigest(),
         "output_bytes": len(private_output),
         "sse_event_types": events,
@@ -301,7 +352,9 @@ def _post(
         url: str, payload: bytes, timeout: float, stream: bool,
         expected_function_arguments: dict | None = None,
         expected_positive_function_arguments: tuple[str, ...] = (),
-        expected_nonempty_function_arguments: tuple[str, ...] = ()) -> dict:
+        expected_nonempty_function_arguments: tuple[str, ...] = (),
+        expected_output_text_terms: tuple[str, ...] = (),
+        expected_output_text_any_terms: tuple[str, ...] = ()) -> dict:
     request = urllib.request.Request(
         url, data=payload, headers={"Content-Type": "application/json"},
         method="POST")
@@ -392,7 +445,9 @@ def _post(
         expected_positive_function_arguments=(
             expected_positive_function_arguments),
         expected_nonempty_function_arguments=(
-            expected_nonempty_function_arguments))
+            expected_nonempty_function_arguments),
+        expected_output_text_terms=expected_output_text_terms,
+        expected_output_text_any_terms=expected_output_text_any_terms)
 
 
 def _write(path: Path | None, value: dict) -> None:
@@ -534,6 +589,16 @@ def main() -> int:
         help=(
             "require these argument names to have nonempty values in one "
             "function call; only a boolean match witness is persisted"))
+    parser.add_argument(
+        "--expected-output-text-term", action="append", default=[],
+        help=(
+            "require every case-insensitive term in final output_text; only "
+            "a boolean match witness is persisted"))
+    parser.add_argument(
+        "--expected-output-text-any-term", action="append", default=[],
+        help=(
+            "require at least one case-insensitive term in final output_text; "
+            "only boolean match witnesses are persisted"))
     parser.add_argument("--expected-backend")
     parser.add_argument(
         "--expected-runtime-profile", action="append", default=[])
@@ -744,7 +809,11 @@ def main() -> int:
             expected_positive_function_arguments=tuple(
                 args.expected_positive_function_argument),
             expected_nonempty_function_arguments=tuple(
-                args.expected_nonempty_function_argument))
+                args.expected_nonempty_function_argument),
+            expected_output_text_terms=tuple(
+                args.expected_output_text_term),
+            expected_output_text_any_terms=tuple(
+                args.expected_output_text_any_term))
         after = _pressure()
         row["repeat"] = index + 1
         row["request_label"] = label
@@ -840,6 +909,20 @@ def main() -> int:
             failures.append(
                 f"repeat {index + 1}: function arguments did not contain "
                 "the expected nonempty fields")
+        if (
+            args.expected_output_text_term
+            and row.get("output_text_terms_match") is not True
+        ):
+            failures.append(
+                f"repeat {index + 1}: output text did not contain every "
+                "expected term")
+        if (
+            args.expected_output_text_any_term
+            and row.get("output_text_any_term_match") is not True
+        ):
+            failures.append(
+                f"repeat {index + 1}: output text did not contain any "
+                "accepted mechanism term")
         if (args.expected_backend is not None
                 and row.get("backend") != args.expected_backend):
             failures.append(

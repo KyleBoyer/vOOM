@@ -859,21 +859,22 @@ def _qwen_native_mtp_policy(
 
     The real-checkpoint A/Bs are deliberately encoded as an architectural
     policy rather than a model-name allowlist: MTP regressed on fully resident
-    dense 4B and on MoE 35B, while it won on dense models whose payload exceeds
-    the streamed weight-cache budget (9B/27B). ``1`` remains an expert override;
-    the construction site still refuses MoE targets unconditionally.
+    dense 4B and on the old batched/refeed MoE verifier, while it won on dense
+    models whose payload exceeds the streamed weight-cache budget (9B/27B).
+    ``1`` remains an explicit operator override and admits the newer serial,
+    midpoint-restoring MoE verifier; auto remains conservative.
     """
     requested = str(requested or "auto").strip().lower()
     if requested not in ("auto", "0", "1"):
         raise ValueError("VMODEL_QWEN_MTP_SPECULATIVE must be auto, 0, or 1")
     if model_type not in ("qwen3_5", "qwen3_5_moe"):
         return False, "unsupported-architecture"
-    if num_experts:
-        return False, "moe-expert-io-regression"
     if requested == "0":
         return False, "operator-disabled"
     if requested == "1":
         return True, "operator-forced"
+    if num_experts:
+        return False, "moe-serial-verifier-not-auto-validated"
     if ngram_enabled:
         return False, "explicit-ngram-selected"
     if payload_bytes <= 0:
@@ -1040,6 +1041,33 @@ class EngineManager:
             "VMODEL_QWEN_MOE_PREFILL_EXPERT_BATCH", "16").strip()
         qwen_moe_decode_batch_request = os.environ.get(
             "VMODEL_QWEN_MOE_DECODE_EXPERT_BATCH", "8").strip()
+        qwen_quant_lm_head_request = os.environ.get(
+            "VMODEL_QWEN35_QUANT_LM_HEAD", "0").strip()
+        if qwen_quant_lm_head_request not in ("0", "1"):
+            raise RequestValidationError(
+                "VMODEL_QWEN35_QUANT_LM_HEAD must be 0 or 1")
+        qwen_rerank_lm_head_request = os.environ.get(
+            "VMODEL_QWEN35_RERANK_LM_HEAD", "0").strip()
+        if qwen_rerank_lm_head_request not in ("0", "1"):
+            raise RequestValidationError(
+                "VMODEL_QWEN35_RERANK_LM_HEAD must be 0 or 1")
+        try:
+            qwen_rerank_lm_head_candidates = int(os.environ.get(
+                "VMODEL_QWEN35_RERANK_LM_HEAD_CANDIDATES", "64"))
+        except ValueError as error:
+            raise RequestValidationError(
+                "VMODEL_QWEN35_RERANK_LM_HEAD_CANDIDATES must be an integer"
+            ) from error
+        if qwen_rerank_lm_head_candidates <= 0:
+            raise RequestValidationError(
+                "VMODEL_QWEN35_RERANK_LM_HEAD_CANDIDATES must be positive")
+        if (
+            qwen_quant_lm_head_request == "1"
+            and qwen_rerank_lm_head_request == "1"
+        ):
+            raise RequestValidationError(
+                "Qwen quantized-only and exact-reranked LM heads are mutually "
+                "exclusive")
         native_ct_mxfp4_request = os.environ.get(
             "VMODEL_CT_MXFP4_NATIVE", "0").strip()
         if native_ct_mxfp4_request not in ("0", "1"):
@@ -1211,6 +1239,9 @@ class EngineManager:
             bool(requires_vision), resident_backend_request,
             qwen_mtp_request, qwen_moe_prefill_batch_request,
             qwen_moe_decode_batch_request,
+            qwen_quant_lm_head_request,
+            qwen_rerank_lm_head_request,
+            qwen_rerank_lm_head_candidates,
             native_ct_mxfp4_request,
             k3_scale_sidecar_request,
             bf16_nf12_sidecar_request,
@@ -1245,6 +1276,9 @@ class EngineManager:
             bool(requires_vision), resident_backend_request,
             qwen_mtp_request, qwen_moe_prefill_batch_request,
             qwen_moe_decode_batch_request,
+            qwen_quant_lm_head_request,
+            qwen_rerank_lm_head_request,
+            qwen_rerank_lm_head_candidates,
             native_ct_mxfp4_request,
             k3_scale_sidecar_request,
             bf16_nf12_sidecar_request,
@@ -1864,6 +1898,31 @@ class EngineManager:
                     rc.quant_attention = False
                     rc.quant_router = False
                     rc.quant_lm_head = False
+                    if qwen_quant_lm_head_request == "1":
+                        # Explicit side-quest path: retain one compact MXFP4
+                        # output projection instead of streaming the 1.02 GB
+                        # BF16 head once per generated token. This changes the
+                        # target distribution and therefore remains opt-in.
+                        rc.stream_lm_head = False
+                        rc.pin_lm_head = True
+                        rc.quant_lm_head = True
+                    elif qwen_rerank_lm_head_request == "1":
+                        # Content-independent candidate compression: generate
+                        # a broad shortlist with one resident MXFP4 head, then
+                        # rescore those rows from the released BF16 head. This
+                        # avoids a full 1.02 GB projection stream per token and
+                        # is substantially safer than accepting packed logits
+                        # directly. Candidate recall remains empirical, so the
+                        # path is an explicit side-quest opt-in.
+                        rc.stream_lm_head = False
+                        rc.pin_lm_head = True
+                        rc.quant_lm_head = False
+                        rc.rerank_lm_head = True
+                        rc.rerank_lm_head_mode = "mxfp4"
+                        rc.rerank_lm_head_bits = 4
+                        rc.rerank_lm_head_group_size = 32
+                        rc.rerank_lm_head_candidates = (
+                            qwen_rerank_lm_head_candidates)
                     qwen_moe_top_k = os.environ.get(
                         "VMODEL_QWEN_MOE_EXPERT_TOP_K", "released"
                     ).strip().lower()
@@ -3250,20 +3309,13 @@ class EngineManager:
                         flush=True,
                     )
             elif (getattr(rc, "qwen_mtp_speculative", False)
-                    and target_engine.store.names_with_prefix("mtp.")
-                    and not target_engine.cfg.num_experts):
-                # F110 (2026-07-25): real A/B against real checkpoints found
-                # MTP speculation is a real ~1.8x win for DENSE qwen3_5
-                # targets but a real ~0.95x REGRESSION for qwen3_5_moe --
-                # drafting a token for a MoE checkpoint requires the MTP
-                # layer's own small MoE routing + a separate expert-page
-                # fetch (QwenMTPDrafter._get_experts) on top of the trunk's
-                # verify pass, and that extra disk-bound fetch outweighs the
-                # savings from needing fewer trunk passes. Gated to
-                # num_experts==0 (dense) so enabling the opt-in env var
-                # never silently regresses a MoE deployment; MoE targets
-                # fall through to the plain target engine below exactly as
-                # if no mtp.* weights existed.
+                    and target_engine.store.names_with_prefix("mtp.")):
+                # MoE remains excluded from auto by
+                # _qwen_native_mtp_policy. Explicit opt-in exercises the
+                # serial-position verifier: one trunk sweep, one-token routing
+                # shapes, and retained KDA midpoint restoration on rejection.
+                # This removes both causes of F110's older MoE regression
+                # without accepting any draft without target verification.
                 from .qwen35_mtp import QwenMTPSpeculativeEngine
 
                 try:
@@ -3272,6 +3324,8 @@ class EngineManager:
                             "VMODEL_QWEN_MTP_MAX_PROMPT_TOKENS", "32768"))
                         qwen_mtp_min_output_tokens = int(os.environ.get(
                             "VMODEL_QWEN_MTP_MIN_OUTPUT_TOKENS", "32"))
+                        qwen_mtp_stochastic_draft_top_k = int(os.environ.get(
+                            "VMODEL_QWEN_MTP_STOCHASTIC_DRAFT_TOP_K", "4"))
                     except ValueError as error:
                         raise ValueError(
                             "VMODEL_QWEN_MTP prompt/output limits must be integers"
@@ -3280,14 +3334,24 @@ class EngineManager:
                         target_engine,
                         max_prompt_tokens=qwen_mtp_max_prompt_tokens,
                         min_output_tokens=qwen_mtp_min_output_tokens,
-                        adaptive_stop=(qwen_mtp_request == "auto"),
+                        # Explicit profiles still need bounded behavior on an
+                        # unfamiliar topic or template.  Keep probing from the
+                        # first token, but fall back to the exact ordinary path
+                        # when the released draft head is not winning on this
+                        # request.  This is a per-request safety valve, not an
+                        # auto-admission decision.
+                        adaptive_stop=True,
+                        stochastic_draft_top_k=(
+                            qwen_mtp_stochastic_draft_top_k),
                         plain_warmup_tokens=(
                             3 if qwen_mtp_request == "auto" else 0))
                     print(
                         f"[server] Qwen native MTP speculation: "
                         f"target={model_dir.name} policy={qwen_mtp_reason} "
                         f"prompt_limit={qwen_mtp_max_prompt_tokens} "
-                        f"min_output={qwen_mtp_min_output_tokens}",
+                        f"min_output={qwen_mtp_min_output_tokens} "
+                        f"stochastic_draft_top_k="
+                        f"{qwen_mtp_stochastic_draft_top_k}",
                         flush=True,
                     )
                 except Exception as error:
@@ -6026,7 +6090,11 @@ def _log_path_stats(result: dict, prompt_tokens: int) -> None:
             f"adaptive_disabled="
             f"{int(stats.get('qwen_mtp_adaptive_disabled', 0) or 0)}, "
             f"plain_finish_sweeps="
-            f"{int(stats.get('qwen_mtp_plain_decode_sweeps', 0) or 0)}",
+            f"{int(stats.get('qwen_mtp_plain_decode_sweeps', 0) or 0)}, "
+            f"grammar_forced="
+            f"{int(stats.get('qwen_mtp_grammar_forced_tokens', 0) or 0)}"
+            f"/{int(stats.get('qwen_mtp_grammar_forced_sweeps', 0) or 0)}, "
+            f"rounds={stats.get('qwen_mtp_round_outcomes', '')}",
             flush=True,
         )
     elif stats.get("qwen_mtp_enabled"):
@@ -6243,6 +6311,15 @@ def _vision_protocol_timing(result: dict) -> dict:
         "qwen_mtp_adaptive_disabled",
         "qwen_mtp_plain_decode_sweeps",
         "qwen_mtp_warmup_decode_sweeps",
+        "qwen_mtp_serial_verify_rounds",
+        "qwen_mtp_kda_endpoint_restores",
+        "qwen_mtp_refeed_sweeps_saved",
+        "qwen_mtp_constraint_verified",
+        "qwen_mtp_stochastic",
+        "qwen_mtp_stochastic_draft_argmax",
+        "qwen_mtp_stochastic_draft_top_k",
+        "qwen_mtp_grammar_forced_tokens",
+        "qwen_mtp_grammar_forced_sweeps",
         "qwen_native_mtp_loaded",
         "qwen_native_mtp_enabled",
         "qwen_native_mtp_used",
@@ -6280,6 +6357,8 @@ def _vision_protocol_timing(result: dict) -> dict:
         if key in stats or key in result:
             value[key] = int(metric(key) or 0)
     optional_float_fields = (
+        "qwen_mtp_accept_rate",
+        "qwen_mtp_stochastic_expected_acceptance",
         "resident_persistent_prompt_cache_load_s",
         "resident_persistent_prompt_cache_save_s",
     )
@@ -6287,6 +6366,7 @@ def _vision_protocol_timing(result: dict) -> dict:
         if key in stats or key in result:
             value[key] = float(metric(key) or 0.0)
     for key in (
+        "qwen_mtp_round_outcomes",
         "kimi_k3_prefill_tile_policy",
         "kimi_k3_prefill_schedule",
     ):
@@ -6319,6 +6399,17 @@ def _execution_profile_fields(engine) -> dict[str, object]:
             f"runtime-{rc.quant_mode}-q{rc.quant_bits}-g{rc.quant_group_size}")
     else:
         weight_profile = "released"
+    if (
+        rc is not None
+        and getattr(rc, "quant_lm_head", False)
+        and getattr(rc, "pin_lm_head", False)
+        and not getattr(rc, "stream_lm_head", True)
+    ):
+        weight_profile += (
+            f"+head-{rc.quant_mode}"
+            f"-q{rc.quant_bits}"
+            f"-g{rc.quant_group_size}"
+        )
     if rc is not None and getattr(rc, "rerank_lm_head", False):
         weight_profile += (
             f"+head-{rc.rerank_lm_head_mode}"

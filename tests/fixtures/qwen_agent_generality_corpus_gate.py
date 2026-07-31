@@ -41,6 +41,7 @@ def _case_command(
     scenario: str | None = None, function_name: str | None = None,
     min_cached_tokens: int = 20, require_real_tool: bool | None = None,
     max_warm_seconds: float = 60.0, gateway_phase: str | None = None,
+    max_first_seconds: float = 60.0,
     max_output_tokens: int | None = None,
     response_status: str | None = "completed",
     min_available_gb: float = 3.2,
@@ -48,6 +49,9 @@ def _case_command(
     expected_backend: str = "mlx-lm",
     repeat_cache_source: str = "hot-prompt-exact",
     nonempty_function_argument: str | None = None,
+    expected_output_text_terms: tuple[str, ...] = (),
+    expected_output_text_any_terms: tuple[str, ...] = (),
+    replacement_user_text: str | None = None,
 ) -> list[str]:
     command = [
         sys.executable, str(REPLAY), str(capture),
@@ -58,7 +62,7 @@ def _case_command(
         "--timeout", "180",
         "--expected-output-type", output_type,
         "--expected-backend", expected_backend,
-        "--expected-max-first-wall-seconds", "60",
+        "--expected-max-first-wall-seconds", str(max_first_seconds),
         "--expected-max-repeat-wall-seconds", str(max_warm_seconds),
         "--expected-first-cache-source", first_cache_source,
         "--expected-max-peak-metal-gb", "8.5",
@@ -94,6 +98,12 @@ def _case_command(
             "--expected-nonempty-function-argument",
             nonempty_function_argument,
         ])
+    for term in expected_output_text_terms:
+        command.extend(["--expected-output-text-term", term])
+    for term in expected_output_text_any_terms:
+        command.extend(["--expected-output-text-any-term", term])
+    if replacement_user_text is not None:
+        command.extend(["--replacement-user-text", replacement_user_text])
     if require_real_tool is not None:
         command.extend([
             "--expected-gateway-real-tool-required",
@@ -120,6 +130,16 @@ def main() -> int:
     parser.add_argument(
         "--grammar-jump-forward-lossy", choices=("0", "1"), default="0")
     parser.add_argument("--qwen35-weight-cache-mb", type=int)
+    parser.add_argument(
+        "--qwen-quant-lm-head", choices=("0", "1"), default="0")
+    parser.add_argument(
+        "--qwen-rerank-lm-head", choices=("0", "1"), default="0")
+    parser.add_argument(
+        "--qwen-rerank-lm-head-candidates", type=int, default=64)
+    parser.add_argument(
+        "--qwen-mtp-speculative", choices=("auto", "0", "1"), default="0")
+    parser.add_argument("--qwen-mtp-min-output-tokens", type=int, default=32)
+    parser.add_argument("--max-first-seconds", type=float, default=60.0)
     parser.add_argument("--port", type=int, default=8130)
     parser.add_argument("--min-available-gb", type=float, default=3.2)
     parser.add_argument("--max-swap-growth-mb", type=float, default=16.0)
@@ -143,6 +163,9 @@ def main() -> int:
         args.persistent_prompt_cache_max_mb,
         args.min_available_gb,
         args.max_swap_growth_mb,
+        args.max_first_seconds,
+        args.qwen_mtp_min_output_tokens,
+        args.qwen_rerank_lm_head_candidates,
     ) <= 0:
         parser.error("reserve and persistent-cache limits must be positive")
     if args.persistent_replay and args.persistent_prompt_cache_dir is None:
@@ -174,6 +197,16 @@ def main() -> int:
     if args.qwen35_weight_cache_mb is not None:
         server_overrides["VMODEL_QWEN35_WEIGHT_CACHE_MB"] = str(
             args.qwen35_weight_cache_mb)
+    server_overrides["VMODEL_QWEN35_QUANT_LM_HEAD"] = (
+        args.qwen_quant_lm_head)
+    server_overrides["VMODEL_QWEN35_RERANK_LM_HEAD"] = (
+        args.qwen_rerank_lm_head)
+    server_overrides["VMODEL_QWEN35_RERANK_LM_HEAD_CANDIDATES"] = str(
+        args.qwen_rerank_lm_head_candidates)
+    server_overrides["VMODEL_QWEN_MTP_SPECULATIVE"] = (
+        args.qwen_mtp_speculative)
+    server_overrides["VMODEL_QWEN_MTP_MIN_OUTPUT_TOKENS"] = str(
+        args.qwen_mtp_min_output_tokens)
     expected_backend = (
         "mlx-lm" if args.backend == "mlx-lm" else "voom")
     repeat_cache_source = (
@@ -231,6 +264,39 @@ def main() -> int:
                 "developer": False,
                 "stream": False,
                 "subject": "direct-humor",
+                "max_output_tokens": (
+                    "16 direct-answer quality bound; not a latency result"),
+            },
+        },
+        {
+            "name": "long-system-science-132-tools-temp05",
+            "capture": args.direct_capture,
+            "temperature": 0.5,
+            "repeats": 2,
+            "output_type": "message",
+            "first_cache_source": "cold",
+            "stream_mode": "disabled",
+            "gateway_phase": "direct",
+            "replacement_user_text": (
+                "In one concise sentence, explain why the daytime sky "
+                "usually appears blue."),
+            "expected_output_text_terms": ("blue",),
+            "expected_output_text_any_terms": (
+                "scatter", "rayleigh", "wavelength", "atmosphere"),
+            "max_output_tokens": 16,
+            "response_status": None,
+            "min_cached_tokens": 1_000,
+            "declared_shape": {
+                "capture": "tracked-synthetic-mutation",
+                "conversation": "single-turn-science-question",
+                "tools": 132,
+                "system": "long",
+                "developer": False,
+                "stream": False,
+                "subject": "atmospheric-science",
+                "semantic_witness": (
+                    "contains blue + one of scatter/rayleigh/"
+                    "wavelength/atmosphere"),
                 "max_output_tokens": (
                     "16 direct-answer quality bound; not a latency result"),
             },
@@ -356,6 +422,7 @@ def main() -> int:
             "in_run_available_gb_at_least": args.min_available_gb,
             "max_swap_growth_mb": args.max_swap_growth_mb,
             "true_peak_metal_gb_strictly_below": 8.5,
+            "first_response_seconds_at_most": args.max_first_seconds,
         },
         "cases": [],
         "failures": [],
@@ -392,6 +459,7 @@ def main() -> int:
                 model=args.model, port=args.port, result=child_result,
                 min_available_gb=args.min_available_gb,
                 max_swap_growth_mb=args.max_swap_growth_mb,
+                max_first_seconds=args.max_first_seconds,
                 expected_backend=expected_backend,
                 repeat_cache_source=repeat_cache_source,
                 **command_args)

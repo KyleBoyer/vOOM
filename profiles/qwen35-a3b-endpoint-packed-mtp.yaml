@@ -1,0 +1,17 @@
+schema: voom.runtime-profile.v1
+name: qwen35-a3b-endpoint-packed-mtp
+description: Explicit Qwen3.6-35B-A3B endpoint-packed profile with native one-token MTP verification.
+notes:
+  - Uses the checkpoint's released MTP head only as a draft; greedy tokens require target argmax equality, while stochastic tokens use exact p/q acceptance and target-minus-draft residual correction.
+  - Stochastic drafting flattens q over the constrained MTP top four to cover ranking-near-misses; this remains target-distribution exact for every topic because rejection samples the normalized positive part of p minus that declared q.
+  - Serial layer-major verification keeps routed MoE arithmetic one-position-shaped and restores KDA plus every full-attention layer's local mixed-depth endpoint after rejection.
+  - A three-round probe falls back on all-reject greedy drafts or stochastic drafts whose exact mean p/q overlap is below 5%; retained per-layer endpoints keep every rejection refeed-free.
+  - Grammar-deterministic spans are folded into one layer-major target sweep before MTP resumes at the next genuinely ambiguous token, preserving the parent profile's jump-forward benefit.
+  - The shared-trunk fast tier is content-blind physical placement and is prepared separately with formats.fast_tier --include-trunk.
+  - MTP remains explicit rather than auto-selected until the heterogeneous corpus and repeated cold-run evidence are broad enough for a default change.
+extends:
+  - qwen35-a3b-endpoint-packed
+settings:
+  VMODEL_QWEN_MTP_SPECULATIVE: true
+  VMODEL_QWEN_MTP_MIN_OUTPUT_TOKENS: 2
+  VMODEL_QWEN_MTP_STOCHASTIC_DRAFT_TOP_K: 4

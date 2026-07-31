@@ -1,0 +1,14 @@
+schema: voom.runtime-profile.v1
+name: qwen35-a3b-endpoint-packed-head-rerank64
+description: Qwen3.6-35B-A3B endpoint-packed profile with MXFP4 candidate search and exact BF16 head reranking.
+notes:
+  - A resident MXFP4 projection selects 64 candidates and released BF16 rows rescore them exactly; this removes the full 1.02 GB head stream from every decode step.
+  - The candidate construction is fixed across topics, prompts, tool catalogs, roles, streaming modes, and temperatures.
+  - This is lossy because tokens outside the 64-candidate shortlist have zero sampling support; quality and candidate recall require heterogeneous gates.
+  - Native MTP is deliberately not composed here; the isolated reranked head passed its semantic gate while their stochastic composition remains experimental.
+  - It remains explicit and cannot become an auto default without broad replay-corpus proof.
+extends:
+  - qwen35-a3b-endpoint-packed
+settings:
+  VMODEL_QWEN35_RERANK_LM_HEAD: true
+  VMODEL_QWEN35_RERANK_LM_HEAD_CANDIDATES: 64

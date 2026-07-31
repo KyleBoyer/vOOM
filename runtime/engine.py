@@ -2881,6 +2881,39 @@ class StreamingEngine:
         return layer_runner.final_logits(
             hidden, self._norm_w, head, self.cfg.rms_norm_eps)
 
+    def _constraint_logits(
+        self, logits: mx.array, constraint, hidden: mx.array | None = None,
+    ) -> mx.array:
+        """Apply a grammar before sparse-head candidate selection.
+
+        Ordinary dense/streamed heads retain their established post-projection
+        mask. A candidate-reranked head instead selects its exact BF16 rows
+        from the legal approximate logits so every emitted candidate remains
+        grammar-valid. The operation depends only on the constraint state, not
+        prompt wording, subject, or tool identity.
+        """
+        if constraint is None:
+            return logits
+        from .quant import RerankedQHead, reranked_matmul
+
+        head = self._lm_head_weight()
+        source = hidden if hidden is not None else self._h_last
+        if isinstance(head, RerankedQHead) and source is not None:
+            if self.cfg.model_type in ("qwen3_5_moe", "qwen3_5"):
+                from .qwen35 import qwen35_rms_norm
+
+                normalized = qwen35_rms_norm(
+                    source[:, -1:, :], self._norm_w,
+                    self.cfg.rms_norm_eps)
+            else:
+                normalized = mx.fast.rms_norm(
+                    source[:, -1:, :], self._norm_w,
+                    self.cfg.rms_norm_eps)
+            return reranked_matmul(
+                normalized, head,
+                logits_transform=constraint.mask_logits)[0, 0]
+        return constraint.mask_logits(logits)
+
     def _all_logits(self, hidden: mx.array) -> mx.array:
         head = self._lm_head_weight()
         if self.cfg.model_type in ("qwen3_5_moe", "qwen3_5"):
@@ -6359,7 +6392,7 @@ class StreamingEngine:
             self._h_window = x
             self._h_last = x[:, -1:, :]
             logits = self._final_logits(x)
-        sampled_logits = constraint.mask_logits(logits) if constraint is not None else logits
+        sampled_logits = self._constraint_logits(logits, constraint)
         next_tok = sample(sampled_logits, sampling, history=tokens)
         if constraint is not None:
             constraint.accept_token(next_tok)
@@ -6701,9 +6734,8 @@ class StreamingEngine:
                     x = self._embed(pending)
                     x = self._sweep(x, kv, offset=kv.offset)
                     logits = self._final_logits(x)
-                    sampled_logits = (
-                        constraint.mask_logits(logits)
-                        if constraint is not None else logits)
+                    sampled_logits = self._constraint_logits(
+                        logits, constraint, hidden=x)
                     next_tok = sample(
                         sampled_logits, sampling,
                         history=tokens + generated

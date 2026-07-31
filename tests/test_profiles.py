@@ -68,6 +68,26 @@ def test_builtin_profiles_resolve_complete_agent_group():
     assert settings["VMODEL_FAST_TOOL_GATEWAY_EXECUTION_CONTEXT"] == "full"
     assert settings["VMODEL_FAST_TOOL_GATEWAY_QWEN_MOE_TOP_K"] == "released"
 
+    mtp_order, mtp_settings = resolve_runtime_profiles(
+        ("qwen35-a3b-endpoint-packed-mtp",), catalog)
+    assert mtp_order == (
+        "qwen35-a3b-endpoint-packed",
+        "qwen35-a3b-endpoint-packed-mtp",
+    )
+    assert mtp_settings["VMODEL_QWEN_MTP_SPECULATIVE"] == "1"
+    assert mtp_settings["VMODEL_QWEN_MTP_MIN_OUTPUT_TOKENS"] == "2"
+    assert mtp_settings["VMODEL_QWEN_MTP_STOCHASTIC_DRAFT_TOP_K"] == "4"
+
+    rerank_order, rerank_settings = resolve_runtime_profiles(
+        ("qwen35-a3b-endpoint-packed-head-rerank64",), catalog)
+    assert rerank_order == (
+        "qwen35-a3b-endpoint-packed",
+        "qwen35-a3b-endpoint-packed-head-rerank64",
+    )
+    assert rerank_settings["VMODEL_QWEN35_RERANK_LM_HEAD"] == "1"
+    assert rerank_settings[
+        "VMODEL_QWEN35_RERANK_LM_HEAD_CANDIDATES"] == "64"
+
 
 def test_builtin_k3_and_qwen9_profiles_pin_validated_values():
     catalog = discover_runtime_profiles((ROOT / "profiles",))

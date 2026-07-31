@@ -388,6 +388,46 @@ def dequantize_compressed_tensors_mxfp4(
     return (values * scale_expanded).astype(out_dtype)
 
 
+def reranked_matmul(
+    x: mx.array,
+    w: RerankedQHead,
+    logits_transform=None,
+) -> mx.array:
+    """Candidate search plus exact row scoring, optionally after a mask.
+
+    Applying a grammar before candidate selection is essential: an
+    unrestricted top-k can otherwise contain no legal token, at which point
+    masking the already-sparse result produces an all--infinity distribution.
+    """
+    approx = matmul(x, w.approx)
+    selection = approx
+    if logits_transform is not None:
+        selection = logits_transform(approx.reshape(-1)).reshape(approx.shape)
+    k = w.candidates
+    indices = mx.argpartition(
+        -selection, kth=k - 1, axis=-1)[..., :k]
+
+    # Treat each vocabulary row as a one-output expert. gather_mm uses the
+    # same matrix kernel as an exact projection for just the dynamic rows,
+    # unlike an elementwise multiply+sum whose reduction arithmetic was
+    # measured to change greedy choices on the real OLMoE checkpoint.
+    flat = x.reshape(-1, x.shape[-1])
+    flat_indices = indices.reshape(-1, k)
+    lhs = mx.expand_dims(flat, (-2, -3))
+    rhs = mx.expand_dims(w.exact, -2).swapaxes(-1, -2)
+    exact_scores = mx.gather_mm(
+        lhs, rhs, rhs_indices=flat_indices
+    ).squeeze((-1, -2)).reshape(indices.shape)
+
+    sparse = mx.full(
+        approx.shape, float("-inf"), dtype=approx.dtype)
+    result = mx.put_along_axis(
+        sparse, indices, exact_scores.astype(approx.dtype), axis=-1)
+    if logits_transform is not None:
+        result = logits_transform(result.reshape(-1)).reshape(result.shape)
+    return result
+
+
 def matmul(x: mx.array, w) -> mx.array:
     """x @ w.T for a plain, quantized, or candidate-reranked weight."""
     from .bf16_nf12_linear import NF12Tensor
@@ -395,27 +435,7 @@ def matmul(x: mx.array, w) -> mx.array:
     if isinstance(w, NF12Tensor):
         return w.matmul(x)
     if isinstance(w, RerankedQHead):
-        approx = matmul(x, w.approx)
-        k = w.candidates
-        indices = mx.argpartition(
-            -approx, kth=k - 1, axis=-1)[..., :k]
-
-        # Treat each vocabulary row as a one-output expert. gather_mm uses the
-        # same matrix kernel as an exact projection for just the dynamic rows,
-        # unlike an elementwise multiply+sum whose reduction arithmetic was
-        # measured to change greedy choices on the real OLMoE checkpoint.
-        flat = x.reshape(-1, x.shape[-1])
-        flat_indices = indices.reshape(-1, k)
-        lhs = mx.expand_dims(flat, (-2, -3))
-        rhs = mx.expand_dims(w.exact, -2).swapaxes(-1, -2)
-        exact_scores = mx.gather_mm(
-            lhs, rhs, rhs_indices=flat_indices
-        ).squeeze((-1, -2)).reshape(indices.shape)
-
-        sparse = mx.full(
-            approx.shape, float("-inf"), dtype=approx.dtype)
-        return mx.put_along_axis(
-            sparse, indices, exact_scores.astype(approx.dtype), axis=-1)
+        return reranked_matmul(x, w)
     if isinstance(w, QTensor):
         return mx.quantized_matmul(
             x, w.wq, scales=w.scales, biases=w.biases,
