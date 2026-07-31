@@ -63,4 +63,9 @@ jobs:
           "
 
       - name: Run tests
-        run: python -m pytest tests/ -q
+        # MLX retains allocator/device state for a Python process lifetime.
+        # Running every module in one randomized 1K-test process causes
+        # order-dependent state leakage and eventually a Metal segfault before
+        # pytest can print its failure summary. The checked-in sharder preserves
+        # serial coverage while giving each module a fresh MLX process.
+        run: python tests/run_pytest_sharded.py
