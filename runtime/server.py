@@ -110,6 +110,10 @@ from functools import lru_cache
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
+from .profiles import (RuntimeProfileError, active_runtime_profile_fields,
+                       apply_runtime_profiles, discover_runtime_profiles,
+                       parse_runtime_profile_names, runtime_profile_dirs)
+
 ROOT = Path(__file__).resolve().parent.parent
 
 
@@ -897,6 +901,69 @@ def _qwen_chunked_delta_policy(
     return False, "lossless-checkpoint-boundary"
 
 
+def _qwen_lossy_suffix_prefill_policy(
+        requested: str, *, mode: str, total_layers: int,
+        layer_types: tuple[str, ...] | list[str]) -> tuple[int, int, int]:
+    """Parse a fixed, explicit mixed-depth Qwen prefill schedule.
+
+    ``EARLY_LAYERS:SUFFIX_TOKENS`` means every prompt position crosses the
+    first depth, while only the final suffix crosses the remaining layers.
+    ``EARLY_LAYERS:PREFIX_TOKENS:SUFFIX_TOKENS`` additionally retains a fixed
+    leading semantic anchor through the remaining layers. Neither form
+    inspects prompt contents.
+    Requiring the first full-attention layer inside the shallow prefix keeps
+    KVCache.offset anchored to the complete prompt even though later layers
+    retain compact endpoint state.
+    """
+    requested = str(requested or "").strip().lower()
+    if requested in ("", "0", "off"):
+        return 0, 0, 0
+    if mode not in ("fast", "fast-long"):
+        raise ValueError(
+            "VMODEL_QWEN35_LOSSY_SUFFIX_PREFILL requires a lossy fast mode")
+    fields = requested.split(":")
+    if len(fields) not in (2, 3):
+        raise ValueError(
+            "VMODEL_QWEN35_LOSSY_SUFFIX_PREFILL must be "
+            "EARLY_LAYERS:SUFFIX_TOKENS or "
+            "EARLY_LAYERS:PREFIX_TOKENS:SUFFIX_TOKENS")
+    try:
+        parsed = tuple(int(field) for field in fields)
+    except ValueError as error:
+        raise ValueError(
+            "VMODEL_QWEN35_LOSSY_SUFFIX_PREFILL fields must be integers"
+        ) from error
+    if len(parsed) == 2:
+        early_layers, suffix_tokens = parsed
+        prefix_tokens = 0
+    else:
+        early_layers, prefix_tokens, suffix_tokens = parsed
+    if not 0 < early_layers < int(total_layers):
+        raise ValueError(
+            "VMODEL_QWEN35_LOSSY_SUFFIX_PREFILL EARLY_LAYERS must be "
+            f"within [1, {int(total_layers) - 1}]")
+    if prefix_tokens < 0:
+        raise ValueError(
+            "VMODEL_QWEN35_LOSSY_SUFFIX_PREFILL PREFIX_TOKENS must be "
+            "non-negative")
+    if suffix_tokens <= 0:
+        raise ValueError(
+            "VMODEL_QWEN35_LOSSY_SUFFIX_PREFILL SUFFIX_TOKENS must be positive")
+    full_attention_layers = [
+        index for index, layer_type in enumerate(layer_types)
+        if layer_type == "full_attention"
+    ]
+    if not full_attention_layers:
+        raise ValueError(
+            "VMODEL_QWEN35_LOSSY_SUFFIX_PREFILL requires a hybrid Qwen "
+            "checkpoint with full-attention layers")
+    if early_layers <= full_attention_layers[0]:
+        raise ValueError(
+            "VMODEL_QWEN35_LOSSY_SUFFIX_PREFILL EARLY_LAYERS must include "
+            "the first full-attention layer")
+    return early_layers, prefix_tokens, suffix_tokens
+
+
 def _grammar_jump_forward_policy(requested: str, *, mode: str) -> tuple[bool, str]:
     """Use string-level grammar jumps only when explicitly requested.
 
@@ -1037,10 +1104,27 @@ class EngineManager:
             k3_prefill_tile_width = int(os.environ.get(
                 "VMODEL_K3_PREFILL_TILE_WIDTH", "1"
             ))
+            k3_prefill_long_context_tokens = int(os.environ.get(
+                "VMODEL_K3_PREFILL_LONG_CONTEXT_TOKENS", "256"
+            ))
+            k3_prefill_short_tile_width = int(os.environ.get(
+                "VMODEL_K3_PREFILL_SHORT_TILE_WIDTH", "256"
+            ))
+            k3_dense_mlp_short_tile_size = int(os.environ.get(
+                "VMODEL_K3_DENSE_MLP_SHORT_TILE_SIZE", "0"
+            ))
         except ValueError as error:
             raise RequestValidationError(
                 "VMODEL_K3_* tile settings must be integers"
             ) from error
+        k3_prefill_tile_policy = os.environ.get(
+            "VMODEL_K3_PREFILL_TILE_POLICY", "fixed"
+        ).strip().lower()
+        if k3_prefill_tile_policy not in ("fixed", "prompt-length"):
+            raise RequestValidationError(
+                "VMODEL_K3_PREFILL_TILE_POLICY must be fixed or "
+                "prompt-length"
+            )
         if not 0 <= k3_mla_key_tile_size <= 8192:
             raise RequestValidationError(
                 "VMODEL_K3_MLA_KEY_TILE_SIZE must be in [0, 8192]"
@@ -1056,6 +1140,18 @@ class EngineManager:
         if not 1 <= k3_prefill_tile_width <= 4096:
             raise RequestValidationError(
                 "VMODEL_K3_PREFILL_TILE_WIDTH must be in [1, 4096]"
+            )
+        if k3_prefill_long_context_tokens <= 0:
+            raise RequestValidationError(
+                "VMODEL_K3_PREFILL_LONG_CONTEXT_TOKENS must be positive"
+            )
+        if not 1 <= k3_prefill_short_tile_width <= 4096:
+            raise RequestValidationError(
+                "VMODEL_K3_PREFILL_SHORT_TILE_WIDTH must be in [1, 4096]"
+            )
+        if not 0 <= k3_dense_mlp_short_tile_size <= 4096:
+            raise RequestValidationError(
+                "VMODEL_K3_DENSE_MLP_SHORT_TILE_SIZE must be in [0, 4096]"
             )
         k3_suffix_request = os.environ.get(
             "VMODEL_K3_SUFFIX_DECODING", "0"
@@ -1125,6 +1221,10 @@ class EngineManager:
             k3_fused_attnres_tile_size,
             k3_dense_mlp_tile_size,
             k3_prefill_tile_width,
+            k3_prefill_tile_policy,
+            k3_prefill_long_context_tokens,
+            k3_prefill_short_tile_width,
+            k3_dense_mlp_short_tile_size,
             k3_suffix_request,
             k3_suffix_k,
             k3_suffix_max_depth,
@@ -1155,6 +1255,10 @@ class EngineManager:
             k3_fused_attnres_tile_size,
             k3_dense_mlp_tile_size,
             k3_prefill_tile_width,
+            k3_prefill_tile_policy,
+            k3_prefill_long_context_tokens,
+            k3_prefill_short_tile_width,
+            k3_dense_mlp_short_tile_size,
             k3_suffix_request,
             k3_suffix_k,
             k3_suffix_max_depth,
@@ -1720,6 +1824,33 @@ class EngineManager:
                         "VMODEL_QWEN_MOE_LAYER_STATIONARY_PREFILL must be 0 or 1")
                 rc.layer_stationary_prefill = (
                     qwen_moe_layer_stationary == "1")
+                (rc.qwen_lossy_suffix_prefill_early_layers,
+                 rc.qwen_lossy_suffix_prefill_prefix_tokens,
+                 rc.qwen_lossy_suffix_prefill_tokens
+                 ) = _qwen_lossy_suffix_prefill_policy(
+                    os.environ.get(
+                        "VMODEL_QWEN35_LOSSY_SUFFIX_PREFILL", ""),
+                    mode=mode,
+                    total_layers=int(cfg_probe.num_hidden_layers),
+                    layer_types=tuple(getattr(cfg_probe, "layer_types", ())),
+                )
+                try:
+                    rc.qwen_postgen_min_available_mb = int(os.environ.get(
+                        "VMODEL_QWEN35_POSTGEN_MIN_AVAILABLE_MB", "0"))
+                except ValueError as error:
+                    raise ValueError(
+                        "VMODEL_QWEN35_POSTGEN_MIN_AVAILABLE_MB must be an "
+                        "integer") from error
+                if rc.qwen_postgen_min_available_mb < 0:
+                    raise ValueError(
+                        "VMODEL_QWEN35_POSTGEN_MIN_AVAILABLE_MB must be "
+                        "non-negative")
+                if rc.qwen_lossy_suffix_prefill_early_layers:
+                    rc.layer_stationary_prefill = True
+                    # Durable hot-KV currently assumes uniform per-layer
+                    # position counts. Keep this mixed representation in RAM;
+                    # exact endpoint/extension reuse remains supported.
+                    rc.hot_prompt_kv_persist_dir = ""
                 if mode in ("fast", "fast-long"):
                     # Initial side-quest profile: quantize only expert MLP
                     # matrices. DeltaNet, gated full attention, routers, shared
@@ -2770,6 +2901,18 @@ class EngineManager:
             )
             rc.kimi_k3_dense_mlp_tile_size = (
                 k3_dense_mlp_tile_size if mtype == "kimi_k3" else 0
+            )
+            rc.kimi_k3_prefill_tile_policy = (
+                k3_prefill_tile_policy if mtype == "kimi_k3" else "fixed"
+            )
+            rc.kimi_k3_prefill_long_context_tokens = (
+                k3_prefill_long_context_tokens
+            )
+            rc.kimi_k3_prefill_short_tile_width = (
+                k3_prefill_short_tile_width
+            )
+            rc.kimi_k3_dense_mlp_short_tile_size = (
+                k3_dense_mlp_short_tile_size
             )
             chunked_delta_request = os.environ.get(
                 "VMODEL_QWEN35_CHUNKED_DELTA", "auto")
@@ -6124,6 +6267,14 @@ def _vision_protocol_timing(result: dict) -> dict:
         "resident_persistent_prompt_cache_bytes",
         "resident_persistent_prompt_logits_bytes",
         "resident_persistent_generation_logits",
+        "postgen_weight_cache_trim",
+        "postgen_weight_cache_trim_requested_bytes",
+        "postgen_weight_cache_trim_released_bytes",
+        "postgen_weight_cache_trim_available_before_bytes",
+        "postgen_weight_cache_trim_available_after_bytes",
+        "kimi_k3_prefill_tile_width",
+        "kimi_k3_dense_mlp_tile_size",
+        "kimi_k3_prefill_long_context_tokens",
     )
     for key in optional_integer_fields:
         if key in stats or key in result:
@@ -6135,10 +6286,16 @@ def _vision_protocol_timing(result: dict) -> dict:
     for key in optional_float_fields:
         if key in stats or key in result:
             value[key] = float(metric(key) or 0.0)
+    for key in (
+        "kimi_k3_prefill_tile_policy",
+        "kimi_k3_prefill_schedule",
+    ):
+        if key in stats or key in result:
+            value[key] = str(metric(key) or "")
     return value
 
 
-def _execution_profile_fields(engine) -> dict[str, str]:
+def _execution_profile_fields(engine) -> dict[str, object]:
     """Non-sensitive artifact identity for API reproducibility telemetry."""
     model_dir = Path(getattr(engine, "_model_dir", ""))
     store = getattr(engine, "store", None)
@@ -6205,6 +6362,7 @@ def _execution_profile_fields(engine) -> dict[str, str]:
             if kind == "dspark" else
             f"exact-speculative-k{getattr(engine, '_speculative_k', 0)}")
         fields["vmodel_draft_checkpoint"] = Path(draft_dir).name
+    fields.update(active_runtime_profile_fields())
     return fields
 
 
@@ -6239,7 +6397,10 @@ def _openai_finish_reason(result: dict, *, has_tool_calls: bool = False) -> str:
 
 class Handler(BaseHTTPRequestHandler):
     def _json(self, code: int, obj: dict):
-        body = json.dumps(obj).encode()
+        # Profile identity is process configuration, so disclose it even on
+        # registry/download/error responses that have not constructed an
+        # engine yet. Setting values and note text are intentionally omitted.
+        body = json.dumps({**obj, **active_runtime_profile_fields()}).encode()
         self.send_response(code)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
@@ -8216,9 +8377,59 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def main():
+    global _ENABLE_UNSAFE_AUTOPACK
     ap = argparse.ArgumentParser()
     ap.add_argument("--port", type=int, default=8077)
+    ap.add_argument(
+        "--profile", action="append", default=None, metavar="NAME",
+        help=("apply a named runtime profile; repeat to layer groups in order "
+              "(overrides VMODEL_PROFILE selection)"),
+    )
+    ap.add_argument(
+        "--profile-dir", action="append", default=[], metavar="PATH",
+        help="add a runtime profile search directory",
+    )
+    ap.add_argument(
+        "--list-profiles", action="store_true",
+        help="list discovered runtime profiles and exit",
+    )
     args = ap.parse_args()
+    try:
+        search_dirs = runtime_profile_dirs(args.profile_dir)
+        if args.list_profiles:
+            catalog = discover_runtime_profiles(search_dirs)
+            for name in sorted(catalog):
+                profile = catalog[name]
+                parents = (
+                    f" (extends {', '.join(profile.extends)})"
+                    if profile.extends else "")
+                print(f"{name}{parents}\n  {profile.description}")
+            return
+        selected = parse_runtime_profile_names(
+            args.profile if args.profile is not None
+            else os.environ.get("VMODEL_PROFILE"))
+        application = apply_runtime_profiles(
+            selected, search_dirs=search_dirs, activate=True)
+    except RuntimeProfileError as error:
+        ap.error(str(error))
+    # This is the only server option captured at import time. Refresh it after
+    # profile application so a saved group has the same meaning as an explicit
+    # environment assignment.
+    _ENABLE_UNSAFE_AUTOPACK = (
+        os.environ.get("VMODEL_ENABLE_UNSAFE_AUTOPACK") == "1")
+    if application is not None:
+        override_text = (
+            ",".join(application.overridden_keys)
+            if application.overridden_keys else "none")
+        print(
+            "[server] runtime profiles: "
+            f"selected={','.join(application.selected)} "
+            f"groups={','.join(application.resolution_order)} "
+            f"digest={application.profile_digest[:12]} "
+            f"effective={application.effective_digest[:12]} "
+            f"explicit_overrides={override_text}",
+            flush=True,
+        )
     print(f"[server] vOOM endpoint on http://127.0.0.1:{args.port}  models: {list(_registry())}", flush=True)
     server = ThreadingHTTPServer(("127.0.0.1", args.port), Handler)
     try:

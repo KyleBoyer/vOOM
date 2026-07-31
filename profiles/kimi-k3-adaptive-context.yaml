@@ -1,0 +1,18 @@
+schema: voom.runtime-profile.v1
+name: kimi-k3-adaptive-context
+description: Select Kimi K3 short or long prefill tiles from rendered prompt-token count.
+extends:
+  - kimi-k3-memory-core
+notes:
+  - "The policy is content-blind: it sees only the tokenizer's final rendered token count, never prompt text, tools, routes, message roles, or subject."
+  - "Prompts below 256 tokens use the short 256/0 prefill-cap/dense schedule; prompts at or above 256 tokens use the long 256/256 schedule."
+  - "The 256-wide cap is one effective tile for every short prompt; a measured 1-wide trial was rejected because it touched the same expert bytes and added attention barriers."
+  - "The 256-token crossover is a conservative configurable rollout point between measured 10-token and 1024-token endpoints; intermediate-size timing gates are still required before making this automatic globally."
+  - "Durable prompt-KV persistence is rejected for this policy; in-memory hot endpoints carry a schedule identity and cannot cross short/long buckets."
+settings:
+  VMODEL_K3_PREFILL_TILE_POLICY: prompt-length
+  VMODEL_K3_PREFILL_LONG_CONTEXT_TOKENS: 256
+  VMODEL_K3_PREFILL_SHORT_TILE_WIDTH: 256
+  VMODEL_K3_DENSE_MLP_SHORT_TILE_SIZE: 0
+  VMODEL_K3_PREFILL_TILE_WIDTH: 256
+  VMODEL_K3_DENSE_MLP_TILE_SIZE: 256

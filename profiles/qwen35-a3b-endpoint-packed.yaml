@@ -1,0 +1,15 @@
+schema: voom.runtime-profile.v1
+name: qwen35-a3b-endpoint-packed
+description: Explicit lossy endpoint-packed prefill and bounded cache profile for Qwen3.6-35B-A3B.
+notes:
+  - Runs all prompt positions through four layers, then retains the first 128 and final 64 positions with their original global positions.
+  - Uses a fixed geometry with no subject, wording, message, or tool-name predicates.
+  - Top-2 routed experts and grammar jump-forward are lossy opt-ins and must never be selected by auto mode without broad-corpus proof.
+  - The 2300 MB weight cache and 3200 MB post-generation available-memory floor target the 16 GB M4 test host; override them for other machines.
+settings:
+  VMODEL_RESIDENT_BACKEND: voom
+  VMODEL_QWEN35_LOSSY_SUFFIX_PREFILL: "4:128:64"
+  VMODEL_QWEN_MOE_EXPERT_TOP_K: 2
+  VMODEL_GRAMMAR_JUMP_FORWARD_LOSSY: true
+  VMODEL_QWEN35_WEIGHT_CACHE_MB: 2300
+  VMODEL_QWEN35_POSTGEN_MIN_AVAILABLE_MB: 3200

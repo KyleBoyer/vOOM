@@ -1,0 +1,10 @@
+schema: voom.runtime-profile.v1
+name: qwen35-a3b-endpoint-packed-agent
+description: Composed Qwen3.6-35B-A3B endpoint-packed and full-context agent profile.
+notes:
+  - This is an explicit side-quest profile; selecting it never changes the defaults used without a profile.
+  - The fixed feature groups are reusable across request subjects and tool catalogs, but remain lossy and require application-specific quality gates.
+  - The July 31 five-temperature captured-request gate passed under 30 seconds cold, while broader real-message latency and memory gates remain incomplete.
+extends:
+  - qwen35-a3b-endpoint-packed
+  - agent-tool-gateway

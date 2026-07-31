@@ -78,6 +78,40 @@ def hybrid_prefill_chunk_size(available_bytes: int, model_scale: int = 0) -> int
     return 1
 
 
+def kimi_k3_prompt_prefill_schedule(
+    prompt_tokens: int,
+    *,
+    policy: str,
+    long_context_tokens: int,
+    short_tile_width: int,
+    long_tile_width: int,
+    short_dense_mlp_tile_size: int,
+    long_dense_mlp_tile_size: int,
+) -> tuple[int, int, str]:
+    """Select K3's content-blind prefill schedule from rendered token count.
+
+    ``fixed`` preserves the historical explicit tile settings.  The opt-in
+    ``prompt-length`` policy uses the short schedule below one configurable
+    token boundary and the long schedule at/above it.  It deliberately cannot
+    inspect prompt text, messages, tools, routes, or subjects.
+    """
+    if policy == "fixed":
+        return long_tile_width, long_dense_mlp_tile_size, "fixed"
+    if policy != "prompt-length":
+        raise ValueError(
+            "K3 prefill tile policy must be 'fixed' or 'prompt-length'")
+    if prompt_tokens < long_context_tokens:
+        return short_tile_width, short_dense_mlp_tile_size, "short"
+    return long_tile_width, long_dense_mlp_tile_size, "long"
+
+
+def kimi_k3_prefill_schedule_compatible(
+    *, policy: str, active_schedule: str, cached_schedule: str,
+) -> bool:
+    """Whether an in-memory K3 endpoint can serve this tile schedule."""
+    return policy != "prompt-length" or cached_schedule == active_schedule
+
+
 def hybrid_min_weight_cache_floor_mb(available_bytes: int) -> int:
     """F94: the weight-cache floor for qwen3_5/qwen3_5_moe -- deliberately
     NOT gated on `available_bytes` (the parameter is kept only so existing
@@ -644,6 +678,20 @@ class RuntimeConfig:
     # StreamingEngine._layer_stationary_qwen35_sweep and CLAUDE.md's
     # 2026-07-23 note on why chunk-major re-reads dominate prefill time here.
     layer_stationary_prefill: bool = False
+    # Explicit lossy Qwen hybrid prefill schedule. The first N layers consume
+    # the full prompt; a fixed P-position prefix anchor plus the final S hidden
+    # positions continue through the remaining layers. P=0 preserves the
+    # original suffix-only experiment. Zeroes preserve the released full-depth
+    # computation. This is request-content independent and is admitted only by
+    # the named fast-profile environment opt-in in server.py.
+    qwen_lossy_suffix_prefill_early_layers: int = 0
+    qwen_lossy_suffix_prefill_prefix_tokens: int = 0
+    qwen_lossy_suffix_prefill_tokens: int = 0
+    # Optional system-available floor enforced after a mixed-depth Qwen
+    # response by shedding consumed LRU weight pages. Kept separate from the
+    # pre-allocation/hot-KV admission floor so it cannot perturb the arithmetic
+    # or cache residency of the request being measured.
+    qwen_postgen_min_available_mb: int = 0
     prefill_last_token_separate: bool = False  # MLX-LM-compatible endpoint schedule
     prefill_checkpoint_every: int = 0  # F60: save prompt-KV state every N prefill positions
     # (0 = off). Interrupted mega-prefills then RESUME via the existing
@@ -695,6 +743,15 @@ class RuntimeConfig:
     # layer-stationary long prefill. Zero preserves the existing full-position
     # call; explicit for the same rollout/generality reasons as fused AttnRes.
     kimi_k3_dense_mlp_tile_size: int = 0
+    # Optional request-length scheduler for K3 prefill. ``fixed`` preserves
+    # the two legacy settings above/at ``prefill_chunk_size``. The explicit
+    # ``prompt-length`` policy selects a separately bounded short schedule
+    # below one rendered-token threshold and those legacy values above it.
+    # This policy is content-blind and remains opt-in through a named profile.
+    kimi_k3_prefill_tile_policy: str = "fixed"
+    kimi_k3_prefill_long_context_tokens: int = 256
+    kimi_k3_prefill_short_tile_width: int = 256
+    kimi_k3_dense_mlp_short_tile_size: int = 0
     warm_mb: int = 0  # F04: compressed-RAM warm tier budget (0=off; bf16 pages only)
     final_dead_token_elim: bool = True  # F36: last layer's MLP runs only on the last prefill position
     router_lookahead: bool = False  # F45: measured NEGATIVE on local disk (pollutes LFU, competes with demand reads); retry over NAS only
@@ -880,6 +937,14 @@ class RuntimeConfig:
                 "kimi_k3_fused_attnres_tile_size", 0),
             kimi_k3_dense_mlp_tile_size=run.get(
                 "kimi_k3_dense_mlp_tile_size", 0),
+            kimi_k3_prefill_tile_policy=run.get(
+                "kimi_k3_prefill_tile_policy", "fixed"),
+            kimi_k3_prefill_long_context_tokens=run.get(
+                "kimi_k3_prefill_long_context_tokens", 256),
+            kimi_k3_prefill_short_tile_width=run.get(
+                "kimi_k3_prefill_short_tile_width", 256),
+            kimi_k3_dense_mlp_short_tile_size=run.get(
+                "kimi_k3_dense_mlp_short_tile_size", 0),
             warm_mb=run.get("warm_mb", 0),
             final_dead_token_elim=run.get("final_dead_token_elim", True),
             router_lookahead=run.get("router_lookahead", False),
@@ -943,6 +1008,11 @@ class _HotPromptSlot:
     # construction site must decide this explicitly rather than risk a
     # stale/wrong value slipping through unnoticed.
     chunk_size: int
+    # K3's prompt-length policy also changes the dense-MLP tile. A content-
+    # blind bucket id prevents an endpoint built by the short schedule from
+    # being reused after a continuation crosses into the long schedule (or
+    # vice versa). Empty preserves all pre-adaptive/non-K3 slots.
+    kimi_k3_prefill_schedule: str = ""
     approximate: bool = False  # true only for a selectively repaired PIC prompt
     # Optional (content id, prompt-token start, prompt-token end) records used
     # by the lossy PIC path. They are included in durable checkpoint manifests
@@ -967,6 +1037,14 @@ class StreamingEngine:
         self.rc = rc or RuntimeConfig()
         self.rc.execution_profile = str(
             self.rc.execution_profile or "").strip().lower()
+        self.rc.kimi_k3_prefill_tile_policy = str(
+            self.rc.kimi_k3_prefill_tile_policy or "fixed").strip().lower()
+        # These are the configured long-context values. The active RuntimeConfig
+        # fields are allowed to change per request, so retain immutable copies
+        # before the first adaptive selection or memory retry mutates them.
+        self._k3_prefill_long_tile_width = int(self.rc.prefill_chunk_size)
+        self._k3_dense_mlp_long_tile_size = int(
+            self.rc.kimi_k3_dense_mlp_tile_size)
         if self.rc.execution_profile not in telemetry.RequestProfiler.LEVELS:
             raise ValueError(
                 "execution_profile must be '', 'layers', or 'ops'")
@@ -988,6 +1066,42 @@ class StreamingEngine:
         if self.rc.kimi_k3_dense_mlp_tile_size < 0:
             raise ValueError(
                 "kimi_k3_dense_mlp_tile_size must be >= 0"
+            )
+        if self.rc.kimi_k3_prefill_tile_policy not in (
+            "fixed", "prompt-length"
+        ):
+            raise ValueError(
+                "kimi_k3_prefill_tile_policy must be 'fixed' or "
+                "'prompt-length'"
+            )
+        if self.rc.kimi_k3_prefill_long_context_tokens <= 0:
+            raise ValueError(
+                "kimi_k3_prefill_long_context_tokens must be positive"
+            )
+        if not 1 <= self.rc.kimi_k3_prefill_short_tile_width <= 4096:
+            raise ValueError(
+                "kimi_k3_prefill_short_tile_width must be in [1, 4096]"
+            )
+        if not 0 <= self.rc.kimi_k3_dense_mlp_short_tile_size <= 4096:
+            raise ValueError(
+                "kimi_k3_dense_mlp_short_tile_size must be in [0, 4096]"
+            )
+        if (
+            self.rc.kimi_k3_prefill_tile_policy == "prompt-length"
+            and not 1 <= self._k3_prefill_long_tile_width <= 4096
+        ):
+            raise ValueError(
+                "prompt-length K3 prefill requires the configured long tile "
+                "width to be in [1, 4096]"
+            )
+        if (
+            self.rc.kimi_k3_prefill_tile_policy == "prompt-length"
+            and (self.rc.prompt_kv_dir or self.rc.hot_prompt_kv_persist_dir)
+        ):
+            raise ValueError(
+                "prompt-length K3 prefill currently supports only cold or "
+                "in-memory hot KV; durable prompt-KV stores require a fixed "
+                "schedule"
             )
         if (
             self.rc.kimi_k3_absorbed_mla
@@ -1062,6 +1176,9 @@ class StreamingEngine:
             raise ValueError("hot_prompt_kv_slots must be positive when hot_prompt_kv is enabled")
         if self.rc.hot_prompt_kv_min_available_mb < 0:
             raise ValueError("hot_prompt_kv_min_available_mb must be non-negative")
+        if self.rc.qwen_postgen_min_available_mb < 0:
+            raise ValueError(
+                "qwen_postgen_min_available_mb must be non-negative")
         if self.rc.hot_prompt_kv:
             if self.rc.prefill_chunk_size != self.rc.hot_prompt_kv_chunk_size:
                 raise ValueError(
@@ -3165,7 +3282,10 @@ class StreamingEngine:
 
     def _layer_stationary_qwen35_sweep(
             self, x: mx.array, kv: KVCache, offset: int,
-            tile_width: int, on_progress=None) -> mx.array:
+            tile_width: int, on_progress=None, *, layer_start: int = 0,
+            layer_end: int | None = None,
+            profile_path: str = "layer_stationary_qwen35",
+            positions3: mx.array | None = None) -> mx.array:
         """F94 live path: layer-major (not chunk-major) prefill for qwen3_5/
         qwen3_5_moe (Qwen3.5-4B/9B, Qwen3.6-27B hybrid DeltaNet/full-attention
         layers). Fetches each layer's weights exactly once for the WHOLE
@@ -3219,7 +3339,17 @@ class StreamingEngine:
         if tile_width <= 0:
             raise ValueError("tile_width must be positive")
         n = self.cfg.num_hidden_layers
+        layer_end = n if layer_end is None else int(layer_end)
+        layer_start = int(layer_start)
+        if not 0 <= layer_start < layer_end <= n:
+            raise ValueError(
+                "Qwen layer-stationary range must satisfy "
+                "0 <= layer_start < layer_end <= num_hidden_layers")
         total = int(x.shape[1])
+        if positions3 is not None and tuple(positions3.shape) != (3, total):
+            raise ValueError(
+                "Qwen layer-stationary positions must have shape "
+                f"(3, {total})")
         (self._layer_transient,
          self._layer_transient_margin) = _layer_transient_for_positions(
              total,
@@ -3229,11 +3359,13 @@ class StreamingEngine:
              getattr(self, "_decode_layer_transient", 0))
         profiler = self._request_profiler
         if profiler is not None:
-            profiler.begin_sweep(total, path="layer_stationary_qwen35")
-        for i in range(n):
+            profiler.begin_sweep(total, path=profile_path)
+        for i in range(layer_start, layer_end):
             self._select_layer_transient(total, i)
             if self.prefetcher:
-                for j in range(i + 1, min(i + 1 + self.rc.prefetch_depth, n)):
+                for j in range(
+                        i + 1,
+                        min(i + 1 + self.rc.prefetch_depth, layer_end)):
                     self.prefetcher.schedule(self._layer_key(j), self._layer_names(j))
 
             cache_before = (
@@ -3268,10 +3400,13 @@ class StreamingEngine:
                         self._layer_transient,
                         margin=self._layer_transient_margin)
                 xt = x[:, pos:end, :]
+                tile_positions3 = (
+                    None if positions3 is None else positions3[:, pos:end])
                 attention_t0 = time.perf_counter()
                 yt = _qwen35_attention_residual(
                     xt, w, f"model.layers.{i}", self.cfg, kv, i,
                     offset + pos, mlp_last_only=False,
+                    positions3=tile_positions3,
                     zmlx_fused_decode=self.rc.zmlx_fused_deltanet_decode,
                     native_fused_decode=self.rc.native_fused_deltanet_decode,
                     chunked_delta_prefill=(
@@ -3323,6 +3458,68 @@ class StreamingEngine:
             del w
         self._restore_aggregate_layer_transient(total)
         return x
+
+    def _qwen35_lossy_suffix_prefill_sweep(
+            self, x: mx.array, kv: KVCache, offset: int,
+            tile_width: int, on_progress=None) -> mx.array:
+        """Run the fixed mixed-depth Qwen endpoint-packed prefill schedule.
+
+        Every prompt position crosses the first ``early_layers`` blocks, so
+        lower recurrent/full-attention state and retained hidden inputs are
+        derived from the complete prompt. A fixed leading ``prefix_tokens``
+        anchor and final ``suffix_tokens`` continue through the upper blocks.
+        This gives upper layers both early instruction/schema semantics and
+        recent conversational intent without classifying prompt contents.
+        Upper recurrence skips the unretained middle and upper full-attention
+        KV contains only the packed endpoints. RoPE retains every endpoint's
+        original global position.
+
+        This is deliberately lossy, fixed by configuration rather than request
+        contents, and used only by server.py's explicit fast-profile opt-in.
+        """
+        early_layers = int(
+            self.rc.qwen_lossy_suffix_prefill_early_layers)
+        prefix_tokens = int(
+            self.rc.qwen_lossy_suffix_prefill_prefix_tokens)
+        suffix_tokens = int(self.rc.qwen_lossy_suffix_prefill_tokens)
+        total_layers = int(self.cfg.num_hidden_layers)
+        total_tokens = int(x.shape[1])
+        if not 0 < early_layers < total_layers:
+            raise ValueError("invalid Qwen lossy suffix-prefill layer depth")
+        if prefix_tokens < 0 or suffix_tokens <= 0:
+            raise ValueError("invalid Qwen lossy suffix-prefill token count")
+        retained_tokens = prefix_tokens + suffix_tokens
+        if total_tokens <= retained_tokens:
+            return self._layer_stationary_qwen35_sweep(
+                x, kv, offset=offset, tile_width=tile_width,
+                on_progress=on_progress)
+
+        x = self._layer_stationary_qwen35_sweep(
+            x, kv, offset=offset, tile_width=tile_width,
+            on_progress=on_progress, layer_end=early_layers,
+            profile_path="qwen35_lossy_suffix_shallow")
+        suffix_start = total_tokens - suffix_tokens
+        if prefix_tokens:
+            x = mx.concatenate(
+                (x[:, :prefix_tokens, :], x[:, suffix_start:, :]), axis=1)
+            positions = mx.concatenate((
+                mx.arange(offset, offset + prefix_tokens, dtype=mx.float32),
+                mx.arange(
+                    offset + suffix_start, offset + total_tokens,
+                    dtype=mx.float32),
+            ))
+            positions3 = mx.stack((positions, positions, positions), axis=0)
+            deep_offset = offset
+            profile_path = "qwen35_lossy_endpoint_packed_deep"
+        else:
+            x = x[:, suffix_start:, :]
+            positions3 = None
+            deep_offset = offset + suffix_start
+            profile_path = "qwen35_lossy_suffix_deep"
+        return self._layer_stationary_qwen35_sweep(
+            x, kv, offset=deep_offset, tile_width=tile_width,
+            on_progress=on_progress, layer_start=early_layers,
+            profile_path=profile_path, positions3=positions3)
 
     def _layer_stationary_glm_sweep(
             self, x: mx.array, kv, offset: int, tile_width: int,
@@ -4659,6 +4856,14 @@ class StreamingEngine:
                 f"k3mlakt{self.rc.kimi_k3_mla_key_tile_size}"
                 f"k3ar{self.rc.kimi_k3_fused_attnres_tile_size}"
                 f"k3dmlp{self.rc.kimi_k3_dense_mlp_tile_size}"
+                f"k3tilepolicy{self.rc.kimi_k3_prefill_tile_policy}"
+                f"k3tilethreshold"
+                f"{self.rc.kimi_k3_prefill_long_context_tokens}"
+                f"k3shorttile{self.rc.kimi_k3_prefill_short_tile_width}"
+                f"k3shortdmlp"
+                f"{self.rc.kimi_k3_dense_mlp_short_tile_size}"
+                f"k3longtile{self._k3_prefill_long_tile_width}"
+                f"k3longdmlp{self._k3_dense_mlp_long_tile_size}"
                 f"dead{int(self.rc.final_dead_token_elim)}"
                 f"head{int(self.rc.stream_lm_head)}"
                 f"tiedhead{int(self.rc.quantize_tied_lm_head)}"
@@ -4668,6 +4873,12 @@ class StreamingEngine:
                 f"fswiglu{int(self.rc.fused_swiglu)}"
                 f"chunk{self.rc.prefill_chunk_size}"
                 f"layerstationary{int(self.rc.layer_stationary_prefill)}"
+                f"qwensuffixdepth"
+                f"{self.rc.qwen_lossy_suffix_prefill_early_layers}"
+                f"qwenprefixtokens"
+                f"{self.rc.qwen_lossy_suffix_prefill_prefix_tokens}"
+                f"qwensuffixtokens"
+                f"{self.rc.qwen_lossy_suffix_prefill_tokens}"
                 f"lastsep{int(self.rc.prefill_last_token_separate)}"
                 # The v2 schedule retains a layer-stationary prompt
                 # endpoint's hidden state for logits instead of recomputing
@@ -4845,6 +5056,15 @@ class StreamingEngine:
             "tool_pic_system_floor_bytes": 0,
             "tool_pic_system_memory_admitted": 0,
             "prompt_state_approximate": 0,
+            "qwen_lossy_suffix_prefill_enabled": int(
+                bool(self.rc.qwen_lossy_suffix_prefill_early_layers)),
+            "qwen_lossy_suffix_prefill_used": 0,
+            "qwen_lossy_suffix_prefill_early_layers": int(
+                self.rc.qwen_lossy_suffix_prefill_early_layers),
+            "qwen_lossy_suffix_prefill_prefix_tokens": int(
+                self.rc.qwen_lossy_suffix_prefill_prefix_tokens),
+            "qwen_lossy_suffix_prefill_tokens": int(
+                self.rc.qwen_lossy_suffix_prefill_tokens),
             "suffix_decoding_enabled": int(self.rc.suffix_decoding),
             "suffix_decoding_used": 0,
             "suffix_decoding_fallback_reason": (
@@ -4900,6 +5120,45 @@ class StreamingEngine:
         tokens = (list(prepared_ids) if prepared_ids is not None
                   else self.tokenizer.encode(prompt).ids)
         path_stats["prompt_tokenize_s"] = time.perf_counter() - tokenize_t0
+        if self.cfg.model_type == "kimi_k3":
+            if self.rc.kimi_k3_prefill_tile_policy == "prompt-length":
+                (k3_tile_width, k3_dense_tile_size,
+                 k3_schedule_bucket) = kimi_k3_prompt_prefill_schedule(
+                    len(tokens),
+                    policy=self.rc.kimi_k3_prefill_tile_policy,
+                    long_context_tokens=(
+                        self.rc.kimi_k3_prefill_long_context_tokens),
+                    short_tile_width=(
+                        self.rc.kimi_k3_prefill_short_tile_width),
+                    long_tile_width=self._k3_prefill_long_tile_width,
+                    short_dense_mlp_tile_size=(
+                        self.rc.kimi_k3_dense_mlp_short_tile_size),
+                    long_dense_mlp_tile_size=(
+                        self._k3_dense_mlp_long_tile_size),
+                )
+                retry_ceiling = int(getattr(
+                    self, "_hybrid_retry_chunk_ceiling", 0) or 0)
+                if retry_ceiling:
+                    k3_tile_width = min(k3_tile_width, retry_ceiling)
+                self.rc.prefill_chunk_size = k3_tile_width
+                self.rc.hot_prompt_kv_chunk_size = k3_tile_width
+                self.rc.kimi_k3_dense_mlp_tile_size = k3_dense_tile_size
+            else:
+                k3_tile_width = int(self.rc.prefill_chunk_size)
+                k3_dense_tile_size = int(
+                    self.rc.kimi_k3_dense_mlp_tile_size)
+                k3_schedule_bucket = "fixed"
+            self._active_k3_prefill_schedule = (
+                f"{k3_schedule_bucket}:prefill={k3_tile_width}:"
+                f"dense={k3_dense_tile_size}"
+            )
+            path_stats["kimi_k3_prefill_tile_policy"] = (
+                self.rc.kimi_k3_prefill_tile_policy)
+            path_stats["kimi_k3_prefill_schedule"] = k3_schedule_bucket
+            path_stats["kimi_k3_prefill_tile_width"] = k3_tile_width
+            path_stats["kimi_k3_dense_mlp_tile_size"] = k3_dense_tile_size
+            path_stats["kimi_k3_prefill_long_context_tokens"] = int(
+                self.rc.kimi_k3_prefill_long_context_tokens)
         if (self.effective_max_position_embeddings
                 and len(tokens) + max_tokens > self.effective_max_position_embeddings):
             raise ValueError(
@@ -5106,6 +5365,19 @@ class StreamingEngine:
             # needed only to derive the correct disk-persistence parent chain below
 
             for idx, slot in enumerate(self._hot_prompt_slots):
+                if (
+                    self.cfg.model_type == "kimi_k3"
+                    and not kimi_k3_prefill_schedule_compatible(
+                        policy=self.rc.kimi_k3_prefill_tile_policy,
+                        active_schedule=self._active_k3_prefill_schedule,
+                        cached_schedule=getattr(
+                            slot, "kimi_k3_prefill_schedule", ""),
+                    )
+                ):
+                    # KDA/MLA endpoints are exact only for the schedule that
+                    # constructed their lineage. Crossing the token threshold
+                    # deliberately starts cold instead of mixing tile shapes.
+                    continue
                 if (getattr(slot, "cache_namespace", "default")
                         != cache_namespace):
                     continue
@@ -5234,6 +5506,16 @@ class StreamingEngine:
                 baseline_positions = len(tokens) - best_matched
                 pic_candidates = []
                 for idx, slot in enumerate(self._hot_prompt_slots):
+                    if (
+                        self.cfg.model_type == "kimi_k3"
+                        and not kimi_k3_prefill_schedule_compatible(
+                            policy=self.rc.kimi_k3_prefill_tile_policy,
+                            active_schedule=self._active_k3_prefill_schedule,
+                            cached_schedule=getattr(
+                                slot, "kimi_k3_prefill_schedule", ""),
+                        )
+                    ):
+                        continue
                     if (getattr(slot, "cache_namespace", "default")
                             != cache_namespace):
                         continue
@@ -5701,10 +5983,31 @@ class StreamingEngine:
                                 tile_width=boundary_chunk,
                                 on_progress=on_progress)
                         else:
-                            bx = self._layer_stationary_qwen35_sweep(
-                                bx, kv, offset=pos,
-                                tile_width=boundary_chunk,
-                                on_progress=on_progress)
+                            use_lossy_suffix = (
+                                pos == 0
+                                and bool(
+                                    self.rc
+                                    .qwen_lossy_suffix_prefill_early_layers)
+                                and stable_boundary - pos
+                                > (
+                                    self.rc
+                                    .qwen_lossy_suffix_prefill_prefix_tokens
+                                    + self.rc
+                                    .qwen_lossy_suffix_prefill_tokens)
+                            )
+                            if use_lossy_suffix:
+                                bx = self._qwen35_lossy_suffix_prefill_sweep(
+                                    bx, kv, offset=pos,
+                                    tile_width=boundary_chunk,
+                                    on_progress=on_progress)
+                                prompt_state_approximate = True
+                                path_stats[
+                                    "qwen_lossy_suffix_prefill_used"] = 1
+                            else:
+                                bx = self._layer_stationary_qwen35_sweep(
+                                    bx, kv, offset=pos,
+                                    tile_width=boundary_chunk,
+                                    on_progress=on_progress)
                         del bx
                         bpos = stable_boundary
                         path_stats["hot_prompt_boundary_layer_stationary"] = 1
@@ -5857,9 +6160,29 @@ class StreamingEngine:
                             xc, kv, offset=pos, tile_width=chunk,
                             on_progress=on_progress)
                     else:
-                        xc = self._layer_stationary_qwen35_sweep(
-                            xc, kv, offset=pos, tile_width=chunk,
-                            on_progress=on_progress)
+                        use_lossy_suffix = (
+                            pos == 0
+                            and bool(
+                                self.rc
+                                .qwen_lossy_suffix_prefill_early_layers)
+                            and stop_before - pos
+                            > (
+                                self.rc
+                                .qwen_lossy_suffix_prefill_prefix_tokens
+                                + self.rc
+                                .qwen_lossy_suffix_prefill_tokens)
+                        )
+                        if use_lossy_suffix:
+                            xc = self._qwen35_lossy_suffix_prefill_sweep(
+                                xc, kv, offset=pos, tile_width=chunk,
+                                on_progress=on_progress)
+                            prompt_state_approximate = True
+                            path_stats[
+                                "qwen_lossy_suffix_prefill_used"] = 1
+                        else:
+                            xc = self._layer_stationary_qwen35_sweep(
+                                xc, kv, offset=pos, tile_width=chunk,
+                                on_progress=on_progress)
                     if stop_before == len(tokens):
                         layer_stationary_endpoint_x = xc
                         path_stats["layer_stationary_endpoint_fused"] = 1
@@ -6635,6 +6958,37 @@ class StreamingEngine:
                 self.governor.request_peak(),
                 mx.get_active_memory(),
             )
+        # A configured serving floor is also a post-response retention
+        # invariant. Admission protects it before large allocations, but a
+        # cold MoE sweep can finish with a full weight cache plus the newly
+        # retained prompt endpoint and land just below the floor. Shed only the
+        # measured deficit (plus one small sampling pad) from consumed LRU
+        # weight pages after all model arithmetic and endpoint synchronization.
+        # ``trim_to`` leaves the configured admission budget unchanged, so the
+        # next request can refill normally instead of running the entire model
+        # under a smaller cache and changing its latency/trajectory.
+        postgen_floor = int(
+            self.rc.qwen_postgen_min_available_mb * 1_000_000)
+        postgen_available_before = int(psutil.virtual_memory().available)
+        if (
+            self.rc.qwen_lossy_suffix_prefill_early_layers
+            and postgen_floor > 0
+            and postgen_available_before < postgen_floor
+        ):
+            cache_before_trim = int(self.cache.total_bytes)
+            requested_reclaim = (
+                postgen_floor - postgen_available_before + 128_000_000)
+            released = self.cache.trim_to(
+                cache_before_trim - requested_reclaim)
+            path_stats["postgen_weight_cache_trim"] = 1
+            path_stats["postgen_weight_cache_trim_requested_bytes"] = int(
+                requested_reclaim)
+            path_stats["postgen_weight_cache_trim_released_bytes"] = int(
+                released)
+            path_stats["postgen_weight_cache_trim_available_before_bytes"] = (
+                postgen_available_before)
+            path_stats["postgen_weight_cache_trim_available_after_bytes"] = int(
+                psutil.virtual_memory().available)
         request_cache_after = _cache_io_snapshot(self)
         _record_cache_io_delta(
             self, request_cache_before, path_stats, after=request_cache_after)
@@ -6850,6 +7204,12 @@ class StreamingEngine:
         """Whether a fresh, unsampled prefill can be replayed more slowly."""
         if self._hybrid_chunk_size_applies():
             return True
+        if (
+            self._hot_kv_persist is None
+            and self.cfg.model_type == "kimi_k3"
+            and self.rc.kimi_k3_prefill_tile_policy == "prompt-length"
+        ):
+            return True
         if self._hot_kv_persist is None and self.rc.adaptive_chunk_size:
             # Any F68 adaptive-chunk model (gpt_oss, GLM, Kimi K3, ...) can
             # hit a MemoryError from _fetch_experts' independent
@@ -6941,6 +7301,8 @@ class StreamingEngine:
                 prompt_logits=None,
                 reusable_prefix=0,
                 chunk_size=self.rc.prefill_chunk_size,
+                kimi_k3_prefill_schedule=getattr(
+                    self, "_active_k3_prefill_schedule", ""),
                 approximate=prompt_state_approximate,
                 tool_capsules=(),
                 segment_chain=(),
@@ -6958,6 +7320,8 @@ class StreamingEngine:
             # per-conversation pick (new), set earlier in this same
             # generate() call.
             chunk_size=self.rc.prefill_chunk_size,
+            kimi_k3_prefill_schedule=getattr(
+                self, "_active_k3_prefill_schedule", ""),
             approximate=prompt_state_approximate,
             tool_capsules=tool_capsules,
             segment_chain=segment_chain,
@@ -7000,6 +7364,8 @@ class StreamingEngine:
             # whatever chunk size was actually driving this interrupted
             # request is what a retry must resume with.
             chunk_size=self.rc.prefill_chunk_size,
+            kimi_k3_prefill_schedule=getattr(
+                self, "_active_k3_prefill_schedule", ""),
             approximate=False,
             tool_capsules=retained_capsules,
             segment_chain=(),

@@ -1,0 +1,14 @@
+schema: voom.runtime-profile.v1
+name: qwen35-9b-depth-adaptive
+description: Explicit dense Qwen3.5-9B depth-adaptive prefill with exact endpoint reuse.
+notes:
+  - Every prompt position crosses eight layers and the final 256 positions cross the remaining layers.
+  - The schedule is fixed and contains no prompt, subject, message, tool, or response-branch predicate.
+  - It is lossy and default-off; exact repeats may reuse the saved endpoint while strict extensions recompute.
+settings:
+  VMODEL_RESIDENT_BACKEND: mlx-lm
+  VMODEL_MLX_LM_LOSSY_SUFFIX_PREFILL: "8:256"
+  VMODEL_MLX_LM_PROMPT_CACHE: true
+  VMODEL_MLX_LM_LOGIT_CHAIN: true
+  VMODEL_MLX_LM_NATIVE_MTP: false
+  VMODEL_MLX_LM_SYSTEM_RESERVE_MB: 1500

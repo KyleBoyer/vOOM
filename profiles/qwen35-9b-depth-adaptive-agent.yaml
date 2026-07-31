@@ -1,0 +1,9 @@
+schema: voom.runtime-profile.v1
+name: qwen35-9b-depth-adaptive-agent
+description: Composed Qwen3.5-9B depth-adaptive and full-context agent profile.
+notes:
+  - This composition keeps safe full execution context and the released expert policy while making the model's prefill approximation explicit.
+  - Use a heterogeneous real-request corpus and all required temperatures before treating a new deployment's latency or quality as established.
+extends:
+  - qwen35-9b-depth-adaptive
+  - agent-tool-gateway

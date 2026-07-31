@@ -70,6 +70,48 @@ class KVCache:
         if dsa is not None:
             dsa.trim(length)
 
+    def layer_lengths(self) -> tuple[int, ...]:
+        """Return each layer's local append length.
+
+        Mixed-depth prefill can intentionally give upper attention layers a
+        compact suffix while a lower layer anchors the global ``offset``.
+        Speculative rollback must therefore checkpoint local lengths instead
+        of assuming every layer begins at global position zero.
+        """
+        axis = 1 if self.compressed_mla else 2
+        return tuple(
+            0 if value is None else int(value.shape[axis])
+            for value in self.keys
+        )
+
+    def trim_layer_lengths(self, lengths) -> None:
+        """Roll each attention layer back to its checkpoint-local length."""
+        targets = tuple(int(value) for value in lengths)
+        if len(targets) != len(self.keys) or any(value < 0 for value in targets):
+            raise ValueError("invalid per-layer KV rollback lengths")
+        pending = []
+        for index, target in enumerate(targets):
+            keys = self.keys[index]
+            if keys is None:
+                if target:
+                    raise ValueError("cannot restore a missing KV layer")
+                continue
+            axis = 1 if self.compressed_mla else 2
+            current = int(keys.shape[axis])
+            if target > current:
+                raise ValueError("cannot grow KV during rollback")
+            if target == current:
+                continue
+            if self.compressed_mla:
+                self.keys[index] = keys[:, :target, :]
+                pending.append(self.keys[index])
+            else:
+                self.keys[index] = keys[:, :, :target, :]
+                self.values[index] = self.values[index][:, :, :target, :]
+                pending.extend((self.keys[index], self.values[index]))
+        if pending:
+            mx.eval(*pending)
+
 
 class Fp8KVCache(KVCache):
     """Same interface and math-facing contract as KVCache, but the resident

@@ -97,6 +97,27 @@ def test_one_pass_eviction_preserves_policy_order_and_clears_once(monkeypatch):
     assert not cache.would_fit(6)
 
 
+def test_trim_to_releases_lru_pages_without_lowering_future_budget(monkeypatch):
+    clears = []
+    monkeypatch.setattr(cache_module, "_clear_device_cache",
+                        lambda: clears.append(True))
+    store = FakeStore()
+    cache = WeightCache(store, max_bytes=100)
+    cache.pin("pin", ["pin.weight"])
+    cache.get("old", ["old.weight"])
+    cache.get("new", ["new.weight"])
+
+    released = cache.trim_to(20)
+
+    assert released == 10
+    assert cache.resident_keys == ["pin", "new"]
+    assert cache.total_bytes == 20
+    assert cache.max_bytes == 100
+    assert cache.stats.evictions == 1
+    assert store.released == [("old.weight",)]
+    assert clears == [True]
+
+
 def test_one_pass_eviction_matches_legacy_policy_across_random_edge_cases(
         monkeypatch):
     clears = []

@@ -1,0 +1,12 @@
+schema: voom.runtime-profile.v1
+name: kimi-k3-exact-streaming
+description: Exact released-MXFP4 streaming and overlapped expert I/O for Kimi K3.
+notes:
+  - Native compressed-tensors MXFP4 consumes the checkpoint's released symbols rather than quantizing the served model.
+  - Expert batch prefetch begins only after released routing and changes neither expert selection nor arithmetic.
+  - The 3000 MB cache is the measured 16 GB host value and should be explicitly overridden on other machines.
+  - Scale and NF12 sidecar paths are intentionally absent because they are machine-local storage configuration.
+settings:
+  VMODEL_CT_MXFP4_NATIVE: true
+  VMODEL_EXPERT_BATCH_PREFETCH: true
+  VMODEL_KIMI_LINEAR_WEIGHT_CACHE_MB: 3000

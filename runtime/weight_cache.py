@@ -348,6 +348,21 @@ class WeightCache:
             target = max(0, self.max_bytes - incoming_bytes)
             self._evict_to_locked(target)
 
+    def trim_to(self, target_bytes: int) -> int:
+        """Evict consumed pages to a temporary residency target.
+
+        Unlike changing ``max_bytes``, this does not lower the admission budget
+        for the next request: it is a post-request pressure valve that sheds
+        cold LRU pages now while allowing later demand to refill the configured
+        cache normally. Pinned pages remain protected by the ordinary eviction
+        policy. Returns the cache-accounted bytes actually released.
+        """
+        target = max(0, int(target_bytes))
+        with self._lock:
+            before = self._total_bytes
+            self._evict_to_locked(target)
+            return before - self._total_bytes
+
     # ---- internals --------------------------------------------------------
 
     @staticmethod

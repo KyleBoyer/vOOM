@@ -1,0 +1,13 @@
+schema: voom.runtime-profile.v1
+name: kimi-k3-long-context-memory
+description: Fixed bounded-memory long-context prefill schedule for Kimi K3.
+extends:
+  - kimi-k3-memory-core
+notes:
+  - Uses fixed architecture and memory dimensions only; it contains no prompt, subject, tool, message, route, or capture predicates.
+  - A complete 93-layer greedy-token gate passed; the 4096-token five-layer stress rung reduced peak Metal by 1.511 GB.
+  - The complete 46107-token captured request has not cleared the 8.5 GB Metal gate, so this remains explicit and default-off.
+settings:
+  VMODEL_K3_PREFILL_TILE_POLICY: fixed
+  VMODEL_K3_DENSE_MLP_TILE_SIZE: 256
+  VMODEL_K3_PREFILL_TILE_WIDTH: 256

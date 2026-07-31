@@ -262,15 +262,37 @@ def _full_attention(
 
     mask = None
     if length > 1:
-        q_pos = mx.arange(offset, offset + length, dtype=mx.int32)[:, None]
-        k_pos = mx.arange(keys.shape[2], dtype=mx.int32)[None, :]
-        mask = mx.where(k_pos <= q_pos, 0.0, float("-inf")).astype(q.dtype)
+        # The cache normally begins at global position zero, making its local
+        # length and the RoPE offset identical. Mixed-depth lossy prefill can
+        # intentionally begin an upper layer at a later global position:
+        # RoPE must still use ``offset``, while the causal mask must index the
+        # compact layer-local cache. Deriving the query start from the updated
+        # key length is identical on ordinary caches and correct on compact
+        # suffix caches (including subsequent multi-token extensions).
+        mask = _cache_local_causal_mask(
+            length, int(keys.shape[2]), q.dtype)
     attended = mx.fast.scaled_dot_product_attention(
         q, keys, values, scale=head_dim ** -0.5, mask=mask)
     attended = attended.transpose(0, 2, 1, 3).reshape(
         batch, length, heads * head_dim)
     attended = attended * mx.sigmoid(output_gate)
     return _linear(attended, w, f"{prefix}.self_attn.o_proj")
+
+
+def _cache_local_causal_mask(
+        query_length: int, key_length: int, dtype) -> mx.array:
+    """Lower-right causal mask for an append-only, possibly compact KV."""
+    query_length = int(query_length)
+    key_length = int(key_length)
+    cache_local_offset = key_length - query_length
+    if query_length <= 0 or cache_local_offset < 0:
+        raise ValueError("invalid Qwen causal-mask cache dimensions")
+    q_pos = mx.arange(
+        cache_local_offset, cache_local_offset + query_length,
+        dtype=mx.int32)[:, None]
+    k_pos = mx.arange(key_length, dtype=mx.int32)[None, :]
+    return mx.where(
+        k_pos <= q_pos, 0.0, float("-inf")).astype(dtype)
 
 
 # Chunked-parallel DeltaNet (fast/lossy, 2026-07-23): replaces the sequential

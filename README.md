@@ -33,6 +33,7 @@ active validation (see "Status" below).
 
 ```
 runtime/
+  profiles.py        named YAML profile discovery/composition/telemetry
   config.py          HF config.json -> ModelConfig
   local_config.py     machine-local storage config (see "Extra storage" below)
   path_resolver.py     pure mountpoint health/re-resolution helpers
@@ -123,6 +124,32 @@ storage — this is not required to run the project.
 # the bounded cache/prefetch profile for the requested local model.
 .venv/bin/python -m runtime.server --port 8077
 
+# Saved runtime profiles are named YAML groups of the same VMODEL_* settings,
+# with inheritance and notes. Inspect the catalog, then select one by CLI or
+# environment. Repeated groups layer left-to-right; an explicit VMODEL_* value
+# in the process environment always has final precedence.
+.venv/bin/python -m runtime.profiles list
+.venv/bin/python -m runtime.profiles show qwen35-a3b-endpoint-packed-agent
+.venv/bin/python -m runtime.server \
+    --profile qwen35-a3b-endpoint-packed-agent --port 8077
+# This host also has a gitignored composition with its verified K3 sidecar
+# paths; the portable K3 technique groups remain tracked under profiles/.
+.venv/bin/python -m runtime.profiles show kimi-k3-this-mac-fast-tier
+.venv/bin/python -m runtime.server \
+    --profile kimi-k3-this-mac-fast-tier --port 8077
+# Portable K3 scheduling groups are separate: short first-token latency,
+# fixed long-context throughput, or an opt-in rendered-token-count selector.
+.venv/bin/python -m runtime.profiles show kimi-k3-short-first-token
+.venv/bin/python -m runtime.profiles show kimi-k3-long-context-memory
+.venv/bin/python -m runtime.profiles show kimi-k3-adaptive-context
+# Equivalent selection for launchd/container configuration:
+# VMODEL_PROFILE=qwen35-a3b-endpoint-packed-agent \
+#     .venv/bin/python -m runtime.server --port 8077
+# Put machine-local profiles in gitignored profiles.local/, or add search
+# directories with VMODEL_PROFILE_DIR / repeated --profile-dir. Responses emit
+# selected/resolved names and configured/effective SHA-256 profile digests,
+# plus overridden key names (never values). See profiles/README.md.
+
 # Fast-mode text requests automatically use the optional MLX-LM backend when
 # the selected checkpoint is a measured, fully resident dense-Qwen MXFP4
 # artifact and current system/Metal headroom admits it. Qwen3.5-4B keeps the
@@ -141,6 +168,30 @@ VMODEL_RESIDENT_BACKEND=voom .venv/bin/python -m runtime.server --port 8077
 # Exact token extensions reuse the resident hybrid prompt state by default;
 # exact repeats, branches, and token mismatches prefill cold. Set
 # VMODEL_MLX_LM_PROMPT_CACHE=0 for a cold control/rollback.
+
+# Explicit lossy depth-adaptive prefill for dense Qwen3.5. `8:256` is the
+# measured Qwen3.5-9B profile: the whole prompt crosses eight layers and its
+# latest 256 hidden positions cross the remaining layers. The static schedule
+# has five-temperature and heterogeneous-request gates, but is never selected
+# by `auto`. Exact prompt repeats remain eligible; strict extensions recompute.
+VMODEL_MLX_LM_LOSSY_SUFFIX_PREFILL=8:256 \
+    .venv/bin/python -m runtime.server --port 8077
+
+# Explicit lossy endpoint-packed prefill for the out-of-core
+# Qwen3.6-35B-A3B MoE checkpoint. `4:128:64` runs the complete prompt through
+# four layers, then packs the first 128 and final 64 hidden positions (with
+# their original global RoPE positions) through the remaining layers. This
+# fixed geometry contains no prompt/tool/subject predicates and is never
+# selected by `auto`. Top-2 and grammar jumps are independent lossy opt-ins.
+# The post-generation floor sheds only consumed LRU weight pages after model
+# arithmetic; it does not lower the next request's cache admission budget.
+VMODEL_RESIDENT_BACKEND=voom \
+VMODEL_QWEN35_LOSSY_SUFFIX_PREFILL=4:128:64 \
+VMODEL_QWEN_MOE_EXPERT_TOP_K=2 \
+VMODEL_GRAMMAR_JUMP_FORWARD_LOSSY=1 \
+VMODEL_QWEN35_WEIGHT_CACHE_MB=2300 \
+VMODEL_QWEN35_POSTGEN_MIN_AVAILABLE_MB=3200 \
+    .venv/bin/python -m runtime.server --port 8077
 
 # Attribute one request by phase, execution path, layer type, weight wait,
 # materialized compute, cache movement, and store bytes. "ops" additionally

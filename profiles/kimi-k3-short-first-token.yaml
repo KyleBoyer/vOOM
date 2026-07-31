@@ -1,0 +1,13 @@
+schema: voom.runtime-profile.v1
+name: kimi-k3-short-first-token
+description: Low-transient Kimi K3 schedule for short prompts and first-token latency.
+extends:
+  - kimi-k3-memory-core
+notes:
+  - A 256-position cap consumes a short prompt in one tile while the untiled dense MLP avoids long-context-only tiling overhead.
+  - A real 10-token 1-wide trial was rejected after taking 181.2 seconds because layer-stationary MoE routing still touched the same 227.37 GB and the narrower attention schedule only added barriers.
+  - Selection is explicit and independent of prompt contents, tools, subject, and requested output.
+settings:
+  VMODEL_K3_PREFILL_TILE_POLICY: fixed
+  VMODEL_K3_PREFILL_TILE_WIDTH: 256
+  VMODEL_K3_DENSE_MLP_TILE_SIZE: 0

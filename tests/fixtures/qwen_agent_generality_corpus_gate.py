@@ -45,6 +45,9 @@ def _case_command(
     response_status: str | None = "completed",
     min_available_gb: float = 3.2,
     max_swap_growth_mb: float = 16.0,
+    expected_backend: str = "mlx-lm",
+    repeat_cache_source: str = "hot-prompt-exact",
+    nonempty_function_argument: str | None = None,
 ) -> list[str]:
     command = [
         sys.executable, str(REPLAY), str(capture),
@@ -54,7 +57,7 @@ def _case_command(
         "--temperature", format(temperature, "g"),
         "--timeout", "180",
         "--expected-output-type", output_type,
-        "--expected-backend", "mlx-lm",
+        "--expected-backend", expected_backend,
         "--expected-max-first-wall-seconds", "60",
         "--expected-max-repeat-wall-seconds", str(max_warm_seconds),
         "--expected-first-cache-source", first_cache_source,
@@ -73,7 +76,7 @@ def _case_command(
         command.extend(["--expected-response-status", response_status])
     if repeats > 1:
         command.extend([
-            "--expected-repeat-cache-source", "hot-prompt-exact",
+            "--expected-repeat-cache-source", repeat_cache_source,
             "--expected-min-repeat-cached-tokens", str(min_cached_tokens),
         ])
     if stream_mode == "preserved":
@@ -86,6 +89,11 @@ def _case_command(
         command.extend(["--scenario", scenario])
     if function_name is not None:
         command.extend(["--expected-function-call-name", function_name])
+    if nonempty_function_argument is not None:
+        command.extend([
+            "--expected-nonempty-function-argument",
+            nonempty_function_argument,
+        ])
     if require_real_tool is not None:
         command.extend([
             "--expected-gateway-real-tool-required",
@@ -102,6 +110,16 @@ def main() -> int:
     parser.add_argument("--direct-capture", required=True, type=Path)
     parser.add_argument("--model", required=True)
     parser.add_argument("--result-json", required=True, type=Path)
+    parser.add_argument(
+        "--case", action="append", default=[],
+        help="run only these named cases (repeatable; default runs all)")
+    parser.add_argument(
+        "--backend", choices=("auto", "voom", "mlx-lm"), default="mlx-lm")
+    parser.add_argument("--lossy-suffix-prefill")
+    parser.add_argument("--qwen-moe-expert-top-k", default="released")
+    parser.add_argument(
+        "--grammar-jump-forward-lossy", choices=("0", "1"), default="0")
+    parser.add_argument("--qwen35-weight-cache-mb", type=int)
     parser.add_argument("--port", type=int, default=8130)
     parser.add_argument("--min-available-gb", type=float, default=3.2)
     parser.add_argument("--max-swap-growth-mb", type=float, default=16.0)
@@ -132,7 +150,7 @@ def main() -> int:
             "--persistent-replay requires --persistent-prompt-cache-dir")
 
     server_overrides = {
-        "VMODEL_RESIDENT_BACKEND": "mlx-lm",
+        "VMODEL_RESIDENT_BACKEND": args.backend,
         "VMODEL_MLX_LM_PROMPT_CACHE": "1",
         "VMODEL_MLX_LM_LOGIT_CHAIN": "1",
         "VMODEL_MLX_LM_NATIVE_MTP": "0",
@@ -142,8 +160,24 @@ def main() -> int:
         "VMODEL_FAST_TOOL_GATEWAY_ABSTAIN": "0",
         "VMODEL_FAST_TOOL_GATEWAY_EXECUTION_CONTEXT": "full",
         "VMODEL_FAST_TOOL_GATEWAY_QWEN_MOE_TOP_K": "released",
-        "VMODEL_GRAMMAR_JUMP_FORWARD_LOSSY": "0",
+        "VMODEL_GRAMMAR_JUMP_FORWARD_LOSSY":
+            args.grammar_jump_forward_lossy,
     }
+    if args.lossy_suffix_prefill:
+        server_overrides["VMODEL_QWEN35_LOSSY_SUFFIX_PREFILL"] = (
+            args.lossy_suffix_prefill)
+    if args.backend == "voom":
+        server_overrides["VMODEL_QWEN35_POSTGEN_MIN_AVAILABLE_MB"] = str(
+            int(args.min_available_gb * 1_000))
+    server_overrides["VMODEL_QWEN_MOE_EXPERT_TOP_K"] = (
+        args.qwen_moe_expert_top_k)
+    if args.qwen35_weight_cache_mb is not None:
+        server_overrides["VMODEL_QWEN35_WEIGHT_CACHE_MB"] = str(
+            args.qwen35_weight_cache_mb)
+    expected_backend = (
+        "mlx-lm" if args.backend == "mlx-lm" else "voom")
+    repeat_cache_source = (
+        "hot-prompt-exact" if expected_backend == "mlx-lm" else "memory")
     if args.persistent_prompt_cache_dir is not None:
         server_overrides.update({
             "VMODEL_MLX_LM_PERSISTENT_PROMPT_CACHE_DIR": str(
@@ -162,6 +196,8 @@ def main() -> int:
             "stream_mode": "preserved",
             "gateway_phase": "direct",
             "min_cached_tokens": 1_000,
+            "max_output_tokens": 16,
+            "response_status": None,
             "declared_shape": {
                 "capture": "identity-pinned-real",
                 "conversation": "unchanged",
@@ -170,6 +206,8 @@ def main() -> int:
                 "developer": False,
                 "stream": True,
                 "subject": "direct-humor",
+                "max_output_tokens": (
+                    "16 direct-answer quality bound; not a latency result"),
             },
         },
         {
@@ -180,9 +218,11 @@ def main() -> int:
             "output_type": "message",
             # Wire streaming does not affect prompt/model state, so this must
             # reuse the exact state left by the preceding streamed request.
-            "first_cache_source": "hot-prompt-exact",
+            "first_cache_source": repeat_cache_source,
             "stream_mode": "disabled",
             "gateway_phase": "direct",
+            "max_output_tokens": 16,
+            "response_status": None,
             "declared_shape": {
                 "capture": "identity-pinned-real",
                 "conversation": "unchanged",
@@ -191,6 +231,8 @@ def main() -> int:
                 "developer": False,
                 "stream": False,
                 "subject": "direct-humor",
+                "max_output_tokens": (
+                    "16 direct-answer quality bound; not a latency result"),
             },
         },
         {
@@ -225,6 +267,8 @@ def main() -> int:
             "stream_mode": "forced",
             "scenario": "short-direct-no-tools",
             "min_cached_tokens": 20,
+            "max_output_tokens": 16,
+            "response_status": None,
             "declared_shape": {
                 "capture": "tracked-synthetic-mutation",
                 "conversation": "short-direct-no-tools",
@@ -233,6 +277,8 @@ def main() -> int:
                 "developer": False,
                 "stream": True,
                 "subject": "direct-humor",
+                "max_output_tokens": (
+                    "16 direct-answer quality bound; not a latency result"),
             },
         },
         {
@@ -273,6 +319,7 @@ def main() -> int:
             "stream_mode": "disabled",
             "scenario": "deferred-action",
             "function_name": "mastra_workspace_execute_command",
+            "nonempty_function_argument": "command",
             "min_cached_tokens": 1_000,
             "require_real_tool": True,
             "declared_shape": {
@@ -286,6 +333,16 @@ def main() -> int:
             },
         },
     ]
+    if args.case:
+        requested_cases = set(args.case)
+        known_cases = {case["name"] for case in cases}
+        unknown_cases = requested_cases - known_cases
+        if unknown_cases:
+            parser.error(
+                "unknown case name(s): " + ", ".join(sorted(unknown_cases)))
+        cases = [
+            case for case in cases if case["name"] in requested_cases
+        ]
     if args.persistent_replay:
         for case in cases:
             if case["first_cache_source"] == "cold":
@@ -335,6 +392,8 @@ def main() -> int:
                 model=args.model, port=args.port, result=child_result,
                 min_available_gb=args.min_available_gb,
                 max_swap_growth_mb=args.max_swap_growth_mb,
+                expected_backend=expected_backend,
+                repeat_cache_source=repeat_cache_source,
                 **command_args)
             code = subprocess.run(command, cwd=ROOT).returncode
             child = (

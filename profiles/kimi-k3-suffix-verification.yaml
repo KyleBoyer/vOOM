@@ -1,0 +1,14 @@
+schema: voom.runtime-profile.v1
+name: kimi-k3-suffix-verification
+description: Exact greedy Kimi K3 suffix proposals with target verification and retained KDA endpoints.
+notes:
+  - The bounded suffix model proposes tokens, but released K3 verifies every committed token; stochastic requests fall back to ordinary sampling.
+  - Retaining per-position KDA endpoints avoids a restore-and-refeed sweep after partial rejection when the one GB endpoint budget admits it.
+  - Multi-domain structural traces support the fixed k/depth/probability values, but target-generated broad acceptance remains incomplete.
+settings:
+  VMODEL_K3_SUFFIX_DECODING: true
+  VMODEL_K3_SUFFIX_K: 2
+  VMODEL_K3_SUFFIX_MAX_DEPTH: 8
+  VMODEL_K3_SUFFIX_FACTOR: 2.0
+  VMODEL_K3_SUFFIX_MIN_PROBABILITY: 0.75
+  VMODEL_K3_SUFFIX_MAX_LOCAL_TOKENS: 65536

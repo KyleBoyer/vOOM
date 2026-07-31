@@ -1,0 +1,13 @@
+schema: voom.runtime-profile.v1
+name: agent-tool-gateway
+description: Full-context hidden tool gateway with deterministic host pagination.
+notes:
+  - Keeps the full execution context and released expert count; it does not enable the narrow task capsule.
+  - Disables gateway abstention so the selected real tool is re-enabled for execution.
+  - Tool catalog limits retain their runtime defaults and can be layered or overridden independently.
+settings:
+  VMODEL_FAST_TOOL_GATEWAY: true
+  VMODEL_FAST_TOOL_GATEWAY_HOST_ROUTE: true
+  VMODEL_FAST_TOOL_GATEWAY_ABSTAIN: false
+  VMODEL_FAST_TOOL_GATEWAY_EXECUTION_CONTEXT: full
+  VMODEL_FAST_TOOL_GATEWAY_QWEN_MOE_TOP_K: released

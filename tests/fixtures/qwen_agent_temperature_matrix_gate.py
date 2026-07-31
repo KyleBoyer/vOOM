@@ -26,6 +26,12 @@ import psutil
 
 
 ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(ROOT))
+
+from runtime.profiles import (discover_runtime_profiles,
+                              resolve_runtime_profiles,
+                              runtime_profile_dirs)
+
 REPLAY = ROOT / "tests/fixtures/qwen3_large_agent_replay_gate.py"
 TEMPERATURES = (0.0, 0.3, 0.5, 0.7, 1.0)
 
@@ -122,8 +128,24 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--capture", required=True, type=Path)
     parser.add_argument("--model", required=True)
+    parser.add_argument(
+        "--runtime-profile", action="append", default=[],
+        help="server runtime profile; repeat to layer groups in order")
+    parser.add_argument(
+        "--profile-settings-only", action="store_true",
+        help="do not duplicate profile settings through environment overrides")
     parser.add_argument("--expected-function", required=True)
     parser.add_argument("--result-json", required=True, type=Path)
+    parser.add_argument(
+        "--backend", choices=("auto", "voom", "mlx-lm"), default="mlx-lm")
+    parser.add_argument("--lossy-suffix-prefill")
+    parser.add_argument("--qwen-moe-expert-top-k", default="released")
+    parser.add_argument(
+        "--grammar-jump-forward-lossy", choices=("0", "1"), default="0")
+    parser.add_argument("--qwen35-weight-cache-mb", type=int)
+    parser.add_argument("--expected-function-arguments-json")
+    parser.add_argument(
+        "--expected-positive-function-argument", action="append", default=[])
     parser.add_argument("--temperature", action="append")
     parser.add_argument("--port", type=int, default=8129)
     parser.add_argument("--request-timeout", type=float, default=180.0)
@@ -151,6 +173,8 @@ def main() -> int:
     if args.result_json.exists():
         raise SystemExit(
             f"refusing to overwrite result artifact: {args.result_json}")
+    if args.profile_settings_only and not args.runtime_profile:
+        parser.error("--profile-settings-only requires --runtime-profile")
     if min(
         args.request_timeout, args.server_ready_timeout,
         args.max_cold_seconds, args.max_warm_seconds,
@@ -160,7 +184,7 @@ def main() -> int:
         parser.error("timeouts, thresholds, and safety limits must be positive")
 
     server_overrides = {
-        "VMODEL_RESIDENT_BACKEND": "mlx-lm",
+        "VMODEL_RESIDENT_BACKEND": args.backend,
         "VMODEL_MLX_LM_PROMPT_CACHE": "1",
         "VMODEL_MLX_LM_LOGIT_CHAIN": "1",
         "VMODEL_MLX_LM_NATIVE_MTP": "0",
@@ -170,8 +194,24 @@ def main() -> int:
         "VMODEL_FAST_TOOL_GATEWAY_ABSTAIN": "0",
         "VMODEL_FAST_TOOL_GATEWAY_EXECUTION_CONTEXT": "full",
         "VMODEL_FAST_TOOL_GATEWAY_QWEN_MOE_TOP_K": "released",
-        "VMODEL_GRAMMAR_JUMP_FORWARD_LOSSY": "0",
+        "VMODEL_GRAMMAR_JUMP_FORWARD_LOSSY":
+            args.grammar_jump_forward_lossy,
     }
+    if args.lossy_suffix_prefill:
+        server_overrides["VMODEL_QWEN35_LOSSY_SUFFIX_PREFILL"] = (
+            args.lossy_suffix_prefill)
+    if args.backend == "voom":
+        server_overrides["VMODEL_QWEN35_POSTGEN_MIN_AVAILABLE_MB"] = str(
+            int(args.min_available_gb * 1_000))
+    server_overrides["VMODEL_QWEN_MOE_EXPERT_TOP_K"] = (
+        args.qwen_moe_expert_top_k)
+    if args.qwen35_weight_cache_mb is not None:
+        server_overrides["VMODEL_QWEN35_WEIGHT_CACHE_MB"] = str(
+            args.qwen35_weight_cache_mb)
+    expected_backend = (
+        "mlx-lm" if args.backend == "mlx-lm" else "voom")
+    expected_repeat_cache_source = (
+        "hot-prompt-exact" if expected_backend == "mlx-lm" else "memory")
     if args.persistent_prompt_cache_dir is not None:
         server_overrides.update({
             "VMODEL_MLX_LM_PERSISTENT_PROMPT_CACHE_DIR": str(
@@ -179,12 +219,23 @@ def main() -> int:
             "VMODEL_MLX_LM_PERSISTENT_PROMPT_CACHE_MAX_MB": str(
                 args.persistent_prompt_cache_max_mb),
         })
+    if args.profile_settings_only:
+        server_overrides = {}
+    profile_groups: tuple[str, ...] = ()
+    profile_settings: dict[str, str] = {}
+    if args.runtime_profile:
+        catalog = discover_runtime_profiles(runtime_profile_dirs())
+        profile_groups, profile_settings = resolve_runtime_profiles(
+            tuple(args.runtime_profile), catalog)
     report = {
         "schema": "voom.qwen-agent-temperature-matrix.v1",
         "capture_path": str(args.capture),
         "model_override": args.model,
         "temperatures": list(temperatures),
         "server_environment_overrides": server_overrides,
+        "runtime_profiles": list(args.runtime_profile),
+        "runtime_profile_groups": list(profile_groups),
+        "profile_settings_only": args.profile_settings_only,
         "request_mutations": {
             "model": args.model,
             "temperature_per_row": list(temperatures),
@@ -199,7 +250,7 @@ def main() -> int:
             "warm_wall_seconds_strictly_below": args.max_warm_seconds,
             "first_cache_source": args.expected_first_cache_source,
             "first_output_sha256": args.expected_first_output_sha256,
-            "repeat_cache_source": "hot-prompt-exact",
+            "repeat_cache_source": expected_repeat_cache_source,
             "repeat_cached_tokens_at_least": args.min_cached_tokens,
             "true_peak_metal_gb_strictly_below": 8.5,
             "in_run_available_gb_at_least": args.min_available_gb,
@@ -254,13 +305,20 @@ def main() -> int:
             _atomic_json(args.result_json, report)
             continue
         server_env = os.environ.copy()
+        if args.profile_settings_only:
+            for setting_name in profile_settings:
+                server_env.pop(setting_name, None)
         server_env.update(server_overrides)
         print(
             f"[matrix] starting fresh server temperature={temperature:g}",
             flush=True)
+        server_command = [
+            sys.executable, "-m", "runtime.server", "--port", str(args.port),
+        ]
+        for profile_name in args.runtime_profile:
+            server_command.extend(("--profile", profile_name))
         server = subprocess.Popen(
-            [sys.executable, "-m", "runtime.server",
-             "--port", str(args.port)],
+            server_command,
             cwd=ROOT,
             env=server_env,
         )
@@ -281,12 +339,13 @@ def main() -> int:
                 "--expected-output-type", "function_call",
                 "--expected-function-call-name", args.expected_function,
                 "--expected-response-status", "completed",
-                "--expected-backend", "mlx-lm",
+                "--expected-backend", expected_backend,
                 "--expected-max-first-wall-seconds",
                 str(args.max_cold_seconds),
                 "--expected-max-repeat-wall-seconds",
                 str(args.max_warm_seconds),
-                "--expected-repeat-cache-source", "hot-prompt-exact",
+                "--expected-repeat-cache-source",
+                expected_repeat_cache_source,
                 "--expected-min-repeat-cached-tokens",
                 str(args.min_cached_tokens),
                 "--expected-max-peak-metal-gb", "8.5",
@@ -295,10 +354,26 @@ def main() -> int:
                 "--max-swap-growth-mb", str(args.max_swap_growth_mb),
                 "--result-json", str(child_result),
             ]
+            for profile_name in args.runtime_profile:
+                command.extend(("--expected-runtime-profile", profile_name))
+            for profile_name in profile_groups:
+                command.extend((
+                    "--expected-runtime-profile-group", profile_name))
+            if args.profile_settings_only:
+                command.append("--expected-no-runtime-profile-overrides")
             if args.expected_first_cache_source is not None:
                 command.extend([
                     "--expected-first-cache-source",
                     args.expected_first_cache_source,
+                ])
+            if args.expected_function_arguments_json is not None:
+                command.extend([
+                    "--expected-function-arguments-json",
+                    args.expected_function_arguments_json,
+                ])
+            for argument_name in args.expected_positive_function_argument:
+                command.extend([
+                    "--expected-positive-function-argument", argument_name,
                 ])
             fixture_code = subprocess.run(command, cwd=ROOT).returncode
             if child_result.is_file():

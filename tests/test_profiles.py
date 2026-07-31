@@ -1,0 +1,281 @@
+"""Pure tests for named runtime profiles (no MLX or model I/O)."""
+
+from __future__ import annotations
+
+import json
+import os
+from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
+import yaml
+
+from runtime.profiles import (
+    PROFILE_SCHEMA,
+    RuntimeProfileError,
+    active_runtime_profile_fields,
+    apply_runtime_profiles,
+    clear_active_runtime_profiles,
+    discover_runtime_profiles,
+    load_runtime_profile,
+    parse_runtime_profile_names,
+    resolve_runtime_profiles,
+    runtime_profile_dirs,
+)
+
+
+ROOT = Path(__file__).resolve().parent.parent
+
+
+def _write_profile(
+    directory: Path,
+    name: str,
+    *,
+    settings: dict | None = None,
+    extends: list[str] | None = None,
+    notes: list[str] | None = None,
+) -> Path:
+    directory.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "schema": PROFILE_SCHEMA,
+        "name": name,
+        "description": f"Profile {name}",
+    }
+    if notes is not None:
+        payload["notes"] = notes
+    if extends is not None:
+        payload["extends"] = extends
+    if settings is not None:
+        payload["settings"] = settings
+    path = directory / f"{name}.yaml"
+    path.write_text(yaml.safe_dump(payload, sort_keys=False))
+    return path
+
+
+def test_builtin_profiles_resolve_complete_agent_group():
+    catalog = discover_runtime_profiles((ROOT / "profiles",))
+    order, settings = resolve_runtime_profiles(
+        ("qwen35-a3b-endpoint-packed-agent",), catalog)
+
+    assert order == (
+        "qwen35-a3b-endpoint-packed",
+        "agent-tool-gateway",
+        "qwen35-a3b-endpoint-packed-agent",
+    )
+    assert settings["VMODEL_QWEN35_LOSSY_SUFFIX_PREFILL"] == "4:128:64"
+    assert settings["VMODEL_QWEN_MOE_EXPERT_TOP_K"] == "2"
+    assert settings["VMODEL_FAST_TOOL_GATEWAY"] == "1"
+    assert settings["VMODEL_FAST_TOOL_GATEWAY_EXECUTION_CONTEXT"] == "full"
+    assert settings["VMODEL_FAST_TOOL_GATEWAY_QWEN_MOE_TOP_K"] == "released"
+
+
+def test_builtin_k3_and_qwen9_profiles_pin_validated_values():
+    catalog = discover_runtime_profiles((ROOT / "profiles",))
+
+    qwen_order, qwen_settings = resolve_runtime_profiles(
+        ("qwen35-9b-depth-adaptive-agent",), catalog)
+    assert qwen_order == (
+        "qwen35-9b-depth-adaptive",
+        "agent-tool-gateway",
+        "qwen35-9b-depth-adaptive-agent",
+    )
+    assert qwen_settings["VMODEL_MLX_LM_LOSSY_SUFFIX_PREFILL"] == "8:256"
+    assert qwen_settings["VMODEL_MLX_LM_SYSTEM_RESERVE_MB"] == "1500"
+
+    k3_order, k3_settings = resolve_runtime_profiles((
+        "kimi-k3-exact-streaming",
+        "kimi-k3-adaptive-context",
+        "kimi-k3-suffix-verification",
+    ), catalog)
+    assert k3_order == (
+        "kimi-k3-exact-streaming",
+        "kimi-k3-memory-core",
+        "kimi-k3-adaptive-context",
+        "kimi-k3-suffix-verification",
+    )
+    assert k3_settings["VMODEL_CT_MXFP4_NATIVE"] == "1"
+    assert k3_settings["VMODEL_K3_ABSORBED_MLA"] == "1"
+    assert k3_settings["VMODEL_K3_FUSED_ATTNRES_TILE_SIZE"] == "128"
+    assert k3_settings["VMODEL_K3_PREFILL_TILE_POLICY"] == "prompt-length"
+    assert k3_settings["VMODEL_K3_PREFILL_LONG_CONTEXT_TOKENS"] == "256"
+    assert k3_settings["VMODEL_K3_PREFILL_SHORT_TILE_WIDTH"] == "256"
+    assert k3_settings["VMODEL_K3_PREFILL_TILE_WIDTH"] == "256"
+    assert k3_settings["VMODEL_K3_SUFFIX_K"] == "2"
+    assert k3_settings["VMODEL_K3_SUFFIX_MIN_PROBABILITY"] == "0.75"
+
+    short_order, short_settings = resolve_runtime_profiles(
+        ("kimi-k3-short-first-token",), catalog)
+    assert short_order == (
+        "kimi-k3-memory-core",
+        "kimi-k3-short-first-token",
+    )
+    assert short_settings["VMODEL_K3_PREFILL_TILE_POLICY"] == "fixed"
+    assert short_settings["VMODEL_K3_PREFILL_TILE_WIDTH"] == "256"
+    assert short_settings["VMODEL_K3_DENSE_MLP_TILE_SIZE"] == "0"
+
+
+def test_profile_inheritance_and_later_selection_precedence(tmp_path):
+    _write_profile(tmp_path, "base", settings={
+        "VMODEL_SHARED": 1,
+        "VMODEL_BASE_ONLY": True,
+    })
+    _write_profile(tmp_path, "child", extends=["base"], settings={
+        "VMODEL_SHARED": 2,
+        "VMODEL_CHILD_ONLY": False,
+    })
+    catalog = discover_runtime_profiles((tmp_path,))
+
+    order, settings = resolve_runtime_profiles(("child", "base"), catalog)
+
+    assert order == ("base", "child", "base")
+    assert settings == {
+        "VMODEL_SHARED": "1",
+        "VMODEL_BASE_ONLY": "1",
+        "VMODEL_CHILD_ONLY": "0",
+    }
+
+
+def test_explicit_environment_wins_and_changes_effective_digest(tmp_path):
+    _write_profile(tmp_path, "speed", settings={
+        "VMODEL_CACHE_MB": 2300,
+        "VMODEL_FEATURE": True,
+    })
+    env = {"VMODEL_CACHE_MB": "4096", "UNRELATED": "preserved"}
+
+    application = apply_runtime_profiles(
+        ("speed",), search_dirs=(tmp_path,), environ=env)
+
+    assert application is not None
+    assert env == {
+        "VMODEL_CACHE_MB": "4096",
+        "VMODEL_FEATURE": "1",
+        "UNRELATED": "preserved",
+    }
+    assert application.overridden_keys == ("VMODEL_CACHE_MB",)
+    assert application.profile_digest != application.effective_digest
+
+
+def test_equivalent_application_has_stable_digests(tmp_path):
+    _write_profile(tmp_path, "stable", settings={
+        "VMODEL_B": "two",
+        "VMODEL_A": 1,
+    })
+
+    first = apply_runtime_profiles(
+        ("stable",), search_dirs=(tmp_path,), environ={})
+    second = apply_runtime_profiles(
+        ("stable",), search_dirs=(tmp_path,), environ={})
+
+    assert first is not None and second is not None
+    assert first.profile_digest == second.profile_digest
+    assert first.effective_digest == second.effective_digest
+
+
+def test_active_telemetry_never_discloses_setting_values(tmp_path):
+    _write_profile(tmp_path, "telemetry", settings={
+        "VMODEL_PRIVATE_PATH": "/a/machine-specific/path",
+    })
+    try:
+        application = apply_runtime_profiles(
+            ("telemetry",), search_dirs=(tmp_path,), environ={}, activate=True)
+        fields = active_runtime_profile_fields()
+        assert application is not None
+        assert fields["vmodel_runtime_profiles"] == ["telemetry"]
+        assert fields["vmodel_runtime_profile_groups"] == ["telemetry"]
+        assert fields["vmodel_runtime_profile_digest"] == application.profile_digest
+        assert fields["vmodel_runtime_effective_digest"] == application.effective_digest
+        assert "/a/machine-specific/path" not in json.dumps(fields)
+        assert "VMODEL_PRIVATE_PATH" not in json.dumps(fields)
+    finally:
+        clear_active_runtime_profiles()
+    assert active_runtime_profile_fields() == {}
+
+
+def test_server_execution_fields_include_active_profile_identity(tmp_path):
+    from runtime.server import _execution_profile_fields
+
+    _write_profile(tmp_path, "response", settings={"VMODEL_FEATURE": True})
+    model_dir = tmp_path / "model"
+    model_dir.mkdir()
+    (model_dir / "config.json").write_text("{}")
+    engine = SimpleNamespace(
+        _model_dir=model_dir,
+        store=SimpleNamespace(quantization={}, on_disk_quantized=False),
+        rc=SimpleNamespace(
+            quant_bits=0,
+            rerank_lm_head=False,
+            resident_attention_mode="",
+            expert_top_k_by_layer=(),
+            native_ct_mxfp4=False,
+            kimi_k3_scale_sidecar_dir="",
+            bf16_nf12_sidecar_dir="",
+        ),
+    )
+    try:
+        apply_runtime_profiles(
+            ("response",), search_dirs=(tmp_path,), environ={}, activate=True)
+        fields = _execution_profile_fields(engine)
+        assert fields["vmodel_runtime_profiles"] == ["response"]
+        assert fields["vmodel_runtime_profile_groups"] == ["response"]
+        assert len(fields["vmodel_runtime_profile_digest"]) == 64
+        assert len(fields["vmodel_runtime_effective_digest"]) == 64
+    finally:
+        clear_active_runtime_profiles()
+
+
+def test_profile_selection_parses_repeated_and_comma_separated_values():
+    assert parse_runtime_profile_names(("one,two", "three")) == (
+        "one", "two", "three")
+    with pytest.raises(RuntimeProfileError, match="invalid runtime profile name"):
+        parse_runtime_profile_names("../escape")
+
+
+def test_environment_and_explicit_search_dirs_follow_defaults(tmp_path):
+    env_one = tmp_path / "env-one"
+    env_two = tmp_path / "env-two"
+    explicit = tmp_path / "explicit"
+    env = {"VMODEL_PROFILE_DIR": os.pathsep.join((str(env_one), str(env_two)))}
+
+    directories = runtime_profile_dirs((explicit,), environ=env)
+
+    assert directories[-3:] == (
+        env_one.resolve(), env_two.resolve(), explicit.resolve())
+
+
+def test_profile_rejects_non_vmodel_and_recursive_settings(tmp_path):
+    bad = _write_profile(tmp_path, "bad", settings={"PATH": "/tmp"})
+    with pytest.raises(RuntimeProfileError, match="setting names"):
+        load_runtime_profile(bad)
+
+    recursive = _write_profile(
+        tmp_path, "recursive", settings={"VMODEL_PROFILE": "bad"})
+    with pytest.raises(RuntimeProfileError, match="cannot be set by a profile"):
+        load_runtime_profile(recursive)
+
+    nonfinite = _write_profile(
+        tmp_path, "nonfinite", settings={"VMODEL_VALUE": float("inf")})
+    with pytest.raises(RuntimeProfileError, match="NaN or infinite"):
+        load_runtime_profile(nonfinite)
+
+
+def test_profile_rejects_duplicate_names_and_inheritance_cycles(tmp_path):
+    first = tmp_path / "first"
+    second = tmp_path / "second"
+    _write_profile(first, "duplicate", settings={"VMODEL_X": 1})
+    _write_profile(second, "duplicate", settings={"VMODEL_X": 2})
+    with pytest.raises(RuntimeProfileError, match="duplicate runtime profile"):
+        discover_runtime_profiles((first, second))
+
+    cycle_dir = tmp_path / "cycles"
+    _write_profile(cycle_dir, "alpha", extends=["beta"])
+    _write_profile(cycle_dir, "beta", extends=["alpha"])
+    catalog = discover_runtime_profiles((cycle_dir,))
+    with pytest.raises(RuntimeProfileError, match="alpha -> beta -> alpha"):
+        resolve_runtime_profiles(("alpha",), catalog)
+
+
+def test_unknown_parent_fails_with_available_catalog(tmp_path):
+    _write_profile(tmp_path, "child", extends=["missing"])
+    catalog = discover_runtime_profiles((tmp_path,))
+    with pytest.raises(RuntimeProfileError, match="unknown runtime profile 'missing'"):
+        resolve_runtime_profiles(("child",), catalog)

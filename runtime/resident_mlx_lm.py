@@ -32,6 +32,34 @@ _METAL_HARD_CEILING_BYTES = 8_500_000_000
 _SUPPORTED_AUTO_MODEL_TYPES = frozenset({"qwen3_5"})
 
 
+def _parse_lossy_suffix_prefill(raw: str | None) -> tuple[int, int] | None:
+    """Parse the explicit depth-adaptive prefill schedule.
+
+    The schedule is deliberately request-independent: ``D:S`` runs the full
+    prompt through the first D layers, retains the most recent S hidden
+    positions, then runs that suffix through the remaining layers.  It is a
+    lossy side-quest mode and never activates from ``auto``.
+    """
+    value = str(raw or "").strip().lower()
+    if value in ("", "0", "off"):
+        return None
+    fields = value.split(":")
+    if len(fields) != 2:
+        raise ValueError(
+            "VMODEL_MLX_LM_LOSSY_SUFFIX_PREFILL must be off or "
+            "EARLY_LAYERS:SUFFIX_TOKENS")
+    try:
+        early_layers, suffix_tokens = map(int, fields)
+    except ValueError as error:
+        raise ValueError(
+            "VMODEL_MLX_LM_LOSSY_SUFFIX_PREFILL fields must be integers"
+        ) from error
+    if early_layers <= 0 or suffix_tokens <= 0:
+        raise ValueError(
+            "VMODEL_MLX_LM_LOSSY_SUFFIX_PREFILL fields must be positive")
+    return early_layers, suffix_tokens
+
+
 @dataclass(frozen=True)
 class ResidentBackendDecision:
     backend: str
@@ -388,6 +416,8 @@ class ResidentMLXLMEngine:
         self._generation_sampled_tokens = 0
         self._native_mtp = None
         self._persistent_prompt_store = None
+        self._lossy_suffix_prefill = _parse_lossy_suffix_prefill(
+            os.environ.get("VMODEL_MLX_LM_LOSSY_SUFFIX_PREFILL"))
 
         tokenizer_path = self._model_dir / "tokenizer.json"
         if not tokenizer_path.is_file():
@@ -409,6 +439,22 @@ class ResidentMLXLMEngine:
         mlx_lm = import_mlx_lm()
         self.model, _ = mlx_lm.load(
             str(self._model_dir), lazy=False)
+        if self._lossy_suffix_prefill is not None:
+            early_layers, _suffix_tokens = self._lossy_suffix_prefill
+            layers = getattr(
+                getattr(
+                    getattr(self.model, "language_model", None),
+                    "model", None),
+                "layers", ())
+            if (getattr(cfg, "model_type", "") != "qwen3_5"
+                    or not layers):
+                raise ValueError(
+                    "VMODEL_MLX_LM_LOSSY_SUFFIX_PREFILL currently requires "
+                    "a dense Qwen3.5 checkpoint")
+            if early_layers >= len(layers):
+                raise ValueError(
+                    "VMODEL_MLX_LM_LOSSY_SUFFIX_PREFILL EARLY_LAYERS must "
+                    f"be less than the model depth ({len(layers)})")
         native_mtp_setting = os.environ.get(
             "VMODEL_MLX_LM_NATIVE_MTP", "0")
         if native_mtp_setting not in ("0", "1"):
@@ -440,6 +486,7 @@ class ResidentMLXLMEngine:
             arithmetic = json.dumps({
                 "backend": "resident-mlx-lm",
                 "native_mtp_loaded": native_mtp_setting,
+                "lossy_suffix_prefill": self._lossy_suffix_prefill,
                 "persistent_prompt_format": "v2",
                 "versions": version,
             }, sort_keys=True, separators=(",", ":"))
@@ -537,6 +584,85 @@ class ResidentMLXLMEngine:
         cache_module = importlib.import_module("mlx_lm.models.cache")
         return cache_module.make_prompt_cache(self.model)
 
+    def _qwen35_layerwise_forward(self, inputs, cache):
+        """Forward Qwen3.5 with a mask derived from each layer's own cache.
+
+        Released MLX-LM shares masks created from layer 0 and layer 3 because
+        ordinary forwards keep all hybrid-cache lengths equal.  Depth-adaptive
+        prefill intentionally gives early and late layers different history
+        lengths, so decode must derive the otherwise-identical mask locally.
+        """
+        base = importlib.import_module("mlx_lm.models.base")
+        text_model = self.model.language_model
+        core = text_model.model
+        hidden = core.embed_tokens(inputs)
+        for layer, layer_cache in zip(core.layers, cache):
+            mask = (
+                base.create_ssm_mask(hidden, layer_cache)
+                if layer.is_linear
+                else base.create_attention_mask(hidden, layer_cache))
+            hidden = layer(hidden, mask=mask, cache=layer_cache)
+        hidden = core.norm(hidden)
+        if text_model.args.tie_word_embeddings:
+            return core.embed_tokens.as_linear(hidden)
+        return text_model.lm_head(hidden)
+
+    def _qwen35_lossy_suffix_prefill(
+        self, prompt, prompt_cache, early_layers: int, suffix_tokens: int,
+        prefill_step_size: int, progress,
+    ):
+        """Run request-independent shallow-full/deep-suffix prompt encoding."""
+        base = importlib.import_module("mlx_lm.models.base")
+        text_model = self.model.language_model
+        core = text_model.model
+        total = int(prompt.shape[0])
+        processed = 0
+        boundary = None
+
+        while processed < total:
+            count = min(prefill_step_size, total - processed)
+            hidden = core.embed_tokens(
+                prompt[processed:processed + count][None])
+            for layer_index in range(early_layers):
+                layer = core.layers[layer_index]
+                layer_cache = prompt_cache[layer_index]
+                mask = (
+                    base.create_ssm_mask(hidden, layer_cache)
+                    if layer.is_linear
+                    else base.create_attention_mask(hidden, layer_cache))
+                hidden = layer(hidden, mask=mask, cache=layer_cache)
+            tail = hidden[:, -min(suffix_tokens, count):, :]
+            boundary = (
+                tail if boundary is None
+                else mx.concatenate([boundary, tail], axis=1)[
+                    :, -suffix_tokens:, :])
+            mx.eval(
+                boundary,
+                [entry.state for entry in prompt_cache[:early_layers]])
+            processed += count
+            progress(processed, total)
+            mx.clear_cache()
+
+        hidden = boundary
+        for layer_index in range(early_layers, len(core.layers)):
+            layer = core.layers[layer_index]
+            layer_cache = prompt_cache[layer_index]
+            mask = (
+                base.create_ssm_mask(hidden, layer_cache)
+                if layer.is_linear
+                else base.create_attention_mask(hidden, layer_cache))
+            hidden = layer(hidden, mask=mask, cache=layer_cache)
+        hidden = core.norm(hidden[:, -1:, :])
+        logits = (
+            core.embed_tokens.as_linear(hidden)
+            if text_model.args.tie_word_embeddings
+            else text_model.lm_head(hidden))
+        raw_values = logits[:, -1, :].reshape(-1)
+        mx.eval(
+            raw_values,
+            [entry.state for entry in prompt_cache])
+        return raw_values
+
     def _direct_tokens(
         self, prompt_ids: list[int], max_tokens: int, sampling: SamplingParams,
         constraint, generated: list[int], prompt_cache, progress,
@@ -549,7 +675,10 @@ class ResidentMLXLMEngine:
         logit_chain_stats=None,
         on_generation_checkpoint=None,
         on_prompt_endpoint=None,
+        lossy_suffix_prefill=None,
+        model_forward=None,
     ):
+        model_forward = model_forward or self.model
         prompt = mx.array(prompt_ids, dtype=mx.int32)
         total = len(prompt_ids)
         processed = prefix_len
@@ -573,37 +702,45 @@ class ResidentMLXLMEngine:
                 prompt_mtp_cache)
             mx.eval([entry.state for entry in prompt_mtp_cache])
 
-        while total - processed > 1:
-            count = min(prefill_step_size, (total - processed) - 1)
-            chunk = prompt[processed:processed + count][None]
-            if use_mtp:
-                _logits, hidden = native_mtp.trunk_forward(
-                    chunk, prompt_cache)
-                native_mtp.advance(
-                    hidden,
-                    prompt[
-                        processed + 1:processed + count + 1][None],
-                    prompt_mtp_cache)
-                mx.eval(
-                    [entry.state for entry in prompt_cache],
-                    [entry.state for entry in prompt_mtp_cache])
-            else:
-                self.model(chunk, cache=prompt_cache)
-                mx.eval([entry.state for entry in prompt_cache])
-            processed += count
-            progress(processed, total)
-            mx.clear_cache()
-
         if exact_prompt_logits is not None:
             raw_values = exact_prompt_logits
             endpoint_hidden = exact_prompt_hidden
+        elif lossy_suffix_prefill is not None:
+            early_layers, suffix_tokens = lossy_suffix_prefill
+            raw_values = self._qwen35_lossy_suffix_prefill(
+                prompt, prompt_cache, early_layers, suffix_tokens,
+                prefill_step_size, progress)
+            endpoint_hidden = None
+            if on_prompt_endpoint is not None:
+                on_prompt_endpoint(
+                    prompt_cache, raw_values, None, None)
         else:
+            while total - processed > 1:
+                count = min(prefill_step_size, (total - processed) - 1)
+                chunk = prompt[processed:processed + count][None]
+                if use_mtp:
+                    _logits, hidden = native_mtp.trunk_forward(
+                        chunk, prompt_cache)
+                    native_mtp.advance(
+                        hidden,
+                        prompt[
+                            processed + 1:processed + count + 1][None],
+                        prompt_mtp_cache)
+                    mx.eval(
+                        [entry.state for entry in prompt_cache],
+                        [entry.state for entry in prompt_mtp_cache])
+                else:
+                    model_forward(chunk, cache=prompt_cache)
+                    mx.eval([entry.state for entry in prompt_cache])
+                processed += count
+                progress(processed, total)
+                mx.clear_cache()
             current = prompt[processed:]
             if use_mtp:
                 logits, endpoint_hidden = native_mtp.trunk_forward(
                     current[None], prompt_cache)
             else:
-                logits = self.model(current[None], cache=prompt_cache)
+                logits = model_forward(current[None], cache=prompt_cache)
                 endpoint_hidden = None
             raw_values = logits[:, -1, :].reshape(-1)
             # Materialize the raw endpoint distribution, exact trunk hidden,
@@ -686,7 +823,7 @@ class ResidentMLXLMEngine:
             raw_values = None
             for position, catchup in enumerate(
                     generated[catchup_start:], start=catchup_start + 1):
-                logits = self.model(
+                logits = model_forward(
                     mx.array([[int(catchup)]], dtype=mx.int32),
                     cache=prompt_cache)
                 raw_values = logits[:, -1, :].reshape(-1)
@@ -707,7 +844,7 @@ class ResidentMLXLMEngine:
             yield token
             current = mx.array([token], dtype=mx.int32)
             while True:
-                logits = self.model(
+                logits = model_forward(
                     current[None], cache=prompt_cache)[:, -1, :]
                 raw_values = logits.reshape(-1)
                 if on_generation_checkpoint is not None:
@@ -882,6 +1019,7 @@ class ResidentMLXLMEngine:
             self._native_mtp
             if mtp_decode_setting == "1"
             and self._native_mtp is not None
+            and self._lossy_suffix_prefill is None
             and constraint is None
             and max_tokens > 1
             else None)
@@ -952,6 +1090,11 @@ class ResidentMLXLMEngine:
                 if (native_mtp is not None and full_prefix
                         and (self.last_mtp_kv is None
                              or self._last_prompt_hidden is None)):
+                    full_prefix, full_match = 0, "miss"
+                if (self._lossy_suffix_prefill is not None
+                        and full_match == "extension"):
+                    # Different-depth caches cannot yet advance a strict
+                    # extension without recomputing the retained boundary.
                     full_prefix, full_match = 0, "miss"
                 if full_match != "exact" or self._last_prompt_logits is not None:
                     prefix_len = full_prefix
@@ -1118,7 +1261,14 @@ class ResidentMLXLMEngine:
             on_generation_checkpoint=capture_generation_checkpoint,
             on_prompt_endpoint=(
                 None if cache_match == "exact"
-                else capture_prompt_endpoint))
+                else capture_prompt_endpoint),
+            lossy_suffix_prefill=(
+                self._lossy_suffix_prefill
+                if cache_match != "exact" else None),
+            model_forward=(
+                self._qwen35_layerwise_forward
+                if self._lossy_suffix_prefill is not None
+                else self.model))
         base_execution_path = (
             "mlx_lm_prompt_exact"
             if cache_match == "exact"
@@ -1127,7 +1277,10 @@ class ResidentMLXLMEngine:
             else "mlx_lm_direct")
         execution_path = (
             f"{base_execution_path}_native_mtp"
-            if native_mtp is not None else base_execution_path)
+            if native_mtp is not None
+            else f"{base_execution_path}_lossy_suffix_prefill"
+            if self._lossy_suffix_prefill is not None
+            else base_execution_path)
 
         first_token_s = 0.0
         prefill_s = 0.0
@@ -1298,6 +1451,16 @@ class ResidentMLXLMEngine:
                     self._resident_backend_decision.estimated_metal_bytes),
                 "resident_model_load_s": self._load_s,
                 "prefill_step_size": prefill_step_size,
+                "lossy_suffix_prefill_enabled": int(
+                    self._lossy_suffix_prefill is not None),
+                "lossy_suffix_prefill_early_layers": int(
+                    self._lossy_suffix_prefill[0]
+                    if self._lossy_suffix_prefill is not None else 0),
+                "lossy_suffix_prefill_tokens": int(
+                    self._lossy_suffix_prefill[1]
+                    if self._lossy_suffix_prefill is not None else 0),
+                "prompt_state_approximate": int(
+                    self._lossy_suffix_prefill is not None),
                 "request_incremental_projection_bytes": incremental_bytes,
                 "request_system_available_bytes": current_available,
                 "request_system_required_bytes": required_available,

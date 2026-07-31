@@ -13,9 +13,11 @@ import pytest
 
 from runtime.resident_mlx_lm import (
     ResidentBackendDecision,
+    ResidentMLXLMEngine,
     _exact_extension_prefix,
     _exact_prompt_cache_match,
     _fork_prompt_cache,
+    _parse_lossy_suffix_prefill,
     _prompt_cache_nbytes,
     _qwen35_request_incremental_bytes,
     _unique_retained_array_bytes,
@@ -119,6 +121,141 @@ def test_optional_mlx_lm_import_uses_pinned_transformers_compat():
         pytest.skip("optional mlx-lm dependency is not installed")
     module = import_mlx_lm()
     assert module.__name__ == "mlx_lm"
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        (None, None),
+        ("", None),
+        ("off", None),
+        ("0", None),
+        ("8:384", (8, 384)),
+    ],
+)
+def test_lossy_suffix_prefill_schedule_is_explicit(raw, expected):
+    assert _parse_lossy_suffix_prefill(raw) == expected
+
+
+@pytest.mark.parametrize("raw", ["8", "8:384:2", "x:384", "0:384", "8:0"])
+def test_lossy_suffix_prefill_schedule_rejects_invalid_values(raw):
+    with pytest.raises(ValueError, match="LOSSY_SUFFIX_PREFILL"):
+        _parse_lossy_suffix_prefill(raw)
+
+
+def test_layerwise_qwen_forward_uses_each_hybrid_cache_for_its_mask(
+    monkeypatch,
+):
+    mask_calls = []
+
+    class FakeBase:
+        @staticmethod
+        def create_ssm_mask(hidden, cache):
+            mask_calls.append(("ssm", cache))
+            return None
+
+        @staticmethod
+        def create_attention_mask(hidden, cache):
+            mask_calls.append(("attention", cache))
+            return None
+
+    class FakeLayer:
+        def __init__(self, is_linear):
+            self.is_linear = is_linear
+
+        def __call__(self, hidden, mask, cache):
+            assert mask is None
+            return hidden
+
+    layers = [FakeLayer(True), FakeLayer(False), FakeLayer(True)]
+    core = SimpleNamespace(
+        layers=layers,
+        embed_tokens=lambda inputs: mx.ones(
+            (*inputs.shape, 2), dtype=mx.float32),
+        norm=lambda hidden: hidden,
+    )
+    text_model = SimpleNamespace(
+        model=core,
+        args=SimpleNamespace(tie_word_embeddings=False),
+        lm_head=lambda hidden: hidden,
+    )
+    engine = object.__new__(ResidentMLXLMEngine)
+    engine.model = SimpleNamespace(language_model=text_model)
+    monkeypatch.setattr(
+        "runtime.resident_mlx_lm.importlib.import_module",
+        lambda _name: FakeBase)
+    caches = [object(), object(), object()]
+
+    logits = engine._qwen35_layerwise_forward(
+        mx.array([[1]], dtype=mx.int32), caches)
+    mx.eval(logits)
+
+    assert mask_calls == [
+        ("ssm", caches[0]),
+        ("attention", caches[1]),
+        ("ssm", caches[2]),
+    ]
+    assert logits.shape == (1, 1, 2)
+
+
+def test_lossy_suffix_prefill_runs_full_shallow_chunks_and_one_deep_suffix(
+    monkeypatch,
+):
+    class FakeBase:
+        @staticmethod
+        def create_ssm_mask(_hidden, _cache):
+            return None
+
+        create_attention_mask = create_ssm_mask
+
+    class FakeCache:
+        state = [mx.zeros((1,), dtype=mx.float32)]
+
+    class FakeLayer:
+        is_linear = True
+
+        def __init__(self):
+            self.lengths = []
+
+        def __call__(self, hidden, mask, cache):
+            assert mask is None
+            self.lengths.append(hidden.shape[1])
+            return hidden + 1
+
+    layers = [FakeLayer() for _ in range(4)]
+    core = SimpleNamespace(
+        layers=layers,
+        embed_tokens=lambda inputs: inputs[..., None].astype(mx.float32),
+        norm=lambda hidden: hidden,
+    )
+    text_model = SimpleNamespace(
+        model=core,
+        args=SimpleNamespace(tie_word_embeddings=False),
+        lm_head=lambda hidden: hidden,
+    )
+    engine = object.__new__(ResidentMLXLMEngine)
+    engine.model = SimpleNamespace(language_model=text_model)
+    monkeypatch.setattr(
+        "runtime.resident_mlx_lm.importlib.import_module",
+        lambda _name: FakeBase)
+    progress = []
+
+    logits = engine._qwen35_lossy_suffix_prefill(
+        mx.array([1, 2, 3, 4, 5], dtype=mx.int32),
+        [FakeCache() for _ in layers],
+        early_layers=2,
+        suffix_tokens=2,
+        prefill_step_size=2,
+        progress=lambda done, total: progress.append((done, total)),
+    )
+    mx.eval(logits)
+
+    assert layers[0].lengths == [2, 2, 1]
+    assert layers[1].lengths == [2, 2, 1]
+    assert layers[2].lengths == [2]
+    assert layers[3].lengths == [2]
+    assert progress == [(2, 5), (4, 5), (5, 5)]
+    assert logits.shape == (1,)
 
 
 def test_decision_shape_is_stable_for_server_telemetry():

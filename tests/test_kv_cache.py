@@ -39,6 +39,24 @@ def test_short_decode_uses_exact_length_concatenation():
     assert values.flatten().tolist() == [1001, 1002, 1003, 1004]
 
 
+def test_per_layer_lengths_restore_mixed_depth_speculative_tail():
+    cache = KVCache(3)
+    cache.update(0, *_kv(range(10)))
+    cache.update(2, *_kv(range(4)))
+    checkpoint = cache.layer_lengths()
+    assert checkpoint == (10, 0, 4)
+
+    cache.update(0, *_kv([10, 11, 12]))
+    cache.update(2, *_kv([4, 5, 6]))
+    cache.trim_layer_lengths((12, 0, 6))
+    mx.eval(cache.keys[0], cache.keys[2])
+
+    assert cache.layer_lengths() == (12, 0, 6)
+    assert cache.offset == 12
+    assert cache.keys[0].reshape(-1).tolist() == list(range(12))
+    assert cache.keys[2].reshape(-1).tolist() == list(range(6))
+
+
 def test_crossing_capacity_preserves_prefix_exactly():
     cache = SteppedKVCache(1)
     first = list(range(cache.step))

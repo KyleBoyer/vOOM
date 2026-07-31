@@ -17,6 +17,7 @@ __pycache__/
 
 # Machine-local config (NAS/storage paths); see voom.local.example.yaml
 voom.local.yaml
+profiles.local/
 
 # Research journal / in-progress investigation notes -- not the shipped
 # runtime. See README.md for the curated, public-facing docs.

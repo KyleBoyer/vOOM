@@ -183,7 +183,10 @@ def _safe_selection(value) -> dict:
 
 
 def _summary(response: dict, *, wall_s: float, events: list[str],
-             progress: list[dict], deltas: list[str]) -> dict:
+             progress: list[dict], deltas: list[str],
+             expected_function_arguments: dict | None = None,
+             expected_positive_function_arguments: tuple[str, ...] = (),
+             expected_nonempty_function_arguments: tuple[str, ...] = ()) -> dict:
     output = response.get("output") or []
     stable_output = []
     for item in output:
@@ -204,6 +207,46 @@ def _summary(response: dict, *, wall_s: float, events: list[str],
     ).encode("utf-8")
     delta_sizes = [len(delta.encode("utf-8")) for delta in deltas]
     final_output_text = response.get("output_text", "")
+    parsed_function_arguments = []
+    for item in output:
+        if not isinstance(item, dict) or item.get("type") != "function_call":
+            continue
+        try:
+            arguments = json.loads(item.get("arguments") or "{}")
+        except (TypeError, ValueError):
+            continue
+        if isinstance(arguments, dict):
+            parsed_function_arguments.append(arguments)
+    argument_match = (
+        None if expected_function_arguments is None else any(
+            all(arguments.get(key) == value
+                for key, value in expected_function_arguments.items())
+            for arguments in parsed_function_arguments)
+    )
+    positive_argument_match = (
+        None if not expected_positive_function_arguments else any(
+            all(
+                isinstance(arguments.get(key), (int, float))
+                and not isinstance(arguments.get(key), bool)
+                and arguments[key] > 0
+                for key in expected_positive_function_arguments
+            )
+            for arguments in parsed_function_arguments)
+    )
+    nonempty_argument_match = (
+        None if not expected_nonempty_function_arguments else any(
+            all(
+                arguments.get(key) is not None
+                and not isinstance(arguments.get(key), bool)
+                and (
+                    arguments[key] > 0
+                    if isinstance(arguments[key], (int, float))
+                    else bool(arguments[key])
+                )
+                for key in expected_nonempty_function_arguments
+            )
+            for arguments in parsed_function_arguments)
+    )
     return {
         "http_status": 200,
         "response_status": response.get("status"),
@@ -217,6 +260,13 @@ def _summary(response: dict, *, wall_s: float, events: list[str],
         "backend_admission": response.get("vmodel_backend_admission"),
         "checkpoint": response.get("vmodel_checkpoint"),
         "weight_profile": response.get("vmodel_weight_profile"),
+        "runtime_profiles": response.get("vmodel_runtime_profiles"),
+        "runtime_profile_groups": response.get("vmodel_runtime_profile_groups"),
+        "runtime_profile_digest": response.get("vmodel_runtime_profile_digest"),
+        "runtime_effective_digest": response.get(
+            "vmodel_runtime_effective_digest"),
+        "runtime_profile_overrides": response.get(
+            "vmodel_runtime_profile_overrides"),
         "max_output_tokens": response.get("vmodel_max_output_tokens"),
         "output_budget_source": response.get("vmodel_output_budget_source"),
         "tool_selection": _safe_selection(response.get("vmodel_tool_selection")),
@@ -224,6 +274,11 @@ def _summary(response: dict, *, wall_s: float, events: list[str],
         "function_call_names": [
             item.get("name") for item in output
             if isinstance(item, dict) and item.get("type") == "function_call"],
+        # Boolean-only semantic witness: expected values are operator-supplied
+        # and the private response arguments remain absent from the artifact.
+        "function_call_arguments_match": argument_match,
+        "function_call_positive_arguments_match": positive_argument_match,
+        "function_call_nonempty_arguments_match": nonempty_argument_match,
         "output_sha256": hashlib.sha256(private_output).hexdigest(),
         "output_bytes": len(private_output),
         "sse_event_types": events,
@@ -242,7 +297,11 @@ def _summary(response: dict, *, wall_s: float, events: list[str],
     }
 
 
-def _post(url: str, payload: bytes, timeout: float, stream: bool) -> dict:
+def _post(
+        url: str, payload: bytes, timeout: float, stream: bool,
+        expected_function_arguments: dict | None = None,
+        expected_positive_function_arguments: tuple[str, ...] = (),
+        expected_nonempty_function_arguments: tuple[str, ...] = ()) -> dict:
     request = urllib.request.Request(
         url, data=payload, headers={"Content-Type": "application/json"},
         method="POST")
@@ -328,7 +387,12 @@ def _post(url: str, payload: bytes, timeout: float, stream: bool) -> dict:
         }
     return _summary(
         response_value, wall_s=time.perf_counter() - started,
-        events=events, progress=progress, deltas=deltas)
+        events=events, progress=progress, deltas=deltas,
+        expected_function_arguments=expected_function_arguments,
+        expected_positive_function_arguments=(
+            expected_positive_function_arguments),
+        expected_nonempty_function_arguments=(
+            expected_nonempty_function_arguments))
 
 
 def _write(path: Path | None, value: dict) -> None:
@@ -455,7 +519,28 @@ def main() -> int:
     parser.add_argument("--expected-execution-outcome")
     parser.add_argument("--expected-min-output-tokens", type=int)
     parser.add_argument("--expected-function-call-name")
+    parser.add_argument(
+        "--expected-function-arguments-json",
+        help=(
+            "require at least one function call to contain this JSON-object "
+            "subset; only a boolean match witness is persisted"))
+    parser.add_argument(
+        "--expected-positive-function-argument", action="append", default=[],
+        help=(
+            "require these argument names to have positive numeric values in "
+            "one function call; only a boolean match witness is persisted"))
+    parser.add_argument(
+        "--expected-nonempty-function-argument", action="append", default=[],
+        help=(
+            "require these argument names to have nonempty values in one "
+            "function call; only a boolean match witness is persisted"))
     parser.add_argument("--expected-backend")
+    parser.add_argument(
+        "--expected-runtime-profile", action="append", default=[])
+    parser.add_argument(
+        "--expected-runtime-profile-group", action="append", default=[])
+    parser.add_argument(
+        "--expected-no-runtime-profile-overrides", action="store_true")
     parser.add_argument("--expected-max-first-wall-seconds", type=float)
     parser.add_argument("--expected-max-repeat-wall-seconds", type=float)
     parser.add_argument("--expected-first-cache-source")
@@ -493,6 +578,17 @@ def main() -> int:
         parser.error("repeats, max-output-tokens, and timeout must be positive")
     if args.temperature is not None and args.temperature < 0:
         parser.error("temperature must be non-negative")
+    expected_function_arguments = None
+    if args.expected_function_arguments_json is not None:
+        try:
+            expected_function_arguments = json.loads(
+                args.expected_function_arguments_json)
+        except ValueError as error:
+            parser.error(
+                f"expected-function-arguments-json is invalid: {error}")
+        if not isinstance(expected_function_arguments, dict):
+            parser.error(
+                "expected-function-arguments-json must decode to an object")
     if args.stream and args.preserve_stream:
         parser.error("stream and preserve-stream are mutually exclusive")
     if (args.expected_min_output_tokens is not None
@@ -642,7 +738,13 @@ def main() -> int:
     failures = []
     for index, (label, payload) in enumerate(payloads):
         before = _pressure()
-        row = _post(args.url, payload, args.timeout, request_stream)
+        row = _post(
+            args.url, payload, args.timeout, request_stream,
+            expected_function_arguments=expected_function_arguments,
+            expected_positive_function_arguments=tuple(
+                args.expected_positive_function_argument),
+            expected_nonempty_function_arguments=tuple(
+                args.expected_nonempty_function_argument))
         after = _pressure()
         row["repeat"] = index + 1
         row["request_label"] = label
@@ -717,11 +819,61 @@ def main() -> int:
             failures.append(
                 f"repeat {index + 1}: function calls {function_names!r} do not "
                 f"include {args.expected_function_call_name!r}")
+        if (
+            expected_function_arguments is not None
+            and row.get("function_call_arguments_match") is not True
+        ):
+            failures.append(
+                f"repeat {index + 1}: function arguments did not contain "
+                "the expected subset")
+        if (
+            args.expected_positive_function_argument
+            and row.get("function_call_positive_arguments_match") is not True
+        ):
+            failures.append(
+                f"repeat {index + 1}: function arguments did not contain "
+                "the expected positive numeric fields")
+        if (
+            args.expected_nonempty_function_argument
+            and row.get("function_call_nonempty_arguments_match") is not True
+        ):
+            failures.append(
+                f"repeat {index + 1}: function arguments did not contain "
+                "the expected nonempty fields")
         if (args.expected_backend is not None
                 and row.get("backend") != args.expected_backend):
             failures.append(
                 f"repeat {index + 1}: backend {row.get('backend')!r}, "
                 f"expected {args.expected_backend!r}")
+        if (args.expected_runtime_profile
+                and row.get("runtime_profiles")
+                != args.expected_runtime_profile):
+            failures.append(
+                f"repeat {index + 1}: runtime profiles "
+                f"{row.get('runtime_profiles')!r}, expected "
+                f"{args.expected_runtime_profile!r}")
+        if (args.expected_runtime_profile_group
+                and row.get("runtime_profile_groups")
+                != args.expected_runtime_profile_group):
+            failures.append(
+                f"repeat {index + 1}: runtime profile groups "
+                f"{row.get('runtime_profile_groups')!r}, expected "
+                f"{args.expected_runtime_profile_group!r}")
+        if (args.expected_no_runtime_profile_overrides
+                and row.get("runtime_profile_overrides") not in (None, [])):
+            failures.append(
+                f"repeat {index + 1}: unexpected runtime profile overrides "
+                f"{row.get('runtime_profile_overrides')!r}")
+        for digest_name in (
+            "runtime_profile_digest", "runtime_effective_digest",
+        ):
+            if args.expected_runtime_profile:
+                digest = row.get(digest_name)
+                if (not isinstance(digest, str) or len(digest) != 64
+                        or any(char not in "0123456789abcdef" for char in digest)):
+                    failures.append(
+                        f"repeat {index + 1}: invalid {digest_name} "
+                        f"{digest!r}")
         wall_s = float(row.get("wall_seconds", float("inf")))
         if (index == 0
                 and args.expected_max_first_wall_seconds is not None
@@ -842,6 +994,10 @@ def main() -> int:
             "max_peak_metal_gb": args.expected_max_peak_metal_gb,
             "function_call_name": args.expected_function_call_name,
             "backend": args.expected_backend,
+            "runtime_profiles": args.expected_runtime_profile,
+            "runtime_profile_groups": args.expected_runtime_profile_group,
+            "no_runtime_profile_overrides": (
+                args.expected_no_runtime_profile_overrides),
             "gateway_real_tool_required": (
                 args.expected_gateway_real_tool_required),
         },

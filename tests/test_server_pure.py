@@ -60,6 +60,7 @@ from runtime.server import (Handler, INFER_LOCK, PreparedPrompt, PriorityLock, R
                             _grammar_jump_forward_policy,
                             _has_own_method,
                             _qwen_chunked_delta_policy,
+                            _qwen_lossy_suffix_prefill_policy,
                             _speculative_draft_for,
                             _request_reasoning_controls, _request_sampling,
                             _registry,
@@ -1180,6 +1181,38 @@ def test_qwen_chunked_delta_auto_is_lossy_only_and_overridable():
     ) == (False, "unsupported-architecture")
 
 
+def test_qwen_lossy_suffix_prefill_is_explicit_fixed_and_hybrid_safe():
+    layer_types = [
+        "linear_attention", "linear_attention", "linear_attention",
+        "full_attention",
+    ] * 10
+    assert _qwen_lossy_suffix_prefill_policy(
+        "", mode="fast", total_layers=40, layer_types=layer_types,
+    ) == (0, 0, 0)
+    assert _qwen_lossy_suffix_prefill_policy(
+        "4:128", mode="fast", total_layers=40, layer_types=layer_types,
+    ) == (4, 0, 128)
+    assert _qwen_lossy_suffix_prefill_policy(
+        "8:256:128", mode="fast", total_layers=40,
+        layer_types=layer_types,
+    ) == (8, 256, 128)
+    with pytest.raises(ValueError, match="PREFIX_TOKENS"):
+        _qwen_lossy_suffix_prefill_policy(
+            "8:-1:128", mode="fast", total_layers=40,
+            layer_types=layer_types)
+    with pytest.raises(ValueError, match="lossy fast mode"):
+        _qwen_lossy_suffix_prefill_policy(
+            "4:128", mode="lossless", total_layers=40,
+            layer_types=layer_types)
+    with pytest.raises(ValueError, match="first full-attention"):
+        _qwen_lossy_suffix_prefill_policy(
+            "3:128", mode="fast", total_layers=40,
+            layer_types=layer_types)
+    with pytest.raises(ValueError, match="EARLY_LAYERS:SUFFIX_TOKENS"):
+        _qwen_lossy_suffix_prefill_policy(
+            "4", mode="fast", total_layers=40, layer_types=layer_types)
+
+
 def test_grammar_jump_forward_auto_is_disabled_pending_validation():
     # 2026-07-26 correction: this used to default-enable for every lossy
     # fast-mode request. That reproduces a real measured correctness risk
@@ -1588,6 +1621,10 @@ def test_k3_long_context_math_candidates_are_explicit_and_forwarded():
             "VMODEL_K3_FUSED_ATTNRES_TILE_SIZE": "128",
             "VMODEL_K3_DENSE_MLP_TILE_SIZE": "256",
             "VMODEL_K3_PREFILL_TILE_WIDTH": "256",
+            "VMODEL_K3_PREFILL_TILE_POLICY": "prompt-length",
+            "VMODEL_K3_PREFILL_LONG_CONTEXT_TOKENS": "384",
+            "VMODEL_K3_PREFILL_SHORT_TILE_WIDTH": "2",
+            "VMODEL_K3_DENSE_MLP_SHORT_TILE_SIZE": "8",
         },
         clear=True,
     ), patch(
@@ -1607,6 +1644,10 @@ def test_k3_long_context_math_candidates_are_explicit_and_forwarded():
     assert rc.kimi_k3_fused_attnres_tile_size == 128
     assert rc.kimi_k3_dense_mlp_tile_size == 256
     assert rc.prefill_chunk_size == 256
+    assert rc.kimi_k3_prefill_tile_policy == "prompt-length"
+    assert rc.kimi_k3_prefill_long_context_tokens == 384
+    assert rc.kimi_k3_prefill_short_tile_width == 2
+    assert rc.kimi_k3_dense_mlp_short_tile_size == 8
 
 
 def test_k3_suffix_verification_is_explicit_and_bounded():
@@ -1885,6 +1926,47 @@ def test_hybrid_prefill_chunk_size_ladder_reinstated_for_per_conversation_use():
     assert hybrid_prefill_chunk_size(500_000_000) == 8
     assert hybrid_prefill_chunk_size(499_999_999) == 1
     assert hybrid_prefill_chunk_size(0) == 1
+
+
+def test_k3_prompt_prefill_schedule_uses_only_token_boundary():
+    from runtime.engine import (
+        kimi_k3_prefill_schedule_compatible,
+        kimi_k3_prompt_prefill_schedule,
+    )
+
+    settings = {
+        "policy": "prompt-length",
+        "long_context_tokens": 256,
+        "short_tile_width": 256,
+        "long_tile_width": 256,
+        "short_dense_mlp_tile_size": 0,
+        "long_dense_mlp_tile_size": 256,
+    }
+    assert kimi_k3_prompt_prefill_schedule(255, **settings) == (
+        256, 0, "short")
+    assert kimi_k3_prompt_prefill_schedule(256, **settings) == (
+        256, 256, "long")
+    assert kimi_k3_prompt_prefill_schedule(
+        1,
+        policy="fixed",
+        long_context_tokens=256,
+        short_tile_width=1,
+        long_tile_width=128,
+        short_dense_mlp_tile_size=0,
+        long_dense_mlp_tile_size=64,
+    ) == (128, 64, "fixed")
+    assert kimi_k3_prefill_schedule_compatible(
+        policy="prompt-length",
+        active_schedule="short:prefill=256:dense=0",
+        cached_schedule="short:prefill=256:dense=0",
+    )
+    assert not kimi_k3_prefill_schedule_compatible(
+        policy="prompt-length",
+        active_schedule="long:prefill=256:dense=256",
+        cached_schedule="short:prefill=256:dense=0",
+    )
+    assert kimi_k3_prefill_schedule_compatible(
+        policy="fixed", active_schedule="fixed:new", cached_schedule="")
 
 
 def test_hybrid_prefill_chunk_size_model_scale_no_longer_changes_the_ceiling():

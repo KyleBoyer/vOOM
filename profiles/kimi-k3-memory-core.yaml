@@ -1,0 +1,12 @@
+schema: voom.runtime-profile.v1
+name: kimi-k3-memory-core
+description: Exact compressed/absorbed MLA and fused tiled AttnRes for Kimi K3.
+notes:
+  - These operations are architecture-only and preserve the released model math; they inspect no prompt text, subject, tool, route, or message shape.
+  - Prefill and dense-MLP tile sizes intentionally live in separate short, long, and adaptive scheduling profiles.
+  - The complete captured long request has not yet cleared the 8.5 GB Metal gate, so this remains explicit and default-off.
+settings:
+  VMODEL_K3_COMPRESSED_MLA: true
+  VMODEL_K3_ABSORBED_MLA: true
+  VMODEL_K3_MLA_KEY_TILE_SIZE: 2048
+  VMODEL_K3_FUSED_ATTNRES_TILE_SIZE: 128
