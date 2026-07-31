@@ -74,3 +74,25 @@ def test_shard_tree_is_stopped_on_net_swap_growth(monkeypatch, tmp_path):
     assert returncode == 2
     assert "swap occupancy" in refusal
     assert stopped == [proc]
+
+
+def test_shard_tree_is_stopped_on_timeout(monkeypatch, tmp_path):
+    proc = FakeProcess(None)
+    stopped = []
+    monotonic = iter((10.0, 12.1))
+    monkeypatch.setattr(runner.time, "monotonic", lambda: next(monotonic))
+    monkeypatch.setattr(
+        runner.psutil, "virtual_memory",
+        lambda: SimpleNamespace(available=int(8e9)))
+    monkeypatch.setattr(
+        runner.psutil, "swap_memory", lambda: SimpleNamespace(used=100))
+    monkeypatch.setattr(runner, "_stop_process_group", stopped.append)
+    monkeypatch.setattr(runner.subprocess, "Popen", lambda *a, **k: proc)
+
+    returncode, refusal = runner._run_shard(
+        ["pytest"], tmp_path, {}, int(4e9), int(16e6),
+        timeout_seconds=2.0)
+
+    assert returncode == 2
+    assert refusal == "shard exceeded 2 seconds"
+    assert stopped == [proc]

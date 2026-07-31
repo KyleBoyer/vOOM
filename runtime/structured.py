@@ -8,6 +8,7 @@ instance validation uses the schema's declared draft through ``jsonschema``.
 
 from __future__ import annotations
 
+import os
 import re
 from copy import deepcopy
 from dataclasses import dataclass
@@ -245,7 +246,12 @@ def _compiler(engine):
         info = xgr.TokenizerInfo.from_huggingface(
             tokenizer, vocab_size=int(engine.cfg.vocab_size),
             stop_token_ids=list(engine.cfg.eos_token_ids))
-        compiler = xgr.GrammarCompiler(info, max_threads=4, cache_enabled=True)
+        max_threads = int(os.environ.get("VMODEL_XGRAMMAR_MAX_THREADS", "4"))
+        if not 1 <= max_threads <= 64:
+            raise ValueError(
+                "VMODEL_XGRAMMAR_MAX_THREADS must be between 1 and 64")
+        compiler = xgr.GrammarCompiler(
+            info, max_threads=max_threads, cache_enabled=True)
     except Exception as error:
         raise StructuredDecodingUnavailable(
             f"could not initialize constrained decoder: {error}") from error

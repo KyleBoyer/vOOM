@@ -103,7 +103,7 @@ def _stop_server(proc):
 def _start_server():
     proc = subprocess.Popen(
         [sys.executable, "-m", "runtime.server", "--port", str(PORT)],
-        cwd=str(ROOT), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+        cwd=str(ROOT), stderr=subprocess.STDOUT, text=True,
     )
     # 2026-07-20: every caller does `proc = _start_server(); try: ... finally:
     # _stop_server(proc)`, but that try/finally only wraps code AFTER this

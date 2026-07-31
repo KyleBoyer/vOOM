@@ -58,9 +58,11 @@ def _run_shard(
     env: dict[str, str],
     min_available_bytes: int,
     max_swap_growth_bytes: int,
+    timeout_seconds: float = 0,
 ) -> tuple[int, str | None]:
     """Run one module and terminate its whole tree if RAM crosses the floor."""
     initial_swap_used = int(psutil.swap_memory().used)
+    started = time.monotonic()
     proc = subprocess.Popen(
         command,
         cwd=repo,
@@ -69,6 +71,10 @@ def _run_shard(
     )
     try:
         while proc.poll() is None:
+            if (timeout_seconds > 0
+                    and time.monotonic() - started > timeout_seconds):
+                _stop_process_group(proc)
+                return 2, f"shard exceeded {timeout_seconds:g} seconds"
             available = psutil.virtual_memory().available
             if available < min_available_bytes:
                 _stop_process_group(proc)
@@ -91,12 +97,15 @@ def main() -> int:
     parser.add_argument("--min-available-gb", type=float, default=4.0)
     parser.add_argument("--max-swap-growth-mb", type=float, default=16.0)
     parser.add_argument("--headroom-timeout-seconds", type=float, default=60.0)
+    parser.add_argument(
+        "--shard-timeout-seconds", type=float, default=0,
+        help="terminate a shard after this many seconds; 0 disables")
     parser.add_argument("--pytest-arg", action="append", default=[])
     args = parser.parse_args()
     if args.min_available_gb < 0 or args.max_swap_growth_mb < 0:
         parser.error("memory thresholds must be nonnegative")
-    if args.headroom_timeout_seconds < 0:
-        parser.error("headroom timeout must be nonnegative")
+    if args.headroom_timeout_seconds < 0 or args.shard_timeout_seconds < 0:
+        parser.error("headroom and shard timeouts must be nonnegative")
 
     repo = Path(__file__).resolve().parents[1]
     modules = _test_modules(repo, args.paths)
@@ -123,6 +132,7 @@ def main() -> int:
             env,
             min_available,
             max_swap_growth,
+            args.shard_timeout_seconds,
         )
         if refusal is not None:
             print(

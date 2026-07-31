@@ -41,7 +41,7 @@ def _wait_for_server(proc, timeout=30):
 def _start_server():
     proc = subprocess.Popen(
         [sys.executable, "-m", "runtime.server", "--port", str(PORT)],
-        cwd=str(ROOT), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+        cwd=str(ROOT), stderr=subprocess.STDOUT, text=True,
     )
     # 2026-07-20: _wait_for_server raising (a slow model load past its 30s
     # readiness timeout, or the process exiting early) propagated out of

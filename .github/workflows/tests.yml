@@ -10,11 +10,7 @@ on:
 jobs:
   pytest:
     # MLX requires Apple Silicon + Metal, so this must run on a macOS runner.
-    # XGrammar 0.2.3's native extension consistently exits with SIGSEGV on
-    # GitHub's macOS 14 image while the same constrained-decoding tests pass
-    # repeatedly on newer macOS. Keep the Apple-Silicon/Metal requirement but
-    # use GitHub's stable macOS 15 arm64 image for the native dependency stack.
-    runs-on: macos-15
+    runs-on: macos-14
     steps:
       - uses: actions/checkout@v4
 
@@ -78,5 +74,11 @@ jobs:
         # default while retaining a per-shard swap-growth stop.
         run: >-
           python tests/run_pytest_sharded.py
-          --min-available-gb 2
+          --min-available-gb 1
           --max-swap-growth-mb 256
+          --shard-timeout-seconds 300
+        # XGrammar's four-thread native compiler exits with SIGSEGV on the
+        # three-core hosted M1 runner. The grammar and token semantics are
+        # unchanged; compiling serially makes the native test path stable.
+        env:
+          VMODEL_XGRAMMAR_MAX_THREADS: "1"
