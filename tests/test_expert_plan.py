@@ -261,6 +261,7 @@ def test_route_recording_only_schedules_explicit_predictive_prefetch():
         rc=SimpleNamespace(
             expert_predictive_prefetch=False,
             expert_prefetch_idle_only=True,
+            expert_route_overlap_telemetry=False,
         ),
         cfg=SimpleNamespace(
             num_experts_per_tok=2,

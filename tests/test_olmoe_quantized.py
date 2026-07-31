@@ -104,7 +104,10 @@ def test_runtime_top_k_schedule_defaults_exact_and_supports_qwen_moe():
         _apply_runtime_expert_top_k(
             RuntimeConfig(expert_top_k_by_layer=(7,)), dense)
     except ValueError as error:
-        assert "only for OLMoE and Qwen3.5/3.6 MoE" in str(error)
+        assert (
+            "only for OLMoE, Qwen3.5/3.6 MoE, and Kimi K3"
+            in str(error)
+        )
     else:
         raise AssertionError("a non-OLMoE schedule was accepted")
 

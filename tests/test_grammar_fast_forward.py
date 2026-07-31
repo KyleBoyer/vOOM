@@ -27,6 +27,8 @@ from runtime.structured import GrammarConstraint
 
 _REAL_MODEL_DIR = (
     Path(__file__).resolve().parent.parent / "models" / "Qwen3.5-4B")
+_COMPILER_MODEL_DIR = (
+    Path(__file__).resolve().parent.parent / "models" / "SmolLM2-135M")
 _skip = pytest.mark.skipif(
     not _REAL_MODEL_DIR.exists(),
     reason="real Qwen3.5-4B checkpoint not present on this machine")
@@ -59,8 +61,8 @@ def _fake_engine():
     needs only _model_dir + cfg.vocab_size/eos_token_ids (tokenizer files,
     no weights)."""
     return SimpleNamespace(
-        _model_dir=_REAL_MODEL_DIR,
-        cfg=SimpleNamespace(vocab_size=248320, eos_token_ids=[248044]),
+        _model_dir=_COMPILER_MODEL_DIR,
+        cfg=SimpleNamespace(vocab_size=49152, eos_token_ids=[0]),
     )
 
 

@@ -20,10 +20,17 @@ from runtime.config import ModelConfig
 from runtime.kimi_linear import _route_experts
 
 
-def _tiny_k3_cfg(num_experts: int, top_k: int, expert_prune_masks=None) -> ModelConfig:
+def _tiny_k3_cfg(
+    num_experts: int,
+    top_k: int,
+    expert_prune_masks=None,
+    *,
+    num_hidden_layers: int = 1,
+) -> ModelConfig:
     return ModelConfig(
         model_type="kimi_k3", hidden_size=8, intermediate_size=16,
-        num_hidden_layers=1, num_attention_heads=1, num_key_value_heads=1,
+        num_hidden_layers=num_hidden_layers,
+        num_attention_heads=1, num_key_value_heads=1,
         vocab_size=100, rms_norm_eps=1e-5, rope_theta=10000.0,
         max_position_embeddings=64, tie_word_embeddings=False, attention_bias=False,
         head_dim=8, eos_token_ids=(), torch_dtype="float32",
@@ -85,7 +92,12 @@ def test_mask_only_applies_to_the_named_layer():
     w = _random_weights(rng, hidden, num_experts)
 
     pruned = (3,)
-    cfg = _tiny_k3_cfg(num_experts, top_k, expert_prune_masks={0: pruned})
+    cfg = _tiny_k3_cfg(
+        num_experts,
+        top_k,
+        expert_prune_masks={0: pruned},
+        num_hidden_layers=2,
+    )
     idx_layer0, _ = _route_experts(h, w, "layer0", cfg, layer=0)
     idx_layer1, _ = _route_experts(h, w, "layer0", cfg, layer=1)
     mx.eval(idx_layer0, idx_layer1)
@@ -94,7 +106,13 @@ def test_mask_only_applies_to_the_named_layer():
     # Layer 1 has no mask entry -- expert 3 remains eligible there (may or
     # may not actually be selected on this random data, but must not be
     # unconditionally excluded the way layer 0's is).
-    unmasked_idx, _ = _route_experts(h, w, "layer0", _tiny_k3_cfg(num_experts, top_k), layer=1)
+    unmasked_idx, _ = _route_experts(
+        h,
+        w,
+        "layer0",
+        _tiny_k3_cfg(num_experts, top_k, num_hidden_layers=2),
+        layer=1,
+    )
     mx.eval(unmasked_idx)
     assert np.array_equal(np.array(idx_layer1), np.array(unmasked_idx))
 
