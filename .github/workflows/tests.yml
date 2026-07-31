@@ -68,4 +68,11 @@ jobs:
         # order-dependent state leakage and eventually a Metal segfault before
         # pytest can print its failure summary. The checked-in sharder preserves
         # serial coverage while giving each module a fresh MLX process.
-        run: python tests/run_pytest_sharded.py
+        # GitHub's macos-14 image starts around 3.5 GB available after the
+        # dependency install. Its only downloaded checkpoint is SmolLM2-135M,
+        # so use a CI-specific floor instead of the 4 GB local-workstation
+        # default while retaining a per-shard swap-growth stop.
+        run: >-
+          python tests/run_pytest_sharded.py
+          --min-available-gb 1
+          --max-swap-growth-mb 256
