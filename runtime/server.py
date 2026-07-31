@@ -6117,10 +6117,24 @@ def _vision_protocol_timing(result: dict) -> dict:
         "resident_logit_chain_checkpoint_restored_tokens",
         "resident_logit_chain_retained_step_logits",
         "resident_logit_chain_retained_checkpoints",
+        "resident_persistent_prompt_cache_enabled",
+        "resident_persistent_prompt_cache_hit",
+        "resident_persistent_prompt_cache_saved",
+        "resident_persistent_prompt_cache_error",
+        "resident_persistent_prompt_cache_bytes",
+        "resident_persistent_prompt_logits_bytes",
+        "resident_persistent_generation_logits",
     )
     for key in optional_integer_fields:
         if key in stats or key in result:
             value[key] = int(metric(key) or 0)
+    optional_float_fields = (
+        "resident_persistent_prompt_cache_load_s",
+        "resident_persistent_prompt_cache_save_s",
+    )
+    for key in optional_float_fields:
+        if key in stats or key in result:
+            value[key] = float(metric(key) or 0.0)
     return value
 
 

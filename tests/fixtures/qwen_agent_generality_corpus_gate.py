@@ -43,6 +43,8 @@ def _case_command(
     max_warm_seconds: float = 60.0, gateway_phase: str | None = None,
     max_output_tokens: int | None = None,
     response_status: str | None = "completed",
+    min_available_gb: float = 3.2,
+    max_swap_growth_mb: float = 16.0,
 ) -> list[str]:
     command = [
         sys.executable, str(REPLAY), str(capture),
@@ -57,8 +59,8 @@ def _case_command(
         "--expected-max-repeat-wall-seconds", str(max_warm_seconds),
         "--expected-first-cache-source", first_cache_source,
         "--expected-max-peak-metal-gb", "8.5",
-        "--min-available-gb", "3.2",
-        "--max-swap-growth-mb", "16",
+        "--min-available-gb", str(min_available_gb),
+        "--max-swap-growth-mb", str(max_swap_growth_mb),
         "--result-json", str(result),
     ]
     if max_output_tokens is None:
@@ -101,18 +103,40 @@ def main() -> int:
     parser.add_argument("--model", required=True)
     parser.add_argument("--result-json", required=True, type=Path)
     parser.add_argument("--port", type=int, default=8130)
+    parser.add_argument("--min-available-gb", type=float, default=3.2)
+    parser.add_argument("--max-swap-growth-mb", type=float, default=16.0)
+    parser.add_argument("--system-reserve-mb", type=int, default=1_500)
+    parser.add_argument("--persistent-prompt-cache-dir", type=Path)
+    parser.add_argument(
+        "--persistent-prompt-cache-max-mb", type=int, default=2_000)
+    parser.add_argument(
+        "--persistent-replay", action="store_true",
+        help=(
+            "require each otherwise-cold corpus row to reload an endpoint "
+            "seeded by a prior corpus run"))
     args = parser.parse_args()
     if args.result_json.exists():
         raise SystemExit(
             f"refusing to overwrite result artifact: {args.result_json}")
     if not _port_is_free(args.port):
         raise SystemExit(f"port {args.port} is already in use")
+    if min(
+        args.system_reserve_mb,
+        args.persistent_prompt_cache_max_mb,
+        args.min_available_gb,
+        args.max_swap_growth_mb,
+    ) <= 0:
+        parser.error("reserve and persistent-cache limits must be positive")
+    if args.persistent_replay and args.persistent_prompt_cache_dir is None:
+        parser.error(
+            "--persistent-replay requires --persistent-prompt-cache-dir")
 
     server_overrides = {
         "VMODEL_RESIDENT_BACKEND": "mlx-lm",
         "VMODEL_MLX_LM_PROMPT_CACHE": "1",
         "VMODEL_MLX_LM_LOGIT_CHAIN": "1",
         "VMODEL_MLX_LM_NATIVE_MTP": "0",
+        "VMODEL_MLX_LM_SYSTEM_RESERVE_MB": str(args.system_reserve_mb),
         "VMODEL_FAST_TOOL_GATEWAY": "1",
         "VMODEL_FAST_TOOL_GATEWAY_HOST_ROUTE": "1",
         "VMODEL_FAST_TOOL_GATEWAY_ABSTAIN": "0",
@@ -120,6 +144,13 @@ def main() -> int:
         "VMODEL_FAST_TOOL_GATEWAY_QWEN_MOE_TOP_K": "released",
         "VMODEL_GRAMMAR_JUMP_FORWARD_LOSSY": "0",
     }
+    if args.persistent_prompt_cache_dir is not None:
+        server_overrides.update({
+            "VMODEL_MLX_LM_PERSISTENT_PROMPT_CACHE_DIR": str(
+                args.persistent_prompt_cache_dir),
+            "VMODEL_MLX_LM_PERSISTENT_PROMPT_CACHE_MAX_MB": str(
+                args.persistent_prompt_cache_max_mb),
+        })
     cases = [
         {
             "name": "real-direct-long-system-132-tools-stream",
@@ -255,10 +286,20 @@ def main() -> int:
             },
         },
     ]
+    if args.persistent_replay:
+        for case in cases:
+            if case["first_cache_source"] == "cold":
+                case["first_cache_source"] = "persistent-prompt-exact"
     report = {
         "schema": "voom.qwen-agent-generality-corpus.v1",
         "model_override": args.model,
         "server_environment_overrides": server_overrides,
+        "persistent_replay": args.persistent_replay,
+        "thresholds": {
+            "in_run_available_gb_at_least": args.min_available_gb,
+            "max_swap_growth_mb": args.max_swap_growth_mb,
+            "true_peak_metal_gb_strictly_below": 8.5,
+        },
         "cases": [],
         "failures": [],
         "passed": False,
@@ -292,6 +333,8 @@ def main() -> int:
             }
             command = _case_command(
                 model=args.model, port=args.port, result=child_result,
+                min_available_gb=args.min_available_gb,
+                max_swap_growth_mb=args.max_swap_growth_mb,
                 **command_args)
             code = subprocess.run(command, cwd=ROOT).returncode
             child = (
@@ -302,6 +345,22 @@ def main() -> int:
                 failure = f"replay gate exited {code}"
             elif not isinstance(child, dict) or child.get("passed") is not True:
                 failure = "replay artifact missing or failed"
+            if (failure is None
+                    and case["first_cache_source"]
+                    == "persistent-prompt-exact"):
+                first = (child.get("runs") or [{}])[0]
+                timing = first.get("timing") or {}
+                if (
+                    timing.get("resident_persistent_prompt_cache_hit") != 1
+                    or timing.get("resident_persistent_prompt_cache_error") != 0
+                    or float(timing.get(
+                        "resident_persistent_prompt_cache_load_s", 0.0)) <= 0
+                    or int(timing.get(
+                        "resident_persistent_prompt_cache_bytes", 0)) <= 0
+                ):
+                    failure = (
+                        "first request lacked a clean checksummed "
+                        "persistent-cache hit witness")
             report["cases"].append({
                 "name": case["name"],
                 "declared_shape": case["declared_shape"],

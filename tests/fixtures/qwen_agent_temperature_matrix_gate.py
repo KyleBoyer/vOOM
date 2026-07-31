@@ -133,6 +133,12 @@ def main() -> int:
     parser.add_argument("--min-cached-tokens", type=int, default=5_000)
     parser.add_argument("--min-available-gb", type=float, default=3.2)
     parser.add_argument("--max-swap-growth-mb", type=float, default=16.0)
+    parser.add_argument("--system-reserve-mb", type=int, default=1_500)
+    parser.add_argument("--persistent-prompt-cache-dir", type=Path)
+    parser.add_argument(
+        "--persistent-prompt-cache-max-mb", type=int, default=1_000)
+    parser.add_argument("--expected-first-cache-source")
+    parser.add_argument("--expected-first-output-sha256")
     args = parser.parse_args()
     try:
         temperatures = _parse_temperatures(args.temperature)
@@ -149,6 +155,7 @@ def main() -> int:
         args.request_timeout, args.server_ready_timeout,
         args.max_cold_seconds, args.max_warm_seconds,
         args.min_available_gb, args.max_swap_growth_mb,
+        args.system_reserve_mb, args.persistent_prompt_cache_max_mb,
     ) <= 0 or args.min_cached_tokens <= 0:
         parser.error("timeouts, thresholds, and safety limits must be positive")
 
@@ -157,6 +164,7 @@ def main() -> int:
         "VMODEL_MLX_LM_PROMPT_CACHE": "1",
         "VMODEL_MLX_LM_LOGIT_CHAIN": "1",
         "VMODEL_MLX_LM_NATIVE_MTP": "0",
+        "VMODEL_MLX_LM_SYSTEM_RESERVE_MB": str(args.system_reserve_mb),
         "VMODEL_FAST_TOOL_GATEWAY": "1",
         "VMODEL_FAST_TOOL_GATEWAY_HOST_ROUTE": "1",
         "VMODEL_FAST_TOOL_GATEWAY_ABSTAIN": "0",
@@ -164,6 +172,13 @@ def main() -> int:
         "VMODEL_FAST_TOOL_GATEWAY_QWEN_MOE_TOP_K": "released",
         "VMODEL_GRAMMAR_JUMP_FORWARD_LOSSY": "0",
     }
+    if args.persistent_prompt_cache_dir is not None:
+        server_overrides.update({
+            "VMODEL_MLX_LM_PERSISTENT_PROMPT_CACHE_DIR": str(
+                args.persistent_prompt_cache_dir),
+            "VMODEL_MLX_LM_PERSISTENT_PROMPT_CACHE_MAX_MB": str(
+                args.persistent_prompt_cache_max_mb),
+        })
     report = {
         "schema": "voom.qwen-agent-temperature-matrix.v1",
         "capture_path": str(args.capture),
@@ -182,9 +197,13 @@ def main() -> int:
         "thresholds": {
             "cold_wall_seconds_strictly_below": args.max_cold_seconds,
             "warm_wall_seconds_strictly_below": args.max_warm_seconds,
+            "first_cache_source": args.expected_first_cache_source,
+            "first_output_sha256": args.expected_first_output_sha256,
             "repeat_cache_source": "hot-prompt-exact",
             "repeat_cached_tokens_at_least": args.min_cached_tokens,
             "true_peak_metal_gb_strictly_below": 8.5,
+            "in_run_available_gb_at_least": args.min_available_gb,
+            "max_swap_growth_mb": args.max_swap_growth_mb,
         },
         "runs": [],
         "failures": [],
@@ -276,6 +295,11 @@ def main() -> int:
                 "--max-swap-growth-mb", str(args.max_swap_growth_mb),
                 "--result-json", str(child_result),
             ]
+            if args.expected_first_cache_source is not None:
+                command.extend([
+                    "--expected-first-cache-source",
+                    args.expected_first_cache_source,
+                ])
             fixture_code = subprocess.run(command, cwd=ROOT).returncode
             if child_result.is_file():
                 fixture_report = json.loads(child_result.read_text())
@@ -289,6 +313,30 @@ def main() -> int:
             elif fixture_report.get("passed") is not True:
                 failure = (
                     f"temperature {temperature:g}: replay artifact failed")
+            if failure is None and args.expected_first_cache_source == (
+                    "persistent-prompt-exact"):
+                first = (fixture_report.get("runs") or [{}])[0]
+                timing = first.get("timing") or {}
+                if (
+                    timing.get("resident_persistent_prompt_cache_hit") != 1
+                    or timing.get("resident_persistent_prompt_cache_error") != 0
+                    or float(timing.get(
+                        "resident_persistent_prompt_cache_load_s", 0.0)) <= 0
+                    or int(timing.get(
+                        "resident_persistent_prompt_cache_bytes", 0)) <= 0
+                ):
+                    failure = (
+                        f"temperature {temperature:g}: first request lacked "
+                        "a clean checksummed persistent-cache hit witness")
+            if (failure is None
+                    and args.expected_first_output_sha256 is not None):
+                first = (fixture_report.get("runs") or [{}])[0]
+                if first.get("output_sha256") != (
+                        args.expected_first_output_sha256):
+                    failure = (
+                        f"temperature {temperature:g}: first output SHA "
+                        f"{first.get('output_sha256')!r}, expected "
+                        f"{args.expected_first_output_sha256!r}")
         except Exception as error:
             failure = (
                 f"temperature {temperature:g}: "

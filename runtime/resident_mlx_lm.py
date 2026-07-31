@@ -11,6 +11,7 @@ from __future__ import annotations
 import copy
 import gc
 import importlib
+import importlib.metadata
 import json
 import os
 import time
@@ -386,6 +387,7 @@ class ResidentMLXLMEngine:
         self._last_generation_checkpoints: tuple = ()
         self._generation_sampled_tokens = 0
         self._native_mtp = None
+        self._persistent_prompt_store = None
 
         tokenizer_path = self._model_dir / "tokenizer.json"
         if not tokenizer_path.is_file():
@@ -417,6 +419,42 @@ class ResidentMLXLMEngine:
 
             self._native_mtp = ResidentQwenMTP(
                 self.model, self._model_dir, quantization)
+        persistent_prompt_dir = os.environ.get(
+            "VMODEL_MLX_LM_PERSISTENT_PROMPT_CACHE_DIR", "").strip()
+        if persistent_prompt_dir:
+            from .kv_store import model_fingerprint
+            from .resident_prompt_store import ResidentPromptStore
+
+            persistent_max_mb = _positive_env_mb(
+                os.environ,
+                "VMODEL_MLX_LM_PERSISTENT_PROMPT_CACHE_MAX_MB",
+                4_000,
+            )
+            version = {}
+            for distribution in ("mlx", "mlx-lm"):
+                try:
+                    version[distribution] = importlib.metadata.version(
+                        distribution)
+                except importlib.metadata.PackageNotFoundError:
+                    version[distribution] = "unknown"
+            arithmetic = json.dumps({
+                "backend": "resident-mlx-lm",
+                "native_mtp_loaded": native_mtp_setting,
+                "persistent_prompt_format": "v2",
+                "versions": version,
+            }, sort_keys=True, separators=(",", ":"))
+            fingerprint = model_fingerprint(
+                self._model_dir,
+                compressed_mla=False,
+                quant=json.dumps(
+                    quantization, sort_keys=True, separators=(",", ":")),
+                arithmetic=arithmetic,
+            )
+            self._persistent_prompt_store = ResidentPromptStore(
+                persistent_prompt_dir,
+                fingerprint,
+                max_bytes=persistent_max_mb * 1_000_000,
+            )
         self._load_s = time.perf_counter() - started
         self._model_active_bytes = max(0, mx.get_active_memory() - before)
         if mx.get_active_memory() > decision.metal_ceiling_bytes:
@@ -432,6 +470,7 @@ class ResidentMLXLMEngine:
         if native_mtp is not None:
             self._native_mtp = None
             native_mtp.close()
+        self._persistent_prompt_store = None
         model = getattr(self, "model", None)
         if model is not None:
             self.model = None
@@ -800,7 +839,6 @@ class ResidentMLXLMEngine:
         if prefill_step_size <= 0:
             raise ValueError(
                 "VMODEL_MLX_LM_PREFILL_STEP_SIZE must be positive")
-
         cache_setting = os.environ.get(
             "VMODEL_MLX_LM_PROMPT_CACHE", "1")
         if cache_setting not in ("0", "1"):
@@ -847,6 +885,51 @@ class ResidentMLXLMEngine:
             and constraint is None
             and max_tokens > 1
             else None)
+        persistent_stats = {
+            "hit": 0,
+            "saved": 0,
+            "load_s": 0.0,
+            "save_s": 0.0,
+            "cache_bytes": 0,
+            "logits_bytes": 0,
+            "generation_logits": 0,
+            "error": 0,
+        }
+        persistent_store = (
+            self._persistent_prompt_store
+            if cache_setting == "1" and native_mtp is None else None)
+        in_memory_prefix, in_memory_match = _exact_prompt_cache_match(
+            self._last_cache_token_ids, prompt_ids)
+        in_memory_exact = (
+            in_memory_match == "exact"
+            and in_memory_prefix
+            and self.last_kv is not None
+            and self._last_prompt_logits is not None)
+        if persistent_store is not None and not in_memory_exact:
+            try:
+                loaded = persistent_store.load(prompt_ids)
+            except Exception:
+                # Persistence is an optional acceleration layer.  A storage
+                # or format failure must fall back to released model math.
+                loaded = None
+                persistent_stats["error"] = 1
+            if loaded is not None:
+                (
+                    loaded_cache,
+                    loaded_logits,
+                    loaded_generation_tokens,
+                    loaded_generation_logits,
+                    loaded_stats,
+                ) = loaded
+                persistent_stats.update(loaded_stats)
+                self.last_kv = loaded_cache
+                self.last_mtp_kv = None
+                self._last_cache_token_ids = tuple(prompt_ids)
+                self._last_prompt_logits = loaded_logits
+                self._last_prompt_hidden = None
+                self._last_generation_tokens = loaded_generation_tokens
+                self._last_generation_step_logits = loaded_generation_logits
+                self._last_generation_checkpoints = ()
         prefix_len = 0
         cache_match = "miss"
         matched_cache = None
@@ -939,7 +1022,10 @@ class ResidentMLXLMEngine:
                     "completed_tokens": int(done),
                     "total_tokens": int(total),
                     "cache_source": (
-                        f"hot-prompt-{cache_match}"
+                        "persistent-prompt-exact"
+                        if persistent_stats["hit"]
+                        and cache_match == "exact"
+                        else f"hot-prompt-{cache_match}"
                         if prefix_len else "cold"),
                 })
 
@@ -1100,7 +1186,6 @@ class ResidentMLXLMEngine:
             if delta:
                 on_token(delta)
 
-        total_s = time.perf_counter() - request_started
         decode_s = sum(decode_intervals)
         kv_bytes = (
             _prompt_cache_nbytes(prompt_cache)
@@ -1136,6 +1221,25 @@ class ResidentMLXLMEngine:
             self._last_generation_tokens = ()
             self._last_generation_step_logits = ()
             self._last_generation_checkpoints = ()
+        if (persistent_store is not None
+                and not persistent_stats["hit"]
+                and not in_memory_exact
+                and retained_prompt_cache is not None
+                and retained_prompt_logits is not None):
+            try:
+                saved_stats = persistent_store.save(
+                    prompt_ids,
+                    retained_prompt_cache,
+                    retained_prompt_logits,
+                    self._last_generation_tokens,
+                    self._last_generation_step_logits,
+                )
+                persistent_stats.update(saved_stats)
+            except Exception:
+                # Preserve a correct response even when the opt-in cache
+                # directory becomes unavailable or the entry is unwriteable.
+                persistent_stats["error"] = 1
+        total_s = time.perf_counter() - request_started
         true_peak = max(
             active_before, mx.get_active_memory(), mx.get_peak_memory())
         result = {
@@ -1159,8 +1263,29 @@ class ResidentMLXLMEngine:
                 "execution_path": execution_path,
                 "prompt_cache_prefix_tokens": prefix_len,
                 "prompt_cache_source": (
-                    f"hot-prompt-{cache_match}"
+                    "persistent-prompt-exact"
+                    if persistent_stats["hit"]
+                    and cache_match == "exact"
+                    else f"hot-prompt-{cache_match}"
                     if prefix_len else "cold"),
+                "resident_persistent_prompt_cache_enabled": int(
+                    persistent_store is not None),
+                "resident_persistent_prompt_cache_hit": int(
+                    persistent_stats["hit"]),
+                "resident_persistent_prompt_cache_saved": int(
+                    persistent_stats["saved"]),
+                "resident_persistent_prompt_cache_error": int(
+                    persistent_stats["error"]),
+                "resident_persistent_prompt_cache_load_s": float(
+                    persistent_stats["load_s"]),
+                "resident_persistent_prompt_cache_save_s": float(
+                    persistent_stats["save_s"]),
+                "resident_persistent_prompt_cache_bytes": int(
+                    persistent_stats["cache_bytes"]),
+                "resident_persistent_prompt_logits_bytes": int(
+                    persistent_stats["logits_bytes"]),
+                "resident_persistent_generation_logits": int(
+                    persistent_stats["generation_logits"]),
                 "retained_prompt_kv_bytes": _prompt_cache_nbytes(
                     retained_prompt_cache)
                 + _prompt_cache_nbytes(retained_prompt_mtp_cache),
