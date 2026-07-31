@@ -78,6 +78,9 @@ class SuffixDecodeStats:
     kda_endpoint_capture_rounds: int = 0
     kda_endpoint_restore_rounds: int = 0
     kda_endpoint_retained_peak_bytes: int = 0
+    kda_factor_capture_rounds: int = 0
+    kda_factor_restore_rounds: int = 0
+    kda_factor_retained_peak_bytes: int = 0
     kda_refeed_sweeps: int = 0
     kda_refeed_sweeps_saved: int = 0
 
@@ -698,12 +701,37 @@ def run_shared_prefill_suffix_decode(
             capture_bytes
             and capture_bytes <= _MAX_RETAINED_KDA_ENDPOINT_BYTES
         )
+        capture_kda_factors = bool(
+            kda_checkpoint is not None
+            and getattr(engine.cfg, "model_type", None) == "kimi_k3"
+            and callable(getattr(
+                engine, "consume_serial_kda_factors", None))
+        )
+        if capture_kda_factors:
+            # Compact sufficient statistics supersede dense endpoints for K3.
+            capture_kda_endpoints = False
+            stats.kda_factor_capture_rounds += 1
         if capture_kda_endpoints:
             stats.kda_endpoint_capture_rounds += 1
         retained_kda_bytes = 0
         try:
             verify_tokens = [catchup_tok] + draft
-            if capture_kda_endpoints:
+            if capture_kda_factors:
+                window_logits = engine.forward_tokens_serial_positions(
+                    verify_tokens,
+                    kv,
+                    capture_kda_factors=True,
+                )
+                retained_kda_bytes = int(getattr(
+                    engine,
+                    "_serial_kda_factor_retained_bytes",
+                    0,
+                ))
+                stats.kda_factor_retained_peak_bytes = max(
+                    stats.kda_factor_retained_peak_bytes,
+                    retained_kda_bytes,
+                )
+            elif capture_kda_endpoints:
                 window_logits = engine.forward_tokens_serial_positions(
                     verify_tokens,
                     kv,
@@ -738,6 +766,10 @@ def run_shared_prefill_suffix_decode(
             )
             if consume_endpoint is not None:
                 consume_endpoint(None)
+            consume_factors = getattr(
+                engine, "consume_serial_kda_factors", None)
+            if consume_factors is not None:
+                consume_factors()
             raise
         stats.sweeps += 1
 
@@ -786,13 +818,26 @@ def run_shared_prefill_suffix_decode(
                 consume_endpoint = getattr(
                     engine, "consume_serial_kda_endpoint", None
                 )
+                consume_factors = getattr(
+                    engine, "consume_serial_kda_factors", None)
+                factor_window = (
+                    consume_factors()
+                    if capture_kda_factors
+                    and consume_factors is not None
+                    else None
+                )
                 retained_endpoint = (
                     consume_endpoint(true_feed_len)
                     if capture_kda_endpoints
                     and consume_endpoint is not None
                     else None
                 )
-                if retained_endpoint is not None:
+                if factor_window is not None:
+                    kv.kda_cache = factor_window.commit_prefix(
+                        kda_checkpoint, true_feed_len)
+                    stats.kda_factor_restore_rounds += 1
+                    stats.kda_refeed_sweeps_saved += 1
+                elif retained_endpoint is not None:
                     # Ordinary MLA/KV was already trimmed to this endpoint.
                     # Install the layer-complete recurrent snapshot assembled
                     # during verification without touching target weights.
@@ -819,6 +864,10 @@ def run_shared_prefill_suffix_decode(
                 )
                 if consume_endpoint is not None:
                     consume_endpoint(None)
+                consume_factors = getattr(
+                    engine, "consume_serial_kda_factors", None)
+                if consume_factors is not None:
+                    consume_factors()
 
         from .engine import _resident_adjusted_transient
 

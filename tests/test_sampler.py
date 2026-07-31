@@ -5,7 +5,12 @@ from __future__ import annotations
 import mlx.core as mx
 import pytest
 
-from runtime.sampler import SamplingParams, sample
+from runtime.sampler import (
+    SamplingParams,
+    filtered_probabilities,
+    sample,
+    speculative_residual_probabilities,
+)
 
 
 def _scalar_remap_reference(logits, params):
@@ -126,3 +131,26 @@ def test_repetition_penalty_ignores_out_of_range_and_duplicate_ids():
     # Duplicate + out-of-vocab ids in history must not crash or double-apply.
     result = sample(logits, params, history=[0, 0, 0, 999999])
     assert result in (0, 1, 2)
+
+
+def test_filtered_probabilities_match_greedy_and_top_k_support():
+    logits = mx.array([0.0, 3.0, 2.0, 1.0])
+    greedy = filtered_probabilities(
+        logits, SamplingParams(temperature=0.0))
+    top_two = filtered_probabilities(
+        logits, SamplingParams(temperature=0.7, top_k=2))
+    mx.eval(greedy, top_two)
+
+    assert greedy.tolist() == [0.0, 1.0, 0.0, 0.0]
+    assert top_two[0].item() == 0.0
+    assert top_two[3].item() == 0.0
+    assert abs(float(mx.sum(top_two).item()) - 1.0) < 1e-6
+
+
+def test_speculative_residual_is_positive_part_and_normalized():
+    target = mx.array([0.6, 0.3, 0.1])
+    draft = mx.array([0.2, 0.5, 0.3])
+    residual = speculative_residual_probabilities(target, draft)
+    mx.eval(residual)
+
+    assert residual.tolist() == pytest.approx([1.0, 0.0, 0.0])

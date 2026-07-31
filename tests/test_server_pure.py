@@ -2814,6 +2814,65 @@ def test_engine_manager_wraps_streamed_lossless_qwen3_with_dspark(tmp_path):
     assert wrapped.target.closes == 1
 
 
+def test_engine_manager_exposes_k3_dspark_only_by_explicit_path(tmp_path):
+    from unittest.mock import patch
+
+    from runtime.server import EngineManager
+
+    target_path = tmp_path / "Kimi-K3"
+    draft_path = tmp_path / "Kimi-K3-DSpark-mxfp4"
+    target_path.mkdir()
+    draft_path.mkdir()
+    cfg = SimpleNamespace(
+        model_type="kimi_k3", tie_word_embeddings=False,
+        index_topk=0, vision_config=None, num_experts=896,
+        hidden_size=7168, intermediate_size=33792,
+        num_hidden_layers=93, num_attention_heads=64,
+        num_key_value_heads=64, head_dim=192, vocab_size=163840,
+        attention_bias=False)
+
+    class FakeEngine:
+        def __init__(self, path, rc):
+            self.path, self.rc, self.closes = Path(path), rc, 0
+            self.cache = SimpleNamespace(max_bytes=3_000_000_000)
+            self.governor = None
+
+        def close(self):
+            self.closes += 1
+
+    class FakeDSparkEngine:
+        def __init__(self, target, draft_dir, *, max_draft_tokens,
+                     max_prompt_tokens, confidence_threshold,
+                     prompt_cache_min_tokens):
+            self.target = target
+            self.draft_dir = Path(draft_dir)
+            self.max_draft_tokens = max_draft_tokens
+            self.max_prompt_tokens = max_prompt_tokens
+
+        def close(self):
+            self.target.close()
+
+    manager = EngineManager()
+    with patch("runtime.config.ModelConfig.from_dir", return_value=cfg), \
+         patch("runtime.path_resolver.resolve_model_dir",
+               side_effect=lambda path: path), \
+         patch("runtime.server._dspark_draft_for",
+               return_value=draft_path) as discover, \
+         patch("runtime.engine.StreamingEngine", FakeEngine), \
+         patch("runtime.dspark.DSparkSpeculativeEngine",
+               FakeDSparkEngine), \
+         patch.dict("os.environ", {
+             "VMODEL_DSPARK_DRAFT": str(draft_path),
+             "VMODEL_DSPARK_MAX_DRAFT_TOKENS": "6",
+         }):
+        wrapped = manager.get(target_path, "lossless")
+
+    assert wrapped.draft_dir == draft_path
+    assert wrapped.max_draft_tokens == 6
+    assert wrapped.max_prompt_tokens == 1_048_576
+    discover.assert_called_once()
+
+
 def test_engine_manager_prefers_full_resident_qwen3_when_governor_admits_it(tmp_path):
     from unittest.mock import patch
 

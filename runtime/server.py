@@ -440,11 +440,13 @@ def _speculative_draft_for(target: Path, cfg) -> Path | None:
 
 
 def _dspark_draft_for(target: Path, cfg) -> Path | None:
-    """Find a complete, shape-compatible local Qwen3 DSpark checkpoint.
+    """Resolve a complete local DSpark checkpoint.
 
-    Discovery never downloads and deliberately requires the released block-7
-    schema validated by the local exact-token/throughput gate.  A custom local
-    checkpoint can still be selected explicitly for experimentation.
+    Automatic sibling discovery remains deliberately restricted to the
+    released Qwen3 block-seven schema already admitted by its broad gate.
+    K3's first local proposal was rejected, so its checkpoint is accepted only
+    through an explicit path and is validated by ``DSparkDrafter.load`` plus
+    the target-compatibility checks in ``DSparkSpeculativeDecoder``.
     """
     override = os.environ.get("VMODEL_DSPARK_DRAFT", "auto").strip()
     if override.lower() in ("0", "off", "false", "none", "disabled"):
@@ -2683,6 +2685,46 @@ class EngineManager:
                 if rc.hot_prompt_kv_min_tokens < 0:
                     raise RequestValidationError(
                         "VMODEL_HOT_PROMPT_KV_MIN_TOKENS must be >= 0")
+
+            # K3 DSpark remains explicit-only: the first released local gate
+            # preserved exact tokens and compact rollback, but accepted 0/1
+            # proposal on its France witness.  That is enough to expose a
+            # research path, not enough to auto-enable it for arbitrary
+            # traffic.
+            dspark_override = os.environ.get(
+                "VMODEL_DSPARK_DRAFT", "auto").strip()
+            k3_dspark_explicit = (
+                mode == "lossless"
+                and mtype == "kimi_k3"
+                and dspark_override.lower() not in (
+                    "", "auto", "0", "off", "false", "none", "disabled")
+            )
+            if k3_dspark_explicit:
+                dspark_dir = _dspark_draft_for(model_dir, cfg_probe)
+                try:
+                    dspark_cap = int(os.environ.get(
+                        "VMODEL_DSPARK_MAX_DRAFT_TOKENS", "6"))
+                    dspark_prompt_limit = int(os.environ.get(
+                        "VMODEL_DSPARK_MAX_PROMPT_TOKENS", "1048576"))
+                    dspark_confidence_threshold = float(os.environ.get(
+                        "VMODEL_DSPARK_CONFIDENCE_THRESHOLD", "0"))
+                    dspark_prompt_cache_min_tokens = int(os.environ.get(
+                        "VMODEL_DSPARK_PROMPT_CACHE_MIN_TOKENS", "0"))
+                except ValueError as error:
+                    raise RequestValidationError(
+                        "VMODEL K3 DSpark limits must be numeric"
+                    ) from error
+                if not 1 <= dspark_cap <= 7 or dspark_prompt_limit <= 0:
+                    raise RequestValidationError(
+                        "VMODEL K3 DSpark cap must be in [1, 7] and "
+                        "prompt limit positive")
+                if (not math.isfinite(dspark_confidence_threshold)
+                        or not 0 <= dspark_confidence_threshold <= 1):
+                    raise RequestValidationError(
+                        "VMODEL_DSPARK_CONFIDENCE_THRESHOLD must be in [0, 1]")
+                if dspark_prompt_cache_min_tokens < 0:
+                    raise RequestValidationError(
+                        "VMODEL_DSPARK_PROMPT_CACHE_MIN_TOKENS must be >= 0")
 
             qwen_mtp_reason = "not-qwen"
             if mtype in ("qwen3_5", "qwen3_5_moe"):

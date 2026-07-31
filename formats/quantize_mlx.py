@@ -84,6 +84,11 @@ def _should_quantize(name: str, value: mx.array, profile: str,
         return _is_expert_weight(name)
     if profile == "all":
         return "embed_tokens" not in name and "norm" not in name
+    if profile == "all-draft":
+        # A speculative draft is never authoritative: quantizing its lookup
+        # table can alter acceptance rate but not target output.  This profile
+        # is therefore intentionally unavailable as a serving-model default.
+        return "norm" not in name
     raise ValueError(f"unknown quantization profile: {profile!r}")
 
 
@@ -145,7 +150,7 @@ def _convert_shard(source_shard: Path, output_shard: Path, *, profile: str,
     for name in sorted(tuple(lazy)):
         value = lazy.pop(name)
         fused = _FUSED_QWEN_EXPERT.match(name)
-        if (fused is not None and profile in ("experts", "all")
+        if (fused is not None and profile in ("experts", "all", "all-draft")
                 and value.ndim == 3):
             experts = int(value.shape[0])
             if fused.group(2) == "gate_up_proj":
@@ -270,7 +275,11 @@ def _main() -> None:
         description="Convert HF safetensors one shard at a time to MLX quantization")
     parser.add_argument("source")
     parser.add_argument("output")
-    parser.add_argument("--profile", choices=("experts", "all"), default="experts")
+    parser.add_argument(
+        "--profile",
+        choices=("experts", "all", "all-draft"),
+        default="experts",
+    )
     parser.add_argument("--mode", choices=("affine", "mxfp4", "nvfp4", "mxfp8"),
                         default="mxfp4")
     parser.add_argument("--group-size", type=int, default=32)

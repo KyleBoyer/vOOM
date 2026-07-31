@@ -178,3 +178,25 @@ def test_qwen_fused_experts_are_split_and_prequantized(tmp_path):
         "model.layers.0.mlp.experts.1.down_proj.weight",
     ])
     assert all(isinstance(value, QTensor) for value in values.values())
+
+
+def test_all_draft_profile_quantizes_embedding_and_output_tables(tmp_path):
+    source, output = tmp_path / "source", tmp_path / "draft-output"
+    _write_source(source)
+    # Add a conventional embedding table to the first source shard/index.
+    shard = source / "model-00001-of-00002.safetensors"
+    tensors = dict(mx.load(str(shard)))
+    tensors["model.embed_tokens.weight"] = mx.ones((128, 64))
+    mx.save_safetensors(str(shard), tensors)
+    index_path = source / "model.safetensors.index.json"
+    index = json.loads(index_path.read_text())
+    index["weight_map"]["model.embed_tokens.weight"] = shard.name
+    index_path.write_text(json.dumps(index))
+
+    convert_model(source, output, profile="all-draft")
+    store = WeightStore(output)
+    values, _seconds, _bytes = store.fetch([
+        "model.embed_tokens.weight", "lm_head.weight"])
+
+    assert isinstance(values["model.embed_tokens.weight"], QTensor)
+    assert isinstance(values["lm_head.weight"], QTensor)

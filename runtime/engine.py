@@ -1407,6 +1407,10 @@ class StreamingEngine:
         # acceptance is known; ordinary calls leave this empty.
         self._serial_kda_endpoints = None
         self._serial_kda_endpoint_retained_bytes = 0
+        self._serial_kda_factors = None
+        self._serial_kda_factor_retained_bytes = 0
+        self._dspark_expert_prefetch_plan = None
+        self._dspark_expert_prefetch_depth = 0
         # F43: a declared context bound <= index_topk means the DSA indexer can
         # never deselect anything — elide its weights and state entirely.
         self._dsa_elided = bool(
@@ -2422,6 +2426,11 @@ class StreamingEngine:
     def _record_expert_route(self, layer: int, expert_ids: list[int],
                              positions: dict[int, list[int]] | None = None) -> None:
         """Record one routed UNION exactly once, independent of compute batches."""
+        dspark_prefetch_plan = getattr(
+            self, "_dspark_expert_prefetch_plan", None)
+        if dspark_prefetch_plan is not None:
+            dspark_prefetch_plan.observe_authoritative(
+                layer, expert_ids)
         provisional = getattr(self, "_provisional", None)
         if provisional is not None and positions is not None:
             provisional.append((layer, positions))
@@ -4123,9 +4132,17 @@ class StreamingEngine:
         selected = endpoints[count - 1]
         return selected if selected.nbytes() > 0 else None
 
+    def consume_serial_kda_factors(self):
+        """Consume compact factors retained by the last serial verifier."""
+        factors = getattr(self, "_serial_kda_factors", None)
+        self._serial_kda_factors = None
+        self._serial_kda_factor_retained_bytes = 0
+        return factors
+
     def forward_tokens_serial_positions(
         self, tokens: list[int], kv, tap_layers=None, *,
         capture_kda_endpoints: bool = False,
+        capture_kda_factors: bool = False,
     ) -> mx.array:
         """Exact dense verification with one weight sweep for many positions.
 
@@ -4138,6 +4155,10 @@ class StreamingEngine:
         # Never leave a prior verifier's large recurrent snapshots resident.
         # A successful caller must consume the desired endpoint immediately.
         self.consume_serial_kda_endpoint(None)
+        self.consume_serial_kda_factors()
+        if capture_kda_endpoints and capture_kda_factors:
+            raise ValueError(
+                "capture either dense KDA endpoints or compact factors, not both")
 
         glm_family = self.cfg.model_type in ("glm_moe_dsa", "kimi_k25", "glm4_moe_lite")
         qwen_family = self.cfg.model_type in ("qwen3_5", "qwen3_5_moe")
@@ -4215,6 +4236,7 @@ class StreamingEngine:
         positions = [embedded[:, i:i + 1, :] for i in range(len(tokens))]
         n = self.cfg.num_hidden_layers
         serial_kda_endpoints = None
+        factor_source = None
         if capture_kda_endpoints:
             source_kda = getattr(kv, "kda_cache", None)
             if source_kda is None:
@@ -4228,6 +4250,12 @@ class StreamingEngine:
             serial_kda_endpoints = [
                 KDAStateCache(n) for _ in range(len(tokens) - 1)
             ]
+        elif capture_kda_factors:
+            factor_source = getattr(kv, "kda_cache", None)
+            if factor_source is None:
+                raise ValueError(
+                    "KDA factor capture requires kv.kda_cache")
+            factor_source.begin_factor_capture()
         if glm_family:
             from .glm import _glm_attention_residual, _glm_mlp_residual
         if qwen_family:
@@ -4294,6 +4322,15 @@ class StreamingEngine:
             self._select_serial_verify_layer_transient(
                 verifier_positions, layer
             )
+            dspark_prefetch_plan = getattr(
+                self, "_dspark_expert_prefetch_plan", None)
+            if dspark_prefetch_plan is not None:
+                dspark_prefetch_plan.schedule_before_layer(
+                    self,
+                    layer,
+                    int(getattr(
+                        self, "_dspark_expert_prefetch_depth", 0)),
+                )
             if self.prefetcher:
                 for nxt in range(
                         layer + 1,
@@ -4555,6 +4592,13 @@ class StreamingEngine:
             if serial_kda_endpoints is not None
             else 0
         )
+        if factor_source is not None:
+            self._serial_kda_factors = factor_source.finish_factor_capture(
+                len(tokens))
+            self._serial_kda_factor_retained_bytes = (
+                self._serial_kda_factors.nbytes()
+                if self._serial_kda_factors is not None else 0
+            )
         return result
 
     def _lazy_resident_decode_step(self, token: mx.array, kv):

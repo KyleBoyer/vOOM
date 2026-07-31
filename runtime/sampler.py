@@ -87,6 +87,91 @@ def _apply_repetition_penalty(
     return values.astype(mx.float32).at[ids].add(penalized - selected)
 
 
+def filtered_probabilities(
+    logits: mx.array,
+    params: SamplingParams | None = None,
+    history=None,
+) -> mx.array:
+    """Return the exact categorical distribution selected by ``params``.
+
+    Unlike :func:`sample`, this keeps a full-vocabulary probability vector.
+    That extra materialization is useful for exact speculative rejection:
+    acceptance needs both ``p(token)`` and ``q(token)``, while a rejection
+    must sample from ``normalize(max(p - q, 0))``.  Greedy requests return a
+    one-hot vector so the same verifier can cover temperatures 0 through 1
+    without a separate, subtly different filtering implementation.
+    """
+    params = params or SamplingParams()
+    values = logits.reshape(-1)
+    if values.size == 0:
+        raise ValueError("cannot build a distribution from empty logits")
+    if params.repetition_penalty != 1.0:
+        values = _apply_repetition_penalty(
+            values, history, float(params.repetition_penalty))
+    if params.is_greedy:
+        winner = mx.argmax(values)
+        return mx.zeros(values.shape, dtype=mx.float32).at[winner].add(1.0)
+
+    values = values.astype(mx.float32) / float(params.temperature)
+    keep = mx.ones(values.shape, dtype=mx.bool_)
+    if params.top_k and params.top_k < values.size:
+        k = int(params.top_k)
+        partition = mx.argpartition(values, kth=values.size - k)
+        selected = partition[-k:]
+        keep = mx.zeros(values.shape, dtype=mx.bool_).at[selected].add(True)
+
+    filtered = mx.where(keep, values, float("-inf"))
+    if params.top_p < 1:
+        order = mx.argsort(filtered)[::-1]
+        sorted_values = filtered[order]
+        sorted_probabilities = mx.softmax(sorted_values)
+        remove = mx.cumsum(sorted_probabilities) > float(params.top_p)
+        # Keep the first token that crosses the nucleus threshold, matching
+        # sample() and the serving path's established convention.
+        remove = mx.concatenate([mx.array([False]), remove[:-1]])
+        kept_sorted = mx.logical_not(remove)
+        nucleus_keep = mx.zeros(
+            values.shape, dtype=mx.bool_
+        ).at[order].add(kept_sorted)
+        filtered = mx.where(mx.logical_and(keep, nucleus_keep),
+                            values, float("-inf"))
+    return mx.softmax(filtered)
+
+
+def sample_probabilities(probabilities: mx.array) -> int:
+    """Sample a normalized full-vocabulary probability vector."""
+    probabilities = probabilities.reshape(-1).astype(mx.float32)
+    if probabilities.size == 0:
+        raise ValueError("cannot sample from an empty probability vector")
+    total = mx.sum(probabilities)
+    mx.eval(total)
+    total_value = float(total.item())
+    if not math.isfinite(total_value) or total_value <= 0:
+        raise ValueError("probability vector must have positive finite mass")
+    normalized = probabilities / total
+    return int(mx.random.categorical(mx.log(normalized)))
+
+
+def speculative_residual_probabilities(
+    target: mx.array, draft: mx.array
+) -> mx.array:
+    """Distribution used after a speculative rejection.
+
+    The positive-part residual is the exact Leviathan rejection correction.
+    A zero residual can occur only through finite-precision equality; in that
+    case falling back to ``target`` remains a valid, normalized target draw.
+    """
+    target = target.reshape(-1).astype(mx.float32)
+    draft = draft.reshape(-1).astype(mx.float32)
+    if target.shape != draft.shape:
+        raise ValueError("target and draft distributions must have equal shape")
+    residual = mx.maximum(target - draft, 0.0)
+    mass = mx.sum(residual)
+    mx.eval(mass)
+    value = float(mass.item())
+    return target if not math.isfinite(value) or value <= 0 else residual / mass
+
+
 def sample(logits: mx.array, params: SamplingParams | None = None,
           history=None) -> int:
     """Sample one token from a rank-1 (or flattenable) logits vector.

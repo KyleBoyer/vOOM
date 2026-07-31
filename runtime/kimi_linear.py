@@ -396,6 +396,18 @@ def _kda_attention(
     o = mx.stack(outputs, axis=1)  # (B, L, H, D) float32
 
     if kda_cache is not None:
+        if kda_cache.factor_capture_active:
+            if L != 1:
+                raise ValueError(
+                    "compact KDA factor capture requires serial positions")
+            kda_cache.capture_factor_step(
+                layer,
+                gate=gate[:, 0],
+                key=k[:, 0],
+                value=v[:, 0],
+                beta=beta[:, 0],
+                conv_history=(q_hist_new, k_hist_new, v_hist_new),
+            )
         mx.eval(state)
         kda_cache.set_state(layer, state)
         kda_cache.set_conv_history(layer, (q_hist_new, k_hist_new, v_hist_new))

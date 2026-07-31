@@ -5,10 +5,17 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import mlx.core as mx
+import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from runtime.dspark import CtxCache, DSparkSpeculativeDecoder
+from runtime.dspark import (
+    CtxCache,
+    DSparkConfig,
+    DSparkDrafter,
+    DSparkSpeculativeDecoder,
+)
+from runtime.sampler import SamplingParams
 
 
 class _Tokenizer:
@@ -159,3 +166,61 @@ def test_exact_repeat_reuses_target_and_drafter_prompt_state():
     assert warm["path_stats"]["prompt_cache_exact_hit"]
     assert warm["path_stats"]["prompt_cache_prefix_tokens"] == 2
     assert warm["path_stats"]["prompt_cache_source"] == "dspark-memory"
+
+
+def test_k3_mla_draft_uses_compressed_context_and_shared_target_head():
+    cfg = DSparkConfig(
+        hidden_size=8,
+        vocab_size=16,
+        num_hidden_layers=2,
+        intermediate_size=16,
+        num_attention_heads=2,
+        num_key_value_heads=2,
+        head_dim=4,
+        block_size=3,
+        mask_token_id=15,
+        target_layer_ids=[0, 1],
+        model_type="k3_dspark",
+        target_hidden_size=8,
+        q_lora_rank=4,
+        kv_lora_rank=4,
+        qk_nope_head_dim=2,
+        qk_rope_head_dim=2,
+        v_head_dim=2,
+        markov_rank=0,
+        enable_confidence_head=False,
+    )
+    draft = DSparkDrafter(cfg)
+    head = mx.zeros((16, 8), dtype=mx.float32).at[3, 0].add(10)
+    draft.bind_target_lm_head(lambda: head)
+    caches = draft.make_ctx_cache()
+    draft.update_context(mx.zeros((1, 5, 16)), 0, caches)
+    logits, hidden = draft.draft_block(1, 5, caches, cap=2)
+    mx.eval(logits, hidden)
+
+    assert logits.shape == (2, 16)
+    assert hidden.shape == (2, 8)
+    assert all(cache.length == 5 for cache in caches)
+    # Content latent and shared positional key stay compressed.
+    assert caches[0].k.shape == (1, 1, 5, 4)
+    assert caches[0].v.shape == (1, 1, 5, 2)
+
+
+@pytest.mark.parametrize("temperature", [0.3, 0.5, 0.7, 1.0])
+def test_stochastic_rejection_samples_target_minus_draft_residual(
+    temperature,
+):
+    sampling = SamplingParams(temperature=temperature, seed=17)
+    sampling.seed_rng()
+    # Proposal 0 has q=1 but p=0, so it always rejects.  The residual puts
+    # all mass on token 1; the replacement is therefore deterministic.
+    q = [mx.array([1.0, 0.0, 0.0])]
+    verified = mx.array([
+        [-100.0, 100.0, -100.0],
+        [0.0, 0.0, 0.0],
+    ])
+    accepted, committed = DSparkSpeculativeDecoder._verify_stochastic(
+        [0], q, verified, sampling, history=[2])
+
+    assert accepted == 0
+    assert committed == [1]
