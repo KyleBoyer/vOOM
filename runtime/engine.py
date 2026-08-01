@@ -678,7 +678,9 @@ class RuntimeConfig:
     # StreamingEngine._layer_stationary_qwen35_sweep and CLAUDE.md's
     # 2026-07-23 note on why chunk-major re-reads dominate prefill time here.
     layer_stationary_prefill: bool = False
-    gptoss_sliding_kv_window: bool = False
+    # Default ON. Only gpt-oss consults it (see the model_type guard at the
+    # use site); it drops keys sliding layers provably cannot read.
+    gptoss_sliding_kv_window: bool = True
     # Explicit lossy Qwen hybrid prefill schedule. The first N layers consume
     # the full prompt; a fixed P-position prefix anchor plus the final S hidden
     # positions continue through the remaining layers. P=0 preserves the

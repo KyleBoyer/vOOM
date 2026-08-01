@@ -186,6 +186,21 @@ def test_trim_below_the_window_fails_closed():
         raise AssertionError("trim below the window must raise")
 
 
+def test_sliding_kv_window_is_on_by_default():
+    """Default ON: retaining keys the model cannot read was the anomaly, not
+    the bound. Proven greedy-identical at 1,024 and 18,608 tokens."""
+    from runtime.engine import RuntimeConfig
+
+    assert RuntimeConfig().gptoss_sliding_kv_window is True
+
+
+def test_sliding_kv_window_remains_disablable():
+    from runtime.engine import RuntimeConfig
+
+    assert RuntimeConfig(
+        gptoss_sliding_kv_window=False).gptoss_sliding_kv_window is False
+
+
 def _run_all():
     tests = [v for k, v in sorted(globals().items())
              if k.startswith("test_") and callable(v)]

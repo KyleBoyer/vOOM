@@ -1506,8 +1506,13 @@ class EngineManager:
                     raise ValueError(
                         "VMODEL_GPTOSS_LAYER_STATIONARY_PREFILL must be 0 or 1")
                 rc.layer_stationary_prefill = layer_stationary_value == "1"
+                # Default ON: this drops keys gpt-oss's sliding layers cannot
+                # read, so it is a retention correction rather than an
+                # approximation. Proven greedy-identical at 1,024 and 18,608
+                # tokens (same output_text_sha256 and token IDs in both A/Bs).
+                # Set to 0 to restore whole-sequence retention.
                 sliding_kv_value = os.environ.get(
-                    "VMODEL_GPTOSS_SLIDING_KV_WINDOW", "0")
+                    "VMODEL_GPTOSS_SLIDING_KV_WINDOW", "1")
                 if sliding_kv_value not in ("0", "1"):
                     raise ValueError(
                         "VMODEL_GPTOSS_SLIDING_KV_WINDOW must be 0 or 1")
