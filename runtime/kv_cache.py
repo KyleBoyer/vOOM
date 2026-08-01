@@ -13,6 +13,36 @@ class KVCache:
     def __init__(self, num_layers: int):
         self.keys: list[mx.array | None] = [None] * num_layers
         self.values: list[mx.array | None] = [None] * num_layers
+        # Per-layer retention bound. ``None`` keeps the whole sequence, which
+        # is the only behavior any caller saw before sliding windows existed.
+        self._windows: list[int | None] = [None] * num_layers
+        # Absolute position of each layer's FIRST retained key. Zero unless a
+        # window has dropped something, so ``offset`` and ``trim`` keep their
+        # exact previous semantics for every unwindowed cache.
+        self._starts: list[int] = [0] * num_layers
+
+    def configure_sliding_windows(self, layer_types, window: int) -> int:
+        """Bound layers whose attention provably cannot read older keys.
+
+        gpt-oss alternates 128-token ``sliding_attention`` layers with full
+        layers, and its attention already slices/masks to that window -- so on
+        an 18.6K-token prompt half the layers retained ~158x more KV than they
+        could ever attend to. Dropping those keys is exact, not approximate:
+        they are unreachable by construction. Returns how many layers were
+        bounded.
+        """
+        if not layer_types or not window or window <= 0:
+            return 0
+        bounded = 0
+        for layer, kind in enumerate(layer_types):
+            if layer < len(self._windows) and str(kind) == "sliding_attention":
+                self._windows[layer] = int(window)
+                bounded += 1
+        return bounded
+
+    def layer_start(self, layer: int) -> int:
+        """Absolute position of the first key retained for ``layer``."""
+        return self._starts[layer] if layer < len(self._starts) else 0
 
     def update(self, layer: int, k: mx.array, v: mx.array) -> tuple[mx.array, mx.array]:
         if self.keys[layer] is None:
@@ -20,14 +50,34 @@ class KVCache:
         else:
             self.keys[layer] = mx.concatenate([self.keys[layer], k], axis=2)
             self.values[layer] = mx.concatenate([self.values[layer], v], axis=2)
+        window = self._windows[layer]
+        if window is not None:
+            # The window is per QUERY, so a prefill tile of L queries still
+            # needs window + L - 1 keys: its OLDEST query looks back a full
+            # window from L-1 positions earlier. Retaining only ``window``
+            # here starves every multi-token tile. Decode (L=1) reduces to
+            # exactly ``window``, and the extra tail is dropped on the next
+            # append.
+            retain = window + k.shape[2] - 1
+            length = self.keys[layer].shape[2]
+            if length > retain:
+                self._starts[layer] += length - retain
+                self.keys[layer] = self.keys[layer][:, :, -retain:, :]
+                self.values[layer] = self.values[layer][:, :, -retain:, :]
         return self.keys[layer], self.values[layer]
 
     @property
     def offset(self) -> int:
-        first = next((value for value in self.keys if value is not None), None)
-        if first is None:
-            return 0
-        return first.shape[1] if self.compressed_mla else first.shape[2]
+        for layer, value in enumerate(self.keys):
+            if value is None:
+                continue
+            if self.compressed_mla:
+                return value.shape[1]
+            # Windowed layers store a suffix, so the true sequence end is the
+            # layer's start plus what it retains. ``_starts`` is 0 without a
+            # window, which reproduces the previous shape-only result exactly.
+            return self._starts[layer] + value.shape[2]
+        return 0
 
     def nbytes(self) -> int:
         total = sum(a.nbytes for a in (*self.keys, *self.values) if a is not None)
@@ -53,13 +103,22 @@ class KVCache:
         for i in range(len(self.keys)):
             if self.keys[i] is None:
                 continue
+            start = self._starts[i]
+            if start and length < start:
+                # A windowed layer physically no longer holds this position.
+                # Silently keeping a longer prefix would misalign every later
+                # key, so refuse instead of corrupting the rollback.
+                raise ValueError(
+                    f"cannot trim layer {i} to {length}: its sliding window "
+                    f"retains only positions >= {start}")
             if self.compressed_mla:
                 if self.keys[i].shape[1] > length:
                     self.keys[i] = self.keys[i][:, :length, :]
                     pending.append(self.keys[i])
-            elif self.keys[i].shape[2] > length:
-                self.keys[i] = self.keys[i][:, :, :length, :]
-                self.values[i] = self.values[i][:, :, :length, :]
+            elif start + self.keys[i].shape[2] > length:
+                local = length - start
+                self.keys[i] = self.keys[i][:, :, :local, :]
+                self.values[i] = self.values[i][:, :, :local, :]
                 pending.extend((self.keys[i], self.values[i]))
         if pending:
             # Every slice is independent. One barrier keeps the old backing

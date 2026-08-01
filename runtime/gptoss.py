@@ -106,7 +106,11 @@ def _attention_gptoss(
 
     if L > 1:  # prefill: causal (+ sliding) mask; decode L=1 needs none (see slice above)
         q_pos = mx.arange(offset, offset + L)[:, None]
-        k_pos = mx.arange(S)[None, :]
+        # A windowed layer stores a SUFFIX of the sequence, so its first key is
+        # at absolute position ``base``, not 0. Without this the causal and
+        # sliding masks would be applied to the wrong positions.
+        base = kv.layer_start(layer) if hasattr(kv, "layer_start") else 0
+        k_pos = mx.arange(base, base + S)[None, :]
         allowed = k_pos <= q_pos
         if sliding:
             allowed = allowed & (k_pos > q_pos - cfg.sliding_window)

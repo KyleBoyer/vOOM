@@ -678,6 +678,7 @@ class RuntimeConfig:
     # StreamingEngine._layer_stationary_qwen35_sweep and CLAUDE.md's
     # 2026-07-23 note on why chunk-major re-reads dominate prefill time here.
     layer_stationary_prefill: bool = False
+    gptoss_sliding_kv_window: bool = False
     # Explicit lossy Qwen hybrid prefill schedule. The first N layers consume
     # the full prompt; a fixed P-position prefix anchor plus the final S hidden
     # positions continue through the remaining layers. P=0 preserves the
@@ -5090,6 +5091,15 @@ class StreamingEngine:
             kv = Fp8KVCache(self.cfg.num_hidden_layers)
         else:
             kv = KVCache(self.cfg.num_hidden_layers)
+        if (self.rc.gptoss_sliding_kv_window
+                and self.cfg.model_type == "gpt_oss"
+                and getattr(self.cfg, "sliding_window", 0)):
+            bounded = kv.configure_sliding_windows(
+                self.cfg.layer_types, int(self.cfg.sliding_window))
+            if bounded:
+                print(f"[engine] gpt-oss sliding KV window: {bounded} layers "
+                      f"bounded to {int(self.cfg.sliding_window)} positions",
+                      flush=True)
         if self.rc.mla_compressed_kv and self.cfg.model_type == "glm_moe_dsa":
             kv.compressed_mla = True
             kv.mla_absorbed = self.rc.mla_absorbed_decode

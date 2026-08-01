@@ -1506,6 +1506,12 @@ class EngineManager:
                     raise ValueError(
                         "VMODEL_GPTOSS_LAYER_STATIONARY_PREFILL must be 0 or 1")
                 rc.layer_stationary_prefill = layer_stationary_value == "1"
+                sliding_kv_value = os.environ.get(
+                    "VMODEL_GPTOSS_SLIDING_KV_WINDOW", "0")
+                if sliding_kv_value not in ("0", "1"):
+                    raise ValueError(
+                        "VMODEL_GPTOSS_SLIDING_KV_WINDOW must be 0 or 1")
+                rc.gptoss_sliding_kv_window = sliding_kv_value == "1"
                 # Layer-stationary attention already uses the declared chunk
                 # as its hard tile-memory bound. A resampled chunk schedule is
                 # both unnecessary and ineligible for the inverted layer loop,
