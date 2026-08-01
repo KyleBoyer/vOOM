@@ -92,10 +92,18 @@ class ModelConfig:
     index_share_for_mtp_iteration: bool = False
     # Qwen3-VL vision extras (None/0 for text-only models)
     vision_config: dict | None = None
+    # The checkpoint's vision architecture is not interchangeable with the
+    # runtime that happens to be implemented.  In particular, Kimi K3 ships a
+    # MoonViT/PatchMerger-V2 tower while qwen3vl.py implements Qwen's ViT and
+    # M-RoPE token geometry.  Preserve the declared family so request dispatch
+    # can fail closed instead of treating any non-empty vision_config as Qwen.
+    vision_backend: str = ""
+    architectures: tuple[str, ...] = ()
     image_token_id: int = 0
     video_token_id: int = 0
     vision_start_token_id: int = 0
     vision_end_token_id: int = 0
+    media_placeholder_token_id: int = 0
     # Qwen3-VL's video processor applies these bounds to T*H*W, not to each
     # frame independently. Defaults are the released architecture values;
     # video_preprocessor_config.json overrides them when present.
@@ -235,9 +243,37 @@ class ModelConfig:
                 if remount:
                     _os.system(remount)
                 _time.sleep(5 * (2 ** attempt))
+        if not isinstance(raw, dict):
+            raise ValueError("config.json must contain an object")
+        outer_model_type = raw.get("model_type", "")
+        architectures_value = raw.get("architectures", ())
+        if architectures_value is None:
+            architectures_value = ()
+        if (not isinstance(architectures_value, (list, tuple))
+                or any(not isinstance(value, str) or not value
+                       for value in architectures_value)):
+            raise ValueError(
+                "config.json architectures must be an array of non-empty strings")
+        architectures = tuple(architectures_value)
+
         # Qwen3-VL-class configs nest the LLM under text_config; lift it and
         # carry the vision/token-id extras alongside.
         vision_config = raw.get("vision_config")
+        if vision_config is not None and not isinstance(vision_config, dict):
+            raise ValueError("config.json vision_config must contain an object")
+        if vision_config is None:
+            vision_backend = ""
+        elif (outer_model_type.startswith("qwen3_vl")
+              or outer_model_type in ("qwen3_5", "qwen3_5_moe")):
+            vision_backend = "qwen3vl"
+        else:
+            # Preserve an unsupported family's identity.  The HTTP layer uses
+            # this value for a precise pre-engine rejection; future native
+            # adapters can replace that rejection without changing config
+            # parsing or silently reclassifying checkpoints.
+            vision_backend = outer_model_type or "unknown"
+        media_placeholder_token_id = raw.get(
+            "media_placeholder_token_id", 0)
         video_min_pixels = 4_096
         video_max_pixels = 25_165_824
         if vision_config is not None and raw.get("model_type", "").startswith("qwen3_vl"):
@@ -493,10 +529,13 @@ class ModelConfig:
                 "rope_interleave", raw.get("model_type") == "kimi_k25"),
             mla_latent_norm_eps=raw.get("mla_latent_norm_eps", 1e-6),
             vision_config=vision_config,
+            vision_backend=vision_backend,
+            architectures=architectures,
             image_token_id=raw.get("image_token_id", 0),
             video_token_id=raw.get("video_token_id", 0),
             vision_start_token_id=raw.get("vision_start_token_id", 0),
             vision_end_token_id=raw.get("vision_end_token_id", 0),
+            media_placeholder_token_id=media_placeholder_token_id,
             video_min_pixels=video_min_pixels,
             video_max_pixels=video_max_pixels,
             index_topk=raw.get("index_topk", 0),

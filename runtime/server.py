@@ -4563,6 +4563,31 @@ def _prepare_vision_prompt(engine, prompt: str, images):
         raise RequestValidationError(str(error)) from error
 
 
+def _vision_request_error(cfg, model_id: str) -> str | None:
+    """Return why ``cfg`` cannot execute an image request, if applicable.
+
+    A released checkpoint may contain a real vision tower without matching the
+    only vision math currently implemented by vOOM.  AirLLM's K3 declaration
+    made that distinction visible: K3 uses MoonViT/PatchMerger-V2, whereas
+    runtime.qwen3vl expects Qwen-specific merge fields, token IDs, and M-RoPE.
+    Never use mere presence of ``vision_config`` as a backend capability test.
+    """
+    vision_config = getattr(cfg, "vision_config", None)
+    if not vision_config:
+        return (
+            f"model '{model_id}' has no vision tower — use a Qwen3-VL model "
+            "(e.g. Qwen3-VL-8B-Instruct) for image input"
+        )
+    backend = getattr(cfg, "vision_backend", "")
+    if backend != "qwen3vl":
+        family = backend or getattr(cfg, "model_type", "unknown")
+        return (
+            f"model '{model_id}' has a {family} vision tower, but vOOM does "
+            "not yet implement that vision backend; text requests remain supported"
+        )
+    return None
+
+
 def _load_vision_images(sources):
     from .toolcalls import load_image, load_video
 
@@ -7450,6 +7475,18 @@ class Handler(BaseHTTPRequestHandler):
                 })
             if mode == "fast":
                 model_dir = _preferred_fast_artifact(model_dir)
+            if image_srcs:
+                # Reject an architecture/backend mismatch before constructing
+                # or evicting the single resident engine.  This is especially
+                # important for the 1.5 TB K3 checkpoint: discovering the
+                # mismatch after engine initialization is both unsafe and
+                # unnecessarily expensive.
+                from .config import ModelConfig
+
+                vision_error = _vision_request_error(
+                    ModelConfig.from_dir(model_dir), model_id)
+                if vision_error is not None:
+                    return self._json(400, {"error": vision_error})
             engine = MANAGER.get(
                 model_dir, mode, requires_vision=bool(image_srcs))
 
@@ -7469,10 +7506,10 @@ class Handler(BaseHTTPRequestHandler):
             if route == "/chat/completions":
                 msgs = _messages_for_structured_output(
                     normalized_messages, self._structured_output)
-                if image_srcs and not engine.cfg.vision_config:
-                    return self._json(400, {"error": (
-                        f"model '{model_id}' has no vision tower — use a "
-                        "Qwen3-VL model (e.g. Qwen3-VL-8B-Instruct) for image input")})
+                if image_srcs and (
+                        vision_error := _vision_request_error(
+                            engine.cfg, model_id)) is not None:
+                    return self._json(400, {"error": vision_error})
                 prompt, rendered_prompt_tokens, tools, _raw_tools, tool_selection = \
                     _prepare_chat_prompt(
                         engine, model_dir, msgs, self._reasoning_effort,
@@ -7875,10 +7912,10 @@ class Handler(BaseHTTPRequestHandler):
             for t in raw_tools
         ]
 
-        if image_srcs and not engine.cfg.vision_config:
-            return self._json(400, {"error": (
-                f"model '{model_id}' has no vision tower — use a "
-                "Qwen3-VL model (e.g. Qwen3-VL-8B-Instruct) for image input")})
+        if image_srcs and (
+                vision_error := _vision_request_error(
+                    engine.cfg, model_id)) is not None:
+            return self._json(400, {"error": vision_error})
 
         msgs = _messages_for_structured_output(msgs, self._structured_output)
         all_tools = list(tools)
@@ -8981,10 +9018,10 @@ class Handler(BaseHTTPRequestHandler):
                      "parameters": t.get("input_schema") or {}}}
                 for t in raw_tools]
 
-        if image_srcs and not engine.cfg.vision_config:
-            return self._json(400, {"error": (
-                f"model '{model_id}' has no vision tower — use a "
-                "Qwen3-VL model (e.g. Qwen3-VL-8B-Instruct) for image input")})
+        if image_srcs and (
+                vision_error := _vision_request_error(
+                    engine.cfg, model_id)) is not None:
+            return self._json(400, {"error": vision_error})
 
         prompt, prompt_tokens, tools, raw_tools, tool_selection = _prepare_chat_prompt(
             engine, model_dir, msgs, self._reasoning_effort, tools, raw_tools,

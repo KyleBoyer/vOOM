@@ -73,6 +73,7 @@ from runtime.server import (Handler, INFER_LOCK, PreparedPrompt, PriorityLock, R
                             _registry,
                             _tool_capsule_spans,
                             _vision_protocol_timing,
+                            _vision_request_error,
                             _validate_fast_dense_resident_kv,
                             _validate_context_budget, _validate_generation_controls,
                             split_model_mode)
@@ -92,6 +93,27 @@ class _CountingCharTokenizer(_CharTokenizer):
     def encode(self, text):
         self.calls += 1
         return super().encode(text)
+
+
+def test_vision_dispatch_distinguishes_tower_presence_from_backend_support():
+    text = SimpleNamespace(model_type="qwen2", vision_config=None,
+                           vision_backend="")
+    kimi = SimpleNamespace(
+        model_type="kimi_k3",
+        vision_config={"patch_size": 14, "merge_kernel_size": [2, 2]},
+        vision_backend="kimi_k3",
+    )
+    qwen = SimpleNamespace(
+        model_type="qwen3_vl",
+        vision_config={"patch_size": 16, "spatial_merge_size": 2},
+        vision_backend="qwen3vl",
+    )
+
+    assert "has no vision tower" in _vision_request_error(text, "text-only")
+    error = _vision_request_error(kimi, "Kimi-K3")
+    assert "kimi_k3 vision tower" in error
+    assert "not yet implement" in error
+    assert _vision_request_error(qwen, "Qwen3-VL") is None
 
 
 def test_route_ignores_query_string():

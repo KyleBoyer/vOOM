@@ -123,6 +123,40 @@ def test_qwen3vl_loads_video_total_pixel_bounds(tmp_path):
     assert loaded.eos_token_ids == (12, 13)
     assert loaded.video_min_pixels == 4_096
     assert loaded.video_max_pixels == 25_165_824
+    assert loaded.vision_backend == "qwen3vl"
+
+
+def test_kimi_k3_preserves_outer_architecture_and_vision_contract(tmp_path):
+    config = {
+        "model_type": "kimi_k3",
+        "architectures": ["KimiK3ForConditionalGeneration"],
+        "text_config": _text_config(eos_token_id=12, vocab_size=32),
+        "vision_config": {
+            "patch_size": 14,
+            "merge_kernel_size": [2, 2],
+            "mm_projector_type": "patchmergerv2",
+        },
+        "media_placeholder_token_id": 20,
+    }
+    _write_config(tmp_path, config)
+
+    loaded = ModelConfig.from_dir(tmp_path)
+
+    assert loaded.model_type == "kimi_k3"
+    assert loaded.vision_backend == "kimi_k3"
+    assert loaded.architectures == ("KimiK3ForConditionalGeneration",)
+    assert loaded.media_placeholder_token_id == 20
+    assert loaded.vision_config == config["vision_config"]
+
+
+@pytest.mark.parametrize("architectures", ["KimiK3ForConditionalGeneration", [""]])
+def test_invalid_architecture_contract_fails_closed(tmp_path, architectures):
+    config = _text_config()
+    config["architectures"] = architectures
+    _write_config(tmp_path, config)
+
+    with pytest.raises(ValueError, match="architectures"):
+        ModelConfig.from_dir(tmp_path)
 
 
 @pytest.mark.parametrize(
