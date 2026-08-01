@@ -125,6 +125,188 @@ INELIGIBLE_TITLES = (
     "INDIA_UNRATED", "JULIET_TVPG")
 
 
+def load_kai_tool_result_export(path: Path) -> tuple[list[dict], dict]:
+    """Load exact paginated Plex calls/results from a private Kai export.
+
+    The export stays local and unmodified.  The returned identity contains
+    only hashes/counts/contract witnesses; callers append the exact call and
+    result objects to the captured request in memory.  This closes the old
+    profiler's most important realism gap: its ten invented rows did not have
+    the same payload shape or answer cardinality as live Plex traffic.
+    """
+    raw = path.read_bytes()
+    value = json.loads(raw)
+    messages = value.get("messages")
+    if not isinstance(messages, list):
+        raise ValueError("Kai export has no messages array")
+    calls = []
+    for message in messages:
+        if not isinstance(message, dict) or message.get("role") != "assistant":
+            continue
+        content = message.get("content")
+        if not isinstance(content, list):
+            continue
+        for part in content:
+            if (not isinstance(part, dict)
+                    or part.get("type") != "tool-call"
+                    or part.get("toolName") != PLEX_MEDIA_TOOL):
+                continue
+            arguments = part.get("args")
+            result = part.get("result")
+            if not isinstance(arguments, dict) or not isinstance(result, dict):
+                raise ValueError("Kai Plex call is missing object args/result")
+            media = result.get("media")
+            if not isinstance(media, list) or any(
+                    not isinstance(row, dict) for row in media):
+                raise ValueError("Kai Plex result media must be object rows")
+            try:
+                offset = int(arguments.get("offset", result.get("offset", 0)))
+                limit = int(arguments.get("limit", result.get("limit", 0)))
+                returned = int(result.get("returned"))
+                total = int(result.get("total"))
+            except (TypeError, ValueError) as error:
+                raise ValueError("Kai Plex pagination fields must be integers") from error
+            if (offset != int(result.get("offset", offset))
+                    or limit != int(result.get("limit", limit))
+                    or returned != len(media)
+                    or limit <= 0 or returned < 0 or total < returned
+                    or not isinstance(result.get("hasMore"), bool)):
+                raise ValueError("Kai Plex pagination contract is inconsistent")
+            calls.append({
+                "name": PLEX_MEDIA_TOOL,
+                "call_id": str(part.get("toolCallId") or f"call_export_{offset}"),
+                "arguments": copy.deepcopy(arguments),
+                "arguments_raw": json.dumps(
+                    arguments, ensure_ascii=False, separators=(",", ":")),
+                "result": copy.deepcopy(result),
+                "offset": offset,
+                "limit": limit,
+                "returned": returned,
+                "total": total,
+            })
+    if not calls:
+        raise ValueError("Kai export contains no Plex media calls")
+    calls.sort(key=lambda call: call["offset"])
+    totals = {call["total"] for call in calls}
+    if (len(totals) != 1
+            or calls[0]["offset"] != 0
+            or any(right["offset"] <= left["offset"]
+                   for left, right in zip(calls, calls[1:]))
+            or any(call["result"]["hasMore"] is not True for call in calls[:-1])
+            or calls[-1]["result"]["hasMore"] is not False
+            or sum(call["returned"] for call in calls) != calls[-1]["total"]):
+        raise ValueError("Kai export is not one complete monotonic page stream")
+    rows = [row for call in calls for row in call["result"]["media"]]
+    identity = {
+        "sha256": hashlib.sha256(raw).hexdigest(),
+        "bytes": len(raw),
+        "plex_calls": len(calls),
+        "offsets": [call["offset"] for call in calls],
+        "rows": len(rows),
+        "total": calls[-1]["total"],
+        "final_has_more": calls[-1]["result"]["hasMore"],
+        "root_path_evidence_available": any(
+            isinstance(row.get("rootFolderPath"), str)
+            and bool(row.get("rootFolderPath")) for row in rows),
+    }
+    return calls, identity
+
+
+def _actual_export_oracle(export_calls: list[dict]) -> dict:
+    """Derive the catalog answer supported by a broad media-list export.
+
+    The live endpoint returns section names but not root folder paths.  A
+    section whose name contains the standalone word Kid/Kids is therefore a
+    useful local proxy, not strict proof of the user's root-path predicate.
+    Keep that evidence limitation explicit so an inferred title match cannot
+    be mislabeled as a fully released-plugin-correct result.
+    """
+    movie_ladder = ("G", "PG", "PG-13", "R", "NC-17")
+    show_ladder = (
+        "TV-Y", "TV-Y7", "TV-Y7-FV", "TV-G", "TV-PG", "TV-14", "TV-MA")
+    rows = [row for call in export_calls for row in call["result"]["media"]]
+
+    def eligible(row: dict) -> bool:
+        root = str(row.get("rootFolderPath") or "")
+        excluded_by_location = (
+            "/kids/" in root.casefold()
+            if root else
+            bool(re.search(
+                r"\bkids?\b", str(row.get("sectionName") or ""), re.I)))
+        if excluded_by_location:
+            return False
+        media_type = row.get("type")
+        rating = row.get("contentRating")
+        if media_type == "movie" and rating in movie_ladder:
+            return movie_ladder.index(rating) <= movie_ladder.index("PG-13")
+        if media_type == "show" and rating in show_ladder:
+            return show_ladder.index(rating) <= show_ladder.index("TV-Y7")
+        return False
+
+    expected = tuple(str(row.get("title")) for row in rows
+                     if row.get("title") and eligible(row))
+    all_titles = tuple(str(row.get("title")) for row in rows if row.get("title"))
+    root_evidence = any(
+        isinstance(row.get("rootFolderPath"), str)
+        and bool(row.get("rootFolderPath")) for row in rows)
+    return {
+        "expected_titles": expected,
+        "all_titles": all_titles,
+        "expected_count": len(expected),
+        "catalog_count": len(rows),
+        "expected_titles_sha256": hashlib.sha256(
+            "\n".join(sorted(expected)).encode("utf-8")).hexdigest(),
+        "root_path_evidence_available": root_evidence,
+        "exclusion_basis": (
+            "rootFolderPath" if root_evidence else
+            "sectionName Kid/Kids proxy; strict root predicate unavailable"),
+    }
+
+
+def _mentioned_catalog_titles(text: str, titles: tuple[str, ...]) -> set[str]:
+    """Find non-overlapping known titles, preferring the longest title."""
+    occupied: list[tuple[int, int]] = []
+    found: set[str] = set()
+    for title in sorted(set(titles), key=lambda value: (-len(value), value)):
+        pattern = re.compile(
+            r"(?<![\w])" + re.escape(title) + r"(?![\w])", re.I)
+        for match in pattern.finditer(text or ""):
+            span = match.span()
+            if any(span[0] < end and start < span[1]
+                   for start, end in occupied):
+                continue
+            occupied.append(span)
+            found.add(title)
+    return found
+
+
+def score_actual_export(final_text: str, export_calls: list[dict]) -> dict:
+    """Score final synthesis against every row in an exact Kai result stream."""
+    oracle = _actual_export_oracle(export_calls)
+    expected = set(oracle["expected_titles"])
+    mentioned = _mentioned_catalog_titles(
+        _harmony_final_channel(final_text), oracle["all_titles"])
+    missing = expected - mentioned
+    unexpected = mentioned - expected
+    inferred_match = not missing and not unexpected
+    return {
+        "inferred_catalog_match": inferred_match,
+        "strict_evidence_passed": bool(
+            inferred_match and oracle["root_path_evidence_available"]),
+        "expected_count": len(expected),
+        "mentioned_expected_count": len(expected & mentioned),
+        "mentioned_ineligible_count": len(unexpected),
+        "missing_count": len(missing),
+        "unexpected_count": len(unexpected),
+        "missing_examples": sorted(missing)[:10],
+        "unexpected_examples": sorted(unexpected)[:10],
+        "catalog_count": oracle["catalog_count"],
+        "expected_titles_sha256": oracle["expected_titles_sha256"],
+        "root_path_evidence_available": oracle["root_path_evidence_available"],
+        "exclusion_basis": oracle["exclusion_basis"],
+    }
+
+
 def _pressure() -> dict[str, int]:
     memory = psutil.virtual_memory()
     swap = psutil.swap_memory()
@@ -316,7 +498,8 @@ def load_profile_request(capture: Path, model: str, profile: str,
                          reasoning_effort: str | None = None,
                          temperature: float = 0.0,
                          tool_choice: str = "capture",
-                         tool_schema_profile: str = "full") -> tuple[dict, dict]:
+                         tool_schema_profile: str = "full", *,
+                         preserve_capture_shape: bool = False) -> tuple[dict, dict]:
     """Return a runnable request and non-sensitive capture identity."""
     if (tool_schema_profile != "full"
             and profile not in ("focused", "captured-adapted")):
@@ -376,19 +559,24 @@ def load_profile_request(capture: Path, model: str, profile: str,
         raise ValueError(f"unknown profile {profile!r}")
 
     request["model"] = model
-    request["stream"] = False
-    request["store"] = False
-    request["temperature"] = float(temperature)
-    # Each synthetic page must inform the next offset.  Speculative parallel
-    # page calls would be executed against no prior result and cannot prove
-    # pagination comprehension, so make the replay deliberately sequential.
-    request["parallel_tool_calls"] = False
-    request["max_output_tokens"] = max_output_tokens
-    request.pop("max_tokens", None)
-    if tool_choice == "specific":
-        request["tool_choice"] = {"type": "function", "name": PLEX_TOOL}
+    if not preserve_capture_shape:
+        request["stream"] = False
+        request["store"] = False
+        request["temperature"] = float(temperature)
+        # Each synthetic page must inform the next offset. Speculative parallel
+        # calls cannot prove pagination comprehension, so keep the legacy
+        # profiler sequential. Export-terminal replay may instead preserve the
+        # original streaming/temperature/absent-cap request verbatim.
+        request["parallel_tool_calls"] = False
+        request["max_output_tokens"] = max_output_tokens
+        request.pop("max_tokens", None)
+        if tool_choice == "specific":
+            request["tool_choice"] = {"type": "function", "name": PLEX_TOOL}
+        elif tool_choice != "capture":
+            request["tool_choice"] = tool_choice
     elif tool_choice != "capture":
-        request["tool_choice"] = tool_choice
+        raise ValueError(
+            "preserve_capture_shape cannot override the captured tool choice")
     if reasoning_effort is not None:
         request["reasoning"] = {"effort": reasoning_effort}
     identity = {
@@ -400,6 +588,11 @@ def load_profile_request(capture: Path, model: str, profile: str,
         "temperature": float(temperature),
         "tool_choice": tool_choice,
         "tool_schema_profile": tool_schema_profile,
+        "preserve_capture_shape": bool(preserve_capture_shape),
+        "effective_stream": request.get("stream", False),
+        "effective_temperature": request.get("temperature"),
+        "effective_output_cap": request.get(
+            "max_output_tokens", request.get("max_tokens")),
     }
     return request, identity
 
@@ -413,7 +606,29 @@ def _post(url: str, request: dict, timeout: float) -> tuple[dict, float]:
     started = time.perf_counter()
     try:
         with urllib.request.urlopen(http_request, timeout=timeout) as response:
-            return json.loads(response.read()), time.perf_counter() - started
+            body = response.read()
+            content_type = response.headers.get("Content-Type", "")
+            if "text/event-stream" not in content_type:
+                return json.loads(body), time.perf_counter() - started
+            terminal = None
+            for line in body.decode("utf-8", errors="replace").splitlines():
+                if not line.startswith("data:"):
+                    continue
+                payload = line[5:].strip()
+                if not payload or payload == "[DONE]":
+                    continue
+                try:
+                    event = json.loads(payload)
+                except ValueError:
+                    continue
+                if event.get("type") in (
+                        "response.completed", "response.incomplete",
+                        "response.failed") and isinstance(
+                            event.get("response"), dict):
+                    terminal = event["response"]
+            if terminal is None:
+                raise ValueError("Responses SSE stream had no terminal response")
+            return terminal, time.perf_counter() - started
     except urllib.error.HTTPError as error:
         body = error.read()
         try:
@@ -633,6 +848,75 @@ def _append_call_and_result(request: dict, call: dict, page: dict) -> None:
     })
 
 
+def _append_export_history(request: dict, export_calls: list[dict]) -> None:
+    for call in export_calls:
+        _append_call_and_result(request, call, call["result"])
+
+
+def _response_turn(response: dict, wall: float, turn: int) -> dict:
+    calls = response_calls(response)
+    return {
+        "turn": turn,
+        "wall_seconds": round(wall, 4),
+        "usage": response.get("usage"),
+        "timing": response.get("vmodel_timing"),
+        "cache_phases": response.get("vmodel_cache_phases"),
+        "tool_selection": response.get("vmodel_tool_selection"),
+        "constraint": response.get("vmodel_constraint"),
+        "call_names": [call.get("name") for call in calls],
+        "error": response.get("error"),
+        "response_status": response.get("status"),
+    }
+
+
+def run_export_terminal_profile(request: dict, export_calls: list[dict],
+                                url: str, timeout: float,
+                                repeats: int = 1) -> dict:
+    """Replay the exact completed Kai page stream into final synthesis."""
+    if repeats <= 0:
+        raise ValueError("repeats must be positive")
+    replay = copy.deepcopy(request)
+    _append_export_history(replay, export_calls)
+    if replay.get("tool_choice") == "required" or isinstance(
+            replay.get("tool_choice"), dict):
+        replay["tool_choice"] = "auto"
+    pressure_before = _pressure()
+    turns = []
+    scores = []
+    final_texts = []
+    started = time.perf_counter()
+    for repeat in range(repeats):
+        response, wall = _post(url, replay, timeout)
+        turns.append(_response_turn(response, wall, repeat + 1))
+        text = response_text(response)
+        final_texts.append(text)
+        scores.append(score_actual_export(text, export_calls))
+        if response.get("error"):
+            break
+    pressure_after = _pressure()
+    return {
+        "gate": "plex-agent-kai-export-terminal-v1",
+        "model": request.get("model"),
+        # The export itself lacks rootFolderPath, so this conservative top-level
+        # pass means exact catalog inference only; strict evidence is reported
+        # separately and cannot silently become true from section-name proxying.
+        "passed": bool(scores and all(
+            score["inferred_catalog_match"] for score in scores)),
+        "strict_evidence_passed": bool(scores and all(
+            score["strict_evidence_passed"] for score in scores)),
+        "scores": scores,
+        "turns": turns,
+        "final_text": final_texts[-1] if final_texts else "",
+        "repeat_output_sha256": [
+            hashlib.sha256(text.encode("utf-8")).hexdigest()
+            for text in final_texts
+        ],
+        "wall_seconds": round(time.perf_counter() - started, 4),
+        "pressure_before": pressure_before,
+        "pressure_after": pressure_after,
+    }
+
+
 def run_profile(request: dict, url: str, timeout: float,
                 max_tool_rounds: int) -> dict:
     pressure_before = _pressure()
@@ -647,18 +931,7 @@ def run_profile(request: dict, url: str, timeout: float,
         calls = response_calls(response)
         text = response_text(response)
         reasoning = response.get("vmodel_reasoning")
-        turns.append({
-            "turn": turn_index + 1,
-            "wall_seconds": round(wall, 4),
-            "usage": response.get("usage"),
-            "timing": response.get("vmodel_timing"),
-            "cache_phases": response.get("vmodel_cache_phases"),
-            "tool_selection": response.get("vmodel_tool_selection"),
-            "constraint": response.get("vmodel_constraint"),
-            "call_names": [call.get("name") for call in calls],
-            "error": response.get("error"),
-            "response_status": response.get("status"),
-        })
+        turns.append(_response_turn(response, wall, turn_index + 1))
         if response.get("error"):
             break
         if text:
@@ -751,21 +1024,46 @@ def main() -> int:
         "--policy-adapter", action="store_true",
         help="also score the explicit specialist+deterministic Plex pipeline",
     )
+    parser.add_argument(
+        "--kai-tool-export", type=Path,
+        help=(
+            "append the exact completed Plex call/result history from a "
+            "private Kai conversation export and benchmark final synthesis"),
+    )
+    parser.add_argument(
+        "--repeat-requests", type=int, default=1,
+        help="repeat an export-backed terminal request in one server process",
+    )
+    parser.add_argument(
+        "--preserve-capture-shape", action="store_true",
+        help=(
+            "preserve captured streaming, temperature, tool choice, and absent "
+            "output cap; only the requested model is changed"),
+    )
     parser.add_argument("--start-server", action="store_true")
     parser.add_argument("--server-ready-timeout", type=float, default=120)
     parser.add_argument("--server-log", type=Path)
     parser.add_argument("--result-json", type=Path)
     args = parser.parse_args()
     if (args.timeout <= 0 or args.max_output_tokens <= 0
-            or args.max_tool_rounds < 0 or args.temperature < 0):
+            or args.max_tool_rounds < 0 or args.temperature < 0
+            or args.repeat_requests <= 0):
         parser.error(
             "timeouts/output must be positive; tool rounds and temperature "
             "must be nonnegative")
+    if args.kai_tool_export is not None and args.policy_adapter:
+        parser.error("--policy-adapter cannot be combined with --kai-tool-export")
 
     request, identity = load_profile_request(
         args.capture, args.model, args.profile, args.max_output_tokens,
         args.reasoning_effort, args.temperature, args.tool_choice,
-        args.tool_schema_profile)
+        args.tool_schema_profile,
+        preserve_capture_shape=args.preserve_capture_shape)
+    export_calls = None
+    export_identity = None
+    if args.kai_tool_export is not None:
+        export_calls, export_identity = load_kai_tool_result_export(
+            args.kai_tool_export)
     process = None
     log_file = None
     try:
@@ -780,7 +1078,13 @@ def main() -> int:
                 [sys.executable, "-m", "runtime.server", "--port", str(port)],
                 stdout=log_file, stderr=subprocess.STDOUT)
             _wait_for_server(args.url, process, args.server_ready_timeout)
-        result = run_profile(request, args.url, args.timeout, args.max_tool_rounds)
+        result = (
+            run_export_terminal_profile(
+                request, export_calls, args.url, args.timeout,
+                repeats=args.repeat_requests)
+            if export_calls is not None else
+            run_profile(request, args.url, args.timeout, args.max_tool_rounds)
+        )
     finally:
         if process is not None:
             process.terminate()
@@ -792,6 +1096,8 @@ def main() -> int:
         if log_file is not None:
             log_file.close()
     result["capture"] = identity
+    if export_identity is not None:
+        result["kai_tool_export"] = export_identity
     if args.policy_adapter:
         result["policy_adapter"] = evaluate_plex_policy_adapter(result["calls"])
         if result.get("turns"):

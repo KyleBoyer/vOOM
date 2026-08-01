@@ -152,6 +152,21 @@ def test_builtin_k3_and_qwen9_profiles_pin_validated_values():
     assert task_settings[
         "VMODEL_FAST_TOOL_GATEWAY_EXECUTION_CONTEXT"] == "task"
 
+    stationary_order, stationary_settings = resolve_runtime_profiles(
+        ("gpt-oss-120b-tool-agent-layer-stationary",), catalog)
+    assert stationary_order == (
+        "agent-tool-gateway",
+        "gpt-oss-120b-tool-agent",
+        "gpt-oss-120b-tool-agent-task",
+        "gpt-oss-120b-tool-agent-layer-stationary",
+    )
+    assert stationary_settings[
+        "VMODEL_GPTOSS_LAYER_STATIONARY_PREFILL"] == "1"
+    assert stationary_settings["VMODEL_GPTOSS_PREFILL_CHUNK_SIZE"] == "128"
+    assert stationary_settings["VMODEL_GPTOSS_PREFILL_EXPERT_BATCH"] == "8"
+    assert stationary_settings["VMODEL_GPTOSS_HOT_PROMPT_KV"] == "1"
+    assert stationary_settings["VMODEL_GRAMMAR_FAST_FORWARD"] == "1"
+
     k3_order, k3_settings = resolve_runtime_profiles((
         "kimi-k3-exact-streaming",
         "kimi-k3-adaptive-context",

@@ -4,9 +4,12 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent / "fixtures"))
 
-from plex_agent_profile import (PLEX_TOOL, compact_plex_planner_tool,
+from plex_agent_profile import (PLEX_MEDIA_TOOL, PLEX_TOOL,
+                                compact_plex_planner_tool,
                                 evaluate_plex_policy_adapter,
-                                load_profile_request, score_profile)
+                                load_kai_tool_result_export,
+                                load_profile_request, score_actual_export,
+                                score_profile)
 
 
 def _call(**arguments):
@@ -363,6 +366,63 @@ def test_truncated_harmony_analysis_still_fails_without_a_final_channel():
     text = "analysisALPHA_G include. ECHO_R excluded. Still verifying"
     result = score_profile(calls, text)
     assert result["passed"] is False
+
+
+def test_exact_kai_export_pages_drive_full_catalog_oracle(tmp_path):
+    rows = [
+        {"title": "Allowed Movie", "type": "movie", "contentRating": "PG-13",
+         "sectionName": "Movies"},
+        {"title": "Too Mature", "type": "movie", "contentRating": "R",
+         "sectionName": "Movies"},
+        {"title": "Allowed Show", "type": "show", "contentRating": "TV-Y7",
+         "sectionName": "TV Shows"},
+        {"title": "Kid Root Proxy", "type": "movie", "contentRating": "G",
+         "sectionName": "Kid Movies"},
+    ]
+    parts = []
+    for offset in (0, 2):
+        page = rows[offset:offset + 2]
+        parts.append({
+            "type": "tool-call", "toolName": PLEX_MEDIA_TOOL,
+            "toolCallId": f"call_{offset}", "args": {"limit": 2, "offset": offset},
+            "result": {"offset": offset, "limit": 2, "returned": len(page),
+                       "total": 4, "hasMore": offset == 0, "media": page},
+        })
+    export = tmp_path / "kai.json"
+    export.write_text(json.dumps({
+        "messages": [{"role": "assistant", "content": parts}],
+    }))
+
+    calls, identity = load_kai_tool_result_export(export)
+    assert identity["offsets"] == [0, 2]
+    assert identity["rows"] == 4
+    assert not identity["root_path_evidence_available"]
+
+    score = score_actual_export("Allowed Movie\nAllowed Show", calls)
+    assert score["inferred_catalog_match"]
+    assert not score["strict_evidence_passed"]
+    assert score["expected_count"] == 2
+    assert score["mentioned_ineligible_count"] == 0
+
+
+def test_kai_export_oracle_rejects_unrelated_live_answer(tmp_path):
+    export = tmp_path / "kai.json"
+    export.write_text(json.dumps({
+        "messages": [{"role": "assistant", "content": [{
+            "type": "tool-call", "toolName": PLEX_MEDIA_TOOL,
+            "toolCallId": "call_0", "args": {"limit": 100, "offset": 0},
+            "result": {"offset": 0, "limit": 100, "returned": 1,
+                       "total": 1, "hasMore": False, "media": [{
+                           "title": "Expected", "type": "movie",
+                           "contentRating": "PG", "sectionName": "Movies",
+                       }]},
+        }]}],
+    }))
+    calls, _identity = load_kai_tool_result_export(export)
+    score = score_actual_export(
+        "Who is mentioned in the show Young Sheldon?", calls)
+    assert not score["inferred_catalog_match"]
+    assert score["missing_count"] == 1
 
 
 def test_kids_exclusion_done_in_reasoning_still_scores_when_delivered_out_of_band():

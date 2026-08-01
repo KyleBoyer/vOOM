@@ -144,39 +144,195 @@ def _group_routes(idx: mx.array, weights: mx.array
     return groups
 
 
-def run_gptoss_block(
-    x: mx.array, w: dict, prefix: str, cfg: ModelConfig, kv, layer: int, offset: int,
-    get_experts, freqs: mx.array, mscale: float, mlp_last_only: bool = False,
+def _gptoss_attention_residual(
+    x: mx.array, w: dict, prefix: str, cfg: ModelConfig, kv, layer: int,
+    offset: int, freqs: mx.array, mscale: float,
 ) -> mx.array:
-    h = mx.fast.rms_norm(x, w[f"{prefix}.input_layernorm.weight"], cfg.rms_norm_eps)
-    x = x + _attention_gptoss(h, w, prefix, cfg, kv, layer, offset, freqs, mscale)
-    if mlp_last_only:  # F36: KV is built; only the last position feeds the logits
-        x = x[:, -1:, :]
+    """Run GPT-OSS's input norm and attention residual for one causal tile.
 
-    h = mx.fast.rms_norm(x, w[f"{prefix}.post_attention_layernorm.weight"], cfg.rms_norm_eps)
-    logits = _linear(h, w, f"{prefix}.mlp.router")  # (1, L, E), bf16 + bias
+    This split is intentionally just the first half of ``run_gptoss_block``.
+    Keeping it public-to-the-runtime lets the layer-stationary prefill path
+    advance each layer's KV in bounded position tiles before routing the
+    complete post-attention sequence once.  No parameter, normalization, RoPE,
+    sink, masking, or residual arithmetic differs from the ordinary block.
+    """
+    h = mx.fast.rms_norm(
+        x, w[f"{prefix}.input_layernorm.weight"], cfg.rms_norm_eps)
+    return x + _attention_gptoss(
+        h, w, prefix, cfg, kv, layer, offset, freqs, mscale)
+
+
+def _gptoss_mlp_residual(
+    x: mx.array, w: dict, prefix: str, cfg: ModelConfig, layer: int,
+    get_experts, *, iter_expert_batches=None, profile=None,
+) -> mx.array:
+    """Run GPT-OSS's router and MXFP4 MoE with bounded expert lifetime.
+
+    Route selection and contribution order are identical to the historical
+    monolithic block.  When ``iter_expert_batches`` is supplied, each bounded
+    page mapping is consumed and the accumulated output is materialized before
+    requesting the next mapping.  This is the same F74-v2 ownership boundary
+    used by the other paged MoE runners and prevents a full 128-expert union
+    from remaining strongly referenced during long prefill ranges.
+    """
+    h = mx.fast.rms_norm(
+        x, w[f"{prefix}.post_attention_layernorm.weight"], cfg.rms_norm_eps)
+    logits = _linear(h, w, f"{prefix}.mlp.router")
     k = cfg.num_experts_per_tok
     idx = mx.argpartition(-logits, kth=k - 1, axis=-1)[..., :k]
     sel = mx.take_along_axis(logits, idx, axis=-1)
-    pw = mx.softmax(sel.astype(mx.float32), axis=-1)  # gpt-oss: softmax over the top-k logits
+    pw = mx.softmax(sel.astype(mx.float32), axis=-1)
     mx.eval(idx, pw)
 
     groups = _group_routes(idx, pw)
+    # Compute contributions in the exact historical insertion order.  Fetch
+    # order was previously sorted, but the old loop consumed ``groups.items``;
+    # the bounded producer may fetch in this same consumption order without
+    # changing any arithmetic.
+    expert_ids = list(groups)
+    positions_by_expert = {
+        expert: [position for position, _weight in groups[expert]]
+        for expert in expert_ids
+    }
+    if iter_expert_batches is None:
+        pages = get_experts(
+            layer, sorted(expert_ids), positions=positions_by_expert)
+        batches = ((expert_ids, pages),)
+    else:
+        batches = iter_expert_batches(
+            layer, expert_ids, positions=positions_by_expert)
 
     limit = cfg.swiglu_limit
     out = mx.zeros_like(h)
-    experts = get_experts(layer, sorted(groups), positions={e: [pt for pt, _ in v] for e, v in groups.items()})
-    for e, plist in groups.items():
-        ew = experts[e]
-        p = f"{prefix}.mlp.experts.{e}"
-        positions = [pt for pt, _ in plist]
-        weights = mx.array([wt for _, wt in plist]).astype(h.dtype)
-        hx = h[:, positions, :]
-        gu = _mxfp4_linear(hx, ew[f"{p}.gate_up_blocks"], ew[f"{p}.gate_up_scales"], ew[f"{p}.gate_up_bias"])
-        gate, up = gu[..., 0::2], gu[..., 1::2]
-        gate = mx.minimum(gate, limit)
-        up = mx.clip(up, -limit, limit)
-        glu = gate * mx.sigmoid(gate * 1.702)
-        y = _mxfp4_linear((up + 1) * glu, ew[f"{p}.down_blocks"], ew[f"{p}.down_scales"], ew[f"{p}.down_bias"])
-        out = out.at[:, positions, :].add(y * weights[None, :, None])
+    for batch_ids, pages in batches:
+        for expert in batch_ids:
+            plist = groups[expert]
+            ew = pages[expert]
+            p = f"{prefix}.mlp.experts.{expert}"
+            positions = [position for position, _weight in plist]
+            route_weights = mx.array(
+                [weight for _position, weight in plist]).astype(h.dtype)
+            hx = h[:, positions, :]
+            gu = _mxfp4_linear(
+                hx, ew[f"{p}.gate_up_blocks"],
+                ew[f"{p}.gate_up_scales"], ew[f"{p}.gate_up_bias"])
+            gate, up = gu[..., 0::2], gu[..., 1::2]
+            gate = mx.minimum(gate, limit)
+            up = mx.clip(up, -limit, limit)
+            glu = gate * mx.sigmoid(gate * 1.702)
+            y = _mxfp4_linear(
+                (up + 1) * glu, ew[f"{p}.down_blocks"],
+                ew[f"{p}.down_scales"], ew[f"{p}.down_bias"])
+            out = out.at[:, positions, :].add(
+                y * route_weights[None, :, None])
+        if iter_expert_batches is not None:
+            # Materialize the accumulated activation before the producer is
+            # resumed so no lazy graph can retain this batch's expert pages.
+            mx.eval(out)
+        del pages
     return x + out
+
+
+def _gptoss_tiled_mlp_residual(
+    tiles: list[mx.array], w: dict, prefix: str, cfg: ModelConfig, layer: int,
+    get_experts, *, iter_expert_batches=None, profile=None,
+) -> mx.array:
+    """Evaluate a tile-equivalent MoE while fetching each expert union once.
+
+    Layer-stationary prefill must retain the ordinary fixed tile's matrix
+    shapes as well as route/contribution order: changing a router or expert
+    GEMM from (tile, hidden) to (whole_prompt, hidden) can select a different
+    floating kernel. Route and normalize every tile independently, materialize
+    each expert contribution while its bounded page is live, then reconstruct
+    each tile in its original first-seen expert order after all pages are gone.
+    The retained contribution volume is only routed activation output
+    (positions * top-k * hidden), never expert weights.
+    """
+    if not tiles:
+        raise ValueError("GPT-OSS tiled MLP needs at least one tile")
+    routed = []
+    expert_ids: list[int] = []
+    positions_by_expert: dict[int, list[int]] = {}
+    position_base = 0
+    for x in tiles:
+        h = mx.fast.rms_norm(
+            x, w[f"{prefix}.post_attention_layernorm.weight"],
+            cfg.rms_norm_eps)
+        logits = _linear(h, w, f"{prefix}.mlp.router")
+        k = cfg.num_experts_per_tok
+        idx = mx.argpartition(-logits, kth=k - 1, axis=-1)[..., :k]
+        sel = mx.take_along_axis(logits, idx, axis=-1)
+        pw = mx.softmax(sel.astype(mx.float32), axis=-1)
+        mx.eval(idx, pw)
+        groups = _group_routes(idx, pw)
+        for expert, plist in groups.items():
+            if expert not in positions_by_expert:
+                expert_ids.append(expert)
+                positions_by_expert[expert] = []
+            positions_by_expert[expert].extend(
+                position_base + position for position, _weight in plist)
+        routed.append((x, h, groups))
+        position_base += int(x.shape[1])
+
+    if iter_expert_batches is None:
+        pages = get_experts(
+            layer, sorted(expert_ids), positions=positions_by_expert)
+        batches = ((expert_ids, pages),)
+    else:
+        batches = iter_expert_batches(
+            layer, expert_ids, positions=positions_by_expert)
+
+    limit = cfg.swiglu_limit
+    contributions: dict[tuple[int, int], tuple[list[int], mx.array]] = {}
+    for batch_ids, pages in batches:
+        for expert in batch_ids:
+            ew = pages[expert]
+            p = f"{prefix}.mlp.experts.{expert}"
+            for tile_index, (_x, h, groups) in enumerate(routed):
+                plist = groups.get(expert)
+                if not plist:
+                    continue
+                positions = [position for position, _weight in plist]
+                route_weights = mx.array(
+                    [weight for _position, weight in plist]).astype(h.dtype)
+                hx = h[:, positions, :]
+                gu = _mxfp4_linear(
+                    hx, ew[f"{p}.gate_up_blocks"],
+                    ew[f"{p}.gate_up_scales"], ew[f"{p}.gate_up_bias"])
+                gate, up = gu[..., 0::2], gu[..., 1::2]
+                gate = mx.minimum(gate, limit)
+                up = mx.clip(up, -limit, limit)
+                glu = gate * mx.sigmoid(gate * 1.702)
+                contribution = _mxfp4_linear(
+                    (up + 1) * glu, ew[f"{p}.down_blocks"],
+                    ew[f"{p}.down_scales"], ew[f"{p}.down_bias"])
+                contribution = contribution * route_weights[None, :, None]
+                mx.eval(contribution)
+                contributions[(tile_index, expert)] = (
+                    positions, contribution)
+        del pages
+
+    outputs = []
+    for tile_index, (x, h, groups) in enumerate(routed):
+        out = mx.zeros_like(h)
+        for expert in groups:
+            positions, contribution = contributions.pop((tile_index, expert))
+            out = out.at[:, positions, :].add(contribution)
+        outputs.append(x + out)
+    if contributions:
+        raise RuntimeError("unconsumed GPT-OSS tiled expert contributions")
+    return outputs[0] if len(outputs) == 1 else mx.concatenate(outputs, axis=1)
+
+
+def run_gptoss_block(
+    x: mx.array, w: dict, prefix: str, cfg: ModelConfig, kv, layer: int, offset: int,
+    get_experts, freqs: mx.array, mscale: float, mlp_last_only: bool = False,
+    iter_expert_batches=None, profile=None,
+) -> mx.array:
+    x = _gptoss_attention_residual(
+        x, w, prefix, cfg, kv, layer, offset, freqs, mscale)
+    if mlp_last_only:  # F36: KV is built; only the last position feeds the logits
+        x = x[:, -1:, :]
+    return _gptoss_mlp_residual(
+        x, w, prefix, cfg, layer, get_experts,
+        iter_expert_batches=iter_expert_batches, profile=profile)

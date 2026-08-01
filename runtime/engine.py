@@ -3174,6 +3174,12 @@ class StreamingEngine:
                     x, w, f"model.layers.{i}", self.cfg, kv, i, offset,
                     self._get_experts, self._rope_freqs, self._mscale,
                     mlp_last_only=last_only,
+                    iter_expert_batches=(
+                        self._iter_expert_batches
+                        if (self.rc.expert_fetch_batch
+                            or self.rc.expert_batch_prefetch)
+                        else None),
+                    profile=profiler,
                 )
             elif self.cfg.model_type in ("glm_moe_dsa", "kimi_k25", "glm4_moe_lite"):
                 # F93: Kimi K2.5's language model is architecturally identical
@@ -3475,6 +3481,126 @@ class StreamingEngine:
                     cache_after=profiler.cache_snapshot(self.cache),
                     layer_type=self._profile_layer_type(i),
                 )
+            if on_progress is not None:
+                on_progress({
+                    "phase": "prefill_layer",
+                    "completed_layers": i + 1,
+                    "total_layers": n,
+                    "total_tokens": total,
+                    "cache_source": "cold",
+                })
+            self._record_layer_transient(
+                total, i,
+                _resident_adjusted_transient(
+                    active_before, mx.get_active_memory(),
+                    mx.get_peak_memory()))
+            self._note_true_peak()
+            del w
+        self._restore_aggregate_layer_transient(total)
+        return x
+
+    def _layer_stationary_gptoss_sweep(
+            self, x: mx.array, kv: KVCache, offset: int,
+            tile_width: int, on_progress=None) -> mx.array:
+        """Layer-major GPT-OSS prefill with bounded causal tiles and experts.
+
+        GPT-OSS's ordinary safe prefill is chunk-major: every 64--512 position
+        chunk streams all 36 out-of-core layer trunks again.  This inverse loop
+        fetches one layer, advances only that layer's released attention/KV in
+        the same causal tile order, concatenates the post-attention rows, and
+        evaluates the stateless router/MoE once for the complete range.  Each
+        layer page is therefore fetched once rather than once per prompt chunk.
+
+        The attention and MLP halves are the exact helpers used by
+        ``run_gptoss_block``. Expert contributions retain their historical
+        insertion order, while ``_iter_expert_batches`` materializes each
+        bounded page group before the next is fetched.  The path remains
+        explicit because full-model greedy equivalence and broad real-request
+        evidence are required before changing GPT-OSS's default schedule.
+        """
+        from .gptoss import (
+            _gptoss_attention_residual, _gptoss_tiled_mlp_residual)
+
+        if tile_width <= 0:
+            raise ValueError("tile_width must be positive")
+        n = self.cfg.num_hidden_layers
+        total = int(x.shape[1])
+        (self._layer_transient,
+         self._layer_transient_margin) = _layer_transient_for_positions(
+             total,
+             getattr(
+                 self, "_prefill_layer_transient_by_positions", {}
+             ).get(total, 0),
+             getattr(self, "_decode_layer_transient", 0))
+        profiler = self._request_profiler
+        if profiler is not None:
+            profiler.begin_sweep(total, path="layer_stationary_gptoss")
+        for i in range(n):
+            self._select_layer_transient(total, i)
+            if self.prefetcher:
+                for j in range(
+                        i + 1, min(i + 1 + self.rc.prefetch_depth, n)):
+                    self.prefetcher.schedule(
+                        self._layer_key(j), self._layer_names(j))
+
+            cache_before = (
+                profiler.cache_snapshot(self.cache)
+                if profiler is not None else None)
+            t0 = time.perf_counter()
+            layer_key = self._layer_key(i)
+            layer_names = self._layer_names(i)
+            if not self.cache.contains(layer_key):
+                incoming_page = self._layer_fetch_bytes_estimate(i)
+                if incoming_page:
+                    self.cache.prepare_for(incoming_page)
+                    if self.governor is not None:
+                        self.governor.reserve(incoming_page)
+            w = self.cache.get(layer_key, layer_names)
+            weight_wait_s = time.perf_counter() - t0
+            self.timer.add("weights_wait", weight_wait_s)
+
+            active_before = mx.get_active_memory()
+            mx.reset_peak_memory()
+            t0 = time.perf_counter()
+            tiles = []
+            pos = 0
+            while pos < total:
+                end = min(pos + tile_width, total)
+                if self.governor is not None and self._layer_transient:
+                    self.governor.reserve(
+                        self._layer_transient,
+                        margin=self._layer_transient_margin)
+                attention_t0 = time.perf_counter()
+                yt = _gptoss_attention_residual(
+                    x[:, pos:end, :], w, f"model.layers.{i}", self.cfg,
+                    kv, i, offset + pos, self._rope_freqs, self._mscale)
+                mx.eval(yt)
+                if profiler is not None and profiler.sync_substeps:
+                    profiler.record_substep(
+                        "attention", i,
+                        time.perf_counter() - attention_t0,
+                        positions=end - pos)
+                tiles.append(yt)
+                pos = end
+            mlp_t0 = time.perf_counter()
+            x = _gptoss_tiled_mlp_residual(
+                tiles, w, f"model.layers.{i}", self.cfg, i,
+                self._get_experts,
+                iter_expert_batches=self._iter_expert_batches,
+                profile=profiler)
+            mx.eval(x)
+            if profiler is not None and profiler.sync_substeps:
+                profiler.record_substep(
+                    "mlp", i, time.perf_counter() - mlp_t0,
+                    positions=total)
+            compute_s = time.perf_counter() - t0
+            self.timer.add("layer_compute", compute_s)
+            if profiler is not None:
+                profiler.record_layer(
+                    i, positions=total, weight_wait_s=weight_wait_s,
+                    compute_s=compute_s, cache_before=cache_before,
+                    cache_after=profiler.cache_snapshot(self.cache),
+                    layer_type=self._profile_layer_type(i))
             if on_progress is not None:
                 on_progress({
                     "phase": "prefill_layer",
@@ -5985,7 +6111,8 @@ class StreamingEngine:
                     boundary_layer_stationary = (
                         self.rc.layer_stationary_prefill
                         and self.cfg.model_type in (
-                            "qwen3_5", "qwen3_5_moe", "kimi_linear", "kimi_k3",
+                            "qwen3_5", "qwen3_5_moe", "gpt_oss",
+                            "kimi_linear", "kimi_k3",
                             "glm_moe_dsa", "kimi_k25", "glm4_moe_lite")
                         and not self.rc.adaptive_chunk_size
                         and not (
@@ -6007,6 +6134,11 @@ class StreamingEngine:
                                 on_progress=on_progress)
                         elif self.cfg.model_type == "kimi_k3":
                             bx = self._layer_stationary_kimi_k3_sweep(
+                                bx, kv, offset=pos,
+                                tile_width=boundary_chunk,
+                                on_progress=on_progress)
+                        elif self.cfg.model_type == "gpt_oss":
+                            bx = self._layer_stationary_gptoss_sweep(
                                 bx, kv, offset=pos,
                                 tile_width=boundary_chunk,
                                 on_progress=on_progress)
@@ -6124,7 +6256,8 @@ class StreamingEngine:
                 bool(chunk)
                 and self.rc.layer_stationary_prefill
                 and self.cfg.model_type in (
-                    "qwen3_5", "qwen3_5_moe", "kimi_linear", "kimi_k3",
+                    "qwen3_5", "qwen3_5_moe", "gpt_oss",
+                    "kimi_linear", "kimi_k3",
                     "glm_moe_dsa", "kimi_k25", "glm4_moe_lite")
                 and adaptive is None
                 and not (ckpt and kv_store is not None)
@@ -6137,7 +6270,8 @@ class StreamingEngine:
                 if not self.rc.layer_stationary_prefill:
                     blockers.append("disabled")
                 if self.cfg.model_type not in (
-                        "qwen3_5", "qwen3_5_moe", "kimi_linear", "kimi_k3",
+                        "qwen3_5", "qwen3_5_moe", "gpt_oss",
+                        "kimi_linear", "kimi_k3",
                         "glm_moe_dsa", "kimi_k25", "glm4_moe_lite"):
                     blockers.append("architecture")
                 if adaptive is not None:
@@ -6188,6 +6322,10 @@ class StreamingEngine:
                             on_progress=on_progress)
                     elif self.cfg.model_type == "kimi_k3":
                         xc = self._layer_stationary_kimi_k3_sweep(
+                            xc, kv, offset=pos, tile_width=chunk,
+                            on_progress=on_progress)
+                    elif self.cfg.model_type == "gpt_oss":
+                        xc = self._layer_stationary_gptoss_sweep(
                             xc, kv, offset=pos, tile_width=chunk,
                             on_progress=on_progress)
                     elif self.cfg.model_type in (

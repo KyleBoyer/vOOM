@@ -1500,8 +1500,66 @@ class EngineManager:
                     raise ValueError(
                         "VMODEL_GPTOSS_PREFILL_CHUNK_SIZE must be in [1, 512]")
                 rc.prefill_chunk_size = gptoss_prefill_chunk
-                rc.adaptive_chunk_size = True
+                layer_stationary_value = os.environ.get(
+                    "VMODEL_GPTOSS_LAYER_STATIONARY_PREFILL", "0")
+                if layer_stationary_value not in ("0", "1"):
+                    raise ValueError(
+                        "VMODEL_GPTOSS_LAYER_STATIONARY_PREFILL must be 0 or 1")
+                rc.layer_stationary_prefill = layer_stationary_value == "1"
+                # Layer-stationary attention already uses the declared chunk
+                # as its hard tile-memory bound. A resampled chunk schedule is
+                # both unnecessary and ineligible for the inverted layer loop,
+                # so retain F68 only on the established chunk-major default.
+                rc.adaptive_chunk_size = not rc.layer_stationary_prefill
                 rc.adaptive_chunk_safe_bytes = 0
+                try:
+                    rc.max_weight_cache_mb = int(os.environ.get(
+                        "VMODEL_GPTOSS_WEIGHT_CACHE_MB",
+                        str(rc.max_weight_cache_mb)))
+                    rc.expert_fetch_batch = int(os.environ.get(
+                        "VMODEL_GPTOSS_PREFILL_EXPERT_BATCH", "0"))
+                    rc.decode_expert_fetch_batch = int(os.environ.get(
+                        "VMODEL_GPTOSS_DECODE_EXPERT_BATCH", "0"))
+                except ValueError as error:
+                    raise ValueError(
+                        "VMODEL_GPTOSS cache/expert settings must be integers"
+                    ) from error
+                if not 1500 <= rc.max_weight_cache_mb <= 6500:
+                    raise ValueError(
+                        "VMODEL_GPTOSS_WEIGHT_CACHE_MB must be in [1500, 6500]")
+                if not 0 <= rc.expert_fetch_batch <= 32:
+                    raise ValueError(
+                        "VMODEL_GPTOSS_PREFILL_EXPERT_BATCH must be in [0, 32]")
+                if not 0 <= rc.decode_expert_fetch_batch <= 4:
+                    raise ValueError(
+                        "VMODEL_GPTOSS_DECODE_EXPERT_BATCH must be in [0, 4]")
+                hot_kv_value = os.environ.get(
+                    "VMODEL_GPTOSS_HOT_PROMPT_KV", "0")
+                if hot_kv_value not in ("0", "1"):
+                    raise ValueError(
+                        "VMODEL_GPTOSS_HOT_PROMPT_KV must be 0 or 1")
+                rc.hot_prompt_kv = hot_kv_value == "1"
+                if rc.hot_prompt_kv and not rc.layer_stationary_prefill:
+                    raise ValueError(
+                        "VMODEL_GPTOSS_HOT_PROMPT_KV requires fixed "
+                        "layer-stationary prefill")
+                if rc.hot_prompt_kv:
+                    try:
+                        rc.hot_prompt_kv_slots = int(os.environ.get(
+                            "VMODEL_GPTOSS_HOT_KV_SLOTS", "1"))
+                        rc.hot_prompt_kv_min_tokens = int(os.environ.get(
+                            "VMODEL_GPTOSS_HOT_KV_MIN_TOKENS", "16"))
+                    except ValueError as error:
+                        raise ValueError(
+                            "VMODEL_GPTOSS_HOT_KV settings must be integers"
+                        ) from error
+                    if not 1 <= rc.hot_prompt_kv_slots <= 4:
+                        raise ValueError(
+                            "VMODEL_GPTOSS_HOT_KV_SLOTS must be in [1, 4]")
+                    if rc.hot_prompt_kv_min_tokens < 0:
+                        raise ValueError(
+                            "VMODEL_GPTOSS_HOT_KV_MIN_TOKENS must be non-negative")
+                    rc.hot_prompt_kv_chunk_size = rc.prefill_chunk_size
                 # adaptive_chunk_size and a durable prompt-KV fingerprint are
                 # mutually exclusive (StreamingEngine.__init__ raises
                 # otherwise: an adaptive schedule's kernel/reduction path can

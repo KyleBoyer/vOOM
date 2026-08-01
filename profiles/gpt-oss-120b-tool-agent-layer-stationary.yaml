@@ -1,0 +1,21 @@
+schema: voom.runtime-profile.v1
+name: gpt-oss-120b-tool-agent-layer-stationary
+description: Experimental GPT-OSS-120B tool-agent path with bounded layer-stationary prefill and exact in-memory prompt repeats.
+notes:
+  - "Extends the explicit task-context tool profile; prompt/tool selection remains lossy, while the served checkpoint stays in its released native MXFP4/BF16 representation."
+  - "Inverts only the prefill schedule: each layer trunk is fetched once, attention advances in fixed 128-position causal tiles, and routed experts are consumed eight pages at a time in historical contribution order."
+  - "Retains one exact prompt endpoint for same-process repeats. Any token mismatch is a cold miss; no approximate LCP or request/content predicate is admitted."
+  - "The smaller evictable weight cache leaves headroom for retained GPT-OSS KV on this 16 GB host. The live governor may reclaim it further."
+  - "This remains explicit/default-off until released-weight greedy A/B, the real Kai result export, and a heterogeneous request corpus pass latency, quality, and <=8.5 GB Metal gates."
+extends:
+  - gpt-oss-120b-tool-agent-task
+settings:
+  VMODEL_GPTOSS_LAYER_STATIONARY_PREFILL: true
+  VMODEL_GPTOSS_PREFILL_CHUNK_SIZE: 128
+  VMODEL_GPTOSS_PREFILL_EXPERT_BATCH: 8
+  VMODEL_GPTOSS_DECODE_EXPERT_BATCH: 4
+  VMODEL_GPTOSS_WEIGHT_CACHE_MB: 4500
+  VMODEL_GPTOSS_HOT_PROMPT_KV: true
+  VMODEL_GPTOSS_HOT_KV_SLOTS: 1
+  VMODEL_GPTOSS_HOT_KV_MIN_TOKENS: 16
+  VMODEL_GRAMMAR_FAST_FORWARD: true
