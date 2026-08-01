@@ -22,13 +22,23 @@ from .layer_runner import _linear
 
 
 def yarn_params(cfg: ModelConfig) -> tuple[mx.array, float]:
-    """Return (rope freqs for mx.fast.rope, attention scaling mscale)."""
+    """Return released-model-correct YaRN parameters for ``mx.fast.rope``.
+
+    Transformers expresses YaRN as a linear blend of *inverse* frequencies,
+    whereas MLX's ``freqs=`` argument expects their reciprocal (the RoPE
+    denominators).  Blending the denominators directly is not equivalent, so
+    perform the reference blend first and invert only the final result.
+    GPT-OSS also publishes ``truncate: false`` and therefore uses the floating
+    correction bounds rather than the more common floor/ceil variant.
+    """
     rs = cfg.rope_scaling
     dim = cfg.head_dim
     base = cfg.rope_theta
-    inv = base ** (mx.arange(0, dim, 2) / dim)  # mx.fast.rope wants freqs, not inv_freq
+    pos_freqs = base ** (
+        mx.arange(0, dim, 2, dtype=mx.float32) / dim
+    )  # mx.fast.rope wants denominators, not inverse frequencies
     if not rs or rs.get("rope_type") != "yarn":
-        return inv, 1.0
+        return pos_freqs, 1.0
     factor = rs["factor"]
     orig_max = rs["original_max_position_embeddings"]
     beta_fast, beta_slow = rs.get("beta_fast", 32.0), rs.get("beta_slow", 1.0)
@@ -36,17 +46,30 @@ def yarn_params(cfg: ModelConfig) -> tuple[mx.array, float]:
     def correction_dim(num_rot):
         return dim * math.log(orig_max / (num_rot * 2 * math.pi)) / (2 * math.log(base))
 
-    low = math.floor(correction_dim(beta_fast))
-    high = math.ceil(correction_dim(beta_slow))
+    low = correction_dim(beta_fast)
+    high = correction_dim(beta_slow)
+    if rs.get("truncate", True):
+        low = math.floor(low)
+        high = math.ceil(high)
     low, high = max(low, 0), min(high, dim - 1)
-    ramp = mx.clip((mx.arange(dim // 2) - low) / max(high - low, 1e-3), 0.0, 1.0)
-    # YaRN: dims below `low` (high frequency, wavelength << context) EXTRAPOLATE
-    # (keep original denominators); dims above `high` INTERPOLATE (denominator
-    # * factor = slower rotation). The first release of this function had the
-    # blend swapped, which scrambled positions progressively with distance and
-    # degenerated every gpt-oss generation past ~40 tokens.
-    freqs = inv * (1 - ramp) + inv * factor * ramp
-    mscale = 0.1 * math.log(factor) + 1.0
+    denominator = high - low
+    if denominator == 0:
+        denominator = 0.001
+    ramp = mx.clip(
+        (mx.arange(dim // 2, dtype=mx.float32) - low) / denominator,
+        0.0,
+        1.0,
+    )
+
+    inv_freq_extrapolation = 1.0 / pos_freqs
+    inv_freq_interpolation = 1.0 / (factor * pos_freqs)
+    extrapolation_factor = 1.0 - ramp
+    inv_freq = (
+        inv_freq_interpolation * (1.0 - extrapolation_factor)
+        + inv_freq_extrapolation * extrapolation_factor
+    )
+    freqs = 1.0 / inv_freq
+    mscale = 1.0 if factor <= 1 else 0.1 * math.log(factor) + 1.0
     return freqs, mscale
 
 

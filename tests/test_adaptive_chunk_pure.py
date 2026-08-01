@@ -301,6 +301,29 @@ def test_expert_fetch_noise_does_not_collapse_chunk_size_when_residualized():
         f"with={proposed_with}")
 
 
+def test_finite_expert_pool_stops_charging_for_impossible_new_experts():
+    """The adversarial route bound becomes constant after all E experts."""
+    page_bytes = 15_000_000
+    per_token = 4 * page_bytes
+    pool_bytes = 128 * page_bytes
+    alpha = 1_000_000
+    budget = 3_000_000_000
+    ctrl = AdaptiveChunkController(
+        safe_bytes=10_000_000_000,
+        initial_chunk=64,
+        worst_case_expert_bytes_per_token=per_token,
+        max_expert_fetch_bytes=pool_bytes,
+    )
+    proposal = ctrl._safe_chunk_proposal(alpha, budget)
+    assert proposal == int((budget - pool_bytes) / alpha)
+    assert alpha * proposal + min(per_token * proposal, pool_bytes) <= budget
+
+    # Below the 32-token saturation point, this is exactly the historical
+    # worst-case per-token equation, not an expected-value approximation.
+    small_budget = (alpha + per_token) * 17
+    assert ctrl._safe_chunk_proposal(alpha, small_budget) == 17
+
+
 def _run_all() -> None:
     tests = [
         test_kv_telemetry_not_double_counted,
@@ -310,6 +333,7 @@ def _run_all() -> None:
         test_moe_routing_spike_does_not_break_safety_or_get_masked,
         test_bad_first_observation_does_not_permanently_poison_growth,
         test_expert_fetch_noise_does_not_collapse_chunk_size_when_residualized,
+        test_finite_expert_pool_stops_charging_for_impossible_new_experts,
         test_escalate_growth_cap_converges_faster_without_overshooting,
     ]
     for test in tests:

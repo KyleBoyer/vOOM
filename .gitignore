@@ -19,6 +19,11 @@ __pycache__/
 voom.local.yaml
 profiles.local/
 
+# Ollama store relocated off the internal disk per CLAUDE.md's fast-tier
+# policy. Contains model blobs AND ollama's id_ed25519 signing key -- never
+# commit it.
+ollama_models_internal_migrated/
+
 # Research journal / in-progress investigation notes -- not the shipped
 # runtime. See README.md for the curated, public-facing docs.
 STATUS.md

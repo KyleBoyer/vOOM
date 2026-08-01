@@ -1,0 +1,17 @@
+schema: voom.runtime-profile.v1
+name: qwen35-9b-tool-balanced-agent
+description: Resident Qwen3.5-9B with suffix-local selected interfaces for balanced multi-turn tool use.
+notes:
+  - Duplicates only the already-selected compact tool interface into the private activation result, keeping parameter constraints beside the latest intent.
+  - Packs the selected tool's prompt-side optional fields down to the 12 most relevant identifiers/descriptions; the public and executable schemas remain complete.
+  - Retains a larger 1024-token full-depth suffix and a short prompt-only intent anchor after tool results so completed calls can be synthesized instead of repeated.
+  - After an explicitly requested pagination stream returns only false hasMore flags, enters a text-only final-synthesis turn instead of exposing catalog tools again.
+  - The mechanism is independent of provider, tool names, parameter names, subject, temperature, and request fingerprint.
+  - This remains an explicit lossy profile until heterogeneous real-request and temperature gates justify any broader promotion.
+extends:
+  - qwen35-9b-depth-adaptive
+  - agent-tool-gateway
+settings:
+  VMODEL_MLX_LM_LOSSY_SUFFIX_PREFILL: "16:1024"
+  VMODEL_FAST_TOOL_GATEWAY_SUFFIX_CONTRACT: true
+  VMODEL_FAST_TOOL_GATEWAY_TERMINAL_PAGINATION_SYNTHESIS: true

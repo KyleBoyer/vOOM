@@ -105,6 +105,7 @@ import uuid
 import psutil
 from bisect import bisect_left
 from collections import OrderedDict
+from copy import deepcopy
 from dataclasses import replace
 from functools import lru_cache
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -1488,7 +1489,17 @@ class EngineManager:
                 # narrow performance tuning -- it does not need the
                 # broad-request-shape validation a new default-on latency
                 # optimization would.
-                rc.prefill_chunk_size = 64
+                try:
+                    gptoss_prefill_chunk = int(os.environ.get(
+                        "VMODEL_GPTOSS_PREFILL_CHUNK_SIZE", "64"))
+                except ValueError as error:
+                    raise ValueError(
+                        "VMODEL_GPTOSS_PREFILL_CHUNK_SIZE must be an integer"
+                    ) from error
+                if not 1 <= gptoss_prefill_chunk <= 512:
+                    raise ValueError(
+                        "VMODEL_GPTOSS_PREFILL_CHUNK_SIZE must be in [1, 512]")
+                rc.prefill_chunk_size = gptoss_prefill_chunk
                 rc.adaptive_chunk_size = True
                 rc.adaptive_chunk_safe_bytes = 0
                 # adaptive_chunk_size and a durable prompt-KV fingerprint are
@@ -3701,6 +3712,18 @@ def _messages_for_native_template(messages: list[dict]) -> list[dict]:
     for message in messages:
         copied = dict(message)
         calls = message.get("tool_calls") or []
+        # Harmony's released template checks substring membership whenever
+        # these keys exist. Responses function-call history legitimately uses
+        # ``content: null``; Jinja then evaluates ``"marker" in None`` and
+        # raises before it reaches the tool-call branch. Empty content carries
+        # the same protocol meaning and is what the template's later truthy
+        # checks already expect. Keep this normalization render-local so the
+        # public request/history remains byte-for-byte untouched.
+        if copied.get("role") == "assistant":
+            if "content" in copied and copied["content"] is None:
+                copied["content"] = ""
+            if "thinking" in copied and copied["thinking"] is None:
+                copied["thinking"] = ""
         if calls:
             copied_calls = []
             for call in calls:
@@ -4675,6 +4698,22 @@ _HIDDEN_GATEWAY_DECISION_POLICY = (
     "caller."
 )
 
+_HIDDEN_GATEWAY_TERMINAL_PAGINATION_POLICY = (
+    "Private final-synthesis phase: the user explicitly requested complete "
+    "pagination and the latest tool result contains a pagination contract "
+    "whose hasMore flags are all false. Use the conversation and every tool "
+    "result to answer the original request now. No tool is available in this "
+    "phase. The private selected-interface context preserves any comparison, "
+    "ordering, filtering, or exclusion semantics declared by the tool; apply "
+    "those semantics to raw rows when necessary. Pagination is the completed "
+    "retrieval mechanism, not a requested answer format: do not divide or "
+    "paginate the answer. Use only the analysis needed to verify the result, "
+    "then move immediately to the final channel. In the final channel, use a "
+    "compact plain list of accepted items; do not add a table or repeat the "
+    "per-row verification. Return only the final answer, not an audit of "
+    "rejected rows. Do not emit tool-call markup or describe a future action."
+)
+
 _HIDDEN_GATEWAY_REAL_TOOL_POLICY = (
     "Private tool-execution phase: catalog search has already selected the "
     "most relevant real tools. Call exactly one real tool now when any provided "
@@ -4811,35 +4850,62 @@ def _gateway_message_text(message: dict) -> str:
     return ""
 
 
-def _gateway_tool_result_has_more(message: dict) -> bool:
-    """Recognize an explicit pagination contract in a tool result.
+def _gateway_tool_result_pagination_state(message: dict) -> bool | None:
+    """Return true/false for an explicit pagination contract, else none.
 
     This is protocol state, not a model inference: a boolean field whose name
-    ends in ``hasMore`` says that the external operation is incomplete.  The
-    hidden gateway can therefore require its already-activated catalog on the
-    next pass instead of spending a full generation deciding whether to keep
-    working.  Unknown/non-JSON tool outputs retain the ordinary model path.
+    ends in ``hasMore`` says whether the external operation is incomplete.
+    Unknown/non-JSON outputs and objects without such a boolean retain the
+    ordinary model path.
     """
     if message.get("role") != "tool":
-        return False
+        return None
     try:
         value = json.loads(_gateway_message_text(message))
     except (TypeError, ValueError):
-        return False
+        return None
 
-    def contains_has_more(item) -> bool:
+    states: list[bool] = []
+
+    def collect_has_more(item) -> None:
         if isinstance(item, dict):
             for key, child in item.items():
                 normalized = re.sub(r"[^a-z0-9]", "", str(key).lower())
-                if normalized.endswith("hasmore") and child is True:
-                    return True
-                if contains_has_more(child):
-                    return True
+                if (normalized.endswith("hasmore")
+                        and isinstance(child, bool)):
+                    states.append(child)
+                collect_has_more(child)
         elif isinstance(item, list):
-            return any(contains_has_more(child) for child in item)
-        return False
+            for child in item:
+                collect_has_more(child)
 
-    return contains_has_more(value)
+    collect_has_more(value)
+    return any(states) if states else None
+
+
+def _gateway_tool_result_has_more(message: dict) -> bool:
+    """Recognize an explicitly incomplete pagination contract."""
+    return _gateway_tool_result_pagination_state(message) is True
+
+
+def _hidden_gateway_terminal_pagination_synthesis(
+        messages: list[dict]) -> bool:
+    """Recognize an explicitly requested, explicitly completed page stream.
+
+    This is intentionally protocol- and intent-based rather than tied to a
+    provider, tool name, result payload, or request fingerprint. It remains an
+    opt-in route because a heterogeneous multi-action corpus must prove that a
+    terminal page is not followed by a different requested external action.
+    """
+    if (not messages
+            or _gateway_tool_result_pagination_state(messages[-1]) is not False):
+        return False
+    user_text = next((
+        _gateway_message_text(message)
+        for message in reversed(messages)
+        if message.get("role") == "user"
+    ), "")
+    return bool(_GATEWAY_PAGINATION_REQUEST_RE.search(user_text))
 
 
 def _hidden_gateway_force_reason(messages: list[dict]) -> str | None:
@@ -5232,7 +5298,8 @@ def _hidden_gateway_activation_put(key: str, tools: list[dict]) -> tuple[str, ..
 
 def _hidden_gateway_execution_messages(
         messages: list[dict], selected_tools: list[dict],
-        activation_key: str) -> list[dict]:
+        activation_key: str, *,
+        include_interface_contract: bool = False) -> list[dict]:
     """Insert one canonical private activation pair at a prefix-stable point.
 
     The discovery action itself is intentionally absent: an initial turn may
@@ -5254,6 +5321,42 @@ def _hidden_gateway_execution_messages(
     call_id = (
         "vmodel_gateway_"
         + hashlib.sha256(identity.encode("utf-8")).hexdigest()[:12])
+    activation_result = {
+        "status": "enabled",
+        "tools": list(names),
+    }
+    if include_interface_contract:
+        from .toolcalls import compact_tool_schema, relevant_tool_interface
+
+        # Approximate suffix-prefill profiles otherwise see the selected tool's
+        # full schema only at the very beginning of the native chat template.
+        # Duplicate a bounded, canonical prompt-only interface in the private
+        # activation result so parameter names and the latest user intent share
+        # the full-depth suffix.  This is selected-schema locality: it contains
+        # no provider, subject, request hash, or argument-value heuristic.
+        interfaces = []
+        encoded_chars = 0
+        for tool in selected_tools:
+            interface = compact_tool_schema(relevant_tool_interface(
+                tool, messages, max_properties=12))
+            encoded = json.dumps(
+                interface, ensure_ascii=False, sort_keys=True,
+                separators=(",", ":"))
+            if interfaces and encoded_chars + len(encoded) > 12_000:
+                break
+            interfaces.append(interface)
+            encoded_chars += len(encoded)
+        activation_result.update({
+            "instruction": (
+                "Bind every explicit scope, comparison, exclusion, and "
+                "pagination clause in the original request one-for-one to "
+                "the most specific compatible interface field. Do not omit "
+                "a constraint or invent an unrelated filter; align literal "
+                "value kinds with field names (for example paths with Path "
+                "fields and negated constraints with matching exclude "
+                "fields)."),
+            "interfaces": interfaces,
+        })
     pair = [{
         "role": "assistant", "content": "",
         "tool_calls": [{
@@ -5266,10 +5369,9 @@ def _hidden_gateway_execution_messages(
     }, {
         "role": "tool", "tool_call_id": call_id,
         "name": _HIDDEN_TOOL_ENABLE_NAME,
-        "content": json.dumps({
-            "status": "enabled",
-            "tools": list(names),
-        }, ensure_ascii=False, separators=(",", ":")),
+        "content": json.dumps(
+            activation_result, ensure_ascii=False, sort_keys=True,
+            separators=(",", ":")),
     }]
 
     activated = set(names)
@@ -5285,6 +5387,222 @@ def _hidden_gateway_execution_messages(
             insert_at = index
             break
     return [*messages[:insert_at], *pair, *messages[insert_at:]]
+
+
+def _hidden_gateway_result_suffix_anchor(
+        messages: list[dict], selected_tools: list[dict]) -> list[dict]:
+    """Put the original intent beside the newest tool result, prompt-only.
+
+    Native tool templates place schemas and the original user turn near the
+    prompt's beginning.  A lossy depth/suffix schedule can therefore retain a
+    detailed result at the end while losing the question it must answer.  Once
+    a result exists, append a small private anchor to that result so the model
+    can decide generically between synthesis and another external action.  The
+    public transcript and tool output remain untouched.
+    """
+    last_tool = next((
+        index for index in range(len(messages) - 1, -1, -1)
+        if messages[index].get("role") == "tool"
+    ), None)
+    if last_tool is None:
+        return [dict(message) for message in messages]
+    original_intent = next((
+        _gateway_message_text(messages[index]).strip()
+        for index in range(last_tool - 1, -1, -1)
+        if messages[index].get("role") == "user"
+        and _gateway_message_text(messages[index]).strip()
+    ), "")
+    if not original_intent:
+        return [dict(message) for message in messages]
+    names = tuple(dict.fromkeys(
+        name for tool in selected_tools
+        if (name := _tool_function_name(tool))))
+    from .toolcalls import relevant_tool_interface
+    interfaces = [
+        relevant_tool_interface(tool, messages, max_properties=6)
+        for tool in selected_tools
+        if _tool_function_name(tool)
+    ]
+    anchor = json.dumps({
+        "enabled_tools": names,
+        "instruction": (
+            "Continue the original request using all tool results above. "
+            "If pagination is complete, answer now instead of repeating a "
+            "completed call; call again only when another action is required. "
+            "Apply comparison/filter semantics from selected_interfaces and "
+            "return only accepted rows, never an audit of rejected rows."),
+        "selected_interfaces": interfaces,
+        "original_request": original_intent,
+    }, ensure_ascii=False, separators=(",", ":"))
+    copied = [dict(message) for message in messages]
+    content = copied[last_tool].get("content")
+    if isinstance(content, str):
+        copied[last_tool]["content"] = (
+            "<vmodel_private_context>" + anchor
+            + "</vmodel_private_context>\n" + content)
+    return copied
+
+
+def _hidden_gateway_terminal_interface(
+        tool: dict, messages: list[dict], *, max_properties: int = 12) -> dict:
+    """Return a bounded structural copy of the interface actually exercised.
+
+    Final synthesis already retains every Harmony assistant call, including
+    its complete argument object. Repeating a broad intent-ranked interface
+    beside the last result therefore spends prompt depth on unused optional
+    fields and can miss a domain-qualified field that the call did use.
+    Prefer fields present in matching call history, retain the function's
+    top-level semantic contract plus JSON-Schema constraints, and fall back to
+    the generic intent-ranked interface when no usable call object exists.
+
+    Nested annotations are prompt-lossy in this explicit fast profile. A short
+    field description is restored only when the top-level contract does not
+    already name that field, avoiding duplicate prose while retaining an
+    otherwise-local fact such as whether a bound is inclusive.
+    """
+    if max_properties <= 0:
+        raise ValueError("max_properties must be positive")
+    from .toolcalls import compact_tool_schema, relevant_tool_interface
+
+    function = tool.get("function", tool) if isinstance(tool, dict) else {}
+    tool_name = str(function.get("name", "")) \
+        if isinstance(function, dict) else ""
+    observed: set[str] = set()
+    for message in messages:
+        for call in message.get("tool_calls") or ():
+            if not isinstance(call, dict):
+                continue
+            called = call.get("function", call)
+            if (not isinstance(called, dict)
+                    or str(called.get("name", "")) != tool_name):
+                continue
+            arguments = called.get("arguments", {})
+            if isinstance(arguments, str):
+                try:
+                    arguments = json.loads(arguments)
+                except (TypeError, ValueError):
+                    continue
+            if isinstance(arguments, dict):
+                observed.update(
+                    str(name) for name in arguments if isinstance(name, str))
+
+    interface = deepcopy(tool)
+    copied_function = interface.get("function", interface) \
+        if isinstance(interface, dict) else {}
+    schema = (
+        copied_function.get("parameters",
+                            copied_function.get("input_schema", {}))
+        if isinstance(copied_function, dict) else {})
+    properties = schema.get("properties") if isinstance(schema, dict) else None
+    selected_names: list[str] = []
+    if isinstance(properties, dict) and observed:
+        selected_names = [
+            name for name in properties if name in observed][:max_properties]
+    if selected_names:
+        selected = set(selected_names)
+        schema["properties"] = {
+            name: value for name, value in properties.items()
+            if name in selected}
+        for key in ("required", "x-optional"):
+            values = schema.get(key)
+            if isinstance(values, list):
+                schema[key] = [name for name in values if name in selected]
+        if "parameters" in copied_function:
+            copied_function["parameters"] = schema
+        else:
+            copied_function["input_schema"] = schema
+    else:
+        interface = relevant_tool_interface(
+            tool, messages, max_properties=max_properties)
+
+    semantic_interface = deepcopy(interface)
+    compact = compact_tool_schema(interface)
+    compact_function = compact.get("function", compact)
+    semantic_function = semantic_interface.get(
+        "function", semantic_interface)
+    top_description = str(compact_function.get("description", ""))
+    if len(top_description) > 2_000:
+        top_description = top_description[:1_997].rstrip() + "..."
+        compact_function["description"] = top_description
+    compact_schema = compact_function.get(
+        "parameters", compact_function.get("input_schema", {}))
+    semantic_schema = semantic_function.get(
+        "parameters", semantic_function.get("input_schema", {}))
+    compact_properties = (
+        compact_schema.get("properties")
+        if isinstance(compact_schema, dict) else None)
+    semantic_properties = (
+        semantic_schema.get("properties")
+        if isinstance(semantic_schema, dict) else None)
+
+    def descriptions(value) -> list[str]:
+        found: list[str] = []
+        if isinstance(value, dict):
+            for key, child in value.items():
+                if key == "description" and isinstance(child, str) and child:
+                    found.append(child)
+                else:
+                    found.extend(descriptions(child))
+        elif isinstance(value, list):
+            for child in value:
+                found.extend(descriptions(child))
+        return found
+
+    if isinstance(compact_properties, dict) and isinstance(
+            semantic_properties, dict):
+        top_folded = top_description.casefold()
+        for name, compact_property in compact_properties.items():
+            if (not isinstance(compact_property, dict)
+                    or name.casefold() in top_folded):
+                continue
+            field_descriptions = list(dict.fromkeys(descriptions(
+                semantic_properties.get(name))))
+            if field_descriptions:
+                description = " ".join(field_descriptions)
+                compact_property["description"] = (
+                    description if len(description) <= 320
+                    else description[:317].rstrip() + "...")
+    return compact
+
+
+def _hidden_gateway_terminal_result_suffix_anchor(
+        messages: list[dict], selected_tools: list[dict]) -> list[dict]:
+    """Place one compact final-synthesis contract beside the newest result.
+
+    The terminal system policy already says how to finish, and each preserved
+    assistant call already names the enabled function. Keep only the original
+    request and bounded executed interfaces here instead of repeating tool
+    names and a second generic instruction paragraph. No tool result, call,
+    ordering edge, or caller-visible message is changed.
+    """
+    last_tool = next((
+        index for index in range(len(messages) - 1, -1, -1)
+        if messages[index].get("role") == "tool"
+    ), None)
+    if last_tool is None:
+        return [dict(message) for message in messages]
+    original_intent = next((
+        _gateway_message_text(messages[index]).strip()
+        for index in range(last_tool - 1, -1, -1)
+        if messages[index].get("role") == "user"
+        and _gateway_message_text(messages[index]).strip()
+    ), "")
+    if not original_intent:
+        return [dict(message) for message in messages]
+    interfaces = [
+        _hidden_gateway_terminal_interface(tool, messages)
+        for tool in selected_tools if _tool_function_name(tool)]
+    anchor = json.dumps({
+        "original_request": original_intent,
+        "selected_interfaces": interfaces,
+    }, ensure_ascii=False, separators=(",", ":"))
+    copied = [dict(message) for message in messages]
+    content = copied[last_tool].get("content")
+    if isinstance(content, str):
+        copied[last_tool]["content"] = (
+            "<vmodel_private_context>" + anchor
+            + "</vmodel_private_context>\n" + content)
+    return copied
 
 
 def _hidden_gateway_execution_context(
@@ -5315,6 +5633,27 @@ def _hidden_gateway_execution_context(
             continue
         projected.append(dict(message))
     return projected, omitted_chars
+
+
+def _hidden_gateway_terminal_context(
+        messages: list[dict], selected_tools: list[dict], profile: str, *,
+        suffix_contract: bool) -> tuple[list[dict], int]:
+    """Apply the selected execution-context profile to final synthesis.
+
+    Terminal pagination is generated by the gateway's decision pass because no
+    real tool remains available.  It must nevertheless honor the same explicit
+    ``full``/``task`` context choice as the execution pass; otherwise the final
+    turn silently restores global system/developer scaffolding after every
+    earlier tool turn used the task projection. The optional terminal result
+    anchor is prompt-only and is added before projection so task mode retains
+    it beside the newest tool result without duplicating the ordinary decision
+    phase's broader continuation contract.
+    """
+    source = (
+        _hidden_gateway_terminal_result_suffix_anchor(
+            messages, selected_tools)
+        if suffix_contract else messages)
+    return _hidden_gateway_execution_context(source, profile)
 
 
 def _hidden_gateway_execution_context_policy(
@@ -5623,7 +5962,8 @@ def _prepare_chat_prompt(engine, model_dir: Path, messages: list[dict], reasonin
                          enable_thinking: bool | None = None,
                          reasoning_requested: bool = False,
                          cache_namespace: str = "default",
-                         preserve_tool_parameter_prose: bool = False):
+                         preserve_tool_parameter_prose: bool = False,
+                         relevant_parameter_messages: list[dict] | None = None):
     """Apply explicitly side-quest-only tool compaction/retrieval and render.
 
     Fast mode keeps all tools by default but strips parameter-level prose and
@@ -5637,7 +5977,8 @@ def _prepare_chat_prompt(engine, model_dir: Path, messages: list[dict], reasonin
     """
     from .toolcalls import (canonical_tool_indices, canonicalize_tool_history,
                             compact_tool_schema, effective_tool_prompt_schema,
-                            pinned_tool_indices, rank_tool_indices)
+                            pinned_tool_indices, rank_tool_indices,
+                            relevant_tool_interface)
 
     try:
         messages = canonicalize_tool_history(messages)
@@ -5689,10 +6030,18 @@ def _prepare_chat_prompt(engine, model_dir: Path, messages: list[dict], reasonin
     selected_raw = [raw_tools[i] for i in selected_indices]
     if compact_json:
         prompt_order = canonical_tool_indices(selected_tools)
-        prompt_tools = [
-            (compact_tool_schema(selected_tools[i])
-             if compacted else effective_tool_prompt_schema(selected_tools[i]))
+        prompt_sources = [
+            (relevant_tool_interface(
+                selected_tools[i], relevant_parameter_messages,
+                max_properties=12)
+             if relevant_parameter_messages is not None
+             else selected_tools[i])
             for i in prompt_order
+        ]
+        prompt_tools = [
+            (compact_tool_schema(tool)
+             if compacted else effective_tool_prompt_schema(tool))
+            for tool in prompt_sources
         ]
     else:
         # ``x-optional`` is the wire adapter's source of truth in every mode,
@@ -5751,6 +6100,8 @@ def _prepare_chat_prompt(engine, model_dir: Path, messages: list[dict], reasonin
                 "tool_retrieval_profile", "hybrid-lexical-capability-v1")
             if limit else None),
         "schema_profile": (
+            "selected-relevant-prose-compact-json"
+            if relevant_parameter_messages is not None else
             "compact-no-nested-prose" if compacted else
             "selected-full-prose-compact-json" if compact_json else
             "released-effective-optionality"),
@@ -5811,7 +6162,9 @@ def _prepare_chat_prompt(engine, model_dir: Path, messages: list[dict], reasonin
                 force_paged_kv=bool(
                     (resident_kv or {}).get("adaptive_spill_required", 0)),
                 stable_boundary_tokens=stable_boundary_tokens),
-            prompt_tokens, selected_tools,
+            prompt_tokens, (
+                prompt_tools
+                if relevant_parameter_messages is not None else selected_tools),
             selected_raw, metadata)
 
 
@@ -6457,6 +6810,139 @@ def _execution_profile_fields(engine) -> dict[str, object]:
     return fields
 
 
+# Harmony renders assistant output as a sequence of channels: `analysis`
+# carrying chain-of-thought, optional `commentary` channels carrying tool
+# calls, and `final` carrying the user-visible answer. Only the final channel
+# is the assistant's reply -- harmony's own guidance is explicit that analysis
+# content is not intended for end users. parse_tool_calls already lifts the
+# commentary calls out; what remains is analysis and final concatenated, so a
+# client reading `content`/`output_text` would otherwise receive the
+# chain-of-thought glued to the answer. Measured 2026-07-31 on the
+# gpt-oss-120b Plex gate: the reply scored as naming every ineligible title
+# purely because the analysis channel enumerated them while rejecting them.
+#
+# Decoded text may or may not retain the special-token glyphs, so both forms
+# are matched. This fails SAFE -- when no final-channel marker is positively
+# identified (notably when generation was cut off inside analysis, which is
+# exactly when the analysis text is all the client has), the text is returned
+# unchanged rather than emptied.
+_HARMONY_FINAL_MARKERS = (
+    "<|channel|>final<|message|>",
+    "<|channel|>final",
+    "assistantfinal",
+)
+_HARMONY_FINAL_TERMINATORS = ("<|return|>", "<|end|>", "<|start|>")
+_HARMONY_GLYPH_RE = re.compile(r"<\|[a-z_]+\|>")
+_HARMONY_ANALYSIS_LABEL_RE = re.compile(r"^\s*(?:assistant)?analysis")
+
+
+def _harmony_visible_span(text: str, start_hint: int = -1) -> tuple[int, int] | None:
+    """Locate harmony's final-channel content as a span of ``text``.
+
+    Streaming and non-streaming both resolve the visible answer through this
+    one function so they cannot disagree: the streamed prefix is always a
+    prefix of the finally-parsed content, which is the invariant
+    ``_MarkerHoldback.final_remainder`` asserts. Surrounding whitespace is
+    excluded from the span rather than stripped afterwards, so a trailing
+    newline arriving mid-stream can never make the streamed text longer than
+    the final text. ``start_hint`` locks a start already found by a caller
+    that is scanning a growing buffer.
+    """
+    if start_hint >= 0:
+        start = start_hint
+    else:
+        cut = -1
+        for marker in _HARMONY_FINAL_MARKERS:
+            found = text.rfind(marker)
+            if found >= 0:
+                cut = max(cut, found + len(marker))
+        if cut < 0:
+            return None
+        start = cut
+    end = len(text)
+    for terminator in _HARMONY_FINAL_TERMINATORS:
+        index = text.find(terminator, start)
+        if index >= 0:
+            end = min(end, index)
+    while start < end and text[start].isspace():
+        start += 1
+    while end > start and text[end - 1].isspace():
+        end -= 1
+    return (start, end) if end > start else None
+
+
+def _harmony_split_channels(text: str, model_type: str) -> tuple[str, str]:
+    """Split harmony output into (user-visible final channel, analysis).
+
+    Fails SAFE: with no positively-identified final channel -- notably when
+    generation was cut off inside analysis, which is exactly when the analysis
+    text is all the client has -- the text is returned unchanged as the
+    visible part rather than emptied, and the analysis is reported empty.
+    """
+    if model_type != "gpt_oss" or not isinstance(text, str) or not text:
+        return text, ""
+    span = _harmony_visible_span(text)
+    if span is None:
+        return text, ""
+    analysis = _HARMONY_GLYPH_RE.sub("", text[:span[0]])
+    analysis = _HARMONY_ANALYSIS_LABEL_RE.sub("", analysis, count=1)
+    return text[span[0]:span[1]], analysis.strip()
+
+
+def _harmony_visible_text(text: str, model_type: str) -> str:
+    """Return harmony's final channel alone, or the text unchanged."""
+    return _harmony_split_channels(text, model_type)[0]
+
+
+class _HarmonyChannelGate:
+    """Withhold harmony's analysis channel from a user-visible token stream.
+
+    A stream cannot know whether a final channel is still coming, so output is
+    buffered until a final-channel marker is confirmed and only the final
+    channel is released from then on. If generation ends without one, nothing
+    was released and the caller's ordinary end-of-stream remainder path emits
+    the unchanged text -- the same fail-safe the non-streaming path uses.
+    """
+
+    def __init__(self, model_type: str):
+        self.enabled = model_type == "gpt_oss"
+        self.raw = ""
+        self.start = -1
+        self.emitted = 0
+        self.released = ""
+
+    def feed(self, text: str) -> str:
+        if not self.enabled:
+            return text
+        self.raw += text
+        span = _harmony_visible_span(self.raw, self.start)
+        if span is None:
+            return ""
+        self.start = span[0]
+        visible = self.raw[span[0]:span[1]]
+        if len(visible) <= self.emitted:
+            return ""
+        released = visible[self.emitted:]
+        self.emitted = len(visible)
+        self.released += released
+        return released
+
+    def remainder(self, final_text: str) -> str:
+        """Tail still owed to an UNBUFFERED stream so it matches final_text.
+
+        The buffered path already reconciles through
+        ``_MarkerHoldback.final_remainder``; this covers the no-tools branch,
+        including the fail-safe case where no final channel ever arrived and
+        the whole withheld text is owed at the end.
+        """
+        if not self.enabled or not isinstance(final_text, str):
+            return ""
+        if self.released:
+            return (final_text[len(self.released):]
+                    if final_text.startswith(self.released) else "")
+        return final_text
+
+
 def _responses_output_items(text: str, tools: list[dict], model_type: str,
                             message_id: str, *,
                             message_status: str = "completed",
@@ -6464,6 +6950,7 @@ def _responses_output_items(text: str, tools: list[dict], model_type: str,
     """Build Responses output without losing text surrounding tool calls."""
     content, calls = _parse_request_tool_calls(
         text, tools, model_type, allow_parallel)
+    content = _harmony_visible_text(content, model_type)
     output = []
     if content or not calls:
         output.append({
@@ -7103,6 +7590,10 @@ class Handler(BaseHTTPRequestHandler):
                     engine.cfg.model_type, _DEFAULT_HOLDBACK_MARKERS)
                     if buffer_for_tools else ())
                 holdback = _MarkerHoldback(markers) if buffer_for_tools else None
+                # /completions returns raw text as the product; only the chat
+                # surface carries an assistant message whose channels matter.
+                channel_gate = _HarmonyChannelGate(
+                    engine.cfg.model_type if kind == "chat.completion" else "")
 
                 def write_stream_chunk(value, finish_reason=None):
                     choice = {"index": 0, "finish_reason": finish_reason}
@@ -7118,11 +7609,16 @@ class Handler(BaseHTTPRequestHandler):
                     self.wfile.flush()
 
                 def emit(tok: str):
+                    tok = channel_gate.feed(tok)
                     if holdback is None:
-                        write_stream_chunk(
-                            {"content": tok} if kind == "chat.completion" else tok)
+                        if tok:
+                            write_stream_chunk(
+                                {"content": tok} if kind == "chat.completion" else tok)
+                        else:
+                            self.wfile.write(b": keepalive\n\n")
+                            self.wfile.flush()
                         return
-                    safe = holdback.feed(tok)
+                    safe = holdback.feed(tok) if tok else ""
                     if safe:
                         write_stream_chunk({"content": safe})
                     else:
@@ -7149,6 +7645,8 @@ class Handler(BaseHTTPRequestHandler):
                     content, calls = _parse_request_tool_calls(
                         result["text"], tools, engine.cfg.model_type,
                         allow_parallel_tool_calls)
+                    content = _harmony_visible_text(
+                        content, engine.cfg.model_type)
                     remainder = holdback.final_remainder(content)
                     if remainder:
                         write_stream_chunk({"content": remainder})
@@ -7158,6 +7656,15 @@ class Handler(BaseHTTPRequestHandler):
                             for index, call in enumerate(calls)]})
                         finish_reason = _openai_finish_reason(
                             result, has_tool_calls=True)
+                else:
+                    # No holdback to reconcile through: flush whatever the
+                    # channel gate withheld (the whole text when generation
+                    # never reached a final channel).
+                    tail = channel_gate.remainder(_harmony_visible_text(
+                        result["text"], engine.cfg.model_type))
+                    if tail:
+                        write_stream_chunk(
+                            {"content": tail} if kind == "chat.completion" else tail)
                 # Always send a terminal choice before [DONE], including the
                 # no-tools path. Some clients wait for finish_reason rather than
                 # treating socket/data termination as the semantic finish.
@@ -7191,12 +7698,15 @@ class Handler(BaseHTTPRequestHandler):
             _log_path_stats(result, result.get("prompt_tokens", 0))
             text = result["text"]
             if kind == "chat.completion":
-                message = {"role": "assistant", "content": text}
+                message = {"role": "assistant", "content": _harmony_visible_text(
+                    text, engine.cfg.model_type)}
                 finish = _openai_finish_reason(result)
                 if tools:
                     content, calls = _parse_request_tool_calls(
                         text, tools, engine.cfg.model_type,
                         allow_parallel_tool_calls)
+                    content = _harmony_visible_text(
+                        content, engine.cfg.model_type)
                     if calls:
                         message = {"role": "assistant", "content": content or None,
                                    "tool_calls": calls}
@@ -7315,6 +7825,13 @@ class Handler(BaseHTTPRequestHandler):
         gateway_execution_prose_request = "auto"
         gateway_execution_context_request = "auto"
         gateway_qwen_moe_top_k_request = "auto"
+        gateway_suffix_contract = False
+        gateway_literal_grounding = False
+        gateway_terminal_pagination_synthesis_enabled = False
+        gateway_terminal_pagination_synthesis = False
+        gateway_terminal_context_profile = "none"
+        gateway_terminal_context_reason = "not-terminal-synthesis"
+        gateway_terminal_context_omitted_chars = 0
         gateway_abstention_enabled = True
         gateway_abstention_reason = "gateway-disabled"
         gateway_virtual_tools = []
@@ -7383,6 +7900,31 @@ class Handler(BaseHTTPRequestHandler):
                     raise RequestValidationError(
                         "VMODEL_FAST_TOOL_GATEWAY_QWEN_MOE_TOP_K must be "
                         "positive")
+            gateway_suffix_contract_value = os.environ.get(
+                "VMODEL_FAST_TOOL_GATEWAY_SUFFIX_CONTRACT", "0")
+            if gateway_suffix_contract_value not in ("0", "1"):
+                raise RequestValidationError(
+                    "VMODEL_FAST_TOOL_GATEWAY_SUFFIX_CONTRACT must be 0 or 1")
+            gateway_suffix_contract = gateway_suffix_contract_value == "1"
+            gateway_literal_grounding_value = os.environ.get(
+                "VMODEL_FAST_TOOL_GATEWAY_LITERAL_GROUNDING", "0")
+            if gateway_literal_grounding_value not in ("0", "1"):
+                raise RequestValidationError(
+                    "VMODEL_FAST_TOOL_GATEWAY_LITERAL_GROUNDING must be "
+                    "0 or 1")
+            gateway_literal_grounding = (
+                gateway_literal_grounding_value == "1")
+            gateway_terminal_pagination_value = os.environ.get(
+                "VMODEL_FAST_TOOL_GATEWAY_TERMINAL_PAGINATION_SYNTHESIS", "0")
+            if gateway_terminal_pagination_value not in ("0", "1"):
+                raise RequestValidationError(
+                    "VMODEL_FAST_TOOL_GATEWAY_TERMINAL_PAGINATION_SYNTHESIS "
+                    "must be 0 or 1")
+            gateway_terminal_pagination_synthesis_enabled = (
+                gateway_terminal_pagination_value == "1")
+            gateway_terminal_pagination_synthesis = (
+                gateway_terminal_pagination_synthesis_enabled
+                and _hidden_gateway_terminal_pagination_synthesis(msgs))
             try:
                 (gateway_abstention_enabled,
                  gateway_abstention_reason) = \
@@ -7402,14 +7944,47 @@ class Handler(BaseHTTPRequestHandler):
                 max_activated=gateway_max_activated)
             gateway_force_reason = (
                 "client-required" if tool_choice == "required"
+                else None if gateway_terminal_pagination_synthesis
                 else _hidden_gateway_force_reason(msgs)
             )
             gateway_virtual_tools, gateway_virtual_raw = (
                 _hidden_gateway_virtual_pairs())
-            prompt_catalog = gateway_virtual_tools
-            prompt_raw_catalog = gateway_virtual_raw
+            prompt_catalog = (
+                [] if gateway_terminal_pagination_synthesis
+                else gateway_virtual_tools)
+            prompt_raw_catalog = (
+                [] if gateway_terminal_pagination_synthesis
+                else gateway_virtual_raw)
+            if gateway_terminal_pagination_synthesis:
+                try:
+                    (gateway_terminal_context_profile,
+                     gateway_terminal_context_reason) = \
+                        _hidden_gateway_execution_context_policy(
+                            gateway_execution_context_request,
+                            messages=msgs,
+                            selected_tools=gateway_initial_tools,
+                            mode=mode,
+                            model_type=engine.cfg.model_type,
+                            host_route=gateway_host_route,
+                            force_reason=gateway_force_reason)
+                except ValueError as error:
+                    raise RequestValidationError(str(error)) from error
+                (decision_source_messages,
+                 gateway_terminal_context_omitted_chars) = \
+                    _hidden_gateway_terminal_context(
+                        msgs, gateway_initial_tools,
+                        gateway_terminal_context_profile,
+                        suffix_contract=gateway_suffix_contract)
+            else:
+                decision_source_messages = (
+                    _hidden_gateway_result_suffix_anchor(
+                        msgs, gateway_initial_tools)
+                    if gateway_suffix_contract else msgs)
             decision_messages = _prepend_system_content(
-                msgs, _HIDDEN_GATEWAY_DECISION_POLICY)
+                decision_source_messages,
+                (_HIDDEN_GATEWAY_TERMINAL_PAGINATION_POLICY
+                 if gateway_terminal_pagination_synthesis
+                 else _HIDDEN_GATEWAY_DECISION_POLICY))
         else:
             gateway_limit = 0
             gateway_initial_retrieval = {}
@@ -7434,6 +8009,7 @@ class Handler(BaseHTTPRequestHandler):
                 preserve_tool_parameter_prose=(
                     not gateway_enabled and len(prompt_catalog) <= 4))
         gateway_decision_choice = (
+            "none" if gateway_terminal_pagination_synthesis else
             _hidden_gateway_decision_choice(
                 tool_choice, gateway_force_reason,
                 bool(gateway_activated_names))
@@ -7445,7 +8021,8 @@ class Handler(BaseHTTPRequestHandler):
         # API response parsing never admits the gateway-only virtual function.
         # It may parse any caller-supplied real tool, while constrained decoding
         # ensures the model itself only sees/calls the phase's selected subset.
-        response_parse_tools = all_tools
+        response_parse_tools = (
+            [] if gateway_terminal_pagination_synthesis else all_tools)
         response_raw_tools = (
             requested_raw_tools if gateway_enabled or tool_choice == "none"
             else selected_raw_tools)
@@ -7478,7 +8055,16 @@ class Handler(BaseHTTPRequestHandler):
                 message_status="incomplete" if incomplete else "completed",
                 allow_parallel=allow_parallel_tool_calls)
             output_text = content
+            # Harmony's analysis channel is the model's reasoning, not its
+            # answer, so it is kept OUT of output_text -- but a model may
+            # legitimately do its filtering there (rejecting rows in reasoning
+            # rather than via a tool argument), so it is reported alongside
+            # rather than discarded. Namespaced like the other vmodel_* fields
+            # so OpenAI clients ignore it.
+            _visible, harmony_analysis = _harmony_split_channels(
+                text, engine.cfg.model_type)
             return {
+                "vmodel_reasoning": harmony_analysis or None,
                 "id": rid, "object": "response", "created_at": created_at, "model": model_id,
                 "status": "incomplete" if incomplete else "completed", "error": None,
                 "incomplete_details": (
@@ -7521,6 +8107,14 @@ class Handler(BaseHTTPRequestHandler):
                     "suffix_prefill_seconds": round(float(result.get("prefill_s", 0.0)), 4),
                     "first_token_seconds": round(float(result.get("first_token_s", 0.0)), 4),
                     "decode_seconds": round(float(result.get("decode_s", 0.0)), 4),
+                    "prefill_chunks": int(
+                        path_stats.get("prefill_chunks", 0) or 0),
+                    "adaptive_chunk_events": list(
+                        path_stats.get("adaptive_chunk_events", ()) or ()),
+                    "pressure_chunk_events": list(
+                        path_stats.get("pressure_chunk_events", ()) or ()),
+                    "memory_prefill_retries": int(
+                        path_stats.get("memory_prefill_retries", 0) or 0),
                     "resident_pipelined_decode_steps": int(
                         result.get("resident_pipelined_decode_steps", 0) or 0),
                     "prompt_cache_write_seconds": round(float(
@@ -7647,6 +8241,16 @@ class Handler(BaseHTTPRequestHandler):
                 "gateway_direct_streaming": bool(
                     decision_stream is not None
                     and decision_stream.branch == "direct"),
+                "gateway_terminal_pagination_synthesis": int(
+                    gateway_terminal_pagination_synthesis),
+                "gateway_terminal_pagination_synthesis_enabled": int(
+                    gateway_terminal_pagination_synthesis_enabled),
+                "gateway_terminal_context_profile": (
+                    gateway_terminal_context_profile),
+                "gateway_terminal_context_reason": (
+                    gateway_terminal_context_reason),
+                "gateway_terminal_context_omitted_chars": int(
+                    gateway_terminal_context_omitted_chars),
                 # Keep the old field for wire/log compatibility while exposing
                 # the action-neutral name to new harnesses.
                 "gateway_late_search_suppressed": int(
@@ -7728,7 +8332,8 @@ class Handler(BaseHTTPRequestHandler):
             except ValueError as error:
                 raise RequestValidationError(str(error)) from error
             internal_messages = _hidden_gateway_execution_messages(
-                msgs, selected_tools, gateway_activation_key)
+                msgs, selected_tools, gateway_activation_key,
+                include_interface_contract=gateway_suffix_contract)
             internal_messages, execution_context_omitted_chars = \
                 _hidden_gateway_execution_context(
                     internal_messages, gateway_execution_context)
@@ -7800,7 +8405,9 @@ class Handler(BaseHTTPRequestHandler):
                     # dispensable prose. Canonical ordering and compact JSON
                     # remain enabled, so this does not restore the 130+ tool
                     # prompt that the hidden gateway was built to avoid.
-                    preserve_tool_parameter_prose=gateway_execution_prose)
+                    preserve_tool_parameter_prose=gateway_execution_prose,
+                    relevant_parameter_messages=(
+                        msgs if gateway_suffix_contract else None))
             self._constraint = _configure_constraint(
                 engine, self._structured_output, prompt_tools, "required",
                 False)
@@ -7841,6 +8448,42 @@ class Handler(BaseHTTPRequestHandler):
                 call for call in execution_calls
                 if call["function"]["name"] != _HIDDEN_TOOL_ABSTAIN_NAME
             ]
+            literal_arguments_grounded = 0
+            if gateway_literal_grounding and len(real_calls) == 1:
+                from .toolcalls import ground_missing_literal_arguments
+
+                call_function = real_calls[0]["function"]
+                prompt_tool_by_name = {
+                    _tool_function_name(tool): tool for tool in prompt_tools
+                    if _tool_function_name(tool)}
+                grounding_tool = prompt_tool_by_name.get(
+                    str(call_function.get("name", "")))
+                try:
+                    model_arguments = json.loads(
+                        call_function.get("arguments", "{}"))
+                except (TypeError, ValueError):
+                    model_arguments = None
+                if grounding_tool is not None and isinstance(
+                        model_arguments, dict):
+                    grounded_arguments, literal_arguments_grounded = \
+                        ground_missing_literal_arguments(
+                            grounding_tool, msgs, model_arguments)
+                    if literal_arguments_grounded:
+                        result["text"] = (
+                            "<tool_call>\n"
+                            + json.dumps({
+                                "name": call_function["name"],
+                                "arguments": grounded_arguments,
+                            }, ensure_ascii=False, separators=(",", ":"))
+                            + "\n</tool_call>")
+                        _execution_content, execution_calls = \
+                            _parse_request_tool_calls(
+                                result["text"], prompt_tools,
+                                engine.cfg.model_type, allow_parallel=False)
+                        real_calls = [
+                            call for call in execution_calls
+                            if call["function"]["name"]
+                            != _HIDDEN_TOOL_ABSTAIN_NAME]
             defaulted_call = (
                 _hidden_gateway_initial_pagination_defaults(
                     msgs, selected_tools, real_calls[0])
@@ -7922,6 +8565,10 @@ class Handler(BaseHTTPRequestHandler):
                     pagination_call is not None),
                 "gateway_initial_pagination_defaults_applied": int(
                     argument_defaults_applied),
+                "gateway_literal_arguments_grounded": int(
+                    literal_arguments_grounded),
+                "gateway_literal_grounding": int(
+                    gateway_literal_grounding),
                 "gateway_execution_context_profile": (
                     gateway_execution_context),
                 "gateway_execution_context_reason": (
@@ -7930,6 +8577,7 @@ class Handler(BaseHTTPRequestHandler):
                     execution_context_omitted_chars),
                 "gateway_execution_parameter_prose": int(
                     gateway_execution_prose),
+                "gateway_suffix_contract": int(gateway_suffix_contract),
                 "gateway_execution_expert_top_k": int(
                     effective_gateway_top_k),
                 "gateway_execution_expert_top_k_reason": (
@@ -8073,14 +8721,22 @@ class Handler(BaseHTTPRequestHandler):
 
         token_count = [0]
         holdback = _MarkerHoldback(markers) if buffer_for_tools else None
+        channel_gate = _HarmonyChannelGate(engine.cfg.model_type)
 
         def on_token(tok):
+            tok = channel_gate.feed(tok)
             if not buffer_for_tools:
-                emit("response.output_text.delta", item_id=msg_id, output_index=0,
-                    content_index=0, delta=tok, logprobs=[])
+                if tok:
+                    emit("response.output_text.delta", item_id=msg_id, output_index=0,
+                        content_index=0, delta=tok, logprobs=[])
+                else:
+                    # Withheld analysis produces no deltas; keep the socket
+                    # warm so a long reasoning phase cannot look like a stall.
+                    self.wfile.write(b": keepalive\n\n")
+                    self.wfile.flush()
                 return
             token_count[0] += 1
-            safe_text = holdback.feed(tok)
+            safe_text = holdback.feed(tok) if tok else ""
             if safe_text:
                 ensure_msg_item_added()
                 emit("response.output_text.delta", item_id=msg_id, output_index=0,
@@ -8177,7 +8833,8 @@ class Handler(BaseHTTPRequestHandler):
             # No real tool call after all: flush whatever was still held back.
             out_item = message_item
             text = out_item["content"][0]["text"] if out_item is not None else ""
-            remainder = holdback.final_remainder(text) if holdback is not None else ""
+            remainder = (holdback.final_remainder(text) if holdback is not None
+                         else channel_gate.remainder(text))
             if remainder:
                 ensure_msg_item_added()
                 emit("response.output_text.delta", item_id=msg_id, output_index=0,
@@ -8265,6 +8922,7 @@ class Handler(BaseHTTPRequestHandler):
         def build_content(text: str, termination_reason: str):
             content, calls = _parse_request_tool_calls(
                 text, tools, engine.cfg.model_type, allow_parallel_tool_calls)
+            content = _harmony_visible_text(content, engine.cfg.model_type)
             blocks = []
             if content:
                 blocks.append({"type": "text", "text": content})
@@ -8394,12 +9052,18 @@ class Handler(BaseHTTPRequestHandler):
             engine.cfg.model_type, _DEFAULT_HOLDBACK_MARKERS)
             if buffer_for_tools else ())
         holdback = _MarkerHoldback(markers) if buffer_for_tools else None
+        channel_gate = _HarmonyChannelGate(engine.cfg.model_type)
 
         def on_token(tok):
+            tok = channel_gate.feed(tok)
             if holdback is None:
-                emit("content_block_delta", {"index": 0, "delta": {"type": "text_delta", "text": tok}})
+                if tok:
+                    emit("content_block_delta", {"index": 0, "delta": {"type": "text_delta", "text": tok}})
+                else:
+                    self.wfile.write(b": keepalive\n\n")
+                    self.wfile.flush()
                 return
-            safe = holdback.feed(tok)
+            safe = holdback.feed(tok) if tok else ""
             if safe:
                 emit("content_block_delta", {
                     "index": 0, "delta": {"type": "text_delta", "text": safe}})
@@ -8432,11 +9096,12 @@ class Handler(BaseHTTPRequestHandler):
             result["text"], result.get("termination_reason", "eos"))
         text_content = "".join(
             block["text"] for block in blocks if block["type"] == "text")
-        if holdback is not None:
-            remainder = holdback.final_remainder(text_content)
-            if remainder:
-                emit("content_block_delta", {
-                    "index": 0, "delta": {"type": "text_delta", "text": remainder}})
+        remainder = (holdback.final_remainder(text_content)
+                     if holdback is not None
+                     else channel_gate.remainder(text_content))
+        if remainder:
+            emit("content_block_delta", {
+                "index": 0, "delta": {"type": "text_delta", "text": remainder}})
         emit("content_block_stop", {"index": 0})
 
         idx = 1

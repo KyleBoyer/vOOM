@@ -12,10 +12,109 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from runtime.toolcalls import (anthropic_messages_to_canonical,
                                canonical_tool_indices, canonicalize_tool_history,
                                compact_tool_schema, expand_image_pad_tokens,
-                               load_image, merge_leading_system_messages,
+                               ground_missing_literal_arguments, load_image,
+                               merge_leading_system_messages,
                                normalize_messages, parse_tool_calls, pinned_tool_indices,
-                               rank_tool_indices, responses_input_to_messages,
+                               rank_tool_indices, relevant_tool_interface,
+                               responses_input_to_messages,
                                semantic_tool_capability_query, tools_preamble)
+
+
+def _interface_tool(name, properties):
+    return {"type": "function", "function": {
+        "name": name, "description": f"Operate {name}",
+        "parameters": {"type": "object", "properties": properties,
+                       "required": list(properties),
+                       "x-optional": list(properties)}}}
+
+
+def test_relevant_tool_interface_highlights_constraints_without_mutating_schema():
+    tool = _interface_tool("inventory_list_stock", {
+        "warehouseId": {"type": "string"},
+        "excludeWarehouseId": {"type": "string"},
+        "minimumQuantity": {"type": "number"},
+        "maximumQuantity": {"type": "number"},
+        "supplierId": {"type": "string"},
+        "categoryId": {"type": "string"},
+        "includeArchived": {"type": "boolean"},
+        "cursor": {"type": "string"},
+        "limit": {"type": "integer"},
+        "sortBy": {"type": "string"},
+        "sortDirection": {"type": "string"},
+        "locale": {"type": "string"},
+    })
+    highlighted = relevant_tool_interface(tool, [{
+        "role": "user",
+        "content": "list stock below 5 excluding warehouse west and paginate",
+    }], max_properties=6)
+    props = highlighted["function"]["parameters"]["properties"]
+
+    assert {"excludeWarehouseId", "maximumQuantity", "cursor", "limit"} <= set(props)
+    assert len(props) == 6
+    assert len(tool["function"]["parameters"]["properties"]) == 12
+    assert set(highlighted["function"]["parameters"]["required"]) == set(props)
+
+
+def test_relevant_tool_interface_generalizes_to_calendar_fields():
+    tool = _interface_tool("calendar_list_events", {
+        "afterTime": {"type": "string", "description": "lower time bound"},
+        "beforeTime": {"type": "string", "description": "upper time bound"},
+        "attendeeEmail": {"type": "string"},
+        "calendarId": {"type": "string"},
+        "includeDeclined": {"type": "boolean"},
+        "timezone": {"type": "string"},
+    })
+    highlighted = relevant_tool_interface(tool, [{
+        "role": "user", "content": "events after Monday for attendee Sam",
+    }], max_properties=3)
+    assert {"afterTime", "attendeeEmail"} <= set(
+        highlighted["function"]["parameters"]["properties"])
+
+
+def test_literal_grounding_maps_unambiguous_negated_path_without_overwrite():
+    tool = _interface_tool("catalog_list_records", {
+        "rootFolderPath": {"type": "string",
+                           "description": "root folder path to include"},
+        "excludeRootFolderPath": {"type": "string",
+                                  "description": "root folder path to exclude"},
+        "excludeSectionName": {"type": "string",
+                               "description": "section name to exclude"},
+    })
+    original = {"mediaType": "all"}
+    grounded, count = ground_missing_literal_arguments(tool, [{
+        "role": "user",
+        "content": 'list records whose root folder does not contain "/Archive/"',
+    }], original)
+
+    assert grounded == {
+        "mediaType": "all", "excludeRootFolderPath": "/Archive/"}
+    assert count == 1
+    assert original == {"mediaType": "all"}
+
+
+def test_literal_grounding_maps_inventory_exclusion_across_another_domain():
+    tool = _interface_tool("inventory_list_stock", {
+        "warehouseId": {"type": "string"},
+        "excludeWarehouseId": {"type": "string"},
+        "supplierId": {"type": "string"},
+    })
+    grounded, count = ground_missing_literal_arguments(tool, [{
+        "role": "user", "content": 'list stock excluding warehouse "west"',
+    }], {})
+    assert grounded == {"excludeWarehouseId": "west"}
+    assert count == 1
+
+
+def test_literal_grounding_leaves_ambiguous_destination_path_untouched():
+    tool = _interface_tool("files_copy", {
+        "sourcePath": {"type": "string"},
+        "destinationPath": {"type": "string"},
+    })
+    grounded, count = ground_missing_literal_arguments(tool, [{
+        "role": "user", "content": 'copy the file at "/tmp/value"',
+    }], {})
+    assert grounded == {}
+    assert count == 0
 
 
 def test_hermes_single_call():
@@ -669,14 +768,49 @@ def test_fast_tool_ranking_maps_movies_and_shows_to_media_capability():
     assert rank_tool_indices(tools, messages)[0] == 1
 
 
-def test_semantic_tool_capability_query_drops_argument_qualifier_clause():
+def test_fast_tool_ranking_uses_parameter_constraints_to_disambiguate():
+    tools = [
+        {"type": "function", "function": {
+            "name": "catalog_list_records",
+            "description": "List records with owner and path filters.",
+            "parameters": {"type": "object", "properties": {
+                "excludeRootFolderPath": {"type": "string"},
+                "minimumRating": {"type": "string"},
+            }}}},
+        {"type": "function", "function": {
+            "name": "catalog_list_record_media",
+            "description": "List record titles with content ratings.",
+            "parameters": {"type": "object", "properties": {}}}},
+    ]
+    messages = [{"role": "user", "content": (
+        "List media titles by rating whose root folder must be excluded.")}]
+    assert rank_tool_indices(tools, messages)[0] == 0
+
+
+def test_semantic_tool_capability_query_retains_argument_qualifier_clause():
     messages = [{"role": "user", "content": (
         "List Plex movies and TV shows by age rating whose root folder does "
         "not contain /Kids/. Make sure to paginate the listing.")}]
     query = semantic_tool_capability_query(messages)
     assert "plex movies and tv shows" in query
-    assert "root folder" not in query
-    assert query.endswith("paginate")
+    assert "root folder" in query
+    assert "kids" in query
+    assert "paginate" in query
+
+
+def test_bare_tool_name_is_not_boosted_by_incidental_prose():
+    tools = [
+        {"type": "function", "function": {
+            "name": "make", "description": "Manage build recipes.",
+            "parameters": {}}},
+        {"type": "function", "function": {
+            "name": "catalog_list_records",
+            "description": "List catalog records with pagination.",
+            "parameters": {}}},
+    ]
+    messages = [{"role": "user", "content": (
+        "List the catalog records and make sure to paginate.")}]
+    assert rank_tool_indices(tools, messages)[0] == 1
 
 
 def test_tool_order_and_ranking_ties_are_canonical_not_request_order():

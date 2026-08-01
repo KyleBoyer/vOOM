@@ -202,26 +202,201 @@ def semantic_tool_query(messages: list[dict], *, max_chars: int = 4000) -> str:
 
 def semantic_tool_capability_query(
         messages: list[dict], *, max_chars: int = 1000) -> str:
-    """Compress the latest intent to capability words, not argument filters.
+    """Compress the latest intent while retaining required input capabilities.
 
-    Hidden host routing needs the same short query the model-authored catalog
-    phase produced. Full requests often append clauses describing argument
-    values (for example, a root-folder exclusion); feeding those clauses back
-    into retrieval can select a metadata helper instead of the primary listing
-    capability. The execution model still receives the complete original
-    request and owns every argument.
+    Clauses introduced by words such as ``whose``, ``where``, or ``excluding``
+    are frequently the only evidence that distinguishes two otherwise similar
+    tools: one may merely list records while another supports the requested
+    owner, path, date, rating, or exclusion filter.  Earlier code discarded the
+    whole qualifier clause and could therefore select a tool incapable of
+    satisfying the request.  Keep a bounded capsule from both ends of the
+    latest intent so capability and parameter requirements participate in the
+    same generic schema ranker.  The execution model still owns argument values.
     """
     raw = semantic_tool_query(messages, max_chars=max_chars * 4)
     if not raw:
         return ""
-    primary = re.split(
-        r"\b(?:whose|where|excluding|except)\b", raw,
-        maxsplit=1, flags=re.IGNORECASE)[0]
-    words = _search_words(primary)[:48]
-    all_words = set(_search_words(raw))
-    if all_words & {"paginate", "pagination", "paging", "pages"}:
+    all_words = _search_words(raw)
+    # Long conversational requests tend to put the action near the beginning
+    # and the decisive constraints near the end.  Retain both without allowing
+    # a pathological message to expand the router query without bound.
+    if len(all_words) <= 96:
+        words = all_words
+    else:
+        words = [*all_words[:48], *all_words[-48:]]
+    if (set(all_words) & {"paginate", "pagination", "paging", "pages"}
+            and "paginate" not in words):
         words.append("paginate")
     return " ".join(words)[:max_chars].strip()
+
+
+def relevant_tool_interface(
+        tool: dict, messages: list[dict], *, max_properties: int = 10) -> dict:
+    """Return a prompt-only interface highlighting intent-relevant inputs.
+
+    The selected tool remains governed by its complete executable JSON schema.
+    This smaller copy exists only near a lossy model's full-depth suffix, where
+    a long interface full of unrelated optional fields can obscure the few
+    parameter distinctions present in the user request. Ranking uses field
+    identifiers, descriptions, enums, and generic comparison/pagination words;
+    it never contains provider-, subject-, or request-specific rules.
+    """
+    if max_properties <= 0:
+        raise ValueError("max_properties must be positive")
+    highlighted = deepcopy(tool)
+    fn = highlighted.get("function", highlighted)
+    if not isinstance(fn, dict):
+        return highlighted
+    schema = fn.get("parameters", fn.get("input_schema", {}))
+    properties = schema.get("properties") if isinstance(schema, dict) else None
+    if not isinstance(properties, dict) or len(properties) <= max_properties:
+        return highlighted
+
+    query_words = set(_capability_words(semantic_tool_query(messages)))
+    # Provider/action identity (for example the namespace and ``list`` verb)
+    # selected the tool; it is not evidence that an optional parameter bearing
+    # the provider's name is requested. Keep field ranking focused on the
+    # residual constraints.
+    query_words -= set(_search_words(fn.get("name", "")))
+    negative = bool(query_words & {
+        "exclude", "excluding", "except", "not", "without"})
+    lower_bound = bool(query_words & {
+        "below", "less", "lower", "maximum", "most", "under", "younger"})
+    upper_bound = bool(query_words & {
+        "above", "after", "greater", "higher", "minimum", "over"})
+    pagination = bool(query_words & {
+        "cursor", "page", "pages", "paginate", "pagination", "paging"})
+
+    scored = []
+    for order, (name, prop) in enumerate(properties.items()):
+        name_words = set(_search_words(name))
+        detail_words = set(_search_words(prop))
+        score = 12 * len(query_words & name_words)
+        score += 2 * len(query_words & detail_words)
+        if (negative and "exclude" in name_words
+                and (query_words & (name_words - {"exclude"}))):
+            score += 24
+        if lower_bound and name_words & {"max", "operator", "upper"}:
+            score += 16
+        if upper_bound and name_words & {"min", "operator", "lower"}:
+            score += 16
+        if pagination and name_words & {"cursor", "limit", "offset", "page"}:
+            score += 48
+        # Domain-qualified fields win over an ambiguous shared value whenever
+        # the request names that domain. This is identifier overlap, not a
+        # catalog-specific mapping.
+        score += 8 * len((query_words & name_words) - {"value", "type"})
+        scored.append((-score, order, str(name)))
+    scored.sort()
+    selected = {name for _score, _order, name in scored[:max_properties]}
+    schema["properties"] = {
+        name: prop for name, prop in properties.items() if name in selected}
+    for required_key in ("required", "x-optional"):
+        values = schema.get(required_key)
+        if isinstance(values, list):
+            schema[required_key] = [name for name in values if name in selected]
+    fn["parameters"] = schema
+    return highlighted
+
+
+_EXPLICIT_LITERAL_RE = re.compile(
+    r'"([^"\n]{1,256})"|`([^`\n]{1,256})`')
+
+
+def ground_missing_literal_arguments(
+        tool: dict, messages: list[dict], arguments: dict,
+        *, candidate_names: set[str] | None = None) -> tuple[dict, int]:
+    """Fill only unambiguous, explicitly quoted missing string arguments.
+
+    This opt-in lossy helper never rewrites a model-authored value. It uses a
+    local context window, parameter identifiers/descriptions, generic negation,
+    and literal shape (path/email/URL) to bind a literal only when the best
+    compatible missing field clears both an absolute and runner-up margin.
+    """
+    fn = tool.get("function", tool) if isinstance(tool, dict) else {}
+    schema = fn.get("parameters", fn.get("input_schema", {})) \
+        if isinstance(fn, dict) else {}
+    properties = schema.get("properties") if isinstance(schema, dict) else None
+    if not isinstance(properties, dict) or not isinstance(arguments, dict):
+        return dict(arguments or {}), 0
+    query = semantic_tool_query(messages)
+    if not query:
+        return dict(arguments), 0
+    grounded = dict(arguments)
+    existing_values = {
+        str(value).casefold() for value in grounded.values()
+        if isinstance(value, str)}
+    count = 0
+
+    def accepts_string(prop) -> bool:
+        if not isinstance(prop, dict):
+            return False
+        if prop.get("type") == "string":
+            return True
+        return any(
+            isinstance(choice, dict) and choice.get("type") == "string"
+            for union in ("anyOf", "oneOf")
+            for choice in (prop.get(union) or []))
+
+    for match in _EXPLICIT_LITERAL_RE.finditer(query):
+        literal = next(value for value in match.groups() if value is not None)
+        if literal.casefold() in existing_values:
+            continue
+        context = query[max(0, match.start() - 160):match.end() + 80]
+        context_words = set(_capability_words(context))
+        negative = bool(context_words & {
+            "exclude", "excluding", "except", "not", "without"})
+        scored = []
+        for order, (name, prop) in enumerate(properties.items()):
+            if name in grounded or (candidate_names is not None
+                                    and name not in candidate_names):
+                continue
+            if not accepts_string(prop):
+                continue
+            name_words = set(_search_words(name))
+            detail_words = set(_search_words(prop))
+            score = 12 * len(context_words & name_words)
+            score += 2 * len(context_words & detail_words)
+            if (negative and "exclude" in name_words
+                    and context_words & (name_words - {"exclude"})):
+                score += 24
+            if "/" in literal and "path" in name_words:
+                score += 30
+            if "@" in literal and "email" in name_words:
+                score += 30
+            if re.match(r"^[a-z][a-z0-9+.-]*://", literal, re.IGNORECASE) \
+                    and "url" in name_words:
+                score += 30
+            scored.append((-score, order, name))
+        if not scored:
+            continue
+        scored.sort()
+        best_score = -scored[0][0]
+        second_score = -scored[1][0] if len(scored) > 1 else 0
+        if best_score < 30 or best_score - second_score < 12:
+            continue
+        grounded[scored[0][2]] = literal
+        existing_values.add(literal.casefold())
+        count += 1
+    return grounded, count
+
+
+def _explicit_tool_name_mentioned(name: str, user_transcript: str) -> bool:
+    """Require explicit syntax before treating a bare word as a tool name."""
+    if not name:
+        return False
+    if any(character in name for character in "_.-"):
+        return re.search(
+            rf"(?<![A-Za-z0-9_.-]){re.escape(name)}(?![A-Za-z0-9_.-])",
+            user_transcript, flags=re.IGNORECASE) is not None
+    # Short function names such as ``make``, ``open``, and ``go`` are ordinary
+    # prose.  A substring match must not overwhelm semantic ranking merely
+    # because a request says "make sure" or "open to alternatives".
+    return re.search(
+        rf"(?:\b(?:use|call|invoke)\s+(?:the\s+)?|"
+        rf"\b(?:tool|function)\s+(?:named\s+)?|`)"
+        rf"{re.escape(name)}(?:`|\b)",
+        user_transcript, flags=re.IGNORECASE) is not None
 
 
 def pinned_tool_indices(tools: list[dict], messages: list[dict]) -> list[int]:
@@ -247,19 +422,7 @@ def pinned_tool_indices(tools: list[dict], messages: list[dict]) -> list[int]:
     for i, tool in enumerate(tools):
         fn = tool.get("function", tool)
         name = str(fn.get("name", ""))
-        if any(character in name for character in "_.-"):
-            mentioned = bool(name) and re.search(
-                rf"(?<![A-Za-z0-9_.-]){re.escape(name)}(?![A-Za-z0-9_.-])",
-                user_transcript, flags=re.IGNORECASE) is not None
-        else:
-            # A bare function name may be an ordinary word (`make`, `go`,
-            # `open`). Require explicit tool-selection syntax instead of
-            # hard-pinning it from prose such as "make sure to paginate".
-            mentioned = bool(name) and re.search(
-                rf"(?:\b(?:use|call|invoke)\s+(?:the\s+)?|"
-                rf"\b(?:tool|function)\s+(?:named\s+)?|`)"
-                rf"{re.escape(name)}(?:`|\b)",
-                user_transcript, flags=re.IGNORECASE) is not None
+        mentioned = _explicit_tool_name_mentioned(name, user_transcript)
         if name in historical_names or mentioned:
             pinned.append(i)
     return pinned
@@ -330,19 +493,20 @@ def _lexical_tool_scores(
     n_docs = len(docs)
 
     weighted_query = Counter()
-    transcript_parts = []
+    user_transcript_parts = []
     historical_names = set()
     for message in messages:
         text = _message_search_text(message)
-        transcript_parts.append(text.lower())
         role = message.get("role")
+        if role == "user":
+            user_transcript_parts.append(text)
         weight = 6 if role == "user" else (1 if role == "system" else 2)
         for word in _capability_words(text):
             weighted_query[word] += weight
         for call in message.get("tool_calls") or []:
             if isinstance(call, dict):
                 historical_names.add(str((call.get("function") or {}).get("name", "")))
-    transcript = "\n".join(transcript_parts)
+    user_transcript = "\n".join(user_transcript_parts)
 
     scores = []
     for name, nws, doc in zip(names, name_words, docs):
@@ -355,8 +519,7 @@ def _lexical_tool_scores(
             score += q_weight * idf * (1.0 + math.log(tf))
             if word in nws:
                 score += 4.0 * q_weight * idf
-        normalized_name = name.lower()
-        if normalized_name and normalized_name in transcript:
+        if _explicit_tool_name_mentioned(name, user_transcript):
             score += 100_000.0
         if name in historical_names:
             score += 1_000_000.0

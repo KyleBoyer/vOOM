@@ -1,0 +1,16 @@
+schema: voom.runtime-profile.v1
+name: gpt-oss-120b-tool-agent
+description: Released-weight GPT-OSS-120B with explicit prompt-lossy tool routing and finite-expert adaptive prefill.
+notes:
+  - "Use model=lossy-gpt-oss-120b to activate the hidden gateway; this makes prompt selection approximate, while the checkpoint remains exactly as released, including native MXFP4 experts, with no additional quantization or pruning."
+  - "Starts prefill at 512 positions, below the locally known-unsafe 4096-position shape, while retaining live governor shrink and from-scratch retry to 128, 32, 8, then 1."
+  - "Uses a finite expert-union memory bound: adversarial k-new-pages-per-position before saturation and the released expert count as a hard cap afterward."
+  - "Keeps the full hidden execution context and applies only generic selected-tool, suffix-contract, literal-grounding, and terminal-pagination mechanisms."
+  - "This remains explicit opt-in until several real request shapes and tool domains pass quality and memory gates."
+extends:
+  - agent-tool-gateway
+settings:
+  VMODEL_GPTOSS_PREFILL_CHUNK_SIZE: 512
+  VMODEL_FAST_TOOL_GATEWAY_SUFFIX_CONTRACT: true
+  VMODEL_FAST_TOOL_GATEWAY_LITERAL_GROUNDING: true
+  VMODEL_FAST_TOOL_GATEWAY_TERMINAL_PAGINATION_SYNTHESIS: true

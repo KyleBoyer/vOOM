@@ -315,3 +315,73 @@ def test_captured_adapted_preserves_catalog_but_rewrites_only_plex(tmp_path):
     assert adapted["showRatingValue"] == {"const": "TV-Y7"}
     assert request["tools"][0] == tools[0]
     assert identity["profile"] == "captured-adapted"
+
+
+def test_harmony_analysis_channel_does_not_count_as_the_answer():
+    """A correct gpt-oss reply rejects the ineligible titles BY NAME inside
+    harmony's analysis channel. Scoring the concatenated channels counted
+    those rejections as leaks and zeroed the exclusion points -- the exact
+    reason the 2026-07-31 gate read 85.0/fail while its final channel was
+    perfect. Verbatim shape from that run."""
+    calls = [
+        _call(mediaType="all", excludeRootFolderPath="/Kids/",
+              ratingOperator="lte", movieRatingValue="PG-13",
+              showRatingValue="TV-Y7", limit=100, offset=0),
+        _call(mediaType="all", excludeRootFolderPath="/Kids/",
+              ratingOperator="lte", movieRatingValue="PG-13",
+              showRatingValue="TV-Y7", limit=100, offset=100),
+    ]
+    text = (
+        "analysisFirst page movies: ALPHA_G G root /Media/Movies OK include. "
+        "ECHO_R R excluded. FOXTROT_KIDS_PG root /Media/Kids/Movies contains "
+        "/Kids/ so exclude.\n\nSeries: CHARLIE_TVY include. GOLF_TV14 TV-14 "
+        "excluded. BRAVO_PG13 include. INDIA_UNRATED unknown exclude. "
+        "DELTA_TVY7 include. HOTEL_KIDS_TVY root /Media/Kids/TV contains "
+        "/Kids/ exclude. JULIET_TVPG TV-PG exclude.\n\n"
+        "Thus final list: ALPHA_G, CHARLIE_TVY, BRAVO_PG13, DELTA_TVY7.\n\n"
+        "Return plain list.assistantfinalALPHA_G\nCHARLIE_TVY\nBRAVO_PG13\n"
+        "DELTA_TVY7")
+    result = score_profile(calls, text)
+    assert result["exclusion_points"] == 15
+    assert all(result["ineligible_titles_absent"].values())
+    assert all(result["eligible_titles_found"].values())
+    assert result["score"] == 100
+    assert result["passed"] is True
+
+
+def test_truncated_harmony_analysis_still_fails_without_a_final_channel():
+    """The safety direction: a run cut off inside analysis has produced no
+    answer, and must not be rescued by slicing."""
+    calls = [
+        _call(mediaType="all", excludeRootFolderPath="/Kids/",
+              ratingOperator="lte", movieRatingValue="PG-13",
+              showRatingValue="TV-Y7", limit=100, offset=0),
+        _call(mediaType="all", excludeRootFolderPath="/Kids/",
+              ratingOperator="lte", movieRatingValue="PG-13",
+              showRatingValue="TV-Y7", limit=100, offset=100),
+    ]
+    text = "analysisALPHA_G include. ECHO_R excluded. Still verifying"
+    result = score_profile(calls, text)
+    assert result["passed"] is False
+
+
+def test_kids_exclusion_done_in_reasoning_still_scores_when_delivered_out_of_band():
+    """The model may implement the Kids exclusion by post-filtering in its
+    reasoning rather than via a tool argument. Harmony now delivers that
+    reasoning out-of-band, so the witness must still find it there."""
+    calls = [
+        _call(mediaType="all", ratingOperator="lte", movieRatingValue="PG-13",
+              showRatingValue="TV-Y7", limit=100, offset=0),
+        _call(mediaType="all", ratingOperator="lte", movieRatingValue="PG-13",
+              showRatingValue="TV-Y7", limit=100, offset=100),
+    ]
+    reasoning = (
+        "FOXTROT_KIDS_PG has rootFolderPath /Media/Kids/Movies which contains "
+        "/Kids/ so exclude it. HOTEL_KIDS_TVY rootFolderPath /Media/Kids/TV "
+        "contains /Kids/ so exclude it too.")
+    answer = "ALPHA_G\nCHARLIE_TVY\nBRAVO_PG13\nDELTA_TVY7"
+    without = score_profile(calls, answer)
+    with_reasoning = score_profile(calls, answer, reasoning)
+    assert without["checks"]["excluded_kids_root"]["passed"] is False
+    assert with_reasoning["checks"]["excluded_kids_root"]["passed"] is True
+    assert with_reasoning["passed"] is True

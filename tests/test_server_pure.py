@@ -22,6 +22,9 @@ from runtime.server import (Handler, INFER_LOCK, PreparedPrompt, PriorityLock, R
                             _cache_phase_telemetry,
                             _execution_profile_fields,
                             _fast_dense_resident_kv_projection,
+                            _HarmonyChannelGate,
+                            _harmony_split_channels,
+                            _harmony_visible_text,
                             _hidden_gateway_catalogs,
                             _hidden_gateway_abstention_policy,
                             _hidden_gateway_execution_abstention_policy,
@@ -32,6 +35,10 @@ from runtime.server import (Handler, INFER_LOCK, PreparedPrompt, PriorityLock, R
                             _hidden_gateway_execution_context,
                             _hidden_gateway_execution_context_policy,
                             _hidden_gateway_execution_messages,
+                            _hidden_gateway_result_suffix_anchor,
+                            _HIDDEN_GATEWAY_TERMINAL_PAGINATION_POLICY,
+                            _hidden_gateway_terminal_context,
+                            _hidden_gateway_terminal_pagination_synthesis,
                             _hidden_gateway_host_action,
                             _hidden_gateway_initial_pagination_defaults,
                             _hidden_gateway_pagination_call,
@@ -289,6 +296,29 @@ def test_native_template_history_renders_tool_arguments_as_object_not_string():
             _fake_engine(), model_dir, messages, "low", compact_json=True)
     assert released == '{"city": "Chicago"}'
     assert compact == '{"city":"Chicago"}'
+
+
+def test_native_harmony_history_normalizes_null_assistant_content():
+    # GPT-OSS's released template checks ``"<|channel|>" in
+    # message.content`` whenever the content key exists. Responses function
+    # calls legitimately carry content=None, which otherwise raises TypeError
+    # before the template reaches its tool-call branch.
+    template = (
+        "{% for message in messages %}{% if message.role == 'assistant' %}"
+        "{% if 'forbidden' in message.content %}BAD{% endif %}"
+        "{{ message.tool_calls[0].function.name }}"
+        "{% endif %}{% endfor %}"
+    )
+    messages = [{"role": "assistant", "content": None, "tool_calls": [{
+        "id": "call_weather", "type": "function", "function": {
+            "name": "weather", "arguments": "{}"}}]}]
+    with tempfile.TemporaryDirectory() as directory:
+        model_dir = Path(directory)
+        (model_dir / "tokenizer_config.json").write_text(
+            json.dumps({"chat_template": template}))
+        rendered = _chat_prompt(
+            _fake_engine(model_type="gpt_oss"), model_dir, messages, "low")
+    assert rendered == "weather"
 
 
 def test_fast_qwen35_tool_history_uses_one_canonical_hermes_prefix(tmp_path):
@@ -658,6 +688,47 @@ def test_fast_tool_catalog_permutations_render_identically_but_wire_order_surviv
     # the exact request order expected by each protocol adapter.
     assert [t["function"]["name"] for t in second[2]] == ["mu", "zeta", "alpha"]
     assert [t["name"] for t in second[3]] == ["mu", "zeta", "alpha"]
+
+
+def test_relevant_parameter_prompt_returns_packed_constraint_schema_but_full_wire(
+        tmp_path):
+    (tmp_path / "chat_template.jinja").write_text(
+        "{% for tool in tools %}{{ tool | tojson }}{% endfor %}"
+        "{% for message in messages %}{{ message.content }}{% endfor %}")
+    engine = _fake_engine()
+    properties = {
+        "query": {"type": "string"},
+        "excludeWarehouseId": {"type": "string"},
+        "minimumQuantity": {"type": "number"},
+        "maximumQuantity": {"type": "number"},
+        "cursor": {"type": "string"},
+        "limit": {"type": "integer"},
+        **{f"unrelated{index}": {"type": "string"} for index in range(10)},
+    }
+    tool = _named_tool("inventory_list_stock")
+    tool["function"]["parameters"] = {
+        "type": "object", "properties": properties,
+        "additionalProperties": False,
+    }
+    raw = [{
+        "type": "function", "name": "inventory_list_stock",
+        "parameters": tool["function"]["parameters"],
+    }]
+    messages = [{
+        "role": "user",
+        "content": "list stock below five excluding warehouse west and paginate",
+    }]
+
+    prepared = _prepare_chat_prompt(
+        engine, tmp_path, messages, "low", [tool], raw, "fast", 1,
+        preserve_tool_parameter_prose=True,
+        relevant_parameter_messages=messages)
+
+    prompt_properties = prepared[2][0]["function"]["parameters"]["properties"]
+    assert len(prompt_properties) == 12
+    assert {"excludeWarehouseId", "maximumQuantity", "cursor", "limit"} <= set(
+        prompt_properties)
+    assert len(prepared[3][0]["parameters"]["properties"]) == len(properties)
 
 
 def test_fast_qwen_style_tools_carry_token_aligned_capsule_spans(tmp_path):
@@ -1084,6 +1155,65 @@ def test_hidden_gateway_execution_activation_changes_with_catalog():
         "plex_list", "plex_search"]
 
 
+def test_hidden_gateway_suffix_contract_is_selected_schema_local_not_subject_local():
+    tool = _named_tool("calendar_list_events")
+    tool["function"].update({
+        "description": "List calendar events with optional time and attendee filters.",
+        "parameters": {"type": "object", "properties": {
+            "afterTime": {"type": "string", "description": "Lower time bound"},
+            "attendee": {"type": "string", "description": "Attendee email"},
+        }},
+    })
+    messages = [{"role": "user", "content": "list tomorrow's events for Sam"}]
+
+    execution = _hidden_gateway_execution_messages(
+        messages, [tool], "c" * 64, include_interface_contract=True)
+    activation = json.loads(execution[-1]["content"])
+
+    assert activation["tools"] == ["calendar_list_events"]
+    interface = activation["interfaces"][0]["function"]
+    assert interface["name"] == "calendar_list_events"
+    assert set(interface["parameters"]["properties"]) == {
+        "afterTime", "attendee"}
+    assert "Plex" not in execution[-1]["content"]
+
+
+@pytest.mark.parametrize(("user_text", "tool_name"), [
+    ("list inventory below its reorder point", "inventory_list_stock"),
+    ("show failed build jobs from today", "ci_list_jobs"),
+    ("find unread messages and paginate", "mail_list_messages"),
+])
+def test_hidden_gateway_result_suffix_anchor_retains_original_intent_across_domains(
+        user_text, tool_name):
+    tool = _named_tool(tool_name)
+    tool["function"].update({
+        "description": "List rows under a declared ordering contract.",
+        "parameters": {"type": "object", "properties": {
+            "threshold": {"type": "string", "description": (
+                "Ordered low < medium < high")},
+        }},
+    })
+    messages = [
+        {"role": "user", "content": user_text},
+        {"role": "assistant", "content": "", "tool_calls": [{
+            "id": "call_1", "type": "function", "function": {
+                "name": tool_name, "arguments": "{}"}}]},
+        {"role": "tool", "tool_call_id": "call_1",
+         "content": "{\"hasMore\":false,\"rows\":[]}"},
+    ]
+
+    anchored = _hidden_gateway_result_suffix_anchor(
+        messages, [tool])
+
+    assert anchored[:-1] == messages[:-1]
+    assert messages[-1]["content"] == \
+        "{\"hasMore\":false,\"rows\":[]}"
+    assert user_text in anchored[-1]["content"]
+    assert tool_name in anchored[-1]["content"]
+    assert "answer now" in anchored[-1]["content"]
+    assert "Ordered low < medium < high" in anchored[-1]["content"]
+
+
 def test_hidden_gateway_task_context_keeps_task_history_and_reports_omission():
     messages = [
         {"role": "system", "content": "global harness policy"},
@@ -1108,6 +1238,59 @@ def test_hidden_gateway_task_context_keeps_task_history_and_reports_omission():
         assert "full" in str(error) and "task" in str(error)
     else:
         raise AssertionError("an unknown execution context was accepted")
+
+
+def test_hidden_gateway_terminal_context_reuses_task_projection_across_domains():
+    tool = _named_tool("inventory_list_stock")
+    tool["function"].update({
+        "description": "List inventory under a declared filter contract.",
+        "parameters": {"type": "object", "properties": {
+            "maximumQuantity": {
+                "type": "number", "description": "Inclusive upper bound"},
+        }},
+    })
+    messages = [
+        {"role": "system", "content": "unrelated global harness policy"},
+        {"role": "developer", "content": "unrelated developer examples"},
+        {"role": "user", "content": "list all stock below five and paginate"},
+        {"role": "assistant", "content": "", "tool_calls": [{
+            "id": "call_1", "type": "function", "function": {
+                "name": "inventory_list_stock",
+                "arguments": "{\"maximumQuantity\":5,\"offset\":0}",
+            },
+        }]},
+        {"role": "tool", "tool_call_id": "call_1",
+         "content": "{\"hasMore\":true,\"rows\":[{\"sku\":\"A\"}]}"},
+        {"role": "assistant", "content": "", "tool_calls": [{
+            "id": "call_2", "type": "function", "function": {
+                "name": "inventory_list_stock",
+                "arguments": "{\"maximumQuantity\":5,\"offset\":100}",
+            },
+        }]},
+        {"role": "tool", "tool_call_id": "call_2",
+         "content": "{\"hasMore\":false,\"rows\":[{\"sku\":\"B\"}]}"},
+    ]
+
+    projected, omitted = _hidden_gateway_terminal_context(
+        messages, [tool], "task", suffix_contract=True)
+
+    assert all(message["role"] not in ("system", "developer")
+               for message in projected)
+    assert [message["tool_call_id"] for message in projected
+            if message["role"] == "tool"] == ["call_1", "call_2"]
+    assert "list all stock below five and paginate" in projected[-1]["content"]
+    assert "Inclusive upper bound" in projected[-1]["content"]
+    assert "\"sku\":\"B\"" in projected[-1]["content"]
+    assert "enabled_tools" not in projected[-1]["content"]
+    assert "answer now instead" not in projected[-1]["content"]
+    interface = json.loads(projected[-1]["content"].split(
+        "<vmodel_private_context>", 1)[1].split(
+            "</vmodel_private_context>", 1)[0])[
+                "selected_interfaces"][0]["function"]
+    assert set(interface["parameters"]["properties"]) == {
+        "maximumQuantity"}
+    assert omitted == len(
+        "unrelated global harness policyunrelated developer examples")
 
 
 def test_hidden_gateway_task_context_auto_always_stays_full():
@@ -1339,6 +1522,41 @@ def test_hidden_gateway_forces_activated_catalog_for_explicit_pagination():
     assert _hidden_gateway_decision_choice(
         "auto", "tool-result-pagination", activated_tools=False,
     ) == "specific:vmodel_search_tools"
+
+
+def test_hidden_gateway_terminal_pagination_synthesis_is_explicit_and_generic():
+    base = [
+        {"role": "user", "content": "List all inventory and paginate."},
+        {"role": "assistant", "content": "", "tool_calls": [{
+            "id": "call_1", "type": "function", "function": {
+                "name": "inventory_list", "arguments": "{\"offset\":50}",
+            },
+        }]},
+    ]
+    assert _hidden_gateway_terminal_pagination_synthesis(base + [{
+        "role": "tool", "tool_call_id": "call_1",
+        "content": json.dumps({"items": [], "has_more": False}),
+    }]) is True
+    assert _hidden_gateway_terminal_pagination_synthesis(base + [{
+        "role": "tool", "tool_call_id": "call_1",
+        "content": json.dumps({"items": [], "has_more": True}),
+    }]) is False
+    assert _hidden_gateway_terminal_pagination_synthesis([
+        {"role": "user", "content": "List current inventory."},
+        {"role": "tool", "content": json.dumps({"hasMore": False})},
+    ]) is False
+    assert _hidden_gateway_terminal_pagination_synthesis([
+        {"role": "user", "content": "List all inventory and paginate."},
+        {"role": "tool", "content": json.dumps({"items": []})},
+    ]) is False
+    assert "completed retrieval mechanism" in \
+        _HIDDEN_GATEWAY_TERMINAL_PAGINATION_POLICY
+    assert "not a requested answer format" in \
+        _HIDDEN_GATEWAY_TERMINAL_PAGINATION_POLICY
+    assert "compact plain list" in \
+        _HIDDEN_GATEWAY_TERMINAL_PAGINATION_POLICY
+    assert "do not add a table" in \
+        _HIDDEN_GATEWAY_TERMINAL_PAGINATION_POLICY
 
 
 def test_hidden_gateway_host_route_only_skips_already_forced_decisions():
@@ -4147,6 +4365,111 @@ def test_priority_lock_context_manager_uses_default_priority():
     with lock:
         assert lock._locked is True
     assert lock._locked is False
+
+
+def test_harmony_visible_text_returns_final_channel_only():
+    # The exact shape measured from the real gpt-oss-120b Plex gate on
+    # 2026-07-31: glyphs stripped by decode, channel names left as bare words.
+    raw = ("analysisECHO_R is rated R so exclude. GOLF_TV14 excluded.\n\n"
+           "Thus final list: ALPHA_G, CHARLIE_TVY.\n\n"
+           "Return plain list.assistantfinalALPHA_G\nCHARLIE_TVY")
+    assert _harmony_visible_text(raw, "gpt_oss") == "ALPHA_G\nCHARLIE_TVY"
+
+
+def test_harmony_visible_text_handles_special_token_glyphs():
+    raw = ("<|channel|>analysis<|message|>secret reasoning<|end|>"
+           "<|start|>assistant<|channel|>final<|message|>the answer<|return|>")
+    assert _harmony_visible_text(raw, "gpt_oss") == "the answer"
+
+
+def test_harmony_visible_text_preserves_text_without_a_final_channel():
+    # Generation cut off inside analysis: the analysis text is all the client
+    # has, so emptying it would destroy the response rather than clean it.
+    truncated = "analysisI still need to verify the remaining rows"
+    assert _harmony_visible_text(truncated, "gpt_oss") == truncated
+
+
+def test_harmony_visible_text_leaves_other_model_families_alone():
+    raw = "assistantfinal is an ordinary word here"
+    assert _harmony_visible_text(raw, "qwen3_5") == raw
+
+
+def test_harmony_visible_text_uses_the_last_final_channel():
+    raw = "assistantfinalfirst<|start|>assistant<|channel|>final<|message|>second"
+    assert _harmony_visible_text(raw, "gpt_oss") == "second"
+
+
+def test_harmony_visible_text_ignores_empty_final_channel():
+    raw = "analysisreal content here.assistantfinal   "
+    assert _harmony_visible_text(raw, "gpt_oss") == raw
+
+
+def _stream_through_gate(raw: str, chunk: int = 3):
+    """Feed text through the gate one small piece at a time, as decode does."""
+    gate = _HarmonyChannelGate("gpt_oss")
+    streamed = "".join(
+        gate.feed(raw[i:i + chunk]) for i in range(0, len(raw), chunk))
+    return gate, streamed
+
+
+def test_harmony_gate_streams_only_the_final_channel():
+    raw = ("analysisECHO_R is rated R so exclude.assistantfinalALPHA_G\n"
+           "CHARLIE_TVY")
+    _gate, streamed = _stream_through_gate(raw)
+    assert streamed == "ALPHA_G\nCHARLIE_TVY"
+    assert "ECHO_R" not in streamed
+
+
+def test_harmony_gate_holds_everything_when_no_final_channel_arrives():
+    raw = "analysisstill verifying the remaining rows"
+    gate, streamed = _stream_through_gate(raw)
+    assert streamed == ""
+    # Fail-safe: the whole text is owed at end-of-stream, so the client still
+    # receives it rather than an empty response.
+    assert gate.remainder(raw) == raw
+
+
+def test_harmony_gate_streamed_text_is_a_prefix_of_the_parsed_content():
+    # _MarkerHoldback.final_remainder raises unless this holds, so a trailing
+    # newline arriving mid-stream must not outrun the final parsed text.
+    raw = "analysisreasoning here.assistantfinal  the answer  \n\n"
+    gate, streamed = _stream_through_gate(raw, chunk=1)
+    visible = _harmony_visible_text(raw, "gpt_oss")
+    assert visible == "the answer"
+    assert visible.startswith(streamed)
+    assert gate.remainder(visible) == visible[len(streamed):]
+
+
+def test_harmony_gate_survives_a_marker_split_across_decode_pieces():
+    raw = "analysisx.assistantfinalDONE"
+    for chunk in (1, 2, 4, 7):
+        _gate, streamed = _stream_through_gate(raw, chunk=chunk)
+        assert streamed == "DONE", f"chunk={chunk}"
+
+
+def test_harmony_gate_is_inert_for_other_model_families():
+    gate = _HarmonyChannelGate("qwen3_5")
+    assert gate.feed("plain text") == "plain text"
+    assert gate.remainder("plain text") == ""
+
+
+def test_harmony_split_channels_reports_reasoning_separately():
+    raw = ("<|channel|>analysis<|message|>FOXTROT_KIDS_PG is under /Kids/ so "
+           "exclude<|end|><|start|>assistant<|channel|>final<|message|>"
+           "ALPHA_G<|return|>")
+    visible, analysis = _harmony_split_channels(raw, "gpt_oss")
+    assert visible == "ALPHA_G"
+    # The reasoning is preserved out-of-band: a model may do its filtering
+    # there rather than through a tool argument.
+    assert "FOXTROT_KIDS_PG" in analysis
+    assert "<|" not in analysis
+
+
+def test_harmony_split_channels_reports_no_reasoning_without_a_final_channel():
+    raw = "analysiscut off mid-thought"
+    visible, analysis = _harmony_split_channels(raw, "gpt_oss")
+    assert visible == raw
+    assert analysis == ""
 
 
 def _run_all():

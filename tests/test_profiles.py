@@ -88,7 +88,6 @@ def test_builtin_profiles_resolve_complete_agent_group():
     assert rerank_settings[
         "VMODEL_QWEN35_RERANK_LM_HEAD_CANDIDATES"] == "64"
 
-
 def test_builtin_k3_and_qwen9_profiles_pin_validated_values():
     catalog = discover_runtime_profiles((ROOT / "profiles",))
 
@@ -101,6 +100,57 @@ def test_builtin_k3_and_qwen9_profiles_pin_validated_values():
     )
     assert qwen_settings["VMODEL_MLX_LM_LOSSY_SUFFIX_PREFILL"] == "8:256"
     assert qwen_settings["VMODEL_MLX_LM_SYSTEM_RESERVE_MB"] == "1500"
+
+    balanced_order, balanced_settings = resolve_runtime_profiles(
+        ("qwen35-9b-tool-balanced-agent",), catalog)
+    assert balanced_order == (
+        "qwen35-9b-depth-adaptive",
+        "agent-tool-gateway",
+        "qwen35-9b-tool-balanced-agent",
+    )
+    assert balanced_settings["VMODEL_MLX_LM_LOSSY_SUFFIX_PREFILL"] == "16:1024"
+    assert balanced_settings[
+        "VMODEL_FAST_TOOL_GATEWAY_SUFFIX_CONTRACT"] == "1"
+    assert balanced_settings[
+        "VMODEL_FAST_TOOL_GATEWAY_TERMINAL_PAGINATION_SYNTHESIS"] == "1"
+    assert "VMODEL_FAST_TOOL_GATEWAY_LITERAL_GROUNDING" not in (
+        balanced_settings)
+
+    grounded_order, grounded_settings = resolve_runtime_profiles(
+        ("qwen35-9b-tool-grounded-agent",), catalog)
+    assert grounded_order == (
+        "qwen35-9b-depth-adaptive",
+        "agent-tool-gateway",
+        "qwen35-9b-tool-balanced-agent",
+        "qwen35-9b-tool-grounded-agent",
+    )
+    assert grounded_settings[
+        "VMODEL_FAST_TOOL_GATEWAY_LITERAL_GROUNDING"] == "1"
+
+    gptoss_order, gptoss_settings = resolve_runtime_profiles(
+        ("gpt-oss-120b-tool-agent",), catalog)
+    assert gptoss_order == (
+        "agent-tool-gateway",
+        "gpt-oss-120b-tool-agent",
+    )
+    assert gptoss_settings["VMODEL_GPTOSS_PREFILL_CHUNK_SIZE"] == "512"
+    assert gptoss_settings["VMODEL_FAST_TOOL_GATEWAY_EXECUTION_CONTEXT"] == "full"
+    assert gptoss_settings[
+        "VMODEL_FAST_TOOL_GATEWAY_SUFFIX_CONTRACT"] == "1"
+    assert gptoss_settings[
+        "VMODEL_FAST_TOOL_GATEWAY_LITERAL_GROUNDING"] == "1"
+    assert gptoss_settings[
+        "VMODEL_FAST_TOOL_GATEWAY_TERMINAL_PAGINATION_SYNTHESIS"] == "1"
+
+    task_order, task_settings = resolve_runtime_profiles(
+        ("gpt-oss-120b-tool-agent-task",), catalog)
+    assert task_order == (
+        "agent-tool-gateway",
+        "gpt-oss-120b-tool-agent",
+        "gpt-oss-120b-tool-agent-task",
+    )
+    assert task_settings[
+        "VMODEL_FAST_TOOL_GATEWAY_EXECUTION_CONTEXT"] == "task"
 
     k3_order, k3_settings = resolve_runtime_profiles((
         "kimi-k3-exact-streaming",

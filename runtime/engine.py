@@ -1721,12 +1721,13 @@ class StreamingEngine:
             self._rope_freqs, self._mscale = _gptoss_rope_state(
                 self.cfg, packed=self.store.packed)
             mx.eval(self._rope_freqs)
-            # Quarantined: runtime/gptoss.py still differs from OpenAI's
-            # inverse-frequency/truncate:false reference. Make that visible in
-            # telemetry and invalidate any older cache identity rather than
-            # presenting the profile as conformance-validated.
-            self.rope_profile = "checkpoint-gptoss-yarn-unvalidated"
-            self.rope_cache_identity = "checkpoint-gptoss-yarn-unvalidated-v2"
+            # The checkpoint's truncate:false YaRN parameters are reproduced
+            # in inverse-frequency space and oracle-checked against the
+            # released Transformers implementation.  Bump the cache identity
+            # so no endpoint created by either earlier noncanonical formula is
+            # ever restored under the corrected positional geometry.
+            self.rope_profile = "checkpoint-gptoss-yarn-32x"
+            self.rope_cache_identity = "checkpoint-gptoss-yarn-reference-v3"
         if self.cfg.num_experts and not self.store.packed:
             # 2026-07-19 (benchmark-sweep follow-up): some checkpoints ship
             # experts as ONE fused tensor per projection (e.g. Qwen3-VL-235B's
@@ -6095,7 +6096,9 @@ class StreamingEngine:
                     safe_bytes=adaptive_safe_bytes, initial_chunk=chunk,
                     escalate_growth_cap=self.rc.adaptive_chunk_escalate_growth_cap,
                     worst_case_expert_bytes_per_token=(
-                        self.cfg.num_experts_per_tok * self._expert_fetch_page_bytes))
+                        self.cfg.num_experts_per_tok * self._expert_fetch_page_bytes),
+                    max_expert_fetch_bytes=(
+                        self.cfg.num_experts * self._expert_fetch_page_bytes))
                 path_stats["adaptive_chunk_events"] = adaptive.events
                 path_stats["adaptive_chunk_dynamic_ceiling"] = int(
                     adaptive_dynamic_ceiling)

@@ -1,0 +1,11 @@
+schema: voom.runtime-profile.v1
+name: qwen35-9b-tool-grounded-agent
+description: Balanced Qwen3.5-9B tool profile with conservative literal-to-argument grounding.
+notes:
+  - Extends the balanced multi-turn profile with deterministic grounding of explicit quoted or backticked literals to one unambiguous string parameter.
+  - Grounding never overwrites model-produced arguments and requires both an absolute relevance threshold and a margin over the next candidate.
+  - This is a generic opt-in comparison profile, not a Plex-specific rule or a substitute for end-to-end semantic validation.
+extends:
+  - qwen35-9b-tool-balanced-agent
+settings:
+  VMODEL_FAST_TOOL_GATEWAY_LITERAL_GROUNDING: true

@@ -69,9 +69,13 @@ completes) is exactly the confound polluting the fit, and can be
 measured and subtracted before that data point ever enters `_history`,
 without needing to predict anything. See `observe`'s and the growth
 branch's own comments for how `expert_fetch_bytes`/
-`worst_case_expert_bytes_per_token` do this; both default to 0 (exact
-prior behavior) for callers that don't pass them, i.e. every non-MoE
-model and every existing test.
+`worst_case_expert_bytes_per_token` does this. A finite MoE layer cannot
+touch more than its released expert count, however, so the optional
+`max_expert_fetch_bytes` caps that linear bound once the whole expert pool is
+covered. This retains the adversarial bound before saturation without
+pretending token 10,000 can discover a 129th expert in a 128-expert layer.
+Both values default to 0 (exact prior behavior) for callers that don't pass
+them, i.e. every non-MoE model and existing external caller.
 
 This is intended to change scheduling only, but different chunk shapes can select
 different floating-point kernels/reduction shapes. Therefore every enabled shape
@@ -86,7 +90,8 @@ class AdaptiveChunkController:
     def __init__(self, safe_bytes: int, initial_chunk: int, margin_bytes: int = int(1e9),
                 dead_band: float = 0.2, escalate_growth_cap: bool = False,
                 max_growth_multiplier: float = 8.0,
-                worst_case_expert_bytes_per_token: int = 0):
+                worst_case_expert_bytes_per_token: int = 0,
+                max_expert_fetch_bytes: int = 0):
         if safe_bytes <= 0:
             raise ValueError("safe_bytes must be positive")
         self.safe_bytes = int(safe_bytes)
@@ -129,8 +134,35 @@ class AdaptiveChunkController:
         # touch more experts too, and growing into that blind spot is
         # exactly the bug F129/the 2026-07-29 memory-retry fix hit.
         self.worst_case_expert_bytes_per_token = worst_case_expert_bytes_per_token
+        self.max_expert_fetch_bytes = max(0, int(max_expert_fetch_bytes))
         self.unsafe_at_minimum = False
         self.events: list[str] = []  # human-readable log of controller decisions
+
+    def _safe_chunk_proposal(self, alpha: float, budget: float) -> int:
+        """Solve a conservative compute plus finite-expert-union bound.
+
+        Before a layer's pool is saturated, every active route at an added
+        position may be a new page. At saturation the expert term is constant::
+
+            cost(C) = alpha*C + min(per_token*C, pool_bytes)
+
+        This is a monotone two-piece closed form: no expected-routing
+        assumption, and no impossible unbounded expert growth.
+        """
+        alpha = max(float(alpha), 1e-6)
+        budget = float(budget)
+        per_token = max(0, int(self.worst_case_expert_bytes_per_token))
+        pool = self.max_expert_fetch_bytes
+        if per_token <= 0 or pool <= 0:
+            return max(1, int(budget / (alpha + per_token)))
+
+        saturation_chunk = max(1, (pool + per_token - 1) // per_token)
+        saturation_cost = alpha * saturation_chunk + pool
+        if budget < saturation_cost:
+            proposed = int(budget / (alpha + per_token))
+        else:
+            proposed = int((budget - pool) / alpha)
+        return max(1, proposed)
 
     def next_chunk_size(self) -> int:
         return max(1, self.chunk)
@@ -272,10 +304,8 @@ class AdaptiveChunkController:
                 # deliberately pessimistic beyond that point -- safe, just
                 # not maximally tight, which matches this file's existing
                 # safety-over-optimism stance throughout.
-                effective_alpha = alpha + self.worst_case_expert_bytes_per_token
                 budget = self.safe_bytes - active_before - self.margin - beta
-                proposed = int(budget / effective_alpha) if effective_alpha > 0 else self.chunk
-                proposed = max(1, proposed)
+                proposed = self._safe_chunk_proposal(alpha, budget)
                 old = self.chunk
                 growth_cap = int(self.chunk * self._growth_cap_multiplier)
                 if self.escalate_growth_cap:

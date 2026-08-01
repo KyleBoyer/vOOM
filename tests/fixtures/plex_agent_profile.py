@@ -476,8 +476,33 @@ def _offset(arguments) -> int | None:
         return None
 
 
+# gpt-oss emits harmony channels: an `analysis` chain-of-thought channel and
+# the user-visible `final` channel. A correct answer routinely REJECTS the
+# ineligible titles by name inside analysis, so scoring the concatenated text
+# counts those rejections as if the model had listed them -- inverting the
+# exclusion rubric and rewarding runs that merely truncated before naming
+# them. Slice to the final channel first. Kept here as well as server-side so
+# archived raw artifacts re-score correctly.
+_HARMONY_FINAL_RE = re.compile(
+    r"(?:<\|channel\|>final(?:<\|message\|>)?|assistantfinal)")
+_HARMONY_END_RE = re.compile(r"<\|(?:return|end|start)\|>")
+
+
+def _harmony_final_channel(text: str) -> str:
+    """Return harmony's final channel alone, or the text unchanged."""
+    markers = list(_HARMONY_FINAL_RE.finditer(text or ""))
+    if not markers:
+        return text or ""
+    tail = (text or "")[markers[-1].end():]
+    end = _HARMONY_END_RE.search(tail)
+    if end:
+        tail = tail[:end.start()]
+    return tail.strip() or (text or "")
+
+
 def _final_answer_slice(text: str) -> str:
     """Prefer an explicitly labelled final selection over analysis prose."""
+    text = _harmony_final_channel(text)
     markers = list(re.finditer(
         r"(?im)^\s*(?:#{1,6}\s*)?(?:final\s+(?:list|answer)|"
         r"titles\s+meeting\s+criteria|(?:let\s+me\s+)?re-verify)\s*:?\s*$",
@@ -505,7 +530,8 @@ def _explicit_kids_root_verification(text: str) -> bool:
     return True
 
 
-def score_profile(calls: list[dict], final_text: str) -> dict:
+def score_profile(calls: list[dict], final_text: str,
+                  reasoning: str = "") -> dict:
     """Score the four independent behaviors on a stable 100-point rubric."""
     plex_calls = [
         call for call in calls
@@ -520,11 +546,18 @@ def score_profile(calls: list[dict], final_text: str) -> dict:
         and all(right > left for left, right in zip(
             numeric_offsets, numeric_offsets[1:])))
     answer_text = _final_answer_slice(final_text)
+    # A model may implement the Kids exclusion by post-filtering in its
+    # reasoning instead of via a tool argument, and that reasoning is the only
+    # witness of it. Harmony now delivers reasoning out-of-band (it is no
+    # longer glued to the answer), so the witness must consider both -- while
+    # the answer itself is still scored from the final channel alone.
+    verification_text = "\n".join(part for part in (final_text, reasoning)
+                                  if part)
     root_or_section_filter_or_verification = (
         "/kids/" in str(first.get("excludeRootFolderPath") or "").lower()
         or "kids" in str(
             first.get("excludePlexLibrarySectionName") or "").lower()
-        or _explicit_kids_root_verification(final_text))
+        or _explicit_kids_root_verification(verification_text))
     checks = {
         "selected_plex_tool": (bool(plex_calls), 10),
         "media_type_all": (_norm(first.get("mediaType")) == "all", 8),
@@ -606,12 +639,14 @@ def run_profile(request: dict, url: str, timeout: float,
     turns = []
     all_calls: list[dict] = []
     final_text = ""
+    final_reasoning = ""
     page_index = 0
     started = time.perf_counter()
     for turn_index in range(max_tool_rounds + 1):
         response, wall = _post(url, request, timeout)
         calls = response_calls(response)
         text = response_text(response)
+        reasoning = response.get("vmodel_reasoning")
         turns.append({
             "turn": turn_index + 1,
             "wall_seconds": round(wall, 4),
@@ -628,6 +663,7 @@ def run_profile(request: dict, url: str, timeout: float,
             break
         if text:
             final_text = text
+            final_reasoning = reasoning if isinstance(reasoning, str) else ""
         all_calls.extend(calls)
         plex_calls = [
             call for call in calls
@@ -647,7 +683,7 @@ def run_profile(request: dict, url: str, timeout: float,
             request["tool_choice"] = "auto"
         page_index += 1
 
-    rubric = score_profile(all_calls, final_text)
+    rubric = score_profile(all_calls, final_text, final_reasoning)
     pressure_after = _pressure()
     return {
         "gate": "plex-agent-profile-v1",
@@ -660,6 +696,7 @@ def run_profile(request: dict, url: str, timeout: float,
             "arguments": call.get("arguments"),
         } for call in all_calls],
         "final_text": final_text,
+        "final_reasoning": final_reasoning,
         "wall_seconds": round(time.perf_counter() - started, 4),
         "pressure_before": pressure_before,
         "pressure_after": pressure_after,

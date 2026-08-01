@@ -1,0 +1,11 @@
+schema: voom.runtime-profile.v1
+name: gpt-oss-120b-tool-agent-task
+description: GPT-OSS-120B fast tool profile using a compact latest-task execution context.
+notes:
+  - "Extends the released-weight GPT-OSS profile but explicitly omits unrelated earlier prose from the model execution prompt; latest user intent, selected interfaces, and tool-call/result history remain."
+  - "The projection is generic and contains no request fingerprint, provider, tool name, parameter name, subject, or answer predicate."
+  - "This is prompt-lossy and must remain explicit opt-in until real heterogeneous requests prove that omitted earlier context is not required for their answers."
+extends:
+  - gpt-oss-120b-tool-agent
+settings:
+  VMODEL_FAST_TOOL_GATEWAY_EXECUTION_CONTEXT: task
