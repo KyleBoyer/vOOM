@@ -7782,9 +7782,15 @@ class Handler(BaseHTTPRequestHandler):
             prompt_tokens = (rendered_prompt_tokens if rendered_prompt_tokens is not None
                              else len(engine.tokenizer.encode(prompt).ids))
             completion_tokens = len(result["tokens"])
+            # Harmony's analysis channel is kept out of the answer, so report
+            # it alongside rather than dropping it -- the same contract the
+            # Responses surface already exposes.
+            _visible, harmony_analysis = _harmony_split_channels(
+                text, engine.cfg.model_type)
             self._json(200, {
                 "id": rid, "object": kind, "created": int(t0), "model": model_id,
                 "choices": [choice],
+                "vmodel_reasoning": harmony_analysis or None,
                 "usage": {"prompt_tokens": prompt_tokens,
                           "completion_tokens": completion_tokens,
                           "total_tokens": prompt_tokens + completion_tokens,
@@ -9060,9 +9066,14 @@ class Handler(BaseHTTPRequestHandler):
         _log_path_stats(result, result.get("prompt_tokens", 0))
         blocks, stop_reason = build_content(
             result["text"], result.get("termination_reason", "eos"))
+        # Harmony's analysis channel is kept out of the answer blocks, so
+        # report it alongside rather than dropping it.
+        _visible, harmony_analysis = _harmony_split_channels(
+            result["text"], engine.cfg.model_type)
         self._json(200, {
             "id": f"msg_{uuid.uuid4().hex[:24]}", "type": "message", "role": "assistant",
             "model": model_id, "content": blocks, "stop_reason": stop_reason,
+            "vmodel_reasoning": harmony_analysis or None,
             "stop_sequence": (result.get("stop_sequence")
                               if stop_reason == "stop_sequence" else None),
             "usage": {"input_tokens": prompt_tokens, "output_tokens": len(result["tokens"])},
