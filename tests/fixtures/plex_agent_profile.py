@@ -41,6 +41,7 @@ import re
 import subprocess
 import sys
 import time
+import unicodedata
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -263,20 +264,80 @@ def _actual_export_oracle(export_calls: list[dict]) -> dict:
     }
 
 
+# Models render catalog titles with typographic characters that carry no
+# semantic difference: U+2011 non-breaking hyphens ("Spider-Man"), U+2019
+# apostrophes ("God's"), U+202F narrow no-break spaces before a year, and
+# hyphen/space interchange ("The A-Team" written "A Team").  Matching the raw
+# title with re.escape misses every one of those, so a correct answer scored
+# as a miss.  Measured on the 2026-07-31 real-export run: 7 titles matched
+# strictly versus 42 after folding.  Folding is applied identically to the
+# answer text and to the catalog titles, so this changes precision, not what
+# counts as correct.
+# Horizontal separators only: folding newlines away would merge the whole
+# answer into one line and let a later "[Excluded: ...]" marker suppress
+# every earlier title.
+_TITLE_SEPARATORS_RE = re.compile(r"(?:[^\S\r\n]|[\u2010-\u2015\-_])+")
+_TITLE_APOSTROPHES_RE = re.compile(r"['‘’ʼ´`]")
+_LEADING_ARTICLE_RE = re.compile(r"(?i)^(?:the|a|an)\s+")
+# A title named with an explicit rejection on the same line is the model
+# REPORTING an exclusion, not claiming the item.  Counting those mentions as
+# leaks penalizes exactly the behavior the task asks for.
+_EXCLUSION_MARKER_RE = re.compile(
+    r"(?i)\b(?:exclud|reject|omit|filtered\s+out|not\s+included|"
+    r"does\s+not\s+(?:meet|qualify)|too\s+high)")
+
+
+def _fold_title_text(value: str) -> str:
+    """Canonicalize typographic variation without changing word content."""
+    folded = unicodedata.normalize("NFKC", value or "")
+    folded = _TITLE_APOSTROPHES_RE.sub("", folded)
+    return _TITLE_SEPARATORS_RE.sub(" ", folded)
+
+
+def _mention_is_excluded(text: str, end: int) -> bool:
+    """True when the remainder of the mention's line marks it rejected."""
+    line_end = text.find("\n", end)
+    tail = text[end:] if line_end < 0 else text[end:line_end]
+    return bool(_EXCLUSION_MARKER_RE.search(tail))
+
+
 def _mentioned_catalog_titles(text: str, titles: tuple[str, ...]) -> set[str]:
-    """Find non-overlapping known titles, preferring the longest title."""
+    """Find non-overlapping known titles the answer ASSERTS, longest first.
+
+    A title the answer names only to reject is not asserted, so it is neither
+    a leak when ineligible nor a hit when eligible.
+    """
+    folded_text = _fold_title_text(text)
     occupied: list[tuple[int, int]] = []
     found: set[str] = set()
-    for title in sorted(set(titles), key=lambda value: (-len(value), value)):
-        pattern = re.compile(
-            r"(?<![\w])" + re.escape(title) + r"(?![\w])", re.I)
-        for match in pattern.finditer(text or ""):
-            span = match.span()
-            if any(span[0] < end and start < span[1]
-                   for start, end in occupied):
-                continue
-            occupied.append(span)
-            found.add(title)
+    candidates = []
+    for title in set(titles):
+        folded = _fold_title_text(title).strip()
+        if not folded:
+            continue
+        # The full form is always preferred; the article-less form is only a
+        # fallback, and longest-first ordering plus the occupied-span check
+        # still prevent a shorter catalog title from stealing a longer match.
+        variants = [folded]
+        stripped = _LEADING_ARTICLE_RE.sub("", folded).strip()
+        if stripped and stripped != folded:
+            variants.append(stripped)
+        candidates.append((title, variants))
+    candidates.sort(key=lambda item: (-len(item[1][0]), item[0]))
+    for title, variants in candidates:
+        for variant in variants:
+            pattern = re.compile(
+                r"(?<![\w])" + re.escape(variant) + r"(?![\w])", re.I)
+            for match in pattern.finditer(folded_text):
+                span = match.span()
+                if any(span[0] < end and start < span[1]
+                       for start, end in occupied):
+                    continue
+                occupied.append(span)
+                if not _mention_is_excluded(folded_text, span[1]):
+                    found.add(title)
+            if title in found:
+                break
     return found
 
 

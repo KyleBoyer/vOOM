@@ -445,3 +445,58 @@ def test_kids_exclusion_done_in_reasoning_still_scores_when_delivered_out_of_ban
     assert without["checks"]["excluded_kids_root"]["passed"] is False
     assert with_reasoning["checks"]["excluded_kids_root"]["passed"] is True
     assert with_reasoning["passed"] is True
+
+
+from plex_agent_profile import _mentioned_catalog_titles
+
+
+def test_typographic_title_variants_are_matched():
+    """Models render titles with non-breaking hyphens, curly apostrophes,
+    narrow no-break spaces, and dropped leading articles. None of those are
+    semantic differences, but re.escape matching missed all of them: the
+    2026-07-31 real-export run scored 7 matches where 45 were present."""
+    catalog = ("The Amazing Spider-Man", "The A-Team", "God's Not Dead",
+               "Arrival")
+    answer = (
+        "Amazing Spider‑Man (2012) – PG‑13\n"
+        "A Team (2010) – PG‑13\n"
+        "God’s Not Dead (2014) – PG\n"
+        "Arrival (2016) - PG-13\n")
+    assert _mentioned_catalog_titles(answer, catalog) == set(catalog)
+
+
+def test_explicitly_rejected_titles_are_not_counted_as_leaks():
+    """Naming a row in order to reject it is the requested behavior, not a
+    leak. Only titles the answer actually asserts should count."""
+    answer = (
+        "Anastasia (1997) - G [Excluded: Kid Movies]\n"
+        "Balto (1995) - G [Excluded: Kid Movies]\n"
+        "Arrival (2016) - PG-13\n")
+    found = _mentioned_catalog_titles(answer, ("Anastasia", "Balto", "Arrival"))
+    assert found == {"Arrival"}
+
+
+def test_an_unlabelled_ineligible_title_is_still_a_leak():
+    """The exclusion allowance must not become a blanket amnesty: a title
+    listed with no rejection marker is still claimed."""
+    answer = "Arrival (2016) - PG-13\nAnastasia (1997) - G\n"
+    found = _mentioned_catalog_titles(answer, ("Arrival", "Anastasia"))
+    assert found == {"Arrival", "Anastasia"}
+
+
+def test_an_eligible_title_marked_excluded_is_not_credited():
+    """Symmetry: wrongly rejecting a required title is a miss, not a hit."""
+    answer = "Arrival (2016) - PG-13 [Excluded: rating too high]\n"
+    assert _mentioned_catalog_titles(answer, ("Arrival",)) == set()
+
+
+def test_a_later_exclusion_marker_does_not_suppress_earlier_titles():
+    """Regression: folding separators must preserve line breaks. Collapsing
+    newlines merged the whole answer into one line, so a single later
+    '[Excluded: ...]' marker suppressed every title above it."""
+    answer = (
+        "Arrival (2016) - PG-13\n"
+        "Avatar (2009) - PG-13\n"
+        "Anastasia (1997) - G [Excluded: Kid Movies]\n")
+    found = _mentioned_catalog_titles(answer, ("Arrival", "Avatar", "Anastasia"))
+    assert found == {"Arrival", "Avatar"}
