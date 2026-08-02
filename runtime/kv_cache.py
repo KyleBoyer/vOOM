@@ -2,7 +2,14 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+import os
+import tempfile
+
 import mlx.core as mx
+import numpy as np
+
+from .uncached_io import set_darwin_nocache
 
 
 class KVCache:
@@ -816,6 +823,105 @@ class SteppedKVCache(KVCache):
     def __init__(self, num_layers: int):
         super().__init__(num_layers)
         self._lengths: list[int] = [0] * num_layers
+        self._latent_spill_root: Path | None = None
+        self._latent_spill_temporary = None
+        self._latent_spill_meta: dict[int, tuple[Path, tuple[int, ...], str]] = {}
+        self.latent_spill_bytes_written = 0
+        self.latent_spill_bytes_read = 0
+        self.latent_spill_layers = 0
+        self.latent_spill_reloads = 0
+        self.latent_spill_uncached_descriptors = 0
+
+    def enable_latent_disk_spill(self, root: str | Path) -> None:
+        """Tier exact compressed-MLA arrays and reload them on demand."""
+        root = Path(root).expanduser().resolve()
+        root.mkdir(parents=True, exist_ok=True)
+        self._latent_spill_root = root
+        self._latent_spill_temporary = tempfile.TemporaryDirectory(
+            prefix="voom-k3-mla-kv-", dir=root)
+
+    @property
+    def latent_spill_enabled(self) -> bool:
+        return self._latent_spill_temporary is not None
+
+    def _latent_spill_directory(self) -> Path:
+        if self._latent_spill_temporary is None:
+            raise RuntimeError("compressed MLA KV spill is not enabled")
+        return Path(self._latent_spill_temporary.name)
+
+    @staticmethod
+    def _latent_payload(value: mx.array) -> tuple[bytes, str]:
+        mx.eval(value)
+        if value.dtype == mx.bfloat16:
+            return np.asarray(value.view(mx.uint16)).tobytes(order="C"), "bf16"
+        if value.dtype == mx.float16:
+            return np.asarray(value).astype(np.float16, copy=False).tobytes(order="C"), "f16"
+        if value.dtype == mx.float32:
+            return np.asarray(value).astype(np.float32, copy=False).tobytes(order="C"), "f32"
+        raise TypeError(f"unsupported compressed MLA spill dtype {value.dtype}")
+
+    @staticmethod
+    def _latent_from_payload(
+        payload: bytes, shape: tuple[int, ...], dtype: str,
+    ) -> mx.array:
+        host_dtype = {
+            "bf16": np.uint16,
+            "f16": np.float16,
+            "f32": np.float32,
+        }.get(dtype)
+        if host_dtype is None:
+            raise TypeError(f"unsupported compressed MLA dtype token {dtype}")
+        host = np.frombuffer(payload, dtype=host_dtype).reshape(shape)
+        value = mx.array(host)
+        return value.view(mx.bfloat16) if dtype == "bf16" else value
+
+    def spill_latent_layer(self, layer: int) -> bool:
+        """Write one completed MLA layer exactly, then release its array."""
+        if not self.latent_spill_enabled or not self.compressed_mla:
+            return False
+        value = self.keys[layer]
+        if value is None:
+            return False
+        payload, dtype = self._latent_payload(value)
+        path = self._latent_spill_directory() / f"layer-{layer:03d}.bin"
+        with path.open("wb", buffering=0) as output:
+            self.latent_spill_uncached_descriptors += int(
+                set_darwin_nocache(output.fileno()))
+            output.write(payload)
+            output.flush()
+            os.fsync(output.fileno())
+        self._latent_spill_meta[layer] = (
+            path, tuple(map(int, value.shape)), dtype)
+        self.latent_spill_bytes_written += len(payload)
+        self.latent_spill_layers += 1
+        self.keys[layer] = None
+        return True
+
+    def _reload_latent_layer(self, layer: int) -> None:
+        metadata = self._latent_spill_meta.get(layer)
+        if metadata is None or self.keys[layer] is not None:
+            return
+        path, shape, dtype = metadata
+        with path.open("rb", buffering=0) as source:
+            self.latent_spill_uncached_descriptors += int(
+                set_darwin_nocache(source.fileno()))
+            payload = source.read()
+        value = self._latent_from_payload(payload, shape, dtype)
+        mx.eval(value)
+        self.keys[layer] = value
+        self.latent_spill_bytes_read += len(payload)
+        self.latent_spill_reloads += 1
+
+    def latent_spill_stats(self) -> dict[str, int]:
+        return {
+            "layers": self.latent_spill_layers,
+            "bytes_written": self.latent_spill_bytes_written,
+            "bytes_read": self.latent_spill_bytes_read,
+            "reloads": self.latent_spill_reloads,
+            "resident_bytes": sum(
+                value.nbytes for value in self.keys if value is not None),
+            "uncached_descriptors": self.latent_spill_uncached_descriptors,
+        }
 
     @classmethod
     def from_cache(cls, cache: KVCache) -> "KVCache":
@@ -894,6 +1000,7 @@ class SteppedKVCache(KVCache):
             raise ValueError(
                 "update_latent requires compressed_mla=True"
             )
+        self._reload_latent_layer(layer)
         previous = self._layer_length(layer)
         incoming = int(lat.shape[1])
         end = previous + incoming
@@ -916,9 +1023,7 @@ class SteppedKVCache(KVCache):
 
     @property
     def offset(self) -> int:
-        first = next((i for i, value in enumerate(self.keys)
-                      if value is not None), None)
-        return 0 if first is None else self._layer_length(first)
+        return next((length for length in self._lengths if length), 0)
 
     def nbytes(self) -> int:
         total = 0
@@ -946,6 +1051,9 @@ class SteppedKVCache(KVCache):
     def trim(self, length: int):
         pending = []
         for layer, key in enumerate(self.keys):
+            if key is None and self._layer_length(layer) > length:
+                self._reload_latent_layer(layer)
+                key = self.keys[layer]
             if key is None or self._layer_length(layer) <= length:
                 continue
             if self.compressed_mla:
@@ -961,3 +1069,15 @@ class SteppedKVCache(KVCache):
         dsa = getattr(self, "dsa", None)
         if dsa is not None:
             dsa.trim(length)
+
+    def close_latent_spill(self) -> None:
+        self._latent_spill_meta.clear()
+        if self._latent_spill_temporary is not None:
+            self._latent_spill_temporary.cleanup()
+            self._latent_spill_temporary = None
+
+    def __del__(self):
+        try:
+            self.close_latent_spill()
+        except Exception:
+            pass

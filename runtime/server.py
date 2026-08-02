@@ -1106,9 +1106,26 @@ class EngineManager:
         k3_absorbed_mla_request = os.environ.get(
             "VMODEL_K3_ABSORBED_MLA", "0"
         ).strip()
+        k3_compiled_kda_request = os.environ.get(
+            "VMODEL_K3_COMPILED_KDA_PREFILL", "0"
+        ).strip()
+        k3_native_kda_request = os.environ.get(
+            "VMODEL_K3_NATIVE_FUSED_KDA_PREFILL", "0"
+        ).strip()
+        k3_attnres_spill_request = os.environ.get(
+            "VMODEL_K3_ATTNRES_SPILL_DIR", ""
+        ).strip()
+        k3_kda_spill_request = os.environ.get(
+            "VMODEL_K3_KDA_SPILL_DIR", ""
+        ).strip()
+        k3_mla_kv_spill_request = os.environ.get(
+            "VMODEL_K3_MLA_KV_SPILL_DIR", ""
+        ).strip()
         for name, value in (
             ("VMODEL_K3_COMPRESSED_MLA", k3_compressed_mla_request),
             ("VMODEL_K3_ABSORBED_MLA", k3_absorbed_mla_request),
+            ("VMODEL_K3_COMPILED_KDA_PREFILL", k3_compiled_kda_request),
+            ("VMODEL_K3_NATIVE_FUSED_KDA_PREFILL", k3_native_kda_request),
         ):
             if value not in ("0", "1"):
                 raise RequestValidationError(f"{name} must be 0 or 1")
@@ -1119,6 +1136,24 @@ class EngineManager:
             raise RequestValidationError(
                 "VMODEL_K3_ABSORBED_MLA=1 requires "
                 "VMODEL_K3_COMPRESSED_MLA=1"
+            )
+        if (
+            k3_mla_kv_spill_request
+            and k3_compressed_mla_request != "1"
+        ):
+            raise RequestValidationError(
+                "VMODEL_K3_MLA_KV_SPILL_DIR requires "
+                "VMODEL_K3_COMPRESSED_MLA=1"
+            )
+        if k3_compiled_kda_request == "1" and k3_native_kda_request == "1":
+            raise RequestValidationError(
+                "compiled and native-fused K3 KDA prefill are mutually "
+                "exclusive"
+            )
+        if k3_native_kda_request == "1" and mode == "lossless":
+            raise RequestValidationError(
+                "VMODEL_K3_NATIVE_FUSED_KDA_PREFILL changes the FP32 "
+                "reduction schedule and requires a fast model ID"
             )
         try:
             k3_mla_key_tile_size = int(os.environ.get(
@@ -1161,6 +1196,11 @@ class EngineManager:
         if not 0 <= k3_fused_attnres_tile_size <= 4096:
             raise RequestValidationError(
                 "VMODEL_K3_FUSED_ATTNRES_TILE_SIZE must be in [0, 4096]"
+            )
+        if k3_attnres_spill_request and not k3_fused_attnres_tile_size:
+            raise RequestValidationError(
+                "VMODEL_K3_ATTNRES_SPILL_DIR requires "
+                "VMODEL_K3_FUSED_ATTNRES_TILE_SIZE"
             )
         if not 0 <= k3_dense_mlp_tile_size <= 4096:
             raise RequestValidationError(
@@ -1249,6 +1289,11 @@ class EngineManager:
             bf16_nf12_uncached_request,
             k3_compressed_mla_request,
             k3_absorbed_mla_request,
+            k3_compiled_kda_request,
+            k3_native_kda_request,
+            k3_attnres_spill_request,
+            k3_kda_spill_request,
+            k3_mla_kv_spill_request,
             k3_mla_key_tile_size,
             k3_fused_attnres_tile_size,
             k3_dense_mlp_tile_size,
@@ -1286,6 +1331,11 @@ class EngineManager:
             bf16_nf12_uncached_request,
             k3_compressed_mla_request,
             k3_absorbed_mla_request,
+            k3_compiled_kda_request,
+            k3_native_kda_request,
+            k3_attnres_spill_request,
+            k3_kda_spill_request,
+            k3_mla_kv_spill_request,
             k3_mla_key_tile_size,
             k3_fused_attnres_tile_size,
             k3_dense_mlp_tile_size,
@@ -3033,6 +3083,23 @@ class EngineManager:
             rc.kimi_k3_absorbed_mla = bool(
                 mtype == "kimi_k3"
                 and k3_absorbed_mla_request == "1"
+            )
+            rc.kimi_k3_compiled_kda_prefill = bool(
+                mtype == "kimi_k3"
+                and k3_compiled_kda_request == "1"
+            )
+            rc.kimi_k3_native_fused_kda_prefill = bool(
+                mtype == "kimi_k3"
+                and k3_native_kda_request == "1"
+            )
+            rc.kimi_k3_attnres_spill_dir = (
+                k3_attnres_spill_request if mtype == "kimi_k3" else ""
+            )
+            rc.kimi_k3_kda_spill_dir = (
+                k3_kda_spill_request if mtype == "kimi_k3" else ""
+            )
+            rc.kimi_k3_mla_kv_spill_dir = (
+                k3_mla_kv_spill_request if mtype == "kimi_k3" else ""
             )
             rc.kimi_k3_mla_key_tile_size = k3_mla_key_tile_size
             rc.kimi_k3_fused_attnres_tile_size = (
@@ -6889,6 +6956,13 @@ def _execution_profile_fields(engine) -> dict[str, object]:
         "vmodel_weight_profile": weight_profile,
         "vmodel_backend": str(getattr(engine, "backend_name", "voom")),
     }
+    if rc is not None and getattr(rc, "kimi_k3_compiled_kda_prefill", False):
+        fields["vmodel_kda_prefill"] = "compiled-mlx-byte-identical"
+    elif (
+        rc is not None
+        and getattr(rc, "kimi_k3_native_fused_kda_prefill", False)
+    ):
+        fields["vmodel_kda_prefill"] = "native-metal-reassociated-fp32"
     resident_decision = getattr(engine, "_resident_backend_decision", None)
     if resident_decision is not None:
         fields["vmodel_backend_admission"] = str(resident_decision.reason)

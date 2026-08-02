@@ -80,8 +80,12 @@ Architecture (from the real downloaded modeling_kimi.py / config.json):
 from __future__ import annotations
 
 from functools import lru_cache
+from pathlib import Path
+import os
+import tempfile
 
 import mlx.core as mx
+import numpy as np
 
 from . import quant
 from .config import ModelConfig, effective_expert_top_k
@@ -89,6 +93,213 @@ from .expert_batching import consume_expert_batches
 from .glm import _group_routes, _mla_attention
 from .kda_state import KDAStateCache
 from .layer_runner import _linear, _swiglu
+from .uncached_io import set_darwin_nocache
+
+
+class _DiskAttnResSnapshot:
+    """Exact BF16 row-addressable AttnRes snapshot stored on local disk."""
+
+    ndim = 2
+
+    def __init__(self, owner, index: int):
+        self._owner = owner
+        self.index = int(index)
+
+    @property
+    def path(self) -> Path:
+        return self._owner._group_path(self.index // self._owner.group_size)
+
+    @property
+    def shape(self) -> tuple[int, int]:
+        return self._owner.shape
+
+    def __getitem__(self, key):
+        if not isinstance(key, slice) or key.step not in (None, 1):
+            raise TypeError("disk AttnRes snapshots require contiguous slices")
+        start, stop, step = key.indices(self.shape[0])
+        if step != 1:
+            raise TypeError("disk AttnRes snapshots require unit stride")
+        return self._owner.read_stacked(
+            start, stop, count=self.index + 1
+        )[:, self.index, :]
+
+
+class DiskBackedAttnResSnapshots(list):
+    """List-compatible bounded-memory store for K3 residual snapshots.
+
+    AttnRes only appends one immutable BF16 ``[positions, hidden]`` snapshot
+    every 12 layers, then consumes contiguous row tiles. Persisting each
+    snapshot in exact released dtype avoids a multi-gigabyte Metal residency
+    floor at 46K+ tokens while preserving every value byte. The directory is
+    temporary and removed after the sweep.
+    """
+
+    def __init__(
+        self,
+        root: str | Path,
+        *,
+        write_tile_rows: int = 256,
+        group_size: int = 4,
+    ):
+        super().__init__()
+        root = Path(root).expanduser().resolve()
+        root.mkdir(parents=True, exist_ok=True)
+        self._temporary = tempfile.TemporaryDirectory(
+            prefix="voom-k3-attnres-", dir=root)
+        self.directory = Path(self._temporary.name)
+        self.group_size = max(1, int(group_size))
+        # Keep the historical attribute for diagnostics/tests.  It is the
+        # first bounded packed group, not an unbounded all-snapshot file.
+        self._packed_path = self._group_path(0)
+        self._readers: dict[int, object] = {}
+        self.shape: tuple[int, int] = (0, 0)
+        self.write_tile_rows = max(1, int(write_tile_rows))
+        self.bytes_written = 0
+        self.bytes_read = 0
+        self.write_calls = 0
+        self.read_calls = 0
+        self.uncached_descriptors = 0
+
+    def _group_path(self, group: int) -> Path:
+        return self.directory / f"snapshots-{int(group):03d}.bf16"
+
+    def _close_reader(self, group: int) -> None:
+        reader = self._readers.pop(int(group), None)
+        if reader is not None:
+            reader.close()
+
+    def append(self, value):
+        if value.ndim != 2 or value.dtype != mx.bfloat16:
+            raise ValueError(
+                "disk AttnRes snapshots require rank-2 BF16 values")
+        rows, hidden = map(int, value.shape)
+        old_blocks = len(self)
+        if old_blocks and self.shape != (rows, hidden):
+            raise ValueError(
+                f"AttnRes snapshot shape {(rows, hidden)} != {self.shape}")
+        group = old_blocks // self.group_size
+        old_group_blocks = old_blocks % self.group_size
+        packed_path = self._group_path(group)
+        temporary_path = self.directory / f"snapshots-{group:03d}.next.bf16"
+        self._close_reader(group)
+        old_source = (
+            packed_path.open("rb", buffering=0)
+            if old_group_blocks else None
+        )
+        with temporary_path.open("wb", buffering=0) as output:
+            self.uncached_descriptors += int(
+                set_darwin_nocache(output.fileno()))
+            if old_source is not None:
+                self.uncached_descriptors += int(
+                    set_darwin_nocache(old_source.fileno()))
+            for start in range(0, rows, self.write_tile_rows):
+                end = min(start + self.write_tile_rows, rows)
+                tile = value[start:end]
+                mx.eval(tile)
+                new_host = np.asarray(tile.view(mx.uint16))
+                if new_host.dtype != np.uint16:
+                    raise TypeError(
+                        f"AttnRes host dtype {new_host.dtype} is not uint16")
+                if old_source is not None:
+                    old_elements = (
+                        (end - start) * old_group_blocks * hidden
+                    )
+                    old_payload = old_source.read(old_elements * 2)
+                    if len(old_payload) != old_elements * 2:
+                        raise IOError(
+                            "short packed AttnRes read while appending: "
+                            f"{len(old_payload)} != {old_elements * 2}")
+                    old_host = np.frombuffer(
+                        old_payload, dtype=np.uint16
+                    ).reshape(end - start, old_group_blocks, hidden)
+                    combined = np.concatenate(
+                        [old_host, new_host[:, None, :]], axis=1)
+                    self.bytes_read += len(old_payload)
+                    self.read_calls += 1
+                else:
+                    combined = new_host[:, None, :]
+                payload = combined.tobytes(order="C")
+                output.write(payload)
+                self.bytes_written += len(payload)
+                self.write_calls += 1
+            output.flush()
+            os.fsync(output.fileno())
+        if old_source is not None:
+            old_source.close()
+        expected = rows * (old_group_blocks + 1) * hidden * 2
+        if temporary_path.stat().st_size != expected:
+            raise IOError(
+                "packed AttnRes size "
+                f"{temporary_path.stat().st_size} != {expected}")
+        os.replace(temporary_path, packed_path)
+        self.shape = (rows, hidden)
+        self.clear()
+        for index in range(old_blocks + 1):
+            super().append(_DiskAttnResSnapshot(self, index))
+        self._readers[group] = packed_path.open("rb", buffering=0)
+        self.uncached_descriptors += int(set_darwin_nocache(
+            self._readers[group].fileno()))
+
+    def read_stacked(
+        self, start: int, stop: int, *, count: int | None = None,
+    ) -> mx.array:
+        """Read one contiguous row stripe across every requested snapshot."""
+        blocks = len(self)
+        count = blocks if count is None else int(count)
+        if not 0 <= count <= blocks:
+            raise ValueError(f"AttnRes count {count} is outside [0, {blocks}]")
+        start, stop, step = slice(start, stop).indices(self.shape[0])
+        if step != 1:
+            raise TypeError("packed AttnRes requires unit row stride")
+        rows = stop - start
+        if count == 0:
+            return mx.zeros(
+                (rows, 0, self.shape[1]), dtype=mx.bfloat16)
+        pieces = []
+        for group, first in enumerate(range(0, count, self.group_size)):
+            stored = min(self.group_size, blocks - first)
+            requested = min(stored, count - first)
+            elements = rows * stored * self.shape[1]
+            offset = start * stored * self.shape[1] * 2
+            path = self._group_path(group)
+            reader = self._readers.get(group)
+            if reader is None:
+                reader = path.open("rb", buffering=0)
+                self.uncached_descriptors += int(
+                    set_darwin_nocache(reader.fileno()))
+                self._readers[group] = reader
+            reader.seek(offset)
+            payload = reader.read(elements * 2)
+            if len(payload) != elements * 2:
+                raise IOError(
+                    f"short packed AttnRes read from {path}: "
+                    f"{len(payload)} != {elements * 2}")
+            host = np.frombuffer(payload, dtype=np.uint16).reshape(
+                rows, stored, self.shape[1]
+            )
+            if requested != stored:
+                host = np.ascontiguousarray(host[:, :requested, :])
+            pieces.append(host)
+            self.bytes_read += len(payload)
+            self.read_calls += 1
+        host = pieces[0] if len(pieces) == 1 else np.concatenate(pieces, axis=1)
+        return mx.array(host).view(mx.bfloat16)
+
+    def stats(self) -> dict[str, int]:
+        return {
+            "snapshots": len(self),
+            "bytes_written": self.bytes_written,
+            "bytes_read": self.bytes_read,
+            "write_calls": self.write_calls,
+            "read_calls": self.read_calls,
+            "uncached_descriptors": self.uncached_descriptors,
+        }
+
+    def close(self) -> None:
+        self.clear()
+        for group in list(self._readers):
+            self._close_reader(group)
+        self._temporary.cleanup()
 
 
 def _route_experts(
@@ -299,15 +510,196 @@ def _kimi_dense_mlp_tiled(
     return output
 
 
+_NATIVE_KDA_PREFILL_SCAN_SOURCE = r"""
+    constexpr uint MAX_D = 256;
+
+    const uint dv = thread_position_in_grid.x;
+    const uint h = thread_position_in_grid.y;
+    const uint b = thread_position_in_grid.z;
+    const uint tid = thread_index_in_threadgroup;
+    const uint L = q_shape[1];
+    const uint H = q_shape[2];
+    const uint D = q_shape[3];
+
+    // K3 has Dk == Dv == 128. One threadgroup owns one head, so load the
+    // query/key/decay vectors once per position rather than once per value
+    // column. The recurrent matrix itself stays in coherent global memory.
+    threadgroup float shared_q[MAX_D];
+    threadgroup float shared_k[MAX_D];
+    threadgroup float shared_decay[MAX_D];
+
+    const size_t state_base = ((size_t)b * H + h) * D * D + dv;
+    for (uint t = 0; t < L; ++t) {
+        const size_t vector_base = ((size_t)b * L + t) * H * D + h * D;
+        if (tid < D) {
+            shared_q[tid] = static_cast<float>(q[vector_base + tid]);
+            shared_k[tid] = static_cast<float>(k[vector_base + tid]);
+            shared_decay[tid] = exp(
+                static_cast<float>(gate[vector_base + tid]));
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        float predicted = 0.0f;
+        for (uint dk = 0; dk < D; ++dk) {
+            const size_t index = state_base + (size_t)dk * D;
+            const float previous = t == 0
+                ? static_cast<float>(state[index])
+                : static_cast<float>(out_state[index]);
+            const float decayed = previous * shared_decay[dk];
+            out_state[index] = static_cast<T>(decayed);
+            predicted += shared_k[dk] * decayed;
+        }
+
+        const size_t value_index = vector_base + dv;
+        const float residual = static_cast<float>(v[value_index]) - predicted;
+        const float scaled_residual = static_cast<float>(
+            beta[((size_t)b * L + t) * H + h]) * residual;
+        float output = 0.0f;
+        for (uint dk = 0; dk < D; ++dk) {
+            const size_t index = state_base + (size_t)dk * D;
+            const float updated = static_cast<float>(out_state[index])
+                + shared_k[dk] * scaled_residual;
+            out_state[index] = static_cast<T>(updated);
+            output += shared_q[dk] * updated;
+        }
+        out[value_index] = static_cast<T>(output);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+"""
+
+
+@lru_cache(maxsize=1)
+def _native_kda_prefill_scan_kernel():
+    if not mx.metal.is_available():
+        return None
+    return mx.fast.metal_kernel(
+        name="voom_kimi_kda_prefill_scan",
+        input_names=["q", "k", "v", "gate", "beta", "state"],
+        output_names=["out", "out_state"],
+        source=_NATIVE_KDA_PREFILL_SCAN_SOURCE,
+    )
+
+
+def _native_fused_kda_prefill_scan(
+    q: mx.array,
+    k: mx.array,
+    v: mx.array,
+    gate: mx.array,
+    beta: mx.array,
+    state: mx.array,
+) -> tuple[mx.array, mx.array]:
+    """Fuse an entire multi-position KDA recurrence into one Metal dispatch.
+
+    This is the released recurrence, not a chunk/WY approximation: positions
+    still advance serially and every state update precedes the corresponding
+    output.  It changes the reduction schedule from MLX's separate ``sum``
+    operations to a serial FP32 accumulation inside one kernel, so ordinary
+    roundoff differences remain possible and serving must opt in until greedy
+    released-model gates admit it.
+    """
+    if q.shape != k.shape or q.shape != v.shape or q.shape != gate.shape:
+        raise ValueError(
+            "native KDA prefill requires matching q/k/v/gate shapes")
+    if len(q.shape) != 4:
+        raise ValueError("native KDA prefill expects [B,L,H,D] tensors")
+    batch, length, heads, dim = map(int, q.shape)
+    if length <= 1:
+        raise ValueError("native KDA prefill requires more than one position")
+    if not 1 <= dim <= 256:
+        raise ValueError("native KDA prefill head dimension must be <=256")
+    if beta.shape != (batch, length, heads):
+        raise ValueError(
+            f"native KDA beta shape {beta.shape} != "
+            f"{(batch, length, heads)}")
+    if state.shape != (batch, heads, dim, dim):
+        raise ValueError(
+            f"native KDA state shape {state.shape} != "
+            f"{(batch, heads, dim, dim)}")
+    if any(value.dtype != mx.float32
+           for value in (q, k, v, gate, beta, state)):
+        raise ValueError("native KDA prefill currently requires float32")
+    kernel = _native_kda_prefill_scan_kernel()
+    if kernel is None:
+        raise RuntimeError("native KDA prefill requires Metal")
+    output, final_state = kernel(
+        inputs=[q, k, v, gate, beta, state],
+        template=[("T", state.dtype)],
+        grid=(dim, heads, batch),
+        threadgroup=(dim, 1, 1),
+        output_shapes=[q.shape, state.shape],
+        output_dtypes=[state.dtype, state.dtype],
+    )
+    return output, final_state
+
+
+@mx.compile
+def _compiled_kda_scan_segment(q, k, v, gate, beta, state):
+    """Trace the ordinary MLX KDA recurrence without changing its operators."""
+    outputs = []
+    for position in range(q.shape[1]):
+        q_t = q[:, position]
+        k_t = k[:, position]
+        v_t = v[:, position]
+        state = state * mx.exp(gate[:, position])[..., None]
+        predicted = mx.sum(k_t[..., None] * state, axis=-2)
+        residual = v_t - predicted
+        state = state + (
+            beta[:, position, :, None] * k_t
+        )[..., None] * residual[..., None, :]
+        outputs.append(mx.sum(q_t[..., None] * state, axis=-2))
+    return mx.stack(outputs, axis=1), state
+
+
+def _compiled_kda_prefill_scan(
+    q: mx.array,
+    k: mx.array,
+    v: mx.array,
+    gate: mx.array,
+    beta: mx.array,
+    state: mx.array,
+    *,
+    segment: int = 32,
+) -> tuple[mx.array, mx.array]:
+    """Compile the reference recurrence in bounded, byte-identical segments.
+
+    Segment 32 deliberately retains the reference path's state-evaluation
+    cadence.  The compiled graph uses the same MLX sums and elementwise ops;
+    unlike the custom Metal scan above, it does not reassociate FP32 dots.
+    """
+    length = int(q.shape[1])
+    if length <= 1 or segment <= 0:
+        raise ValueError(
+            "compiled KDA prefill requires multiple positions and a "
+            "positive segment")
+    outputs = []
+    for start in range(0, length, segment):
+        end = min(start + segment, length)
+        output, state = _compiled_kda_scan_segment(
+            q[:, start:end],
+            k[:, start:end],
+            v[:, start:end],
+            gate[:, start:end],
+            beta[:, start:end],
+            state,
+        )
+        mx.eval(state)
+        outputs.append(output)
+    return mx.concatenate(outputs, axis=1), state
+
+
 def _kda_attention(
     h: mx.array, w: dict, prefix: str, cfg: ModelConfig, kda_cache: KDAStateCache | None, layer: int,
     native_fused_decode: bool = False,
+    native_fused_prefill: bool = False,
+    compiled_prefill: bool = False,
+    profile=None,
 ) -> mx.array:
     B, L, _ = h.shape
     H = cfg.kda_num_heads
     D = cfg.kda_head_dim
     K = cfg.kda_conv_kernel_size
 
+    projection_t0 = profile.start_substep() if profile is not None else None
     q = _linear(h, w, f"{prefix}.self_attn.q_proj")
     k = _linear(h, w, f"{prefix}.self_attn.k_proj")
     v = _linear(h, w, f"{prefix}.self_attn.v_proj")
@@ -332,7 +724,12 @@ def _kda_attention(
     q, q_hist_new = conv_fn(q, w[f"{prefix}.self_attn.q_conv1d.weight"], q_hist, K)
     k, k_hist_new = conv_fn(k, w[f"{prefix}.self_attn.k_conv1d.weight"], k_hist, K)
     v, v_hist_new = conv_fn(v, w[f"{prefix}.self_attn.v_conv1d.weight"], v_hist, K)
+    if profile is not None:
+        profile.finish_substep(
+            "kda_qkv_conv", layer, projection_t0, q, k, v,
+            positions=L)
 
+    gate_t0 = profile.start_substep() if profile is not None else None
     dt_bias = w[f"{prefix}.self_attn.dt_bias"].reshape(H, D).astype(mx.float32)
     g_raw = _linear(_linear(h, w, f"{prefix}.self_attn.f_a_proj"), w, f"{prefix}.self_attn.f_b_proj")
     g_raw = g_raw.reshape(B, L, H, D).astype(mx.float32) + dt_bias
@@ -375,25 +772,43 @@ def _kda_attention(
 
     q = _l2norm(q) * (D ** -0.5)
     k = _l2norm(k)
+    if profile is not None:
+        profile.finish_substep(
+            "kda_gate_norm", layer, gate_t0, q, k, v, gate, beta,
+            positions=L)
 
     state = kda_cache.state(layer) if kda_cache is not None else None
     if state is None:
         state = mx.zeros((B, H, D, D), dtype=mx.float32)
 
-    outputs = []
-    for t in range(L):
-        q_t, k_t, v_t, g_t, beta_t = q[:, t], k[:, t], v[:, t], gate[:, t], beta[:, t]
-        state = state * mx.exp(g_t)[..., None]                       # (B,H,K,V) decay along K axis
-        pred_v = mx.sum(k_t[..., None] * state, axis=-2)             # (B,H,V)
-        residual = v_t - pred_v
-        state = state + (beta_t[..., None] * k_t)[..., None] * residual[..., None, :]
-        o_t = mx.sum(q_t[..., None] * state, axis=-2)                # (B,H,V)
-        outputs.append(o_t)
-        if (t + 1) % 32 == 0:
-            # F92: bound the lazy graph -- a naive Python-level scan otherwise
-            # accumulates one node per op per timestep with no eval boundary.
-            mx.eval(state)
-    o = mx.stack(outputs, axis=1)  # (B, L, H, D) float32
+    scan_t0 = profile.start_substep() if profile is not None else None
+    if native_fused_prefill and compiled_prefill:
+        raise ValueError(
+            "native and compiled KDA prefill paths are mutually exclusive")
+    if L > 1 and native_fused_prefill:
+        o, state = _native_fused_kda_prefill_scan(
+            q, k, v, gate, beta, state)
+    elif L > 1 and compiled_prefill:
+        o, state = _compiled_kda_prefill_scan(
+            q, k, v, gate, beta, state)
+    else:
+        outputs = []
+        for t in range(L):
+            q_t, k_t, v_t, g_t, beta_t = q[:, t], k[:, t], v[:, t], gate[:, t], beta[:, t]
+            state = state * mx.exp(g_t)[..., None]                       # (B,H,K,V) decay along K axis
+            pred_v = mx.sum(k_t[..., None] * state, axis=-2)             # (B,H,V)
+            residual = v_t - pred_v
+            state = state + (beta_t[..., None] * k_t)[..., None] * residual[..., None, :]
+            o_t = mx.sum(q_t[..., None] * state, axis=-2)                # (B,H,V)
+            outputs.append(o_t)
+            if (t + 1) % 32 == 0:
+                # F92: bound the lazy graph -- a naive Python-level scan otherwise
+                # accumulates one node per op per timestep with no eval boundary.
+                mx.eval(state)
+        o = mx.stack(outputs, axis=1)  # (B, L, H, D) float32
+    if profile is not None:
+        profile.finish_substep(
+            "kda_scan", layer, scan_t0, o, state, positions=L)
 
     if kda_cache is not None:
         if kda_cache.factor_capture_active:
@@ -417,6 +832,7 @@ def _kda_attention(
     # config.linear_attn_config.use_full_rank_gate is true (confirmed
     # present -- true -- on the real checkpoint; absent/false for the
     # original Kimi Linear 48B, which only ever ships g_a_proj/g_b_proj).
+    output_t0 = profile.start_substep() if profile is not None else None
     if cfg.kda_use_full_rank_gate:
         g_out = _linear(h, w, f"{prefix}.self_attn.g_proj")
     else:
@@ -424,7 +840,11 @@ def _kda_attention(
     g_out = g_out.reshape(B, L, H, D)
     o = _gated_rms_norm(o, g_out, w[f"{prefix}.self_attn.o_norm.weight"], cfg.rms_norm_eps)
     o = o.reshape(B, L, H * D)
-    return _linear(o, w, f"{prefix}.self_attn.o_proj")
+    result = _linear(o, w, f"{prefix}.self_attn.o_proj")
+    if profile is not None:
+        profile.finish_substep(
+            "kda_output", layer, output_t0, result, positions=L)
+    return result
 
 
 def _kimi_linear_attention_residual(
@@ -489,7 +909,7 @@ def _kimi_linear_mlp_residual(
 def _kimi_moe_output(
     h: mx.array, w: dict, prefix: str, cfg: ModelConfig, layer: int,
     get_experts, iter_expert_batches=None, profile=None, stat_collector=None,
-    overlap_shared_expert: bool = False,
+    overlap_shared_expert: bool = False, shared_tile_size: int = 0,
 ) -> mx.array:
     """Routed-experts + shared-experts MoE output ONLY -- no residual add,
     and the caller must already have checked `layer >= cfg.first_k_dense_replace`
@@ -556,7 +976,25 @@ def _kimi_moe_output(
     # The final addition and every routed accumulation remain in their original
     # order, so this is a scheduling identity rather than a math approximation.
     shared = None
-    if overlap_shared_expert:
+    if shared_tile_size and cfg.moe_latent_hidden_size:
+        # Long-context K3 already retains a full hidden-width AttnRes MLP
+        # input.  Materializing the shared expert's full gate/up activations
+        # beside it added another multi-GB peak at 46K.  Both routed branches
+        # need only the much smaller latent projection after routing, while
+        # the shared branch is row-independent.  Evaluate both now, with the
+        # shared MLP position-tiled, then release the hidden-width input before
+        # expert paging.  The final addition and every per-row dot product are
+        # unchanged; only overlap/lifetime scheduling differs.
+        shared = _kimi_dense_mlp_tiled(
+            h,
+            w,
+            f"{moe_prefix}.shared_experts",
+            cfg,
+            shared_tile_size,
+        )
+        mx.eval(h_latent, shared)
+        del h
+    elif overlap_shared_expert:
         shared = _kimi_dense_mlp(
             h, w, f"{moe_prefix}.shared_experts", cfg)
         mx.async_eval(shared)
@@ -586,6 +1024,32 @@ def _kimi_moe_output(
         if cfg.moe_latent_use_norm:
             out = mx.fast.rms_norm(
                 out, w[f"{moe_prefix}.routed_expert_norm.weight"], cfg.rms_norm_eps)
+        mx.eval(out)
+        del h_latent
+        if shared is not None and shared_tile_size:
+            # Both final branches are row-independent:
+            #
+            #   result[p] = up(routed[p]) + shared[p].
+            #
+            # The ordinary expression materializes a second full hidden-width
+            # buffer for ``up(routed)`` and a third for the addition. Reuse the
+            # already-evaluated shared output as the destination and evaluate
+            # the identical latent-width dot product in position tiles. The
+            # reduction dimension and left-to-right addition are unchanged;
+            # only independent output rows and tensor lifetimes are scheduled.
+            for start in range(0, out.shape[1], shared_tile_size):
+                end = min(start + shared_tile_size, out.shape[1])
+                routed_tile = _linear(
+                    out[:, start:end, :],
+                    w,
+                    f"{moe_prefix}.routed_expert_up_proj",
+                )
+                value = routed_tile + shared[:, start:end, :]
+                mx.eval(value)
+                shared[:, start:end, :] = value
+                mx.eval(shared)
+            del out
+            return shared
         out = _linear(out, w, f"{moe_prefix}.routed_expert_up_proj")
 
     if shared is None:
@@ -802,12 +1266,23 @@ def _apply_attn_res_fused_tiled(
     if prefix_sum.ndim != 2:
         raise ValueError("fused AttnRes expects a rank-2 prefix")
     rows, hidden = prefix_sum.shape
-    residual_list = (
-        list(block_residual)
-        if isinstance(block_residual, (list, tuple))
+    residual_store = (
+        block_residual
+        if isinstance(block_residual, DiskBackedAttnResSnapshots)
         else None
     )
-    if residual_list is None:
+    residual_list = (
+        list(block_residual)
+        if residual_store is None
+        and isinstance(block_residual, (list, tuple))
+        else None
+    )
+    if residual_store is not None:
+        if residual_store.shape != prefix_sum.shape:
+            raise ValueError(
+                "packed AttnRes residual shape does not match prefix")
+        blocks = len(residual_store)
+    elif residual_list is None:
         if block_residual.ndim != 3:
             raise ValueError("fused AttnRes expects rank-3 residuals")
         if (
@@ -843,7 +1318,9 @@ def _apply_attn_res_fused_tiled(
     for start in range(0, rows, tile_size):
         end = min(start + tile_size, rows)
         prefix_tile = prefix_sum[start:end]
-        if residual_list is None:
+        if residual_store is not None:
+            residual_tile = residual_store.read_stacked(start, end)
+        elif residual_list is None:
             residual_tile = block_residual[start:end]
         elif residual_list:
             # FLA's list-input/pointer-table idea expressed with MLX views:
@@ -1005,11 +1482,161 @@ def attn_res_wrap_layer(
     return prefix_sum, block_residual
 
 
+def attn_res_wrap_layer_streamed(
+    x: mx.array,
+    block_residual: DiskBackedAttnResSnapshots,
+    w: dict,
+    prefix: str,
+    cfg: ModelConfig,
+    layer: int,
+    attn_tile_fn,
+    mlp_fn,
+    *,
+    tile_size: int,
+    fused_tile_size: int,
+) -> tuple[mx.array, DiskBackedAttnResSnapshots]:
+    """Bound full-context K3 activation lifetimes around exact row tiles.
+
+    A 46K x 7168 BF16 activation is about 661 MB.  The ordinary wrapper can
+    retain the full normalized attention input, every attention result tile,
+    their concatenation, and the full MLP input at the same time.  Snapshot
+    spilling alone therefore cannot keep a 16-GB Mac below its Metal ceiling.
+
+    AttnRes and RMSNorm are independent across position rows.  Evaluate those
+    operations around each already-causal attention tile and assign its result
+    into one full output buffer.  The MLP still receives the entire prompt, so
+    router grouping/expert reuse and released arithmetic are unchanged.  Only
+    tensor lifetime and assignment scheduling differ.
+    """
+    if tile_size <= 0 or fused_tile_size <= 0:
+        raise ValueError("streamed AttnRes requires positive tile sizes")
+    if not isinstance(block_residual, DiskBackedAttnResSnapshots):
+        raise TypeError("streamed AttnRes requires disk-backed snapshots")
+    batch, total, hidden = map(int, x.shape)
+    old_residual_count = len(block_residual)
+    boundary = layer % cfg.attn_res_block_size == 0
+    if boundary:
+        block_residual.append(x.reshape(-1, hidden))
+
+    def residual_position_tile(count: int, start: int, end: int):
+        parts = [
+            block_residual.read_stacked(
+                b * total + start,
+                b * total + end,
+                count=count,
+            )
+            for b in range(batch)
+        ]
+        return parts[0] if len(parts) == 1 else mx.concatenate(parts, axis=0)
+
+    def apply_tile(
+        prefix_tile: mx.array,
+        residual_count: int,
+        proj_weight: mx.array,
+        norm_weight: mx.array,
+        start: int,
+        end: int,
+    ) -> mx.array:
+        residual_tiles = residual_position_tile(
+            residual_count, start, end)
+        return _apply_attn_res(
+            prefix_tile.reshape(-1, hidden),
+            residual_tiles,
+            proj_weight,
+            norm_weight,
+            cfg.rms_norm_eps,
+            fused_tile_size=fused_tile_size,
+        ).reshape(batch, end - start, hidden)
+
+    for start in range(0, total, tile_size):
+        end = min(start + tile_size, total)
+        source_tile = x[:, start:end, :]
+        hidden_tile = source_tile
+        if old_residual_count:
+            hidden_tile = apply_tile(
+                source_tile,
+                old_residual_count,
+                w[f"{prefix}.self_attention_res_proj.weight"],
+                w[f"{prefix}.self_attention_res_norm.weight"],
+                start,
+                end,
+            )
+        attention_input = mx.fast.rms_norm(
+            hidden_tile,
+            w[f"{prefix}.input_layernorm.weight"],
+            cfg.rms_norm_eps,
+        )
+        attention_out = attn_tile_fn(attention_input, start, end)
+        value = attention_out if boundary else source_tile + attention_out
+        mx.eval(value)
+        # This function owns ``x`` exclusively. The exact post-attention tile
+        # is fully evaluated before assignment, so its source view is no
+        # longer needed and the 661-MB full-context input can double as the
+        # output accumulator instead of coexisting with a second buffer.
+        x[:, start:end, :] = value
+        mx.eval(x)
+    del (
+        attention_input,
+        attention_out,
+        hidden_tile,
+        old_residual_count,
+        source_tile,
+        value,
+    )
+    attention_sum = x
+    del x
+
+    mlp_input = mx.zeros_like(attention_sum)
+    mx.eval(mlp_input)
+    current_residual_count = len(block_residual)
+    for start in range(0, total, tile_size):
+        end = min(start + tile_size, total)
+        hidden_tile = apply_tile(
+            attention_sum[:, start:end, :],
+            current_residual_count,
+            w[f"{prefix}.mlp_res_proj.weight"],
+            w[f"{prefix}.mlp_res_norm.weight"],
+            start,
+            end,
+        )
+        value = mx.fast.rms_norm(
+            hidden_tile,
+            w[f"{prefix}.post_attention_layernorm.weight"],
+            cfg.rms_norm_eps,
+        )
+        mx.eval(value)
+        mlp_input[:, start:end, :] = value
+        mx.eval(mlp_input)
+    del current_residual_count
+
+    # Pop the sole owner before entering the callback.  The K3 latent-MoE
+    # callback can then release its hidden-width input as soon as routing,
+    # latent projection, and the tiled shared branch have consumed it.
+    mlp_input_owner = [mlp_input]
+    del mlp_input
+    mlp_out = mlp_fn(mlp_input_owner.pop())
+    mx.eval(mlp_out)
+    # The residual addition is also independent per position. Reuse the
+    # post-attention accumulator after each exact tile result is materialized,
+    # avoiding a third full hidden-width buffer at the layer boundary.
+    for start in range(0, total, tile_size):
+        end = min(start + tile_size, total)
+        value = attention_sum[:, start:end, :] + mlp_out[:, start:end, :]
+        mx.eval(value)
+        attention_sum[:, start:end, :] = value
+        mx.eval(attention_sum)
+    del mlp_out, value
+    return attention_sum, block_residual
+
+
 def run_kimi_k3_block(
     x: mx.array, w: dict, prefix: str, cfg: ModelConfig, kv,
     layer: int, offset: int, block_residual, get_experts,
     mlp_last_only: bool = False, iter_expert_batches=None,
-    native_fused_decode: bool = False, profile=None, stat_collector=None,
+    native_fused_decode: bool = False,
+    native_fused_prefill: bool = False,
+    compiled_prefill: bool = False,
+    profile=None, stat_collector=None,
     fused_attnres_tile_size: int = 0,
 ) -> tuple[mx.array, mx.array]:
     """One Kimi K3 decoder block WITH AttnRes -- thin wrapper supplying the
@@ -1035,7 +1662,10 @@ def run_kimi_k3_block(
             kda_cache = getattr(kv, "kda_cache", None)
             return _kda_attention(
                 h, w, prefix, cfg, kda_cache, layer,
-                native_fused_decode=native_fused_decode)
+                native_fused_decode=native_fused_decode,
+                native_fused_prefill=native_fused_prefill,
+                compiled_prefill=compiled_prefill,
+                profile=profile)
         raise ValueError(
             f"layer {layer} is in neither cfg.full_attn_layers nor cfg.kda_layers")
 

@@ -211,6 +211,27 @@ def _layer_transient_reserve_margin(position_count: int) -> int:
     return 0 if position_count == 1 else 400_000_000
 
 
+def _recurring_layer_transient_reserve_margin(
+        position_count: int, observation_count: int,
+) -> int:
+    """Retire the secondary shape-uncertainty pad after recurrence proof.
+
+    The governor's independent critical reserve remains in force.  This only
+    removes the extra 400-MB allowance once the same typed layer signature and
+    position count have completed once.  The first occurrence necessarily ran
+    before a learned reserve existed; after it succeeds, the measured
+    high-water is reserved in full and monotonically tracks the recurring
+    maximum.  Keeping a pad only on occurrence two is therefore not a
+    first-allocation safety guarantee, while the governor's independent 1.2-GB
+    critical reserve continues to protect system memory.
+    """
+    if observation_count < 0:
+        raise ValueError("observation_count must be non-negative")
+    if observation_count >= 1:
+        return 0
+    return _layer_transient_reserve_margin(position_count)
+
+
 def _layer_transient_for_positions(
         position_count: int, prefill_bytes: int, decode_bytes: int,
 ) -> tuple[int, int]:
@@ -615,6 +636,16 @@ class RuntimeConfig:
     # that test's A/B produced -- an isolated microbenchmark win is
     # deliberately NOT trusted on its own given the zmlx precedent.
     native_fused_deltanet_decode: bool = False
+    # Opt-in multi-position Kimi KDA recurrence fusion. This keeps the
+    # released serial state equation but performs its FP32 reductions inside
+    # one Metal kernel, so it is algebraically exact while not necessarily
+    # activation-byte-identical to MLX's separately dispatched reductions.
+    # Keep disabled until real K3 greedy and continuation gates admit it.
+    kimi_k3_native_fused_kda_prefill: bool = False
+    # Opt-in byte-identical KDA prefill graph compilation. This retains the
+    # ordinary MLX reduction operators and 32-position state boundaries while
+    # amortizing graph dispatch/optimization overhead.
+    kimi_k3_compiled_kda_prefill: bool = False
     # Chunkwise WY DeltaNet prefill. Numerically close but not
     # activation-identical across arbitrary checkpoint splits, so server.py
     # admits it automatically only for fast/lossy Qwen3.5/3.6 routes.
@@ -742,6 +773,18 @@ class RuntimeConfig:
     # retains the released composite MLX path. Explicit opt-in pending a full
     # real-model greedy gate and broader prompt-shape corpus.
     kimi_k3_fused_attnres_tile_size: int = 0
+    # Optional external-volume scratch for exact BF16 AttnRes snapshots. This
+    # is a memory-tiering choice, not compression or quantization; it requires
+    # the fused tiled readout so snapshots are read back in bounded row tiles.
+    kimi_k3_attnres_spill_dir: str = ""
+    # Exact FP32/BF16 recurrent KDA endpoints can be tiered after each
+    # completed prefill layer and lazily restored for decode. This bounds the
+    # otherwise depth-growing ~6.7-MB-per-KDA-layer Metal residency.
+    kimi_k3_kda_spill_dir: str = ""
+    # Exact released-dtype compressed MLA latents are likewise dead after
+    # their layer's prefill. Tier them and restore each layer lazily for
+    # decode, bounding the ~73-MB-per-full-attention-layer resident growth.
+    kimi_k3_mla_kv_spill_dir: str = ""
     # Bound K3's 33,792-wide dense MLP gate/up activations during a
     # layer-stationary long prefill. Zero preserves the existing full-position
     # call; explicit for the same rollout/generality reasons as fused AttnRes.
@@ -938,6 +981,12 @@ class RuntimeConfig:
                 "kimi_k3_mla_key_tile_size", 2048),
             kimi_k3_fused_attnres_tile_size=run.get(
                 "kimi_k3_fused_attnres_tile_size", 0),
+            kimi_k3_attnres_spill_dir=run.get(
+                "kimi_k3_attnres_spill_dir", ""),
+            kimi_k3_kda_spill_dir=run.get(
+                "kimi_k3_kda_spill_dir", ""),
+            kimi_k3_mla_kv_spill_dir=run.get(
+                "kimi_k3_mla_kv_spill_dir", ""),
             kimi_k3_dense_mlp_tile_size=run.get(
                 "kimi_k3_dense_mlp_tile_size", 0),
             kimi_k3_prefill_tile_policy=run.get(
@@ -1066,9 +1115,31 @@ class StreamingEngine:
             raise ValueError(
                 "kimi_k3_fused_attnres_tile_size must be >= 0"
             )
+        if (
+            self.rc.kimi_k3_attnres_spill_dir
+            and not self.rc.kimi_k3_fused_attnres_tile_size
+        ):
+            raise ValueError(
+                "kimi_k3_attnres_spill_dir requires fused AttnRes tiling"
+            )
+        if (
+            self.rc.kimi_k3_mla_kv_spill_dir
+            and not self.rc.kimi_k3_compressed_mla
+        ):
+            raise ValueError(
+                "kimi_k3_mla_kv_spill_dir requires compressed MLA"
+            )
         if self.rc.kimi_k3_dense_mlp_tile_size < 0:
             raise ValueError(
                 "kimi_k3_dense_mlp_tile_size must be >= 0"
+            )
+        if (
+            self.rc.kimi_k3_compiled_kda_prefill
+            and self.rc.kimi_k3_native_fused_kda_prefill
+        ):
+            raise ValueError(
+                "compiled and native-fused K3 KDA prefill are mutually "
+                "exclusive"
             )
         if self.rc.kimi_k3_prefill_tile_policy not in (
             "fixed", "prompt-length"
@@ -3230,6 +3301,10 @@ class StreamingEngine:
                     mlp_last_only=last_only,
                     iter_expert_batches=self._iter_expert_batches,
                     native_fused_decode=self.rc.native_fused_deltanet_decode,
+                    native_fused_prefill=(
+                        self.rc.kimi_k3_native_fused_kda_prefill),
+                    compiled_prefill=(
+                        self.rc.kimi_k3_compiled_kda_prefill),
                     profile=profiler,
                     fused_attnres_tile_size=(
                         self.rc.kimi_k3_fused_attnres_tile_size),
@@ -3980,7 +4055,9 @@ class StreamingEngine:
         from .kimi_linear import (
             _kda_attention, _mla_attention, _kimi_dense_mlp_tiled,
             _kimi_moe_output,
-            attn_res_wrap_layer, apply_output_attn_res)
+            attn_res_wrap_layer, attn_res_wrap_layer_streamed,
+            apply_output_attn_res,
+            DiskBackedAttnResSnapshots)
 
         if tile_width <= 0:
             raise ValueError("tile_width must be positive")
@@ -4003,13 +4080,19 @@ class StreamingEngine:
         profiler = self._request_profiler
         if profiler is not None:
             profiler.begin_sweep(total, path="layer_stationary_kimi_k3")
-        block_residual = (
-            []
-            if self.rc.kimi_k3_fused_attnres_tile_size
-            else mx.zeros(
-                (x.shape[0] * total, 0, x.shape[2]), dtype=x.dtype
+        if self.rc.kimi_k3_attnres_spill_dir:
+            block_residual = DiskBackedAttnResSnapshots(
+                self.rc.kimi_k3_attnres_spill_dir,
+                write_tile_rows=tile_width,
             )
-        )
+        else:
+            block_residual = (
+                []
+                if self.rc.kimi_k3_fused_attnres_tile_size
+                else mx.zeros(
+                    (x.shape[0] * total, 0, x.shape[2]), dtype=x.dtype
+                )
+            )
         for i in range(n):
             self._select_layer_transient(total, i)
             if self.prefetcher:
@@ -4042,33 +4125,62 @@ class StreamingEngine:
             t0 = time.perf_counter()
             prefix = f"model.layers.{i}"
 
+            def attn_tile_fn(ht, start, end, i=i, prefix=prefix):
+                if self.governor is not None and self._layer_transient:
+                    reserve_margin = self._layer_transient_margin
+                    if isinstance(
+                        block_residual, DiskBackedAttnResSnapshots
+                    ):
+                        key = (
+                            total,
+                            self._transient_layer_signature(i),
+                        )
+                        observations = int(getattr(
+                            self,
+                            "_layer_transient_observation_counts",
+                            {},
+                        ).get(key, 0))
+                        reserve_margin = (
+                            _recurring_layer_transient_reserve_margin(
+                                total, observations)
+                        )
+                    self.governor.reserve(
+                        self._layer_transient,
+                        margin=reserve_margin)
+                attention_t0 = time.perf_counter()
+                if i in self.cfg.full_attn_layers:
+                    yt = _mla_attention(
+                        ht, w, prefix, self.cfg, kv, i, offset + start)
+                elif i in self.cfg.kda_layers:
+                    kda_cache = getattr(kv, "kda_cache", None)
+                    yt = _kda_attention(
+                        ht, w, prefix, self.cfg, kda_cache, i,
+                        native_fused_decode=(
+                            self.rc.native_fused_deltanet_decode),
+                        native_fused_prefill=(
+                            self.rc.kimi_k3_native_fused_kda_prefill),
+                        compiled_prefill=(
+                            self.rc.kimi_k3_compiled_kda_prefill),
+                        profile=profiler)
+                else:
+                    raise ValueError(
+                        f"layer {i} is in neither cfg.full_attn_layers "
+                        "nor cfg.kda_layers")
+                mx.eval(yt)
+                if profiler is not None and profiler.sync_substeps:
+                    profiler.record_substep(
+                        "attention", i,
+                        time.perf_counter() - attention_t0,
+                        positions=end - start)
+                return yt
+
             def attn_fn(hidden_states, i=i, prefix=prefix):
                 tiles = []
                 pos = 0
                 while pos < total:
                     end = min(pos + tile_width, total)
-                    if self.governor is not None and self._layer_transient:
-                        self.governor.reserve(
-                            self._layer_transient,
-                            margin=self._layer_transient_margin)
                     ht = hidden_states[:, pos:end, :]
-                    attention_t0 = time.perf_counter()
-                    if i in self.cfg.full_attn_layers:
-                        yt = _mla_attention(
-                            ht, w, prefix, self.cfg, kv, i, offset + pos)
-                    elif i in self.cfg.kda_layers:
-                        kda_cache = getattr(kv, "kda_cache", None)
-                        yt = _kda_attention(
-                            ht, w, prefix, self.cfg, kda_cache, i,
-                            native_fused_decode=self.rc.native_fused_deltanet_decode)
-                    else:
-                        raise ValueError(
-                            f"layer {i} is in neither cfg.full_attn_layers nor cfg.kda_layers")
-                    mx.eval(yt)
-                    if profiler is not None and profiler.sync_substeps:
-                        profiler.record_substep(
-                            "attention", i, time.perf_counter() - attention_t0,
-                            positions=end - pos)
+                    yt = attn_tile_fn(ht, pos, end)
                     tiles.append(yt)
                     pos = end
                 return tiles[0] if len(tiles) == 1 else mx.concatenate(tiles, axis=1)
@@ -4086,23 +4198,84 @@ class StreamingEngine:
                 else:
                     if self.rc.expert_batch_prefetch:
                         self._expert_shared_overlap_layers += 1
-                    out = _kimi_moe_output(
-                        h2, w, prefix, self.cfg, i, self._get_experts,
-                        iter_expert_batches=self._iter_expert_batches,
-                        profile=profiler,
-                        overlap_shared_expert=(
-                            self.rc.expert_batch_prefetch))
+                    h2_owner = [h2]
+                    del h2
+                    streamed_moe = isinstance(
+                        block_residual, DiskBackedAttnResSnapshots)
+                    saved_transient = self._layer_transient
+                    if streamed_moe:
+                        # At expert-fetch time the streamed wrapper has
+                        # already materialized the full MLP input, and the
+                        # tiled latent-MoE path has evaluated its latent and
+                        # shared branches.  mx.get_active_memory() therefore
+                        # accounts for those live buffers.  Adding the whole
+                        # historical layer transient again double-counted
+                        # them and refused 8.16 GB projected despite a 7.19
+                        # GB measured dense+MoE peak.  Reserve compact expert
+                        # pages against the authoritative live sample; the
+                        # ordinary/non-streamed paths retain their existing
+                        # fail-closed transient reservation.
+                        self._layer_transient = 0
+                    try:
+                        out = _kimi_moe_output(
+                            h2_owner.pop(),
+                            w, prefix, self.cfg, i, self._get_experts,
+                            iter_expert_batches=self._iter_expert_batches,
+                            profile=profiler,
+                            overlap_shared_expert=(
+                                self.rc.expert_batch_prefetch),
+                            shared_tile_size=(
+                                self.rc.kimi_k3_dense_mlp_tile_size
+                                if streamed_moe else 0),
+                        )
+                    finally:
+                        self._layer_transient = saved_transient
                 mx.eval(out)
                 if profiler is not None and profiler.sync_substeps:
                     profiler.record_substep(
                         "mlp", i, time.perf_counter() - mlp_t0, positions=total)
                 return out
 
-            x, block_residual = attn_res_wrap_layer(
-                x, block_residual, w, prefix, self.cfg, i, attn_fn, mlp_fn,
-                fused_tile_size=(
-                    self.rc.kimi_k3_fused_attnres_tile_size))
+            if isinstance(block_residual, DiskBackedAttnResSnapshots):
+                # Transfer the prior activation's sole owner into the streamed
+                # wrapper so it can release that full-context buffer before
+                # entering the much larger MoE lifetime.
+                x_owner = [x]
+                del x
+                x, block_residual = attn_res_wrap_layer_streamed(
+                    x_owner.pop(),
+                    block_residual, w, prefix, self.cfg, i,
+                    attn_tile_fn, mlp_fn,
+                    tile_size=tile_width,
+                    fused_tile_size=(
+                        self.rc.kimi_k3_fused_attnres_tile_size))
+            else:
+                x, block_residual = attn_res_wrap_layer(
+                    x, block_residual, w, prefix, self.cfg, i,
+                    attn_fn, mlp_fn,
+                    fused_tile_size=(
+                        self.rc.kimi_k3_fused_attnres_tile_size))
             mx.eval(x)
+            if (
+                self.rc.kimi_k3_kda_spill_dir
+                and i in self.cfg.kda_layers
+                and getattr(kv, "kda_cache", None) is not None
+                and kv.kda_cache.spill_layer(i)
+            ):
+                # The completed endpoint is now exact raw bytes on the
+                # external tier. No later prefill layer consumes it; decode
+                # reloads that layer lazily through the same cache interface.
+                mx.clear_cache()
+            if (
+                self.rc.kimi_k3_mla_kv_spill_dir
+                and i in self.cfg.full_attn_layers
+                and getattr(kv, "latent_spill_enabled", False)
+                and kv.spill_latent_layer(i)
+            ):
+                # Later prefill layers never attend through an earlier layer's
+                # KV. Decode reloads this exact latent only when it reaches the
+                # corresponding full-attention layer.
+                mx.clear_cache()
             compute_s = time.perf_counter() - t0
             self.timer.add("layer_compute", compute_s)
             if profiler is not None:
@@ -4152,6 +4325,9 @@ class StreamingEngine:
             }, block_residual, self.cfg,
             fused_tile_size=(
                 self.rc.kimi_k3_fused_attnres_tile_size))
+        if isinstance(block_residual, DiskBackedAttnResSnapshots):
+            self._last_k3_attnres_spill_stats = block_residual.stats()
+            block_residual.close()
         return x
 
     def _layer_stationary_kimi_k3_nf12_split_sweep(
@@ -4166,6 +4342,7 @@ class StreamingEngine:
         whole-layer BF16 buffer.
         """
         from .kimi_linear import (
+            DiskBackedAttnResSnapshots,
             _kda_attention,
             _kimi_dense_mlp_tiled,
             _kimi_moe_output,
@@ -4192,13 +4369,19 @@ class StreamingEngine:
             profiler.begin_sweep(
                 total, path="layer_stationary_kimi_k3_nf12_split"
             )
-        block_residual = (
-            []
-            if self.rc.kimi_k3_fused_attnres_tile_size
-            else mx.zeros(
-                (x.shape[0] * total, 0, x.shape[2]), dtype=x.dtype
+        if self.rc.kimi_k3_attnres_spill_dir:
+            block_residual = DiskBackedAttnResSnapshots(
+                self.rc.kimi_k3_attnres_spill_dir,
+                write_tile_rows=tile_width,
             )
-        )
+        else:
+            block_residual = (
+                []
+                if self.rc.kimi_k3_fused_attnres_tile_size
+                else mx.zeros(
+                    (x.shape[0] * total, 0, x.shape[2]), dtype=x.dtype
+                )
+            )
 
         for i in range(n):
             self._select_layer_transient(total, i)
@@ -4291,6 +4474,13 @@ class StreamingEngine:
                         native_fused_decode=(
                             self.rc.native_fused_deltanet_decode
                         ),
+                        native_fused_prefill=(
+                            self.rc.kimi_k3_native_fused_kda_prefill
+                        ),
+                        compiled_prefill=(
+                            self.rc.kimi_k3_compiled_kda_prefill
+                        ),
+                        profile=profiler,
                     )
                 else:
                     raise ValueError(
@@ -4437,7 +4627,7 @@ class StreamingEngine:
             self.cache.discard(mlp_key, mlp_names)
 
         self._restore_aggregate_layer_transient(total)
-        return apply_output_attn_res(
+        result = apply_output_attn_res(
             x,
             {
                 "model.output_attn_res_proj.weight": (
@@ -4452,6 +4642,10 @@ class StreamingEngine:
             fused_tile_size=(
                 self.rc.kimi_k3_fused_attnres_tile_size),
         )
+        if isinstance(block_residual, DiskBackedAttnResSnapshots):
+            self._last_k3_attnres_spill_stats = block_residual.stats()
+            block_residual.close()
+        return result
 
     def forward_tokens(self, tokens: list[int], kv, tap_layers=None) -> mx.array:
         """Feed tokens through the streamed model against an existing KV cache.
@@ -5119,6 +5313,9 @@ class StreamingEngine:
             kv.mla_absorbed_key_tile_size = int(
                 self.rc.kimi_k3_mla_key_tile_size
             )
+            if self.rc.kimi_k3_mla_kv_spill_dir:
+                kv.enable_latent_disk_spill(
+                    self.rc.kimi_k3_mla_kv_spill_dir)
         if self.cfg.model_type in (
                 "kimi_linear", "kimi_k3", "qwen3_5_moe", "qwen3_5", "jet_nemotron"):
             # KDA's recurrent state is fixed-size and not token-indexed. Exact
@@ -5132,6 +5329,12 @@ class StreamingEngine:
             from .kda_state import KDAStateCache
 
             kv.kda_cache = KDAStateCache(self.cfg.num_hidden_layers)
+            if (
+                self.cfg.model_type == "kimi_k3"
+                and self.rc.kimi_k3_kda_spill_dir
+            ):
+                kv.kda_cache.enable_disk_spill(
+                    self.rc.kimi_k3_kda_spill_dir)
         return kv
 
     def generate(self, prompt: str, max_tokens: int = 64, on_token=None, stop=None,
@@ -7175,6 +7378,17 @@ class StreamingEngine:
             path_stats["postgen_weight_cache_trim_available_after_bytes"] = int(
                 psutil.virtual_memory().available)
         request_cache_after = _cache_io_snapshot(self)
+        kda_cache = getattr(kv, "kda_cache", None)
+        if kda_cache is not None and getattr(
+            kda_cache, "spill_enabled", False
+        ):
+            self._last_k3_kda_spill_stats = kda_cache.spill_stats()
+            path_stats["k3_kda_spill"] = dict(
+                self._last_k3_kda_spill_stats)
+        if getattr(kv, "latent_spill_enabled", False):
+            self._last_k3_mla_kv_spill_stats = kv.latent_spill_stats()
+            path_stats["k3_mla_kv_spill"] = dict(
+                self._last_k3_mla_kv_spill_stats)
         _record_cache_io_delta(
             self, request_cache_before, path_stats, after=request_cache_after)
         _record_cache_io_delta(
