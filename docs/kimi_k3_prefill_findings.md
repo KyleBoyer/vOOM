@@ -1,6 +1,7 @@
 # Kimi K3 prefill findings
 
-Measured 2026-08-01 on the project M4 Mac mini (16 GB unified memory).  This
+Measured 2026-08-01 through 2026-08-02 on the project M4 Mac mini (16 GB
+unified memory).  This
 document separates exact model computation, algebraically equivalent but
 floating-point-reassociated computation, and explicitly lossy side-quest
 profiles.
@@ -81,12 +82,61 @@ simply scales the measured 91.831-second full-fast decode by the five-layer
 released/fast decode ratio (6.794/6.285); full-depth lossless decode remains
 unmeasured.
 
-The completed fast run therefore does not yet reach tens of minutes for a
+The completed uncached fast run therefore does not reach tens of minutes for a
 never-seen 46K-token request.  An exact cache may reuse only a byte-identical
 prompt or prefix under the same model, tokenizer, arithmetic, and schedule
 namespace.  Every uncached suffix position must still cross every released
 layer.  MTP/speculative decoding can reduce later-token latency, not the first
-cold prefill.
+cold prefill.  The following exact shared-prefix result changes the warm-cache
+case without changing that cold-cache lower bound.
+
+## Exact prefix for a never-seen harness request
+
+Two distinct, byte-preserved real Responses captures share 131 tools and the
+same two leading system messages but have different user-message hashes.  The
+seed capture is 148,276 bytes with SHA-256
+`dfbb91d57d4374111251a2f0383810e4d0ef2ad4b19aa94d8a21b290acf89c7e`;
+the target is 148,252 bytes with SHA-256
+`fed4c3ff827708e25c18ac3bb23e3229a5e79f5033627ff2f43358e1c176d007`.
+Both preserve streaming, temperature 0.3, automatic tool choice, all three
+messages, and all tools in request order.
+
+The gate renders only the tools, leading system/developer messages, and the
+next user-role boundary.  Two synthetic continuations find a tokenizer-safe
+endpoint before any dynamic content.  It then independently proves that the
+resulting 37,816 token IDs are a literal prefix of both real prompts.  The
+37,825-token target has only nine unseen suffix tokens, so the reusable prefix
+is 99.976% of the request.  No target user/history content enters the seed.
+
+| phase / cache state | first token | next token | total | peak Metal | class |
+|---|---:|---:|---:|---:|---|
+| static endpoint, fresh engine, prompt miss | **104.934 min** | discarded and not fed back | **104.934 min** | **4.978 GB** | one-time warmup, lossy profile |
+| distinct target, exact 37,816-token memory prefix | **100.244 s / 1.671 min** | **88.943 s** | **189.188 s / 3.153 min** | **6.524 GB** | measured, lossy profile |
+| released-lossless target with the same exact prefix | about **185 s / 3.1 min** | about **99 s** | about **4.7 min** | not gated | projected, not measured |
+
+The measured profile is REAP50 + routed top-4 + native KDA, so it is explicitly
+lossy even though cache reuse itself is exact for that profile.  The lossless
+projection applies the same 1.843x full-prompt released/fast ratio used above
+to target prefill and the separate roughly 99-second lossless continuation
+proxy; it is not a completed released-model gate.
+
+This is a warm-prefix result, not a cold first-process call: the 104.934-minute
+static seed must run once per matching model/tokenizer/arithmetic/schedule
+namespace and remain resident.  After that preparation, the model had never
+seen the target dynamic content, cache lookup took 0.000751 seconds, and path
+telemetry reported source `memory`, LCP 37,816, reusable prefix 37,816, and no
+exact full-prompt hit.  The timing preserved the target capture bytes and
+temperature while adding deterministic sampling seed 7, limiting output to two
+tokens, and excluding HTTP/SSE wrapper time.  Logical target weight views read
+244.594 GB in prefill and 221.463 GB in decode; those counters do not establish
+strict physical uncached storage traffic.
+
+The full artifacts are
+`logs/k3_shared_prefix_full_reap50_top4_20260802.json` and
+`logs/gates/k3-shared-prefix-full-reap50-top4-20260802.done.json`.  The reduced
+five-layer gate first proved the same exact extension path: 300.466-second seed,
+7.308-second target first token, 14.347-second two-token total, and 6.524 GB
+peak Metal.
 
 ## Native KDA microprobe
 
