@@ -62,7 +62,7 @@ Only the local model and explicit two-token output cap changed.
 |---|---:|---:|---:|---:|---|
 | REAP50 + top-4 + native KDA, fresh engine, prompt miss | **149.765 min** | **91.831 s** | **151.296 min** model time | **7.184 GB** | measured, lossy |
 | same gate including process/envelope overhead | about **151.0 min** | 91.831 s | **152.516 min** wall | 7.184 GB | first-token split derived |
-| released lossless, unseen prompt | about **276 min / 4.6 h** | about 2.7 min/token | not measured | not gated | projected |
+| released lossless, unseen prompt | about **276 min / 4.6 h** | not measured; a shallow 4K ratio scales to about 99 s | not measured | not gated | projected |
 | exact full-prompt cache hit | not measured | schedule-dependent | not measured | not measured | exact only in matching namespace |
 
 The measured run used a fresh engine and had no prompt/KV cache hit.  It is not
@@ -76,7 +76,10 @@ KDA wrote/read 449.4 MB, and MLA wrote/read 1.281 GB.
 The released-lossless estimate applies the measured 4K five-layer class ratios
 (1.9544x KDA and 1.7202x full attention) to the complete fast gate's measured
 69-KDA-layer and 24-full-attention-layer totals.  It is not a substitute for a
-completed released-model gate.
+completed released-model gate.  The separate 99-second continuation indication
+simply scales the measured 91.831-second full-fast decode by the five-layer
+released/fast decode ratio (6.794/6.285); full-depth lossless decode remains
+unmeasured.
 
 The completed fast run therefore does not yet reach tens of minutes for a
 never-seen 46K-token request.  An exact cache may reuse only a byte-identical
