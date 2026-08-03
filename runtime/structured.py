@@ -239,10 +239,18 @@ def _compiler(engine):
     xgr = _xgrammar()
     try:
         from transformers import AutoTokenizer
+        from .tiktoken_convert import has_tiktoken_tokenizer
 
         _relax_layer_type_validation()
+        # Kimi releases ship only tiktoken.model plus their tokenizer class as
+        # local checkpoint code.  vOOM already uses this exact local class to
+        # build its verified fast tokenizer (tiktoken_convert.py); XGrammar
+        # needs the same vocabulary view.  Keep remote code disabled for every
+        # ordinary tokenizer.json checkpoint and keep network access disabled
+        # unconditionally.
         tokenizer = AutoTokenizer.from_pretrained(
-            str(engine._model_dir), local_files_only=True)
+            str(engine._model_dir), local_files_only=True,
+            trust_remote_code=has_tiktoken_tokenizer(engine._model_dir))
         info = xgr.TokenizerInfo.from_huggingface(
             tokenizer, vocab_size=int(engine.cfg.vocab_size),
             stop_token_ids=list(engine.cfg.eos_token_ids))

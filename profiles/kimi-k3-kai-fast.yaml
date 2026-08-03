@@ -1,0 +1,29 @@
+schema: voom.runtime-profile.v1
+name: kimi-k3-kai-fast
+description: Measured lossy K3 Kai-harness profile with exact startup-prefix retention.
+extends:
+  - kimi-k3-exact-streaming
+  - kimi-k3-memory-core
+notes:
+  - Explicit fast-mode profile; top-4 routing and the native KDA reduction schedule are lossy relative to the released checkpoint.
+  - Fixed 128-position prefill is required by the durable recurrent/MLA prefix fingerprint and matches the full 37,816-token shared-prefix gate.
+  - REAP calibration, sidecars, spill roots, persistent-cache root, and startup-prefix documents are machine-local paths and must be supplied separately.
+  - The 150 MB weight and 64 MB MLX caches are the measured 16 GB Kai-harness values, not general defaults.
+  - Two experts per decode fetch bounds simultaneous compact expert pages; one-position layer-0 and shared-expert gate/up/activation projections are materialized sequentially so independent native-MXFP4 staging does not overlap.
+settings:
+  VMODEL_K3_PREFILL_TILE_POLICY: fixed
+  VMODEL_K3_PREFILL_TILE_WIDTH: 128
+  VMODEL_K3_MLA_KEY_TILE_SIZE: 1024
+  VMODEL_K3_FUSED_ATTNRES_TILE_SIZE: 128
+  VMODEL_K3_DENSE_MLP_TILE_SIZE: 256
+  VMODEL_K3_NATIVE_FUSED_KDA_PREFILL: true
+  VMODEL_K3_WEIGHT_CACHE_MB: 150
+  VMODEL_K3_MLX_CACHE_MB: 64
+  VMODEL_K3_EXPERT_FETCH_BATCH: 16
+  VMODEL_K3_DECODE_EXPERT_FETCH_BATCH: 2
+  VMODEL_K3_EXPERT_TOP_K: 4
+  VMODEL_K3_HOT_PROMPT_KV: true
+  VMODEL_K3_HOT_KV_SLOTS: 1
+  VMODEL_K3_HOT_KV_MIN_TOKENS: 1
+  VMODEL_K3_HOT_KV_PERSIST_MAX_CHECKPOINTS: 4
+  VMODEL_K3_HOT_KV_PERSIST_MAX_MB: 3000

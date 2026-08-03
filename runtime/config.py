@@ -595,7 +595,16 @@ class ModelConfig:
         )
         if config.model_type == "kimi_k3":
             manifest_path = os.environ.get(
+                "VMODEL_K3_EXPERT_PRUNE_MANIFEST", "")
+            legacy_manifest_path = os.environ.get(
                 "VMODEL_KIMI_K3_EXPERT_PRUNE_MANIFEST", "")
+            if (manifest_path and legacy_manifest_path
+                    and Path(manifest_path).expanduser().resolve()
+                    != Path(legacy_manifest_path).expanduser().resolve()):
+                raise ValueError(
+                    "VMODEL_K3_EXPERT_PRUNE_MANIFEST and legacy "
+                    "VMODEL_KIMI_K3_EXPERT_PRUNE_MANIFEST disagree")
+            manifest_path = manifest_path or legacy_manifest_path
             if manifest_path:
                 # Side-Quest 3: opt-in, lossy REAP-style pruning -- see
                 # expert_prune_masks's own field docstring above and

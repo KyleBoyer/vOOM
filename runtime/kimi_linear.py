@@ -463,7 +463,14 @@ def _kimi_expert_mlp(h: mx.array, w: dict, prefix: str, cfg: ModelConfig) -> mx.
     return _linear(activated, w, f"{prefix}.w2")
 
 
-def _kimi_dense_mlp(h: mx.array, w: dict, prefix: str, cfg: ModelConfig) -> mx.array:
+def _kimi_dense_mlp(
+    h: mx.array,
+    w: dict,
+    prefix: str,
+    cfg: ModelConfig,
+    *,
+    synchronize_subprojections: bool = False,
+) -> mx.array:
     """gate_proj/up_proj/down_proj MLP (dense layer-0, and shared_experts),
     dispatching activation by cfg.hidden_act. Kimi Linear/K2.5 take the
     exact same path as the existing layer_runner._swiglu call sites (kept
@@ -472,10 +479,24 @@ def _kimi_dense_mlp(h: mx.array, w: dict, prefix: str, cfg: ModelConfig) -> mx.a
     if cfg.hidden_act != "situ":
         return _swiglu(h, w, prefix)
     gate = _linear(h, w, f"{prefix}.gate_proj")
+    if synchronize_subprojections:
+        # K3's native MXFP4 gate/up/down projections are independent weight
+        # decodes around tiny one-token activations.  Letting all three remain
+        # in one lazy graph made their full-weight staging overlap at a measured
+        # 6.5 GB.  Materializing each released projection in sequence preserves
+        # every dot product while bounding staging to one projection at a time.
+        mx.eval(gate)
     up = _linear(h, w, f"{prefix}.up_proj")
+    if synchronize_subprojections:
+        mx.eval(up)
     activated = _situ_and_mul(
         gate, up, cfg.activation_situ_beta, cfg.activation_situ_linear_beta)
-    return _linear(activated, w, f"{prefix}.down_proj")
+    if synchronize_subprojections:
+        mx.eval(activated)
+    result = _linear(activated, w, f"{prefix}.down_proj")
+    if synchronize_subprojections:
+        mx.eval(result)
+    return result
 
 
 def _kimi_dense_mlp_tiled(
@@ -996,7 +1017,10 @@ def _kimi_moe_output(
         del h
     elif overlap_shared_expert:
         shared = _kimi_dense_mlp(
-            h, w, f"{moe_prefix}.shared_experts", cfg)
+            h, w, f"{moe_prefix}.shared_experts", cfg,
+            synchronize_subprojections=(
+                cfg.model_type == "kimi_k3" and h.shape[1] == 1),
+        )
         mx.async_eval(shared)
 
     out = mx.zeros_like(h_latent)
@@ -1054,7 +1078,10 @@ def _kimi_moe_output(
 
     if shared is None:
         shared = _kimi_dense_mlp(
-            h, w, f"{moe_prefix}.shared_experts", cfg)
+            h, w, f"{moe_prefix}.shared_experts", cfg,
+            synchronize_subprojections=(
+                cfg.model_type == "kimi_k3" and h.shape[1] == 1),
+        )
     else:
         mx.eval(shared)
     return out + shared
@@ -1671,7 +1698,10 @@ def run_kimi_k3_block(
 
     def mlp_fn(h2):
         if layer < cfg.first_k_dense_replace:
-            return _kimi_dense_mlp(h2, w, f"{prefix}.mlp", cfg)
+            return _kimi_dense_mlp(
+                h2, w, f"{prefix}.mlp", cfg,
+                synchronize_subprojections=(h2.shape[1] == 1),
+            )
         return _kimi_moe_output(
             h2, w, prefix, cfg, layer, get_experts,
             iter_expert_batches=iter_expert_batches, profile=profile,

@@ -249,14 +249,19 @@ def _score_match(new_tokens, cand_tokens, cand_prompt_length: int,
         if old != new:
             break
         lcp += 1
+    if len(new_tokens) == len(cand_tokens) and lcp == len(new_tokens):
+        # When generation produced no fed-back token (for example a one-token
+        # startup prewarm), cand_tokens and the prompt endpoint are identical.
+        # This is an exact endpoint, not a rewind-style repeat.  The distinction
+        # is required for hybrid recurrent caches, which may extend or consume
+        # an endpoint exactly but cannot rewind their folded KDA state.
+        watermark = min(cand_reusable_prefix, len(new_tokens))
+        return ("endpoint", len(new_tokens), watermark, cand_chain_len, lcp)
     if len(new_tokens) == cand_prompt_length and lcp >= len(new_tokens):
         n_full = cand_reusable_prefix // chunk_size
         n_segments = n_full + (1 if cand_prompt_length > cand_reusable_prefix else 0)
         watermark = min(cand_reusable_prefix, len(new_tokens))
         return ("repeat", len(new_tokens), watermark, n_segments, lcp)
-    if len(new_tokens) == len(cand_tokens) and lcp == len(new_tokens):
-        watermark = min(cand_reusable_prefix, len(new_tokens))
-        return ("endpoint", len(new_tokens), watermark, cand_chain_len, lcp)
     if len(new_tokens) > len(cand_tokens) and lcp == len(cand_tokens):
         watermark = min(cand_reusable_prefix, len(cand_tokens))
         return ("extension", len(cand_tokens), watermark, cand_chain_len, lcp)
@@ -271,12 +276,18 @@ def _score_match(new_tokens, cand_tokens, cand_prompt_length: int,
 def _slice_kv(kv: KVCache, start: int, end: int) -> dict[str, mx.array]:
     arrays = {}
     for i in range(len(kv.keys)):
-        if kv.keys[i] is None:
+        key = kv.keys[i]
+        if key is None and kv.compressed_mla:
+            materialize = getattr(
+                kv, "materialize_latent_layer_for_persistence", None)
+            if materialize is not None:
+                key = materialize(i)
+        if key is None:
             continue
         if kv.compressed_mla:
-            arrays[f"k{i}"] = kv.keys[i][:, start:end, :]
+            arrays[f"k{i}"] = key[:, start:end, :]
         else:
-            arrays[f"k{i}"] = kv.keys[i][:, :, start:end, :]
+            arrays[f"k{i}"] = key[:, :, start:end, :]
             if kv.values[i] is not None:
                 arrays[f"v{i}"] = kv.values[i][:, :, start:end, :]
     dsa = getattr(kv, "dsa", None)

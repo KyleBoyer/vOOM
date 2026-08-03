@@ -441,6 +441,14 @@ class KDAStateCache:
 
     def export_arrays(self) -> dict[str, mx.array]:
         """Stable safetensors mapping for one exact recurrent endpoint."""
+        # Layer-stationary K3 prefill deliberately spills completed recurrent
+        # layers and clears their resident owners.  A durable endpoint export
+        # must not interpret that absence as "this checkpoint has no KDA".
+        # Reload each immutable spill payload exactly once before constructing
+        # the safetensors mapping, mirroring compressed MLA persistence.
+        for layer in sorted(self._spill_meta):
+            if self._state[layer] is None:
+                self._reload_layer(layer)
         arrays: dict[str, mx.array] = {}
         for layer, value in enumerate(self._state):
             if value is not None:

@@ -912,6 +912,17 @@ class SteppedKVCache(KVCache):
         self.latent_spill_bytes_read += len(payload)
         self.latent_spill_reloads += 1
 
+    def materialize_latent_layer_for_persistence(self, layer: int):
+        """Return an exact MLA layer even after layer-stationary disk spill.
+
+        Durable hot-KV snapshots are written after prefill, when completed K3
+        MLA layers may intentionally be absent from ``keys``.  Persistence is
+        not allowed to mistake that absence for an architecture without an
+        attention layer; reload the immutable spill payload before slicing.
+        """
+        self._reload_latent_layer(layer)
+        return self.keys[layer]
+
     def latent_spill_stats(self) -> dict[str, int]:
         return {
             "layers": self.latent_spill_layers,

@@ -698,6 +698,9 @@ class RuntimeConfig:
     # Oldest-by-mtime checkpoints beyond this are dropped each turn; their
     # ancestor segments are swept only once no surviving checkpoint needs
     # them.
+    hot_prompt_kv_persist_max_mb: int = 0  # 0 = checkpoint-count limit only;
+    # otherwise GC also bounds all reachable immutable segment/checkpoint
+    # bytes. This is especially important for long K3 MLA prefix snapshots.
     # Side-quest-only override for a Qwen2 checkpoint that does not itself
     # declare rope_scaling. 0/1 = released RoPE; >1 = static YaRN extrapolation.
     qwen_yarn_factor: float = 0.0
@@ -957,6 +960,8 @@ class RuntimeConfig:
             hot_prompt_kv_persist_dir=run.get("hot_prompt_kv_persist_dir", ""),
             hot_prompt_kv_persist_max_checkpoints=run.get(
                 "hot_prompt_kv_persist_max_checkpoints", 64),
+            hot_prompt_kv_persist_max_mb=run.get(
+                "hot_prompt_kv_persist_max_mb", 0),
             qwen_yarn_factor=run.get("qwen_yarn_factor", 0.0),
             prefill_chunk_size=run.get("prefill_chunk_size", 0),
             prefill_last_token_separate=run.get(
@@ -1201,6 +1206,8 @@ class StreamingEngine:
             raise ValueError("prompt_kv_min_tokens must be >= 0")
         if self.rc.prompt_kv_journal_chunk_size <= 0:
             raise ValueError("prompt_kv_journal_chunk_size must be positive")
+        if self.rc.hot_prompt_kv_persist_max_mb < 0:
+            raise ValueError("hot_prompt_kv_persist_max_mb must be non-negative")
         if self.rc.tool_pic_repair_tokens < 0:
             raise ValueError("tool_pic_repair_tokens must be non-negative")
         if self.rc.tool_pic_min_savings < 0:
@@ -1931,6 +1938,7 @@ class StreamingEngine:
                 self.rc.hot_prompt_kv_persist_dir, self._get_kv_fingerprint(),
                 self.rc.hot_prompt_kv_chunk_size,
                 max_checkpoints=self.rc.hot_prompt_kv_persist_max_checkpoints,
+                max_bytes=self.rc.hot_prompt_kv_persist_max_mb * 1_000_000,
                 config=self.cfg,
                 require_dsa=(
                     self.cfg.model_type == "glm_moe_dsa"
@@ -3351,12 +3359,45 @@ class StreamingEngine:
                                            rope_mscale=self._mscale,
                                            fused_swiglu=self.rc.fused_swiglu)
             mx.eval(x)
+            end_active = mx.get_active_memory()
+            peak_active = mx.get_peak_memory()
+            measured_transient = _resident_adjusted_transient(
+                active_before, end_active, peak_active)
+            if self.cfg.model_type == "kimi_k3":
+                self._last_k3_transient_observation = {
+                    "layer": i,
+                    "signature": self._transient_layer_signature(i),
+                    "start_active_bytes": int(active_before),
+                    "end_active_bytes": int(end_active),
+                    "peak_active_bytes": int(peak_active),
+                    "measured_transient_bytes": int(measured_transient),
+                }
             self._record_layer_transient(
-                position_count, i,
-                _resident_adjusted_transient(
-                    active_before, mx.get_active_memory(),
-                    mx.get_peak_memory()))
+                position_count, i, measured_transient)
             self._note_true_peak()
+            if position_count == 1 and self.cfg.model_type == "kimi_k3":
+                # A token's layer-i endpoint is consumed only by layer i of
+                # the *next* token. No later layer in this sweep reads it, so
+                # return exact KDA/MLA state to the configured spill tier as
+                # soon as its compute and peak accounting are complete. This
+                # is the decode analogue of the proven layer-stationary
+                # prefill lifetime and prevents a restored 27K endpoint from
+                # accumulating every reloaded layer in Metal at once.
+                spilled = False
+                if (
+                    self.rc.kimi_k3_kda_spill_dir
+                    and i in self.cfg.kda_layers
+                    and getattr(kv, "kda_cache", None) is not None
+                ):
+                    spilled = kv.kda_cache.spill_layer(i) or spilled
+                if (
+                    self.rc.kimi_k3_mla_kv_spill_dir
+                    and i in self.cfg.full_attn_layers
+                    and getattr(kv, "latent_spill_enabled", False)
+                ):
+                    spilled = kv.spill_latent_layer(i) or spilled
+                if spilled:
+                    mx.clear_cache()
             compute_s = time.perf_counter() - t0
             self.timer.add("layer_compute", compute_s)
             if profiler is not None:
@@ -5206,6 +5247,16 @@ class StreamingEngine:
             from .kv_store import model_fingerprint
 
             quant = _quantization_cache_identity(self.rc, self.store)
+            scale_sidecar = getattr(self.store, "k3_scale_sidecar", None)
+            nf12_sidecar = getattr(self.store, "bf16_nf12_sidecar", None)
+            scale_sidecar_identity = (
+                getattr(scale_sidecar, "generation_dir", Path("none")).name
+                if scale_sidecar is not None else "none"
+            )
+            nf12_sidecar_identity = (
+                getattr(nf12_sidecar, "generation_dir", Path("none")).name
+                if nf12_sidecar is not None else "none"
+            )
             arithmetic = (
                 f"abs{int(self.rc.mla_absorbed_decode)}"
                 f"k3cmla{int(self.rc.kimi_k3_compressed_mla)}"
@@ -5213,6 +5264,17 @@ class StreamingEngine:
                 f"k3mlakt{self.rc.kimi_k3_mla_key_tile_size}"
                 f"k3ar{self.rc.kimi_k3_fused_attnres_tile_size}"
                 f"k3dmlp{self.rc.kimi_k3_dense_mlp_tile_size}"
+                f"k3compiledkda{int(self.rc.kimi_k3_compiled_kda_prefill)}"
+                f"k3nativekda{int(self.rc.kimi_k3_native_fused_kda_prefill)}"
+                f"k3scalesidecar{scale_sidecar_identity}"
+                f"k3nf12sidecar{nf12_sidecar_identity}"
+                f"k3nf12direct{int(self.rc.bf16_nf12_direct_linear)}"
+                f"experttopk{tuple(self.cfg.expert_top_k_by_layer)}"
+                f"expertprune{tuple(sorted(
+                    (int(layer), tuple(experts))
+                    for layer, experts in (
+                        self.cfg.expert_prune_masks or {}).items()
+                ))}"
                 f"k3tilepolicy{self.rc.kimi_k3_prefill_tile_policy}"
                 f"k3tilethreshold"
                 f"{self.rc.kimi_k3_prefill_long_context_tokens}"
@@ -5336,6 +5398,67 @@ class StreamingEngine:
                 kv.kda_cache.enable_disk_spill(
                     self.rc.kimi_k3_kda_spill_dir)
         return kv
+
+    def _configure_restored_k3_spill(self, kv: KVCache) -> KVCache:
+        """Give a durable K3 endpoint the live runtime's exact spill policy.
+
+        The journal deliberately reconstructs a generic :class:`KVCache`: its
+        immutable payload must not encode machine-local temporary directories.
+        K3 serving, however, uses ``SteppedKVCache`` for compressed MLA and
+        layer-stationary disk spill for both MLA and recurrent KDA state.  Apply
+        those process-local mechanics after checksum validation and before the
+        endpoint enters the hot-slot lifecycle.  This changes only placement;
+        tensor dtype, shape, and bytes remain unchanged.
+        """
+        if self.cfg.model_type != "kimi_k3":
+            return kv
+        if self.rc.kimi_k3_mla_kv_spill_dir and kv.compressed_mla:
+            from .kv_cache import SteppedKVCache
+
+            kv = SteppedKVCache.from_cache(kv)
+            # Durable payloads encode exact latent arrays, not process-local
+            # execution flags. Reapply the same fingerprinted compressed-MLA
+            # arithmetic selected by new_kv(); otherwise restart silently
+            # expands all cached latents into per-head K/V even though the
+            # cold process used absorbed MLA.
+            kv.mla_absorbed = self.rc.kimi_k3_absorbed_mla
+            kv.mla_absorbed_prefill = self.rc.kimi_k3_absorbed_mla
+            kv.mla_absorbed_key_tile_size = int(
+                self.rc.kimi_k3_mla_key_tile_size)
+            if not kv.latent_spill_enabled:
+                kv.enable_latent_disk_spill(
+                    self.rc.kimi_k3_mla_kv_spill_dir)
+        recurrent = getattr(kv, "kda_cache", None)
+        if (
+            recurrent is not None
+            and self.rc.kimi_k3_kda_spill_dir
+            and not recurrent.spill_enabled
+        ):
+            recurrent.enable_disk_spill(self.rc.kimi_k3_kda_spill_dir)
+        return kv
+
+    def _respill_completed_k3_state(self, kv: KVCache) -> dict[str, int]:
+        """Release K3 endpoint arrays materialized by durable serialization.
+
+        ``HotPromptKVPersistence.save`` must load every spilled array to produce
+        one checksummed, restart-safe endpoint.  Leaving those arrays resident
+        defeats K3's layer-stationary memory bound on the following request.
+        Write the exact arrays back to the request's temporary spill tier and
+        release their Metal owners.  Decode reloads each layer on demand.
+        """
+        counts = {"kda_layers": 0, "mla_layers": 0}
+        if self.cfg.model_type != "kimi_k3":
+            return counts
+        recurrent = getattr(kv, "kda_cache", None)
+        if recurrent is not None and getattr(recurrent, "spill_enabled", False):
+            for layer in self.cfg.kda_layers:
+                counts["kda_layers"] += int(recurrent.spill_layer(layer))
+        if getattr(kv, "latent_spill_enabled", False):
+            for layer in self.cfg.full_attn_layers:
+                counts["mla_layers"] += int(kv.spill_latent_layer(layer))
+        if counts["kda_layers"] or counts["mla_layers"]:
+            mx.clear_cache()
+        return counts
 
     def generate(self, prompt: str, max_tokens: int = 64, on_token=None, stop=None,
                  on_progress=None, sampling: SamplingParams | None = None,
@@ -6105,7 +6228,7 @@ class StreamingEngine:
                             disk_match, self.cfg.num_hidden_layers)
                         if loaded is not None:
                             loaded_tokens, loaded_kv, loaded_exact_logits = loaded
-                            kv = loaded_kv
+                            kv = self._configure_restored_k3_spill(loaded_kv)
                             matched = disk_match["matched"]
                             exact_logits = loaded_exact_logits
                             reusable_watermark = disk_match["watermark"]
@@ -7319,6 +7442,11 @@ class StreamingEngine:
                 )
                 path_stats["hot_prompt_kv_persist_write_s"] = (
                     time.perf_counter() - persist_t0)
+                respilled = self._respill_completed_k3_state(kv)
+                path_stats["hot_prompt_k3_respill_kda_layers"] = respilled[
+                    "kda_layers"]
+                path_stats["hot_prompt_k3_respill_mla_layers"] = respilled[
+                    "mla_layers"]
             new_slot = self._new_hot_prompt_slot(
                 recurrent_exact_only=recurrent_exact_only,
                 boundary_fork_kv=boundary_fork_kv,

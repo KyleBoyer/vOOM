@@ -8,7 +8,7 @@ import mlx.core as mx
 import pytest
 
 from runtime.structured import (GrammarConstraint, JSONSchemaValidationError,
-                                _grammar_compatible_schema,
+                                _compiler, _grammar_compatible_schema,
                                 _required_tool_grammar, effective_tool_schema,
                                 tool_call_json_schema,
                                 validate_json_schema)
@@ -138,6 +138,24 @@ def test_xgrammar_constraint_accepts_complete_qwen_json_sequence():
         assert float(masked[token]) == 0.0
         constraint.accept_token(token)
     assert constraint.completed
+
+
+def test_xgrammar_compiler_accepts_kimi_local_tiktoken_code():
+    """Kimi checkpoints expose their exact vocabulary through local code."""
+    from pathlib import Path
+
+    from runtime.config import ModelConfig
+
+    model = Path(__file__).resolve().parents[1] / "models" / "Kimi-K3"
+    if not (model / "tiktoken.model").exists():
+        pytest.skip("local Kimi K3 tokenizer is not installed")
+    engine = SimpleNamespace(
+        _model_dir=model,
+        cfg=ModelConfig.from_dir(model),
+        _xgrammar_compiler=None,
+    )
+
+    assert _compiler(engine) is engine._xgrammar_compiler
 
 
 class _FakeMatcher:

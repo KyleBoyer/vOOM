@@ -1275,6 +1275,71 @@ class EngineManager:
             raise RequestValidationError(
                 "VMODEL_K3_SUFFIX_MAX_LOCAL_TOKENS must be positive"
             )
+        k3_hot_prompt_kv_request = os.environ.get(
+            "VMODEL_K3_HOT_PROMPT_KV", "0").strip()
+        if k3_hot_prompt_kv_request not in ("0", "1"):
+            raise RequestValidationError(
+                "VMODEL_K3_HOT_PROMPT_KV must be 0 or 1")
+        k3_hot_kv_persist_dir = os.environ.get(
+            "VMODEL_K3_HOT_KV_PERSIST_DIR",
+            os.environ.get("VMODEL_HOT_PROMPT_KV_PERSIST_DIR", ""),
+        ).strip()
+        k3_expert_top_k_request = os.environ.get(
+            "VMODEL_K3_EXPERT_TOP_K", "released").strip().lower()
+        k3_expert_prune_manifest = (
+            os.environ.get("VMODEL_K3_EXPERT_PRUNE_MANIFEST", "").strip()
+            or os.environ.get(
+                "VMODEL_KIMI_K3_EXPERT_PRUNE_MANIFEST", "").strip()
+        )
+        try:
+            k3_weight_cache_mb = int(os.environ.get(
+                "VMODEL_K3_WEIGHT_CACHE_MB",
+                os.environ.get("VMODEL_KIMI_LINEAR_WEIGHT_CACHE_MB", "3000"),
+            ))
+            k3_mlx_cache_mb = int(os.environ.get(
+                "VMODEL_K3_MLX_CACHE_MB", "1024"))
+            k3_expert_fetch_batch = int(os.environ.get(
+                "VMODEL_K3_EXPERT_FETCH_BATCH", "1"))
+            k3_decode_expert_fetch_batch = int(os.environ.get(
+                "VMODEL_K3_DECODE_EXPERT_FETCH_BATCH",
+                str(min(k3_expert_fetch_batch, 8))))
+            k3_hot_kv_slots = int(os.environ.get(
+                "VMODEL_K3_HOT_KV_SLOTS", "1"))
+            k3_hot_kv_min_tokens = int(os.environ.get(
+                "VMODEL_K3_HOT_KV_MIN_TOKENS", "16"))
+            k3_hot_kv_max_checkpoints = int(os.environ.get(
+                "VMODEL_K3_HOT_KV_PERSIST_MAX_CHECKPOINTS", "8"))
+            k3_hot_kv_max_mb = int(os.environ.get(
+                "VMODEL_K3_HOT_KV_PERSIST_MAX_MB", "0"))
+        except ValueError as error:
+            raise RequestValidationError(
+                "VMODEL_K3 cache, hot-KV, and expert settings must be integers"
+            ) from error
+        if not 150 <= k3_weight_cache_mb <= 8500:
+            raise RequestValidationError(
+                "VMODEL_K3_WEIGHT_CACHE_MB must be in [150, 8500]")
+        if not 64 <= k3_mlx_cache_mb <= 4096:
+            raise RequestValidationError(
+                "VMODEL_K3_MLX_CACHE_MB must be in [64, 4096]")
+        if not 1 <= k3_expert_fetch_batch <= 64:
+            raise RequestValidationError(
+                "VMODEL_K3_EXPERT_FETCH_BATCH must be in [1, 64]")
+        if not 1 <= k3_decode_expert_fetch_batch <= 8:
+            raise RequestValidationError(
+                "VMODEL_K3_DECODE_EXPERT_FETCH_BATCH must be in [1, 8]")
+        if not 1 <= k3_hot_kv_slots <= 8:
+            raise RequestValidationError(
+                "VMODEL_K3_HOT_KV_SLOTS must be in [1, 8]")
+        if k3_hot_kv_min_tokens < 0:
+            raise RequestValidationError(
+                "VMODEL_K3_HOT_KV_MIN_TOKENS must be non-negative")
+        if k3_hot_kv_max_checkpoints < 0 or k3_hot_kv_max_mb < 0:
+            raise RequestValidationError(
+                "VMODEL_K3 durable hot-KV limits must be non-negative")
+        if k3_hot_kv_persist_dir and k3_hot_prompt_kv_request != "1":
+            raise RequestValidationError(
+                "VMODEL_K3_HOT_KV_PERSIST_DIR requires "
+                "VMODEL_K3_HOT_PROMPT_KV=1")
         key = (
             str(model_dir), mode, yarn_factor.hex(),
             bool(requires_vision), resident_backend_request,
@@ -1308,6 +1373,18 @@ class EngineManager:
             k3_suffix_factor.hex(),
             k3_suffix_min_probability.hex(),
             k3_suffix_max_local_tokens,
+            k3_hot_prompt_kv_request,
+            k3_hot_kv_persist_dir,
+            k3_hot_kv_slots,
+            k3_hot_kv_min_tokens,
+            k3_hot_kv_max_checkpoints,
+            k3_hot_kv_max_mb,
+            k3_weight_cache_mb,
+            k3_mlx_cache_mb,
+            k3_expert_fetch_batch,
+            k3_decode_expert_fetch_batch,
+            k3_expert_top_k_request,
+            k3_expert_prune_manifest,
         )
         # A healthy resident engine owns all state it needs. Return before
         # touching model storage so a transient NAS disconnect cannot stall or
@@ -1350,6 +1427,18 @@ class EngineManager:
             k3_suffix_factor.hex(),
             k3_suffix_min_probability.hex(),
             k3_suffix_max_local_tokens,
+            k3_hot_prompt_kv_request,
+            k3_hot_kv_persist_dir,
+            k3_hot_kv_slots,
+            k3_hot_kv_min_tokens,
+            k3_hot_kv_max_checkpoints,
+            k3_hot_kv_max_mb,
+            k3_weight_cache_mb,
+            k3_mlx_cache_mb,
+            k3_expert_fetch_batch,
+            k3_decode_expert_fetch_batch,
+            k3_expert_top_k_request,
+            k3_expert_prune_manifest,
         )
         # Validate the requested profile before evicting a healthy resident
         # engine. ModelConfig.from_dir is read-only and has the same remount
@@ -1362,6 +1451,10 @@ class EngineManager:
                 "this checkpoint is a vOOM-derived lossy artifact; request it "
                 f"as {LOSSY_PREFIX}{model_dir.name} (fast mode), or use its "
                 "original source checkpoint for lossless mode")
+        if (mtype == "kimi_k3" and mode == "lossless"
+                and k3_expert_prune_manifest):
+            raise RequestValidationError(
+                "K3 expert pruning is lossy and requires a fast model ID")
         if mode == "fast-long" and mtype not in ("qwen2", "olmoe"):
             raise RequestValidationError(
                 "fast-long is currently supported only for Qwen2 and OLMoE checkpoints")
@@ -1728,7 +1821,38 @@ class EngineManager:
                 rc.prefill_chunk_size = k3_prefill_tile_width
                 rc.layer_stationary_prefill = True
                 rc.min_weight_cache_mb = 150
-                rc.max_weight_cache_mb = 3000
+                rc.max_weight_cache_mb = k3_weight_cache_mb
+                rc.mlx_cache_limit_mb = k3_mlx_cache_mb
+                rc.expert_fetch_batch = k3_expert_fetch_batch
+                rc.decode_expert_fetch_batch = k3_decode_expert_fetch_batch
+                rc.hot_prompt_kv = k3_hot_prompt_kv_request == "1"
+                if rc.hot_prompt_kv:
+                    rc.hot_prompt_kv_chunk_size = rc.prefill_chunk_size
+                    rc.hot_prompt_kv_slots = k3_hot_kv_slots
+                    rc.hot_prompt_kv_min_tokens = k3_hot_kv_min_tokens
+                    rc.hot_prompt_kv_persist_dir = k3_hot_kv_persist_dir
+                    rc.hot_prompt_kv_persist_max_checkpoints = (
+                        k3_hot_kv_max_checkpoints)
+                    rc.hot_prompt_kv_persist_max_mb = k3_hot_kv_max_mb
+                if k3_expert_top_k_request not in ("", "released"):
+                    if mode not in ("fast", "fast-long"):
+                        raise RequestValidationError(
+                            "VMODEL_K3_EXPERT_TOP_K requires a fast model ID")
+                    try:
+                        selected_top_k = int(k3_expert_top_k_request)
+                    except ValueError as error:
+                        raise RequestValidationError(
+                            "VMODEL_K3_EXPERT_TOP_K must be 'released' or an "
+                            "integer") from error
+                    released_top_k = int(
+                        getattr(cfg_probe, "num_experts_per_tok", 0) or 0)
+                    if not 1 <= selected_top_k <= released_top_k:
+                        raise RequestValidationError(
+                            "VMODEL_K3_EXPERT_TOP_K must be within "
+                            f"[1, {released_top_k}]")
+                    rc.expert_top_k_by_layer = (
+                        selected_top_k,
+                    ) * int(cfg_probe.num_hidden_layers)
                 # F188: exact target-verified suffix drafting. K3 has no
                 # released MTP head, so a bounded engine-local suffix model is
                 # the zero-weight draft source. The verifier runs positions
@@ -8293,6 +8417,8 @@ class Handler(BaseHTTPRequestHandler):
                     "suffix_prefill_seconds": round(float(result.get("prefill_s", 0.0)), 4),
                     "first_token_seconds": round(float(result.get("first_token_s", 0.0)), 4),
                     "decode_seconds": round(float(result.get("decode_s", 0.0)), 4),
+                    "true_peak_metal_bytes": int(
+                        result.get("true_peak_metal_bytes", 0) or 0),
                     "prefill_chunks": int(
                         path_stats.get("prefill_chunks", 0) or 0),
                     "adaptive_chunk_events": list(
@@ -9323,6 +9449,62 @@ class Handler(BaseHTTPRequestHandler):
         print(f"[server] -> {args[0] if args else ''}{elapsed}", flush=True)
 
 
+def _run_startup_prewarms(paths, result_path: str = "") -> dict:
+    """Eagerly construct one engine and seed its declared K3 prefixes."""
+    from .prewarm import (
+        atomic_write_result,
+        load_startup_prefixes,
+        run_startup_prefix,
+    )
+
+    entries = load_startup_prefixes(paths)
+    resolved = []
+    for entry in entries:
+        model_id, suffix_mode = split_model_mode(entry.model)
+        mode = suffix_mode or "lossless"
+        model_dir = _resolve(model_id)
+        if mode == "fast":
+            model_dir = _preferred_fast_artifact(model_dir)
+        resolved.append((entry, model_dir.resolve(), mode))
+    targets = {(str(model_dir), mode) for _entry, model_dir, mode in resolved}
+    if len(targets) != 1:
+        raise ValueError(
+            "startup prefixes must target one resident model/mode; got "
+            + ", ".join(f"{mode}:{path}" for path, mode in sorted(targets)))
+
+    started = time.perf_counter()
+    results = []
+    with INFER_LOCK:
+        entry0, model_dir, mode = resolved[0]
+        engine = MANAGER.get(model_dir, mode, requires_vision=False)
+        for entry, entry_model_dir, entry_mode in resolved:
+            if entry_model_dir != model_dir or entry_mode != mode:
+                raise AssertionError("validated startup target changed")
+            print(
+                f"[prewarm] {entry.name}: model={entry.model} "
+                f"source={entry.request_file}", flush=True)
+            result = run_startup_prefix(engine, model_dir, mode, entry)
+            results.append(result)
+            print(
+                f"[prewarm] {entry.name}: source={result['cache_source']} "
+                f"restored={int(result['restored_before_prewarm'])} "
+                f"prefix={result['prefix']['tokens']} "
+                f"wall={result['wall_seconds']:.3f}s", flush=True)
+        fingerprint = engine._get_kv_fingerprint()
+    document = {
+        "schema": "voom.startup-prewarm-result.v1",
+        "model_dir": str(model_dir),
+        "mode": mode,
+        "kv_fingerprint": fingerprint,
+        "wall_seconds": time.perf_counter() - started,
+        "prefixes": results,
+        "verdict": "PASS",
+    }
+    if result_path:
+        atomic_write_result(result_path, document)
+    return document
+
+
 def main():
     global _ENABLE_UNSAFE_AUTOPACK
     ap = argparse.ArgumentParser()
@@ -9339,6 +9521,15 @@ def main():
     ap.add_argument(
         "--list-profiles", action="store_true",
         help="list discovered runtime profiles and exit",
+    )
+    ap.add_argument(
+        "--prewarm-prefixes", action="append", default=[], metavar="PATH",
+        help=("load a voom.startup-prefixes.v1 JSON document and seed its "
+              "exact K3 prefix before the HTTP endpoint becomes ready; repeatable"),
+    )
+    ap.add_argument(
+        "--prewarm-result", default="", metavar="PATH",
+        help="atomically write content-free startup prewarm telemetry as JSON",
     )
     args = ap.parse_args()
     try:
@@ -9377,6 +9568,22 @@ def main():
             f"explicit_overrides={override_text}",
             flush=True,
         )
+    prewarm_paths = list(args.prewarm_prefixes)
+    profile_prewarm = os.environ.get("VMODEL_PREWARM_PREFIXES", "").strip()
+    if profile_prewarm:
+        prewarm_paths.extend(
+            value for value in profile_prewarm.split(os.pathsep) if value)
+    prewarm_result = (
+        args.prewarm_result
+        or os.environ.get("VMODEL_PREWARM_RESULT", "").strip()
+    )
+    if prewarm_paths:
+        try:
+            _run_startup_prewarms(prewarm_paths, prewarm_result)
+        except Exception as error:
+            with INFER_LOCK:
+                MANAGER.close()
+            ap.error(f"startup prewarm failed: {type(error).__name__}: {error}")
     print(f"[server] vOOM endpoint on http://127.0.0.1:{args.port}  models: {list(_registry())}", flush=True)
     server = ThreadingHTTPServer(("127.0.0.1", args.port), Handler)
     try:

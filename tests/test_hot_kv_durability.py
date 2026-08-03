@@ -94,6 +94,51 @@ def test_hybrid_recurrent_endpoint_survives_disk_round_trip(tmp_path):
     assert tuple(chain) == tuple(match["chain"])
 
 
+def test_hybrid_recurrent_prompt_only_checkpoint_is_exact_endpoint(tmp_path):
+    """A one-token prewarm feeds no generated token back into the cache.
+
+    Its full token sequence therefore equals its prompt sequence.  Disk match
+    scoring must classify that identity as an endpoint before the ordinary
+    prompt-repeat arm, because recurrent state can consume an endpoint exactly
+    but cannot be rewound as a repeat.
+    """
+    from types import SimpleNamespace
+
+    config = SimpleNamespace(
+        layer_types=("linear_attention", "full_attention"), kda_layers=())
+    journal = HotPromptKVPersistence(
+        tmp_path, "hybrid-prompt-only", 2, config=config,
+        require_recurrent=True)
+    tokens = [10, 11, 12, 13]
+    kv = KVCache(2)
+    kv.keys[1] = mx.arange(8, dtype=mx.float32).reshape(1, 1, 4, 2)
+    kv.values[1] = kv.keys[1] + 100
+    recurrent = KDAStateCache(2)
+    recurrent.set_state(
+        0, mx.arange(12, dtype=mx.float32).reshape(1, 1, 3, 4))
+    recurrent.set_conv_history(
+        0, (mx.arange(6, dtype=mx.float32).reshape(1, 2, 3),))
+    kv.kda_cache = recurrent
+    logits = mx.array([[1.0, 2.0]], dtype=mx.float32)
+    mx.eval(kv.keys[1], kv.values[1], logits)
+    journal.save(
+        (), 0, tokens, kv, logits, logits,
+        prompt_length=len(tokens), reusable_prefix=2)
+
+    match = journal.find_best_match(tokens, 2)
+
+    assert match is not None
+    assert match["case"] == "endpoint"
+    loaded = journal.load_matched_chain(match, 2)
+    assert loaded is not None
+    loaded_tokens, restored, exact_logits = loaded
+    assert loaded_tokens == tuple(tokens)
+    assert exact_logits is not None
+    assert np.array_equal(
+        np.array(restored.kda_cache.state(0)),
+        np.array(recurrent.state(0)))
+
+
 def test_same_size_segment_corruption_is_rejected_and_repaired(tmp_path):
     journal = _journal(tmp_path)
     tokens = list(range(4))
