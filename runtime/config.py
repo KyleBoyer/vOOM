@@ -163,6 +163,21 @@ class ModelConfig:
     # engine.py must use this, not a hardcoded ".mlp.experts." substring, or
     # MoE paging silently finds zero matching tensors for Kimi models.
     moe_expert_prefix: str = "mlp.experts"
+
+    def moe_module_prefix(self) -> str:
+        """Parent module holding the gate/router beside ``moe_expert_prefix``.
+
+        F198: the router lookahead used to look the gate up at a hardcoded
+        ``mlp.gate.weight``. Kimi's gate is ``block_sparse_moe.gate.weight``,
+        so the lookup silently found nothing and the predictor turned itself
+        off on precisely the models whose expert paging costs the most.
+        Deriving the parent from the expert prefix keeps the two in step.
+        Returns "" when experts hang directly off the layer.
+        """
+        parts = self.moe_expert_prefix.split(".")
+        if parts[-1] == "experts":
+            return ".".join(parts[:-1])
+        return self.moe_expert_prefix
     # F92: Kimi Linear's MLA layers are NoPE -- config.json's mla_use_nope=true
     # means RoPE is never applied to the "rope" head-dim split at all (real
     # modeling_kimi.py has no apply_rotary_emb call anywhere; position info

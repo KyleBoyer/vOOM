@@ -497,6 +497,16 @@ class RuntimeConfig:
     pin_lm_head: bool = False
     pin_first_layers: int = 0
     pin_last_layers: int = 0
+    # F197: derive the pinned trunk prefix from a byte budget instead of a hand
+    # -chosen layer count. A trunk is read strictly cyclically, which defeats
+    # recency/frequency eviction completely (0% hits at any sub-trunk budget,
+    # proven against the real cache in tests/test_f197_pinned_trunk_prefix.py),
+    # so budget spent on trunk residency only pays when it is pinned. Zero
+    # keeps the explicit pin_first_layers count in charge.
+    pin_trunk_budget_mb: int = 0
+    # Capacity pin planning must leave for routed expert pages. Only consulted
+    # when pin_trunk_budget_mb is set.
+    pin_trunk_expert_reserve_mb: int = 0
     prefetch_depth: int = 0  # 0 disables prefetch
     prefetch_workers: int = 0  # 0 = store default (raw: 1, packed: 2)
     max_kv_mb: int = 0  # 0 = unpaged KV (all resident); >0 enables disk spilling
@@ -1481,6 +1491,18 @@ class StreamingEngine:
                 min_dim=self.rc.quant_min_dim,
             )
             transform = quant_policy.transform
+            if self.store.mtplx_mtp_sidecar:
+                # The MTPLX body is already standard MLX MXFP4, while its
+                # separately indexed native-MTP block is intentionally the
+                # released BF16 draft head.  Keep that sidecar in its declared
+                # format instead of applying the body's runtime quant policy a
+                # second time; accepted tokens remain target-verified either
+                # way, but this preserves the artifact's measured draft
+                # contract and expected acceptance rate.
+                def transform(name, value):
+                    if name.startswith("mtp."):
+                        return value
+                    return quant_policy.transform(name, value)
         warm = None
         if self.rc.warm_mb:
             from .warm_tier import WarmTier
@@ -1699,13 +1721,20 @@ class StreamingEngine:
                 self._eval_weight(self._tied_lm_head_w)
 
         n = self.cfg.num_hidden_layers
-        pinned_layers = set(range(self.rc.pin_first_layers)) | set(
+        pin_first = self.rc.pin_first_layers
+        self.planned_trunk_pin_layers = 0
+        self.planned_trunk_pin_bytes = 0
+        if self.rc.pin_trunk_budget_mb > 0:
+            pin_first = self._plan_trunk_pin_layers(n)
+            self.planned_trunk_pin_layers = pin_first
+        pinned_layers = set(range(pin_first)) | set(
             range(n - self.rc.pin_last_layers, n)
         )
         for i in sorted(pinned_layers):
             # _layer_names: for MoE models this pins attention/norms/router only —
             # experts page separately (pinning all experts would defeat the point)
-            self.cache.pin(self._layer_key(i), self._layer_names(i))
+            for key, names in self._trunk_pages(i):
+                self.cache.pin(key, names)
 
         self.expert_usage: dict[tuple[int, int], int] = {}
         self.expert_hits = 0
@@ -2686,6 +2715,74 @@ class StreamingEngine:
             expert_page_bytes=self._expert_storage_page_bytes,
         )
 
+    def _trunk_pages(self, layer: int) -> list[tuple[str, list[str]]]:
+        """Return the exact (key, names) trunk pages this layer's runner asks for.
+
+        Pinning is only useful if it populates the same keys the sweep looks
+        up.  K3's NF12 path deliberately splits each layer into ``.attn`` and
+        ``.mlp`` pages so the two have independent lifetimes, and a pin under
+        the whole-layer key would be resident but never hit -- it would cost
+        residency and return nothing, while looking like "pinning does not
+        help". Mirror the runner's own eligibility test rather than guessing.
+        """
+        key = self._layer_key(layer)
+        if (self.rc.layer_stationary_prefill
+                and self.store.bf16_nf12_sidecar is not None
+                and not self.store.bf16_nf12_uncached_reads
+                and self.cfg.model_type == "kimi_k3"):
+            attention_names, mlp_names = self._k3_nf12_split_layer_names(layer)
+            return [(f"{key}.attn", attention_names), (f"{key}.mlp", mlp_names)]
+        return [(key, self._layer_names(layer))]
+
+    def _plan_trunk_pin_layers(self, num_layers: int) -> int:
+        """Size the pinned trunk prefix from measured on-disk layer bytes.
+
+        Fails closed to zero -- ordinary eviction, today's behavior -- if any
+        layer's storage size cannot be established from checkpoint metadata.
+        Planning on a partial size model would silently pin less than the
+        budget allows or overcommit the cache, and neither error is visible
+        from the outside.
+
+        A pin is permanent for the engine's lifetime, so the reserve it leaves
+        behind has to cover the *largest* thing that competes with it, not the
+        average. That is one routed expert fetch batch plus the governor's
+        transient margin: a plan that ignores it succeeds at startup and then
+        fails the request mid-decode when ``reserve()`` refuses an allocation
+        it can no longer make room for (measured on real K3: pinning 1.866GB
+        pushed a 1.52GB expert batch past the 7.31GB ceiling). Deriving the
+        floor here turns that late crash into an up-front refusal to pin.
+        """
+        from .cache_policy import plan_pinned_prefix
+
+        layer_bytes = []
+        for layer in range(num_layers):
+            names = [name for _key, page in self._trunk_pages(layer)
+                     for name in page]
+            if not names or self.store.storage_bytes_unknown(names):
+                print(
+                    f"[engine] trunk pin planning disabled: layer {layer} "
+                    "has no resolvable storage size")
+                return 0
+            layer_bytes.append(self.store.storage_bytes(names))
+        budget = self.rc.pin_trunk_budget_mb * 1_000_000
+        expert_batch = (self.rc.expert_fetch_batch
+                        or self.cfg.num_experts_per_tok or 1)
+        required_reserve = (expert_batch * self._expert_fetch_page_bytes
+                            + self._layer_transient_margin)
+        reserve = max(self.rc.pin_trunk_expert_reserve_mb * 1_000_000,
+                      required_reserve)
+        count = plan_pinned_prefix(layer_bytes, budget, reserve_bytes=reserve)
+        self.planned_trunk_pin_bytes = sum(layer_bytes[:count])
+        print(
+            f"[engine] trunk pin plan: {count}/{num_layers} layers, "
+            f"{self.planned_trunk_pin_bytes / 1e9:.3f}GB pinned of "
+            f"{sum(layer_bytes) / 1e9:.3f}GB trunk "
+            f"(budget {budget / 1e9:.3f}GB, expert reserve "
+            f"{reserve / 1e9:.3f}GB, of which "
+            f"{required_reserve / 1e9:.3f}GB is the mandatory expert-batch "
+            f"floor)")
+        return count
+
     def _fetch_experts(self, layer: int, expert_ids: list[int]) -> dict[int, dict]:
         """Fetch one lifetime-bounded expert batch; routing was recorded already."""
         items = []
@@ -2880,20 +2977,31 @@ class StreamingEngine:
         and prefetch that union. Token-conditioned, unlike the Markov
         transition predictor. Never blocks on disk: skips unless the next
         layer's page is already resident, and the default idle-only gate admits
-        no backlog behind existing prefetch work."""
-        key = self._layer_key(nxt)
+        no backlog behind existing prefetch work.
+
+        F198: the gate/router name is derived from ``moe_expert_prefix`` rather
+        than assumed to be ``mlp.``. Kimi Linear and K3 ship their gate under
+        ``block_sparse_moe.gate.*``, so a hardcoded ``mlp.`` lookup found
+        neither weight, fell through to the dense-layer branch, and returned
+        without scheduling anything -- the predictor was silently inert on
+        exactly the architectures whose expert paging costs the most.
+        """
+        page = self._trunk_pages(nxt)[-1]  # the gate lives with the MLP page
+        key, names = page
         if not self.cache.contains(key):
             return
-        w = self.cache.get(key, self._layer_names(nxt))
+        w = self.cache.get(key, names)
         p = f"model.layers.{nxt}"
         k = self.cfg.num_experts_per_tok
         ln = w.get(f"{p}.post_attention_layernorm.weight")
         h = mx.fast.rms_norm(x, ln, self.cfg.rms_norm_eps) if ln is not None else x
-        router_w = w.get(f"{p}.mlp.router.weight")
-        gate_w = w.get(f"{p}.mlp.gate.weight")
+        parent = self.cfg.moe_module_prefix()
+        moe = f"{p}.{parent}" if parent else p
+        router_w = w.get(f"{moe}.router.weight")
+        gate_w = w.get(f"{moe}.gate.weight")
         if router_w is not None:  # gpt-oss: linear router + bias, top-k on logits
             logits = h @ router_w.T
-            bias = w.get(f"{p}.mlp.router.bias")
+            bias = w.get(f"{moe}.router.bias")
             if bias is not None:
                 logits = logits + bias
             idx = mx.argpartition(-logits, kth=k - 1, axis=-1)[..., :k]
@@ -2902,7 +3010,7 @@ class StreamingEngine:
                 scores = h.astype(mx.float32) @ gate_w.astype(mx.float32).T
             else:
                 scores = (h @ gate_w.T).astype(mx.float32)
-            bias = w.get(f"{p}.mlp.gate.e_score_correction_bias")
+            bias = w.get(f"{moe}.gate.e_score_correction_bias")
             if bias is not None:  # GLM noaux_tc: SELECTION uses sigmoid + bias
                 scores = mx.sigmoid(scores) + bias
             idx = mx.argpartition(-scores, kth=k - 1, axis=-1)[..., :k]

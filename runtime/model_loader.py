@@ -17,6 +17,7 @@ import struct
 import threading
 import time
 from collections import defaultdict
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -250,6 +251,7 @@ class WeightStore:
         # weight_map construction; None for every other checkpoint format.
         self.gguf = None
         self._gguf_pending_real_names: dict[str, str] = {}
+        self.mtplx_mtp_sidecar: str | None = None
         self.config = ModelConfig.from_dir(self.dir)
         raw_config = json.loads(_read_text_retry(self.dir / "config.json"))
         text_config = raw_config.get("text_config", {})
@@ -316,7 +318,47 @@ class WeightStore:
             single = self.dir / "model.safetensors"
             gguf_candidates = sorted(self.dir.glob("*.gguf"))
             if index_path.exists():
-                self.weight_map: dict[str, str] = json.loads(_read_text_retry(index_path))["weight_map"]
+                index_payload = json.loads(_read_text_retry(index_path))
+                self.weight_map: dict[str, str] = index_payload["weight_map"]
+                # MTPLX keeps the model body's standard MLX triplets in the
+                # ordinary index and ships the released BF16 native-MTP block
+                # as a sidecar.  Honor only an explicit, safe index pointer;
+                # never scan arbitrary sibling files into a checkpoint.
+                index_metadata = index_payload.get("metadata", {})
+                if not isinstance(index_metadata, dict):
+                    raise ValueError(
+                        "model.safetensors.index.json metadata must be an object")
+                sidecar = index_metadata.get("mtplx_mtp_sidecar")
+                if sidecar is not None:
+                    if not (
+                        isinstance(sidecar, str)
+                        and sidecar
+                        and Path(sidecar).name == sidecar
+                        and not Path(sidecar).is_absolute()
+                        and sidecar.endswith(".safetensors")
+                    ):
+                        raise ValueError(
+                            "unsafe MTPLX MTP sidecar path in weight index: "
+                            f"{sidecar!r}")
+                    sidecar_path = self.dir / sidecar
+                    if not sidecar_path.is_file():
+                        raise FileNotFoundError(
+                            f"MTPLX MTP sidecar is missing: {sidecar_path}")
+                    sidecar_names = [
+                        name for name in mx.load(str(sidecar_path))
+                        if name.startswith("mtp.")
+                    ]
+                    if not sidecar_names:
+                        raise ValueError(
+                            f"MTPLX MTP sidecar has no mtp.* tensors: {sidecar_path}")
+                    collisions = sorted(set(sidecar_names) & set(self.weight_map))
+                    if collisions:
+                        raise ValueError(
+                            "MTPLX MTP sidecar collides with indexed tensors: "
+                            f"{collisions[:3]}")
+                    self.weight_map.update(
+                        {name: sidecar for name in sidecar_names})
+                    self.mtplx_mtp_sidecar = sidecar
             elif not single.exists() and gguf_candidates:
                 # VibeThinker-3B's tool-calling fine-tune ships GGUF-only.
                 # Tensor names use llama.cpp's own naming scheme
@@ -347,6 +389,8 @@ class WeightStore:
         # model.language_model.*: expose canonical model.* aliases so the
         # dense engine runs unchanged. visual.* names pass through untouched
         # (the vision tower addresses them explicitly).
+        # MTPLX's self-contained multimodal layout uses the equivalent
+        # vision_tower.* prefix; expose it as model.visual.* for qwen3vl.py.
         # F93 (2026-07-19): Kimi K2.5 uses the OPPOSITE order,
         # language_model.model.*, not model.language_model.* -- confirmed
         # against the real downloaded checkpoint's model.safetensors.index.json.
@@ -373,6 +417,8 @@ class WeightStore:
                 canon = "model." + n[len("language_model.model."):]
             elif n.startswith("language_model."):
                 canon = n[len("language_model."):]
+            elif n.startswith("vision_tower."):
+                canon = "model.visual." + n[len("vision_tower."):]
             else:
                 continue
             self._real_name[canon] = n
@@ -654,14 +700,11 @@ class WeightStore:
                 int(self.bf16_nf12_invalidation_failures),
             )
 
-    def _safetensors_physical_offset(
-        self, shard: str, canonical_name: str
-    ) -> int:
-        """Return one tensor's payload-relative byte offset.
+    def _safetensors_header(self, shard: str) -> dict:
+        """Return one shard's parsed safetensors header, cached per shard.
 
-        Headers are cached per shard and read only for the explicit physical-
-        order experiment. The mapping is checkpoint metadata; it contains no
-        prompt-, route-, layer-policy-, or model-name heuristic.
+        The header is checkpoint metadata; reading it contains no prompt-,
+        route-, layer-policy-, or model-name heuristic.
         """
         with self._safetensors_header_lock:
             header = self._safetensors_headers.get(shard)
@@ -684,6 +727,13 @@ class WeightStore:
                     os.close(fd)
                 header = json.loads(raw)
                 self._safetensors_headers[shard] = header
+        return header
+
+    def _safetensors_physical_offset(
+        self, shard: str, canonical_name: str
+    ) -> int:
+        """Return one tensor's payload-relative byte offset."""
+        header = self._safetensors_header(shard)
         real_name = self._real_name.get(
             canonical_name, canonical_name
         )
@@ -945,6 +995,84 @@ class WeightStore:
         if not page_bytes:
             return fallback
         return round(sum(page_bytes.values()) / len(page_bytes))
+
+    def storage_bytes(self, names: Sequence[str]) -> int:
+        """Return the on-disk bytes these tensors cost, without reading them.
+
+        Used to size a pinned trunk prefix against a byte budget before
+        anything is materialized.  Prefers the representation actually served:
+        an active NF12 sidecar reports its own encoded extent, otherwise the
+        safetensors header's ``data_offsets`` are authoritative.  Names whose
+        size cannot be established are charged zero and reported by
+        ``storage_bytes_unknown`` so a caller can refuse to plan on partial
+        information rather than silently under-count.
+        """
+        total = 0
+        for name in names:
+            entry = (self._raw_fast_tier_manifest or {}).get(name)
+            if entry is not None:
+                total += int(entry["nbytes"])
+                continue
+            sidecar_bytes = self._nf12_encoded_bytes(name)
+            if sidecar_bytes is not None:
+                total += sidecar_bytes
+                continue
+            metadata = self._safetensors_entry(name)
+            if metadata is None:
+                continue
+            start, end = (int(v) for v in metadata["data_offsets"])
+            total += end - start
+        return total
+
+    def _safetensors_entry(self, name: str) -> dict | None:
+        """Locate one tensor's header entry by canonical or real name.
+
+        ``weight_map`` and the shard headers are not keyed alike: the index is
+        rewritten to canonical ``model.layers.*`` names during load, while the
+        header inside each shard keeps the checkpoint's own prefix (K3 ships
+        ``language_model.model.layers.*``). Resolving only one of the two
+        silently loses every tensor whose prefix was rewritten.
+        """
+        real = self._real_name.get(name, name)
+        shard = self.weight_map.get(name)
+        if shard is None:
+            shard = self.weight_map.get(real)
+        if shard is None:
+            return None
+        header = self._safetensors_header(shard)
+        for candidate in (real, name):
+            metadata = header.get(candidate)
+            if isinstance(metadata, dict):
+                return metadata
+        return None
+
+    def storage_bytes_unknown(self, names: Sequence[str]) -> list[str]:
+        """Names ``storage_bytes`` could not size, so callers can fail closed."""
+        unknown = []
+        for name in names:
+            if name in (self._raw_fast_tier_manifest or {}):
+                continue
+            if self._nf12_encoded_bytes(name) is not None:
+                continue
+            if self._safetensors_entry(name) is None:
+                unknown.append(name)
+        return unknown
+
+    def _nf12_encoded_bytes(self, name: str) -> int | None:
+        """Encoded size of one tensor in the active NF12 trunk sidecar."""
+        sidecar = self.bf16_nf12_sidecar
+        if sidecar is None:
+            return None
+        match = _LAYER_PARAM_RE.match(name)
+        if match is None:
+            return None
+        layer = int(match.group(1))
+        if not sidecar.has_layer(layer) or name not in sidecar.encoded_names(layer):
+            return None
+        for tensor in sidecar.layer_entry(layer)["tensors"]:
+            if tensor["name"] == name:
+                return int(tensor["encoded_bytes"])
+        return None
 
     def is_quantized(self, name: str) -> bool:
         """Whether one logical matrix is stored as an MLX quantized triplet.

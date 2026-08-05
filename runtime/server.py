@@ -311,16 +311,101 @@ def _voom_quantization_metadata(model_dir: Path) -> dict | None:
     return marker if isinstance(marker, dict) and marker.get("profile") else None
 
 
+def _mtplx_quantization_metadata(model_dir: Path) -> dict | None:
+    """Read a complete, internally bound MTPLX derivative marker.
+
+    MTPLX artifacts keep their upstream ``config.json`` intact, so they do
+    not carry vOOM's local converter marker.  Treat one as a lossy derivative
+    only when its runtime contract, release manifest, index sidecar pointer,
+    and standard MLX MXFP4 descriptor agree.  This keeps generic published
+    quantization metadata from being mistaken for local lossless weights.
+    """
+    try:
+        runtime = json.loads((model_dir / "mtplx_runtime.json").read_text())
+        release = json.loads((model_dir / "RELEASE_MANIFEST.json").read_text())
+        config = json.loads((model_dir / "config.json").read_text())
+        index = json.loads(
+            (model_dir / "model.safetensors.index.json").read_text())
+    except (OSError, ValueError):
+        return None
+    if not all(isinstance(value, dict) for value in (
+            runtime, release, config, index)):
+        return None
+    base_model = runtime.get("base_model")
+    revision = runtime.get("base_revision")
+    sidecar = runtime.get("mtp_sidecar_file")
+    quant = config.get("quantization") or config.get("quantization_config")
+    index_metadata = index.get("metadata", {})
+    index_sidecar = (index_metadata.get("mtplx_mtp_sidecar")
+                     if isinstance(index_metadata, dict) else None)
+    try:
+        bits = int(quant.get("bits", 0))
+        group_size = int(quant.get("group_size", 0))
+    except (AttributeError, TypeError, ValueError):
+        return None
+    safe_sidecar = (
+        isinstance(sidecar, str)
+        and sidecar
+        and Path(sidecar).name == sidecar
+        and not Path(sidecar).is_absolute()
+    )
+    if not (
+        isinstance(base_model, str) and base_model
+        and isinstance(revision, str)
+        and re.fullmatch(r"[0-9a-f]{40}", revision)
+        and safe_sidecar
+        and (model_dir / sidecar).is_file()
+        and index_sidecar == sidecar
+        and release.get("base_model") == base_model
+        and release.get("source_revision") == revision
+        and runtime.get("mtp_source") == base_model
+        and runtime.get("mtp_sidecar_format") == "bf16"
+        and runtime.get("body_quantization") == "mxfp4"
+        and isinstance(quant, dict)
+        and quant.get("mode") == "mxfp4"
+        and bits == 4
+        and group_size == 32
+    ):
+        return None
+    return {
+        "profile": "all",
+        "source_model": base_model,
+        "source_revision": revision,
+        "provenance": "mtplx",
+    }
+
+
+def _lossy_derivative_metadata(model_dir: Path) -> dict | None:
+    marker = _voom_quantization_metadata(model_dir)
+    if marker is not None:
+        # The discriminator is ours, not a free-form marker field.
+        return {**marker, "provenance": "voom"}
+    return _mtplx_quantization_metadata(model_dir)
+
+
 def _is_voom_lossy_checkpoint(model_dir: Path) -> bool:
-    """Whether this artifact was derived by vOOM's lossy converter.
+    """Whether this is an explicitly proven lossy derivative.
 
     Generic quantization metadata is insufficient: some publishers release a
     quantized checkpoint as the canonical artifact (gpt-oss is one example),
     and serving that artifact unchanged is still the lossless goal. The
-    converter writes an explicit provenance marker, so only locally derived
-    artifacts are forced onto the side-quest namespace.
+    converter or MTPLX release writes explicit provenance, so only bound
+    derivatives are forced onto the side-quest namespace.
     """
-    return _voom_quantization_metadata(model_dir) is not None
+    return _lossy_derivative_metadata(model_dir) is not None
+
+
+def _local_hf_revision(model_dir: Path) -> str | None:
+    """Return the single pinned Hub commit recorded by ``hf download``."""
+    try:
+        revisions = {
+            path.stem
+            for path in (model_dir / ".cache/huggingface/trees").glob("*.json")
+            if re.fullmatch(r"[0-9a-f]{40}", path.stem)
+        }
+    except OSError:
+        return None
+    return next(iter(revisions)) if len(revisions) == 1 else None
 
 
 def _derived_artifacts_for(source: Path) -> list[Path]:
@@ -332,9 +417,20 @@ def _derived_artifacts_for(source: Path) -> list[Path]:
         return []
     found = []
     for candidate in candidates:
-        marker = _voom_quantization_metadata(candidate)
+        marker = _lossy_derivative_metadata(candidate)
         try:
-            same_source = marker and Path(marker.get("source", "")).resolve() == source
+            if marker and marker.get("provenance") == "mtplx":
+                source_model = str(marker.get("source_model", ""))
+                same_source = (
+                    source_model.rsplit("/", 1)[-1] == source.name
+                    and marker.get("source_revision")
+                    == _local_hf_revision(source)
+                )
+            else:
+                same_source = (
+                    marker
+                    and Path(marker.get("source", "")).resolve() == source
+                )
         except OSError:
             same_source = False
         if (same_source and (candidate / "model.safetensors.index.json").is_file()
@@ -353,7 +449,7 @@ def _preferred_fast_artifact(source: Path) -> Path:
         except (OSError, ValueError):
             continue
         quant = config.get("quantization", {})
-        marker = config.get("voom_quantization", {})
+        marker = _lossy_derivative_metadata(candidate) or {}
         try:
             bits = int(quant.get("bits", 0))
         except (TypeError, ValueError):
@@ -7018,7 +7114,7 @@ def _execution_profile_fields(engine) -> dict[str, object]:
     model_dir = Path(getattr(engine, "_model_dir", ""))
     store = getattr(engine, "store", None)
     rc = getattr(engine, "rc", None)
-    marker = _voom_quantization_metadata(model_dir) if model_dir.name else None
+    marker = _lossy_derivative_metadata(model_dir) if model_dir.name else None
     quantization = getattr(store, "quantization", {}) or {}
     try:
         bits = int(quantization.get("bits", 0))

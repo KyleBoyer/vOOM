@@ -61,6 +61,7 @@ from runtime.server import (Handler, INFER_LOCK, PreparedPrompt, PriorityLock, R
                             _compiled_template,
                             _openai_finish_reason, _responses_output_items, _safe_emit_len,
                             _parse_request_tool_calls, _tool_request_controls,
+                            _is_voom_lossy_checkpoint,
                             _preferred_fast_artifact,
                             _dspark_draft_for,
                             _engine_generate,
@@ -3639,6 +3640,80 @@ def test_base_qwen36_prefers_complete_expert_mxfp4_sibling(tmp_path):
     (q4 / "model.safetensors.index.json").write_text("{}")
 
     assert _preferred_fast_artifact(source) == q4
+
+
+def _write_mtplx_fixture(source: Path, artifact: Path, revision: str) -> None:
+    (source / ".cache/huggingface/trees").mkdir(parents=True)
+    (source / ".cache/huggingface/trees" / f"{revision}.json").write_text("{}")
+    artifact.mkdir()
+    base_model = f"empero-ai/{source.name}"
+    (artifact / "config.json").write_text(json.dumps({
+        "model_type": "qwen3_5",
+        "quantization": {"mode": "mxfp4", "bits": 4, "group_size": 32},
+    }))
+    (artifact / "model.safetensors.index.json").write_text(json.dumps({
+        "metadata": {"mtplx_mtp_sidecar": "mtp.safetensors"},
+        "weight_map": {},
+    }))
+    (artifact / "mtp.safetensors").write_bytes(b"fixture")
+    (artifact / "mtplx_runtime.json").write_text(json.dumps({
+        "base_model": base_model,
+        "base_revision": revision,
+        "mtp_source": base_model,
+        "mtp_sidecar_file": "mtp.safetensors",
+        "mtp_sidecar_format": "bf16",
+        "body_quantization": "mxfp4",
+    }))
+    (artifact / "RELEASE_MANIFEST.json").write_text(json.dumps({
+        "base_model": base_model,
+        "source_revision": revision,
+    }))
+
+
+def test_base_qwythos_prefers_revision_bound_mtplx_mxfp4_sibling(tmp_path):
+    revision = "7c72a9c714cf66281cb222c4aa0aef368d84c94f"
+    source = tmp_path / "Qwythos-27B-v1"
+    artifact = tmp_path / "Qwythos-27B-v1-mlx-all-mxfp4"
+    source.mkdir()
+    _write_mtplx_fixture(source, artifact, revision)
+
+    assert _is_voom_lossy_checkpoint(artifact)
+    assert _preferred_fast_artifact(source) == artifact
+
+
+def test_mtplx_source_revision_mismatch_is_not_selected(tmp_path):
+    source_revision = "7c72a9c714cf66281cb222c4aa0aef368d84c94f"
+    artifact_revision = "8aa70bf12de66ea70d7543daf71150e14dcff01d"
+    source = tmp_path / "Qwythos-27B-v1"
+    artifact = tmp_path / "Qwythos-27B-v1-mlx-all-mxfp4"
+    source.mkdir()
+    _write_mtplx_fixture(source, artifact, artifact_revision)
+    tree = source / ".cache/huggingface/trees"
+    (tree / f"{artifact_revision}.json").unlink()
+    (tree / f"{source_revision}.json").write_text("{}")
+
+    # The artifact remains explicitly lossy, but it must not be substituted
+    # for a different local source revision.
+    assert _is_voom_lossy_checkpoint(artifact)
+    assert _preferred_fast_artifact(source) == source
+
+
+def test_mtplx_checkpoint_is_advertised_only_as_lossy(tmp_path):
+    from unittest.mock import patch
+
+    revision = "7c72a9c714cf66281cb222c4aa0aef368d84c94f"
+    source = tmp_path / "Qwythos-27B-v1"
+    artifact = tmp_path / "Qwythos-27B-v1-mlx-all-mxfp4"
+    source.mkdir()
+    _write_mtplx_fixture(source, artifact, revision)
+
+    with patch("runtime.server._registry", return_value={
+            source.name: source, artifact.name: artifact}):
+        ids = _advertised_model_ids()
+    assert source.name in ids
+    assert f"lossy-{source.name}" in ids
+    assert artifact.name not in ids
+    assert f"lossy-{artifact.name}" in ids
 
 
 def test_execution_profile_discloses_effective_derived_artifact(tmp_path):

@@ -25,6 +25,8 @@ from itertools import combinations
 from pathlib import Path
 from typing import Iterable, Mapping, Sequence
 
+from .cache_policy import CacheEntry, rank_victims
+
 
 TraceEvent = tuple[int, tuple[int, ...]]
 Sweep = dict[int, tuple[int, ...]]
@@ -241,6 +243,7 @@ def simulate_layout(
     coalesce_gap_pages: int = -1,
     bundle_pages: int = 0,
     cache_pages: int = 0,
+    fetch_batch: int = 0,
 ) -> LayoutResult:
     """Charge physical bytes/requests for one immutable expert layout.
 
@@ -256,13 +259,23 @@ def simulate_layout(
     current physical amplification.
 
     ``cache_pages`` replays the runtime's cumulative-frequency/recency eviction
-    shape at expert-page granularity. Pinned trunk/KV capacity must already be
+    shape at expert-page granularity, using the same ``runtime.cache_policy``
+    ordering the live cache evicts by. Pinned trunk/KV capacity must already be
     subtracted by the caller. Zero disables the cache (all accesses miss).
+
+    ``fetch_batch`` mirrors ``WeightCache.max_fetch_batch``: the missing pages
+    of one routed union are admitted in groups of this size with an eviction
+    pass between groups, bounding peak residency. Zero admits the whole union
+    at once. This models one ``get_many`` call per layer, which is the
+    ``StreamingEngine._get_experts`` shape; the engine's separate
+    ``_iter_expert_batches`` splitting of the union across several ``get_many``
+    calls is deliberately not modeled, because that path resolves its hits
+    incrementally rather than in one locked pass.
     """
     if expert_page_bytes <= 0 or bandwidth_mbps <= 0:
         raise ValueError("expert_page_bytes and bandwidth_mbps must be positive")
     if (request_overhead_ms < 0 or coalesce_gap_pages < -1
-            or bundle_pages < 0 or cache_pages < 0):
+            or bundle_pages < 0 or cache_pages < 0 or fetch_batch < 0):
         raise ValueError("layout costs must be non-negative")
     if bundle_pages and coalesce_gap_pages >= 0:
         raise ValueError("fixed bundles and dynamic coalescing are exclusive")
@@ -300,41 +313,50 @@ def simulate_layout(
                 else:
                     cache_misses += 1
                     missing.append(expert)
-            if cache_pages:
-                for expert in missing:
-                    key = (layer, expert)
-                    cache[key] = None
-                    while len(cache) > cache_pages:
-                        victim = min(
-                            (frequencies[candidate], age, candidate)
-                            for age, candidate in enumerate(cache)
-                        )[2]
-                        del cache[victim]
             if not missing:
                 continue
             demanded_pages += len(missing)
-            selected = sorted(positions[layer][expert] for expert in missing)
-            if bundle_pages:
-                total_pages = len(positions[layer])
-                bundles = {position // bundle_pages for position in selected}
-                requests += len(bundles)
-                for bundle in bundles:
-                    start = bundle * bundle_pages
-                    physical_pages += min(bundle_pages, total_pages - start)
-            elif coalesce_gap_pages < 0:
-                requests += len(selected)
-                physical_pages += len(selected)
-            else:
-                run_start = run_end = selected[0]
-                for position in selected[1:]:
-                    if position - run_end - 1 <= coalesce_gap_pages:
-                        run_end = position
-                    else:
-                        requests += 1
-                        physical_pages += run_end - run_start + 1
-                        run_start = run_end = position
-                requests += 1
-                physical_pages += run_end - run_start + 1
+            # ``WeightCache.get_many`` resolves every hit in one locked pass
+            # (above), then fetches the misses in ``max_fetch_batch`` groups
+            # with an eviction between groups.  Admitting the whole union and
+            # evicting once would let this union's own pages survive that the
+            # runtime would have dropped.
+            group_size = fetch_batch if fetch_batch > 0 else len(missing)
+            for start in range(0, len(missing), group_size):
+                group = missing[start:start + group_size]
+                if cache_pages:
+                    for expert in group:
+                        cache[(layer, expert)] = None
+                    if len(cache) > cache_pages:
+                        victims = rank_victims(
+                            (CacheEntry(key) for key in cache), frequencies)
+                        for victim in victims:
+                            if len(cache) <= cache_pages:
+                                break
+                            del cache[victim]
+                selected = sorted(positions[layer][expert] for expert in group)
+                if bundle_pages:
+                    total_pages = len(positions[layer])
+                    bundles = {position // bundle_pages for position in selected}
+                    requests += len(bundles)
+                    for bundle in bundles:
+                        bundle_start = bundle * bundle_pages
+                        physical_pages += min(
+                            bundle_pages, total_pages - bundle_start)
+                elif coalesce_gap_pages < 0:
+                    requests += len(selected)
+                    physical_pages += len(selected)
+                else:
+                    run_start = run_end = selected[0]
+                    for position in selected[1:]:
+                        if position - run_end - 1 <= coalesce_gap_pages:
+                            run_end = position
+                        else:
+                            requests += 1
+                            physical_pages += run_end - run_start + 1
+                            run_start = run_end = position
+                    requests += 1
+                    physical_pages += run_end - run_start + 1
 
     demanded_bytes = demanded_pages * expert_page_bytes
     physical_bytes = physical_pages * expert_page_bytes
@@ -352,6 +374,65 @@ def simulate_layout(
         read_amplification=amplification,
         predicted_wall_s=wall,
     )
+
+
+def identity_orders(sweeps: Sequence[Sweep], num_experts: int = 0
+                    ) -> dict[int, list[int]]:
+    """Released expert order per layer -- the no-relayout baseline."""
+    num_experts = int(num_experts) or _infer_num_experts(sweeps)
+    layers = {int(layer) for sweep in sweeps for layer in sweep}
+    return {layer: list(range(num_experts)) for layer in layers}
+
+
+@dataclass(frozen=True)
+class CapacityPoint:
+    cache_pages: int
+    cache_bytes: int
+    hits: int
+    misses: int
+    hit_rate: float
+    physical_bytes: int
+
+
+def capacity_sweep(
+    sweeps: Sequence[Sweep],
+    capacities: Sequence[int],
+    *,
+    expert_page_bytes: int,
+    num_experts: int = 0,
+    fetch_batch: int = 0,
+) -> list[CapacityPoint]:
+    """Replay one recorded trace at many expert-cache capacities.
+
+    The trace records what the model *demanded*, before any cache answered it,
+    so a single recorded run scores every capacity offline.  Sizing the expert
+    cache this way costs one replay per point instead of one full request.
+
+    Capacities are page counts; convert from a byte budget with
+    ``budget // expert_page_bytes`` after subtracting pinned, trunk, and KV
+    residency, which this model does not represent.
+    """
+    orders = identity_orders(sweeps, num_experts)
+    points = []
+    for cache_pages in sorted({max(0, int(value)) for value in capacities}):
+        result = simulate_layout(
+            sweeps, orders,
+            expert_page_bytes=expert_page_bytes,
+            bandwidth_mbps=1.0,  # unused: only byte/hit accounting is read
+            coalesce_gap_pages=-1,
+            cache_pages=cache_pages,
+            fetch_batch=fetch_batch,
+        )
+        total = result.cache_hits + result.cache_misses
+        points.append(CapacityPoint(
+            cache_pages=cache_pages,
+            cache_bytes=cache_pages * expert_page_bytes,
+            hits=result.cache_hits,
+            misses=result.cache_misses,
+            hit_rate=result.cache_hits / total if total else 0.0,
+            physical_bytes=result.physical_bytes,
+        ))
+    return points
 
 
 @dataclass(frozen=True)
@@ -541,6 +622,14 @@ def main() -> None:
         help="measured idle-I/O page budget per transition; zero is the "
              "fail-safe default",
     )
+    parser.add_argument(
+        "--capacity-sweep", default="",
+        help="comma-separated expert-cache capacities in PAGES, or "
+             "'auto' for a log-spaced ladder up to the trace's working set. "
+             "Replays the recorded demand at each capacity and prints the "
+             "hit-rate/bytes curve, so sizing costs one replay per point "
+             "instead of one full request.",
+    )
     parser.add_argument("--plan-out", default="")
     parser.add_argument("--report-out", default="")
     args = parser.parse_args()
@@ -629,6 +718,37 @@ def main() -> None:
               f"{result.read_amplification:>13.3f}x "
               f"{result.predicted_wall_s:>11.3f}s")
 
+    capacity_points: list[CapacityPoint] = []
+    if args.capacity_sweep:
+        working_set = len({
+            (layer, expert) for sweep in sweeps
+            for layer, experts in sweep.items() for expert in experts
+        })
+        if args.capacity_sweep.strip().lower() == "auto":
+            capacities = [0]
+            step = 1
+            while step < working_set:
+                capacities.append(step)
+                step *= 4
+            capacities.append(working_set)
+        else:
+            capacities = [int(v) for v in args.capacity_sweep.split(",") if v]
+        capacity_points = capacity_sweep(
+            sweeps, capacities, expert_page_bytes=page_bytes,
+            num_experts=num_experts)
+        print(f"\nexpert-cache capacity sweep "
+              f"(working set {working_set} pages = "
+              f"{_format_bytes(working_set * page_bytes)}):")
+        print(f"{'pages':>8} {'budget':>12} {'hit':>7} {'misses':>9} "
+              f"{'physical':>13} {'I/O floor':>12}")
+        for point in capacity_points:
+            wall = point.physical_bytes / (args.bandwidth_mbps * 1_000_000.0)
+            print(f"{point.cache_pages:>8} "
+                  f"{_format_bytes(point.cache_bytes):>12} "
+                  f"{point.hit_rate * 100:>6.1f}% {point.misses:>9} "
+                  f"{_format_bytes(point.physical_bytes):>13} "
+                  f"{wall:>11.3f}s")
+
     prediction = evaluate_transition_predictor(
         train, held_out, top_m=args.predict_top_m,
         expert_page_bytes=page_bytes,
@@ -679,6 +799,7 @@ def main() -> None:
             "request_overhead_ms": args.request_overhead_ms,
             "cache_pages": args.cache_pages,
             "strategies": {name: asdict(result) for name, result in strategies},
+            "capacity_sweep": [asdict(point) for point in capacity_points],
             "transition_predictor": asdict(prediction),
             "opportunistic_predictor": asdict(gated_prediction),
             "adjacent_sweep_persistence": asdict(persistence),

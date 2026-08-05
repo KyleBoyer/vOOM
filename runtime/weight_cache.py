@@ -15,6 +15,8 @@ from collections import OrderedDict
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
+from .cache_policy import CacheEntry, rank_victims
+
 if TYPE_CHECKING:
     import mlx.core as mx
 
@@ -39,14 +41,24 @@ class CacheStats:
     prefetch_hits: int = 0  # hits on pages inserted by the prefetch thread
     disk_s: float = 0.0
     bytes_read: int = 0
+    # F197: pages a producer returned without every requested tensor. Any
+    # nonzero value means a page was served short and the arithmetic that
+    # consumed it is unsound -- the cache raises rather than admitting one, so
+    # this counts detections, not survivals. It exists because a short page is
+    # otherwise silent: an expert whose weights never arrive contributes
+    # nothing to the routed sum and the output is merely *wrong*, not an error.
+    incomplete_pages: int = 0
 
     def summary(self) -> str:
         total = self.hits + self.misses
         rate = self.hits / total * 100 if total else 0.0
+        short = (f", {self.incomplete_pages} INCOMPLETE PAGES"
+                 if self.incomplete_pages else "")
         return (
             f"cache: {self.hits} hits / {self.misses} misses ({rate:.0f}% hit rate, "
             f"{self.prefetch_hits} via prefetch), {self.evictions} evictions, "
             f"store-accounted {self.bytes_read / 1e6:.0f}MB in {self.disk_s:.2f}s"
+            f"{short}"
         )
 
 
@@ -103,9 +115,28 @@ class WeightCache:
 
     def _fetch(self, names: list[str], *, apply_transform: bool = True):
         tensors, secs, nbytes = self.store.fetch(names)
+        self._require_complete(names, tensors, "store fetch")
         if self.transform and apply_transform:
             tensors = {n: self.transform(n, a) for n, a in tensors.items()}
+            self._require_complete(names, tensors, "cache transform")
         return tensors, secs, nbytes
+
+    def _require_complete(self, names, tensors, source: str) -> None:
+        """Refuse a page that is missing any tensor the caller asked for.
+
+        A short page cannot be detected downstream: a routed expert whose
+        weights never arrived simply contributes zero to the MoE sum, so the
+        request completes and returns a plausible, wrong answer. Failing here
+        converts that into an error at the exact point the bytes went missing.
+        """
+        missing = [name for name in names if name not in tensors]
+        if not missing:
+            return
+        with self._lock:
+            self.stats.incomplete_pages += 1
+        raise KeyError(
+            f"{source} returned an incomplete page: {len(missing)} of "
+            f"{len(names)} tensors missing, first {missing[:3]}")
 
     def get(self, key: str, names: list[str], origin: str = "demand", *,
             apply_transform: bool = True) -> dict[str, mx.array]:
@@ -138,6 +169,7 @@ class WeightCache:
         try:
             tensors = self.warm.take(key) if self.warm is not None else None
             if tensors is not None:
+                self._require_complete(names, tensors, "warm tier")
                 secs, nbytes = 0.0, 0
             else:
                 tensors, secs, nbytes = self._fetch(
@@ -210,6 +242,7 @@ class WeightCache:
                 for key, names in missing:
                     t = self.warm.take(key)
                     if t is not None:
+                        self._require_complete(names, t, "warm tier")
                         with self._lock:
                             resident = sum(_tensor_bytes(x) for x in t.values())
                             self._put_page_locked(
@@ -403,23 +436,25 @@ class WeightCache:
         page is gone. Within each class, lowest frequency wins and OrderedDict
         position supplies the age tie-break, exactly matching the former repeated
         ``min`` loop.
+
+        The ordering itself lives in ``runtime.cache_policy`` so the offline
+        capacity simulator replays this policy rather than a second, drifting
+        transcription of it.
         """
         target_bytes = max(0, int(target_bytes))
         if self._total_bytes <= target_bytes:
             return
-        ordinary = []
-        prefetched = []
-        for age, (key, page) in enumerate(self._pages.items()):
-            if page.pinned:
-                continue
-            candidate = (self.freq.get(key, 0), age, key)
-            (prefetched if page.origin == "prefetch" else ordinary).append(
-                candidate)
-        victims = sorted(ordinary) + sorted(prefetched)
+        victims = rank_victims(
+            (
+                CacheEntry(key, page.pinned, page.origin == "prefetch")
+                for key, page in self._pages.items()
+            ),
+            self.freq,
+        )
         evicted = False
         released_names: list[str] = []
         try:
-            for _frequency, _age, key in victims:
+            for key in victims:
                 if self._total_bytes <= target_bytes:
                     break
                 page = self._pages[key]

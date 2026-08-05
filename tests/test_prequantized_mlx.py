@@ -146,6 +146,63 @@ def test_bias_free_standard_mlx_modes_round_trip(mode, group_size, bits, tmp_pat
     assert mx.array_equal(selected, expected)
 
 
+def _write_indexed_mtp_fixture(tmp_path, *, sidecar="mtp.safetensors",
+                               collide=False):
+    config = _config()
+    config.pop("quantization")
+    (tmp_path / "config.json").write_text(json.dumps(config))
+    main_name = "model-00001-of-00001.safetensors"
+    main_tensors = {
+        "model.embed_tokens.weight": mx.ones((8, 64), dtype=mx.bfloat16),
+        "model.norm.weight": mx.ones((64,), dtype=mx.bfloat16),
+        "vision_tower.patch_embed.proj.weight": mx.ones(
+            (64, 64), dtype=mx.bfloat16),
+    }
+    weight_map = {name: main_name for name in main_tensors}
+    if collide:
+        main_tensors["mtp.norm.weight"] = mx.zeros((64,), dtype=mx.bfloat16)
+        weight_map["mtp.norm.weight"] = main_name
+    mx.save_safetensors(str(tmp_path / main_name), main_tensors)
+    if Path(sidecar).name == sidecar:
+        mx.save_safetensors(str(tmp_path / sidecar), {
+            "mtp.norm.weight": mx.arange(64, dtype=mx.float32),
+            "unrelated.weight": mx.ones((1,), dtype=mx.float32),
+        })
+    (tmp_path / "model.safetensors.index.json").write_text(json.dumps({
+        "metadata": {"mtplx_mtp_sidecar": sidecar},
+        "weight_map": weight_map,
+    }))
+
+
+def test_indexed_mtplx_sidecar_exposes_only_mtp_tensors(tmp_path):
+    _write_indexed_mtp_fixture(tmp_path)
+
+    store = WeightStore(tmp_path)
+    assert store.mtplx_mtp_sidecar == "mtp.safetensors"
+    assert store.names_with_prefix("mtp.") == ["mtp.norm.weight"]
+    assert not store.has("unrelated.weight")
+    assert store.has("model.visual.patch_embed.proj.weight")
+    assert not store.has("vision_tower.patch_embed.proj.weight")
+    tensors, _seconds, _nbytes = store.fetch(["mtp.norm.weight"])
+    mx.eval(tensors["mtp.norm.weight"])
+    assert mx.array_equal(
+        tensors["mtp.norm.weight"], mx.arange(64, dtype=mx.float32))
+
+
+def test_indexed_mtplx_sidecar_rejects_unsafe_path(tmp_path):
+    _write_indexed_mtp_fixture(tmp_path, sidecar="../mtp.safetensors")
+
+    with pytest.raises(ValueError, match="unsafe MTPLX MTP sidecar path"):
+        WeightStore(tmp_path)
+
+
+def test_indexed_mtplx_sidecar_rejects_tensor_collision(tmp_path):
+    _write_indexed_mtp_fixture(tmp_path, collide=True)
+
+    with pytest.raises(ValueError, match="collides with indexed tensors"):
+        WeightStore(tmp_path)
+
+
 def test_fine_grained_mlx_quantization_uses_per_module_parameters(tmp_path):
     original = mx.arange(8 * 64, dtype=mx.float32).reshape(8, 64) / 100
     wq, scales, biases = mx.quantize(original, group_size=64, bits=4)
