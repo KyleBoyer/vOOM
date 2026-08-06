@@ -2759,6 +2759,21 @@ class StreamingEngine:
         ratio = (self.cfg.compress_ratios[layer]
                  if layer < len(self.cfg.compress_ratios) else 0)
         window = self.cfg.window_size
+        # The engine derives `offset` from the KV cache's own length, but this
+        # attention keeps its own ring and never calls kv.update(), so
+        # kv.offset stays 0 forever. Every decode step therefore arrived with
+        # offset 0, which sent window_topk_idxs down its start_pos==0 branch
+        # and made each generated token attend to position 0 alone -- an
+        # input-independent state, which is exactly the fixed attractor
+        # generation collapsed into after its first token.
+        #
+        # Track the position separately, advanced by the widths actually
+        # consumed. Prefill (offset 0 with width > 1) resets it.
+        if offset == 0 and x.shape[1] > 1:
+            kv.dsv4_pos = 0
+        offset = int(getattr(kv, "dsv4_pos", 0)) if offset == 0 else offset
+        kv.dsv4_pos = offset + x.shape[1]
+
         rings = getattr(kv, "dsv4_rings", None)
         if rings is None:
             rings = {}
