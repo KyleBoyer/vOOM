@@ -2798,6 +2798,13 @@ class StreamingEngine:
         latent = mx.concatenate([latent[..., :-rope_dim], tail], axis=-1)
 
         rings[layer] = window_ring_write(ring, latent, offset, window)
+        # Materialize the ring. window_ring_write is a concat around the
+        # previous ring, so left lazy each decode step's ring holds a reference
+        # to its predecessor and the whole chain is retained: measured at
+        # +0.52GB per token across 43 layers, monotonically, which is what
+        # exhausted memory on tool-schema prompts. The same applies to the
+        # compressed store, which is appended to per emission.
+        mx.eval(rings[layer])
 
         # Prefill attends over the raw sequence, decode over the ring. The
         # released Attention.forward passes `kv` (seqlen entries) at
@@ -2849,6 +2856,7 @@ class StreamingEngine:
                 stores[layer] = (
                     pooled if layer not in stores
                     else mx.concatenate([stores[layer], pooled], axis=1))
+                mx.eval(stores[layer])
             existing = stores.get(layer)
             if existing is not None:
                 kv_all = mx.concatenate([kv_all, existing], axis=1)

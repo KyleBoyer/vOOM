@@ -206,3 +206,18 @@ def test_decode_window_is_a_rotation_not_a_range():
         "expected a rotation, got a contiguous range")
     # 300 % 128 == 44, so the oldest slot is 45 and the newest is 44.
     assert got[0] == 45 and got[-1] == 44, got[:3].tolist()
+
+
+def test_tiling_is_result_invariant():
+    """Tiling bounds the gathered operand; it must not change any value."""
+    import mlx.core as mx
+
+    from runtime.deepseek_v4 import sparse_windowed_attention
+
+    q, kv, sink, idxs = _inputs(m=37, n=24, topk=11, seed=9)
+    args = (mx.array(q), mx.array(kv), mx.array(sink), mx.array(idxs), 0.3)
+    whole = np.array(sparse_windowed_attention(*args, tile=0))
+    for tile in (1, 4, 16, 36, 37, 64):
+        tiled = np.array(sparse_windowed_attention(*args, tile=tile))
+        assert np.allclose(tiled, whole, atol=1e-6), (
+            f"tile={tile} changed the result")

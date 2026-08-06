@@ -117,19 +117,40 @@ def hc_head(x: mx.array, hc_fn: mx.array, hc_scale: mx.array,
 
 
 def sparse_windowed_attention(q: mx.array, kv: mx.array, attn_sink: mx.array,
-                              topk_idxs: mx.array,
-                              softmax_scale: float) -> mx.array:
+                              topk_idxs: mx.array, softmax_scale: float,
+                              tile: int = 128) -> mx.array:
     """Gathered sparse attention with per-head sinks.
 
     ``q``  is ``[b, s, h, d]``; ``kv`` is ``[b, n, d]`` shared across heads;
     ``topk_idxs`` is ``[b, s, topk]`` with ``-1`` for unused slots.
+
+    Query positions are processed in tiles because the gathered operand is
+    ``[b, tile, topk, d]``: materializing it for every position at once is
+    ~108MB at a 271-token prompt and would be ~19GB at the 46K-token harness
+    capture. The released implementation is a fused FlashAttention-style kernel
+    that never materializes it at all; tiling is the same bound without a
+    custom kernel. Tiling changes only the order in which independent rows are
+    computed, so results are unchanged.
     """
     b, s, h, d = q.shape
-    topk = topk_idxs.shape[-1]
+    if tile <= 0 or s <= tile:
+        return _sparse_windowed_attention_tile(
+            q, kv, attn_sink, topk_idxs, softmax_scale)
+    parts = [
+        _sparse_windowed_attention_tile(
+            q[:, start:start + tile], kv, attn_sink,
+            topk_idxs[:, start:start + tile], softmax_scale)
+        for start in range(0, s, tile)
+    ]
+    return mx.concatenate(parts, axis=1)
+
+
+def _sparse_windowed_attention_tile(q, kv, attn_sink, topk_idxs,
+                                    softmax_scale):
+    b, s, h, d = q.shape
     valid = topk_idxs >= 0
     safe = mx.maximum(topk_idxs, 0).astype(mx.int32)
 
-    # [b, s, topk, d]
     gathered = mx.take_along_axis(
         mx.broadcast_to(kv[:, None, :, :], (b, s, kv.shape[1], d)),
         safe[..., None], axis=2)
