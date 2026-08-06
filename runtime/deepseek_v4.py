@@ -420,3 +420,33 @@ def apply_rope_interleaved(x: mx.array, cos: mx.array, sin: mx.array,
     rotated = mx.stack(
         [real * cos - imaginary * sin, real * sin + imaginary * cos], axis=-1)
     return rotated.reshape(shape).astype(x.dtype)
+
+
+# ---- attention output projection (F210) ------------------------------------
+
+
+def attention_output_projection(o: mx.array, wo_a: mx.array, wo_b: mx.array,
+                                *, n_groups: int, o_lora_rank: int
+                                ) -> mx.array:
+    """Grouped low-rank output projection.
+
+    ``o`` is ``[b, s, heads, head_dim]``. Heads are split into ``n_groups``
+    contiguous groups; each group has its own ``[o_lora_rank, group_width]``
+    slice of ``wo_a``, and the concatenated per-group codes then pass through
+    the shared ``wo_b``.
+
+    ``wo_a`` is stored ``[n_groups * o_lora_rank, group_width]`` and must be
+    viewed as ``[n_groups, o_lora_rank, group_width]`` -- group-major on the
+    OUTPUT axis. Reshaping the other way pairs each group with another group's
+    projection, which keeps every shape valid.
+
+    The caller applies the inverse RoPE to ``o``'s rotary dimensions before
+    this; the released code de-rotates the attention output before projecting.
+    """
+    b, s = o.shape[0], o.shape[1]
+    grouped = o.reshape(b, s, n_groups, -1)
+    per_group = wo_a.reshape(n_groups, o_lora_rank, grouped.shape[-1])
+    codes = mx.einsum("bsgd,grd->bsgr", grouped.astype(mx.float32),
+                      per_group.astype(mx.float32))
+    return (codes.reshape(b, s, n_groups * o_lora_rank)
+            @ wo_b.astype(mx.float32).T).astype(o.dtype)
