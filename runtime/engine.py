@@ -2777,7 +2777,7 @@ class StreamingEngine:
         # Only pure sliding-window layers use the base rope_theta. Using the
         # base theta on compressed layers left the first token correct (small
         # positions, small phase error) and degraded every token after it.
-        theta = 40000.0 if ratio else self.cfg.rope_theta
+        theta = self.cfg.compress_rope_theta if ratio else self.cfg.rope_theta
         original = self.cfg.compress_original_seq_len if ratio else 0
         cos, sin = yarn_freqs(
             rope_dim, offset + x.shape[1], original, theta,
@@ -2940,11 +2940,25 @@ class StreamingEngine:
                 swiglu_limit=self.cfg.swiglu_limit)
             return out.reshape(x.shape).astype(x.dtype)
 
+        tid2eid = w.get(f"{prefix}.ffn.gate.tid2eid")
+        hash_indices = None
+        if tid2eid is not None:
+            # Hash-routed layer: gate.tid2eid maps each token id to its fixed
+            # expert set. self._dsv4_input_ids is the current sweep's token
+            # ids, set by _sweep before the layer loop.
+            ids = getattr(self, "_dsv4_input_ids", None)
+            if ids is None:
+                raise ValueError(
+                    f"layer {layer} is hash-routed but no input ids were "
+                    "recorded for this sweep")
+            hash_indices = tid2eid[ids.reshape(-1)]
         weights, indices = moe_gate(
             x.reshape(-1, x.shape[-1]), gate_weight,
             w.get(f"{prefix}.ffn.gate.bias"),
             topk=self.cfg.num_experts_per_tok,
-            score_func="sqrtsoftplus")
+            score_func="sqrtsoftplus",
+            route_scale=self.cfg.routed_scaling_factor_v4,
+            hash_indices=hash_indices)
 
         expert_ids = sorted({int(e) for row in indices.tolist() for e in row})
         self._record_expert_route(layer, expert_ids)
@@ -3299,6 +3313,12 @@ class StreamingEngine:
         return self.cache.get("embeddings", ["model.embed_tokens.weight"])["model.embed_tokens.weight"]
 
     def _embed(self, tokens: list[int]) -> mx.array:
+        if self.cfg.model_type == "deepseek_v4" and self.cfg.num_hash_layers:
+            # Hash-routed layers need the token ids themselves, not just their
+            # embeddings. Recorded here because this is the only point where
+            # the ids and the sweep that consumes them are guaranteed to
+            # correspond.
+            self._dsv4_input_ids = mx.array(tokens)
         if self._embed_rows is not None:
             result = self._embed_rows.lookup(tokens)
         else:

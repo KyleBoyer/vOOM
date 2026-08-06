@@ -180,6 +180,11 @@ class ModelConfig:
     compress_rope_theta: float = 40000.0
     compress_rope_factor: float = 40.0
     compress_original_seq_len: int = 0
+    # DeepSeek V4 scales every routed-expert weight by this factor, and its
+    # first num_hash_layers layers route by token id via gate.tid2eid rather
+    # than by score.
+    routed_scaling_factor_v4: float = 1.0
+    num_hash_layers: int = 0
 
     def moe_module_prefix(self) -> str:
         """Parent module holding the gate/router beside ``moe_expert_prefix``.
@@ -620,9 +625,20 @@ class ModelConfig:
             rope_head_dim=raw.get("rope_head_dim", 64),
             window_size=raw.get("window_size", 128),
             compress_ratios=tuple(raw.get("compress_ratios", ()) or ()),
+            # F219: read the HF-convention keys the checkpoint actually
+            # ships. The reference's ModelArgs uses different names, so
+            # looking for ITS names finds nothing and silently falls back to
+            # defaults that are wrong for this checkpoint: compress theta
+            # 40000 vs the real 160000, YaRN factor 40 vs 16, and an
+            # original_seq_len of 0 that disables the interpolation entirely.
             compress_rope_theta=raw.get("compress_rope_theta", 40000.0),
-            compress_rope_factor=raw.get("rope_factor", 40.0),
-            compress_original_seq_len=raw.get("original_seq_len", 0),
+            compress_rope_factor=(
+                raw.get("rope_scaling", {}) or {}).get("factor", 40.0),
+            compress_original_seq_len=(
+                raw.get("rope_scaling", {}) or {}).get(
+                    "original_max_position_embeddings", 0),
+            routed_scaling_factor_v4=raw.get("routed_scaling_factor", 1.0),
+            num_hash_layers=raw.get("num_hash_layers", 0),
             moe_expert_prefix=(
                 "block_sparse_moe.experts"
                 if raw.get("model_type") in ("kimi_linear", "kimi_k3")

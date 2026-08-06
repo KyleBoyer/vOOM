@@ -457,7 +457,7 @@ def attention_output_projection(o: mx.array, wo_a: mx.array, wo_b: mx.array,
 
 def moe_gate(x: mx.array, weight: mx.array, bias: mx.array | None, *,
              topk: int, score_func: str = "sqrtsoftplus",
-             route_scale: float = 1.0):
+             route_scale: float = 1.0, hash_indices: mx.array | None = None):
     """Route each token to ``topk`` experts.
 
     ``bias`` shifts scores for *selection only*; the returned weights come from
@@ -483,7 +483,14 @@ def moe_gate(x: mx.array, weight: mx.array, bias: mx.array | None, *,
     original = scores
     if bias is not None:
         scores = scores + bias.astype(mx.float32)
-    indices = mx.argpartition(-scores, kth=topk - 1, axis=-1)[..., :topk]
+    if hash_indices is not None:
+        # The first num_hash_layers layers route by TOKEN ID: gate.tid2eid maps
+        # each vocabulary entry to a fixed expert set, and the gate weights only
+        # supply the mixing weights. Score-based top-k on these layers routes to
+        # entirely different experts.
+        indices = hash_indices.astype(mx.uint32)
+    else:
+        indices = mx.argpartition(-scores, kth=topk - 1, axis=-1)[..., :topk]
     weights = mx.take_along_axis(original, indices, axis=-1)
     if score_func != "softmax":
         weights = weights / mx.sum(weights, axis=-1, keepdims=True)
