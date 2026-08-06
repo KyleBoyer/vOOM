@@ -628,3 +628,75 @@ def deepseek_v4_attention(x: mx.array, w: dict, prefix: str, *,
     return attention_output_projection(
         out, w[f"{prefix}.wo_a"], w[f"{prefix}.wo_b"],
         n_groups=n_groups, o_lora_rank=o_lora_rank)
+
+
+# ---- window ring buffer + compressed cache (F214) --------------------------
+#
+# The released Attention keeps ONE buffer per layer: the first ``window_size``
+# slots are a ring over the most recent positions, and everything after them is
+# the compressed region. Both are addressed by the same gather list, which is
+# why ``get_compress_topk_idxs`` shifts compressed indices by an offset.
+
+
+def window_ring_write(ring: mx.array, kv: mx.array, start_pos: int,
+                      window: int) -> mx.array:
+    """Place ``kv`` into the ring exactly as the released cache does.
+
+    Prefill writes the last ``window`` positions but *rotated*: with
+    ``cutoff = seqlen % window`` the tail lands at ``[cutoff:window]`` and the
+    head wraps to ``[:cutoff]``, so slot ``p % window`` always holds position
+    ``p``. Writing them contiguously instead would put every subsequent decode
+    step's ring index off by ``cutoff``.
+    """
+    seqlen = kv.shape[1]
+    if start_pos == 0:
+        if seqlen <= window:
+            return mx.concatenate(
+                [kv, ring[:, seqlen:]], axis=1) if seqlen < window else kv
+        cutoff = seqlen % window
+        tail = kv[:, -window:]
+        if cutoff == 0:
+            return tail
+        return mx.concatenate([tail[:, window - cutoff:],
+                               tail[:, :window - cutoff]], axis=1)
+    slot = start_pos % window
+    return mx.concatenate(
+        [ring[:, :slot], kv[:, :1], ring[:, slot + 1:]], axis=1)
+
+
+def compress_topk_idxs(ratio: int, seqlen: int, start_pos: int, offset: int
+                       ) -> mx.array:
+    """Compressed-region gather list, matching ``get_compress_topk_idxs``.
+
+    Entries are shifted by ``offset`` because the compressed region shares one
+    buffer with the window ring. A position may only read compressed entry
+    ``< (p + 1) // ratio``; unreachable slots are ``-1``.
+    """
+    if start_pos > 0:
+        return (mx.arange((start_pos + 1) // ratio)
+                + offset).astype(mx.int32)[None, None]
+    entries = seqlen // ratio
+    columns = mx.broadcast_to(mx.arange(entries)[None, :], (seqlen, entries))
+    reach = (mx.arange(1, seqlen + 1) // ratio)[:, None]
+    return mx.where(columns >= reach, -1,
+                    columns + offset).astype(mx.int32)[None]
+
+
+def gather_indices(window: int, ratio: int, seqlen: int, start_pos: int,
+                   compressed_offset: int) -> mx.array:
+    """Concatenate the window and compressed gather lists for one layer.
+
+    ``ratio == 0`` means the layer has no compressed region at all (the
+    released ``compress_ratios`` contains 0, 4 and 128), in which case the
+    window list is the whole gather.
+    """
+    windowed = window_topk_idxs(window, seqlen, start_pos)
+    if not ratio:
+        return windowed
+    compressed = compress_topk_idxs(ratio, seqlen, start_pos,
+                                    compressed_offset)
+    if compressed.shape[1] != windowed.shape[1]:
+        compressed = mx.broadcast_to(
+            compressed, (compressed.shape[0], windowed.shape[1],
+                         compressed.shape[2]))
+    return mx.concatenate([windowed, compressed], axis=-1)
