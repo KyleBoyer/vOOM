@@ -100,3 +100,75 @@ def hc_head(x: mx.array, hc_fn: mx.array, hc_scale: mx.array,
     mixes = (flat @ hc_fn.astype(mx.float32).T) * rsqrt
     pre = mx.sigmoid(mixes * hc_scale + hc_base) + eps
     return mx.sum(pre[..., None] * flat.reshape(shape), axis=2).astype(x.dtype)
+
+
+# ---- sparse windowed attention (F206) --------------------------------------
+#
+# DeepSeek V4's attention gathers an explicit per-position index list rather
+# than masking a dense score matrix. ``-1`` marks an unused slot. A single
+# shared KV vector of ``head_dim`` serves every head (config's
+# ``num_key_value_heads: 1``), so the gathered values are [topk, d], not
+# per-head.
+#
+# The learned per-head ``attn_sink`` is NOT an extra key: it contributes only
+# to the softmax denominator, letting a head attend to "nothing" and shrink its
+# output. Adding it as a key instead would also add its value vector, which is
+# a different function.
+
+
+def sparse_windowed_attention(q: mx.array, kv: mx.array, attn_sink: mx.array,
+                              topk_idxs: mx.array,
+                              softmax_scale: float) -> mx.array:
+    """Gathered sparse attention with per-head sinks.
+
+    ``q``  is ``[b, s, h, d]``; ``kv`` is ``[b, n, d]`` shared across heads;
+    ``topk_idxs`` is ``[b, s, topk]`` with ``-1`` for unused slots.
+    """
+    b, s, h, d = q.shape
+    topk = topk_idxs.shape[-1]
+    valid = topk_idxs >= 0
+    safe = mx.maximum(topk_idxs, 0).astype(mx.int32)
+
+    # [b, s, topk, d]
+    gathered = mx.take_along_axis(
+        mx.broadcast_to(kv[:, None, :, :], (b, s, kv.shape[1], d)),
+        safe[..., None], axis=2)
+
+    scores = mx.einsum("bshd,bskd->bshk", q.astype(mx.float32),
+                       gathered.astype(mx.float32)) * softmax_scale
+    scores = mx.where(valid[:, :, None, :], scores, -mx.inf)
+
+    row_max = mx.max(scores, axis=-1, keepdims=True)
+    # A row whose slots are all unused would otherwise propagate -inf; the sink
+    # alone then carries the denominator.
+    row_max = mx.where(mx.isinf(row_max), mx.zeros_like(row_max), row_max)
+    weights = mx.where(valid[:, :, None, :], mx.exp(scores - row_max), 0.0)
+    denominator = mx.sum(weights, axis=-1, keepdims=True) + mx.exp(
+        attn_sink.reshape(1, 1, h, 1).astype(mx.float32) - row_max)
+    out = mx.einsum("bshk,bskd->bshd", weights, gathered.astype(mx.float32))
+    return (out / denominator).astype(q.dtype)
+
+
+def window_topk_idxs(window_size: int, seqlen: int, start_pos: int
+                     ) -> mx.array:
+    """Sliding-window index list, matching ``get_window_topk_idxs``.
+
+    Decode reuses a ring buffer, so the index list is a rotation rather than a
+    contiguous range; the ``-1`` padding marks slots not yet written.
+    """
+    if start_pos >= window_size - 1:
+        rotated = start_pos % window_size
+        matrix = mx.concatenate([
+            mx.arange(rotated + 1, window_size),
+            mx.arange(0, rotated + 1),
+        ])[None, :]
+    elif start_pos > 0:
+        head = mx.arange(start_pos + 1)
+        pad = mx.full((window_size - start_pos - 1,), -1, dtype=head.dtype)
+        matrix = mx.concatenate([head, pad])[None, :]
+    else:
+        base = mx.arange(seqlen)[:, None]
+        width = min(seqlen, window_size)
+        matrix = mx.maximum(base - window_size + 1, 0) + mx.arange(width)
+        matrix = mx.where(matrix > base, -1, matrix)
+    return matrix.astype(mx.int32)[None]
