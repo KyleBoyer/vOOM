@@ -1905,6 +1905,22 @@ class EngineManager:
                 # floor when system headroom requires it.
                 rc.max_weight_cache_mb = 1500
                 rc.prefetch_depth = 0
+            elif mtype == "deepseek_v4":
+                # F213: 256 experts at top-6 means a multi-position routed
+                # union can reach ~150 experts; at ~50MB per dequantized
+                # expert the governor refuses a whole-union reservation
+                # outright. Bound the fetch batch the same way kimi_k3 does.
+                rc.expert_fetch_batch = int(os.environ.get(
+                    "VMODEL_DSV4_EXPERT_FETCH_BATCH", "4"))
+                rc.decode_expert_fetch_batch = rc.expert_fetch_batch
+                rc.expert_compute_batch = rc.expert_fetch_batch
+                rc.max_weight_cache_mb = int(os.environ.get(
+                    "VMODEL_DSV4_WEIGHT_CACHE_MB", "2500"))
+                rc.min_weight_cache_mb = 150
+                rc.stream_lm_head = True
+                # Compressed layers only pool whole groups at offset 0, so the
+                # prompt must go through in one chunk.
+                rc.prefill_chunk_size = 4096
             elif mtype == "kimi_k3":
                 # F132/F134/F135: K3's untied 2.35GB embedding/head pair and
                 # 2.8T streamed MoE need the same row-paged embedding and

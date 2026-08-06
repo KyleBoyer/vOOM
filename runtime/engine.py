@@ -2758,11 +2758,6 @@ class StreamingEngine:
 
         ratio = (self.cfg.compress_ratios[layer]
                  if layer < len(self.cfg.compress_ratios) else 0)
-        if ratio and offset:
-            raise NotImplementedError(
-                f"deepseek_v4 layer {layer}: compressed decode needs the "
-                "Compressor's incremental state buffers; prefill is wired")
-
         window = self.cfg.window_size
         rings = getattr(kv, "dsv4_rings", None)
         if rings is None:
@@ -2789,7 +2784,49 @@ class StreamingEngine:
 
         kv_all = rings[layer]
         compressed_offset = latent.shape[1] if offset == 0 else window
-        if ratio:
+        stores = getattr(kv, "dsv4_compressed", None)
+        if stores is None:
+            stores = {}
+            kv.dsv4_compressed = stores
+        states = getattr(kv, "dsv4_cstate", None)
+        if states is None:
+            states = {}
+            kv.dsv4_cstate = states
+        if ratio and offset:
+            # Decode: absorb this position into the partial group and append a
+            # compressed entry only on the step that completes it.
+            from .deepseek_v4 import CompressorState
+
+            state = states.get(layer)
+            if state is None:
+                state = CompressorState(
+                    ratio, head_dim, batch=x.shape[0], dtype=mx.float32)
+                states[layer] = state
+            cw = w[f"{prefix}.attn.compressor.wkv.weight"]
+            cg = w[f"{prefix}.attn.compressor.wgate.weight"]
+            pooled = state.step(
+                (x.astype(mx.float32) @ cw.astype(mx.float32).T),
+                (x.astype(mx.float32) @ cg.astype(mx.float32).T),
+                offset, w[f"{prefix}.attn.compressor.ape"])
+            if pooled is not None:
+                pooled = mx.fast.rms_norm(
+                    pooled.astype(x.dtype),
+                    w[f"{prefix}.attn.compressor.norm.weight"],
+                    self.cfg.rms_norm_eps)
+                ccos, csin = yarn_freqs(
+                    rope_dim, offset + 1, 0, 40000.0, 1.0, 32, 1)
+                at = offset + 1 - ratio
+                ctail = apply_rope_interleaved(
+                    pooled[..., -rope_dim:], ccos[at:at + 1], csin[at:at + 1])
+                pooled = mx.concatenate(
+                    [pooled[..., :-rope_dim], ctail], axis=-1)
+                stores[layer] = (
+                    pooled if layer not in stores
+                    else mx.concatenate([stores[layer], pooled], axis=1))
+            existing = stores.get(layer)
+            if existing is not None:
+                kv_all = mx.concatenate([kv_all, existing], axis=1)
+        elif ratio:
             # Prefill-time compression: pool whole groups from the same hidden
             # states, RoPE them at their own positions (j * ratio) under the
             # compressed theta, and append after the window region so one
@@ -2811,6 +2848,7 @@ class StreamingEngine:
                     pooled[..., -rope_dim:], ccos[stride], csin[stride])
                 pooled = mx.concatenate(
                     [pooled[..., :-rope_dim], ctail], axis=-1)
+                stores[layer] = pooled
                 kv_all = mx.concatenate([kv_all, pooled], axis=1)
 
         from .deepseek_v4 import gather_indices
@@ -2869,7 +2907,15 @@ class StreamingEngine:
             score_func="sqrtsoftplus")
 
         expert_ids = sorted({int(e) for row in indices.tolist() for e in row})
-        pages = self._get_experts(layer, expert_ids)
+        self._record_expert_route(layer, expert_ids)
+
+        # Fetch in bounded groups. Reserving the whole routed union at once is
+        # what refused a tool-schema prompt: at 256 experts and top-6 the union
+        # over a long prompt reaches ~150 experts, and 150 x 50MB is past the
+        # Metal ceiling before any compute. Pages are released between groups.
+        batch = max(1, self.rc.expert_fetch_batch or len(expert_ids))
+        pages: dict[int, dict] = {}
+        loaded: list[int] = []
 
         def routed(expert, rows, scale):
             page = pages[expert]
@@ -2886,8 +2932,25 @@ class StreamingEngine:
                 w[f"{prefix}.ffn.shared_experts.w3.weight"],
                 swiglu_limit=self.cfg.swiglu_limit)
 
-        return moe_combine(x, routed, weights, indices, shared,
-                           n_routed_experts=self.cfg.num_experts)
+        flat = x.reshape(-1, x.shape[-1])
+        out = shared(flat).astype(mx.float32)
+        for start in range(0, len(expert_ids), batch):
+            group = expert_ids[start:start + batch]
+            pages.update(self._fetch_experts(layer, group))
+            loaded.extend(group)
+            out = out + moe_combine(
+                flat[None], routed, weights, indices, None,
+                n_routed_experts=self.cfg.num_experts,
+                only_experts=set(group)).reshape(flat.shape).astype(mx.float32)
+            # Materialize before advancing. Left lazy, every group's matmuls
+            # stay live and the accumulated graph reached 12.36GB across a
+            # ~150-expert union -- the reservation was bounded but the
+            # resident set was not.
+            mx.eval(out)
+            for expert in group:
+                pages.pop(expert, None)
+                self.cache.discard(f"layer.{layer}.expert.{expert}")
+        return out.reshape(x.shape).astype(x.dtype)
 
     def _plan_trunk_pin_layers(self, num_layers: int) -> int:
         """Size the pinned trunk prefix from measured on-disk layer bytes.

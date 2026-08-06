@@ -512,7 +512,8 @@ def expert_swiglu(x: mx.array, w1: mx.array, w2: mx.array, w3: mx.array, *,
 
 
 def moe_combine(x: mx.array, routed, weights: mx.array, indices: mx.array,
-                shared=None, *, n_routed_experts: int) -> mx.array:
+                shared=None, *, n_routed_experts: int,
+                only_experts: set | None = None) -> mx.array:
     """Sum the routed experts' weighted outputs plus the shared expert.
 
     ``routed(expert_id, rows, scale)`` returns that expert's already-scaled
@@ -536,6 +537,9 @@ def moe_combine(x: mx.array, routed, weights: mx.array, indices: mx.array,
 
     out = mx.zeros(flat.shape, dtype=mx.float32)
     for expert in sorted(by_expert):
+        if only_experts is not None and expert not in only_experts:
+            # Bounded fetch: this call handles one group of the routed union.
+            continue
         if not 0 <= expert < n_routed_experts:
             raise ValueError(f"routed to expert {expert} out of range")
         pairs = by_expert[expert]
@@ -544,8 +548,12 @@ def moe_combine(x: mx.array, routed, weights: mx.array, indices: mx.array,
         scale = mx.take_along_axis(
             scales[rows], slots[:, None], axis=-1)
         contribution = routed(expert, flat[rows], scale).astype(mx.float32)
-        out = out + mx.zeros(flat.shape, dtype=mx.float32).at[rows].add(
-            contribution)
+        # Scatter straight into the accumulator. Materializing a full-size
+        # zeros buffer per expert made the measured layer transient ~6.6GB on
+        # the real model -- with a ~150-expert routed union that is 150 live
+        # [tokens, hidden] float32 temporaries, and the governor refused the
+        # request outright.
+        out = out.at[rows].add(contribution)
     if shared is not None:
         out = out + shared(flat).astype(mx.float32)
     return out.reshape(x.shape).astype(x.dtype)
@@ -700,3 +708,79 @@ def gather_indices(window: int, ratio: int, seqlen: int, start_pos: int,
             compressed, (compressed.shape[0], windowed.shape[1],
                          compressed.shape[2]))
     return mx.concatenate([windowed, compressed], axis=-1)
+
+
+# ---- compressor decode state (F215) ----------------------------------------
+
+
+class CompressorState:
+    """Per-layer buffers that carry partial groups across decode steps.
+
+    Prefill leaves ``seqlen % ratio`` trailing positions uncompressed; decode
+    fills the group one position at a time and emits a compressed entry only on
+    the step that completes it (``(start_pos + 1) % ratio == 0``).
+
+    At ratio 4 the released module keeps ``2 * ratio`` slots: the first ``ratio``
+    hold the previous group's overlap half and the second ``ratio`` the current
+    group. On emit it takes the overlap half's first ``head_dim`` features and
+    the current half's second ``head_dim``, then slides the current group down.
+    Scores are initialized to ``-inf`` so an unfilled slot contributes nothing
+    through the softmax.
+    """
+
+    def __init__(self, ratio: int, head_dim: int, batch: int = 1,
+                 dtype=mx.float32):
+        self.ratio = int(ratio)
+        self.head_dim = int(head_dim)
+        self.overlap = self.ratio == 4
+        coff = 2 if self.overlap else 1
+        slots = coff * self.ratio
+        self.kv_state = mx.zeros((batch, slots, coff * head_dim), dtype=dtype)
+        self.score_state = mx.full(
+            (batch, slots, coff * head_dim), -mx.inf, dtype=dtype)
+
+    def _write(self, slot: int, kv_row: mx.array, score_row: mx.array) -> None:
+        self.kv_state = mx.concatenate([
+            self.kv_state[:, :slot], kv_row[:, None],
+            self.kv_state[:, slot + 1:]], axis=1)
+        self.score_state = mx.concatenate([
+            self.score_state[:, :slot], score_row[:, None],
+            self.score_state[:, slot + 1:]], axis=1)
+
+    def step(self, kv: mx.array, score: mx.array, start_pos: int,
+             ape: mx.array):
+        """Absorb one position; return a compressed entry or ``None``.
+
+        ``kv``/``score`` are ``[b, 1, coff * head_dim]`` projections of this
+        position's hidden state, before the position embedding is added.
+        """
+        ratio = self.ratio
+        score = score + ape[start_pos % ratio].astype(score.dtype)
+        slot = (ratio if self.overlap else 0) + start_pos % ratio
+        self._write(slot, kv[:, 0], score[:, 0])
+
+        if (start_pos + 1) % ratio:
+            return None
+
+        head_dim = self.head_dim
+        if self.overlap:
+            values = mx.concatenate(
+                [self.kv_state[:, :ratio, :head_dim],
+                 self.kv_state[:, ratio:, head_dim:]], axis=1)
+            scores = mx.concatenate(
+                [self.score_state[:, :ratio, :head_dim],
+                 self.score_state[:, ratio:, head_dim:]], axis=1)
+        else:
+            values, scores = self.kv_state, self.score_state
+
+        pooled = mx.sum(
+            values * mx.softmax(scores, axis=1), axis=1, keepdims=True)
+
+        if self.overlap:
+            # Slide the completed group into the overlap half for the next one.
+            self.kv_state = mx.concatenate(
+                [self.kv_state[:, ratio:], self.kv_state[:, ratio:]], axis=1)
+            self.score_state = mx.concatenate(
+                [self.score_state[:, ratio:], self.score_state[:, ratio:]],
+                axis=1)
+        return pooled
