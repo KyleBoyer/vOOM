@@ -3711,6 +3711,12 @@ class StreamingEngine:
                     norm_eps=self.cfg.rms_norm_eps,
                     sinkhorn_iters=self.cfg.hc_sinkhorn_iters,
                     hc_eps=self.cfg.hc_eps)
+                # Materialize per layer. The gathered sparse-attention operand
+                # is [1, positions, window + compressed, head_dim] -- about
+                # 124MB at a 300-position prompt -- and left lazy every
+                # layer's copy stays live, reaching >12GB across 43 layers
+                # while each individual reservation looked small.
+                mx.eval(hc_stream)
             elif self.cfg.model_type == "lfm2":
                 # F202: 22 gated short-conv + 8 full-attention layers. The conv
                 # layers keep a fixed conv_L_cache-1 history in the same
