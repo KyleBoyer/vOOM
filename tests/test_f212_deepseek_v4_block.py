@@ -41,37 +41,53 @@ ITERS, EPS, NORM_EPS = 20, 1e-6, 1e-6
 
 @pytest.fixture(scope="module")
 def reference():
-    if "kernel" not in sys.modules:
-        stub = types.ModuleType("kernel")
-        for name in ("act_quant", "fp4_act_quant", "fp8_gemm", "fp4_gemm",
-                     "sparse_attn"):
+    """Install/repair the shared ``kernel`` stub, then import the reference.
+
+    The stub module is process-wide and other test files install their own with
+    every entry raising. Skipping installation when ``kernel`` already exists
+    made this file pass alone and fail in a full run, because Block.hc_pre then
+    called another file's raising hc_split_sinkhorn. Always set the entries
+    this file needs rather than testing for the module's presence.
+    """
+    stub = sys.modules.get("kernel") or types.ModuleType("kernel")
+    for name in ("act_quant", "fp4_act_quant", "fp8_gemm", "fp4_gemm",
+                 "sparse_attn"):
+        if not hasattr(stub, name):
             def _unavailable(*_a, __name=name, **_k):
                 raise RuntimeError(f"kernel {__name!r} unavailable here")
             setattr(stub, name, _unavailable)
 
-        def _sinkhorn(mixes, hc_scale, hc_base, hc_mult=4, sinkhorn_iters=20,
-                      eps=1e-6):
-            """Torch transcription; F205 already verified our MLX version."""
-            import torch
+    def _sinkhorn(mixes, hc_scale, hc_base, hc_mult=4, sinkhorn_iters=20,
+                  eps=1e-6):
+        """Torch transcription; F205 already verified our MLX version."""
+        import torch
 
-            hc = hc_mult
-            pre = torch.sigmoid(mixes[..., :hc] * hc_scale[0]
-                                + hc_base[:hc]) + eps
-            post = 2 * torch.sigmoid(mixes[..., hc:2 * hc] * hc_scale[1]
-                                     + hc_base[hc:2 * hc])
-            comb = (mixes[..., 2 * hc:] * hc_scale[2] + hc_base[2 * hc:])
-            comb = comb.reshape(*comb.shape[:-1], hc, hc)
-            comb = comb.softmax(dim=-1) + eps
+        hc = hc_mult
+        pre = torch.sigmoid(mixes[..., :hc] * hc_scale[0]
+                            + hc_base[:hc]) + eps
+        post = 2 * torch.sigmoid(mixes[..., hc:2 * hc] * hc_scale[1]
+                                 + hc_base[hc:2 * hc])
+        comb = (mixes[..., 2 * hc:] * hc_scale[2] + hc_base[2 * hc:])
+        comb = comb.reshape(*comb.shape[:-1], hc, hc)
+        comb = comb.softmax(dim=-1) + eps
+        comb = comb / (comb.sum(dim=-2, keepdim=True) + eps)
+        for _ in range(sinkhorn_iters - 1):
+            comb = comb / (comb.sum(dim=-1, keepdim=True) + eps)
             comb = comb / (comb.sum(dim=-2, keepdim=True) + eps)
-            for _ in range(sinkhorn_iters - 1):
-                comb = comb / (comb.sum(dim=-1, keepdim=True) + eps)
-                comb = comb / (comb.sum(dim=-2, keepdim=True) + eps)
-            return pre, post, comb
-        stub.hc_split_sinkhorn = _sinkhorn
-        sys.modules["kernel"] = stub
+        return pre, post, comb
+
+    # Unconditional: this file REQUIRES a working implementation.
+    stub.hc_split_sinkhorn = _sinkhorn
+    sys.modules["kernel"] = stub
     sys.path.insert(0, str(INFERENCE))
     import model as reference_module
 
+    # model.py does `from kernel import hc_split_sinkhorn`, binding the name at
+    # import time. If another test file imported model first, it captured that
+    # file's raising stub and repairing the kernel module afterwards has no
+    # effect -- which is exactly why this file passed alone and failed in a
+    # full run. Rebind on the module object itself.
+    reference_module.hc_split_sinkhorn = _sinkhorn
     return reference_module
 
 
