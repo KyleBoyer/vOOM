@@ -450,3 +450,102 @@ def attention_output_projection(o: mx.array, wo_a: mx.array, wo_b: mx.array,
                       per_group.astype(mx.float32))
     return (codes.reshape(b, s, n_groups * o_lora_rank)
             @ wo_b.astype(mx.float32).T).astype(o.dtype)
+
+
+# ---- MoE routing and experts (F211) ----------------------------------------
+
+
+def moe_gate(x: mx.array, weight: mx.array, bias: mx.array | None, *,
+             topk: int, score_func: str = "sqrtsoftplus",
+             route_scale: float = 1.0):
+    """Route each token to ``topk`` experts.
+
+    ``bias`` shifts scores for *selection only*; the returned weights come from
+    the unbiased scores. That is the noaux_tc pattern GLM and Kimi also use,
+    and folding the bias into the weights is a silent quality regression rather
+    than an error.
+
+    The released default is ``sqrtsoftplus`` (``sqrt(softplus(logits))``), not
+    softmax. Only the softmax variant skips the renormalization below, so a
+    port that assumes softmax both computes the wrong scores and skips a
+    division.
+    """
+    scores = x.astype(mx.float32) @ weight.astype(mx.float32).T
+    if score_func == "softmax":
+        scores = mx.softmax(scores, axis=-1)
+    elif score_func == "sigmoid":
+        scores = mx.sigmoid(scores)
+    elif score_func == "sqrtsoftplus":
+        scores = mx.sqrt(mx.logaddexp(scores, mx.zeros_like(scores)))
+    else:
+        raise ValueError(f"unknown score_func {score_func!r}")
+
+    original = scores
+    if bias is not None:
+        scores = scores + bias.astype(mx.float32)
+    indices = mx.argpartition(-scores, kth=topk - 1, axis=-1)[..., :topk]
+    weights = mx.take_along_axis(original, indices, axis=-1)
+    if score_func != "softmax":
+        weights = weights / mx.sum(weights, axis=-1, keepdims=True)
+    return weights * route_scale, indices
+
+
+def expert_swiglu(x: mx.array, w1: mx.array, w2: mx.array, w3: mx.array, *,
+                  swiglu_limit: float = 0.0,
+                  weights: mx.array | None = None) -> mx.array:
+    """One expert's SwiGLU, with the released asymmetric clamp.
+
+    ``swiglu_limit`` clamps the up branch on BOTH sides but the gate branch
+    only from above (``torch.clamp(gate, max=limit)``). Clamping the gate
+    symmetrically would suppress the negative tail that ``silu`` is there to
+    pass, so the asymmetry is deliberate and reproduced exactly.
+    """
+    gate = (x.astype(mx.float32) @ w1.astype(mx.float32).T)
+    up = (x.astype(mx.float32) @ w3.astype(mx.float32).T)
+    if swiglu_limit > 0:
+        up = mx.clip(up, -swiglu_limit, swiglu_limit)
+        gate = mx.minimum(gate, swiglu_limit)
+    activated = (gate * mx.sigmoid(gate)) * up
+    if weights is not None:
+        activated = weights * activated
+    return activated @ w2.astype(mx.float32).T
+
+
+def moe_combine(x: mx.array, routed, weights: mx.array, indices: mx.array,
+                shared=None, *, n_routed_experts: int) -> mx.array:
+    """Sum the routed experts' weighted outputs plus the shared expert.
+
+    ``routed(expert_id, rows, scale)`` returns that expert's already-scaled
+    output for the selected token rows, so the caller owns paging: only experts
+    a token actually selected are ever materialized. Selection is resolved on
+    the host because the engine needs the expert id list anyway to schedule
+    weight fetches.
+
+    A token may select the same expert only once (top-k over distinct ids), so
+    each (row, expert) pair contributes exactly one weight.
+    """
+    flat = x.reshape(-1, x.shape[-1])
+    rows_total = flat.shape[0]
+    selected = indices.reshape(rows_total, -1).tolist()
+    scales = weights.reshape(rows_total, -1)
+
+    by_expert: dict[int, list[tuple[int, int]]] = {}
+    for row, experts in enumerate(selected):
+        for slot, expert in enumerate(experts):
+            by_expert.setdefault(int(expert), []).append((row, slot))
+
+    out = mx.zeros(flat.shape, dtype=mx.float32)
+    for expert in sorted(by_expert):
+        if not 0 <= expert < n_routed_experts:
+            raise ValueError(f"routed to expert {expert} out of range")
+        pairs = by_expert[expert]
+        rows = mx.array([row for row, _ in pairs])
+        slots = mx.array([slot for _, slot in pairs])
+        scale = mx.take_along_axis(
+            scales[rows], slots[:, None], axis=-1)
+        contribution = routed(expert, flat[rows], scale).astype(mx.float32)
+        out = out + mx.zeros(flat.shape, dtype=mx.float32).at[rows].add(
+            contribution)
+    if shared is not None:
+        out = out + shared(flat).astype(mx.float32)
+    return out.reshape(x.shape).astype(x.dtype)
