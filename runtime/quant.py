@@ -591,3 +591,92 @@ def dequantize_gguf_q6_k(
         outputs[outer] = mx.concatenate([y1, y2, y3, y4], axis=-1)  # (out, n_super, 128)
     y = mx.concatenate(outputs, axis=-1)  # (out, n_super, 256)
     return y.reshape(out_features, in_features).astype(out_dtype)
+
+
+# ---- DeepSeek V4 block-scaled formats (F204) -------------------------------
+#
+# The released DeepSeek-V4-Flash-0731 checkpoint uses TWO distinct schemes, and
+# neither config.json nor the HuggingFace API describes the important one.
+# config.json declares ``quantization_config.quant_method = "fp8"`` and the API
+# summary says the experts are FP4; the real headers say the 35,328 routed
+# expert weight tensors are ``I8`` with ``F8_E8M0`` scales. Trusting either
+# source would have produced a path that runs and silently returns garbage on
+# every routed expert -- the same class of error F93 and F128 caught on K2.5
+# and K3. Verify tensor dtypes against the real checkpoint, always.
+#
+# Both schemes share the E8M0 scale: an 8-bit biased exponent whose value is
+# 2**(e - 127), the same convention K3's expert scales use.
+
+
+def decode_e8m0_scale(raw: mx.array) -> mx.array:
+    """Decode E8M0 power-of-two scale bytes to float32.
+
+    Built from the IEEE-754 bit pattern rather than ``2.0 ** (e - 127)``:
+    exponent byte ``0`` denotes 2**-127, which is *subnormal* in float32, and
+    the arithmetic form flushes it to zero. That would silently zero every
+    weight block carrying the smallest scale -- caught by comparing all 256
+    encodings against ml_dtypes, not a sample.
+
+    For ``e`` in 1..254 the float32 exponent field is exactly ``e``, so the
+    pattern is ``e << 23``. ``0`` is the subnormal ``0x00400000`` and ``255``
+    is the format's NaN.
+    """
+    if raw.dtype != mx.uint8:
+        raise ValueError(f"E8M0 scales must be uint8, got {raw.dtype}")
+    wide = raw.astype(mx.uint32)
+    bits = wide << 23
+    bits = mx.where(wide == 0, mx.array(0x00400000, mx.uint32), bits)
+    bits = mx.where(wide == 255, mx.array(0x7FC00000, mx.uint32), bits)
+    return bits.view(mx.float32)
+
+
+def _broadcast_block_scale(scale: mx.array, shape: tuple[int, ...]
+                           ) -> mx.array:
+    """Expand a per-block scale to full weight shape by exact repetition.
+
+    Blocking is inferred from the ratio of weight to scale extent on each axis
+    and must divide exactly; a non-integral ratio means the caller has paired
+    the wrong scale with the weight, which is exactly the failure that would
+    otherwise dequantize to plausible noise.
+    """
+    if scale.ndim != len(shape):
+        raise ValueError(
+            f"scale rank {scale.ndim} does not match weight rank {len(shape)}")
+    for axis, (full, blocks) in enumerate(zip(shape, scale.shape)):
+        if blocks <= 0 or full % blocks:
+            raise ValueError(
+                f"axis {axis}: weight extent {full} is not an exact multiple "
+                f"of scale extent {blocks}")
+        scale = mx.repeat(scale, full // blocks, axis=axis)
+    return scale
+
+
+def dequantize_deepseek_v4_fp8(packed: mx.array, scale: mx.array) -> mx.array:
+    """Dequantize an E4M3 weight with E8M0 block scales (attention/shared).
+
+    MLX decodes E4M3 natively from the uint8 payload safetensors stores, so no
+    hand-written bit unpacking is involved.
+    """
+    if packed.dtype != mx.uint8:
+        raise ValueError(
+            f"DeepSeek V4 FP8 weights must load as uint8, got {packed.dtype}")
+    values = mx.from_fp8(packed, mx.float32)
+    return values * _broadcast_block_scale(
+        decode_e8m0_scale(scale), values.shape)
+
+
+def dequantize_deepseek_v4_int8(packed: mx.array, scale: mx.array) -> mx.array:
+    """Dequantize a symmetric INT8 routed expert with E8M0 block scales.
+
+    Symmetric: the checkpoint ships no zero-point tensor, so the value is
+    ``int8 * 2**(e - 127)`` with no offset. Routed experts block only along the
+    column axis (weight ``[2048, 2048]`` against scale ``[2048, 128]`` is one
+    scale per row per 16 columns), unlike the 128x128 blocking the dense path
+    uses -- so the blocking is derived per tensor rather than assumed.
+    """
+    if packed.dtype != mx.int8:
+        raise ValueError(
+            f"DeepSeek V4 routed experts must load as int8, got {packed.dtype}")
+    values = packed.astype(mx.float32)
+    return values * _broadcast_block_scale(
+        decode_e8m0_scale(scale), values.shape)
