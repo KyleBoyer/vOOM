@@ -584,7 +584,7 @@ def fallback_reason(engine, kv, sampling, constraint, *, terminal: bool) -> str 
         return "compressed-kv"
     if (getattr(kv, "kda_cache", None) is not None
             and engine.cfg.model_type not in (
-                "qwen3_5", "qwen3_5_moe", "kimi_linear", "kimi_k3")):
+                "qwen3_5", "qwen3_5_moe", "kimi_linear", "kimi_k3", "lfm2")):
         # F94: KVCache.trim() has no kda_cache branch -- a partially-accepted
         # round would silently roll back only the ordinary KV, leaving the
         # DeltaNet/KDA recurrent state polluted by the rejected suffix with

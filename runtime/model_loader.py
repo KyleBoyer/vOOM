@@ -425,6 +425,17 @@ class WeightStore:
             self.weight_map[canon] = self.weight_map.pop(n)
         self._real_name.update(self._gguf_pending_real_names)
 
+        # F202: LFM2 names its final norm ``model.embedding_norm.weight``; the
+        # engine addresses every architecture's final norm as
+        # ``model.norm.weight``. Alias it only when the canonical name is
+        # genuinely absent, so a checkpoint shipping both keeps its own.
+        if ("model.norm.weight" not in self.weight_map
+                and "model.embedding_norm.weight" in self.weight_map):
+            self.weight_map["model.norm.weight"] = self.weight_map[
+                "model.embedding_norm.weight"]
+            self._real_name["model.norm.weight"] = self._real_name.get(
+                "model.embedding_norm.weight", "model.embedding_norm.weight")
+
         # Standard MLX quantized checkpoints store one logical matrix as
         # ``name.weight`` plus row/group metadata in ``name.scales`` and,
         # for affine quantization, ``name.biases``. Expose only the logical

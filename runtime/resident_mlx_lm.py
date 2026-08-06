@@ -29,7 +29,13 @@ from .sampler import SamplingParams, sample
 
 
 _METAL_HARD_CEILING_BYTES = 8_500_000_000
-_SUPPORTED_AUTO_MODEL_TYPES = frozenset({"qwen3_5"})
+# F201: lfm2 (LFM2.5-2.6B) joins the allowlist. Its hot path is the generic
+# one: the two Qwen-specific hooks (_qwen35_layerwise_forward and
+# _qwen35_lossy_suffix_prefill) are reached only when the opt-in lossy suffix
+# prefill is configured, and that mode already fails closed on any non-Qwen
+# checkpoint. Native MTP is likewise gated on model_type. Admission still
+# requires the locally-derived all-MXFP4 artifact and the memory proof below.
+_SUPPORTED_AUTO_MODEL_TYPES = frozenset({"qwen3_5", "lfm2"})
 
 
 def _parse_lossy_suffix_prefill(raw: str | None) -> tuple[int, int] | None:

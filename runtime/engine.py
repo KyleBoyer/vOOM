@@ -3387,6 +3387,20 @@ class StreamingEngine:
                     iter_expert_batches=self._iter_expert_batches,
                     profile=profiler,
                 )
+            elif self.cfg.model_type == "lfm2":
+                # F202: 22 gated short-conv + 8 full-attention layers. The conv
+                # layers keep a fixed conv_L_cache-1 history in the same
+                # KDAStateCache companion slot Kimi's causal convolution uses,
+                # so fork/restore, disk spill, and suffix-decoding rollback all
+                # apply unchanged. No experts: LFM2 is dense.
+                from .lfm2 import run_lfm2_block
+
+                x = run_lfm2_block(
+                    x, w, f"model.layers.{i}", self.cfg, kv, i, offset,
+                    state_cache=getattr(kv, "kda_cache", None),
+                    mlp_last_only=last_only,
+                    profile=profiler,
+                )
             elif self.cfg.model_type == "kimi_linear":
                 # kimi_k3 dispatches separately below -- run_kimi_linear_block
                 # has no AttnRes awareness, which kimi_k3's real checkpoint
@@ -4874,6 +4888,7 @@ class StreamingEngine:
         # not just a reused _kimi_linear_attention_residual/_mlp_residual
         # dispatch.
         kimi_k3_family = self.cfg.model_type == "kimi_k3"
+        lfm2_family = self.cfg.model_type == "lfm2"
         if not glm_family and not qwen_family and not kimi_family and not kimi_k3_family and (
                 self.cfg.num_experts or self.cfg.model_type == "gpt_oss"):
             # F94: layer_runner.run_block (this function's per-layer call
@@ -4966,6 +4981,8 @@ class StreamingEngine:
         if kimi_family:
             from .kimi_linear import (
                 _kimi_linear_attention_residual, _kimi_linear_mlp_residual)
+        if lfm2_family:
+            from .lfm2 import _lfm2_mlp_residual, _lfm2_operator_residual
         if kimi_k3_family:
             from .kimi_linear import (
                 _apply_attn_res, _kda_attention, _mla_attention,
@@ -5185,6 +5202,21 @@ class StreamingEngine:
                             iter_expert_batches=serial_expert_batches(
                                 position
                             ))
+                    elif lfm2_family:
+                        # F203: same one-position-at-a-time contract as
+                        # qwen_family. The short-conv layers advance their
+                        # conv_L_cache-1 history exactly as real sequential
+                        # decode would, because this IS a sequential call; the
+                        # endpoint snapshot between the two halves is what a
+                        # partial rejection restores.
+                        prefix = f"model.layers.{layer}"
+                        attn_out = _lfm2_operator_residual(
+                            hidden, weights, prefix, self.cfg, kv, layer,
+                            offset + position,
+                            getattr(kv, "kda_cache", None))
+                        capture_kda_position(layer, position)
+                        hidden = _lfm2_mlp_residual(
+                            attn_out, weights, prefix, self.cfg)
                     elif kimi_family:
                         # F113 follow-on (Kimi K3 readiness): same one-
                         # position-at-a-time contract as qwen_family above --
@@ -5487,7 +5519,8 @@ class StreamingEngine:
                 kv.enable_latent_disk_spill(
                     self.rc.kimi_k3_mla_kv_spill_dir)
         if self.cfg.model_type in (
-                "kimi_linear", "kimi_k3", "qwen3_5_moe", "qwen3_5", "jet_nemotron"):
+                "kimi_linear", "kimi_k3", "qwen3_5_moe", "qwen3_5",
+                "jet_nemotron", "lfm2"):
             # KDA's recurrent state is fixed-size and not token-indexed. Exact
             # endpoint/extension retention and durable restore carry this
             # companion cache alongside attention KV; arbitrary prefix trims
