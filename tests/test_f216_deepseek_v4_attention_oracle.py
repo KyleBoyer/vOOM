@@ -259,3 +259,67 @@ def test_compressed_layer_prefill_matches_the_released_forward():
     assert diff / scale < 5e-3, (
         f"compressed prefill diverged: max abs {diff}, "
         f"relative {diff/scale:.5f}")
+
+
+def test_decode_step_matches_the_released_forward():
+    """Prefill then one decode step -- the case every earlier oracle skipped.
+
+    Generation is correct on token 1 and degenerates after, so the failure is
+    decode-only and no start_pos=0 test can see it. The reference maintains its
+    own ring in self.kv_cache across the two calls; this mirrors it with
+    window_ring_write and compares the decode output.
+    """
+    import mlx.core as mx
+    import torch
+
+    from runtime.deepseek_v4 import (apply_rope_interleaved,
+                                     deepseek_v4_attention,
+                                     window_ring_write, window_topk_idxs,
+                                     yarn_freqs)
+
+    reference = _install_stubs()
+    attention, args = _build(reference)
+
+    seqlen = 5
+    rng = np.random.default_rng(7)
+    prompt = (rng.normal(size=(1, seqlen, DIM)) * 0.3).astype(np.float32)
+    nxt = (rng.normal(size=(1, 1, DIM)) * 0.3).astype(np.float32)
+
+    attention(torch.tensor(prompt), 0)
+    expected = attention(torch.tensor(nxt), seqlen).detach().numpy()
+
+    kvw = mx.array(attention.wkv.weight.detach().numpy())
+    kvn = mx.array(attention.kv_norm.weight.detach().numpy())
+    w = {"a.wq_a": mx.array(attention.wq_a.weight.detach().numpy()),
+         "a.wq_b": mx.array(attention.wq_b.weight.detach().numpy()),
+         "a.q_norm": mx.array(attention.q_norm.weight.detach().numpy()),
+         "a.wo_a": mx.array(attention.wo_a.weight.detach().numpy()),
+         "a.wo_b": mx.array(attention.wo_b.weight.detach().numpy()),
+         "a.attn_sink": mx.array(attention.attn_sink.detach().numpy())}
+
+    def latent_of(hidden, offset):
+        cos, sin = yarn_freqs(ROPE_DIM, offset + hidden.shape[1], 0,
+                              10000.0, 1.0, 32, 1)
+        lat = mx.fast.rms_norm(hidden @ kvw.T, kvn, 1e-6)
+        tail = apply_rope_interleaved(
+            lat[..., -ROPE_DIM:], cos[offset:], sin[offset:])
+        return mx.concatenate([lat[..., :-ROPE_DIM], tail], axis=-1), cos, sin
+
+    ring = mx.zeros((1, WINDOW, HEAD_DIM))
+    prompt_latent, _c, _s = latent_of(mx.array(prompt), 0)
+    ring = window_ring_write(ring, prompt_latent, 0, WINDOW)
+
+    step_latent, cos, sin = latent_of(mx.array(nxt), seqlen)
+    ring = window_ring_write(ring, step_latent, seqlen, WINDOW)
+
+    got = np.array(deepseek_v4_attention(
+        mx.array(nxt), w, "a", heads=HEADS, head_dim=HEAD_DIM,
+        rope_head_dim=ROPE_DIM, q_lora_rank=Q_RANK, o_lora_rank=O_RANK,
+        n_groups=GROUPS, norm_eps=1e-6,
+        cos=cos[seqlen:], sin=sin[seqlen:], kv_all=ring,
+        topk_idxs=window_topk_idxs(WINDOW, 1, seqlen)))
+
+    diff = np.abs(got - expected).max()
+    scale = max(np.abs(expected).max(), 1e-6)
+    assert diff / scale < 5e-3, (
+        f"decode step diverged: max abs {diff}, relative {diff/scale:.5f}")
