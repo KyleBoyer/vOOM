@@ -2782,7 +2782,15 @@ class StreamingEngine:
 
         rings[layer] = window_ring_write(ring, latent, offset, window)
 
-        kv_all = rings[layer]
+        # Prefill attends over the raw sequence, decode over the ring. The
+        # released Attention.forward passes `kv` (seqlen entries) at
+        # start_pos 0 and `self.kv_cache` (window slots) afterwards, and
+        # get_window_topk_idxs returns SEQUENCE positions in its start_pos==0
+        # branch versus RING slots after. Using the ring for both was
+        # accidentally right only while seqlen <= window, and put compressed
+        # entries at window+j while the gather list pointed at seqlen+j -- so
+        # every compressed layer read unwritten slots.
+        kv_all = latent if offset == 0 else rings[layer]
         compressed_offset = latent.shape[1] if offset == 0 else window
         stores = getattr(kv, "dsv4_compressed", None)
         if stores is None:
@@ -2850,6 +2858,30 @@ class StreamingEngine:
                     [pooled[..., :-rope_dim], ctail], axis=-1)
                 stores[layer] = pooled
                 kv_all = mx.concatenate([kv_all, pooled], axis=1)
+            # Seed the decode state with the trailing partial group. Prefill
+            # compresses only whole groups; the released module parks the
+            # remaining seqlen % ratio positions in kv_state/score_state and
+            # decode finishes that group. Starting decode from an empty state
+            # made the first decode step's gather ask for one more compressed
+            # entry than existed, reading an unwritten slot -- which is why
+            # token 1 was correct and everything after it degenerated.
+            from .deepseek_v4 import CompressorState
+
+            seed = CompressorState(
+                ratio, head_dim, batch=x.shape[0], dtype=mx.float32)
+            remainder = x.shape[1] % ratio
+            if remainder:
+                cw = w[f"{prefix}.attn.compressor.wkv.weight"]
+                cg = w[f"{prefix}.attn.compressor.wgate.weight"]
+                tail = x[:, -remainder:]
+                kv_tail = tail.astype(mx.float32) @ cw.astype(mx.float32).T
+                sc_tail = tail.astype(mx.float32) @ cg.astype(mx.float32).T
+                base = x.shape[1] - remainder
+                for step in range(remainder):
+                    seed.step(kv_tail[:, step:step + 1],
+                              sc_tail[:, step:step + 1], base + step,
+                              w[f"{prefix}.attn.compressor.ape"])
+            states[layer] = seed
 
         from .deepseek_v4 import gather_indices
 
