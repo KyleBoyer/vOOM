@@ -2772,8 +2772,16 @@ class StreamingEngine:
         latent = mx.fast.rms_norm(
             latent, w[f"{prefix}.attn.kv_norm.weight"], self.cfg.rms_norm_eps)
         rope_dim = self.cfg.rope_head_dim
+        # A compressed layer builds freqs_cis with compress_rope_theta (and
+        # YaRN) for EVERYTHING -- query, window kv, and compressed kv alike.
+        # Only pure sliding-window layers use the base rope_theta. Using the
+        # base theta on compressed layers left the first token correct (small
+        # positions, small phase error) and degraded every token after it.
+        theta = 40000.0 if ratio else self.cfg.rope_theta
+        original = self.cfg.compress_original_seq_len if ratio else 0
         cos, sin = yarn_freqs(
-            rope_dim, offset + x.shape[1], 0, self.cfg.rope_theta, 1.0, 32, 1)
+            rope_dim, offset + x.shape[1], original, theta,
+            self.cfg.compress_rope_factor if ratio else 1.0, 32, 1)
         from .deepseek_v4 import apply_rope_interleaved
 
         tail = apply_rope_interleaved(
@@ -2822,7 +2830,8 @@ class StreamingEngine:
                     w[f"{prefix}.attn.compressor.norm.weight"],
                     self.cfg.rms_norm_eps)
                 ccos, csin = yarn_freqs(
-                    rope_dim, offset + 1, 0, 40000.0, 1.0, 32, 1)
+                    rope_dim, offset + 1, original, theta,
+                    self.cfg.compress_rope_factor, 32, 1)
                 at = offset + 1 - ratio
                 ctail = apply_rope_interleaved(
                     pooled[..., -rope_dim:], ccos[at:at + 1], csin[at:at + 1])
@@ -2849,8 +2858,7 @@ class StreamingEngine:
                 ratio=ratio, head_dim=head_dim,
                 norm_eps=self.cfg.rms_norm_eps)
             if pooled is not None:
-                ccos, csin = yarn_freqs(
-                    rope_dim, x.shape[1], 0, 40000.0, 1.0, 32, 1)
+                ccos, csin = cos, sin
                 stride = mx.arange(pooled.shape[1]) * ratio
                 ctail = apply_rope_interleaved(
                     pooled[..., -rope_dim:], ccos[stride], csin[stride])
