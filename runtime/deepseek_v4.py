@@ -172,3 +172,87 @@ def window_topk_idxs(window_size: int, seqlen: int, start_pos: int
         matrix = mx.maximum(base - window_size + 1, 0) + mx.arange(width)
         matrix = mx.where(matrix > base, -1, matrix)
     return matrix.astype(mx.int32)[None]
+
+
+# ---- KV compression (F207) -------------------------------------------------
+#
+# Beyond the sliding window, DeepSeek V4 keeps a *compressed* KV: every
+# ``compress_ratio`` consecutive positions are pooled into one entry by a
+# learned softmax gate. ``compress_ratios`` varies per layer (0, 4, or 128 in
+# the released config), and only ratio 4 uses overlapping windows.
+#
+# The QAT activation round-trip the released code applies afterwards
+# (``act_quant``) is injectable rather than assumed: it is a separate,
+# separately-testable step, and passing ``None`` keeps this function exactly
+# the pooling arithmetic so an oracle can isolate it.
+
+
+def compressor_overlap_transform(tensor: mx.array, head_dim: int,
+                                 ratio: int, fill: float) -> mx.array:
+    """Interleave each group with the previous group's overlap half.
+
+    ``tensor`` is ``[b, n, ratio, 2 * head_dim]``: the first ``head_dim``
+    features carry the overlapping window and the second ``head_dim`` the
+    ordinary one. The result is ``[b, n, 2 * ratio, head_dim]`` whose later
+    ``ratio`` slots hold this group's ordinary half and whose first ``ratio``
+    slots hold the *previous* group's overlap half -- so group zero has no
+    predecessor and keeps the fill value.
+    """
+    b, n = tensor.shape[0], tensor.shape[1]
+    out = mx.full((b, n, 2 * ratio, head_dim), fill, dtype=tensor.dtype)
+    out[:, :, ratio:] = tensor[..., head_dim:]
+    if n > 1:
+        out[:, 1:, :ratio] = tensor[:, :-1, :, :head_dim]
+    return out
+
+
+def compress_prefill(x: mx.array, wkv: mx.array, wgate: mx.array,
+                     ape: mx.array, norm_weight: mx.array, *,
+                     ratio: int, head_dim: int, norm_eps: float,
+                     act_quant=None):
+    """Pool a prompt into compressed KV entries (the ``start_pos == 0`` path).
+
+    Returns ``(compressed, leftover_positions)``. Positions past the last whole
+    group are not compressed; the released code parks them in a state buffer
+    for the decode path to finish, so the count is reported rather than
+    silently dropped.
+
+    Pooling runs in float32 -- the released module holds ``wkv``/``wgate`` in
+    float32 for exactly this reason -- and the gate softmax is taken over the
+    group axis, not the feature axis.
+    """
+    overlap = ratio == 4
+    coff = 2 if overlap else 1
+    b, seqlen, _ = x.shape
+    remainder = seqlen % ratio
+    cutoff = seqlen - remainder
+    if cutoff < ratio:
+        return None, seqlen
+
+    values = x.astype(mx.float32) @ wkv.astype(mx.float32).T
+    scores = x.astype(mx.float32) @ wgate.astype(mx.float32).T
+    values = values[:, :cutoff]
+    scores = scores[:, :cutoff]
+
+    groups = cutoff // ratio
+    values = values.reshape(b, groups, ratio, coff * head_dim)
+    scores = scores.reshape(b, groups, ratio, coff * head_dim) + ape.astype(
+        mx.float32)
+
+    if overlap:
+        values = compressor_overlap_transform(values, head_dim, ratio, 0.0)
+        scores = compressor_overlap_transform(
+            scores, head_dim, ratio, float("-inf"))
+
+    pooled = mx.sum(values * mx.softmax(scores, axis=2), axis=2)
+    pooled = mx.fast.rms_norm(pooled.astype(x.dtype), norm_weight, norm_eps)
+
+    # RoPE is deliberately NOT applied here. Compressed entry j stands for
+    # original position ``j * ratio``, not j, and compressed layers use YaRN
+    # with ``compress_rope_theta`` rather than the base theta the
+    # sliding-window layers use. Both belong to the caller that knows the
+    # layer's compress_ratio; folding a consecutive-position RoPE in here
+    # would be wrong in a way that still produces plausible activations.
+    if act_quant is not None:
+        pooled = act_quant(pooled)
+    return pooled, remainder
