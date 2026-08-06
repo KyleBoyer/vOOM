@@ -1675,11 +1675,20 @@ class StreamingEngine:
         if self.cfg.model_type == "kimi_k3":
             pin_names.append("model.output_attn_res_proj.weight")
             pin_names.append("model.output_attn_res_norm.weight")
+        # F213: DeepSeek V4's final hyper-connection reduction, applied once
+        # after every layer and before model.norm. Small top-level tensors,
+        # same pinning treatment as model.norm.weight.
+        if self.cfg.model_type == "deepseek_v4":
+            pin_names.extend(["model.hc_head_fn", "model.hc_head_scale",
+                              "model.hc_head_base"])
         persistent = self.cache.pin("persistent", pin_names)
 
         self._embed_w = persistent.get("model.embed_tokens.weight")
         self._norm_w = persistent["model.norm.weight"]
         self._lm_head_w = persistent.get("lm_head.weight")
+        self._hc_head_fn = persistent.get("model.hc_head_fn")
+        self._hc_head_scale = persistent.get("model.hc_head_scale")
+        self._hc_head_base = persistent.get("model.hc_head_base")
         self._output_attn_res_proj_w = persistent.get("model.output_attn_res_proj.weight")
         self._output_attn_res_norm_w = persistent.get("model.output_attn_res_norm.weight")
         self._reranked_lm_head_bytes = 0
@@ -2735,29 +2744,150 @@ class StreamingEngine:
         return [(key, self._layer_names(layer))]
 
     def _deepseek_v4_attention(self, x, w, prefix, layer, kv, offset):
-        """Not yet wired: needs the window + compressed KV caches.
+        """Attention for one DeepSeek V4 layer.
 
-        Every arithmetic piece exists and is oracled in runtime/deepseek_v4.py
-        -- q-LoRA, weightless per-head RMS, interleaved RoPE, gathered sparse
-        attention with sinks, the inverse-RoPE o-LoRA epilogue (F206/F209/F210)
-        -- but the caller must supply ``kv_all`` and ``topk_idxs``, which come
-        from a ring-buffer sliding window of ``window_size`` positions
-        concatenated with the compressed cache. This engine's KVCache stores
-        per-layer [b, heads, seq, dim] and has no ring or compressed region, so
-        the cache itself is the remaining work, not the math.
+        Window-only layers (``compress_ratio == 0``) are complete. Compressed
+        layers additionally need the Compressor state machine and, at ratio 4,
+        the Indexer; both are implemented and oracled in runtime/deepseek_v4.py
+        but their per-layer prefill/decode state is not yet held here, so they
+        fail explicitly rather than attending over an empty compressed region
+        -- which would run and silently drop all long-range context.
         """
-        raise NotImplementedError(
-            f"deepseek_v4 layer {layer}: attention needs the ring-buffer "
-            f"window + compressed KV cache (compress_ratio "
-            f"{self.cfg.compress_ratios[layer] if layer < len(self.cfg.compress_ratios) else '?'}); "
-            "see runtime/deepseek_v4.py for the verified components")
+        from .deepseek_v4 import (deepseek_v4_attention, window_ring_write,
+                                  window_topk_idxs, yarn_freqs)
+
+        ratio = (self.cfg.compress_ratios[layer]
+                 if layer < len(self.cfg.compress_ratios) else 0)
+        if ratio and offset:
+            raise NotImplementedError(
+                f"deepseek_v4 layer {layer}: compressed decode needs the "
+                "Compressor's incremental state buffers; prefill is wired")
+
+        window = self.cfg.window_size
+        rings = getattr(kv, "dsv4_rings", None)
+        if rings is None:
+            rings = {}
+            kv.dsv4_rings = rings
+        head_dim = self.cfg.head_dim
+        ring = rings.get(layer)
+        if ring is None:
+            ring = mx.zeros((x.shape[0], window, head_dim), dtype=x.dtype)
+
+        latent = x @ w[f"{prefix}.attn.wkv.weight"].T
+        latent = mx.fast.rms_norm(
+            latent, w[f"{prefix}.attn.kv_norm.weight"], self.cfg.rms_norm_eps)
+        rope_dim = self.cfg.rope_head_dim
+        cos, sin = yarn_freqs(
+            rope_dim, offset + x.shape[1], 0, self.cfg.rope_theta, 1.0, 32, 1)
+        from .deepseek_v4 import apply_rope_interleaved
+
+        tail = apply_rope_interleaved(
+            latent[..., -rope_dim:], cos[offset:], sin[offset:])
+        latent = mx.concatenate([latent[..., :-rope_dim], tail], axis=-1)
+
+        rings[layer] = window_ring_write(ring, latent, offset, window)
+
+        kv_all = rings[layer]
+        compressed_offset = latent.shape[1] if offset == 0 else window
+        if ratio:
+            # Prefill-time compression: pool whole groups from the same hidden
+            # states, RoPE them at their own positions (j * ratio) under the
+            # compressed theta, and append after the window region so one
+            # gather list addresses both.
+            from .deepseek_v4 import compress_prefill
+
+            pooled, _leftover = compress_prefill(
+                x, w[f"{prefix}.attn.compressor.wkv.weight"],
+                w[f"{prefix}.attn.compressor.wgate.weight"],
+                w[f"{prefix}.attn.compressor.ape"],
+                w[f"{prefix}.attn.compressor.norm.weight"],
+                ratio=ratio, head_dim=head_dim,
+                norm_eps=self.cfg.rms_norm_eps)
+            if pooled is not None:
+                ccos, csin = yarn_freqs(
+                    rope_dim, x.shape[1], 0, 40000.0, 1.0, 32, 1)
+                stride = mx.arange(pooled.shape[1]) * ratio
+                ctail = apply_rope_interleaved(
+                    pooled[..., -rope_dim:], ccos[stride], csin[stride])
+                pooled = mx.concatenate(
+                    [pooled[..., :-rope_dim], ctail], axis=-1)
+                kv_all = mx.concatenate([kv_all, pooled], axis=1)
+
+        from .deepseek_v4 import gather_indices
+
+        topk = gather_indices(window, ratio, x.shape[1], offset,
+                              compressed_offset)
+
+        weights = {
+            f"{prefix}.attn.{name}": w[f"{prefix}.attn.{name}"]
+            for name in ("wq_a.weight", "wq_b.weight", "q_norm.weight",
+                         "wo_a.weight", "wo_b.weight", "attn_sink")
+        }
+        renamed = {k.replace(".weight", "").replace(f"{prefix}.attn.",
+                                                    f"{prefix}.attn."): v
+                   for k, v in weights.items()}
+        return deepseek_v4_attention(
+            x, {f"{prefix}.attn.wq_a": w[f"{prefix}.attn.wq_a.weight"],
+                f"{prefix}.attn.wq_b": w[f"{prefix}.attn.wq_b.weight"],
+                f"{prefix}.attn.q_norm": w[f"{prefix}.attn.q_norm.weight"],
+                f"{prefix}.attn.wo_a": w[f"{prefix}.attn.wo_a.weight"],
+                f"{prefix}.attn.wo_b": w[f"{prefix}.attn.wo_b.weight"],
+                f"{prefix}.attn.attn_sink": w[f"{prefix}.attn.attn_sink"]},
+            f"{prefix}.attn",
+            heads=self.cfg.num_attention_heads, head_dim=head_dim,
+            rope_head_dim=rope_dim, q_lora_rank=self.cfg.q_lora_rank,
+            o_lora_rank=self.cfg.o_lora_rank, n_groups=self.cfg.o_groups,
+            norm_eps=self.cfg.rms_norm_eps,
+            cos=cos[offset:], sin=sin[offset:],
+            kv_all=rings[layer], topk_idxs=topk)
 
     def _deepseek_v4_ffn(self, x, w, prefix, layer):
-        """Not yet wired: needs routed-expert paging through WeightCache."""
-        raise NotImplementedError(
-            f"deepseek_v4 layer {layer}: MoE needs routed-expert paging "
-            "(moe_gate/expert_swiglu/moe_combine are verified in "
-            "runtime/deepseek_v4.py; the fetch loop is not wired)")
+        """MoE for one DeepSeek V4 layer, with routed experts paged on demand.
+
+        Routing runs on the layer page (the gate is a small dense tensor that
+        arrives with the trunk); only the experts a token actually selected are
+        fetched, through the same WeightCache path every other MoE model uses.
+        The shared expert is unconditional and lives on the layer page too.
+        """
+        from .deepseek_v4 import expert_swiglu, moe_combine, moe_gate
+
+        gate_weight = w.get(f"{prefix}.ffn.gate.weight")
+        if gate_weight is None:
+            # Dense layer: shared expert only, no routing.
+            flat = x.reshape(-1, x.shape[-1])
+            out = expert_swiglu(
+                flat, w[f"{prefix}.ffn.shared_experts.w1.weight"],
+                w[f"{prefix}.ffn.shared_experts.w2.weight"],
+                w[f"{prefix}.ffn.shared_experts.w3.weight"],
+                swiglu_limit=self.cfg.swiglu_limit)
+            return out.reshape(x.shape).astype(x.dtype)
+
+        weights, indices = moe_gate(
+            x.reshape(-1, x.shape[-1]), gate_weight,
+            w.get(f"{prefix}.ffn.gate.bias"),
+            topk=self.cfg.num_experts_per_tok,
+            score_func="sqrtsoftplus")
+
+        expert_ids = sorted({int(e) for row in indices.tolist() for e in row})
+        pages = self._get_experts(layer, expert_ids)
+
+        def routed(expert, rows, scale):
+            page = pages[expert]
+            base = f"model.layers.{layer}.{self.cfg.moe_expert_prefix}.{expert}"
+            return expert_swiglu(
+                rows, page[f"{base}.w1.weight"], page[f"{base}.w2.weight"],
+                page[f"{base}.w3.weight"],
+                swiglu_limit=self.cfg.swiglu_limit, weights=scale)
+
+        def shared(rows):
+            return expert_swiglu(
+                rows, w[f"{prefix}.ffn.shared_experts.w1.weight"],
+                w[f"{prefix}.ffn.shared_experts.w2.weight"],
+                w[f"{prefix}.ffn.shared_experts.w3.weight"],
+                swiglu_limit=self.cfg.swiglu_limit)
+
+        return moe_combine(x, routed, weights, indices, shared,
+                           n_routed_experts=self.cfg.num_experts)
 
     def _plan_trunk_pin_layers(self, num_layers: int) -> int:
         """Size the pinned trunk prefix from measured on-disk layer bytes.

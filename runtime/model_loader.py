@@ -449,7 +449,10 @@ class WeightStore:
             for source, canonical in (
                     ("embed.weight", "model.embed_tokens.weight"),
                     ("head.weight", "lm_head.weight"),
-                    ("norm.weight", "model.norm.weight")):
+                    ("norm.weight", "model.norm.weight"),
+                    ("hc_head_fn", "model.hc_head_fn"),
+                    ("hc_head_scale", "model.hc_head_scale"),
+                    ("hc_head_base", "model.hc_head_base")):
                 if source in self.weight_map:
                     self.weight_map[canonical] = self.weight_map[source]
                     self._real_name[canonical] = self._real_name.get(
@@ -1804,8 +1807,8 @@ class WeightStore:
                     sidecar_pool.shutdown(wait=True)
                     sidecar_pool = None
                 if self._dsv4_aux:
-                    from .quant import (dequantize_deepseek_v4_fp8,
-                                        dequantize_deepseek_v4_int8)
+                    from .quant import (dequantize_deepseek_v4_fp4,
+                                        dequantize_deepseek_v4_fp8)
 
                     joined: dict = {}
                     for name in names:
@@ -1818,7 +1821,7 @@ class WeightStore:
                         # declares "fp8" for everything while the 35,328
                         # routed expert tensors are actually INT8.
                         joined[name] = (
-                            dequantize_deepseek_v4_int8(weight, scale)
+                            dequantize_deepseek_v4_fp4(weight, scale)
                             if weight.dtype == mx.int8
                             else dequantize_deepseek_v4_fp8(weight, scale))
                         mx.eval(joined[name])

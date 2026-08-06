@@ -661,6 +661,48 @@ def dequantize_deepseek_v4_fp8(packed: mx.array, scale: mx.array) -> mx.array:
         raise ValueError(
             f"DeepSeek V4 FP8 weights must load as uint8, got {packed.dtype}")
     values = mx.from_fp8(packed, mx.float32)
+    return (values * _broadcast_block_scale(
+        decode_e8m0_scale(scale), values.shape)).astype(mx.bfloat16)
+
+
+def dequantize_deepseek_v4_fp4(packed: mx.array, scale: mx.array
+                               ) -> mx.array:
+    """Dequantize a routed expert: E2M1 FP4 packed two per byte, E8M0 scales.
+
+    CORRECTION (supersedes the INT8 reading in F204). The safetensors header
+    says ``I8``, which describes the storage container, not the contents: each
+    byte holds TWO 4-bit codes, so the logical width is twice the stored one.
+    Three independent checks agree -- ``w1`` unpacks to (2048, 4096) whose
+    in-features match hidden_size 4096 and whose out-features match
+    moe_intermediate_size 2048 (the stored shape chains with neither); the
+    stored byte count is exactly half the logical value count; and the scale
+    granularity works out to 32 logical values per scale, matching the
+    released ``fp4_block_size``. config.json's ``expert_dtype: "fp4"`` was
+    right, and the earlier reading of the header over the config was wrong.
+
+    The F204 INT8 test passed because it compared against a numpy
+    reimplementation of the same assumption -- self-referential on exactly the
+    packing question. Only running a real forward pass surfaced it.
+
+    Codes are the OCP E2M1 set, low nibble first, identical to the MXFP4 path
+    K3 already uses; the difference here is the int8 container and the
+    per-row/32-column scale blocking.
+    """
+    if packed.dtype not in (mx.int8, mx.uint8):
+        raise ValueError(
+            f"DeepSeek V4 routed experts must load as int8/uint8, got "
+            f"{packed.dtype}")
+    raw = packed.view(mx.uint8)
+    low = raw & 0x0F
+    high = (raw >> 4) & 0x0F
+    # Interleave so byte i yields logical columns 2i (low) and 2i+1 (high).
+    codes = mx.stack([low, high], axis=-1).reshape(
+        raw.shape[0], raw.shape[1] * 2)
+
+    lut = mx.array([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0], mx.float32)
+    magnitude = lut[codes & 0x07]
+    values = mx.where((codes & 0x08) != 0, -magnitude, magnitude)
+
     return values * _broadcast_block_scale(
         decode_e8m0_scale(scale), values.shape)
 

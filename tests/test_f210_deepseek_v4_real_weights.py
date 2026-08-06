@@ -121,16 +121,25 @@ def test_real_o_projection_matches_a_grouped_reference(index, shards, config):
         o, wo_a, wo_b, n_groups=groups, o_lora_rank=o_rank))
 
     # Independent reference: loop the groups explicitly rather than einsum.
+    # numpy cannot view bfloat16; cast through float32 for the reference.
     flat = np.array(o).reshape(1, 2, groups, -1)
-    a = np.array(wo_a).reshape(groups, o_rank, flat.shape[-1])
+    a = np.array(wo_a.astype(mx.float32)).reshape(
+        groups, o_rank, flat.shape[-1])
     codes = np.zeros((1, 2, groups, o_rank), np.float32)
     for g in range(groups):
         codes[:, :, g] = flat[:, :, g] @ a[g].T
-    expected = codes.reshape(1, 2, groups * o_rank) @ np.array(wo_b).T
+    expected = (codes.reshape(1, 2, groups * o_rank)
+                @ np.array(wo_b.astype(mx.float32)).T)
 
     assert got.shape == (1, 2, config["hidden_size"])
+    # The dequant emits bfloat16 (routed experts are the resident bulk, and
+    # float32 quadrupled them against the packed source), so the reference is
+    # computed from the same bfloat16 weights and compared at that resolution.
     diff = np.abs(got - expected).max()
-    assert diff < 2e-2, f"grouped projection diverged, max abs diff {diff}"
+    scale = max(np.abs(expected).max(), 1e-6)
+    assert diff / scale < 5e-2, (
+        f"grouped projection diverged, max abs diff {diff} "
+        f"(relative {diff / scale:.4f})")
 
 
 def test_group_major_reshape_is_not_interchangeable(index, shards, config):
