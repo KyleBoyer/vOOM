@@ -2761,18 +2761,12 @@ class StreamingEngine:
         window = self.cfg.window_size
         # The engine derives `offset` from the KV cache's own length, but this
         # attention keeps its own ring and never calls kv.update(), so
-        # kv.offset stays 0 forever. Every decode step therefore arrived with
-        # offset 0, which sent window_topk_idxs down its start_pos==0 branch
-        # and made each generated token attend to position 0 alone -- an
-        # input-independent state, which is exactly the fixed attractor
-        # generation collapsed into after its first token.
-        #
-        # Track the position separately, advanced by the widths actually
-        # consumed. Prefill (offset 0 with width > 1) resets it.
-        if offset == 0 and x.shape[1] > 1:
-            kv.dsv4_pos = 0
-        offset = int(getattr(kv, "dsv4_pos", 0)) if offset == 0 else offset
-        kv.dsv4_pos = offset + x.shape[1]
+        # kv.offset stays 0 forever and every decode step arrives with offset
+        # 0. The effective position is therefore resolved ONCE PER SWEEP in
+        # _sweep and read here -- advancing it in this method incremented it
+        # once per layer, so a single decode token ran layer 0 at position 5,
+        # layer 1 at 6, ... layer 42 at 47.
+        offset = int(getattr(kv, "dsv4_sweep_pos", offset))
 
         rings = getattr(kv, "dsv4_rings", None)
         if rings is None:
@@ -3600,6 +3594,14 @@ class StreamingEngine:
         # like block_residual below.
         hc_stream = None
         if self.cfg.model_type == "deepseek_v4":
+            # One position per sweep, shared by every layer. A real prefill
+            # (width > 1 at offset 0) resets it; each later sweep advances by
+            # the width it actually consumed.
+            if offset == 0 and x.shape[1] > 1:
+                kv.dsv4_pos = 0
+            resolved = int(getattr(kv, "dsv4_pos", 0)) if offset == 0 else offset
+            kv.dsv4_sweep_pos = resolved
+            kv.dsv4_pos = resolved + x.shape[1]
             hc_stream = mx.broadcast_to(
                 x[:, :, None, :],
                 (x.shape[0], x.shape[1], self.cfg.hc_mult, x.shape[2]))
