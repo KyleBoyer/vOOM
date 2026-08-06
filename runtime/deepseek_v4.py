@@ -331,3 +331,92 @@ def index_topk_idxs(score: mx.array, seqlen: int, ratio: int, offset: int,
     else:
         idxs = idxs + offset
     return idxs.astype(mx.int32)
+
+
+# ---- activation QAT and rotary embedding (F209) ----------------------------
+
+
+_FP8_MAX = 448.0
+
+
+def act_quant_simulate(x: mx.array, block_size: int = 128) -> mx.array:
+    """Fused FP8 quantize/dequantize round-trip, as the released kernel does.
+
+    This is QAT simulation, not storage: the released model runs activations
+    through an E4M3 round-trip so inference matches training. Skipping it
+    changes the numbers, so it is applied rather than treated as optional.
+
+    Per block of ``block_size`` along the last axis: ``s = max(|x|, 1e-4) /
+    448`` then ``e4m3(clamp(x / s, -448, 448)) * s``. The 1e-4 floor keeps an
+    all-zero block from dividing by zero; without it the round-trip returns
+    NaN rather than zero.
+    """
+    n = x.shape[-1]
+    if n % block_size:
+        raise ValueError(
+            f"act_quant needs a last axis divisible by {block_size}, got {n}")
+    leading = x.shape[:-1]
+    grouped = x.astype(mx.float32).reshape(*leading, n // block_size, block_size)
+    amax = mx.maximum(mx.max(mx.abs(grouped), axis=-1, keepdims=True), 1e-4)
+    scale = amax / _FP8_MAX
+    clamped = mx.clip(grouped / scale, -_FP8_MAX, _FP8_MAX)
+    # Round-trip through the real E4M3 grid rather than approximating it.
+    quantized = mx.from_fp8(mx.to_fp8(clamped), mx.float32)
+    return (quantized * scale).reshape(*leading, n).astype(x.dtype)
+
+
+def yarn_freqs(dim: int, seqlen: int, original_seq_len: int, base: float,
+               factor: float, beta_fast: float, beta_slow: float):
+    """Port of ``precompute_freqs_cis``: NTK-by-parts (YaRN) interpolation.
+
+    Returns ``(cos, sin)`` of shape ``[seqlen, dim // 2]``. When
+    ``original_seq_len`` is zero the correction is skipped entirely, which is
+    how the released code disables YaRN on pure sliding-window layers -- those
+    use the base theta instead of ``compress_rope_theta``.
+    """
+    import math
+
+    freqs = 1.0 / (base ** (mx.arange(0, dim, 2).astype(mx.float32) / dim))
+    if original_seq_len and seqlen > original_seq_len:
+        def correction_dim(rotations):
+            return (dim * math.log(
+                original_seq_len / (rotations * 2 * math.pi))
+                / (2 * math.log(base)))
+
+        low = math.floor(correction_dim(beta_fast))
+        high = math.ceil(correction_dim(beta_slow))
+        low, high = max(low, 0), min(high, dim - 1)
+        ramp = mx.clip(
+            (mx.arange(dim // 2).astype(mx.float32) - low)
+            / max(high - low, 1e-3), 0.0, 1.0)
+        smooth = 1.0 - ramp
+        freqs = freqs / factor * (1 - smooth) + freqs * smooth
+    angles = mx.arange(seqlen).astype(mx.float32)[:, None] * freqs[None, :]
+    return mx.cos(angles), mx.sin(angles)
+
+
+def apply_rope_interleaved(x: mx.array, cos: mx.array, sin: mx.array,
+                           inverse: bool = False) -> mx.array:
+    """Rotary embedding over *interleaved* pairs, matching the released code.
+
+    ``apply_rotary_emb`` views the last axis as complex via
+    ``unflatten(-1, (-1, 2))``, so pairs are adjacent ``(x0, x1), (x2, x3)``.
+    That is the "traditional" convention -- LFM2 and most of this runtime use
+    the half-split form instead, and substituting one for the other rotates
+    the wrong element pairs while keeping every shape and norm intact.
+
+    ``inverse`` conjugates the rotation, which the attention epilogue uses to
+    de-rotate its output before the projection.
+    """
+    shape = x.shape
+    pairs = x.astype(mx.float32).reshape(*shape[:-1], shape[-1] // 2, 2)
+    real, imaginary = pairs[..., 0], pairs[..., 1]
+    if x.ndim == 4:  # [b, s, h, d] -> broadcast over heads
+        cos, sin = cos[None, :, None, :], sin[None, :, None, :]
+    else:            # [b, s, d]
+        cos, sin = cos[None], sin[None]
+    if inverse:
+        sin = -sin
+    rotated = mx.stack(
+        [real * cos - imaginary * sin, real * sin + imaginary * cos], axis=-1)
+    return rotated.reshape(shape).astype(x.dtype)
