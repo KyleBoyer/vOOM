@@ -3387,6 +3387,25 @@ class StreamingEngine:
                     iter_expert_batches=self._iter_expert_batches,
                     profile=profiler,
                 )
+            elif self.cfg.model_type == "deepseek_v4":
+                # F213: every component of a DeepSeek V4 layer is implemented
+                # and oracled in runtime/deepseek_v4.py (F204-F212), but the
+                # engine cannot yet drive it. Hyper-connections carry the
+                # hidden state as hc_mult parallel streams -- [b, s, hc, dim]
+                # -- for the whole depth, expanded after the embedding and
+                # reduced by hc_head before the LM head. This sweep threads a
+                # [b, s, dim] tensor, so the stream needs a side-channel like
+                # the one kimi_k3 already uses for AttnRes block residuals.
+                #
+                # Fail explicitly rather than fall through to run_moe_block,
+                # which found no input_layernorm and would otherwise be one
+                # renamed tensor away from silently running the wrong
+                # architecture.
+                raise NotImplementedError(
+                    "deepseek_v4 blocks are implemented and verified in "
+                    "runtime/deepseek_v4.py but not yet wired into the sweep: "
+                    "the hyper-connection stream ([b, s, hc_mult, dim]) needs "
+                    "a carrier through _sweep, as kimi_k3 has for AttnRes")
             elif self.cfg.model_type == "lfm2":
                 # F202: 22 gated short-conv + 8 full-attention layers. The conv
                 # layers keep a fixed conv_L_cache-1 history in the same

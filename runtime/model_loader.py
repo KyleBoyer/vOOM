@@ -60,6 +60,20 @@ class _CTInt4Aux:
 
 
 @dataclass(frozen=True)
+class _DSV4Aux:
+    """F213: DeepSeek V4's ``<stem>.weight`` + ``<stem>.scale`` pair.
+
+    Two schemes share this shape and are told apart by the weight's dtype at
+    fetch time, not by config: routed experts are INT8 while attention and
+    shared experts are FP8 E4M3. Both carry E8M0 block scales, but with
+    different blocking, so the block size is derived per tensor.
+    """
+
+    weight: str
+    scale: str
+
+
+@dataclass(frozen=True)
 class _CTMXFP4Aux:
     """F128: Kimi K3's real "mxfp4-pack-quantized" compressed-tensors pair
     (.weight_packed/.weight_scale, no .weight_shape -- confirmed by directly
@@ -425,6 +439,28 @@ class WeightStore:
             self.weight_map[canon] = self.weight_map.pop(n)
         self._real_name.update(self._gguf_pending_real_names)
 
+        # F213: DeepSeek V4 ships no ``model.`` prefix at all -- its tensors
+        # are ``layers.N.*``, ``embed.weight``, ``head.weight``,
+        # ``norm.weight``. Alias them onto the canonical names the engine
+        # addresses so every scheduler/paging call site works unchanged. Only
+        # applied when the canonical name is genuinely absent.
+        if ("model.embed_tokens.weight" not in self.weight_map
+                and "embed.weight" in self.weight_map):
+            for source, canonical in (
+                    ("embed.weight", "model.embed_tokens.weight"),
+                    ("head.weight", "lm_head.weight"),
+                    ("norm.weight", "model.norm.weight")):
+                if source in self.weight_map:
+                    self.weight_map[canonical] = self.weight_map[source]
+                    self._real_name[canonical] = self._real_name.get(
+                        source, source)
+            for name in [n for n in self.weight_map if n.startswith("layers.")]:
+                canonical = "model." + name
+                if canonical not in self.weight_map:
+                    self.weight_map[canonical] = self.weight_map[name]
+                    self._real_name[canonical] = self._real_name.get(
+                        name, name)
+
         # F202: LFM2 names its final norm ``model.embedding_norm.weight``; the
         # engine addresses every architecture's final norm as
         # ``model.norm.weight``. Alias it only when the canonical name is
@@ -513,6 +549,21 @@ class WeightStore:
                 self._ct_mxfp4_aux[logical] = _CTMXFP4Aux(name, scale)
                 self.weight_map[logical] = self.weight_map[name]
                 quant_aux_names.add(name)
+                quant_aux_names.add(scale)
+
+        # F213: DeepSeek V4 pairs every quantized matrix with a sibling
+        # ``.scale``. Registering them here keeps the scheduler addressing one
+        # logical ``.weight`` name while the fetch path joins the pair.
+        self._dsv4_aux: dict[str, _DSV4Aux] = {}
+        if (not self.packed
+                and str(self.config.model_type) == "deepseek_v4"):
+            for name in list(self.weight_map):
+                if not name.endswith(".weight") or name in quant_aux_names:
+                    continue
+                scale = name[:-len(".weight")] + ".scale"
+                if scale not in self.weight_map:
+                    continue
+                self._dsv4_aux[name] = _DSV4Aux(name, scale)
                 quant_aux_names.add(scale)
 
         self.on_disk_quantized = bool(self._quant_aux)
@@ -626,7 +677,10 @@ class WeightStore:
                 "scale_inv" in name or name.endswith(".weight_scale")
                 for name in self.weight_map
             )
-            if standard_declared or method != "unknown" or suspicious_scales:
+            if self._dsv4_aux:
+                # Recognized: handled by the F213 weight/scale pair path.
+                pass
+            elif standard_declared or method != "unknown" or suspicious_scales:
                 raise NotImplementedError(
                     f"unsupported on-disk quantization layout ({method}); convert "
                     "the checkpoint to standard MLX weight/scales/biases triplets"
@@ -1437,9 +1491,16 @@ class WeightStore:
                     seen: set[str] = set()
                     for name in names:
                         aux = self._quant_aux.get(name)
-                        expanded = (
-                            (name, aux.scales, aux.biases)
-                            if aux is not None else (name,))
+                        dsv4 = self._dsv4_aux.get(name)
+                        if aux is not None:
+                            expanded = (name, aux.scales, aux.biases)
+                        elif dsv4 is not None:
+                            # F213: the sibling .scale must be read alongside
+                            # its .weight or the join below has nothing to
+                            # apply.
+                            expanded = (dsv4.weight, dsv4.scale)
+                        else:
+                            expanded = (name,)
                         for physical_name in expanded:
                             if (physical_name is not None
                                     and physical_name not in seen):
@@ -1547,6 +1608,13 @@ class WeightStore:
                 # F128: same reasoning as the INT4 case above, minus the
                 # shape sidecar (K3's MXFP4 pairs ship none).
                 expanded = (ct_mxfp4_aux.packed, ct_mxfp4_aux.scale)
+            elif self._dsv4_aux.get(n) is not None:
+                # F213: DeepSeek V4's sibling .scale must be read alongside
+                # its .weight. Unlike the compressed-tensors cases above the
+                # logical name IS the physical weight tensor, so both are
+                # listed rather than substituted.
+                dsv4 = self._dsv4_aux[n]
+                expanded = (dsv4.weight, dsv4.scale)
             else:
                 aux = self._quant_aux.get(n)
                 expanded = ((n, aux.scales, aux.biases) if aux is not None else (n,))
@@ -1735,7 +1803,27 @@ class WeightStore:
                     nbytes += sidecar_bytes
                     sidecar_pool.shutdown(wait=True)
                     sidecar_pool = None
-                if self._quant_aux or self._ct_int4_aux or self._ct_mxfp4_aux:
+                if self._dsv4_aux:
+                    from .quant import (dequantize_deepseek_v4_fp8,
+                                        dequantize_deepseek_v4_int8)
+
+                    joined: dict = {}
+                    for name in names:
+                        aux = self._dsv4_aux.get(name)
+                        if aux is None:
+                            joined[name] = out[name]
+                            continue
+                        weight, scale = out[aux.weight], out[aux.scale]
+                        # Dtype, not config, decides: the released config
+                        # declares "fp8" for everything while the 35,328
+                        # routed expert tensors are actually INT8.
+                        joined[name] = (
+                            dequantize_deepseek_v4_int8(weight, scale)
+                            if weight.dtype == mx.int8
+                            else dequantize_deepseek_v4_fp8(weight, scale))
+                        mx.eval(joined[name])
+                    out = joined
+                elif self._quant_aux or self._ct_int4_aux or self._ct_mxfp4_aux:
                     from .quant import (
                         QTensor, dequantize_compressed_tensors_int4,
                         dequantize_compressed_tensors_mxfp4)

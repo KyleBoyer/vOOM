@@ -598,6 +598,10 @@ class ModelConfig:
             moe_expert_prefix=(
                 "block_sparse_moe.experts"
                 if raw.get("model_type") in ("kimi_linear", "kimi_k3")
+                # F213: DeepSeek V4 names its MoE module "ffn", and its gate
+                # lives at ffn.gate beside ffn.experts.<id>.
+                else "ffn.experts"
+                if raw.get("model_type") == "deepseek_v4"
                 else "mlp.experts"
             ),
             hidden_act=raw.get("hidden_act", "silu"),
