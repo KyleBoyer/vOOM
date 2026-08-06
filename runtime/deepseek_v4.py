@@ -549,3 +549,82 @@ def moe_combine(x: mx.array, routed, weights: mx.array, indices: mx.array,
     if shared is not None:
         out = out + shared(flat).astype(mx.float32)
     return out.reshape(x.shape).astype(x.dtype)
+
+
+# ---- block assembly (F212) -------------------------------------------------
+
+
+def run_deepseek_v4_block(x: mx.array, hc: dict, norms: dict, attention,
+                          ffn, *, hc_mult: int, norm_eps: float,
+                          sinkhorn_iters: int, hc_eps: float) -> mx.array:
+    """One decoder block over the hyper-connection stream.
+
+    ``x`` is ``[b, s, hc_mult, dim]`` throughout -- the stream never collapses
+    between blocks. Each half reduces it, norms, runs its sublayer on the
+    single reduced ``[b, s, dim]`` tensor, then re-expands.
+
+    Three orderings this gets right and a plausible rewrite does not:
+
+    * ``residual`` is captured BEFORE ``hc_pre``, so ``hc_post`` mixes the
+      original streams, not the reduced tensor;
+    * the attention half uses the ``attn`` HC parameters and the FFN half the
+      ``ffn`` ones -- they are separate learned projections, and swapping them
+      is shape-compatible;
+    * the norm is applied to the REDUCED tensor, after ``hc_pre``, not to the
+      stream before it.
+
+    ``attention`` and ``ffn`` are callables taking and returning
+    ``[b, s, dim]``, so the caller supplies paging-aware implementations and
+    this function stays pure topology.
+    """
+    common = dict(hc_mult=hc_mult, norm_eps=norm_eps,
+                  sinkhorn_iters=sinkhorn_iters, eps=hc_eps)
+
+    residual = x
+    reduced, post, comb = hc_pre(
+        x, hc["attn_fn"], hc["attn_scale"], hc["attn_base"], **common)
+    reduced = mx.fast.rms_norm(reduced, norms["attn"], norm_eps)
+    x = hc_post(attention(reduced), residual, post, comb)
+
+    residual = x
+    reduced, post, comb = hc_pre(
+        x, hc["ffn_fn"], hc["ffn_scale"], hc["ffn_base"], **common)
+    reduced = mx.fast.rms_norm(reduced, norms["ffn"], norm_eps)
+    return hc_post(ffn(reduced), residual, post, comb)
+
+
+def deepseek_v4_attention(x: mx.array, w: dict, prefix: str, *,
+                          heads: int, head_dim: int, rope_head_dim: int,
+                          q_lora_rank: int, o_lora_rank: int, n_groups: int,
+                          norm_eps: float, cos: mx.array, sin: mx.array,
+                          kv_all: mx.array, topk_idxs: mx.array,
+                          act_quant_block: int = 64) -> mx.array:
+    """Compose the attention halves verified in F206/F209/F210.
+
+    Order follows the released ``Attention.forward``: q through its LoRA and
+    norm, per-head RMS *without* a learned weight, RoPE on the rotary tail
+    only, gathered sparse attention, then the INVERSE RoPE on the output before
+    the grouped projection. ``kv_all`` and ``topk_idxs`` come from the caller,
+    which owns the window/compressed cache.
+    """
+    b, s, _ = x.shape
+    q = x @ w[f"{prefix}.wq_a"].T
+    q = mx.fast.rms_norm(q, w[f"{prefix}.q_norm"], norm_eps)
+    q = (q @ w[f"{prefix}.wq_b"].T).reshape(b, s, heads, head_dim)
+    # A weightless RMS over each head, distinct from the learned q_norm above.
+    q = q * mx.rsqrt(mx.mean(mx.square(q.astype(mx.float32)), axis=-1,
+                             keepdims=True) + norm_eps).astype(q.dtype)
+    tail = apply_rope_interleaved(q[..., -rope_head_dim:], cos, sin)
+    q = mx.concatenate([q[..., :-rope_head_dim], tail], axis=-1)
+
+    out = sparse_windowed_attention(
+        q, kv_all, w[f"{prefix}.attn_sink"], topk_idxs,
+        float(head_dim) ** -0.5)
+
+    # De-rotate before projecting -- the released epilogue's inverse=True.
+    tail = apply_rope_interleaved(
+        out[..., -rope_head_dim:], cos, sin, inverse=True)
+    out = mx.concatenate([out[..., :-rope_head_dim], tail], axis=-1)
+    return attention_output_projection(
+        out, w[f"{prefix}.wo_a"], w[f"{prefix}.wo_b"],
+        n_groups=n_groups, o_lora_rank=o_lora_rank)
