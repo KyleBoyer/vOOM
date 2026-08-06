@@ -256,3 +256,78 @@ def compress_prefill(x: mx.array, wkv: mx.array, wgate: mx.array,
     if act_quant is not None:
         pooled = act_quant(pooled)
     return pooled, remainder
+
+
+# ---- indexer: top-k selection over compressed KV (F208) ---------------------
+#
+# Present only where ``compress_ratio == 4``. It scores every compressed entry
+# against a per-head projection of the query and keeps ``index_topk`` of them,
+# which become the sparse attention's gather list alongside the sliding window.
+
+
+def hadamard_transform(x: mx.array, scale: float | None = None) -> mx.array:
+    """Walsh-Hadamard transform over the last axis, which must be a power of two.
+
+    Matches ``fast_hadamard_transform.hadamard_transform``: the *unnormalized*
+    butterfly, then a caller-supplied scale (the released code passes
+    ``d ** -0.5``, making it orthonormal). Applying the normalization inside
+    the butterfly instead would scale by ``d ** -0.5`` per stage rather than
+    once, which is a different transform.
+    """
+    n = x.shape[-1]
+    if n & (n - 1):
+        raise ValueError(f"Hadamard transform needs a power-of-two axis, got {n}")
+    leading = x.shape[:-1]
+    y = x.astype(mx.float32)
+    step = 1
+    while step < n:
+        y = y.reshape(*leading, n // (2 * step), 2, step)
+        lower, upper = y[..., 0, :], y[..., 1, :]
+        y = mx.stack([lower + upper, lower - upper], axis=-2)
+        step *= 2
+    y = y.reshape(*leading, n)
+    return (y * scale if scale is not None else y).astype(x.dtype)
+
+
+def index_scores(q: mx.array, compressed_kv: mx.array, weights: mx.array
+                 ) -> mx.array:
+    """Per-position scores over compressed entries.
+
+    ``relu`` is applied to the per-head scores *before* the head-weighted sum,
+    so a head can only ever add evidence for an entry, never veto another
+    head's. Summing first and then rectifying would let heads cancel.
+    """
+    scored = mx.einsum("bshd,btd->bsht", q.astype(mx.float32),
+                       compressed_kv.astype(mx.float32))
+    scored = mx.maximum(scored, 0.0) * weights.astype(mx.float32)[..., None]
+    return mx.sum(scored, axis=2)
+
+
+def index_topk_idxs(score: mx.array, seqlen: int, ratio: int, offset: int,
+                    index_topk: int, end_pos: int, *, prefill: bool
+                    ) -> mx.array:
+    """Select compressed entries, masking those a position cannot see yet.
+
+    A position ``p`` may only read compressed entries strictly before its own
+    group, i.e. index ``< (p + 1) // ratio``. During prefill that bound is
+    applied twice -- once as ``-inf`` before the top-k so unreachable entries
+    are not selected, and again afterwards, because when fewer than ``k``
+    entries are reachable the top-k still returns ``k`` slots and the surplus
+    must be marked unused rather than silently pointing at future context.
+    """
+    keep = min(int(index_topk), max(end_pos // ratio, 1))
+    if prefill:
+        reach = (mx.arange(1, seqlen + 1) // ratio)[:, None]
+        columns = mx.arange(score.shape[-1])[None, :]
+        blocked = columns >= reach
+        score = score + mx.where(blocked, -mx.inf, 0.0)[None]
+    # argpartition yields unsigned indices; -1 marks unused slots, so the
+    # cast has to happen before any masking or it overflows.
+    idxs = mx.argpartition(
+        -score, kth=keep - 1, axis=-1)[..., :keep].astype(mx.int32)
+    if prefill:
+        reach = (mx.arange(1, seqlen + 1) // ratio)[None, :, None]
+        idxs = mx.where(idxs >= reach, -1, idxs + offset)
+    else:
+        idxs = idxs + offset
+    return idxs.astype(mx.int32)
