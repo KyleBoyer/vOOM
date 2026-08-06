@@ -2734,6 +2734,31 @@ class StreamingEngine:
             return [(f"{key}.attn", attention_names), (f"{key}.mlp", mlp_names)]
         return [(key, self._layer_names(layer))]
 
+    def _deepseek_v4_attention(self, x, w, prefix, layer, kv, offset):
+        """Not yet wired: needs the window + compressed KV caches.
+
+        Every arithmetic piece exists and is oracled in runtime/deepseek_v4.py
+        -- q-LoRA, weightless per-head RMS, interleaved RoPE, gathered sparse
+        attention with sinks, the inverse-RoPE o-LoRA epilogue (F206/F209/F210)
+        -- but the caller must supply ``kv_all`` and ``topk_idxs``, which come
+        from a ring-buffer sliding window of ``window_size`` positions
+        concatenated with the compressed cache. This engine's KVCache stores
+        per-layer [b, heads, seq, dim] and has no ring or compressed region, so
+        the cache itself is the remaining work, not the math.
+        """
+        raise NotImplementedError(
+            f"deepseek_v4 layer {layer}: attention needs the ring-buffer "
+            f"window + compressed KV cache (compress_ratio "
+            f"{self.cfg.compress_ratios[layer] if layer < len(self.cfg.compress_ratios) else '?'}); "
+            "see runtime/deepseek_v4.py for the verified components")
+
+    def _deepseek_v4_ffn(self, x, w, prefix, layer):
+        """Not yet wired: needs routed-expert paging through WeightCache."""
+        raise NotImplementedError(
+            f"deepseek_v4 layer {layer}: MoE needs routed-expert paging "
+            "(moe_gate/expert_swiglu/moe_combine are verified in "
+            "runtime/deepseek_v4.py; the fetch loop is not wired)")
+
     def _plan_trunk_pin_layers(self, num_layers: int) -> int:
         """Size the pinned trunk prefix from measured on-disk layer bytes.
 
@@ -3299,6 +3324,17 @@ class StreamingEngine:
         # empty block_residual here (one per _sweep call = one per chunk,
         # exactly matching a chunk-major caller's own "one forward-call per
         # chunk" mapping) is correct; see run_kimi_k3_block's own docstring.
+        # F213: DeepSeek V4 carries the hidden state as hc_mult parallel
+        # streams for the whole depth. The released Transformer.forward
+        # expands right after the embedding with
+        # ``h.unsqueeze(2).repeat(1, 1, hc_mult, 1)`` and reduces once via
+        # hc_head after the last layer, so this carrier is per-sweep exactly
+        # like block_residual below.
+        hc_stream = None
+        if self.cfg.model_type == "deepseek_v4":
+            hc_stream = mx.broadcast_to(
+                x[:, :, None, :],
+                (x.shape[0], x.shape[1], self.cfg.hc_mult, x.shape[2]))
         block_residual = (
             (
                 []
@@ -3388,24 +3424,23 @@ class StreamingEngine:
                     profile=profiler,
                 )
             elif self.cfg.model_type == "deepseek_v4":
-                # F213: every component of a DeepSeek V4 layer is implemented
-                # and oracled in runtime/deepseek_v4.py (F204-F212), but the
-                # engine cannot yet drive it. Hyper-connections carry the
-                # hidden state as hc_mult parallel streams -- [b, s, hc, dim]
-                # -- for the whole depth, expanded after the embedding and
-                # reduced by hc_head before the LM head. This sweep threads a
-                # [b, s, dim] tensor, so the stream needs a side-channel like
-                # the one kimi_k3 already uses for AttnRes block residuals.
-                #
-                # Fail explicitly rather than fall through to run_moe_block,
-                # which found no input_layernorm and would otherwise be one
-                # renamed tensor away from silently running the wrong
-                # architecture.
-                raise NotImplementedError(
-                    "deepseek_v4 blocks are implemented and verified in "
-                    "runtime/deepseek_v4.py but not yet wired into the sweep: "
-                    "the hyper-connection stream ([b, s, hc_mult, dim]) needs "
-                    "a carrier through _sweep, as kimi_k3 has for AttnRes")
+                from .deepseek_v4 import run_deepseek_v4_block
+
+                prefix = f"model.layers.{i}"
+                hc_stream = run_deepseek_v4_block(
+                    hc_stream,
+                    {key: w[f"{prefix}.hc_{key}"] for key in (
+                        "attn_fn", "attn_scale", "attn_base",
+                        "ffn_fn", "ffn_scale", "ffn_base")},
+                    {"attn": w[f"{prefix}.attn_norm.weight"],
+                     "ffn": w[f"{prefix}.ffn_norm.weight"]},
+                    lambda t: self._deepseek_v4_attention(t, w, prefix, i, kv,
+                                                          offset),
+                    lambda t: self._deepseek_v4_ffn(t, w, prefix, i),
+                    hc_mult=self.cfg.hc_mult,
+                    norm_eps=self.cfg.rms_norm_eps,
+                    sinkhorn_iters=self.cfg.hc_sinkhorn_iters,
+                    hc_eps=self.cfg.hc_eps)
             elif self.cfg.model_type == "lfm2":
                 # F202: 22 gated short-conv + 8 full-attention layers. The conv
                 # layers keep a fixed conv_L_cache-1 history in the same
@@ -3558,6 +3593,20 @@ class StreamingEngine:
                 self._router_lookahead(x, i + 1)
             del w
         self._restore_aggregate_layer_transient(position_count)
+        if self.cfg.model_type == "deepseek_v4" and hc_stream is not None:
+            # One reduction after the last layer, matching the released
+            # forward: hc_head consumes the whole mix vector as sigmoid gates
+            # and needs no Sinkhorn. The caller applies model.norm and the LM
+            # head right after _sweep returns.
+            from .deepseek_v4 import hc_head
+
+            x = hc_head(
+                hc_stream, self._hc_head_fn, self._hc_head_scale,
+                self._hc_head_base, norm_eps=self.cfg.rms_norm_eps,
+                eps=self.cfg.hc_eps)
+            if final_mlp_last_only and x.shape[1] > 1:
+                x = x[:, -1:, :]
+            return x
         if self.cfg.model_type == "kimi_k3" and block_residual is not None:
             # F128: the real KimiLinearModel.forward applies this ONCE,
             # after every layer, before its own final model.norm -- which

@@ -67,7 +67,7 @@ class ModelConfig:
     # GLM-5.2 / DeepSeek-style MLA + MoE specifics
     first_k_dense_replace: int = 0
     qk_nope_head_dim: int = 0
-    qk_rope_head_dim: int = 0
+    qk_rope_head_dim: int = 64
     v_head_dim: int = 0
     q_lora_rank: int = 0
     kv_lora_rank: int = 0
@@ -163,6 +163,17 @@ class ModelConfig:
     # engine.py must use this, not a hardcoded ".mlp.experts." substring, or
     # MoE paging silently finds zero matching tensors for Kimi models.
     moe_expert_prefix: str = "mlp.experts"
+    # F213: DeepSeek V4 hyper-connections. hc_mult parallel hidden streams are
+    # carried through every layer; the mixing weights come from a Sinkhorn
+    # normalization with hc_sinkhorn_iters iterations.
+    hc_mult: int = 1
+    hc_sinkhorn_iters: int = 20
+    hc_eps: float = 1e-6
+    o_lora_rank: int = 0
+    o_groups: int = 1
+    rope_head_dim: int = 64
+    window_size: int = 128
+    compress_ratios: tuple[int, ...] = ()
 
     def moe_module_prefix(self) -> str:
         """Parent module holding the gate/router beside ``moe_expert_prefix``.
@@ -595,6 +606,14 @@ class ModelConfig:
             # ".mlp.experts.<id>.<proj>.weight" layout instead (this
             # field's own default). An earlier version of this code wrongly
             # applied Kimi Linear's naming to kimi_k25/kimi_k2 as well.
+            hc_mult=raw.get("hc_mult", 1),
+            hc_sinkhorn_iters=raw.get("hc_sinkhorn_iters", 20),
+            hc_eps=raw.get("hc_eps", 1e-6),
+            o_lora_rank=raw.get("o_lora_rank", 0),
+            o_groups=raw.get("o_groups", 1),
+            rope_head_dim=raw.get("rope_head_dim", 64),
+            window_size=raw.get("window_size", 128),
+            compress_ratios=tuple(raw.get("compress_ratios", ()) or ()),
             moe_expert_prefix=(
                 "block_sparse_moe.experts"
                 if raw.get("model_type") in ("kimi_linear", "kimi_k3")
