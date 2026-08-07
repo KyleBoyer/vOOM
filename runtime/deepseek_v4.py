@@ -513,8 +513,8 @@ def attention_output_projection(o: mx.array, wo_a: mx.array, wo_b: mx.array,
     per_group = wo_a.reshape(n_groups, o_lora_rank, grouped.shape[-1])
     codes = mx.einsum("bsgd,grd->bsgr", grouped.astype(mx.float32),
                       per_group.astype(mx.float32))
-    return (codes.reshape(b, s, n_groups * o_lora_rank)
-            @ wo_b.astype(mx.float32).T).astype(o.dtype)
+    return _packed_matmul(
+        codes.reshape(b, s, n_groups * o_lora_rank), wo_b).astype(o.dtype)
 
 
 # ---- MoE routing and experts (F211) ----------------------------------------
@@ -577,6 +577,8 @@ def _packed_matmul(x: mx.array, w) -> mx.array:
     0.85GB/s. Serialized those predict 0.55GB/s, which is what the engine
     measured.
     """
+    if isinstance(w, PackedFP8):
+        return w.matmul(x)
     if isinstance(w, PackedExpert):
         # x stays float32: the dense branch below multiplies in float32, and
         # casting the activation to bfloat16 here cost three orders of
@@ -630,6 +632,7 @@ class PackedFP8:
 
     packed: mx.array
     scale: mx.array
+    _group_scales: mx.array | None = None
 
     @property
     def nbytes(self) -> int:
@@ -643,6 +646,37 @@ class PackedFP8:
         from .quant import dequantize_deepseek_v4_fp8
 
         return dequantize_deepseek_v4_fp8(self.packed, self.scale)
+
+    def group_scales(self) -> mx.array:
+        """The 128x128 block scale restated as MLX's per-32-group MXFP8 scale.
+
+        Exact, not approximate: every group of 32 columns lies inside one
+        128-column block and therefore already shares that block's scale, so
+        expanding is a change of representation with no change of value.
+        Verified against the eager dequant on a real trunk tensor -- 100% of
+        elements bit-equal.
+        """
+        if self._group_scales is None:
+            rows, cols = self.packed.shape
+            bm = rows // self.scale.shape[0]
+            bn = cols // self.scale.shape[1]
+            self._group_scales = mx.repeat(
+                mx.repeat(self.scale, bm, axis=0), bn // 32, axis=1)
+        return self._group_scales
+
+    def matmul(self, x: mx.array) -> mx.array:
+        """x @ self.T through MLX's fused MXFP8 kernel, skipping the dequant.
+
+        The trunk dequant is 45.9% of decode wall (2.97s of 6.47 per token),
+        so not materializing is worth more here than anywhere else. The kernel
+        accumulates differently from a float32 dequantized matmul -- a single
+        projection differs by rel 3.3e-3 -- so this is proven by greedy-token
+        equality, never bit identity.
+        """
+        return mx.quantized_matmul(
+            x.astype(mx.float32), self.packed.view(mx.uint32),
+            scales=self.group_scales(), biases=None, transpose=True,
+            group_size=32, bits=8, mode="mxfp8").astype(mx.float32)
 
 
 def expert_swiglu(x: mx.array, w1, w2, w3, *,
@@ -776,7 +810,7 @@ def deepseek_v4_attention(x: mx.array, w: dict, prefix: str, *,
     b, s, _ = x.shape
     q = x @ w[f"{prefix}.wq_a"].T
     q = mx.fast.rms_norm(q, w[f"{prefix}.q_norm"], norm_eps)
-    q = (q @ w[f"{prefix}.wq_b"].T).reshape(b, s, heads, head_dim)
+    q = _packed_matmul(q, w[f"{prefix}.wq_b"]).reshape(b, s, heads, head_dim)
     # A weightless RMS over each head, distinct from the learned q_norm above.
     q = q * mx.rsqrt(mx.mean(mx.square(q.astype(mx.float32)), axis=-1,
                              keepdims=True) + norm_eps).astype(q.dtype)

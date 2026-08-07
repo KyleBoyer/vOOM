@@ -1099,6 +1099,19 @@ class _HotPromptSlot:
     cache_namespace: str = "default"
 
 
+# Trunk weights consumed ONLY by a plain matmul, so MLX's fused MXFP8 kernel
+# can read the released bytes and the dequant never happens. wq_b and wo_b are
+# 40% of a trunk layer between them; wo_a is another 20% but is reshaped for
+# the grouped einsum, so it cannot take this path.
+_DSV4_FUSED_FP8_SUFFIXES = (
+    "attn.wq_b.weight",
+    "attn.wo_b.weight",
+    "ffn.shared_experts.w1.weight",
+    "ffn.shared_experts.w2.weight",
+    "ffn.shared_experts.w3.weight",
+)
+
+
 class StreamingEngine:
     def __init__(self, model_dir: str | Path, rc: RuntimeConfig | None = None):
         self.rc = rc or RuntimeConfig()
@@ -1581,6 +1594,9 @@ class StreamingEngine:
         self._dspark_capture = None
         self._dspark_targets = frozenset(
             int(v) for v in (self.cfg.dspark_target_layer_ids or ()))
+        self._dsv4_fused_fp8 = (
+            _os.environ.get("VMODEL_DSV4_FUSED_FP8") == "1"
+            and _os.environ.get("VMODEL_DSV4_PACKED_TRUNK") == "1")
         self._dsv4_packed_trunk = (
             _os.environ.get("VMODEL_DSV4_PACKED_TRUNK") == "1")
         self._dsv4_expert_retain = (
@@ -3207,8 +3223,12 @@ class StreamingEngine:
 
         if not any(isinstance(v, PackedFP8) for v in page.values()):
             return page
-        return {name: (value.materialize()
-                       if isinstance(value, PackedFP8) else value)
+        return {name: (value
+                       if (isinstance(value, PackedFP8)
+                           and self._dsv4_fused_fp8
+                           and name.endswith(_DSV4_FUSED_FP8_SUFFIXES))
+                       else (value.materialize()
+                             if isinstance(value, PackedFP8) else value))
                 for name, value in page.items()}
 
     def _dsv4_rollback(self, kv, accepted: int, offset: int) -> None:

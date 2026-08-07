@@ -227,3 +227,70 @@ def test_packed_expert_page_estimate_is_not_bf16_sized():
     assert packed_page < bf16_page / 3
     # Codes plus one E8M0 byte per 32 values, and nothing else.
     assert packed_page == int(3 * hidden * inter * 0.53125)
+
+
+@realmodel
+def test_block_scales_restate_exactly_as_mxfp8_group_scales():
+    """The trunk's 128x128 block scale IS a per-32-group scale.
+
+    Every group of 32 columns lies inside one 128-column block, so expanding
+    is a change of representation with no change of value. This must be exact
+    -- if it were approximate the fused kernel would be a lossy path, not a
+    scheduling one.
+    """
+    import mlx.core as mx
+
+    from runtime.deepseek_v4 import PackedFP8
+    from runtime.quant import dequantize_deepseek_v4_fp8
+
+    index = json.loads(
+        (MODEL / "model.safetensors.index.json").read_text())["weight_map"]
+    name = "model.layers.20.attn.wq_a.weight"
+    key = name if name in index else name.replace("model.", "")
+    shard = mx.load(str(MODEL / index[key]))
+    weight, scale = shard[key], shard[key.replace(".weight", ".scale")]
+
+    held = PackedFP8(weight, scale)
+    groups = held.group_scales()
+    assert groups.shape == (weight.shape[0], weight.shape[1] // 32)
+
+    eager = dequantize_deepseek_v4_fp8(weight, scale).astype(mx.float32)
+    fused = mx.dequantize(weight.view(mx.uint32), groups, group_size=32,
+                          bits=8, mode="mxfp8").astype(mx.float32)
+    mx.eval(eager, fused)
+    assert bool(mx.all(eager == fused)), (
+        "restating the block scale changed a value; the fused path would be "
+        "lossy rather than a scheduling change")
+
+
+@realmodel
+def test_fused_fp8_matmul_tracks_the_dequantized_one():
+    """Agreement is approximate by design: the kernel accumulates its own way."""
+    import mlx.core as mx
+    import numpy as np
+
+    from runtime.deepseek_v4 import PackedFP8
+    from runtime.quant import dequantize_deepseek_v4_fp8
+
+    index = json.loads(
+        (MODEL / "model.safetensors.index.json").read_text())["weight_map"]
+    name = "model.layers.20.attn.wq_a.weight"
+    key = name if name in index else name.replace("model.", "")
+    shard = mx.load(str(MODEL / index[key]))
+    weight, scale = shard[key], shard[key.replace(".weight", ".scale")]
+
+    dense = dequantize_deepseek_v4_fp8(weight, scale)
+    rng = np.random.default_rng(3)
+    x = mx.array(rng.normal(size=(2, weight.shape[1])).astype(np.float32))
+    want = (x.astype(dense.dtype) @ dense.T).astype(mx.float32)
+    got = PackedFP8(weight, scale).matmul(x)
+    mx.eval(want, got)
+    rel = float(mx.max(mx.abs(got - want))) / float(mx.max(mx.abs(want)))
+    assert rel < 1e-2, f"fused MXFP8 diverged from the dequantized matmul: {rel}"
+
+
+def test_fused_fp8_is_opt_in_and_requires_the_packed_trunk():
+    source = Path(ROOT / "runtime" / "engine.py").read_text()
+    assert 'VMODEL_DSV4_FUSED_FP8' in source
+    assert '_os.environ.get("VMODEL_DSV4_PACKED_TRUNK") == "1")' in source, (
+        "the fused path must require the packed trunk it reads from")
