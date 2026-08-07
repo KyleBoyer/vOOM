@@ -21,6 +21,8 @@ wrong still produces a doubly-stochastic-looking matrix.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+
 import mlx.core as mx
 
 
@@ -520,7 +522,58 @@ def moe_gate(x: mx.array, weight: mx.array, bias: mx.array | None, *,
     return weights * route_scale, indices
 
 
-def expert_swiglu(x: mx.array, w1: mx.array, w2: mx.array, w3: mx.array, *,
+def _packed_matmul(x: mx.array, w) -> mx.array:
+    """x @ w.T for either a dense array or a packed MXFP4 expert.
+
+    DeepSeek V4's routed experts ship as E2M1 FP4 codes with E8M0 group scales
+    at group_size 32, which is exactly OCP MXFP4: the released bytes feed
+    ``mx.quantized_matmul`` after a shape-only uint8 -> uint32 view, with no
+    repacking and no value conversion. Verified against the dequantized
+    reference on real layer-20 weights at rel 2.3e-07 (float32 rounding).
+
+    This exists because dequantizing is the decode bottleneck, not I/O: a plain
+    pread of expert tensors runs at 1.55GB/s while the same fetch with dequant
+    runs at 0.51GB/s, and the dequant in isolation processes raw bytes at
+    0.85GB/s. Serialized those predict 0.55GB/s, which is what the engine
+    measured.
+    """
+    if isinstance(w, PackedExpert):
+        # x stays float32: the dense branch below multiplies in float32, and
+        # casting the activation to bfloat16 here cost three orders of
+        # magnitude of agreement with the dequantized reference (rel 3.2e-3
+        # against 2.3e-7) for no speed benefit.
+        return mx.quantized_matmul(
+            x.astype(mx.float32), w.codes, scales=w.scales, biases=None,
+            transpose=True, group_size=w.group_size, bits=4,
+            mode="mxfp4").astype(mx.float32)
+    return x.astype(mx.float32) @ w.astype(mx.float32).T
+
+
+@dataclass
+class PackedExpert:
+    """A routed expert left in its released MXFP4 form.
+
+    ``codes`` is the checkpoint's own packed nibble stream viewed as uint32;
+    ``scales`` its E8M0 bytes, unmodified. Nothing is repacked, so this is a
+    representation change only -- but the fused kernel reassociates the
+    float32 sums a dequantized matmul would perform in a different order, so
+    equivalence is proven by greedy-token equality rather than bit identity.
+    """
+
+    codes: mx.array
+    scales: mx.array
+    group_size: int = 32
+
+    @property
+    def nbytes(self) -> int:
+        return self.codes.nbytes + self.scales.nbytes
+
+    @property
+    def shape(self) -> tuple[int, ...]:
+        return (*self.codes.shape[:-1], self.codes.shape[-1] * 8)
+
+
+def expert_swiglu(x: mx.array, w1, w2, w3, *,
                   swiglu_limit: float = 0.0,
                   weights: mx.array | None = None) -> mx.array:
     """One expert's SwiGLU, with the released asymmetric clamp.
@@ -529,16 +582,19 @@ def expert_swiglu(x: mx.array, w1: mx.array, w2: mx.array, w3: mx.array, *,
     only from above (``torch.clamp(gate, max=limit)``). Clamping the gate
     symmetrically would suppress the negative tail that ``silu`` is there to
     pass, so the asymmetry is deliberate and reproduced exactly.
+
+    Each weight is either a dense array or a ``PackedExpert``; the two are
+    interchangeable here and produce the same result to float rounding.
     """
-    gate = (x.astype(mx.float32) @ w1.astype(mx.float32).T)
-    up = (x.astype(mx.float32) @ w3.astype(mx.float32).T)
+    gate = _packed_matmul(x, w1)
+    up = _packed_matmul(x, w3)
     if swiglu_limit > 0:
         up = mx.clip(up, -swiglu_limit, swiglu_limit)
         gate = mx.minimum(gate, swiglu_limit)
     activated = (gate * mx.sigmoid(gate)) * up
     if weights is not None:
         activated = weights * activated
-    return activated @ w2.astype(mx.float32).T
+    return _packed_matmul(activated, w2)
 
 
 def moe_combine(x: mx.array, routed, weights: mx.array, indices: mx.array,

@@ -1561,6 +1561,11 @@ class StreamingEngine:
         # the compact result, so count both. K2.5's released compressed-tensors
         # INT4 path dequantizes to a dense BF16 expert and therefore naturally
         # lands on the dense resident estimate here.
+        import os as _os
+
+        self._dsv4_expert_retain = (
+            _os.environ.get("VMODEL_DSV4_EXPERT_RETAIN") == "1"
+            and _os.environ.get("VMODEL_DSV4_NATIVE_MXFP4") == "1")
         self._expert_fetch_page_bytes = (
             self._expert_page_bytes
             if (self.store.on_disk_quantized
@@ -3035,7 +3040,14 @@ class StreamingEngine:
             mx.eval(out)
             for expert in group:
                 pages.pop(expert, None)
-                self.cache.discard(f"layer.{layer}.expert.{expert}")
+                if not self._dsv4_expert_retain:
+                    # Dropping every expert immediately is what bounds the
+                    # resident set when pages are dequantized bf16 (50.3MB
+                    # each, so one sweep is ~17GB and no cache can hold it).
+                    # Under the native MXFP4 path a page is 12.6MB and a whole
+                    # sweep is ~4.3GB, which a large budget CAN retain -- so
+                    # the drop becomes the only thing preventing reuse.
+                    self.cache.discard(f"layer.{layer}.expert.{expert}")
         return out.reshape(x.shape).astype(x.dtype)
 
     def _plan_trunk_pin_layers(self, num_layers: int) -> int:

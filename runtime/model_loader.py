@@ -227,6 +227,12 @@ class WeightStore:
         self.bf16_nf12_direct_linear = bool(
             bf16_nf12_direct_linear
         )
+        # Explicit opt-in, default off, per this project's anti-overfit rule:
+        # the packed path is a representation change whose fused kernel
+        # reassociates float32 sums, so it stays behind a flag until a broad
+        # released-model corpus passes, not just the probes that found it.
+        self.dsv4_native_mxfp4 = os.environ.get(
+            "VMODEL_DSV4_NATIVE_MXFP4") == "1"
         if (
             self.bf16_nf12_uncached_reads
             and self._bf16_nf12_sidecar_request is None
@@ -1807,6 +1813,7 @@ class WeightStore:
                     sidecar_pool.shutdown(wait=True)
                     sidecar_pool = None
                 if self._dsv4_aux:
+                    from .deepseek_v4 import PackedExpert
                     from .quant import (dequantize_deepseek_v4_fp4,
                                         dequantize_deepseek_v4_fp8)
 
@@ -1820,10 +1827,25 @@ class WeightStore:
                         # Dtype, not config, decides: the released config
                         # declares "fp8" for everything while the 35,328
                         # routed expert tensors are actually INT8.
-                        joined[name] = (
-                            dequantize_deepseek_v4_fp4(weight, scale)
-                            if weight.dtype == mx.int8
-                            else dequantize_deepseek_v4_fp8(weight, scale))
+                        if weight.dtype == mx.int8:
+                            if self.dsv4_native_mxfp4:
+                                # Leave the released MXFP4 bytes alone. The
+                                # E2M1 codes and E8M0 group scales already ARE
+                                # what mx.quantized_matmul(mode="mxfp4")
+                                # consumes; only the uint8 -> uint32 view is
+                                # needed, and it is shape-only. Dequantizing
+                                # here is the decode bottleneck (0.85GB/s
+                                # against 1.55GB/s of read) and inflates the
+                                # resident page 4x.
+                                joined[name] = PackedExpert(
+                                    weight.view(mx.uint8).view(mx.uint32),
+                                    scale)
+                                continue
+                            joined[name] = dequantize_deepseek_v4_fp4(
+                                weight, scale)
+                        else:
+                            joined[name] = dequantize_deepseek_v4_fp8(
+                                weight, scale)
                         mx.eval(joined[name])
                     out = joined
                 elif self._quant_aux or self._ct_int4_aux or self._ct_mxfp4_aux:
