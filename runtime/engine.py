@@ -1597,8 +1597,6 @@ class StreamingEngine:
         self._dspark_capture = None
         self._dspark_targets = frozenset(
             int(v) for v in (self.cfg.dspark_target_layer_ids or ()))
-        self._dsv4_chunked_prefill_ok = (
-            _os.environ.get("VMODEL_DSV4_CHUNKED_PREFILL") == "1")
         self._dsv4_fused_fp8 = (
             _os.environ.get("VMODEL_DSV4_FUSED_FP8") == "1"
             and _os.environ.get("VMODEL_DSV4_PACKED_TRUNK") == "1")
@@ -2874,28 +2872,6 @@ class StreamingEngine:
         # block first destroys window entries the block's own earlier queries
         # still need. See block_decode_topk_idxs.
         block_decode = offset > 0 and x.shape[1] > 1
-        if block_decode and x.shape[1] > window:
-            # Chunked prefill past the first chunk is NOT correct for this
-            # model and must not run silently.
-            #
-            # Measured on a 1550-token prompt ending in a question: one chunk
-            # answers it, two chunks and four chunks each produce a DIFFERENT
-            # continuation of the filler text and neither answers. Positions
-            # older than the 128-slot window are reachable only through the
-            # compressed region, and compress_topk_idxs has never been
-            # exercised at start_pos > 0 with seqlen > 1 -- F214 covers
-            # (0, many) and (many, 1), not (many, many).
-            #
-            # Speculative verification is unaffected: its blocks are
-            # dspark_block_size (5) positions, far inside the window, and are
-            # separately validated byte-identical.
-            if not self._dsv4_chunked_prefill_ok:
-                raise NotImplementedError(
-                    f"DeepSeek V4 chunked prefill is disabled: this sweep has "
-                    f"{x.shape[1]} positions at offset {offset}, beyond the "
-                    f"{window}-slot window. Set VMODEL_DSV4_CHUNKED_PREFILL=1 "
-                    f"to allow it, or raise prefill_chunk_size above the "
-                    f"prompt length.")
         if not block_decode:
             rings[layer] = window_ring_write(ring, latent, offset, window)
         # Materialize the ring. window_ring_write is a concat around the

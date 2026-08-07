@@ -162,3 +162,59 @@ def test_compressed_indices_never_reach_the_current_group():
         used = used[used >= 0] - offset
         assert (used < (position + 1) // ratio).all(), (
             f"position {position} read a compressed entry it cannot see")
+
+
+# ---- mid-stream multi-position writes (chunked prefill, draft blocks) ------
+
+
+@pytest.mark.parametrize("start_pos,seqlen", [
+    (8, 3), (8, 8), (8, 20), (13, 5), (16, 16), (17, 9), (100, 200),
+])
+def test_midstream_write_keeps_slot_invariant(start_pos, seqlen):
+    """slot p % window holds position p, for a write of ANY width.
+
+    The previous implementation wrote kv[:, :1] and dropped the rest, so a
+    chunked prefill left the ring holding one new position plus stale entries.
+    """
+    import mlx.core as mx
+
+    from runtime.deepseek_v4 import window_ring_write
+
+    # Seed the ring with the positions preceding this write.
+    ring = mx.zeros((1, WINDOW, 1))
+    if start_pos:
+        ring = window_ring_write(ring, _positions(start_pos), 0, WINDOW)
+    fresh = (mx.arange(start_pos, start_pos + seqlen)
+             .reshape(1, seqlen, 1).astype(mx.float32))
+    ring = window_ring_write(ring, fresh, start_pos, WINDOW)
+    assert ring.shape == (1, WINDOW, 1)
+
+    values = np.array(ring).reshape(-1)
+    end = start_pos + seqlen
+    retained = min(end, WINDOW)
+    for position in range(end - retained, end):
+        assert values[position % WINDOW] == position, (
+            f"start_pos={start_pos} seqlen={seqlen}: slot "
+            f"{position % WINDOW} holds {values[position % WINDOW]}, "
+            f"expected {position}")
+
+
+def test_midstream_write_matches_writing_one_position_at_a_time():
+    """A block write must equal the same positions written individually."""
+    import mlx.core as mx
+
+    from runtime.deepseek_v4 import window_ring_write
+
+    start_pos, seqlen = 11, 7
+    base = window_ring_write(mx.zeros((1, WINDOW, 1)),
+                             _positions(start_pos), 0, WINDOW)
+    fresh = (mx.arange(start_pos, start_pos + seqlen)
+             .reshape(1, seqlen, 1).astype(mx.float32))
+
+    block = window_ring_write(base, fresh, start_pos, WINDOW)
+    stepwise = base
+    for i in range(seqlen):
+        stepwise = window_ring_write(stepwise, fresh[:, i:i + 1],
+                                     start_pos + i, WINDOW)
+    assert np.array_equal(np.array(block), np.array(stepwise)), (
+        "block write disagrees with stepwise writes of the same positions")

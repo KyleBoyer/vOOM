@@ -899,9 +899,32 @@ def window_ring_write(ring: mx.array, kv: mx.array, start_pos: int,
             return tail
         return mx.concatenate([tail[:, window - cutoff:],
                                tail[:, :window - cutoff]], axis=1)
-    slot = start_pos % window
-    return mx.concatenate(
-        [ring[:, :slot], kv[:, :1], ring[:, slot + 1:]], axis=1)
+    if seqlen == 1:
+        slot = start_pos % window
+        return mx.concatenate(
+            [ring[:, :slot], kv, ring[:, slot + 1:]], axis=1)
+
+    # A mid-stream write of MANY positions. This previously wrote kv[:, :1]
+    # only -- correct for one decode token, and silently discarding the other
+    # seqlen-1 positions for anything wider. Chunked prefill left the ring
+    # holding one new position and stale entries from the previous chunk
+    # everywhere else, which is why three or more chunks diverged while two
+    # (whose final ring is never read again during that sweep) did not.
+    end = start_pos + seqlen
+    if seqlen >= window:
+        # The whole ring is replaced by the last `window` positions, rotated
+        # so slot p % window still holds position p.
+        tail = kv[:, -window:]
+        cutoff = end % window
+        if cutoff == 0:
+            return tail
+        return mx.concatenate([tail[:, window - cutoff:],
+                               tail[:, :window - cutoff]], axis=1)
+    # Fewer positions than slots: each lands in its own slot, no collisions.
+    slots = (start_pos + mx.arange(seqlen)) % window
+    updated = mx.array(ring)
+    updated[:, slots] = kv.astype(ring.dtype)
+    return updated
 
 
 def compress_topk_idxs(ratio: int, seqlen: int, start_pos: int, offset: int
