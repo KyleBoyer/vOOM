@@ -95,3 +95,68 @@ def test_decode_indices_stay_inside_ring_plus_compressed():
         n_compressed = (start_pos + 1) // RATIO
         assert _max_index(idxs) < WINDOW + n_compressed, (
             f"start_pos={start_pos}: index escapes [ring | compressed]")
+
+
+# ---- multi-position decode (speculative verification) ---------------------
+
+
+def test_multi_position_decode_gives_each_query_its_own_window():
+    """Feeding a draft block at once must stay causal ACROSS the block.
+
+    The single-position branch returns one rotated row for every query. Reused
+    for a block, position start_pos+i would attend to start_pos+j for j > i --
+    a later drafted token leaking backwards, which changes an earlier token's
+    output and silently corrupts verification.
+    """
+    import mlx.core as mx
+
+    from runtime.deepseek_v4 import window_topk_idxs
+
+    start, seqlen = 4 * WINDOW + 1, 5
+    idxs = np.array(window_topk_idxs(WINDOW, seqlen, start))[0]
+    assert idxs.shape == (seqlen, WINDOW)
+
+    for i in range(seqlen):
+        here = start + i
+        allowed = {p % WINDOW for p in range(max(0, here - WINDOW + 1), here + 1)}
+        used = {int(v) for v in idxs[i] if v >= 0}
+        assert used <= allowed, (
+            f"query {i} at position {here} read slots {used - allowed}, which "
+            "hold positions it must not see")
+        assert here % WINDOW in used, "query cannot see its own position"
+
+
+def test_multi_position_rows_actually_differ():
+    """Guard: if all rows matched, the causality test above proves nothing."""
+    import mlx.core as mx
+
+    from runtime.deepseek_v4 import window_topk_idxs
+
+    idxs = np.array(window_topk_idxs(WINDOW, 5, 4 * WINDOW + 1))[0]
+    rows = {tuple(r.tolist()) for r in idxs}
+    assert len(rows) == 5, f"expected a distinct window per query, got {rows}"
+
+
+def test_single_position_decode_is_unchanged():
+    """The seqlen==1 path must keep its existing rotation exactly."""
+    import mlx.core as mx
+
+    from runtime.deepseek_v4 import window_topk_idxs
+
+    for start in (WINDOW, WINDOW + 3, 4 * WINDOW + 1):
+        got = np.array(window_topk_idxs(WINDOW, 1, start))
+        rotated = start % WINDOW
+        expected = np.concatenate([np.arange(rotated + 1, WINDOW),
+                                   np.arange(0, rotated + 1)])
+        assert np.array_equal(got.reshape(-1), expected)
+
+
+def test_early_positions_mark_unwritten_slots():
+    import mlx.core as mx
+
+    from runtime.deepseek_v4 import window_topk_idxs
+
+    idxs = np.array(window_topk_idxs(WINDOW, 3, 1))[0]
+    # Position 1 has only slots 0 and 1 written; the rest must be masked.
+    used = {int(v) for v in idxs[0] if v >= 0}
+    assert used == {0, 1}, used

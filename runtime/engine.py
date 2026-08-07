@@ -2814,6 +2814,17 @@ class StreamingEngine:
             latent[..., -rope_dim:], cos[offset:], sin[offset:])
         latent = mx.concatenate([latent[..., :-rope_dim], tail], axis=-1)
 
+        record = getattr(kv, "dsv4_verify_record", None)
+        if record is not None:
+            # Everything needed to redo this layer for a SHORTER prefix, once
+            # the accepted length is known. Cheap: the ring is one window of
+            # latents and the rest are per-position projections, so the whole
+            # record is a few MB across 43 layers -- far less than retaining a
+            # full state snapshot per draft position.
+            record[layer] = {"ring": ring, "latent": latent,
+                             "store": (getattr(kv, "dsv4_compressed", None)
+                                       or {}).get(layer),
+                             "cstate": None, "kv_proj": None, "sc_proj": None}
         rings[layer] = window_ring_write(ring, latent, offset, window)
         # Materialize the ring. window_ring_write is a concat around the
         # previous ring, so left lazy each decode step's ring holds a reference
@@ -2859,19 +2870,39 @@ class StreamingEngine:
             # layer -- about 16.8MB x 41 layers = 0.69GB per token, which is
             # the sawtooth that remained after the ring fix. Pooling still
             # happens in float32, which is what the released module widens for.
-            pooled = state.step(
-                (x.astype(cw.dtype) @ cw.T).astype(mx.float32),
-                (x.astype(cg.dtype) @ cg.T).astype(mx.float32),
-                offset, w[f"{prefix}.attn.compressor.ape"])
-            if pooled is not None:
+            # One step PER POSITION. The recurrence carries a partial group
+            # across steps and emits only on the position that completes it,
+            # so a block of draft positions cannot be absorbed in one call --
+            # doing so silently pools the wrong positions together. Verifying a
+            # draft block is the only caller that arrives with more than one.
+            kv_proj = (x.astype(cw.dtype) @ cw.T).astype(mx.float32)
+            sc_proj = (x.astype(cg.dtype) @ cg.T).astype(mx.float32)
+            if record is not None and layer in record:
+                from .deepseek_v4 import CompressorState as _CS
+
+                before = _CS.__new__(_CS)
+                before.__dict__.update(state.__dict__)
+                record[layer].update({"cstate": before, "kv_proj": kv_proj,
+                                      "sc_proj": sc_proj,
+                                      "ape": w[f"{prefix}.attn.compressor.ape"],
+                                      "cnorm": w[f"{prefix}.attn.compressor.norm.weight"],
+                                      "ratio": ratio, "theta": theta,
+                                      "original": original})
+            for step in range(x.shape[1]):
+                here = offset + step
+                pooled = state.step(
+                    kv_proj[:, step:step + 1], sc_proj[:, step:step + 1],
+                    here, w[f"{prefix}.attn.compressor.ape"])
+                if pooled is None:
+                    continue
                 pooled = mx.fast.rms_norm(
                     pooled.astype(x.dtype),
                     w[f"{prefix}.attn.compressor.norm.weight"],
                     self.cfg.rms_norm_eps)
                 ccos, csin = yarn_freqs(
-                    rope_dim, offset + 1, original, theta,
+                    rope_dim, here + 1, original, theta,
                     self.cfg.compress_rope_factor, 32, 1)
-                at = offset + 1 - ratio
+                at = here + 1 - ratio
                 ctail = apply_rope_interleaved(
                     pooled[..., -rope_dim:], ccos[at:at + 1], csin[at:at + 1])
                 pooled = mx.concatenate(
@@ -3130,6 +3161,75 @@ class StreamingEngine:
         return {name: (value.materialize()
                        if isinstance(value, PackedFP8) else value)
                 for name, value in page.items()}
+
+    def _dsv4_rollback(self, kv, accepted: int, offset: int) -> None:
+        """Truncate one verification sweep's state to its accepted prefix.
+
+        The sweep fed a whole draft block, so ring slots and compressor state
+        now reflect positions the target rejected. Accepted positions are
+        genuinely correct -- the drafted token equalled the target's own -- so
+        they are kept and only the tail is undone, which is what makes
+        verification cheaper than re-feeding.
+
+        Replays rather than snapshots: redoing the ring write and the
+        compressor steps for the first `accepted` positions costs a few MB of
+        recorded projections, where a per-position state snapshot would cost
+        tens of MB per layer.
+        """
+        from .deepseek_v4 import (CompressorState, apply_rope_interleaved,
+                                  window_ring_write, yarn_freqs)
+
+        record = getattr(kv, "dsv4_verify_record", None)
+        if not record:
+            return
+        window = self.cfg.window_size
+        rope_dim = self.cfg.rope_head_dim
+        rings = kv.dsv4_rings
+        stores = getattr(kv, "dsv4_compressed", {})
+        states = getattr(kv, "dsv4_cstate", {})
+
+        for layer, saved in record.items():
+            latent = saved["latent"][:, :accepted]
+            rings[layer] = (
+                window_ring_write(saved["ring"], latent, offset, window)
+                if accepted else saved["ring"])
+            mx.eval(rings[layer])
+
+            if saved["cstate"] is None:
+                continue
+            state = CompressorState.__new__(CompressorState)
+            state.__dict__.update(saved["cstate"].__dict__)
+            ratio = saved["ratio"]
+            if saved["store"] is None:
+                stores.pop(layer, None)
+            else:
+                stores[layer] = saved["store"]
+            for step in range(accepted):
+                here = offset + step
+                pooled = state.step(saved["kv_proj"][:, step:step + 1],
+                                    saved["sc_proj"][:, step:step + 1],
+                                    here, saved["ape"])
+                if pooled is None:
+                    continue
+                pooled = mx.fast.rms_norm(
+                    pooled.astype(latent.dtype), saved["cnorm"],
+                    self.cfg.rms_norm_eps)
+                ccos, csin = yarn_freqs(
+                    rope_dim, here + 1, saved["original"], saved["theta"],
+                    self.cfg.compress_rope_factor, 32, 1)
+                at = here + 1 - ratio
+                ctail = apply_rope_interleaved(
+                    pooled[..., -rope_dim:], ccos[at:at + 1], csin[at:at + 1])
+                pooled = mx.concatenate(
+                    [pooled[..., :-rope_dim], ctail], axis=-1)
+                stores[layer] = (
+                    pooled if layer not in stores
+                    else mx.concatenate([stores[layer], pooled], axis=1))
+                mx.eval(stores[layer])
+            states[layer] = state
+        kv.dsv4_verify_record = None
+        kv.dsv4_pos = offset + accepted
+
 
     # ---- DSpark multi-token draft (mtp.* stages) ----------------------
 

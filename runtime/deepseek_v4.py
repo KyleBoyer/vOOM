@@ -179,6 +179,18 @@ def window_topk_idxs(window_size: int, seqlen: int, start_pos: int
     Decode reuses a ring buffer, so the index list is a rotation rather than a
     contiguous range; the ``-1`` padding marks slots not yet written.
     """
+    if start_pos > 0 and seqlen > 1:
+        # Multi-position decode (speculative verification feeds a whole draft
+        # block at once). Every query needs its OWN window: the single rotated
+        # row the seqlen==1 branch returns would let position start_pos+i
+        # attend to start_pos+j for j > i, which is not merely imprecise but
+        # lets a later drafted token leak into an earlier one's output.
+        # Slot p % window holds position p, and negative positions are unwritten.
+        positions = (start_pos + mx.arange(seqlen))[:, None] \
+            - (window_size - 1) + mx.arange(window_size)[None, :]
+        matrix = mx.where(positions < 0, -1,
+                          positions % window_size)
+        return matrix.astype(mx.int32)[None]
     if start_pos >= window_size - 1:
         rotated = start_pos % window_size
         matrix = mx.concatenate([
