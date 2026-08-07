@@ -2940,7 +2940,16 @@ class StreamingEngine:
             o_lora_rank=self.cfg.o_lora_rank, n_groups=self.cfg.o_groups,
             norm_eps=self.cfg.rms_norm_eps,
             cos=cos[offset:], sin=sin[offset:],
-            kv_all=rings[layer], topk_idxs=topk)
+            # kv_all, NOT rings[layer]. Both branches above assemble the
+            # gathered tensor deliberately: prefill uses the full latent
+            # followed by the compressed entries, decode uses the 128-slot ring
+            # followed by them, and compressed_offset is set to match whichever
+            # was built. Passing the bare ring discarded that assembly. Below
+            # window_size the two agree by accident -- slot p % 128 == p -- so
+            # short prompts looked correct while every prompt past 128 tokens
+            # read the wrong slot for every query and collapsed to BOS, and the
+            # compressed region was never attended to at any length.
+            kv_all=kv_all, topk_idxs=topk)
 
     def _deepseek_v4_ffn(self, x, w, prefix, layer):
         """MoE for one DeepSeek V4 layer, with routed experts paged on demand.
