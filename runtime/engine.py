@@ -1570,6 +1570,9 @@ class StreamingEngine:
             _os.environ.get("VMODEL_DSV4_PROMPT_SLOTS", "4"))
         self._dsv4_prompt_reuse = (
             _os.environ.get("VMODEL_DSV4_PROMPT_REUSE") == "1")
+        self._dspark_capture = None
+        self._dspark_targets = frozenset(
+            int(v) for v in (self.cfg.dspark_target_layer_ids or ()))
         self._dsv4_packed_trunk = (
             _os.environ.get("VMODEL_DSV4_PACKED_TRUNK") == "1")
         self._dsv4_expert_retain = (
@@ -2965,7 +2968,7 @@ class StreamingEngine:
             # compressed region was never attended to at any length.
             kv_all=kv_all, topk_idxs=topk)
 
-    def _deepseek_v4_ffn(self, x, w, prefix, layer):
+    def _deepseek_v4_ffn(self, x, w, prefix, layer, module_base=None):
         """MoE for one DeepSeek V4 layer, with routed experts paged on demand.
 
         Routing runs on the layer page (the gate is a small dense tensor that
@@ -3019,7 +3022,8 @@ class StreamingEngine:
 
         def routed(expert, rows, scale):
             page = pages[expert]
-            base = f"model.layers.{layer}.{self.cfg.moe_expert_prefix}.{expert}"
+            base = (f"{module_base or f'model.layers.{layer}'}"
+                    f".{self.cfg.moe_expert_prefix}.{expert}")
             return expert_swiglu(
                 rows, page[f"{base}.w1.weight"], page[f"{base}.w2.weight"],
                 page[f"{base}.w3.weight"],
@@ -3036,7 +3040,7 @@ class StreamingEngine:
         out = shared(flat).astype(mx.float32)
         for start in range(0, len(expert_ids), batch):
             group = expert_ids[start:start + batch]
-            pages.update(self._fetch_experts(layer, group))
+            pages.update(self._fetch_experts(layer, group, module_base))
             loaded.extend(group)
             out = out + moe_combine(
                 flat[None], routed, weights, indices, None,
@@ -3050,13 +3054,15 @@ class StreamingEngine:
             for expert in group:
                 pages.pop(expert, None)
                 if not self._dsv4_expert_retain:
+                    scope = (module_base.replace(".", "_") if module_base
+                             else f"layer.{layer}")
                     # Dropping every expert immediately is what bounds the
                     # resident set when pages are dequantized bf16 (50.3MB
                     # each, so one sweep is ~17GB and no cache can hold it).
                     # Under the native MXFP4 path a page is 12.6MB and a whole
                     # sweep is ~4.3GB, which a large budget CAN retain -- so
                     # the drop becomes the only thing preventing reuse.
-                    self.cache.discard(f"layer.{layer}.expert.{expert}")
+                    self.cache.discard(f"{scope}.expert.{expert}")
         return out.reshape(x.shape).astype(x.dtype)
 
     def _plan_trunk_pin_layers(self, num_layers: int) -> int:
@@ -3125,6 +3131,174 @@ class StreamingEngine:
                        if isinstance(value, PackedFP8) else value)
                 for name, value in page.items()}
 
+    # ---- DSpark multi-token draft (mtp.* stages) ----------------------
+
+    def _dspark_stage_names(self, stage: int) -> list[str]:
+        return [n for n in self.store.names_with_prefix(f"mtp.{stage}.")
+                if f".{self.cfg.moe_expert_prefix}." not in n]
+
+    def _dspark_stage_page(self, stage: int) -> dict:
+        page = self.cache.get(f"mtp.{stage}.trunk",
+                              self._dspark_stage_names(stage))
+        if self._dsv4_packed_trunk:
+            page = self._materialize_packed_trunk(page)
+        return page
+
+    def _dspark_stage_count(self) -> int:
+        """Derived from the checkpoint, not config.
+
+        config.json's n_mtp_layers is null and num_nextn_predict_layers is a
+        different HF-compat field reading 1, while three complete stages ship.
+        """
+        count = 0
+        while self.store.names_with_prefix(f"mtp.{count}."):
+            count += 1
+        return count
+
+    def _dspark_main_x(self, stage0_page: dict, main_hidden: mx.array):
+        from .dspark import dspark_main_x
+
+        return dspark_main_x(
+            main_hidden, stage0_page["mtp.0.main_proj.weight"],
+            stage0_page["mtp.0.main_norm.weight"],
+            norm_eps=self.cfg.rms_norm_eps)
+
+    def _dspark_prefill_rings(self, kv, main_hidden: mx.array) -> None:
+        """Fill each draft stage's window ring from the prompt.
+
+        The released DSparkBlock.forward returns x unchanged at start_pos == 0
+        and only warms its attention cache, so this runs the KV half of each
+        stage over the whole prompt and never its MoE -- cheap, and without it
+        the first draft attends over an empty ring.
+        """
+        from .deepseek_v4 import apply_rope_interleaved, window_ring_write, yarn_freqs
+
+        stages = self._dspark_stage_count()
+        if stages == 0:
+            return
+        pages = [self._dspark_stage_page(i) for i in range(stages)]
+        main_x = self._dspark_main_x(pages[0], main_hidden)
+        rope_dim = self.cfg.rope_head_dim
+        window = self.cfg.window_size
+        seq = main_x.shape[1]
+        cos, sin = yarn_freqs(rope_dim, seq, 0, self.cfg.rope_theta, 1.0, 32, 1)
+
+        rings = getattr(kv, "dspark_rings", None)
+        if rings is None:
+            rings = {}
+            kv.dspark_rings = rings
+        for stage in range(stages):
+            page = pages[stage]
+            prefix = f"mtp.{stage}.attn"
+            kvp = mx.fast.rms_norm(
+                main_x.astype(page[f"{prefix}.wkv.weight"].dtype)
+                @ page[f"{prefix}.wkv.weight"].T,
+                page[f"{prefix}.kv_norm.weight"], self.cfg.rms_norm_eps)
+            tail = apply_rope_interleaved(kvp[..., -rope_dim:], cos, sin)
+            kvp = mx.concatenate([kvp[..., :-rope_dim], tail], axis=-1)
+            ring = rings.get(stage)
+            if ring is None:
+                ring = mx.zeros((main_x.shape[0], window, self.cfg.head_dim),
+                                dtype=kvp.dtype)
+            rings[stage] = window_ring_write(ring, kvp, 0, window)
+            mx.eval(rings[stage])
+
+    def _dspark_draft(self, kv, main_hidden: mx.array, current_token: int,
+                      position: int) -> list[int]:
+        """Propose dspark_block_size tokens from one draft pass.
+
+        Costs three stages against the target's 43, and every stage reuses the
+        target's own expert paging, so a proposal is roughly 8% of a target
+        sweep. Returns [] when drafting is not possible at this position.
+        """
+        from .dspark import (draft_input_ids, dspark_attention,
+                             dspark_sample_block, run_dspark_stage)
+        from .deepseek_v4 import hc_head, yarn_freqs
+
+        block = self.cfg.dspark_block_size
+        window = self.cfg.window_size
+        if position <= 0 or block <= 0:
+            return []
+
+        stages = self._dspark_stage_count()
+        if stages == 0:
+            return []
+        pages = [self._dspark_stage_page(i) for i in range(stages)]
+        main_x = self._dspark_main_x(pages[0], main_hidden)
+
+        ids = draft_input_ids(current_token, block,
+                              self.cfg.dspark_noise_token_id)
+        x = self._embed([int(v) for v in ids[0].tolist()])
+        x = mx.broadcast_to(x[:, :, None, :],
+                            (x.shape[0], x.shape[1], self.cfg.hc_mult,
+                             x.shape[2]))
+
+        rope_dim = self.cfg.rope_head_dim
+        # Draft stages are window-only (the released DSparkAttention asserts
+        # compress_ratio == 0), so the base theta applies, never the
+        # compressed one.
+        cos, sin = yarn_freqs(rope_dim, position + 1 + block, 0,
+                              self.cfg.rope_theta, 1.0, 32, 1)
+        rings = getattr(kv, "dspark_rings", None)
+        if rings is None:
+            rings = {}
+            kv.dspark_rings = rings
+
+        for stage in range(stages):
+            page = pages[stage]
+            prefix = f"mtp.{stage}.attn"
+            ring = rings.get(stage)
+            if ring is None:
+                ring = mx.zeros((x.shape[0], window, self.cfg.head_dim),
+                                dtype=x.dtype)
+
+            def attention(t, _p=page, _pre=prefix, _r=ring, _s=stage):
+                out, updated = dspark_attention(
+                    t, main_x, _p, _pre, ring=_r, start_pos=position,
+                    heads=self.cfg.num_attention_heads,
+                    head_dim=self.cfg.head_dim, rope_head_dim=rope_dim,
+                    q_lora_rank=self.cfg.q_lora_rank,
+                    o_lora_rank=self.cfg.o_lora_rank,
+                    n_groups=self.cfg.o_groups,
+                    norm_eps=self.cfg.rms_norm_eps, window=window,
+                    cos=cos[position + 1:], sin=sin[position + 1:],
+                    main_cos=cos[position:position + 1],
+                    main_sin=sin[position:position + 1])
+                rings[_s] = updated
+                return out
+
+            hc = {name: page[f"mtp.{stage}.hc_{name}"]
+                  for name in ("attn_fn", "attn_scale", "attn_base",
+                               "ffn_fn", "ffn_scale", "ffn_base")}
+            norms = {"attn": page[f"mtp.{stage}.attn_norm.weight"],
+                     "ffn": page[f"mtp.{stage}.ffn_norm.weight"]}
+            x = run_dspark_stage(
+                x, hc, norms, attention,
+                lambda t, _p=page, _s=stage: self._deepseek_v4_ffn(
+                    t, _p, f"mtp.{_s}", 0, module_base=f"mtp.{_s}"),
+                hc_mult=self.cfg.hc_mult, norm_eps=self.cfg.rms_norm_eps,
+                sinkhorn_iters=self.cfg.hc_sinkhorn_iters,
+                hc_eps=self.cfg.hc_eps)
+            mx.eval(x, rings[stage])
+
+        last = pages[stages - 1]
+        base = f"mtp.{stages - 1}"
+        reduced = hc_head(x, last[f"{base}.hc_head_fn"],
+                          last[f"{base}.hc_head_scale"],
+                          last[f"{base}.hc_head_base"],
+                          norm_eps=self.cfg.rms_norm_eps,
+                          eps=self.cfg.hc_eps)
+        normed = mx.fast.rms_norm(reduced, last[f"{base}.norm.weight"],
+                                  self.cfg.rms_norm_eps)
+        logits = normed.astype(mx.float32) @ self._lm_head_weight().astype(
+            mx.float32).T
+        drafted, _embeds = dspark_sample_block(
+            logits, current_token,
+            last[f"{base}.markov_head.markov_w1.weight"],
+            last[f"{base}.markov_head.markov_w2.weight"])
+        return drafted
+
+
     # ---- DeepSeek V4 exact-prompt state reuse -------------------------
 
     def _dsv4_snapshot_copy(self, kv):
@@ -3183,12 +3357,20 @@ class StreamingEngine:
         kv.dsv4_cstate = states
         kv.dsv4_pos = snapshot["pos"]
 
-    def _fetch_experts(self, layer: int, expert_ids: list[int]) -> dict[int, dict]:
-        """Fetch one lifetime-bounded expert batch; routing was recorded already."""
+    def _fetch_experts(self, layer: int, expert_ids: list[int],
+                       module_base: str | None = None) -> dict[int, dict]:
+        """Fetch one lifetime-bounded expert batch; routing was recorded already.
+
+        ``module_base`` overrides the ``model.layers.{layer}`` prefix so the
+        DSpark draft stages, which live under ``mtp.{stage}``, reuse this exact
+        paging path rather than a parallel one.
+        """
         items = []
         n_missing = 0
+        base = module_base or f"model.layers.{layer}"
+        cache_scope = module_base.replace(".", "_") if module_base else f"layer.{layer}"
         for e in expert_ids:
-            key = f"layer.{layer}.expert.{e}"
+            key = f"{cache_scope}.expert.{e}"
             if self.cache.contains(key):
                 self.expert_hits += 1
             else:
@@ -3197,7 +3379,7 @@ class StreamingEngine:
             items.append((
                 key,
                 self.store.names_with_prefix(
-                    f"model.layers.{layer}.{self.cfg.moe_expert_prefix}.{e}."),
+                    f"{base}.{self.cfg.moe_expert_prefix}.{e}."),
             ))
         if self.governor is not None and n_missing:
             # Reserve only the pages that can coexist in THIS compute batch.
@@ -3216,7 +3398,7 @@ class StreamingEngine:
             profiler.record_expert_fetch(
                 layer, pages=len(expert_ids), misses=n_missing,
                 wall_s=elapsed)
-        return {e: pages[f"layer.{layer}.expert.{e}"] for e in expert_ids}
+        return {e: pages[f"{cache_scope}.expert.{e}"] for e in expert_ids}
 
     def _get_experts(self, layer: int, expert_ids: list[int],
                      positions: dict[int, list[int]] | None = None) -> dict[int, dict]:
@@ -3832,6 +4014,11 @@ class StreamingEngine:
                     norm_eps=self.cfg.rms_norm_eps,
                     sinkhorn_iters=self.cfg.hc_sinkhorn_iters,
                     hc_eps=self.cfg.hc_eps)
+                if self._dspark_capture is not None and i in self._dspark_targets:
+                    # The released target appends h.mean(dim=2) -- the mean over
+                    # the hyper-connection streams, NOT the hc_pre reduction --
+                    # after each target layer, in dspark_target_layer_ids order.
+                    self._dspark_capture.append(mx.mean(hc_stream, axis=2))
                 # Materialize per layer. The gathered sparse-attention operand
                 # is [1, positions, window + compressed, head_dim] -- about
                 # 124MB at a 300-position prompt -- and left lazy every

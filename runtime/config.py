@@ -168,6 +168,14 @@ class ModelConfig:
     # normalization with hc_sinkhorn_iters iterations.
     hc_mult: int = 1
     hc_sinkhorn_iters: int = 20
+    # DSpark draft (mtp.* stages). Stage count is derived from the checkpoint,
+    # not from config: `n_mtp_layers` is null in the released config.json while
+    # three complete stages ship, and `num_nextn_predict_layers` is a
+    # different, HF-compatibility field that reads 1.
+    dspark_block_size: int = 5
+    dspark_noise_token_id: int = 0
+    dspark_markov_rank: int = 256
+    dspark_target_layer_ids: tuple = ()
     hc_eps: float = 1e-6
     o_lora_rank: int = 0
     o_groups: int = 1
@@ -619,6 +627,11 @@ class ModelConfig:
             # applied Kimi Linear's naming to kimi_k25/kimi_k2 as well.
             hc_mult=raw.get("hc_mult", 1),
             hc_sinkhorn_iters=raw.get("hc_sinkhorn_iters", 20),
+            dspark_block_size=int(raw.get("dspark_block_size", 5)),
+            dspark_noise_token_id=int(raw.get("dspark_noise_token_id", 0)),
+            dspark_markov_rank=int(raw.get("dspark_markov_rank", 256)),
+            dspark_target_layer_ids=tuple(
+                raw.get("dspark_target_layer_ids") or ()),
             hc_eps=raw.get("hc_eps", 1e-6),
             o_lora_rank=raw.get("o_lora_rank", 0),
             o_groups=raw.get("o_groups", 1),
