@@ -120,3 +120,39 @@ def test_packed_path_is_opt_in_by_default(monkeypatch):
     assert 'VMODEL_DSV4_NATIVE_MXFP4' in source
     assert 'self.dsv4_native_mxfp4 = os.environ.get(' in source, (
         "the packed path must be gated on an explicit environment opt-in")
+
+
+@realmodel
+def test_fp8_block_dequant_is_unchanged_by_the_broadcast_form():
+    """The trunk dequant must stay bit-identical after dropping mx.repeat.
+
+    The repeat form materialized the scale at full weight shape before
+    multiplying; the broadcast form exposes the block axes instead. That is a
+    scheduling change only, so equality here is exact, not approximate.
+    """
+    import mlx.core as mx
+    import numpy as np
+
+    from runtime.quant import (_broadcast_block_scale, decode_e8m0_scale,
+                               dequantize_deepseek_v4_fp8)
+
+    rng = np.random.default_rng(7)
+    packed = mx.array(rng.integers(0, 255, (512, 256), dtype=np.uint8))
+    scale = mx.array(rng.integers(118, 136, (4, 2)).astype(np.uint8))
+
+    values = mx.from_fp8(packed, mx.float32)
+    expected = (values * _broadcast_block_scale(
+        decode_e8m0_scale(scale), values.shape)).astype(mx.bfloat16)
+    got = dequantize_deepseek_v4_fp8(packed, scale)
+    mx.eval(expected, got)
+    assert bool(mx.all(expected == got)), "broadcast form changed a value"
+
+
+def test_fp8_block_dequant_still_rejects_a_mismatched_scale():
+    import mlx.core as mx
+
+    from runtime.quant import dequantize_deepseek_v4_fp8
+
+    with pytest.raises(ValueError, match="exact multiple"):
+        dequantize_deepseek_v4_fp8(mx.zeros((10, 8), mx.uint8),
+                                   mx.zeros((3, 2), mx.uint8))
