@@ -1597,6 +1597,8 @@ class StreamingEngine:
         self._dspark_capture = None
         self._dspark_targets = frozenset(
             int(v) for v in (self.cfg.dspark_target_layer_ids or ()))
+        self._dsv4_chunked_prefill_ok = (
+            _os.environ.get("VMODEL_DSV4_CHUNKED_PREFILL") == "1")
         self._dsv4_fused_fp8 = (
             _os.environ.get("VMODEL_DSV4_FUSED_FP8") == "1"
             and _os.environ.get("VMODEL_DSV4_PACKED_TRUNK") == "1")
@@ -2887,13 +2889,13 @@ class StreamingEngine:
             # Speculative verification is unaffected: its blocks are
             # dspark_block_size (5) positions, far inside the window, and are
             # separately validated byte-identical.
-            raise NotImplementedError(
-                f"DeepSeek V4 chunked prefill is not correct past the first "
-                f"chunk: this sweep has {x.shape[1]} positions at offset "
-                f"{offset}, beyond the {window}-slot window, so history older "
-                f"than the window would be read from an untested compressed "
-                f"gather. Raise prefill_chunk_size above the prompt length "
-                f"(and lower pin_trunk_budget_mb if that runs out of memory).")
+            if not self._dsv4_chunked_prefill_ok:
+                raise NotImplementedError(
+                    f"DeepSeek V4 chunked prefill is disabled: this sweep has "
+                    f"{x.shape[1]} positions at offset {offset}, beyond the "
+                    f"{window}-slot window. Set VMODEL_DSV4_CHUNKED_PREFILL=1 "
+                    f"to allow it, or raise prefill_chunk_size above the "
+                    f"prompt length.")
         if not block_decode:
             rings[layer] = window_ring_write(ring, latent, offset, window)
         # Materialize the ring. window_ring_write is a concat around the
@@ -3023,14 +3025,28 @@ class StreamingEngine:
             seed = CompressorState(
                 ratio, head_dim, batch=x.shape[0], dtype=mx.float32)
             remainder = x.shape[1] % ratio
-            if remainder:
+            # Replay enough of the tail that the state matches what continuous
+            # processing would hold. At ratio 4 the compressor is OVERLAPPING:
+            # it keeps the previous complete group alongside the partial one,
+            # so seeding only the remainder leaves the overlap half zeroed --
+            # and when the prompt divides evenly the remainder is zero and
+            # NOTHING was seeded at all. The next chunk then pooled its first
+            # group without the overlap context, which is why chunked prefill
+            # diverged from a single sweep. Non-overlapping ratios genuinely
+            # need only the partial group.
+            replay = remainder + (ratio if seed.overlap else 0)
+            replay = min(replay, x.shape[1])
+            if replay:
                 cw = w[f"{prefix}.attn.compressor.wkv.weight"]
                 cg = w[f"{prefix}.attn.compressor.wgate.weight"]
-                tail = x[:, -remainder:]
-                kv_tail = tail.astype(mx.float32) @ cw.astype(mx.float32).T
-                sc_tail = tail.astype(mx.float32) @ cg.astype(mx.float32).T
-                base = x.shape[1] - remainder
-                for step in range(remainder):
+                tail = x[:, -replay:]
+                kv_tail = (tail.astype(cw.dtype) @ cw.T).astype(mx.float32)
+                sc_tail = (tail.astype(cg.dtype) @ cg.T).astype(mx.float32)
+                base = x.shape[1] - replay
+                for step in range(replay):
+                    # Any entry emitted here was already emitted by
+                    # compress_prefill above; the replay exists for the state
+                    # it leaves behind, not for its output.
                     seed.step(kv_tail[:, step:step + 1],
                               sc_tail[:, step:step + 1], base + step,
                               w[f"{prefix}.attn.compressor.ape"])

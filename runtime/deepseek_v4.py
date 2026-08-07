@@ -193,9 +193,17 @@ def block_decode_topk_idxs(window_size: int, seqlen: int, start_pos: int
     visible = (ring_positions[None, :] >= mx.maximum(lower, 0)[:, None])
     ring = mx.where(visible, ring_positions[None, :] % window_size, -1)
 
+    # Causal AND window-bounded. Causality alone is not enough once the block
+    # is wider than the window: query i would attend to every block position
+    # up to i, which for i >= window_size is MORE history than a sliding
+    # window layer may see. That is invisible while the block is small -- a
+    # 5-position draft or an 18-position chunk never reaches the bound -- and
+    # produced rel 0.698 divergence at layer 0, a ratio-0 window-only layer,
+    # on a 600-token prompt chunked at 400.
     block = mx.arange(seqlen)
     causal = block[None, :] <= block[:, None]
-    block_idx = mx.where(causal, window_size + block[None, :], -1)
+    within = block[None, :] > (block[:, None] - window_size)
+    block_idx = mx.where(causal & within, window_size + block[None, :], -1)
     block_idx = mx.broadcast_to(block_idx, (seqlen, seqlen))
     return mx.concatenate([ring, block_idx], axis=-1).astype(mx.int32)[None]
 
@@ -904,12 +912,25 @@ def compress_topk_idxs(ratio: int, seqlen: int, start_pos: int, offset: int
     buffer with the window ring. A position may only read compressed entry
     ``< (p + 1) // ratio``; unreachable slots are ``-1``.
     """
-    if start_pos > 0:
-        return (mx.arange((start_pos + 1) // ratio)
-                + offset).astype(mx.int32)[None, None]
-    entries = seqlen // ratio
+    # One formula for every (start_pos, seqlen). The previous start_pos > 0
+    # branch returned a SINGLE row sized from start_pos alone, ignoring
+    # seqlen: correct for one decode token, wrong for a block, where each
+    # query's compressed reach grows with its own position. Chunked prefill
+    # is the only caller that arrives with both start_pos > 0 and seqlen > 1,
+    # and it diverged from the single-chunk path by rel 0.079 in the logits
+    # on a 118-token prompt split at 100 -- enough to change the answer on
+    # longer prompts, where three chunk sizes produced three different
+    # continuations and none answered the question.
+    #
+    # Reduces to the previous behaviour on both tested shapes: at
+    # start_pos == 0 the entry count and mask are unchanged, and at
+    # seqlen == 1 the row is (start_pos + 1) // ratio wide with nothing
+    # masked, which is what the released generator produces.
+    entries = (start_pos + seqlen) // ratio
+    if entries <= 0:
+        return mx.zeros((1, seqlen, 0), dtype=mx.int32)
     columns = mx.broadcast_to(mx.arange(entries)[None, :], (seqlen, entries))
-    reach = (mx.arange(1, seqlen + 1) // ratio)[:, None]
+    reach = ((start_pos + mx.arange(1, seqlen + 1)) // ratio)[:, None]
     return mx.where(columns >= reach, -1,
                     columns + offset).astype(mx.int32)[None]
 

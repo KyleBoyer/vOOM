@@ -122,3 +122,43 @@ def test_ratio_four_uses_the_split_feature_halves():
     assert out is not None
     assert out.shape == (1, 1, HEAD_DIM)
     assert np.isfinite(np.array(out)).all()
+
+
+def test_prefill_must_seed_the_overlap_half_not_only_the_remainder():
+    """The released prefill seeds BOTH halves; seeding one is a real bug.
+
+    From the checkpoint's own Compressor.forward, start_pos == 0 branch:
+
+        if overlap and cutoff >= ratio:
+            self.kv_state[:bsz, :ratio] = kv[:, cutoff-ratio : cutoff]
+            self.score_state[:bsz, :ratio] = score[:, cutoff-ratio:cutoff] + ape
+        if remainder > 0:
+            ... kv_state[:bsz, offset : offset+remainder] = <remainder>
+
+    Our engine seeded only the remainder, so the overlap half stayed zeroed on
+    every request -- and when the prompt divided evenly by the ratio, nothing
+    was seeded at all. Decode then pooled its first group without the previous
+    group's overlap context.
+
+    Asserted here as the property the engine's replay must reproduce: after
+    consuming a whole group, the overlap half holds it and is not zero.
+    """
+    import mlx.core as mx
+    import numpy as np
+
+    from runtime.deepseek_v4 import CompressorState
+
+    ratio, head_dim = 4, 8
+    state = CompressorState(ratio, head_dim, batch=1, dtype=mx.float32)
+    assert state.overlap, "ratio 4 must be the overlapping scheme"
+
+    rng = np.random.default_rng(0)
+    ape = mx.zeros((ratio, 2 * head_dim), mx.float32)
+    for position in range(ratio):
+        row = mx.array(rng.normal(size=(1, 1, 2 * head_dim)).astype(np.float32))
+        state.step(row, row, position, ape)
+
+    overlap_half = np.array(state.kv_state[:, :ratio])
+    assert np.abs(overlap_half).max() > 0, (
+        "after a complete group the overlap half is still zero, so a decode "
+        "seeded from this state would pool without overlap context")

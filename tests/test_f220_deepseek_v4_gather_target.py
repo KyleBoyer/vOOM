@@ -208,3 +208,44 @@ def test_block_gather_masks_negative_positions_early_in_the_sequence():
             position = 2 - WINDOW + j
             if position < 0:
                 assert slot == -1, "an unwritten position was addressed"
+
+
+def test_block_gather_never_exceeds_the_window():
+    """A sliding-window layer may see at most window_size positions.
+
+    Causality alone does not give this once the block is wider than the
+    window: query i would take every block position up to i. Small blocks
+    never reach the bound, which is why a 5-position draft and an
+    18-position chunk both looked correct while a 200-position chunk
+    diverged by rel 0.698 at a ratio-0 layer.
+    """
+    import mlx.core as mx
+
+    from runtime.deepseek_v4 import block_decode_topk_idxs
+
+    start, seqlen = 400, 200          # block far wider than WINDOW
+    idxs = np.array(block_decode_topk_idxs(WINDOW, seqlen, start))[0]
+    for i in range(seqlen):
+        visible = int((idxs[i] >= 0).sum())
+        assert visible <= WINDOW, (
+            f"query {i} sees {visible} positions, more than the "
+            f"{WINDOW}-slot window")
+
+
+def test_block_gather_keeps_the_newest_window_positions():
+    """Bounded from the correct side: drop the oldest, keep the newest."""
+    import mlx.core as mx
+
+    from runtime.deepseek_v4 import block_decode_topk_idxs
+
+    start, seqlen = 400, 200
+    idxs = np.array(block_decode_topk_idxs(WINDOW, seqlen, start))[0]
+    probe = 150                        # a query well past the window bound
+    block_part = idxs[probe, WINDOW:]
+    used = [int(v) - WINDOW for v in block_part if v >= 0]
+    assert used[-1] == probe, "query cannot see its own position"
+    assert used[0] == probe - WINDOW + 1, (
+        f"oldest visible block position is {used[0]}, expected "
+        f"{probe - WINDOW + 1}")
+    assert (np.array(idxs[probe, :WINDOW]) < 0).all(), (
+        "ring entries should be fully masked once the block covers the window")

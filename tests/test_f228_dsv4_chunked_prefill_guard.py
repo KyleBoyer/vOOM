@@ -43,7 +43,7 @@ def test_guard_names_the_remedy():
     """An error that does not say what to change is only half a guard."""
     guard = _guard_source()
     assert "prefill_chunk_size" in guard
-    assert "pin_trunk_budget_mb" in guard
+    assert "VMODEL_DSV4_CHUNKED_PREFILL" in guard
 
 
 def test_speculative_blocks_stay_below_the_threshold():
