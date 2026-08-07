@@ -2836,9 +2836,15 @@ class StreamingEngine:
                 states[layer] = state
             cw = w[f"{prefix}.attn.compressor.wkv.weight"]
             cg = w[f"{prefix}.attn.compressor.wgate.weight"]
+            # Project in the weights' own dtype and widen only the RESULT.
+            # Upcasting the weights instead allocated a float32 copy of both
+            # [1024, 4096] matrices on every decode step for every compressed
+            # layer -- about 16.8MB x 41 layers = 0.69GB per token, which is
+            # the sawtooth that remained after the ring fix. Pooling still
+            # happens in float32, which is what the released module widens for.
             pooled = state.step(
-                (x.astype(mx.float32) @ cw.astype(mx.float32).T),
-                (x.astype(mx.float32) @ cg.astype(mx.float32).T),
+                (x.astype(cw.dtype) @ cw.T).astype(mx.float32),
+                (x.astype(cg.dtype) @ cg.T).astype(mx.float32),
                 offset, w[f"{prefix}.attn.compressor.ape"])
             if pooled is not None:
                 pooled = mx.fast.rms_norm(

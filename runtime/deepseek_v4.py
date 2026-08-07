@@ -250,8 +250,10 @@ def compress_prefill(x: mx.array, wkv: mx.array, wgate: mx.array,
     if cutoff < ratio:
         return None, seqlen
 
-    values = x.astype(mx.float32) @ wkv.astype(mx.float32).T
-    scores = x.astype(mx.float32) @ wgate.astype(mx.float32).T
+    # Project in the weights' own dtype and widen the result; upcasting the
+    # weight matrices themselves allocates a full float32 copy per call.
+    values = (x.astype(wkv.dtype) @ wkv.T).astype(mx.float32)
+    scores = (x.astype(wgate.dtype) @ wgate.T).astype(mx.float32)
     values = values[:, :cutoff]
     scores = scores[:, :cutoff]
 
@@ -774,6 +776,17 @@ class CompressorState:
         self.score_state = mx.concatenate([
             self.score_state[:, :slot], score_row[:, None],
             self.score_state[:, slot + 1:]], axis=1)
+        # Materialize before returning. These buffers are tiny -- [b, 8, 2048]
+        # float32 -- but each write concatenates around the PREVIOUS state, so
+        # left lazy they chain one graph link per decode step per layer, and
+        # every link pins its inputs: the projections that produced kv_row and
+        # score_row, and through them the compressor's own [1024, 4096] wkv and
+        # wgate matrices. That is 16.8MB per compressed layer per step, about
+        # 0.69GB per token across 41 layers, held for the life of the request
+        # and invisible to any Python-side accounting because the retained
+        # arrays have no Python wrapper. Measured: 0.52GB/token of otherwise
+        # unattributable growth, gone once these two lines evaluate.
+        mx.eval(self.kv_state, self.score_state)
 
     def step(self, kv: mx.array, score: mx.array, start_pos: int,
              ape: mx.array):
