@@ -1570,6 +1570,8 @@ class StreamingEngine:
             _os.environ.get("VMODEL_DSV4_PROMPT_SLOTS", "4"))
         self._dsv4_prompt_reuse = (
             _os.environ.get("VMODEL_DSV4_PROMPT_REUSE") == "1")
+        self._dsv4_packed_trunk = (
+            _os.environ.get("VMODEL_DSV4_PACKED_TRUNK") == "1")
         self._dsv4_expert_retain = (
             _os.environ.get("VMODEL_DSV4_EXPERT_RETAIN") == "1"
             and _os.environ.get("VMODEL_DSV4_NATIVE_MXFP4") == "1")
@@ -3106,6 +3108,23 @@ class StreamingEngine:
             f"floor)")
         return count
 
+    def _materialize_packed_trunk(self, page: dict) -> dict:
+        """Widen a packed trunk page so every consumer sees ordinary arrays.
+
+        The cache keeps these weights in their released FP8 form, which is half
+        the size of the bf16 they would otherwise occupy and therefore twice as
+        pinnable. The dequant those bytes avoided at fetch time happens here
+        instead, once per layer visit. A no-op for every other model, and for
+        DeepSeek V4 pages that were fetched dequantized.
+        """
+        from .deepseek_v4 import PackedFP8
+
+        if not any(isinstance(v, PackedFP8) for v in page.values()):
+            return page
+        return {name: (value.materialize()
+                       if isinstance(value, PackedFP8) else value)
+                for name, value in page.items()}
+
     # ---- DeepSeek V4 exact-prompt state reuse -------------------------
 
     def _dsv4_snapshot_copy(self, kv):
@@ -3738,6 +3757,8 @@ class StreamingEngine:
                     if self.governor is not None:
                         self.governor.reserve(incoming_page)
             w = self.cache.get(layer_key, layer_names)
+            if self._dsv4_packed_trunk:
+                w = self._materialize_packed_trunk(w)
             weight_wait_s = time.perf_counter() - t0
             self.timer.add("weights_wait", weight_wait_s)
 
@@ -4106,6 +4127,8 @@ class StreamingEngine:
                     if self.governor is not None:
                         self.governor.reserve(incoming_page)
             w = self.cache.get(layer_key, layer_names)
+            if self._dsv4_packed_trunk:
+                w = self._materialize_packed_trunk(w)
             weight_wait_s = time.perf_counter() - t0
             self.timer.add("weights_wait", weight_wait_s)
 
@@ -4241,6 +4264,8 @@ class StreamingEngine:
                     if self.governor is not None:
                         self.governor.reserve(incoming_page)
             w = self.cache.get(layer_key, layer_names)
+            if self._dsv4_packed_trunk:
+                w = self._materialize_packed_trunk(w)
             weight_wait_s = time.perf_counter() - t0
             self.timer.add("weights_wait", weight_wait_s)
 
@@ -4423,6 +4448,8 @@ class StreamingEngine:
                     if self.governor is not None:
                         self.governor.reserve(incoming_page)
             w = self.cache.get(layer_key, layer_names)
+            if self._dsv4_packed_trunk:
+                w = self._materialize_packed_trunk(w)
             weight_wait_s = time.perf_counter() - t0
             self.timer.add("weights_wait", weight_wait_s)
 
@@ -4567,6 +4594,8 @@ class StreamingEngine:
                     if self.governor is not None:
                         self.governor.reserve(incoming_page)
             w = self.cache.get(layer_key, layer_names)
+            if self._dsv4_packed_trunk:
+                w = self._materialize_packed_trunk(w)
             weight_wait_s = time.perf_counter() - t0
             self.timer.add("weights_wait", weight_wait_s)
 
@@ -4724,6 +4753,8 @@ class StreamingEngine:
                     if self.governor is not None:
                         self.governor.reserve(incoming_page)
             w = self.cache.get(layer_key, layer_names)
+            if self._dsv4_packed_trunk:
+                w = self._materialize_packed_trunk(w)
             weight_wait_s = time.perf_counter() - t0
             self.timer.add("weights_wait", weight_wait_s)
 

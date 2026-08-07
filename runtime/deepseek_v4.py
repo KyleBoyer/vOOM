@@ -573,6 +573,38 @@ class PackedExpert:
         return (*self.codes.shape[:-1], self.codes.shape[-1] * 8)
 
 
+@dataclass
+class PackedFP8:
+    """A trunk weight left in its released FP8 E4M3 form with block scales.
+
+    Unlike the routed experts there is no MLX kernel that consumes this
+    layout directly -- the scales are 128x128 blocks, not per-group-32 -- so
+    this is not about avoiding the dequant. It is about what the CACHE holds.
+    Dequantized, the trunk is 12.9GB and only 11 of 43 layers fit a 2500MB
+    pin; packed it is 6.17GB and the whole trunk becomes pinnable, which
+    turns 6.73GB of per-token reads into per-token dequant at 4.63GB/s.
+
+    Materialized once per layer visit at the single point the engine takes a
+    layer page, so every consumer still sees an ordinary array.
+    """
+
+    packed: mx.array
+    scale: mx.array
+
+    @property
+    def nbytes(self) -> int:
+        return self.packed.nbytes + self.scale.nbytes
+
+    @property
+    def shape(self) -> tuple[int, ...]:
+        return tuple(self.packed.shape)
+
+    def materialize(self) -> mx.array:
+        from .quant import dequantize_deepseek_v4_fp8
+
+        return dequantize_deepseek_v4_fp8(self.packed, self.scale)
+
+
 def expert_swiglu(x: mx.array, w1, w2, w3, *,
                   swiglu_limit: float = 0.0,
                   weights: mx.array | None = None) -> mx.array:

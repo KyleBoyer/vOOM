@@ -233,6 +233,12 @@ class WeightStore:
         # released-model corpus passes, not just the probes that found it.
         self.dsv4_native_mxfp4 = os.environ.get(
             "VMODEL_DSV4_NATIVE_MXFP4") == "1"
+        # Keep trunk FP8 weights packed in the cache and widen them at use.
+        # Halves what a pinned trunk layer costs, which is the whole point:
+        # the pin planner sizes on disk bytes, so packed storage also makes
+        # its plan match reality instead of undercounting by 1.92x.
+        self.dsv4_packed_trunk = os.environ.get(
+            "VMODEL_DSV4_PACKED_TRUNK") == "1"
         if (
             self.bf16_nf12_uncached_reads
             and self._bf16_nf12_sidecar_request is None
@@ -1813,7 +1819,7 @@ class WeightStore:
                     sidecar_pool.shutdown(wait=True)
                     sidecar_pool = None
                 if self._dsv4_aux:
-                    from .deepseek_v4 import PackedExpert
+                    from .deepseek_v4 import PackedExpert, PackedFP8
                     from .quant import (dequantize_deepseek_v4_fp4,
                                         dequantize_deepseek_v4_fp8)
 
@@ -1843,6 +1849,9 @@ class WeightStore:
                                 continue
                             joined[name] = dequantize_deepseek_v4_fp4(
                                 weight, scale)
+                        elif self.dsv4_packed_trunk:
+                            joined[name] = PackedFP8(weight, scale)
+                            continue
                         else:
                             joined[name] = dequantize_deepseek_v4_fp8(
                                 weight, scale)

@@ -156,3 +156,57 @@ def test_fp8_block_dequant_still_rejects_a_mismatched_scale():
     with pytest.raises(ValueError, match="exact multiple"):
         dequantize_deepseek_v4_fp8(mx.zeros((10, 8), mx.uint8),
                                    mx.zeros((3, 2), mx.uint8))
+
+
+def test_packed_fp8_reports_packed_bytes_and_logical_shape():
+    """A packed trunk page must cost its FP8 bytes, not its bf16 bytes.
+
+    The pin planner sizes on disk bytes while the cache holds what the
+    transform produced. Dequantized, those disagree by 1.92x and the planner
+    silently undercounts; packed, they agree.
+    """
+    import mlx.core as mx
+
+    from runtime.deepseek_v4 import PackedFP8
+
+    packed = mx.zeros((4096, 4096), mx.uint8)
+    scale = mx.zeros((32, 32), mx.uint8)
+    held = PackedFP8(packed, scale)
+    assert held.shape == (4096, 4096)
+    assert held.nbytes == packed.nbytes + scale.nbytes
+    # bf16 would be twice the payload; that difference is the whole point.
+    assert held.nbytes < 4096 * 4096 * 2
+
+
+@realmodel
+def test_materializing_a_packed_page_matches_the_eager_dequant():
+    import mlx.core as mx
+
+    from runtime.deepseek_v4 import PackedFP8
+    from runtime.quant import dequantize_deepseek_v4_fp8
+
+    index = json.loads(
+        (MODEL / "model.safetensors.index.json").read_text())["weight_map"]
+    name = "model.layers.20.attn.wq_a.weight"
+    key = name if name in index else name.replace("model.", "")
+    shard = mx.load(str(MODEL / index[key]))
+    weight = shard[key]
+    scale = shard[key.replace(".weight", ".scale")]
+    assert str(weight.dtype).endswith("uint8")
+
+    eager = dequantize_deepseek_v4_fp8(weight, scale)
+    lazy = PackedFP8(weight, scale).materialize()
+    mx.eval(eager, lazy)
+    assert bool(mx.all(eager == lazy)), (
+        "deferring the trunk dequant changed a value")
+
+
+def test_materialize_helper_passes_through_ordinary_pages():
+    """Must be a no-op for every other model and for eager DeepSeek V4 pages."""
+    import mlx.core as mx
+
+    from runtime.engine import StreamingEngine
+
+    engine = StreamingEngine.__new__(StreamingEngine)
+    page = {"a": mx.zeros((2, 2)), "b": mx.ones((3,))}
+    assert engine._materialize_packed_trunk(page) is page
