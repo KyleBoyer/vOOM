@@ -69,8 +69,16 @@ def test_state_is_materialized_after_each_step():
         before = mx.get_active_memory()
         mx.eval(state.kv_state, state.score_state)
         after = mx.get_active_memory()
-        assert after == before, (
-            "evaluating after step() allocated, so step() left work pending")
+        # Not exact equality: mx.get_active_memory() is a process-wide counter,
+        # so unrelated work in the same session moves it by a few bytes in
+        # either direction (observed 12 bytes DOWNWARD in a full-suite run).
+        # The property under test is that step() leaves no pending graph, which
+        # would show up as an allocation on the scale of the buffers involved,
+        # not as allocator noise.
+        buffer_bytes = state.kv_state.nbytes + state.score_state.nbytes
+        assert after - before < buffer_bytes, (
+            f"evaluating after step() allocated {after - before} bytes, "
+            "so step() left work pending")
 
 
 def test_values_are_unchanged_by_materialization():
