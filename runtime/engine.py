@@ -1563,6 +1563,13 @@ class StreamingEngine:
         # lands on the dense resident estimate here.
         import os as _os
 
+        from collections import OrderedDict as _OrderedDict
+
+        self._dsv4_snapshots: dict = _OrderedDict()
+        self._dsv4_snapshot_slots = int(
+            _os.environ.get("VMODEL_DSV4_PROMPT_SLOTS", "4"))
+        self._dsv4_prompt_reuse = (
+            _os.environ.get("VMODEL_DSV4_PROMPT_REUSE") == "1")
         self._dsv4_expert_retain = (
             _os.environ.get("VMODEL_DSV4_EXPERT_RETAIN") == "1"
             and _os.environ.get("VMODEL_DSV4_NATIVE_MXFP4") == "1")
@@ -3098,6 +3105,64 @@ class StreamingEngine:
             f"{required_reserve / 1e9:.3f}GB is the mandatory expert-batch "
             f"floor)")
         return count
+
+    # ---- DeepSeek V4 exact-prompt state reuse -------------------------
+
+    def _dsv4_snapshot_copy(self, kv):
+        """Detach a reusable copy of this request's DeepSeek V4 prompt state.
+
+        Decode rebinds dict entries and CompressorState attributes rather than
+        mutating arrays in place, so sharing the ARRAYS is safe while sharing
+        the CONTAINERS is not: the next request would advance the snapshot's
+        own ring. Copy every container, share every array.
+        """
+        from .deepseek_v4 import CompressorState
+
+        states = {}
+        for layer, state in (getattr(kv, "dsv4_cstate", None) or {}).items():
+            clone = CompressorState.__new__(CompressorState)
+            clone.__dict__.update(state.__dict__)
+            states[layer] = clone
+        return {
+            "rings": dict(getattr(kv, "dsv4_rings", None) or {}),
+            "compressed": dict(getattr(kv, "dsv4_compressed", None) or {}),
+            "cstate": states,
+            "pos": int(getattr(kv, "dsv4_pos", 0)),
+        }
+
+    def _dsv4_snapshot_store(self, tokens, kv, logits) -> None:
+        if not getattr(kv, "dsv4_rings", None):
+            return
+        snapshot = self._dsv4_snapshot_copy(kv)
+        snapshot["logits"] = logits
+        key = tuple(int(t) for t in tokens)
+        self._dsv4_snapshots[key] = snapshot
+        # Bounded, newest-first. Each entry is ~20MB of state plus one logits
+        # row, so a handful is a few hundred MB at most.
+        while len(self._dsv4_snapshots) > self._dsv4_snapshot_slots:
+            self._dsv4_snapshots.pop(next(iter(self._dsv4_snapshots)))
+
+    def _dsv4_snapshot_lookup(self, tokens):
+        """Exact match only.
+
+        A shorter prefix cannot be served from a longer snapshot: the window
+        ring holds the LAST 128 positions, so truncating the prompt would need
+        state this snapshot no longer contains.
+        """
+        return self._dsv4_snapshots.get(tuple(int(t) for t in tokens))
+
+    def _dsv4_snapshot_restore(self, kv, snapshot) -> None:
+        from .deepseek_v4 import CompressorState
+
+        states = {}
+        for layer, state in snapshot["cstate"].items():
+            clone = CompressorState.__new__(CompressorState)
+            clone.__dict__.update(state.__dict__)
+            states[layer] = clone
+        kv.dsv4_rings = dict(snapshot["rings"])
+        kv.dsv4_compressed = dict(snapshot["compressed"])
+        kv.dsv4_cstate = states
+        kv.dsv4_pos = snapshot["pos"]
 
     def _fetch_experts(self, layer: int, expert_ids: list[int]) -> dict[int, dict]:
         """Fetch one lifetime-bounded expert batch; routing was recorded already."""
@@ -6911,6 +6976,20 @@ class StreamingEngine:
         # regardless of which of the three branches below actually ran.
         boundary_fork_tokens = 0
         boundary_fork_kv = None
+        if (exact_logits is None
+                and self.cfg.model_type == "deepseek_v4"
+                and self._dsv4_prompt_reuse):
+            # DeepSeek V4's prompt state is not a KVCache, so F37's store
+            # cannot serialize it and load_longest_prefix always misses. The
+            # whole state is small -- a 128-slot ring and a compressor carry
+            # buffer per layer, about 20MB total -- so an exact-prompt
+            # snapshot is cheap and skips the entire prefill sweep.
+            snapshot = self._dsv4_snapshot_lookup(tokens)
+            if snapshot is not None:
+                self._dsv4_snapshot_restore(kv, snapshot)
+                exact_logits = snapshot["logits"]
+                path_stats["prompt_cache_source"] = "dsv4_state"
+                path_stats["prompt_cache_prefix_tokens"] = len(tokens)
         if exact_logits is not None:
             logits = exact_logits  # exact hit: zero sweeps
             path_stats["prompt_cache_exact_hit"] = 1
@@ -7404,6 +7483,10 @@ class StreamingEngine:
                      + path_stats["tool_pic_prefill_s"])
         if self._request_profiler is not None:
             self._request_profiler.set_phase("decode")
+        if (self.cfg.model_type == "deepseek_v4"
+                and self._dsv4_prompt_reuse
+                and path_stats["prompt_cache_source"] != "dsv4_state"):
+            self._dsv4_snapshot_store(tokens, kv, logits)
         if (kv_store is not None and exact_logits is None
                 and precomputed_prompt_logits is None and matched < len(tokens)):
             write_t0 = time.perf_counter()
