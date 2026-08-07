@@ -2872,6 +2872,28 @@ class StreamingEngine:
         # block first destroys window entries the block's own earlier queries
         # still need. See block_decode_topk_idxs.
         block_decode = offset > 0 and x.shape[1] > 1
+        if block_decode and x.shape[1] > window:
+            # Chunked prefill past the first chunk is NOT correct for this
+            # model and must not run silently.
+            #
+            # Measured on a 1550-token prompt ending in a question: one chunk
+            # answers it, two chunks and four chunks each produce a DIFFERENT
+            # continuation of the filler text and neither answers. Positions
+            # older than the 128-slot window are reachable only through the
+            # compressed region, and compress_topk_idxs has never been
+            # exercised at start_pos > 0 with seqlen > 1 -- F214 covers
+            # (0, many) and (many, 1), not (many, many).
+            #
+            # Speculative verification is unaffected: its blocks are
+            # dspark_block_size (5) positions, far inside the window, and are
+            # separately validated byte-identical.
+            raise NotImplementedError(
+                f"DeepSeek V4 chunked prefill is not correct past the first "
+                f"chunk: this sweep has {x.shape[1]} positions at offset "
+                f"{offset}, beyond the {window}-slot window, so history older "
+                f"than the window would be read from an untested compressed "
+                f"gather. Raise prefill_chunk_size above the prompt length "
+                f"(and lower pin_trunk_budget_mb if that runs out of memory).")
         if not block_decode:
             rings[layer] = window_ring_write(ring, latent, offset, window)
         # Materialize the ring. window_ring_write is a concat around the
