@@ -4904,6 +4904,144 @@ class StreamingEngine:
         self._restore_aggregate_layer_transient(total)
         return x
 
+    def _layer_stationary_deepseek_v4_sweep(
+            self, x: mx.array, kv, offset: int, tile_width: int,
+            on_progress=None) -> mx.array:
+        """Layer-major prefill for DeepSeek V4.
+
+        Chunk-major prefill re-sweeps all 43 layers for every chunk, so a
+        51,220-token harness prompt at chunk 384 costs 134 full passes over
+        the model. Layer-major fetches each layer exactly once regardless of
+        prompt length, which is the difference between correct and usable.
+
+        Same split every other layer-stationary runner uses: attention runs
+        per TILE, because the window ring and the compressor recurrence must
+        see positions in causal order, while the MoE half runs ONCE per layer
+        over every position. Routing is a function of its input alone, so
+        evaluating it once on all positions rather than once per chunk on a
+        subset is the same function on the union of its arguments.
+
+        The per-tile position must be published on the cache before each
+        attention call: _deepseek_v4_attention reads kv.dsv4_sweep_pos rather
+        than kv.offset, since this attention owns its own ring and never calls
+        kv.update(). Setting it once per sweep -- correct for chunk-major --
+        would run every tile at the first tile's position.
+        """
+        from .deepseek_v4 import (deepseek_v4_attention_residual,
+                                  deepseek_v4_ffn_residual)
+
+        if tile_width <= 0:
+            raise ValueError("tile_width must be positive")
+        n = self.cfg.num_hidden_layers
+        total = int(x.shape[1])
+        (self._layer_transient,
+         self._layer_transient_margin) = _layer_transient_for_positions(
+             total,
+             getattr(self, "_prefill_layer_transient_by_positions", {}
+                     ).get(total, 0),
+             getattr(self, "_decode_layer_transient", 0))
+        profiler = self._request_profiler
+        if profiler is not None:
+            profiler.begin_sweep(total, path="layer_stationary_deepseek_v4")
+
+        if offset == 0:
+            kv.dsv4_pos = 0
+        stream = mx.broadcast_to(
+            x[:, :, None, :],
+            (x.shape[0], total, self.cfg.hc_mult, x.shape[2]))
+
+        for i in range(n):
+            self._select_layer_transient(total, i)
+            if self.prefetcher:
+                for j in range(i + 1, min(i + 1 + self.rc.prefetch_depth, n)):
+                    self.prefetcher.schedule(self._layer_key(j),
+                                             self._layer_names(j))
+            cache_before = (profiler.cache_snapshot(self.cache)
+                            if profiler is not None else None)
+            t0 = time.perf_counter()
+            layer_key = self._layer_key(i)
+            layer_names = self._layer_names(i)
+            if not self.cache.contains(layer_key):
+                incoming_page = self._layer_fetch_bytes_estimate(i)
+                if incoming_page:
+                    self.cache.prepare_for(incoming_page)
+                    if self.governor is not None:
+                        self.governor.reserve(incoming_page)
+            w = self.cache.get(layer_key, layer_names)
+            if self._dsv4_packed_trunk:
+                w = self._materialize_packed_trunk(w)
+            weight_wait_s = time.perf_counter() - t0
+            self.timer.add("weights_wait", weight_wait_s)
+
+            prefix = f"model.layers.{i}"
+            hc = {name: w[f"{prefix}.hc_{name}"]
+                  for name in ("attn_fn", "attn_scale", "attn_base",
+                               "ffn_fn", "ffn_scale", "ffn_base")}
+            norms = {"attn": w[f"{prefix}.attn_norm.weight"],
+                     "ffn": w[f"{prefix}.ffn_norm.weight"]}
+            common = dict(hc_mult=self.cfg.hc_mult,
+                          norm_eps=self.cfg.rms_norm_eps,
+                          sinkhorn_iters=self.cfg.hc_sinkhorn_iters,
+                          hc_eps=self.cfg.hc_eps)
+
+            active_before = mx.get_active_memory()
+            mx.reset_peak_memory()
+            t0 = time.perf_counter()
+            tiles = []
+            pos = 0
+            while pos < total:
+                end = min(pos + tile_width, total)
+                if self.governor is not None and self._layer_transient:
+                    self.governor.reserve(
+                        self._layer_transient,
+                        margin=self._layer_transient_margin)
+                here = offset + pos
+                kv.dsv4_sweep_pos = here
+                tile = deepseek_v4_attention_residual(
+                    stream[:, pos:end], hc, norms,
+                    lambda t, _h=here: self._deepseek_v4_attention(
+                        t, w, prefix, i, kv, _h),
+                    **common)
+                mx.eval(tile)
+                tiles.append(tile)
+                pos = end
+            stream = (tiles[0] if len(tiles) == 1
+                      else mx.concatenate(tiles, axis=1))
+            del tiles
+            stream = deepseek_v4_ffn_residual(
+                stream, hc, norms,
+                lambda t: self._deepseek_v4_ffn(t, w, prefix, i), **common)
+            mx.eval(stream)
+            compute_s = time.perf_counter() - t0
+            self.timer.add("layer_compute", compute_s)
+            if profiler is not None:
+                profiler.record_layer(
+                    i, positions=total, weight_wait_s=weight_wait_s,
+                    compute_s=compute_s, cache_before=cache_before,
+                    cache_after=profiler.cache_snapshot(self.cache),
+                    layer_type=self._profile_layer_type(i))
+            if on_progress is not None:
+                on_progress({"phase": "prefill_layer",
+                             "completed_layers": i + 1, "total_layers": n,
+                             "total_tokens": total, "cache_source": "cold"})
+            self._record_layer_transient(
+                total, i,
+                _resident_adjusted_transient(
+                    active_before, mx.get_active_memory(),
+                    mx.get_peak_memory()))
+            self._note_true_peak()
+            del w
+
+        kv.dsv4_pos = offset + total
+        from .deepseek_v4 import hc_head
+
+        reduced = hc_head(stream, self._hc_head_fn, self._hc_head_scale,
+                          self._hc_head_base,
+                          norm_eps=self.cfg.rms_norm_eps,
+                          eps=self.cfg.hc_eps)
+        mx.eval(reduced)
+        return reduced
+
     def _layer_stationary_kimi_linear_sweep(
             self, x: mx.array, kv, offset: int, tile_width: int,
             on_progress=None) -> mx.array:
@@ -7484,7 +7622,10 @@ class StreamingEngine:
                     if boundary_layer_stationary:
                         bx = self._embed(list(tokens[pos:stable_boundary]))
                         if self.cfg.model_type == "kimi_linear":
-                            bx = self._layer_stationary_kimi_linear_sweep(
+                            bx = (
+                                self._layer_stationary_deepseek_v4_sweep
+                                if self.cfg.model_type == "deepseek_v4"
+                                else self._layer_stationary_kimi_linear_sweep)(
                                 bx, kv, offset=pos,
                                 tile_width=boundary_chunk,
                                 on_progress=on_progress)
@@ -7613,7 +7754,7 @@ class StreamingEngine:
                 and self.rc.layer_stationary_prefill
                 and self.cfg.model_type in (
                     "qwen3_5", "qwen3_5_moe", "gpt_oss",
-                    "kimi_linear", "kimi_k3",
+                    "kimi_linear", "kimi_k3", "deepseek_v4",
                     "glm_moe_dsa", "kimi_k25", "glm4_moe_lite")
                 and adaptive is None
                 and not (ckpt and kv_store is not None)
@@ -7627,7 +7768,7 @@ class StreamingEngine:
                     blockers.append("disabled")
                 if self.cfg.model_type not in (
                         "qwen3_5", "qwen3_5_moe", "gpt_oss",
-                        "kimi_linear", "kimi_k3",
+                        "kimi_linear", "kimi_k3", "deepseek_v4",
                         "glm_moe_dsa", "kimi_k25", "glm4_moe_lite"):
                     blockers.append("architecture")
                 if adaptive is not None:
@@ -7672,7 +7813,11 @@ class StreamingEngine:
                     watermark_continuous = (
                         hot_eligible and reusable_watermark == pos)
                     xc = self._embed(list(tokens[pos:stop_before]))
-                    if self.cfg.model_type == "kimi_linear":
+                    if self.cfg.model_type == "deepseek_v4":
+                        xc = self._layer_stationary_deepseek_v4_sweep(
+                            xc, kv, offset=pos, tile_width=chunk,
+                            on_progress=on_progress)
+                    elif self.cfg.model_type == "kimi_linear":
                         xc = self._layer_stationary_kimi_linear_sweep(
                             xc, kv, offset=pos, tile_width=chunk,
                             on_progress=on_progress)

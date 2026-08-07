@@ -817,18 +817,44 @@ def run_deepseek_v4_block(x: mx.array, hc: dict, norms: dict, attention,
     ``[b, s, dim]``, so the caller supplies paging-aware implementations and
     this function stays pure topology.
     """
-    common = dict(hc_mult=hc_mult, norm_eps=norm_eps,
-                  sinkhorn_iters=sinkhorn_iters, eps=hc_eps)
+    x = deepseek_v4_attention_residual(
+        x, hc, norms, attention, hc_mult=hc_mult, norm_eps=norm_eps,
+        sinkhorn_iters=sinkhorn_iters, hc_eps=hc_eps)
+    return deepseek_v4_ffn_residual(
+        x, hc, norms, ffn, hc_mult=hc_mult, norm_eps=norm_eps,
+        sinkhorn_iters=sinkhorn_iters, hc_eps=hc_eps)
 
+
+def deepseek_v4_attention_residual(x: mx.array, hc: dict, norms: dict,
+                                   attention, *, hc_mult: int,
+                                   norm_eps: float, sinkhorn_iters: int,
+                                   hc_eps: float) -> mx.array:
+    """The attention half of a block, hyper-connections included.
+
+    Split out so a layer-stationary prefill can run this per TILE -- the
+    window ring and compressor state must still see positions in causal
+    order -- while the FFN half runs ONCE per layer over every position.
+    Composition is unchanged: run_deepseek_v4_block is now literally these
+    two in sequence, so F212's topology oracle covers both.
+    """
     residual = x
     reduced, post, comb = hc_pre(
-        x, hc["attn_fn"], hc["attn_scale"], hc["attn_base"], **common)
+        x, hc["attn_fn"], hc["attn_scale"], hc["attn_base"], hc_mult=hc_mult,
+        norm_eps=norm_eps, sinkhorn_iters=sinkhorn_iters, eps=hc_eps)
     reduced = mx.fast.rms_norm(reduced, norms["attn"], norm_eps)
-    x = hc_post(attention(reduced), residual, post, comb)
+    return hc_post(attention(reduced), residual, post, comb)
 
+
+def deepseek_v4_ffn_residual(x: mx.array, hc: dict, norms: dict, ffn, *,
+                             hc_mult: int, norm_eps: float,
+                             sinkhorn_iters: int, hc_eps: float) -> mx.array:
+    """The MoE half of a block. Stateless in position, so it may be evaluated
+    once over all positions instead of once per chunk over a subset -- the
+    same function on the union of its arguments, not a different function."""
     residual = x
     reduced, post, comb = hc_pre(
-        x, hc["ffn_fn"], hc["ffn_scale"], hc["ffn_base"], **common)
+        x, hc["ffn_fn"], hc["ffn_scale"], hc["ffn_base"], hc_mult=hc_mult,
+        norm_eps=norm_eps, sinkhorn_iters=sinkhorn_iters, eps=hc_eps)
     reduced = mx.fast.rms_norm(reduced, norms["ffn"], norm_eps)
     return hc_post(ffn(reduced), residual, post, comb)
 
