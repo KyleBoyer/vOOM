@@ -210,3 +210,20 @@ def test_materialize_helper_passes_through_ordinary_pages():
     engine = StreamingEngine.__new__(StreamingEngine)
     page = {"a": mx.zeros((2, 2)), "b": mx.ones((3,))}
     assert engine._materialize_packed_trunk(page) is page
+
+
+def test_packed_expert_page_estimate_is_not_bf16_sized():
+    """The admission estimate must follow the representation actually held.
+
+    A bf16 estimate is 4x the packed page. That error is not merely
+    conservative: the trunk pin planner subtracts a mandatory expert batch
+    from its budget, so over-estimating experts silently costs pinned trunk
+    layers, and the governor refuses allocations for memory nothing occupies.
+    """
+    hidden, inter = 4096, 2048
+    bf16_page = 3 * hidden * inter * 2
+    packed_page = int(3 * hidden * inter * (0.5 + 1.0 / 32.0))
+    assert bf16_page == 50_331_648
+    assert packed_page < bf16_page / 3
+    # Codes plus one E8M0 byte per 32 values, and nothing else.
+    assert packed_page == int(3 * hidden * inter * 0.53125)

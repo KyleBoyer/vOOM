@@ -1527,7 +1527,15 @@ class StreamingEngine:
         # other model this project supports leaves moe_latent_hidden_size
         # at its 0 default, so this is unchanged for them).
         expert_hidden = self.cfg.moe_latent_hidden_size or self.cfg.hidden_size
-        if self.store.on_disk_quantized:
+        if getattr(self.store, "dsv4_native_mxfp4", False):
+            # A DeepSeek V4 routed expert kept in its released MXFP4 form is
+            # 4-bit codes plus one E8M0 byte per group of 32, not bf16. The
+            # bf16 figure below is 50.33MB against an actual 13.4MB, and that
+            # 4x lands twice: the governor reserves it on every expert fetch,
+            # and the trunk pin planner subtracts a whole batch of it from the
+            # pin budget, costing pinnable layers for memory nothing occupies.
+            resident_bytes_per_weight = 0.5 + 1.0 / 32.0
+        elif self.store.on_disk_quantized:
             resident_bytes_per_weight = self.store.quantized_bytes_per_weight
         elif self.store.native_ct_mxfp4:
             resident_bytes_per_weight = (
