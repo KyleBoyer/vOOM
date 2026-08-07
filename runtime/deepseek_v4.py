@@ -510,9 +510,18 @@ def attention_output_projection(o: mx.array, wo_a: mx.array, wo_b: mx.array,
     """
     b, s = o.shape[0], o.shape[1]
     grouped = o.reshape(b, s, n_groups, -1)
-    per_group = wo_a.reshape(n_groups, o_lora_rank, grouped.shape[-1])
-    codes = mx.einsum("bsgd,grd->bsgr", grouped.astype(mx.float32),
-                      per_group.astype(mx.float32))
+    if isinstance(wo_a, PackedFP8):
+        # The einsum is n_groups independent matmuls against contiguous row
+        # blocks; run each through the fused kernel instead of materializing
+        # the whole [n_groups * o_lora_rank, d] weight.
+        blocks = wo_a.row_groups(n_groups)
+        codes = mx.stack(
+            [blocks[g].matmul(grouped[:, :, g, :]) for g in range(n_groups)],
+            axis=2)
+    else:
+        per_group = wo_a.reshape(n_groups, o_lora_rank, grouped.shape[-1])
+        codes = mx.einsum("bsgd,grd->bsgr", grouped.astype(mx.float32),
+                          per_group.astype(mx.float32))
     return _packed_matmul(
         codes.reshape(b, s, n_groups * o_lora_rank), wo_b).astype(o.dtype)
 
@@ -633,6 +642,7 @@ class PackedFP8:
     packed: mx.array
     scale: mx.array
     _group_scales: mx.array | None = None
+    _row_groups: list | None = None
 
     @property
     def nbytes(self) -> int:
@@ -663,6 +673,28 @@ class PackedFP8:
             self._group_scales = mx.repeat(
                 mx.repeat(self.scale, bm, axis=0), bn // 32, axis=1)
         return self._group_scales
+
+    def row_groups(self, count: int) -> list["PackedFP8"]:
+        """Split into ``count`` equal row blocks, cached.
+
+        wo_a is stored as [n_groups * o_lora_rank, d] and consumed as a
+        grouped einsum, which is really ``count`` independent matmuls against
+        contiguous row blocks. Rows are contiguous in both the packed payload
+        and its block scales, so each block is itself a valid MXFP8 operand and
+        can take the fused path -- worth 20% of a trunk layer, the single
+        largest piece that was still materializing.
+
+        Cached because the split is per weight, not per token, and the pinned
+        page outlives the request.
+        """
+        if self._row_groups is None:
+            rows = self.packed.shape[0] // count
+            scale_rows = self.scale.shape[0] // count
+            self._row_groups = [
+                PackedFP8(self.packed[i * rows:(i + 1) * rows],
+                          self.scale[i * scale_rows:(i + 1) * scale_rows])
+                for i in range(count)]
+        return self._row_groups
 
     def matmul(self, x: mx.array) -> mx.array:
         """x @ self.T through MLX's fused MXFP8 kernel, skipping the dequant.
@@ -808,7 +840,7 @@ def deepseek_v4_attention(x: mx.array, w: dict, prefix: str, *,
     which owns the window/compressed cache.
     """
     b, s, _ = x.shape
-    q = x @ w[f"{prefix}.wq_a"].T
+    q = _packed_matmul(x, w[f"{prefix}.wq_a"])
     q = mx.fast.rms_norm(q, w[f"{prefix}.q_norm"], norm_eps)
     q = _packed_matmul(q, w[f"{prefix}.wq_b"]).reshape(b, s, heads, head_dim)
     # A weightless RMS over each head, distinct from the learned q_norm above.

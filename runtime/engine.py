@@ -1099,12 +1099,15 @@ class _HotPromptSlot:
     cache_namespace: str = "default"
 
 
-# Trunk weights consumed ONLY by a plain matmul, so MLX's fused MXFP8 kernel
-# can read the released bytes and the dequant never happens. wq_b and wo_b are
-# 40% of a trunk layer between them; wo_a is another 20% but is reshaped for
-# the grouped einsum, so it cannot take this path.
+# Trunk weights MLX's fused MXFP8 kernel can read directly, so the dequant
+# never happens. wq_b, wo_b and wo_a are 60% of a trunk layer between them;
+# wo_a reaches the kernel as n_groups contiguous row blocks rather than one
+# operand, since its grouped einsum is really that many independent matmuls.
 _DSV4_FUSED_FP8_SUFFIXES = (
+    "attn.wq_a.weight",
     "attn.wq_b.weight",
+    "attn.wkv.weight",
+    "attn.wo_a.weight",
     "attn.wo_b.weight",
     "ffn.shared_experts.w1.weight",
     "ffn.shared_experts.w2.weight",
@@ -2465,6 +2468,19 @@ class StreamingEngine:
             # F43: with S bounded <= index_topk the indexer selects every position
             # by construction — its weights can never affect output. Skip the bytes.
             names = [n for n in names if ".self_attn.indexer." not in n]
+        if self.cfg.model_type == "deepseek_v4":
+            # DeepSeek V4's Indexer is not implemented: deepseek_v4_attention
+            # never calls index_scores/index_topk_idxs, and the ratio-4 layers
+            # use the plain compressed gather instead. Its weights are 7.8% of
+            # every trunk layer -- 13.11MB read AND dequantized per layer per
+            # token to be discarded.
+            #
+            # This is elision by non-implementation, not by proof, so it is
+            # deliberately fail-loud rather than silent: the names are absent
+            # from the page, so if the Indexer path is ever wired up it raises
+            # a KeyError at the tensor it needs instead of quietly attending
+            # over a subset.
+            names = [n for n in names if ".attn.indexer." not in n]
         return names
 
     def _k3_nf12_split_layer_names(
@@ -2818,7 +2834,9 @@ class StreamingEngine:
         if ring is None:
             ring = mx.zeros((x.shape[0], window, head_dim), dtype=x.dtype)
 
-        latent = x @ w[f"{prefix}.attn.wkv.weight"].T
+        from .deepseek_v4 import _packed_matmul
+
+        latent = _packed_matmul(x, w[f"{prefix}.attn.wkv.weight"])
         latent = mx.fast.rms_norm(
             latent, w[f"{prefix}.attn.kv_norm.weight"], self.cfg.rms_norm_eps)
         rope_dim = self.cfg.rope_head_dim
