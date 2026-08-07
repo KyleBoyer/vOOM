@@ -2833,7 +2833,13 @@ class StreamingEngine:
                              "store": (getattr(kv, "dsv4_compressed", None)
                                        or {}).get(layer),
                              "cstate": None, "kv_proj": None, "sc_proj": None}
-        rings[layer] = window_ring_write(ring, latent, offset, window)
+        # Multi-position decode gathers [ring | block] and writes the ring
+        # only AFTER attention: a slot holds one position, so writing the
+        # block first destroys window entries the block's own earlier queries
+        # still need. See block_decode_topk_idxs.
+        block_decode = offset > 0 and x.shape[1] > 1
+        if not block_decode:
+            rings[layer] = window_ring_write(ring, latent, offset, window)
         # Materialize the ring. window_ring_write is a concat around the
         # previous ring, so left lazy each decode step's ring holds a reference
         # to its predecessor and the whole chain is retained: measured at
@@ -2850,8 +2856,12 @@ class StreamingEngine:
         # accidentally right only while seqlen <= window, and put compressed
         # entries at window+j while the gather list pointed at seqlen+j -- so
         # every compressed layer read unwritten slots.
-        kv_all = latent if offset == 0 else rings[layer]
-        compressed_offset = latent.shape[1] if offset == 0 else window
+        kv_all = (latent if offset == 0
+                  else (mx.concatenate([ring, latent], axis=1)
+                        if block_decode else rings[layer]))
+        compressed_offset = (
+            latent.shape[1] if offset == 0
+            else (window + x.shape[1] if block_decode else window))
         stores = getattr(kv, "dsv4_compressed", None)
         if stores is None:
             stores = {}
@@ -2972,8 +2982,24 @@ class StreamingEngine:
 
         from .deepseek_v4 import gather_indices
 
-        topk = gather_indices(window, ratio, x.shape[1], offset,
-                              compressed_offset)
+        if block_decode:
+            from .deepseek_v4 import block_decode_topk_idxs, compress_topk_idxs
+
+            topk = block_decode_topk_idxs(window, x.shape[1], offset)
+            if ratio:
+                compressed = compress_topk_idxs(
+                    ratio, x.shape[1], offset, compressed_offset)
+                if compressed.shape[1] != topk.shape[1]:
+                    # Same broadcast gather_indices performs: the compressed
+                    # generator can return one row when every query in the
+                    # block sees the same compressed entries.
+                    compressed = mx.broadcast_to(
+                        compressed, (compressed.shape[0], topk.shape[1],
+                                     compressed.shape[2]))
+                topk = mx.concatenate([topk, compressed], axis=-1)
+        else:
+            topk = gather_indices(window, ratio, x.shape[1], offset,
+                                  compressed_offset)
 
         weights = {
             f"{prefix}.attn.{name}": w[f"{prefix}.attn.{name}"]
@@ -2983,7 +3009,7 @@ class StreamingEngine:
         renamed = {k.replace(".weight", "").replace(f"{prefix}.attn.",
                                                     f"{prefix}.attn."): v
                    for k, v in weights.items()}
-        return deepseek_v4_attention(
+        attended = deepseek_v4_attention(
             x, {f"{prefix}.attn.wq_a": w[f"{prefix}.attn.wq_a.weight"],
                 f"{prefix}.attn.wq_b": w[f"{prefix}.attn.wq_b.weight"],
                 f"{prefix}.attn.q_norm": w[f"{prefix}.attn.q_norm.weight"],
@@ -3006,6 +3032,12 @@ class StreamingEngine:
             # read the wrong slot for every query and collapsed to BOS, and the
             # compressed region was never attended to at any length.
             kv_all=kv_all, topk_idxs=topk)
+        if block_decode:
+            # Deferred to here for the reason above: the gather needed the ring
+            # to still hold the positions PRECEDING this block.
+            rings[layer] = window_ring_write(ring, latent, offset, window)
+            mx.eval(rings[layer])
+        return attended
 
     def _deepseek_v4_ffn(self, x, w, prefix, layer, module_base=None):
         """MoE for one DeepSeek V4 layer, with routed experts paged on demand.
@@ -3151,6 +3183,15 @@ class StreamingEngine:
             f"{reserve / 1e9:.3f}GB, of which "
             f"{required_reserve / 1e9:.3f}GB is the mandatory expert-batch "
             f"floor)")
+        from .cache_policy import prefetch_starvation_warning
+
+        warning = prefetch_starvation_warning(
+            self.planned_trunk_pin_bytes, self.cache.max_bytes,
+            max(layer_bytes[:count] or [0]),
+            expert_batch * self._expert_fetch_page_bytes,
+            self.rc.prefetch_depth)
+        if warning:
+            print(warning)
         return count
 
     def _materialize_packed_trunk(self, page: dict) -> dict:

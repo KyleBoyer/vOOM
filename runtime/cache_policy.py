@@ -98,3 +98,42 @@ def plan_pinned_prefix(
         if prefix_total + streaming + reserve <= budget:
             best = count
     return best
+
+
+def prefetch_starvation_warning(pinned_bytes: int, cache_bytes: int,
+                                layer_bytes: int, expert_batch_bytes: int,
+                                prefetch_depth: int) -> str | None:
+    """Warn when a trunk pin leaves the prefetcher no budget to work in.
+
+    A pin is charged against the SAME cache budget the prefetcher checks
+    before accepting a page, so a pin that approaches ``max_weight_cache_mb``
+    makes every scheduled prefetch fail its budget check. Nothing errors and
+    nothing is slower in a way that points at the cause: the run simply loses
+    the overlap it was configured for.
+
+    Found live, and it cost a full round of investigation. Pinning 4.367GB
+    into an 1800MB cache produced prefetch_hits 0 at every depth with
+    byte-identical timings, while disk was 71% of decode; the same pin with
+    the cache raised to 5500MB landed 168 hits and 10.5% wall.
+
+    Returns a message to print, or None when there is room. Advisory only --
+    the operator's explicit budgets are not overridden.
+    """
+    if prefetch_depth <= 0 or pinned_bytes <= 0:
+        return None
+    # A prefetch must fit alongside the pin AND the demand traffic already
+    # competing for the same budget: one layer page in flight plus the routed
+    # expert batch that layer will ask for.
+    needed = layer_bytes * (1 + max(prefetch_depth, 1)) + expert_batch_bytes
+    headroom = cache_bytes - pinned_bytes
+    if headroom >= needed:
+        return None
+    suggested = (pinned_bytes + needed + 999_999) // 1_000_000
+    return (
+        f"[engine] WARNING: trunk pin ({pinned_bytes / 1e9:.3f}GB) leaves "
+        f"{headroom / 1e9:.3f}GB of the {cache_bytes / 1e9:.3f}GB weight "
+        f"cache, but prefetch depth {prefetch_depth} needs "
+        f"{needed / 1e9:.3f}GB to accept a page. Every prefetch will be "
+        f"refused and the run will silently lose I/O/compute overlap. "
+        f"Raise max_weight_cache_mb to at least {suggested}, or lower "
+        f"pin_trunk_budget_mb.")

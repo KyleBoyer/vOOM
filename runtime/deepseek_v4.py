@@ -172,6 +172,34 @@ def _sparse_windowed_attention_tile(q, kv, attn_sink, topk_idxs,
     return (out / denominator).astype(q.dtype)
 
 
+def block_decode_topk_idxs(window_size: int, seqlen: int, start_pos: int
+                           ) -> mx.array:
+    """Gather list for a multi-position decode over ``[ring | block]``.
+
+    A 128-slot ring cannot hold both position p and p+128, so writing a whole
+    block into it BEFORE attention destroys entries the block's own earlier
+    queries still need: the query at ``start_pos`` wants position
+    ``start_pos-127``, whose slot the block just overwrote with
+    ``start_pos+1``. It reads a future token's KV as its oldest window entry,
+    which is silent -- every index is in range and the shapes all agree.
+
+    So the block is concatenated after the ring rather than written into it,
+    exactly as the released DSparkAttention does, and the ring is written only
+    once attention is done. Ring indices address the window PRECEDING the
+    block; block indices are ``window_size + j`` and are causal in j.
+    """
+    ring_positions = start_pos - window_size + mx.arange(window_size)
+    lower = start_pos + mx.arange(seqlen) - window_size + 1
+    visible = (ring_positions[None, :] >= mx.maximum(lower, 0)[:, None])
+    ring = mx.where(visible, ring_positions[None, :] % window_size, -1)
+
+    block = mx.arange(seqlen)
+    causal = block[None, :] <= block[:, None]
+    block_idx = mx.where(causal, window_size + block[None, :], -1)
+    block_idx = mx.broadcast_to(block_idx, (seqlen, seqlen))
+    return mx.concatenate([ring, block_idx], axis=-1).astype(mx.int32)[None]
+
+
 def window_topk_idxs(window_size: int, seqlen: int, start_pos: int
                      ) -> mx.array:
     """Sliding-window index list, matching ``get_window_topk_idxs``.

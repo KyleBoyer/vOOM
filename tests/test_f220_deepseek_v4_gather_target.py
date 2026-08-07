@@ -160,3 +160,51 @@ def test_early_positions_mark_unwritten_slots():
     # Position 1 has only slots 0 and 1 written; the rest must be masked.
     used = {int(v) for v in idxs[0] if v >= 0}
     assert used == {0, 1}, used
+
+
+def test_block_gather_never_reads_a_slot_the_block_overwrote():
+    """The bug this exists for: a ring slot holds ONE position.
+
+    With the block written into the ring first, query 0's oldest window entry
+    (position start-window+1) shares a slot with block position start+1. This
+    gather addresses [ring | block] instead, so ring indices only ever mean
+    positions strictly before the block.
+    """
+    import mlx.core as mx
+
+    from runtime.deepseek_v4 import block_decode_topk_idxs
+
+    start, seqlen = 4 * WINDOW + 1, 5
+    idxs = np.array(block_decode_topk_idxs(WINDOW, seqlen, start))[0]
+    assert idxs.shape == (seqlen, WINDOW + seqlen)
+
+    ring_part, block_part = idxs[:, :WINDOW], idxs[:, WINDOW:]
+    # Ring slots must correspond to positions strictly before the block.
+    for i in range(seqlen):
+        for j, slot in enumerate(ring_part[i]):
+            if slot < 0:
+                continue
+            position = start - WINDOW + j
+            assert position < start, "a ring index reached into the block"
+            assert position % WINDOW == slot
+            assert position >= start + i - WINDOW + 1
+
+    # Block indices are causal and offset past the ring region.
+    for i in range(seqlen):
+        used = [int(v) for v in block_part[i] if v >= 0]
+        assert used == [WINDOW + j for j in range(i + 1)], (
+            f"query {i} block visibility {used} is not causal")
+
+
+def test_block_gather_masks_negative_positions_early_in_the_sequence():
+    import mlx.core as mx
+
+    from runtime.deepseek_v4 import block_decode_topk_idxs
+
+    idxs = np.array(block_decode_topk_idxs(WINDOW, 3, 2))[0]
+    ring_part = idxs[:, :WINDOW]
+    for i in range(3):
+        for j, slot in enumerate(ring_part[i]):
+            position = 2 - WINDOW + j
+            if position < 0:
+                assert slot == -1, "an unwritten position was addressed"
