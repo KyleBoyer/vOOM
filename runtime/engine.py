@@ -3156,7 +3156,7 @@ class StreamingEngine:
         return count
 
     def _dspark_main_x(self, stage0_page: dict, main_hidden: mx.array):
-        from .dspark import dspark_main_x
+        from .dsv4_dspark import dspark_main_x
 
         return dspark_main_x(
             main_hidden, stage0_page["mtp.0.main_proj.weight"],
@@ -3211,8 +3211,8 @@ class StreamingEngine:
         target's own expert paging, so a proposal is roughly 8% of a target
         sweep. Returns [] when drafting is not possible at this position.
         """
-        from .dspark import (draft_input_ids, dspark_attention,
-                             dspark_sample_block, run_dspark_stage)
+        from .dsv4_dspark import (draft_input_ids, dspark_attention,
+                                  dspark_sample_block, run_dspark_stage)
         from .deepseek_v4 import hc_head, yarn_freqs
 
         block = self.cfg.dspark_block_size

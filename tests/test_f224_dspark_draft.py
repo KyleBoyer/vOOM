@@ -49,7 +49,7 @@ released = pytest.mark.skipif(
 def test_gather_matches_the_released_generator(start_pos):
     import mlx.core as mx
 
-    from runtime.dspark import dspark_topk_idxs
+    from runtime.dsv4_dspark import dspark_topk_idxs
 
     reference = _reference()
     expected = reference.get_dspark_topk_idxs(
@@ -60,7 +60,7 @@ def test_gather_matches_the_released_generator(start_pos):
 
 
 def test_gather_refuses_prefill_positions():
-    from runtime.dspark import dspark_topk_idxs
+    from runtime.dsv4_dspark import dspark_topk_idxs
 
     with pytest.raises(ValueError, match="start_pos"):
         dspark_topk_idxs(WINDOW, BLOCK, 0)
@@ -68,7 +68,7 @@ def test_gather_refuses_prefill_positions():
 
 def test_block_positions_are_mutually_visible_not_causal():
     """A causal mask here would be a silent divergence from the released code."""
-    from runtime.dspark import dspark_topk_idxs
+    from runtime.dsv4_dspark import dspark_topk_idxs
 
     idxs = np.array(dspark_topk_idxs(WINDOW, BLOCK, 64))[0]
     rows = {tuple(row.tolist()) for row in idxs}
@@ -80,7 +80,7 @@ def test_block_positions_are_mutually_visible_not_causal():
 def test_draft_input_ids_layout():
     import mlx.core as mx
 
-    from runtime.dspark import draft_input_ids
+    from runtime.dsv4_dspark import draft_input_ids
 
     ids = np.array(draft_input_ids(1234, BLOCK, 999))
     assert ids.shape == (1, BLOCK)
@@ -91,7 +91,7 @@ def test_draft_input_ids_layout():
 def test_markov_bias_is_a_low_rank_bigram_map():
     import mlx.core as mx
 
-    from runtime.dspark import markov_bias
+    from runtime.dsv4_dspark import markov_bias
 
     vocab, rank = 32, 4
     rng = np.random.default_rng(0)
@@ -115,7 +115,7 @@ def test_sampling_is_sequential_through_the_markov_bias():
     """
     import mlx.core as mx
 
-    from runtime.dspark import dspark_sample_block
+    from runtime.dsv4_dspark import dspark_sample_block
 
     vocab = 16
     # w1[t] = e_t, w2[v] = e_{v-1}  =>  bias(t)[v] is 1 exactly at v == t+1.
@@ -138,7 +138,7 @@ def test_sampling_is_sequential_through_the_markov_bias():
 
 
 def test_acceptance_stops_at_the_first_disagreement():
-    from runtime.dspark import accepted_prefix
+    from runtime.dsv4_dspark import accepted_prefix
 
     assert accepted_prefix([1, 2, 3], [1, 2, 3]) == 3
     assert accepted_prefix([1, 2, 3], [1, 9, 3]) == 1
