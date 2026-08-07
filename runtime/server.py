@@ -4288,6 +4288,21 @@ def _chat_prompt(engine, model_dir: Path, messages: list[dict], reasoning: str,
     # stopped, repeating "user: ...\nassistant: ..." until max_tokens cut it
     # off -- and that garbage then got fed back as history on the next turn,
     # compounding token usage and repetition further.
+    if engine.cfg.model_type == "deepseek_v4":
+        # DeepSeek V4 ships no chat_template anywhere the block below looks, so
+        # it would take the generic user:/assistant: fallback -- a transcript
+        # with no learned turn boundary. It ships encoding/encoding_dsv4.py
+        # instead, which we delegate to rather than transcribe.
+        from .dsv4_chat import has_released_encoder, render_prompt
+
+        if has_released_encoder(model_dir):
+            return render_prompt(
+                model_dir, messages, tools,
+                enable_thinking=enable_thinking,
+                reasoning_requested=reasoning_requested,
+                reasoning_effort=reasoning if reasoning_requested else None,
+                add_generation_prompt=add_generation_prompt)
+
     template_text = None
     if (model_dir / "chat_template.jinja").exists():
         # GLM-5.2 and gpt-oss both ship their learned protocol this way. The
@@ -4823,6 +4838,23 @@ def _parse_request_tool_calls(text: str, tools: list[dict], model_type: str,
                               allow_parallel: bool = True):
     if not tools:
         return text, []
+    if model_type == "deepseek_v4":
+        # DSML markup, not any of the conventions runtime/toolcalls.py knows.
+        from .dsv4_chat import parse_tool_calls as parse_dsv4_tool_calls
+
+        allowed = {
+            function["name"]
+            for tool in tools
+            if isinstance((function := tool.get("function", tool)), dict)
+            and isinstance(function.get("name"), str)
+        }
+        # None resolves to the checkpoint whose encoder prompt rendering
+        # already loaded for this same request.
+        content, calls = parse_dsv4_tool_calls(
+            None, text, allowed_names=allowed)
+        if not allow_parallel and len(calls) > 1:
+            calls = calls[:1]
+        return content, calls
     from .toolcalls import parse_tool_calls
 
     allowed_names = {
