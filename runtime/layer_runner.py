@@ -421,11 +421,31 @@ def run_moe_block(
     return run_moe_mlp(x, w, prefix, cfg, layer, get_experts)
 
 
+# Vocabulary rows per chunk of the LM head projection. h @ w.T on a whole
+# [vocab, hidden] head materializes the transpose: measured 2.12GB of
+# transient for a 1.06GB bfloat16 head, which was the single largest spike in
+# a DeepSeek V4 request (final_logits took peak from 5.87GB to 7.99GB at a
+# 16K prompt). Chunking makes it 0.00GB for identical output.
+_LM_HEAD_ROW_CHUNK = 16384
+
+
+def _chunked_head_matmul(h: mx.array, weight: mx.array) -> mx.array:
+    """h @ weight.T without materializing the full transpose."""
+    rows = weight.shape[0]
+    if rows <= _LM_HEAD_ROW_CHUNK:
+        return quant.matmul(h, weight)
+    parts = [quant.matmul(h, weight[start:start + _LM_HEAD_ROW_CHUNK])
+             for start in range(0, rows, _LM_HEAD_ROW_CHUNK)]
+    return mx.concatenate(parts, axis=-1)
+
+
 def final_logits(x: mx.array, norm_weight: mx.array, lm_head_weight, eps: float) -> mx.array:
     """x: (1, L, hidden) -> logits (vocab,) for the last position only."""
     h = mx.fast.rms_norm(x[:, -1:, :], norm_weight, eps)
     if isinstance(lm_head_weight, StreamedLMHead):
         return lm_head_weight.logits(h)[0, 0]
+    if isinstance(lm_head_weight, mx.array):
+        return _chunked_head_matmul(h, lm_head_weight)[0, 0]
     return quant.matmul(h, lm_head_weight)[0, 0]
 
 
@@ -434,4 +454,6 @@ def all_logits(x: mx.array, norm_weight: mx.array, lm_head_weight, eps: float) -
     h = mx.fast.rms_norm(x, norm_weight, eps)
     if isinstance(lm_head_weight, StreamedLMHead):
         return lm_head_weight.logits(h)[0]
+    if isinstance(lm_head_weight, mx.array):
+        return _chunked_head_matmul(h, lm_head_weight)[0]
     return quant.matmul(h, lm_head_weight)[0]
