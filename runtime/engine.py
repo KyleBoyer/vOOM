@@ -4952,11 +4952,19 @@ class StreamingEngine:
             raise ValueError("tile_width must be positive")
         n = self.cfg.num_hidden_layers
         total = int(x.shape[1])
+        # Size the reservation by the widest SINGLE step, not by the prompt.
+        # Nothing here ever processes `total` positions at once: attention runs
+        # per tile_width tile and the MoE per dsv4_ffn_tile_width group. Sizing
+        # by total measured a whole LAYER -- carrier included -- and then
+        # reserved that before every tile, so a 32,020-token prompt was refused
+        # for 8.16GB it never intended to allocate in one go.
+        probe_positions = min(
+            total, max(tile_width, self.rc.dsv4_ffn_tile_width))
         (self._layer_transient,
          self._layer_transient_margin) = _layer_transient_for_positions(
-             total,
+             probe_positions,
              getattr(self, "_prefill_layer_transient_by_positions", {}
-                     ).get(total, 0),
+                     ).get(probe_positions, 0),
              getattr(self, "_decode_layer_transient", 0))
         profiler = self._request_profiler
         if profiler is not None:
@@ -4982,7 +4990,7 @@ class StreamingEngine:
         del expanded
 
         for i in range(n):
-            self._select_layer_transient(total, i)
+            self._select_layer_transient(probe_positions, i)
             if self.prefetcher:
                 for j in range(i + 1, min(i + 1 + self.rc.prefetch_depth, n)):
                     self.prefetcher.schedule(self._layer_key(j),
@@ -5051,6 +5059,7 @@ class StreamingEngine:
             # dsv4_ffn_tile_width positions amortises the fetch again, and
             # joining one group is ~67MB against the carrier's whole extent,
             # so the memory the tile list was introduced to save is kept.
+            step_peak = 0
             previous_retain = self._dsv4_expert_retain
             self._dsv4_expert_retain = True
             try:
@@ -5074,12 +5083,17 @@ class StreamingEngine:
                               else mx.concatenate(members, axis=1))
                     lo = spans[group_start][0]
                     hi = spans[group_end - 1][1]
+                    step_before = mx.get_active_memory()
+                    mx.reset_peak_memory()
                     out = deepseek_v4_ffn_residual(
                         joined, hc, norms,
                         lambda t, _s=(lo, hi): self._deepseek_v4_ffn(
                             t, w, prefix, i, position_slice=_s),
                         **common)
                     mx.eval(out)
+                    step_peak = max(step_peak, _resident_adjusted_transient(
+                        step_before, mx.get_active_memory(),
+                        mx.get_peak_memory()))
                     del joined, members
                     # Split back so the carrier stays a tile list.
                     for index in range(group_start, group_end):
@@ -5102,11 +5116,9 @@ class StreamingEngine:
                 on_progress({"phase": "prefill_layer",
                              "completed_layers": i + 1, "total_layers": n,
                              "total_tokens": total, "cache_source": "cold"})
-            self._record_layer_transient(
-                total, i,
-                _resident_adjusted_transient(
-                    active_before, mx.get_active_memory(),
-                    mx.get_peak_memory()))
+            # Record what ONE step costs, keyed by that step's own width, so
+            # the reservation stays honest however long the prompt is.
+            self._record_layer_transient(probe_positions, i, step_peak)
             self._note_true_peak()
             del w
 
