@@ -722,6 +722,10 @@ class RuntimeConfig:
     # StreamingEngine._layer_stationary_qwen35_sweep and CLAUDE.md's
     # 2026-07-23 note on why chunk-major re-reads dominate prefill time here.
     layer_stationary_prefill: bool = False
+    # Positions per MoE tile inside a layer-stationary DeepSeek V4 prefill.
+    # Bounds the float32 hyper-connection carrier without costing weight
+    # reads: a layer's routed experts stay resident across its own tiles.
+    dsv4_ffn_tile_width: int = 2048
     # Default ON. Only gpt-oss consults it (see the model_type guard at the
     # use site); it drops keys sliding layers provably cannot read.
     gptoss_sliding_kv_window: bool = True
@@ -3087,7 +3091,8 @@ class StreamingEngine:
             mx.eval(rings[layer])
         return attended
 
-    def _deepseek_v4_ffn(self, x, w, prefix, layer, module_base=None):
+    def _deepseek_v4_ffn(self, x, w, prefix, layer, module_base=None,
+                         position_slice=None):
         """MoE for one DeepSeek V4 layer, with routed experts paged on demand.
 
         Routing runs on the layer page (the gate is a small dense tensor that
@@ -3119,7 +3124,20 @@ class StreamingEngine:
                 raise ValueError(
                     f"layer {layer} is hash-routed but no input ids were "
                     "recorded for this sweep")
-            hash_indices = tid2eid[ids.reshape(-1)]
+            ids = ids.reshape(-1)
+            if position_slice is not None:
+                # A layer-stationary prefill evaluates the MoE in tiles, so
+                # the ids must be narrowed to the tile. Without this the gate
+                # is handed the whole sweep's ids against a tile's rows and
+                # the shapes simply fail to broadcast -- which is the good
+                # case; a silent misalignment would route every token wrongly.
+                start, stop = position_slice
+                ids = ids[start:stop]
+            if ids.shape[0] != x.shape[0] * x.shape[1]:
+                raise ValueError(
+                    f"layer {layer} hash routing got {ids.shape[0]} token ids "
+                    f"for {x.shape[0] * x.shape[1]} positions")
+            hash_indices = tid2eid[ids]
         weights, indices = moe_gate(
             x.reshape(-1, x.shape[-1]), gate_weight,
             w.get(f"{prefix}.ffn.gate.bias"),
@@ -5008,9 +5026,41 @@ class StreamingEngine:
             stream = (tiles[0] if len(tiles) == 1
                       else mx.concatenate(tiles, axis=1))
             del tiles
-            stream = deepseek_v4_ffn_residual(
-                stream, hc, norms,
-                lambda t: self._deepseek_v4_ffn(t, w, prefix, i), **common)
+
+            # The MoE half is tiled too, but for MEMORY, not for weights.
+            # hc_pre widens to float32, so one 51,220-position carrier is
+            # 3.4GB and several are live at once -- a single call asked for
+            # 13.4GB and exceeded Metal's maximum buffer size. Tiling caps
+            # that while the expert pages stay resident ACROSS the tiles of
+            # one layer, so they are still read once per layer: a whole
+            # layer's routed set is 256 packed experts, about 3.4GB, which
+            # fits the weight cache. Retention is restored afterwards so the
+            # ordinary bounded-lifetime behaviour returns for decode.
+            ffn_tile = max(tile_width, self.rc.dsv4_ffn_tile_width)
+            previous_retain = self._dsv4_expert_retain
+            self._dsv4_expert_retain = True
+            try:
+                outs = []
+                pos = 0
+                while pos < total:
+                    end = min(pos + ffn_tile, total)
+                    if self.governor is not None and self._layer_transient:
+                        self.governor.reserve(
+                            self._layer_transient,
+                            margin=self._layer_transient_margin)
+                    out = deepseek_v4_ffn_residual(
+                        stream[:, pos:end], hc, norms,
+                        lambda t, _s=(pos, end): self._deepseek_v4_ffn(
+                            t, w, prefix, i, position_slice=_s),
+                        **common)
+                    mx.eval(out)
+                    outs.append(out)
+                    pos = end
+                stream = (outs[0] if len(outs) == 1
+                          else mx.concatenate(outs, axis=1))
+                del outs
+            finally:
+                self._dsv4_expert_retain = previous_retain
             mx.eval(stream)
             compute_s = time.perf_counter() - t0
             self.timer.add("layer_compute", compute_s)
