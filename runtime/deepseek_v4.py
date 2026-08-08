@@ -118,6 +118,12 @@ def hc_head(x: mx.array, hc_fn: mx.array, hc_scale: mx.array,
 # a different function.
 
 
+# Ceiling on one gathered attention operand, [tile, topk, head_dim]
+# float32. Chosen so a long-context layer's gather stays a few hundred
+# MB rather than growing without bound with the prompt.
+_GATHER_TILE_BUDGET_BYTES = 384 * 1024 * 1024
+
+
 def sparse_windowed_attention(q: mx.array, kv: mx.array, attn_sink: mx.array,
                               topk_idxs: mx.array, softmax_scale: float,
                               tile: int = 128) -> mx.array:
@@ -135,7 +141,17 @@ def sparse_windowed_attention(q: mx.array, kv: mx.array, attn_sink: mx.array,
     computed, so results are unchanged.
     """
     b, s, h, d = q.shape
-    if tile <= 0 or s <= tile:
+    # The tile must shrink as the gather widens. topk grows with the prompt --
+    # a ratio-4 layer's compressed region is seqlen/4 entries, so 8,005 of them
+    # at 32K tokens -- and the gathered operand is [b, tile, topk, d]. A fixed
+    # 128-row tile is 108MB at a 271-token prompt and 2.5GB at 32K, which is
+    # what drove peak Metal to 13.53GB there. Cap the operand instead of the
+    # row count: rows are independent, so this changes only how many are
+    # computed at once.
+    budget_rows = max(1, _GATHER_TILE_BUDGET_BYTES
+                      // max(1, topk_idxs.shape[-1] * d * 4))
+    tile = min(tile, budget_rows) if tile > 0 else budget_rows
+    if s <= tile:
         return _sparse_windowed_attention_tile(
             q, kv, attn_sink, topk_idxs, softmax_scale)
     parts = [
