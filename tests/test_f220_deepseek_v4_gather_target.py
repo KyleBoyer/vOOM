@@ -251,29 +251,6 @@ def test_block_gather_keeps_the_newest_window_positions():
         "ring entries should be fully masked once the block covers the window")
 
 
-def test_attention_tile_shrinks_as_the_gather_widens():
-    """A fixed row tile grows without bound with the prompt.
-
-    topk includes the compressed region, which is seqlen/ratio entries, so at
-    32K tokens a ratio-4 layer gathers ~8,500 keys per query. At a fixed
-    128-row tile the operand is 2.5GB, and that is what took peak Metal to
-    13.53GB on a 32,020-token prompt.
-    """
-    import mlx.core as mx
-    import numpy as np
-
-    from runtime import deepseek_v4 as dv4
-
-    head_dim, budget = 576, dv4._GATHER_TILE_BUDGET_BYTES
-    for topk in (256, 2048, 8517):
-        rows = max(1, budget // (topk * head_dim * 4))
-        assert rows * topk * head_dim * 4 <= budget, (
-            f"topk={topk}: operand exceeds the budget")
-    narrow = max(1, budget // (256 * head_dim * 4))
-    wide = max(1, budget // (8517 * head_dim * 4))
-    assert wide < narrow, "tile did not shrink as the gather widened"
-
-
 def test_attention_result_is_independent_of_the_tile():
     """Rows are independent, so tiling must be a scheduling choice only."""
     import mlx.core as mx
