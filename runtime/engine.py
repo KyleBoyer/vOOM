@@ -7719,10 +7719,7 @@ class StreamingEngine:
                     if boundary_layer_stationary:
                         bx = self._embed(list(tokens[pos:stable_boundary]))
                         if self.cfg.model_type == "kimi_linear":
-                            bx = (
-                                self._layer_stationary_deepseek_v4_sweep
-                                if self.cfg.model_type == "deepseek_v4"
-                                else self._layer_stationary_kimi_linear_sweep)(
+                            bx = self._layer_stationary_kimi_linear_sweep(
                                 bx, kv, offset=pos,
                                 tile_width=boundary_chunk,
                                 on_progress=on_progress)
