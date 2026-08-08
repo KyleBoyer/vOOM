@@ -2829,7 +2829,6 @@ class StreamingEngine:
         # layer 1 at 6, ... layer 42 at 47.
         offset = int(getattr(kv, "dsv4_sweep_pos", offset))
 
-        shared_kv = None
         rings = getattr(kv, "dsv4_rings", None)
         if rings is None:
             rings = {}
@@ -2968,7 +2967,9 @@ class StreamingEngine:
                     pooled if layer not in stores
                     else mx.concatenate([stores[layer], pooled], axis=1))
                 mx.eval(stores[layer])
-            shared_kv = stores.get(layer)
+            existing = stores.get(layer)
+            if existing is not None:
+                kv_all = mx.concatenate([kv_all, existing], axis=1)
         elif ratio:
             # Prefill-time compression: pool whole groups from the same hidden
             # states, RoPE them at their own positions (j * ratio) under the
@@ -2991,7 +2992,7 @@ class StreamingEngine:
                 pooled = mx.concatenate(
                     [pooled[..., :-rope_dim], ctail], axis=-1)
                 stores[layer] = pooled
-            shared_kv = stores.get(layer)
+                kv_all = mx.concatenate([kv_all, pooled], axis=1)
             # Seed the decode state with the trailing partial group. Prefill
             # compresses only whole groups; the released module parks the
             # remaining seqlen % ratio positions in kv_state/score_state and
@@ -3033,25 +3034,24 @@ class StreamingEngine:
 
         from .deepseek_v4 import gather_indices
 
-        # The compressed region is attended as a SHARED key region rather than
-        # gathered per query: the rows are identical for every query and only
-        # the causal cutoff differs, so gathering duplicated 12,805 of a
-        # 13,317-slot operand at 51K tokens. The gather list now covers the
-        # window only.
         if block_decode:
-            from .deepseek_v4 import block_decode_topk_idxs
+            from .deepseek_v4 import block_decode_topk_idxs, compress_topk_idxs
 
             topk = block_decode_topk_idxs(window, x.shape[1], offset)
+            if ratio:
+                compressed = compress_topk_idxs(
+                    ratio, x.shape[1], offset, compressed_offset)
+                if compressed.shape[1] != topk.shape[1]:
+                    # Same broadcast gather_indices performs: the compressed
+                    # generator can return one row when every query in the
+                    # block sees the same compressed entries.
+                    compressed = mx.broadcast_to(
+                        compressed, (compressed.shape[0], topk.shape[1],
+                                     compressed.shape[2]))
+                topk = mx.concatenate([topk, compressed], axis=-1)
         else:
-            topk = gather_indices(window, 0, x.shape[1], offset,
+            topk = gather_indices(window, ratio, x.shape[1], offset,
                                   compressed_offset)
-        shared_reach = None
-        if ratio and shared_kv is not None and shared_kv.shape[1]:
-            positions = offset + mx.arange(x.shape[1])
-            shared_reach = mx.minimum((positions + 1) // ratio,
-                                      shared_kv.shape[1]).astype(mx.int32)
-        else:
-            shared_kv = None
 
         weights = {
             f"{prefix}.attn.{name}": w[f"{prefix}.attn.{name}"]
@@ -3083,8 +3083,7 @@ class StreamingEngine:
             # short prompts looked correct while every prompt past 128 tokens
             # read the wrong slot for every query and collapsed to BOS, and the
             # compressed region was never attended to at any length.
-            kv_all=kv_all, topk_idxs=topk,
-            shared_kv=shared_kv, shared_reach=shared_reach)
+            kv_all=kv_all, topk_idxs=topk)
         if block_decode:
             # Deferred to here for the reason above: the gather needed the ring
             # to still hold the positions PRECEDING this block.
