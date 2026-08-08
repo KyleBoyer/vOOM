@@ -4945,8 +4945,8 @@ class StreamingEngine:
         kv.update(). Setting it once per sweep -- correct for chunk-major --
         would run every tile at the first tile's position.
         """
-        from .deepseek_v4 import (deepseek_v4_attention_residual,
-                                  deepseek_v4_ffn_residual)
+        from .deepseek_v4 import (deepseek_v4_attention_residual, hc_post,
+                                  hc_pre)
 
         if tile_width <= 0:
             raise ValueError("tile_width must be positive")
@@ -5052,58 +5052,55 @@ class StreamingEngine:
             # layer's routed set is 256 packed experts, about 3.4GB, which
             # fits the weight cache. Retention is restored afterwards so the
             # ordinary bounded-lifetime behaviour returns for decode.
-            # The MoE runs over GROUPS of consecutive tiles, not single ones.
-            # Per-tile was correct but slow: a layer's routed set is ~3.4GB of
-            # packed experts, more than the free cache holds, so each tile
-            # re-fetched them and reads went 106.6GB -> 242.6GB. Grouping to
-            # dsv4_ffn_tile_width positions amortises the fetch again, and
-            # joining one group is ~67MB against the carrier's whole extent,
-            # so the memory the tile list was introduced to save is kept.
-            step_peak = 0
-            previous_retain = self._dsv4_expert_retain
-            self._dsv4_expert_retain = True
-            try:
-                group_start = 0
-                while group_start < len(spans):
-                    group_end = group_start + 1
-                    positions = spans[group_start][1] - spans[group_start][0]
-                    while (group_end < len(spans)
-                           and positions + (spans[group_end][1]
-                                            - spans[group_end][0])
-                           <= self.rc.dsv4_ffn_tile_width):
-                        positions += (spans[group_end][1]
-                                      - spans[group_end][0])
-                        group_end += 1
-                    if self.governor is not None and self._layer_transient:
-                        self.governor.reserve(
-                            self._layer_transient,
-                            margin=self._layer_transient_margin)
-                    members = tiles[group_start:group_end]
-                    joined = (members[0] if len(members) == 1
-                              else mx.concatenate(members, axis=1))
-                    lo = spans[group_start][0]
-                    hi = spans[group_end - 1][1]
-                    step_before = mx.get_active_memory()
-                    mx.reset_peak_memory()
-                    out = deepseek_v4_ffn_residual(
-                        joined, hc, norms,
-                        lambda t, _s=(lo, hi): self._deepseek_v4_ffn(
-                            t, w, prefix, i, position_slice=_s),
-                        **common)
-                    mx.eval(out)
-                    step_peak = max(step_peak, _resident_adjusted_transient(
-                        step_before, mx.get_active_memory(),
-                        mx.get_peak_memory()))
-                    del joined, members
-                    # Split back so the carrier stays a tile list.
-                    for index in range(group_start, group_end):
-                        a, b = spans[index]
-                        tiles[index] = out[:, a - lo:b - lo]
-                    mx.eval(*(tiles[group_start:group_end]))
-                    del out
-                    group_start = group_end
-            finally:
-                self._dsv4_expert_retain = previous_retain
+            # The MoE runs ONCE per layer over every position, so each of
+            # the layer's routed experts is read exactly once.
+            #
+            # The earlier once-per-layer attempt asked for 13.4GB and was
+            # refused, which sent this down a per-group path -- but the size
+            # was never the MoE. hc_pre widens the CARRIER, which is
+            # [positions, hc_mult, dim]; the MoE's own input is the reduced
+            # [positions, dim], four times smaller and bf16. Splitting the
+            # hyper-connection wrapper (per tile) from the expert compute
+            # (once) keeps both bounded: at 32K the reduced tensor is 262MB
+            # where the carrier is 1.05GB.
+            #
+            # This matters because per-group re-fetching dominated read
+            # traffic at length: 1,186.5GB at 32K against a layer's routed set
+            # of ~3.4GB, i.e. every expert pulled roughly eight times.
+            reduced_parts, posts, combs = [], [], []
+            for index, tile in enumerate(tiles):
+                r, post, comb = hc_pre(
+                    tile, hc["ffn_fn"], hc["ffn_scale"], hc["ffn_base"],
+                    hc_mult=self.cfg.hc_mult, norm_eps=self.cfg.rms_norm_eps,
+                    sinkhorn_iters=self.cfg.hc_sinkhorn_iters,
+                    eps=self.cfg.hc_eps)
+                reduced_parts.append(
+                    mx.fast.rms_norm(r, norms["ffn"], self.cfg.rms_norm_eps))
+                posts.append(post)
+                combs.append(comb)
+            hidden = (reduced_parts[0] if len(reduced_parts) == 1
+                      else mx.concatenate(reduced_parts, axis=1))
+            del reduced_parts
+            mx.eval(hidden)
+
+            if self.governor is not None and self._layer_transient:
+                self.governor.reserve(self._layer_transient,
+                                      margin=self._layer_transient_margin)
+            step_before = mx.get_active_memory()
+            mx.reset_peak_memory()
+            moe_out = self._deepseek_v4_ffn(hidden, w, prefix, i)
+            mx.eval(moe_out)
+            step_peak = _resident_adjusted_transient(
+                step_before, mx.get_active_memory(), mx.get_peak_memory())
+            del hidden
+
+            for index, (start_pos_, end_pos_) in enumerate(spans):
+                tiles[index] = hc_post(
+                    moe_out[:, start_pos_:end_pos_], tiles[index],
+                    posts[index], combs[index])
+                mx.eval(tiles[index])
+            del moe_out, posts, combs
+
             compute_s = time.perf_counter() - t0
             self.timer.add("layer_compute", compute_s)
             if profiler is not None:
