@@ -120,7 +120,8 @@ def hc_head(x: mx.array, hc_fn: mx.array, hc_scale: mx.array,
 
 def sparse_windowed_attention(q: mx.array, kv: mx.array, attn_sink: mx.array,
                               topk_idxs: mx.array, softmax_scale: float,
-                              tile: int = 128) -> mx.array:
+                              tile: int = 128, shared_kv: mx.array | None = None,
+                              shared_reach: mx.array | None = None) -> mx.array:
     """Gathered sparse attention with per-head sinks.
 
     ``q``  is ``[b, s, h, d]``; ``kv`` is ``[b, n, d]`` shared across heads;
@@ -137,19 +138,37 @@ def sparse_windowed_attention(q: mx.array, kv: mx.array, attn_sink: mx.array,
     b, s, h, d = q.shape
     if tile <= 0 or s <= tile:
         return _sparse_windowed_attention_tile(
-            q, kv, attn_sink, topk_idxs, softmax_scale)
+            q, kv, attn_sink, topk_idxs, softmax_scale,
+            shared_kv, shared_reach)
     parts = [
         _sparse_windowed_attention_tile(
             q[:, start:start + tile], kv, attn_sink,
-            topk_idxs[:, start:start + tile], softmax_scale)
+            topk_idxs[:, start:start + tile], softmax_scale,
+            shared_kv,
+            None if shared_reach is None
+            else shared_reach[start:start + tile])
         for start in range(0, s, tile)
     ]
     return mx.concatenate(parts, axis=1)
 
 
 def _sparse_windowed_attention_tile(q, kv, attn_sink, topk_idxs,
-                                    softmax_scale):
+                                    softmax_scale, shared_kv=None,
+                                    shared_reach=None):
+    """One tile of gathered attention, optionally with a SHARED key region.
+
+    ``kv``/``topk_idxs`` are the per-query gather: every query picks its own
+    slots, so the operand [b, tile, topk, d] must be materialized.
+
+    ``shared_kv`` is a region every query attends to with the SAME rows,
+    differing only in how far along it may look (``shared_reach[i]`` entries).
+    That needs no gather at all -- a plain matmul against the region, then a
+    causal mask -- and skipping it matters at length: the compressed region is
+    seqlen/ratio entries, 12,805 of a 13,317-slot gather at 51K tokens, and
+    gathering it duplicated the same rows for all 384 queries in a tile.
+    """
     b, s, h, d = q.shape
+    qf = q.astype(mx.float32)
     valid = topk_idxs >= 0
     safe = mx.maximum(topk_idxs, 0).astype(mx.int32)
 
@@ -157,18 +176,42 @@ def _sparse_windowed_attention_tile(q, kv, attn_sink, topk_idxs,
         mx.broadcast_to(kv[:, None, :, :], (b, s, kv.shape[1], d)),
         safe[..., None], axis=2)
 
-    scores = mx.einsum("bshd,bskd->bshk", q.astype(mx.float32),
+    scores = mx.einsum("bshd,bskd->bshk", qf,
                        gathered.astype(mx.float32)) * softmax_scale
     scores = mx.where(valid[:, :, None, :], scores, -mx.inf)
 
-    row_max = mx.max(scores, axis=-1, keepdims=True)
+    shared_scores = None
+    if shared_kv is not None and shared_kv.shape[1]:
+        shared_scores = mx.einsum(
+            "bshd,btd->bsht", qf, shared_kv.astype(mx.float32)) * softmax_scale
+        entries = mx.arange(shared_kv.shape[1])[None, :]
+        reachable = entries < shared_reach[:, None]
+        shared_scores = mx.where(
+            reachable[None, :, None, :], shared_scores, -mx.inf)
+        row_max = mx.maximum(
+            mx.max(scores, axis=-1, keepdims=True),
+            mx.max(shared_scores, axis=-1, keepdims=True))
+    else:
+        row_max = mx.max(scores, axis=-1, keepdims=True)
+
     # A row whose slots are all unused would otherwise propagate -inf; the sink
     # alone then carries the denominator.
     row_max = mx.where(mx.isinf(row_max), mx.zeros_like(row_max), row_max)
     weights = mx.where(valid[:, :, None, :], mx.exp(scores - row_max), 0.0)
-    denominator = mx.sum(weights, axis=-1, keepdims=True) + mx.exp(
-        attn_sink.reshape(1, 1, h, 1).astype(mx.float32) - row_max)
+    denominator = mx.sum(weights, axis=-1, keepdims=True)
     out = mx.einsum("bshk,bskd->bshd", weights, gathered.astype(mx.float32))
+
+    if shared_scores is not None:
+        shared_weights = mx.where(
+            reachable[None, :, None, :],
+            mx.exp(shared_scores - row_max), 0.0)
+        denominator = denominator + mx.sum(
+            shared_weights, axis=-1, keepdims=True)
+        out = out + mx.einsum("bsht,btd->bshd", shared_weights,
+                              shared_kv.astype(mx.float32))
+
+    denominator = denominator + mx.exp(
+        attn_sink.reshape(1, 1, h, 1).astype(mx.float32) - row_max)
     return (out / denominator).astype(q.dtype)
 
 
@@ -864,7 +907,9 @@ def deepseek_v4_attention(x: mx.array, w: dict, prefix: str, *,
                           q_lora_rank: int, o_lora_rank: int, n_groups: int,
                           norm_eps: float, cos: mx.array, sin: mx.array,
                           kv_all: mx.array, topk_idxs: mx.array,
-                          act_quant_block: int = 64) -> mx.array:
+                          act_quant_block: int = 64,
+                          shared_kv: mx.array | None = None,
+                          shared_reach: mx.array | None = None) -> mx.array:
     """Compose the attention halves verified in F206/F209/F210.
 
     Order follows the released ``Attention.forward``: q through its LoRA and
@@ -885,7 +930,8 @@ def deepseek_v4_attention(x: mx.array, w: dict, prefix: str, *,
 
     out = sparse_windowed_attention(
         q, kv_all, w[f"{prefix}.attn_sink"], topk_idxs,
-        float(head_dim) ** -0.5)
+        float(head_dim) ** -0.5,
+        shared_kv=shared_kv, shared_reach=shared_reach)
 
     # De-rotate before projecting -- the released epilogue's inverse=True.
     tail = apply_rope_interleaved(
