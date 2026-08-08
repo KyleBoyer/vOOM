@@ -4964,9 +4964,22 @@ class StreamingEngine:
 
         if offset == 0:
             kv.dsv4_pos = 0
-        stream = mx.broadcast_to(
+        # The carrier is held as the LIST of tiles it is built from and is
+        # never concatenated. It is positions x hc_mult x dim -- 32KB per
+        # position, 1.68GB at 51K tokens -- and concatenating made it live
+        # twice at the boundary, which killed a 51,220-token run outright
+        # rather than refusing it. Both halves already work per tile, so the
+        # single tensor was only ever an intermediate.
+        spans = []
+        pos = 0
+        while pos < total:
+            spans.append((pos, min(pos + tile_width, total)))
+            pos = spans[-1][1]
+        expanded = mx.broadcast_to(
             x[:, :, None, :],
             (x.shape[0], total, self.cfg.hc_mult, x.shape[2]))
+        tiles = [expanded[:, a:b] for a, b in spans]
+        del expanded
 
         for i in range(n):
             self._select_layer_transient(total, i)
@@ -5005,27 +5018,22 @@ class StreamingEngine:
             active_before = mx.get_active_memory()
             mx.reset_peak_memory()
             t0 = time.perf_counter()
-            tiles = []
-            pos = 0
-            while pos < total:
-                end = min(pos + tile_width, total)
+            for index, (start, end) in enumerate(spans):
                 if self.governor is not None and self._layer_transient:
                     self.governor.reserve(
                         self._layer_transient,
                         margin=self._layer_transient_margin)
-                here = offset + pos
+                here = offset + start
                 kv.dsv4_sweep_pos = here
                 tile = deepseek_v4_attention_residual(
-                    stream[:, pos:end], hc, norms,
+                    tiles[index], hc, norms,
                     lambda t, _h=here: self._deepseek_v4_attention(
                         t, w, prefix, i, kv, _h),
                     **common)
                 mx.eval(tile)
-                tiles.append(tile)
-                pos = end
-            stream = (tiles[0] if len(tiles) == 1
-                      else mx.concatenate(tiles, axis=1))
-            del tiles
+                # Replace in place so the input tile is released now rather
+                # than at the end of the layer.
+                tiles[index] = tile
 
             # The MoE half is tiled too, but for MEMORY, not for weights.
             # hc_pre widens to float32, so one 51,220-position carrier is
@@ -5036,32 +5044,52 @@ class StreamingEngine:
             # layer's routed set is 256 packed experts, about 3.4GB, which
             # fits the weight cache. Retention is restored afterwards so the
             # ordinary bounded-lifetime behaviour returns for decode.
-            ffn_tile = max(tile_width, self.rc.dsv4_ffn_tile_width)
+            # The MoE runs over GROUPS of consecutive tiles, not single ones.
+            # Per-tile was correct but slow: a layer's routed set is ~3.4GB of
+            # packed experts, more than the free cache holds, so each tile
+            # re-fetched them and reads went 106.6GB -> 242.6GB. Grouping to
+            # dsv4_ffn_tile_width positions amortises the fetch again, and
+            # joining one group is ~67MB against the carrier's whole extent,
+            # so the memory the tile list was introduced to save is kept.
             previous_retain = self._dsv4_expert_retain
             self._dsv4_expert_retain = True
             try:
-                outs = []
-                pos = 0
-                while pos < total:
-                    end = min(pos + ffn_tile, total)
+                group_start = 0
+                while group_start < len(spans):
+                    group_end = group_start + 1
+                    positions = spans[group_start][1] - spans[group_start][0]
+                    while (group_end < len(spans)
+                           and positions + (spans[group_end][1]
+                                            - spans[group_end][0])
+                           <= self.rc.dsv4_ffn_tile_width):
+                        positions += (spans[group_end][1]
+                                      - spans[group_end][0])
+                        group_end += 1
                     if self.governor is not None and self._layer_transient:
                         self.governor.reserve(
                             self._layer_transient,
                             margin=self._layer_transient_margin)
+                    members = tiles[group_start:group_end]
+                    joined = (members[0] if len(members) == 1
+                              else mx.concatenate(members, axis=1))
+                    lo = spans[group_start][0]
+                    hi = spans[group_end - 1][1]
                     out = deepseek_v4_ffn_residual(
-                        stream[:, pos:end], hc, norms,
-                        lambda t, _s=(pos, end): self._deepseek_v4_ffn(
+                        joined, hc, norms,
+                        lambda t, _s=(lo, hi): self._deepseek_v4_ffn(
                             t, w, prefix, i, position_slice=_s),
                         **common)
                     mx.eval(out)
-                    outs.append(out)
-                    pos = end
-                stream = (outs[0] if len(outs) == 1
-                          else mx.concatenate(outs, axis=1))
-                del outs
+                    del joined, members
+                    # Split back so the carrier stays a tile list.
+                    for index in range(group_start, group_end):
+                        a, b = spans[index]
+                        tiles[index] = out[:, a - lo:b - lo]
+                    mx.eval(*(tiles[group_start:group_end]))
+                    del out
+                    group_start = group_end
             finally:
                 self._dsv4_expert_retain = previous_retain
-            mx.eval(stream)
             compute_s = time.perf_counter() - t0
             self.timer.add("layer_compute", compute_s)
             if profiler is not None:
@@ -5085,10 +5113,17 @@ class StreamingEngine:
         kv.dsv4_pos = offset + total
         from .deepseek_v4 import hc_head
 
-        reduced = hc_head(stream, self._hc_head_fn, self._hc_head_scale,
-                          self._hc_head_base,
-                          norm_eps=self.cfg.rms_norm_eps,
-                          eps=self.cfg.hc_eps)
+        # Reduce per tile before joining: hc_head collapses the hc_mult axis,
+        # so the concatenated result is a quarter of the carrier's size.
+        for index in range(len(tiles)):
+            tiles[index] = hc_head(
+                tiles[index], self._hc_head_fn, self._hc_head_scale,
+                self._hc_head_base, norm_eps=self.cfg.rms_norm_eps,
+                eps=self.cfg.hc_eps)
+            mx.eval(tiles[index])
+        reduced = (tiles[0] if len(tiles) == 1
+                   else mx.concatenate(tiles, axis=1))
+        del tiles
         mx.eval(reduced)
         return reduced
 
