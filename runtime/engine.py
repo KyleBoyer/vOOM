@@ -3663,6 +3663,36 @@ class StreamingEngine:
         path.mkdir(parents=True, exist_ok=True)
         return path
 
+    def _dsv4_prefix_fingerprint(self) -> str:
+        """Identity of everything that changes what a stored prefix MEANS.
+
+        Deliberately NOT _get_kv_fingerprint: that folds in runtime state
+        which mutates during a request, so two processes with identical
+        configuration produced different values and a written checkpoint was
+        never readable back. This is narrow and deterministic -- the
+        checkpoint directory, the architecture parameters the state's shape
+        and meaning depend on, and the flags that change its arithmetic.
+        """
+        import hashlib
+        import os as _os
+
+        parts = [
+            str(getattr(self, "_model_dir", "")),
+            str(self.cfg.model_type),
+            str(self.cfg.num_hidden_layers),
+            str(self.cfg.head_dim),
+            str(self.cfg.window_size),
+            str(tuple(self.cfg.compress_ratios or ())),
+            str(self.cfg.rope_theta),
+            str(self.cfg.compress_rope_theta),
+            str(self.cfg.index_topk),
+            *(f"{name}={_os.environ.get(name, '')}" for name in (
+                "VMODEL_DSV4_NATIVE_MXFP4", "VMODEL_DSV4_PACKED_TRUNK",
+                "VMODEL_DSV4_FUSED_FP8", "VMODEL_DSV4_CARRIER_DTYPE",
+                "VMODEL_DSV4_INDEXER")),
+        ]
+        return hashlib.sha256("|".join(parts).encode()).hexdigest()
+
     def _dsv4_prefix_write(self, tokens, boundary, per_layer) -> bool:
         """Persist one checkpoint so a COLD start can skip its prefill.
 
@@ -3694,7 +3724,7 @@ class StreamingEngine:
                 arrays[f"cstate_kv.{layer}"] = state.kv_state
                 arrays[f"cstate_score.{layer}"] = state.score_state
         meta = {
-            "fingerprint": self._get_kv_fingerprint(),
+            "fingerprint": self._dsv4_prefix_fingerprint(),
             "boundary": str(boundary),
             "layers": _json.dumps(sorted(layers)),
             "ratio": _json.dumps(
@@ -3721,7 +3751,7 @@ class StreamingEngine:
         directory = self._dsv4_prefix_dir()
         if directory is None:
             return 0
-        want = self._get_kv_fingerprint()
+        want = self._dsv4_prefix_fingerprint()
         best = None
         for path in sorted(directory.glob("dsv4_prefix_*.safetensors")):
             try:

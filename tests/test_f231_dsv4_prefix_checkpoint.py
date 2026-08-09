@@ -148,7 +148,7 @@ def _disk_engine(tmp_path, fingerprint="fp-1", ratios=(0, 4, 128)):
 
     engine = _engine()
     engine.rc = RuntimeConfig(dsv4_prefix_cache_dir=str(tmp_path))
-    engine._get_kv_fingerprint = lambda: fingerprint
+    engine._dsv4_prefix_fingerprint = lambda: fingerprint
 
     class _Cfg:
         compress_ratios = list(ratios)
