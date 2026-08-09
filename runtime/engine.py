@@ -1605,6 +1605,10 @@ class StreamingEngine:
         self._dsv4_prefix_slots = int(
             _os.environ.get("VMODEL_DSV4_PREFIX_SLOTS", "2"))
         self._dsv4_checkpoint = None
+        _carrier = _os.environ.get("VMODEL_DSV4_CARRIER_DTYPE", "")
+        self._dsv4_carrier_dtype = (
+            mx.bfloat16 if _carrier == "bfloat16"
+            else mx.float16 if _carrier == "float16" else None)
         self._dsv4_snapshot_slots = int(
             _os.environ.get("VMODEL_DSV4_PROMPT_SLOTS", "4"))
         self._dsv4_prompt_reuse = (
@@ -5051,6 +5055,13 @@ class StreamingEngine:
         # twice at the boundary, which killed a 51,220-token run outright
         # rather than refusing it. Both halves already work per tile, so the
         # single tensor was only ever an intermediate.
+        # The carrier is [positions, hc_mult, dim]. A 51K census found it held
+        # as float32 -- 3.347GB across 134 tiles, the single largest live
+        # allocation -- because _packed_matmul returns float32, so q, the
+        # attention output and the projection are all float32 and hc_post
+        # inherits it via type_as. The released model runs that chain in its
+        # own dtype, so narrowing the carrier both halves it and moves toward
+        # released behaviour rather than away.
         spans = []
         pos = 0
         while pos < total:
@@ -5124,6 +5135,8 @@ class StreamingEngine:
                     lambda t, _h=here: self._deepseek_v4_attention(
                         t, w, prefix, i, kv, _h),
                     **common)
+                if self._dsv4_carrier_dtype is not None:
+                    tile = tile.astype(self._dsv4_carrier_dtype)
                 mx.eval(tile)
                 # Replace in place so the input tile is released now rather
                 # than at the end of the layer.
@@ -5195,9 +5208,12 @@ class StreamingEngine:
             del hidden
 
             for index, (start_pos_, end_pos_) in enumerate(spans):
-                tiles[index] = hc_post(
+                merged = hc_post(
                     moe_out[:, start_pos_:end_pos_], tiles[index],
                     posts[index], combs[index])
+                if self._dsv4_carrier_dtype is not None:
+                    merged = merged.astype(self._dsv4_carrier_dtype)
+                tiles[index] = merged
                 mx.eval(tiles[index])
             del moe_out, posts, combs
 
