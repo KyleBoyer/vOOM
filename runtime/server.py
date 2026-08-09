@@ -1918,9 +1918,26 @@ class EngineManager:
                     "VMODEL_DSV4_WEIGHT_CACHE_MB", "2500"))
                 rc.min_weight_cache_mb = 150
                 rc.stream_lm_head = True
-                # Compressed layers only pool whole groups at offset 0, so the
-                # prompt must go through in one chunk.
-                rc.prefill_chunk_size = 4096
+                # The embedding table is 129,280 x 4,096 -- 1.06GB resident,
+                # and a 51K census found it and the LM head together holding
+                # 2.118GB before any work. This checkpoint ships the row
+                # sidecar, so page the rows instead: measured 2.41GB -> 1.35GB
+                # after construction, with byte-identical greedy tokens.
+                if os.environ.get("VMODEL_DSV4_EMBED_ROWS", "1") == "1":
+                    rc.embed_rows = True
+                    rc.pin_embeddings = False
+                # Chunked prefill is exact as of the 2026-08-07 fixes (the
+                # compressed reach row, the unbounded block gather and the
+                # mid-stream ring write), verified identical across one, two,
+                # four, seven, sixteen and twenty-five chunks. Layer-stationary
+                # prefill fetches each layer once regardless of chunk count,
+                # so a long prompt no longer pays per chunk.
+                rc.layer_stationary_prefill = True
+                # 384 measured better than 768: a 768-position tile needs a
+                # 4.74GB transient, which squeezed the weight cache to its
+                # 0.1GB floor and drove the run into swap.
+                rc.prefill_chunk_size = int(os.environ.get(
+                    "VMODEL_DSV4_PREFILL_CHUNK", "384"))
             elif mtype == "kimi_k3":
                 # F132/F134/F135: K3's untied 2.35GB embedding/head pair and
                 # 2.8T streamed MoE need the same row-paged embedding and
