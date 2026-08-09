@@ -733,6 +733,10 @@ class RuntimeConfig:
     # boundary below the divergence skips nearly all of prefill on every turn
     # after the first. 0 disables.
     dsv4_prefix_checkpoint_stride: int = 8192
+    # Directory for on-disk prefix checkpoints. Lets a COLD start skip
+    # the tool-preamble prefill entirely, since that preamble is known
+    # before any request arrives.
+    dsv4_prefix_cache_dir: str = ""
     # Default ON. Only gpt-oss consults it (see the model_type guard at the
     # use site); it drops keys sliding layers provably cannot read.
     gptoss_sliding_kv_window: bool = True
@@ -1605,6 +1609,8 @@ class StreamingEngine:
         self._dsv4_prefix_slots = int(
             _os.environ.get("VMODEL_DSV4_PREFIX_SLOTS", "2"))
         self._dsv4_checkpoint = None
+        self._dsv4_indexer = (
+            _os.environ.get("VMODEL_DSV4_INDEXER") == "1")
         _carrier = _os.environ.get("VMODEL_DSV4_CARRIER_DTYPE", "")
         self._dsv4_carrier_dtype = (
             mx.bfloat16 if _carrier == "bfloat16"
@@ -2499,7 +2505,8 @@ class StreamingEngine:
             # from the page, so if the Indexer path is ever wired up it raises
             # a KeyError at the tensor it needs instead of quietly attending
             # over a subset.
-            names = [n for n in names if ".attn.indexer." not in n]
+            if not self._dsv4_indexer:
+                names = [n for n in names if ".attn.indexer." not in n]
         return names
 
     def _k3_nf12_split_layer_names(
@@ -3047,6 +3054,102 @@ class StreamingEngine:
                               w[f"{prefix}.attn.compressor.ape"])
             states[layer] = seed
 
+        # ---- Indexer -------------------------------------------------
+        # The released model does not attend over the whole compressed
+        # region: a separate Indexer, with its OWN compressor (rotate=True,
+        # index_head_dim wide), scores every entry and keeps index_topk of
+        # them. Attending to all of them is a fidelity gap that widens with
+        # the prompt -- 12,805 entries at 51K against a cap of 512 -- and it
+        # is the dominant prefill cost at length.
+        indexer_topk = None
+        if (self._dsv4_indexer and ratio
+                and self.cfg.index_topk
+                and f"{prefix}.attn.indexer.wq_b.weight" in w):
+            from .deepseek_v4 import (apply_rope_interleaved,
+                                      compress_prefill, hadamard_transform,
+                                      indexer_select)
+
+            iprefix = f"{prefix}.attn.indexer"
+            istates = getattr(kv, "dsv4_istate", None)
+            if istates is None:
+                istates = {}
+                kv.dsv4_istate = istates
+            istores = getattr(kv, "dsv4_istore", None)
+            if istores is None:
+                istores = {}
+                kv.dsv4_istore = istores
+            ihead = self.cfg.index_head_dim
+
+            def _finish(pooled_raw, positions):
+                """norm -> RoPE at the group positions -> Hadamard rotate."""
+                out = mx.fast.rms_norm(
+                    pooled_raw.astype(x.dtype),
+                    w[f"{iprefix}.compressor.norm.weight"],
+                    self.cfg.rms_norm_eps)
+                tail = apply_rope_interleaved(
+                    out[..., -rope_dim:], cos[positions], sin[positions])
+                out = mx.concatenate([out[..., :-rope_dim], tail], axis=-1)
+                return hadamard_transform(out)
+
+            if offset == 0:
+                ipooled, _left = compress_prefill(
+                    x, w[f"{iprefix}.compressor.wkv.weight"],
+                    w[f"{iprefix}.compressor.wgate.weight"],
+                    w[f"{iprefix}.compressor.ape"],
+                    w[f"{iprefix}.compressor.norm.weight"],
+                    ratio=ratio, head_dim=ihead,
+                    norm_eps=self.cfg.rms_norm_eps)
+                if ipooled is not None:
+                    istores[layer] = _finish(
+                        ipooled, mx.arange(ipooled.shape[1]) * ratio)
+                seed = CompressorState(ratio, ihead, batch=x.shape[0],
+                                       dtype=mx.float32)
+                replay = (x.shape[1] % ratio) + (ratio if seed.overlap else 0)
+                replay = min(replay, x.shape[1])
+                if replay:
+                    icw = w[f"{iprefix}.compressor.wkv.weight"]
+                    icg = w[f"{iprefix}.compressor.wgate.weight"]
+                    tail_x = x[:, -replay:]
+                    kt = (tail_x.astype(icw.dtype) @ icw.T).astype(mx.float32)
+                    st = (tail_x.astype(icg.dtype) @ icg.T).astype(mx.float32)
+                    base = x.shape[1] - replay
+                    for step in range(replay):
+                        seed.step(kt[:, step:step + 1], st[:, step:step + 1],
+                                  base + step, w[f"{iprefix}.compressor.ape"])
+                istates[layer] = seed
+            else:
+                state = istates.get(layer)
+                if state is None:
+                    state = CompressorState(ratio, ihead, batch=x.shape[0],
+                                            dtype=mx.float32)
+                    istates[layer] = state
+                icw = w[f"{iprefix}.compressor.wkv.weight"]
+                icg = w[f"{iprefix}.compressor.wgate.weight"]
+                kp = (x.astype(icw.dtype) @ icw.T).astype(mx.float32)
+                sp = (x.astype(icg.dtype) @ icg.T).astype(mx.float32)
+                for step in range(x.shape[1]):
+                    here = offset + step
+                    out = state.step(kp[:, step:step + 1], sp[:, step:step + 1],
+                                     here, w[f"{iprefix}.compressor.ape"])
+                    if out is None:
+                        continue
+                    entry = _finish(out, mx.array([here + 1 - ratio]))
+                    istores[layer] = (
+                        entry if layer not in istores
+                        else mx.concatenate([istores[layer], entry], axis=1))
+            ikv = istores.get(layer)
+            if ikv is not None and ikv.shape[1]:
+                qr = mx.fast.rms_norm(
+                    x @ w[f"{prefix}.attn.wq_a.weight"].T,
+                    w[f"{prefix}.attn.q_norm.weight"], self.cfg.rms_norm_eps)
+                indexer_topk = indexer_select(
+                    qr, x, w[f"{iprefix}.wq_b.weight"],
+                    w[f"{iprefix}.weights_proj.weight"], ikv,
+                    n_heads=self.cfg.index_n_heads, head_dim=ihead,
+                    rope_head_dim=rope_dim, cos=cos[offset:], sin=sin[offset:],
+                    ratio=ratio, index_topk=self.cfg.index_topk,
+                    start_pos=offset, offset=compressed_offset)
+
         from .deepseek_v4 import gather_indices
 
         if block_decode:
@@ -3054,8 +3157,10 @@ class StreamingEngine:
 
             topk = block_decode_topk_idxs(window, x.shape[1], offset)
             if ratio:
-                compressed = compress_topk_idxs(
-                    ratio, x.shape[1], offset, compressed_offset)
+                compressed = (indexer_topk if indexer_topk is not None
+                              else compress_topk_idxs(
+                                  ratio, x.shape[1], offset,
+                                  compressed_offset))
                 if compressed.shape[1] != topk.shape[1]:
                     # Same broadcast gather_indices performs: the compressed
                     # generator can return one row when every query in the
@@ -3064,6 +3169,15 @@ class StreamingEngine:
                         compressed, (compressed.shape[0], topk.shape[1],
                                      compressed.shape[2]))
                 topk = mx.concatenate([topk, compressed], axis=-1)
+        elif indexer_topk is not None:
+            from .deepseek_v4 import window_topk_idxs
+
+            windowed = window_topk_idxs(window, x.shape[1], offset)
+            if windowed.shape[1] != indexer_topk.shape[1]:
+                windowed = mx.broadcast_to(
+                    windowed, (windowed.shape[0], indexer_topk.shape[1],
+                               windowed.shape[2]))
+            topk = mx.concatenate([windowed, indexer_topk], axis=-1)
         else:
             topk = gather_indices(window, ratio, x.shape[1], offset,
                                   compressed_offset)
@@ -3533,6 +3647,124 @@ class StreamingEngine:
         return drafted
 
 
+    # ---- DeepSeek V4 prefix checkpoint persistence --------------------
+
+    def _dsv4_prefix_dir(self):
+        """Directory for on-disk prefix checkpoints, or None."""
+        import os as _os
+        from pathlib import Path as _Path
+
+        raw = (getattr(getattr(self, "rc", None),
+                       "dsv4_prefix_cache_dir", "")
+               or _os.environ.get("VMODEL_DSV4_PREFIX_CACHE_DIR", ""))
+        if not raw:
+            return None
+        path = _Path(raw)
+        path.mkdir(parents=True, exist_ok=True)
+        return path
+
+    def _dsv4_prefix_write(self, tokens, boundary, per_layer) -> bool:
+        """Persist one checkpoint so a COLD start can skip its prefill.
+
+        An agent harness sends the same tool preamble on every request, and
+        that preamble is known before any request arrives -- so the 62 minutes
+        turn one spends on it is avoidable outright, not merely amortised
+        across a session. The payload is dominated by the compressed stores
+        (~609MB at a 49,152 boundary); rings and compressor state are ~12MB.
+
+        The token prefix is stored ALONGSIDE the arrays rather than hashed,
+        so a load can verify the match exactly instead of trusting a digest.
+        """
+        import json as _json
+
+        directory = self._dsv4_prefix_dir()
+        if directory is None or boundary <= 0:
+            return False
+        arrays = {"tokens": mx.array(
+            [int(t) for t in tokens[:boundary]], dtype=mx.int32)}
+        layers = []
+        for layer, saved in per_layer.items():
+            layers.append(layer)
+            if saved["ring"] is not None:
+                arrays[f"ring.{layer}"] = saved["ring"]
+            if saved["store"] is not None:
+                arrays[f"store.{layer}"] = saved["store"]
+            state = saved["cstate"]
+            if state is not None:
+                arrays[f"cstate_kv.{layer}"] = state.kv_state
+                arrays[f"cstate_score.{layer}"] = state.score_state
+        meta = {
+            "fingerprint": self._get_kv_fingerprint(),
+            "boundary": str(boundary),
+            "layers": _json.dumps(sorted(layers)),
+            "ratio": _json.dumps(
+                [int(r) for r in (self.cfg.compress_ratios or ())]),
+            "head_dim": str(self.cfg.head_dim),
+        }
+        target = directory / f"dsv4_prefix_{boundary}.safetensors"
+        mx.eval(list(arrays.values()))
+        mx.save_safetensors(str(target), arrays, metadata=meta)
+        return True
+
+    def _dsv4_prefix_read(self, kv, tokens) -> int:
+        """Load the longest on-disk checkpoint that prefixes ``tokens``.
+
+        Same rule as the in-memory path: the whole stored prefix must match,
+        because the state covers exactly those positions. A checkpoint from a
+        different model or runtime is skipped on its fingerprint rather than
+        producing confident nonsense.
+        """
+        import json as _json
+
+        from .deepseek_v4 import CompressorState
+
+        directory = self._dsv4_prefix_dir()
+        if directory is None:
+            return 0
+        want = self._get_kv_fingerprint()
+        best = None
+        for path in sorted(directory.glob("dsv4_prefix_*.safetensors")):
+            try:
+                arrays, meta = mx.load(str(path), return_metadata=True)
+            except Exception:
+                continue
+            if meta.get("fingerprint") != want:
+                continue
+            stored = arrays.get("tokens")
+            if stored is None:
+                continue
+            n = int(stored.shape[0])
+            if n > len(tokens) or (best is not None and n <= best[0]):
+                continue
+            head = mx.array([int(t) for t in tokens[:n]], dtype=mx.int32)
+            if not bool(mx.all(head == stored.astype(mx.int32))):
+                continue
+            best = (n, arrays, meta)
+        if best is None:
+            return 0
+
+        boundary, arrays, meta = best
+        rings, stores, states = {}, {}, {}
+        ratios = _json.loads(meta.get("ratio") or "[]")
+        head_dim = int(meta.get("head_dim") or self.cfg.head_dim)
+        for layer in _json.loads(meta.get("layers") or "[]"):
+            if f"ring.{layer}" in arrays:
+                rings[layer] = arrays[f"ring.{layer}"]
+            if f"store.{layer}" in arrays:
+                stores[layer] = arrays[f"store.{layer}"]
+            if f"cstate_kv.{layer}" in arrays:
+                ratio = ratios[layer] if layer < len(ratios) else 0
+                state = CompressorState(
+                    max(int(ratio), 1), head_dim, batch=1, dtype=mx.float32)
+                state.kv_state = arrays[f"cstate_kv.{layer}"]
+                state.score_state = arrays[f"cstate_score.{layer}"]
+                states[layer] = state
+        kv.dsv4_rings = rings
+        kv.dsv4_compressed = stores
+        kv.dsv4_cstate = states
+        kv.dsv4_pos = boundary
+        return boundary
+
     def _dsv4_prefix_store(self, tokens) -> int:
         """Persist the checkpoint the last sweep captured, keyed by its prefix.
 
@@ -3550,6 +3782,11 @@ class StreamingEngine:
         if boundary <= 0 or boundary > len(tokens):
             return 0
         key = tuple(int(t) for t in tokens[:boundary])
+        if key not in self._dsv4_prefix_checkpoints:
+            try:
+                self._dsv4_prefix_write(tokens, boundary, per_layer)
+            except Exception as exc:            # persistence is best-effort
+                print(f"[engine] prefix checkpoint not written: {exc}")
         self._dsv4_prefix_checkpoints[key] = {
             "pos": boundary, "layers": per_layer}
         while len(self._dsv4_prefix_checkpoints) > self._dsv4_prefix_slots:
@@ -3568,7 +3805,7 @@ class StreamingEngine:
         from .deepseek_v4 import CompressorState
 
         if not self._dsv4_prefix_checkpoints:
-            return 0
+            return self._dsv4_prefix_read(kv, tokens)
         best = None
         for key, entry in self._dsv4_prefix_checkpoints.items():
             n = len(key)
@@ -3577,7 +3814,7 @@ class StreamingEngine:
             if all(int(tokens[i]) == key[i] for i in range(n)):
                 best = (key, entry)
         if best is None:
-            return 0
+            return self._dsv4_prefix_read(kv, tokens)
         entry = best[1]
         rings, stores, states = {}, {}, {}
         for layer, saved in entry["layers"].items():

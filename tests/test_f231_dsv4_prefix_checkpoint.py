@@ -35,9 +35,10 @@ class _FakeKV:
 def _engine(slots=2):
     from collections import OrderedDict
 
-    from runtime.engine import StreamingEngine
+    from runtime.engine import RuntimeConfig, StreamingEngine
 
     engine = StreamingEngine.__new__(StreamingEngine)
+    engine.rc = RuntimeConfig()          # persistence off unless a test sets it
     engine._dsv4_prefix_checkpoints = OrderedDict()
     engine._dsv4_prefix_slots = slots
     engine._dsv4_checkpoint = None
@@ -135,3 +136,89 @@ def test_slots_are_bounded():
         _capture(engine, 4)
         engine._dsv4_prefix_store([i, i, i, i, i])
     assert len(engine._dsv4_prefix_checkpoints) <= 2
+
+
+# ---- on-disk persistence --------------------------------------------------
+
+
+def _disk_engine(tmp_path, fingerprint="fp-1", ratios=(0, 4, 128)):
+    from collections import OrderedDict
+
+    from runtime.engine import RuntimeConfig, StreamingEngine
+
+    engine = _engine()
+    engine.rc = RuntimeConfig(dsv4_prefix_cache_dir=str(tmp_path))
+    engine._get_kv_fingerprint = lambda: fingerprint
+
+    class _Cfg:
+        compress_ratios = list(ratios)
+        head_dim = 4
+    engine.cfg = _Cfg()
+    return engine
+
+
+def test_checkpoint_survives_a_process_boundary(tmp_path):
+    """The point: a COLD start skips the preamble it never prefilled."""
+    import mlx.core as mx
+
+    writer = _disk_engine(tmp_path)
+    _capture(writer, 4, layers=2, fill=7.0)
+    assert writer._dsv4_prefix_store([1, 2, 3, 4, 5, 6]) == 4
+
+    # A fresh engine with no in-memory state at all.
+    reader = _disk_engine(tmp_path)
+    kv = _FakeKV()
+    assert reader._dsv4_prefix_restore(kv, [1, 2, 3, 4, 9]) == 4
+    assert kv.dsv4_pos == 4
+    assert float(mx.max(kv.dsv4_rings[0])) == 7.0
+    assert set(kv.dsv4_cstate) == {0, 1}
+
+
+def test_disk_checkpoint_refuses_a_different_fingerprint(tmp_path):
+    """A model or runtime change must invalidate it, not reinterpret it."""
+    writer = _disk_engine(tmp_path, fingerprint="fp-A")
+    _capture(writer, 4)
+    writer._dsv4_prefix_store([1, 2, 3, 4, 5])
+
+    reader = _disk_engine(tmp_path, fingerprint="fp-B")
+    kv = _FakeKV()
+    assert reader._dsv4_prefix_restore(kv, [1, 2, 3, 4, 5]) == 0
+
+
+def test_disk_checkpoint_refuses_a_diverging_prefix(tmp_path):
+    writer = _disk_engine(tmp_path)
+    _capture(writer, 4)
+    writer._dsv4_prefix_store([1, 2, 3, 4, 5])
+
+    reader = _disk_engine(tmp_path)
+    kv = _FakeKV()
+    assert reader._dsv4_prefix_restore(kv, [1, 2, 9, 4, 5]) == 0
+    assert reader._dsv4_prefix_restore(kv, [1, 2, 3]) == 0
+
+
+def test_disk_checkpoint_stores_tokens_not_a_digest(tmp_path):
+    """Verification must be exact; a digest collision would be unrecoverable."""
+    import mlx.core as mx
+
+    writer = _disk_engine(tmp_path)
+    _capture(writer, 4)
+    writer._dsv4_prefix_store([11, 22, 33, 44, 55])
+
+    files = list(tmp_path.glob("dsv4_prefix_*.safetensors"))
+    assert files, "nothing written"
+    arrays, meta = mx.load(str(files[0]), return_metadata=True)
+    assert "tokens" in arrays
+    assert [int(v) for v in arrays["tokens"].tolist()] == [11, 22, 33, 44]
+    assert meta["boundary"] == "4"
+
+
+def test_missing_directory_is_not_an_error(tmp_path):
+    """Persistence is best-effort; an unset directory just disables it."""
+    engine = _engine()
+
+    from runtime.engine import RuntimeConfig
+
+    engine.rc = RuntimeConfig()
+    assert engine._dsv4_prefix_dir() is None
+    kv = _FakeKV()
+    assert engine._dsv4_prefix_restore(kv, [1, 2, 3]) == 0
