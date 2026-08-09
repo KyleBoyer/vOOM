@@ -726,6 +726,13 @@ class RuntimeConfig:
     # Bounds the float32 hyper-connection carrier without costing weight
     # reads: a layer's routed experts stay resident across its own tiles.
     dsv4_ffn_tile_width: int = 2048
+    # Positions per DeepSeek V4 prefix checkpoint. A harness prompt is almost
+    # entirely a stable prefix -- the captured 51,220-token request is 46,941
+    # tokens of tool schemas plus 4,233 of system prompt against a 42-token
+    # user message -- so resuming from a checkpoint at the largest stride
+    # boundary below the divergence skips nearly all of prefill on every turn
+    # after the first. 0 disables.
+    dsv4_prefix_checkpoint_stride: int = 8192
     # Default ON. Only gpt-oss consults it (see the model_type guard at the
     # use site); it drops keys sliding layers provably cannot read.
     gptoss_sliding_kv_window: bool = True
@@ -1594,6 +1601,10 @@ class StreamingEngine:
         from collections import OrderedDict as _OrderedDict
 
         self._dsv4_snapshots: dict = _OrderedDict()
+        self._dsv4_prefix_checkpoints: dict = _OrderedDict()
+        self._dsv4_prefix_slots = int(
+            _os.environ.get("VMODEL_DSV4_PREFIX_SLOTS", "2"))
+        self._dsv4_checkpoint = None
         self._dsv4_snapshot_slots = int(
             _os.environ.get("VMODEL_DSV4_PROMPT_SLOTS", "4"))
         self._dsv4_prompt_reuse = (
@@ -3518,6 +3529,68 @@ class StreamingEngine:
         return drafted
 
 
+    def _dsv4_prefix_store(self, tokens) -> int:
+        """Persist the checkpoint the last sweep captured, keyed by its prefix.
+
+        Returns the boundary stored, or 0. The value keeps the ARRAYS the
+        sweep produced and copies only the containers, the same ownership rule
+        the exact-prompt snapshot uses: decode rebinds entries rather than
+        mutating arrays, so sharing arrays is safe and sharing containers is
+        not.
+        """
+        captured = getattr(self, "_dsv4_checkpoint", None)
+        self._dsv4_checkpoint = None
+        if not captured:
+            return 0
+        boundary, per_layer = captured
+        if boundary <= 0 or boundary > len(tokens):
+            return 0
+        key = tuple(int(t) for t in tokens[:boundary])
+        self._dsv4_prefix_checkpoints[key] = {
+            "pos": boundary, "layers": per_layer}
+        while len(self._dsv4_prefix_checkpoints) > self._dsv4_prefix_slots:
+            self._dsv4_prefix_checkpoints.pop(
+                next(iter(self._dsv4_prefix_checkpoints)))
+        return boundary
+
+    def _dsv4_prefix_restore(self, kv, tokens) -> int:
+        """Resume from the longest stored prefix of ``tokens``. Returns its length.
+
+        Only a checkpoint whose ENTIRE key is a prefix of this request may be
+        used: its state covers exactly those positions, so a request that
+        diverges earlier cannot use it, and one that diverges later resumes
+        from it and prefills the remainder.
+        """
+        from .deepseek_v4 import CompressorState
+
+        if not self._dsv4_prefix_checkpoints:
+            return 0
+        best = None
+        for key, entry in self._dsv4_prefix_checkpoints.items():
+            n = len(key)
+            if n > len(tokens) or (best is not None and n <= len(best[0])):
+                continue
+            if all(int(tokens[i]) == key[i] for i in range(n)):
+                best = (key, entry)
+        if best is None:
+            return 0
+        entry = best[1]
+        rings, stores, states = {}, {}, {}
+        for layer, saved in entry["layers"].items():
+            if saved["ring"] is not None:
+                rings[layer] = saved["ring"]
+            if saved["store"] is not None:
+                stores[layer] = saved["store"]
+            if saved["cstate"] is not None:
+                clone = CompressorState.__new__(CompressorState)
+                clone.__dict__.update(saved["cstate"].__dict__)
+                states[layer] = clone
+        kv.dsv4_rings = rings
+        kv.dsv4_compressed = stores
+        kv.dsv4_cstate = states
+        kv.dsv4_pos = entry["pos"]
+        return entry["pos"]
+
     # ---- DeepSeek V4 exact-prompt state reuse -------------------------
 
     def _dsv4_snapshot_copy(self, kv):
@@ -4983,6 +5056,19 @@ class StreamingEngine:
         while pos < total:
             spans.append((pos, min(pos + tile_width, total)))
             pos = spans[-1][1]
+        # Checkpoint boundary: the largest tile-aligned stride multiple
+        # strictly inside this sweep. Captured DURING the single pass -- each
+        # layer's ring/compressor state at position B is available the moment
+        # that layer's tile loop crosses B, so collecting one entry per layer
+        # yields the complete state at B without a second sweep.
+        stride = self.rc.dsv4_prefix_checkpoint_stride
+        checkpoint_at = 0
+        if stride > 0 and offset == 0:
+            aligned = (total - 1) // tile_width * tile_width
+            checkpoint_at = min(aligned, (total - 1) // stride * stride)
+            checkpoint_at = checkpoint_at // tile_width * tile_width
+        checkpoint = {} if checkpoint_at else None
+
         expanded = mx.broadcast_to(
             x[:, :, None, :],
             (x.shape[0], total, self.cfg.hc_mult, x.shape[2]))
@@ -5042,6 +5128,20 @@ class StreamingEngine:
                 # Replace in place so the input tile is released now rather
                 # than at the end of the layer.
                 tiles[index] = tile
+                if checkpoint is not None and end == checkpoint_at:
+                    from .deepseek_v4 import CompressorState
+
+                    state = (getattr(kv, "dsv4_cstate", None) or {}).get(i)
+                    clone = None
+                    if state is not None:
+                        clone = CompressorState.__new__(CompressorState)
+                        clone.__dict__.update(state.__dict__)
+                    checkpoint[i] = {
+                        "ring": (getattr(kv, "dsv4_rings", None) or {}).get(i),
+                        "store": (getattr(kv, "dsv4_compressed", None)
+                                  or {}).get(i),
+                        "cstate": clone,
+                    }
 
             # The MoE half is tiled too, but for MEMORY, not for weights.
             # hc_pre widens to float32, so one 51,220-position carrier is
@@ -5120,6 +5220,8 @@ class StreamingEngine:
             del w
 
         kv.dsv4_pos = offset + total
+        if checkpoint:
+            self._dsv4_checkpoint = (checkpoint_at, checkpoint)
         from .deepseek_v4 import hc_head
 
         # Reduce per tile before joining: hc_head collapses the hc_mult axis,
@@ -7650,6 +7752,14 @@ class StreamingEngine:
             logits = precomputed_prompt_logits
         else:
             pos = matched
+            if (self.cfg.model_type == "deepseek_v4"
+                    and self.rc.dsv4_prefix_checkpoint_stride > 0
+                    and pos == 0):
+                resumed = self._dsv4_prefix_restore(kv, tokens)
+                if resumed:
+                    pos = resumed
+                    path_stats["prompt_cache_source"] = "dsv4_prefix"
+                    path_stats["prompt_cache_prefix_tokens"] = resumed
             # A layer-stationary sweep returns the hidden states for every
             # position it consumes.  When that sweep reaches the prompt
             # endpoint, retain its final hidden state for logits instead of
@@ -8142,6 +8252,10 @@ class StreamingEngine:
                 and self._dsv4_prompt_reuse
                 and path_stats["prompt_cache_source"] != "dsv4_state"):
             self._dsv4_snapshot_store(tokens, kv, logits)
+        if self.cfg.model_type == "deepseek_v4":
+            stored = self._dsv4_prefix_store(tokens)
+            if stored:
+                path_stats["prefill_checkpoints_saved"] = 1
         if (kv_store is not None and exact_logits is None
                 and precomputed_prompt_logits is None and matched < len(tokens)):
             write_t0 = time.perf_counter()
