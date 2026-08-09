@@ -362,6 +362,44 @@ def hadamard_transform(x: mx.array, scale: float | None = None) -> mx.array:
     return (y * scale if scale is not None else y).astype(x.dtype)
 
 
+def indexer_select(qr: mx.array, x: mx.array, wq_b: mx.array,
+                   weights_proj: mx.array, indexer_kv: mx.array, *,
+                   n_heads: int, head_dim: int, rope_head_dim: int,
+                   cos: mx.array, sin: mx.array, ratio: int, index_topk: int,
+                   start_pos: int, offset: int,
+                   simulate_fp4: bool = False) -> mx.array:
+    """Which compressed entries each position attends to, per the Indexer.
+
+    The released model does NOT attend over the whole compressed region: an
+    Indexer scores every entry with a small projection and keeps
+    ``index_topk`` (512). Attending to all of them, as this runtime did, is
+    both slower at length -- the region is seqlen/ratio entries, 12,805 at 51K
+    tokens -- and a fidelity gap against the released behaviour.
+
+    ``qr`` is the q-LoRA intermediate the attention already computes, so the
+    Indexer reuses it rather than recomputing the projection.
+
+    The released path additionally runs ``fp4_act_quant`` on the query as a
+    QAT simulation. That is a kernel stub here, so it is off by default and
+    the selection is computed from the unquantized query; the effect is a
+    slightly different ranking near ties, never an out-of-range index.
+    """
+    b, s, _ = x.shape
+    q = (qr @ wq_b.T).reshape(b, s, n_heads, head_dim)
+    tail = apply_rope_interleaved(q[..., -rope_head_dim:], cos, sin)
+    q = mx.concatenate([q[..., :-rope_head_dim], tail], axis=-1)
+    q = hadamard_transform(q)
+    if simulate_fp4:
+        q = act_quant_simulate(q)
+    weights = (x.astype(mx.float32)
+               @ weights_proj.astype(mx.float32).T) * (
+        head_dim ** -0.5 * n_heads ** -0.5)
+    score = index_scores(q, indexer_kv, weights)
+    return index_topk_idxs(
+        score, s, ratio, offset, index_topk, start_pos + s,
+        prefill=(start_pos == 0))
+
+
 def index_scores(q: mx.array, compressed_kv: mx.array, weights: mx.array
                  ) -> mx.array:
     """Per-position scores over compressed entries.
