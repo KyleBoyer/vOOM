@@ -1128,14 +1128,16 @@ class DSparkSpeculativeDecoder:
             stats.sidecar_loaded_bytes += self.drafter_storage_bytes
         return drafter
 
-    def _release_drafter(self, stats: DSparkStats | None = None) -> int:
+    def _release_drafter(
+        self, stats: DSparkStats | None = None, *, force: bool = False,
+    ) -> int:
         """End the draft-weight lifetime before a target verification sweep.
 
         Context K/V belongs to the request and remains exact.  Only the
         lossy proposal model is dropped; the released target therefore never
         overlaps its largest streamed layer with the sidecar allocation.
         """
-        if not self.release_between_sweeps or self.drafter is None:
+        if (not self.release_between_sweeps and not force) or self.drafter is None:
             return 0
         active_before = int(mx.get_active_memory())
         started = time.perf_counter()

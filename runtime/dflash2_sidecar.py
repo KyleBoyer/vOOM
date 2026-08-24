@@ -10,7 +10,9 @@ standalone artifact.  A quantized drafter can change acceptance and speed; it
 cannot preserve target semantics without the later exact target verifier.
 
 The default affine-4/group-64 conversion matches z-lab/dflash's documented MLX
-``--draft-bits 4`` path.  Its README recommends an effective block size no
+``--draft-bits 4`` path. Explicit affine-2/3 builds are supported only as
+target-verified memory/acceptance experiments. Its README recommends a block
+size no
 larger than five when either target or draft is quantized, so the plan records
 four proposals per round even though the checkpoint's architectural maximum is
 seven.  Runtime code must not silently rewrite the checkpoint's own
@@ -234,7 +236,11 @@ def _estimated_quantized_bytes(
         count += 1
         rows = math.prod(spec.shape[:-1])
         width = spec.shape[-1]
-        quantized += rows * width * bits // 8
+        # MLX packs floor(32 / bits) values per uint32. Non-power-of-two bit
+        # widths therefore have row-tail padding that an ideal bits/8 estimate
+        # would miss (notably 3-bit: 10 values per uint32).
+        packed_values = 32 // bits
+        quantized += rows * math.ceil(width / packed_values) * 4
         groups = rows * width // group_size
         # MLX affine stores one 16-bit scale and bias per group.  MX formats
         # use a single byte exponent scale and no bias.
@@ -255,8 +261,8 @@ def plan_sidecar(
     group_size: int = 64,
     mode: str = "affine",
 ) -> dict[str, Any]:
-    if bits not in (4, 8):
-        raise ValueError("DFlash2 draft bits must be 4 or 8")
+    if bits not in (2, 3, 4, 8):
+        raise ValueError("DFlash2 draft bits must be 2, 3, 4, or 8")
     if group_size <= 0:
         raise ValueError("DFlash2 draft group_size must be positive")
     if mode not in ("affine", "mxfp4", "mxfp8"):

@@ -170,3 +170,29 @@ def test_runtime_header_accepts_pinned_q4_and_fails_closed_on_promotion_tamper(
     manifest_path.write_text(json.dumps(raw_manifest))
     with pytest.raises(ValueError, match="default-off serving gate"):
         inspect_runtime_sidecar(output, require_official_geometry=False)
+
+
+@pytest.mark.parametrize("bits", [2, 3])
+def test_target_verified_runtime_accepts_smaller_affine_draft_only_sidecars(
+    tmp_path, bits,
+):
+    source = tmp_path / "source"
+    output = tmp_path / f"sidecar-q{bits}"
+    common = _write_source(source)
+    report = build_sidecar(
+        source,
+        output,
+        min_free_bytes=0,
+        group_size=64,
+        bits=bits,
+        mode="affine",
+        **common,
+    )
+
+    config, physical_names, manifest = inspect_runtime_sidecar(
+        output, require_official_geometry=False)
+    assert config.checkpoint.target_layer_ids == (0, 2)
+    assert json.loads((output / "config.json").read_text())["quantization"][
+        "bits"] == bits
+    assert manifest["conversion"]["bits"] == bits
+    assert len(physical_names) == report["output"]["tensor_count"]

@@ -408,3 +408,19 @@ def test_qwen_sidecar_is_released_during_target_sweep_then_reloaded():
     assert result["path_stats"]["dspark_sidecar_round_releases"] == 1
     assert result["path_stats"]["dspark_sidecar_round_loads"] == 1
     assert result["path_stats"]["dspark_sidecar_loaded_bytes"] == 1234
+
+
+def test_forced_sidecar_release_is_available_for_prompt_lifetime_isolation():
+    decoder = DSparkSpeculativeDecoder(
+        _HybridTarget(accepted=0),
+        _HybridDrafter(),
+        max_draft_tokens=2,
+        prompt_cache_min_tokens=0,
+        release_between_sweeps=False,
+    )
+    resident = decoder.drafter
+
+    assert decoder._release_drafter() == 0
+    assert decoder.drafter is resident
+    decoder._release_drafter(force=True)
+    assert decoder.drafter is None

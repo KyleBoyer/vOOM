@@ -430,9 +430,9 @@ def inspect_runtime_sidecar(
     bits = int(quantization["bits"])
     group_size = int(quantization["group_size"])
     mode = str(quantization["mode"])
-    if (bits, group_size, mode) != (4, 64, "affine"):
+    if mode != "affine" or group_size != 64 or bits not in (2, 3, 4):
         raise ValueError(
-            "DFlash2 runtime requires the pinned affine4/group64 sidecar")
+            "DFlash2 runtime requires a pinned affine2/3/4 group64 sidecar")
 
     proof = manifest.get("proof")
     serving = manifest.get("serving")
@@ -832,10 +832,10 @@ class DFlash2SpeculativeEngine:
         self._speculative_k = self.decoder.max_draft_tokens
         self._speculative_draft_dir = draft_dir
         self._speculative_kind = "dflash2"
-        if release_between_sweeps:
-            # Construction validates and binds the artifact. The first request
-            # reloads it only after the target prompt endpoint is complete.
-            self.decoder._release_drafter()
+        # Construction validates and binds the artifact. Every request starts
+        # target prefill without the sidecar, even when decode-resident mode is
+        # explicitly selected to retain it between verification rounds.
+        self.decoder._release_drafter(force=True)
 
     def __getattr__(self, name):
         return getattr(self.target, name)
@@ -843,7 +843,7 @@ class DFlash2SpeculativeEngine:
     def _target_generate(self, reason: str, prompt: str, max_tokens: int,
                          **kwargs):
         self.decoder.clear_prompt_cache()
-        self.decoder._release_drafter()
+        self.decoder._release_drafter(force=True)
         generate = getattr(
             self.target, "generate_with_memory_retry", self.target.generate)
         result = generate(prompt, max_tokens, **kwargs)
@@ -872,6 +872,9 @@ class DFlash2SpeculativeEngine:
         }
         kwargs = {name: value for name, value in kwargs.items()
                   if value is not None}
+        # A previous request may have retained the proposal weights for decode.
+        # Target prefill always gets an isolated lifetime.
+        self.decoder._release_drafter(force=True)
         if len(ids) > self.max_prompt_tokens:
             return self._target_generate(
                 "prompt-limit", prompt, max_tokens, **kwargs)
@@ -887,13 +890,14 @@ class DFlash2SpeculativeEngine:
 
     def release_request_state(self):
         self.decoder.clear_prompt_cache()
+        self.decoder._release_drafter(force=True)
         self.target.release_request_state()
 
     def close(self):
         if self._closed:
             return
         self._closed = True
-        self.decoder._release_drafter()
+        self.decoder._release_drafter(force=True)
         close = getattr(self.target, "close", None)
         if callable(close):
             close()
