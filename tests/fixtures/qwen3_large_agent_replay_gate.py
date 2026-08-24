@@ -633,6 +633,11 @@ def main() -> int:
             "developer-action", "short-direct-no-tools"),
         help="replace conversation turns with a tracked regression scenario")
     parser.add_argument(
+        "--scenario-user-text",
+        help=(
+            "replace the final user text inside a selected tracked scenario; "
+            "the scenario's system/developer/tool shape remains unchanged"))
+    parser.add_argument(
         "--kai-conversation", type=Path,
         help="replay every user boundary from this local Kai conversation")
     parser.add_argument("--min-available-gb", type=float, default=4.0)
@@ -683,6 +688,14 @@ def main() -> int:
         parser.error(
             "replacement-user-text, append-final-user-text, scenario, and "
             "kai-conversation are mutually exclusive")
+    if args.scenario_user_text is not None and args.scenario is None:
+        parser.error("scenario-user-text requires --scenario")
+    if (args.scenario_user_text is not None
+            and args.scenario not in (
+                "developer-action", "short-direct-no-tools")):
+        parser.error(
+            "scenario-user-text is supported only for scenarios whose final "
+            "item is a user message")
 
     raw = args.capture.read_bytes()
     digest = hashlib.sha256(raw).hexdigest()
@@ -719,7 +732,11 @@ def main() -> int:
             scenario_turns = TOOL_RESULT_TURNS
             request_value["input"] = [*inputs[:-1], *scenario_turns]
         elif args.scenario == "developer-action":
-            scenario_turns = DEVELOPER_ACTION_INPUT
+            scenario_turns = json.loads(json.dumps(DEVELOPER_ACTION_INPUT))
+            if args.scenario_user_text is not None:
+                scenario_turns[-1]["content"] = [{
+                    "type": "input_text", "text": args.scenario_user_text,
+                }]
             request_value["input"] = scenario_turns
             retained = {
                 "mastra_workspace_list_files",
@@ -732,7 +749,11 @@ def main() -> int:
                 raise SystemExit(
                     "developer-action scenario is missing workspace tools")
         else:
-            scenario_turns = SHORT_DIRECT_NO_TOOLS_INPUT
+            scenario_turns = json.loads(json.dumps(SHORT_DIRECT_NO_TOOLS_INPUT))
+            if args.scenario_user_text is not None:
+                scenario_turns[-1]["content"] = [{
+                    "type": "input_text", "text": args.scenario_user_text,
+                }]
             request_value["input"] = scenario_turns
             request_value["tools"] = []
             request_value["tool_choice"] = "none"
@@ -1055,6 +1076,9 @@ def main() -> int:
             "max_output_tokens_omitted": args.omit_max_output_tokens,
             "repeats": args.repeats,
             "scenario": args.scenario,
+            "scenario_user_sha256": (
+                hashlib.sha256(args.scenario_user_text.encode("utf-8")).hexdigest()
+                if args.scenario_user_text is not None else None),
             "kai_conversation_sha256": (
                 hashlib.sha256(args.kai_conversation.read_bytes()).hexdigest()
                 if args.kai_conversation is not None else None),
