@@ -88,6 +88,31 @@ def test_builtin_profiles_resolve_complete_agent_group():
     assert rerank_settings[
         "VMODEL_QWEN35_RERANK_LM_HEAD_CANDIDATES"] == "64"
 
+    huihui_order, huihui_settings = resolve_runtime_profiles(
+        ("huihui-qwen38-27b-fast-agent",), catalog)
+    assert huihui_order == (
+        "agent-tool-gateway",
+        "huihui-qwen38-27b-fast-agent",
+    )
+    assert huihui_settings[
+        "VMODEL_QWEN35_PREFILL_CHUNK_CEILING"] == "128"
+    assert huihui_settings["VMODEL_QWEN_MTP_DEPTH"] == "1"
+    assert huihui_settings[
+        "VMODEL_QWEN_MTP_STOCHASTIC_DRAFT_TOP_K"] == "1"
+    assert huihui_settings["VMODEL_QWEN35_PIN_LM_HEAD"] == "1"
+    assert huihui_settings["VMODEL_QWEN35_PREFETCH_DEPTH"] == "2"
+
+    persist_order, persist_settings = resolve_runtime_profiles(
+        ("huihui-qwen38-27b-lossless-paged-persist",), catalog)
+    assert persist_order == (
+        "huihui-qwen38-27b-lossless",
+        "huihui-qwen38-27b-lossless-paged-persist",
+    )
+    assert persist_settings["VMODEL_QWEN35_KV_MAX_MB"] == "768"
+    assert persist_settings["VMODEL_QWEN35_PAGED_KV_PERSIST"] == "1"
+    assert persist_settings[
+        "VMODEL_QWEN35_FUSED_BOUNDARY_SCAFFOLD_PREFILL"] == "0"
+
 def test_builtin_k3_and_qwen9_profiles_pin_validated_values():
     catalog = discover_runtime_profiles((ROOT / "profiles",))
 

@@ -7,9 +7,11 @@ attention can stay bf16 while the MLP goes 4-bit.
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 from dataclasses import dataclass
 
 import mlx.core as mx
+import numpy as np
 
 
 @dataclass
@@ -60,25 +62,87 @@ class RerankedQHead:
     to the empirically selected candidate support in this explicitly lossy mode.
 
     Candidate recall is an empirical property, not a mathematical guarantee.
-    This representation is therefore restricted to an explicitly lossy profile
-    and keeps the exact head resident for reranking.
+    This representation is therefore restricted to an explicitly lossy
+    profile. ``exact`` may be either the historical resident BF16 matrix or a
+    verified row provider that reads only selected BF16 rows.
     """
 
-    exact: mx.array
+    exact: object
     approx: QTensor
     candidates: int
+    recall_probe_every: int = 0
+    calls: int = 0
+    positions: int = 0
+    candidate_winner_changes: int = 0
+    candidate_recall_probes: int = 0
+    candidate_recall_hits: int = 0
+    # Optional explicit, ranks-only evidence writer. It is attached only for
+    # a fingerprint-bound row-paged K=64 capture run. The scope defaults to
+    # authoritative target decisions; Qwen's shared-head MTP drafter marks
+    # its proposal projections separately so they can never enter the gate.
+    recall_rank_capture: object | None = None
+    recall_rank_capture_scope: str = "authoritative-target"
 
     @property
     def nbytes(self) -> int:
-        return self.exact.nbytes + self.approx.nbytes
+        return int(getattr(self.exact, "nbytes", 0) or 0) + self.approx.nbytes
 
     @property
     def shape(self) -> tuple[int, ...]:
-        return self.exact.shape
+        shape = getattr(self.exact, "shape", None)
+        if shape is not None:
+            return tuple(shape)
+        return (int(self.exact.vocab), int(self.exact.hidden))
 
     @property
     def dtype(self):
-        return self.exact.dtype
+        dtype = getattr(self.exact, "dtype", mx.bfloat16)
+        return mx.bfloat16 if dtype == "BF16" else dtype
+
+    def record_candidate_recall(self, hits: int, probes: int) -> None:
+        if hits < 0 or probes < 0 or hits > probes:
+            raise ValueError("candidate recall requires 0 <= hits <= probes")
+        self.candidate_recall_hits += int(hits)
+        self.candidate_recall_probes += int(probes)
+
+    def telemetry_snapshot(self) -> dict[str, int]:
+        values = {
+            "calls": int(self.calls),
+            "positions": int(self.positions),
+            "candidate_winner_changes": int(self.candidate_winner_changes),
+            "candidate_recall_probes": int(self.candidate_recall_probes),
+            "candidate_recall_hits": int(self.candidate_recall_hits),
+        }
+        provider = getattr(self.exact, "candidate_telemetry", None)
+        if callable(provider):
+            values.update(provider())
+        capture_snapshot = getattr(
+            self.recall_rank_capture, "telemetry_snapshot", None)
+        if callable(capture_snapshot):
+            values.update({
+                f"candidate_rank_capture_{key}": int(value)
+                for key, value in capture_snapshot().items()
+            })
+        return values
+
+
+@contextmanager
+def reranked_lm_head_capture_scope(head, scope: str):
+    """Temporarily label one shared-head projection for recall evidence.
+
+    The ordinary target path remains ``authoritative-target``. Proposal-only
+    MTP projections use ``mtp-draft`` and are excluded by ``reranked_matmul``.
+    """
+
+    if not isinstance(head, RerankedQHead):
+        yield
+        return
+    previous = head.recall_rank_capture_scope
+    head.recall_rank_capture_scope = str(scope)
+    try:
+        yield
+    finally:
+        head.recall_rank_capture_scope = previous
 
 
 def make_reranked_q_head(
@@ -110,6 +174,32 @@ def make_reranked_q_head(
         policy.bits, policy.group_size, policy.mode,
     )
     return RerankedQHead(exact=exact, approx=approx, candidates=candidates)
+
+
+def make_row_paged_reranked_q_head(
+    approx: QTensor,
+    exact_rows,
+    *,
+    candidates: int = 64,
+    recall_probe_every: int = 0,
+) -> RerankedQHead:
+    """Compose an on-disk quantized shortlist with a BF16 row provider."""
+
+    shape = tuple(getattr(exact_rows, "shape", (
+        getattr(exact_rows, "vocab", 0), getattr(exact_rows, "hidden", 0))))
+    if len(shape) != 2 or shape != approx.shape:
+        raise ValueError(
+            f"approximate/exact LM-head shapes differ: {approx.shape} vs {shape}")
+    if candidates <= 0 or candidates > shape[0]:
+        raise ValueError(
+            f"rerank candidates must be in [1, {shape[0]}], got {candidates}")
+    if recall_probe_every < 0:
+        raise ValueError("recall_probe_every must be non-negative")
+    if not callable(getattr(exact_rows, "candidate_logits", None)):
+        raise ValueError("exact LM-head row provider lacks candidate_logits")
+    return RerankedQHead(
+        exact=exact_rows, approx=approx, candidates=candidates,
+        recall_probe_every=recall_probe_every)
 
 
 @dataclass
@@ -407,17 +497,98 @@ def reranked_matmul(
     indices = mx.argpartition(
         -selection, kth=k - 1, axis=-1)[..., :k]
 
-    # Treat each vocabulary row as a one-output expert. gather_mm uses the
-    # same matrix kernel as an exact projection for just the dynamic rows,
-    # unlike an elementwise multiply+sum whose reduction arithmetic was
-    # measured to change greedy choices on the real OLMoE checkpoint.
-    flat = x.reshape(-1, x.shape[-1])
-    flat_indices = indices.reshape(-1, k)
-    lhs = mx.expand_dims(flat, (-2, -3))
-    rhs = mx.expand_dims(w.exact, -2).swapaxes(-1, -2)
-    exact_scores = mx.gather_mm(
-        lhs, rhs, rhs_indices=flat_indices
-    ).squeeze((-1, -2)).reshape(indices.shape)
+    provider = getattr(w.exact, "candidate_logits", None)
+    if callable(provider):
+        exact_scores = provider(x, indices)
+    else:
+        # Treat each vocabulary row as a one-output expert. gather_mm uses the
+        # same matrix kernel as an exact projection for just the dynamic rows,
+        # unlike an elementwise multiply+sum whose reduction arithmetic was
+        # measured to change greedy choices on the real OLMoE checkpoint.
+        flat = x.reshape(-1, x.shape[-1])
+        flat_indices = indices.reshape(-1, k)
+        lhs = mx.expand_dims(flat, (-2, -3))
+        rhs = mx.expand_dims(w.exact, -2).swapaxes(-1, -2)
+        exact_scores = mx.gather_mm(
+            lhs, rhs, rhs_indices=flat_indices
+        ).squeeze((-1, -2)).reshape(indices.shape)
+
+    call_number = w.calls + 1
+    probe_due = bool(
+        callable(provider) and w.recall_probe_every
+        and call_number % w.recall_probe_every == 0)
+    capture = w.recall_rank_capture
+    capture_remaining = int(getattr(capture, "remaining", 0) or 0)
+    capture_due = bool(
+        callable(provider)
+        and w.recall_rank_capture_scope == "authoritative-target"
+        and capture_remaining > 0)
+    if probe_due or capture_due:
+        oracle = getattr(w.exact, "candidate_recall_logits", None)
+        if not callable(oracle):
+            raise ValueError(
+                "candidate-recall probing requires a full-logit row provider")
+        flat_x = x.reshape(-1, x.shape[-1])
+        total_positions = int(flat_x.shape[0])
+        oracle_positions = (
+            total_positions if probe_due
+            else min(total_positions, capture_remaining))
+        oracle_x = (
+            x if oracle_positions == total_positions
+            else flat_x[:oracle_positions])
+        exact_full = oracle(oracle_x)
+        if logits_transform is not None:
+            exact_full = logits_transform(
+                exact_full.reshape(-1)).reshape(exact_full.shape)
+        exact_rows = exact_full.reshape(-1, exact_full.shape[-1])
+        exact_full_winner = mx.argmax(exact_rows, axis=-1, keepdims=True)
+        selected_indices = indices.reshape(-1, k)[:oracle_positions]
+        recall_hit_rows = mx.any(
+            selected_indices == exact_full_winner, axis=-1)
+        if probe_due:
+            recall_hits = mx.sum(recall_hit_rows)
+            mx.eval(recall_hits)
+            w.record_candidate_recall(
+                int(recall_hits.item()), int(exact_full_winner.size))
+        if capture_due:
+            selection_rows = selection.reshape(-1, selection.shape[-1])[
+                :oracle_positions]
+            winner_values = mx.take_along_axis(
+                selection_rows, exact_full_winner, axis=-1)
+            vocabulary_ids = mx.arange(selection_rows.shape[-1]).reshape(1, -1)
+            greater = mx.sum(selection_rows > winner_values, axis=-1)
+            tied_lower_ids = mx.sum(
+                (selection_rows == winner_values)
+                & (vocabulary_ids < exact_full_winner),
+                axis=-1,
+            )
+            stable_ranks = 1 + greater + tied_lower_ids
+            top1_agreements = (
+                mx.argmax(selection_rows, axis=-1)
+                == exact_full_winner.reshape(-1))
+            mx.eval(stable_ranks, recall_hit_rows, top1_agreements)
+            capture.record(
+                stable_ranks.tolist(),
+                recall_hit_rows.tolist(),
+                top1_agreements.tolist(),
+            )
+
+    w.calls = call_number
+    w.positions += int(indices.size // k)
+    if callable(provider):
+        # The row-paged path already synchronizes candidate IDs and scores for
+        # I/O. Reuse that synchronization to disclose how often exact scoring
+        # changes the approximate top-1 inside the shortlist. This is not
+        # mislabeled as full-vocabulary recall; oracle recall has separate
+        # hit/probe counters populated by candidate-recall fixtures.
+        mx.eval(selection, indices, exact_scores)
+        approximate_winner = mx.argmax(selection, axis=-1)
+        exact_choice = mx.argmax(exact_scores, axis=-1, keepdims=True)
+        exact_winner = mx.take_along_axis(
+            indices, exact_choice, axis=-1).squeeze(-1)
+        mx.eval(approximate_winner, exact_winner)
+        w.candidate_winner_changes += int(np.sum(
+            np.asarray(approximate_winner) != np.asarray(exact_winner)))
 
     sparse = mx.full(
         approx.shape, float("-inf"), dtype=approx.dtype)

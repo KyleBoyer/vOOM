@@ -93,8 +93,9 @@ def _should_quantize(name: str, value: mx.array, profile: str,
 
 
 def _new_state(source: Path, *, profile: str, mode: str,
-               group_size: int, bits: int) -> dict:
-    return {
+               group_size: int, bits: int,
+               precision_plan_digest: str = "") -> dict:
+    state = {
         "version": 2,
         "source": str(source.resolve()),
         "profile": profile,
@@ -106,16 +107,32 @@ def _new_state(source: Path, *, profile: str, mode: str,
         "quantized_tensors": 0,
         "total_size": 0,
     }
+    # Keep the historical uniform-conversion state byte/schema compatible so
+    # an interrupted v2 conversion can resume after this feature lands. Mixed
+    # plans need stronger identity plus the per-tensor descriptors accumulated
+    # across already committed shards, so they use a distinct v3 state.
+    if precision_plan_digest:
+        state.update({
+            "version": 3,
+            "precision_plan_digest": precision_plan_digest,
+            "quantization_descriptors": {},
+        })
+    return state
 
 
 def _load_or_create_state(source: Path, output: Path, *, profile: str,
-                          mode: str, group_size: int, bits: int) -> dict:
+                          mode: str, group_size: int, bits: int,
+                          precision_plan_digest: str = "") -> dict:
     state_path = output / _STATE_NAME
     expected = _new_state(
-        source, profile=profile, mode=mode, group_size=group_size, bits=bits)
+        source, profile=profile, mode=mode, group_size=group_size, bits=bits,
+        precision_plan_digest=precision_plan_digest)
     if state_path.exists():
         state = json.loads(state_path.read_text())
-        for key in ("version", "source", "profile", "mode", "group_size", "bits"):
+        keys = ["version", "source", "profile", "mode", "group_size", "bits"]
+        if precision_plan_digest:
+            keys.append("precision_plan_digest")
+        for key in keys:
             if state.get(key) != expected[key]:
                 raise ValueError(
                     f"resume state mismatch for {key}: "
@@ -130,25 +147,55 @@ def _load_or_create_state(source: Path, output: Path, *, profile: str,
 
 
 def _convert_shard(source_shard: Path, output_shard: Path, *, profile: str,
-                   mode: str, group_size: int, bits: int) -> tuple[dict, int, int]:
+                   mode: str, group_size: int, bits: int,
+                   tensor_plan: dict | None = None,
+                   ) -> tuple[dict, int, int, dict]:
     lazy = dict(mx.load(str(source_shard)))
     output_tensors: dict[str, mx.array] = {}
     quantized_tensors = 0
+    descriptors: dict[str, dict] = {}
 
-    def add_quantized(name: str, value: mx.array) -> None:
+    def add_quantized(name: str, value: mx.array, *, selected_mode: str = mode,
+                      selected_bits: int = bits,
+                      selected_group_size: int = group_size) -> None:
         nonlocal quantized_tensors
         packed = mx.quantize(
-            value, group_size=group_size, bits=bits, mode=mode)
+            value, group_size=selected_group_size,
+            bits=selected_bits, mode=selected_mode)
         mx.eval(packed)
         output_tensors[name] = packed[0]
         stem = name[:-len(".weight")]
         output_tensors[f"{stem}.scales"] = packed[1]
         if len(packed) > 2:
             output_tensors[f"{stem}.biases"] = packed[2]
+        descriptors[stem] = {
+            "bits": selected_bits,
+            "group_size": selected_group_size,
+            "mode": selected_mode,
+        }
         quantized_tensors += 1
 
     for name in sorted(tuple(lazy)):
         value = lazy.pop(name)
+        if tensor_plan is not None:
+            decision = tensor_plan.get(name)
+            if not isinstance(decision, dict):
+                raise ValueError(f"precision plan has no decision for {name!r}")
+            storage = decision.get("storage")
+            if storage == "source":
+                output_tensors[name] = value
+                continue
+            if storage == "bf16":
+                output_tensors[name] = value.astype(mx.bfloat16)
+                continue
+            if storage in ("mxfp4", "mxfp8"):
+                add_quantized(
+                    name, value, selected_mode=storage,
+                    selected_bits=4 if storage == "mxfp4" else 8,
+                    selected_group_size=32)
+                continue
+            raise ValueError(
+                f"precision plan has unsupported storage {storage!r} for {name}")
         fused = _FUSED_QWEN_EXPERT.match(name)
         if (fused is not None and profile in ("experts", "all", "all-draft")
                 and value.ndim == 3):
@@ -195,12 +242,13 @@ def _convert_shard(source_shard: Path, output_shard: Path, *, profile: str,
     total_size = sum(value.nbytes for value in output_tensors.values())
     del committed, output_tensors, lazy
     mx.clear_cache()
-    return weight_map, quantized_tensors, total_size
+    return weight_map, quantized_tensors, total_size, descriptors
 
 
 def convert_model(source: str | Path, output: str | Path, *,
                   profile: str = "experts", mode: str = "mxfp4",
                   group_size: int = 32, bits: int = 4,
+                  precision_plan: str | Path | dict | None = None,
                   progress=None) -> Path:
     source, output = Path(source), Path(output)
     if source.resolve() == output.resolve():
@@ -208,6 +256,18 @@ def convert_model(source: str | Path, output: str | Path, *,
     config_path = source / "config.json"
     if not config_path.is_file():
         raise FileNotFoundError(f"missing {config_path}")
+
+    plan = None
+    plan_digest = ""
+    if precision_plan is not None:
+        from .mixed_precision import validate_plan
+
+        plan = (json.loads(Path(precision_plan).read_text())
+                if isinstance(precision_plan, (str, Path))
+                else precision_plan)
+        plan = validate_plan(plan, source)
+        plan_digest = plan["plan_digest"]
+        profile = f"mixed:{plan['plan_id']}"
 
     # Validate the tuple with MLX before creating a potentially large output.
     probe = mx.zeros((1, group_size), dtype=mx.bfloat16)
@@ -220,7 +280,8 @@ def convert_model(source: str | Path, output: str | Path, *,
 
     state = _load_or_create_state(
         source, output, profile=profile, mode=mode,
-        group_size=group_size, bits=bits)
+        group_size=group_size, bits=bits,
+        precision_plan_digest=plan_digest)
     state_path = output / _STATE_NAME
     shards = _source_shards(source)
     completed = set(state["completed_shards"])
@@ -233,12 +294,15 @@ def convert_model(source: str | Path, output: str | Path, *,
             if progress:
                 progress(index, len(shards), source_shard.name, True)
             continue
-        weight_map, quantized_tensors, total_size = _convert_shard(
+        weight_map, quantized_tensors, total_size, descriptors = _convert_shard(
             source_shard, output / source_shard.name,
-            profile=profile, mode=mode, group_size=group_size, bits=bits)
+            profile=profile, mode=mode, group_size=group_size, bits=bits,
+            tensor_plan=plan["tensors"] if plan is not None else None)
         state["weight_map"].update(weight_map)
         state["quantized_tensors"] += quantized_tensors
         state["total_size"] += total_size
+        if plan is not None:
+            state["quantization_descriptors"].update(descriptors)
         state["completed_shards"].append(source_shard.name)
         _write_json_atomic(state_path, state)
         if progress:
@@ -250,6 +314,8 @@ def convert_model(source: str | Path, output: str | Path, *,
     # canonical descriptor.  A pure path->tuple map works in vOOM but is not a
     # portable standard-MLX checkpoint, so do not emit that looser form.
     quantization = {"bits": bits, "group_size": group_size, "mode": mode}
+    if plan is not None:
+        quantization.update(state["quantization_descriptors"])
     config["quantization"] = quantization
     config["quantization_config"] = quantization
     config["voom_quantization"] = {
@@ -257,6 +323,25 @@ def convert_model(source: str | Path, output: str | Path, *,
         "quantized_tensors": state["quantized_tensors"],
         "source": str(source.resolve()),
     }
+    if plan is not None:
+        config["voom_quantization"].update({
+            "precision_plan_id": plan["plan_id"],
+            "precision_plan_digest": plan["plan_digest"],
+            "source_layout_fingerprint": plan["source_layout_fingerprint"],
+            "estimated_weight_bytes": plan["summary"]["estimated_bytes"],
+        })
+    try:
+        from runtime.lm_head_stream import lm_head_source_identity
+
+        exact_identity = lm_head_source_identity(source)
+        if exact_identity.verified_release_hash:
+            config["voom_quantization"]["source_lm_head_fingerprint"] = (
+                exact_identity.fingerprint)
+    except (FileNotFoundError, KeyError, OSError, ValueError):
+        # Expert-only/tied-head fixtures can legitimately have no standalone
+        # LM head. Serving-side row reranking still requires an explicit
+        # verified fingerprint and therefore cannot silently use this absence.
+        pass
     _write_json_atomic(output / "config.json", config)
     _write_json_atomic(output / "model.safetensors.index.json", {
         "metadata": {"total_size": state["total_size"]},
@@ -284,6 +369,9 @@ def _main() -> None:
                         default="mxfp4")
     parser.add_argument("--group-size", type=int, default=32)
     parser.add_argument("--bits", type=int, default=4)
+    parser.add_argument(
+        "--precision-plan", type=Path,
+        help="validated component-aware plan from formats.mixed_precision")
     args = parser.parse_args()
 
     def report(done, total, shard, resumed):
@@ -292,7 +380,8 @@ def _main() -> None:
 
     result = convert_model(
         args.source, args.output, profile=args.profile, mode=args.mode,
-        group_size=args.group_size, bits=args.bits, progress=report)
+        group_size=args.group_size, bits=args.bits,
+        precision_plan=args.precision_plan, progress=report)
     print(result)
 
 

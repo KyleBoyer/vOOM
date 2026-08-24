@@ -58,6 +58,7 @@ def test_recurrent_model_with_boundary_fork_retains_boundary_not_full_endpoint()
         prompt_state_approximate=False,
         tool_capsules=(("id", 0, 3),),
         segment_chain=("disk-segment-1",),
+        boundary_segment_chain=("stable-segment-1",),
         cache_namespace="default",
     )
     assert slot.tokens == (1, 2, 3, 4, 5, 6, 7)
@@ -67,16 +68,14 @@ def test_recurrent_model_with_boundary_fork_retains_boundary_not_full_endpoint()
     assert slot.prompt_length == 7
     assert slot.reusable_prefix == 0
     assert slot.chunk_size == 128
-    # The boundary slot deliberately drops disk-persistence lineage and PIC
-    # capsule bookkeeping computed against the OLD (full-endpoint) tokens --
-    # they describe a different, now-unretained sequence.
+    # PIC capsule bookkeeping still describes the old full endpoint and is
+    # dropped. The separately persisted exact boundary lineage is retained.
     assert slot.tool_capsules == ()
-    assert slot.segment_chain == ()
+    assert slot.segment_chain == ("stable-segment-1",)
 
 
 def test_recurrent_model_without_boundary_fork_falls_back_to_full_endpoint():
-    """No stable-boundary hint (or it fell inside an already-matched
-    prefix) must degrade exactly to the pre-F96 behavior, unchanged."""
+    """No stable-boundary hint degrades to the pre-F96 behavior unchanged."""
     engine = _bare_engine(prefill_chunk_size=256)
     full_kv = object()
     slot = engine._new_hot_prompt_slot(
@@ -103,6 +102,54 @@ def test_recurrent_model_without_boundary_fork_falls_back_to_full_endpoint():
     assert slot.chunk_size == 256
     assert slot.segment_chain == ("disk-segment-2",)
     assert slot.cache_namespace == "ns-a"
+
+
+def test_matched_stable_boundary_is_forked_before_suffix_mutates_source():
+    from runtime.engine import _fork_matched_hybrid_stable_boundary
+    from runtime.kv_cache import KVCache
+
+    class _Recurrent:
+        def __init__(self, identity):
+            self.identity = identity
+            self.synchronized = 0
+
+        def fork(self):
+            return _Recurrent(self.identity)
+
+        def synchronize(self):
+            self.synchronized += 1
+
+    source = KVCache(2)
+    source.kda_cache = _Recurrent("stable-128")
+
+    retained = _fork_matched_hybrid_stable_boundary(
+        source,
+        matched_tokens=128,
+        stable_boundary_tokens=128,
+        prompt_tokens=141,
+    )
+
+    assert retained is not None and retained is not source
+    assert retained.keys == source.keys
+    assert retained.values == source.values
+    assert retained.kda_cache is not source.kda_cache
+    assert retained.kda_cache.identity == "stable-128"
+    assert retained.kda_cache.synchronized == 1
+
+    # Only exact equality at a strict proper boundary is eligible. Earlier or
+    # later matches still require the ordinary prefill/fork logic.
+    for matched, stable, total in (
+        (127, 128, 141),
+        (129, 128, 141),
+        (0, 0, 141),
+        (141, 141, 141),
+    ):
+        assert _fork_matched_hybrid_stable_boundary(
+            source,
+            matched_tokens=matched,
+            stable_boundary_tokens=stable,
+            prompt_tokens=total,
+        ) is None
 
 
 def test_non_recurrent_model_always_uses_full_endpoint_even_with_a_fork():

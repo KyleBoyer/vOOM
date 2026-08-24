@@ -147,7 +147,7 @@ def test_bias_free_standard_mlx_modes_round_trip(mode, group_size, bits, tmp_pat
 
 
 def _write_indexed_mtp_fixture(tmp_path, *, sidecar="mtp.safetensors",
-                               collide=False):
+                               collide=False, mtp_dtype=mx.bfloat16):
     config = _config()
     config.pop("quantization")
     (tmp_path / "config.json").write_text(json.dumps(config))
@@ -165,7 +165,8 @@ def _write_indexed_mtp_fixture(tmp_path, *, sidecar="mtp.safetensors",
     mx.save_safetensors(str(tmp_path / main_name), main_tensors)
     if Path(sidecar).name == sidecar:
         mx.save_safetensors(str(tmp_path / sidecar), {
-            "mtp.norm.weight": mx.arange(64, dtype=mx.float32),
+            "mtp.norm.weight": mx.arange(64, dtype=mx.float32).astype(
+                mtp_dtype),
             "unrelated.weight": mx.ones((1,), dtype=mx.float32),
         })
     (tmp_path / "model.safetensors.index.json").write_text(json.dumps({
@@ -186,7 +187,8 @@ def test_indexed_mtplx_sidecar_exposes_only_mtp_tensors(tmp_path):
     tensors, _seconds, _nbytes = store.fetch(["mtp.norm.weight"])
     mx.eval(tensors["mtp.norm.weight"])
     assert mx.array_equal(
-        tensors["mtp.norm.weight"], mx.arange(64, dtype=mx.float32))
+        tensors["mtp.norm.weight"],
+        mx.arange(64, dtype=mx.float32).astype(mx.bfloat16))
 
 
 def test_indexed_mtplx_sidecar_rejects_unsafe_path(tmp_path):
@@ -200,6 +202,15 @@ def test_indexed_mtplx_sidecar_rejects_tensor_collision(tmp_path):
     _write_indexed_mtp_fixture(tmp_path, collide=True)
 
     with pytest.raises(ValueError, match="collides with indexed tensors"):
+        WeightStore(tmp_path)
+
+
+def test_indexed_mtplx_sidecar_rejects_non_bf16_mtp_tensor(tmp_path):
+    _write_indexed_mtp_fixture(tmp_path, mtp_dtype=mx.float32)
+
+    with pytest.raises(
+        ValueError, match="must preserve released BF16 mtp.* tensors"
+    ):
         WeightStore(tmp_path)
 
 

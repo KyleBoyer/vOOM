@@ -35,6 +35,63 @@ from .sampler import SamplingParams, sample
 from .weight_cache import WeightCache
 
 
+_HYBRID_RECURRENT_MODEL_TYPES = frozenset({
+    "kimi_linear", "kimi_k3", "qwen3_5_moe", "qwen3_5",
+    "jet_nemotron", "lfm2",
+})
+
+# Deliberately sparse: these are the already-supported Qwen hybrid prefill
+# ladder rungs, plus 0 for the live automatic policy.  Keeping the accepted
+# set exact prevents a profile typo from silently selecting a never-gated
+# Metal shape on the 16 GB host.
+QWEN35_PREFILL_CHUNK_CEILINGS = frozenset((0, 1, 8, 32, 128, 512))
+
+
+def attach_hybrid_recurrent_cache(
+    kv,
+    *,
+    model_type: str,
+    num_hidden_layers: int,
+    kda_spill_dir: str = "",
+):
+    """Attach the fixed-size recurrent companion to any hybrid KV backend.
+
+    ``new_kv()`` is normally the canonical factory, but the exact paged-KV
+    admission path constructs :class:`PagedKVCache` directly after it has
+    decided the resident cache is unsafe.  Keeping this attachment in one
+    helper prevents that alternate backend from silently running every
+    DeltaNet/KDA tile with ``state_cache=None`` and therefore resetting the
+    released recurrence at each tile boundary.
+    """
+    if model_type not in _HYBRID_RECURRENT_MODEL_TYPES:
+        return kv
+    if getattr(kv, "kda_cache", None) is None:
+        from .kda_state import KDAStateCache
+
+        kv.kda_cache = KDAStateCache(int(num_hidden_layers))
+    if model_type == "kimi_k3" and kda_spill_dir:
+        kv.kda_cache.enable_disk_spill(kda_spill_dir)
+    return kv
+
+
+def _fork_matched_hybrid_stable_boundary(
+    kv,
+    *,
+    matched_tokens: int,
+    stable_boundary_tokens: int,
+    prompt_tokens: int,
+):
+    """Retain an already-matched recurrent boundary before suffix mutation."""
+    matched = int(matched_tokens)
+    stable = int(stable_boundary_tokens)
+    total = int(prompt_tokens)
+    if (type(kv) is KVCache
+            and matched == stable
+            and 0 < stable < total):
+        return fork_hybrid_kv_endpoint(kv)
+    return None
+
+
 def hybrid_prefill_chunk_size(available_bytes: int, model_scale: int = 0) -> int:
     """F94/F95: descending chunk-size ladder for qwen3_5/qwen3_5_moe's fixed,
     hot_prompt_kv-compatible prefill chunk (GLM's live adaptive_chunk_size
@@ -258,9 +315,38 @@ def _cache_io_snapshot(engine) -> tuple[int, ...]:
     nf12_stages = (
         nf12_snapshot() if callable(nf12_snapshot) else (0, 0, 0, 0)
     )
+    parallel_snapshot = getattr(engine.store, "parallel_tier_snapshot", None)
+    parallel_stages = (
+        parallel_snapshot() if callable(parallel_snapshot) else (
+            int(getattr(engine.store, "parallel_tier_fetches", 0) or 0),
+            int(getattr(engine.store, "parallel_tier_fast_bytes", 0) or 0),
+            int(getattr(engine.store, "parallel_tier_archive_bytes", 0) or 0),
+            int(getattr(engine.store, "parallel_tier_wall_ns", 0) or 0),
+            int(getattr(
+                engine.store, "parallel_tier_fast_service_ns", 0) or 0),
+            int(getattr(
+                engine.store, "parallel_tier_archive_service_ns", 0) or 0),
+            int(getattr(engine.store, "parallel_tier_hidden_ns", 0) or 0),
+        )
+    )
     return (
         int(stats.hits), int(stats.misses), int(stats.evictions),
-        int(stats.bytes_read), int(engine.expert_hits),
+        int(stats.bytes_read), int(getattr(stats, "pinned_hits", 0) or 0),
+        int(getattr(stats, "prefetch_hits", 0) or 0),
+        int(getattr(stats, "prefetch_waits", 0) or 0),
+        int(float(getattr(stats, "prefetch_wait_s", 0.0) or 0.0) * 1e9),
+        int(getattr(stats, "prefetch_loads", 0) or 0),
+        int(getattr(stats, "prefetch_loaded_bytes", 0) or 0),
+        int(float(getattr(stats, "prefetch_load_s", 0.0) or 0.0) * 1e9),
+        int(getattr(stats, "prefetch_useful_pages", 0) or 0),
+        int(getattr(stats, "prefetch_useful_bytes", 0) or 0),
+        int(float(
+            getattr(stats, "prefetch_useful_load_s", 0.0) or 0.0) * 1e9),
+        int(getattr(stats, "prefetch_wasted_pages", 0) or 0),
+        int(getattr(stats, "prefetch_wasted_bytes", 0) or 0),
+        int(float(
+            getattr(stats, "prefetch_wasted_load_s", 0.0) or 0.0) * 1e9),
+        int(engine.expert_hits),
         int(engine.expert_misses),
         int(getattr(governor, "reservations", 0) or 0),
         int(getattr(governor, "reservation_failures", 0) or 0),
@@ -271,9 +357,7 @@ def _cache_io_snapshot(engine) -> tuple[int, ...]:
             governor, "swap_pressure_out_growth_bytes", 0) or 0),
         int(getattr(engine.store, "fast_tier_bytes", 0) or 0),
         int(getattr(engine.store, "archive_bytes", 0) or 0),
-        int(getattr(engine.store, "parallel_tier_fetches", 0) or 0),
-        int(getattr(engine.store, "parallel_tier_fast_bytes", 0) or 0),
-        int(getattr(engine.store, "parallel_tier_archive_bytes", 0) or 0),
+        *parallel_stages,
         *store_stages,
         *scale_stages,
         *nf12_stages,
@@ -289,6 +373,13 @@ def _record_cache_io_delta(
     keys = (
         "weight_cache_hits", "weight_cache_misses",
         "weight_cache_evictions", "weight_store_bytes_read",
+        "weight_cache_pinned_hits", "weight_cache_prefetch_hits",
+        "weight_prefetch_waits", "weight_prefetch_wait_ns",
+        "weight_prefetch_loads", "weight_prefetch_loaded_bytes",
+        "weight_prefetch_load_ns", "weight_prefetch_useful_pages",
+        "weight_prefetch_useful_bytes", "weight_prefetch_useful_load_ns",
+        "weight_prefetch_wasted_pages", "weight_prefetch_wasted_bytes",
+        "weight_prefetch_wasted_load_ns",
         "expert_cache_hits", "expert_cache_misses",
         "governor_reservations", "governor_reservation_failures",
         "governor_swap_pressure_events",
@@ -296,7 +387,9 @@ def _record_cache_io_delta(
         "governor_swap_out_growth_bytes",
         "weight_fast_tier_bytes", "weight_archive_bytes",
         "parallel_tier_fetches", "parallel_tier_fast_bytes",
-        "parallel_tier_archive_bytes",
+        "parallel_tier_archive_bytes", "parallel_tier_wall_ns",
+        "parallel_tier_fast_service_ns",
+        "parallel_tier_archive_service_ns", "parallel_tier_hidden_ns",
         "ct_mxfp4_transform_ns", "ct_mxfp4_transform_calls",
         "ct_mxfp4_input_bytes", "ct_mxfp4_resident_bytes",
         "k3_scale_sidecar_read_bytes", "k3_scale_sidecar_output_bytes",
@@ -309,6 +402,16 @@ def _record_cache_io_delta(
     if not prefix:
         stats["weight_cache_resident_bytes"] = int(engine.cache.total_bytes)
         stats["weight_cache_budget_bytes"] = int(engine.cache.max_bytes)
+        stats["weight_cache_pinned_bytes"] = int(getattr(
+            engine.cache, "pinned_bytes", 0) or 0)
+        stats["weight_cache_prefetched_bytes"] = int(getattr(
+            engine.cache, "prefetched_bytes", 0) or 0)
+        stats["planned_trunk_pin_layers"] = int(getattr(
+            engine, "planned_trunk_pin_layers", 0) or 0)
+        stats["planned_trunk_pin_bytes"] = int(getattr(
+            engine, "planned_trunk_pin_bytes", 0) or 0)
+        stats["weight_prefetch_depth"] = int(getattr(
+            getattr(engine, "rc", None), "prefetch_depth", 0) or 0)
         stats["layer_transient_bytes"] = int(engine._layer_transient)
         stats["prefill_layer_transient_bytes"] = int(getattr(
             engine, "_prefill_layer_transient", 0) or 0)
@@ -317,6 +420,27 @@ def _record_cache_io_delta(
         stats["layer_transient_margin_bytes"] = int(getattr(
             engine, "_layer_transient_margin", 400_000_000))
         stats["token_transient_bytes"] = int(engine._token_transient)
+    stats[prefix + "weight_prefetch_wait_s"] = (
+        stats[prefix + "weight_prefetch_wait_ns"] / 1e9)
+    stats[prefix + "weight_prefetch_load_s"] = (
+        stats[prefix + "weight_prefetch_load_ns"] / 1e9)
+    stats[prefix + "weight_prefetch_useful_load_s"] = (
+        stats[prefix + "weight_prefetch_useful_load_ns"] / 1e9)
+    stats[prefix + "weight_prefetch_wasted_load_s"] = (
+        stats[prefix + "weight_prefetch_wasted_load_ns"] / 1e9)
+    stats[prefix + "weight_prefetch_hidden_lower_bound_s"] = max(
+        0.0,
+        stats[prefix + "weight_prefetch_useful_load_s"]
+        - stats[prefix + "weight_prefetch_wait_s"],
+    )
+    stats[prefix + "parallel_tier_wall_s"] = (
+        stats[prefix + "parallel_tier_wall_ns"] / 1e9)
+    stats[prefix + "parallel_tier_fast_service_s"] = (
+        stats[prefix + "parallel_tier_fast_service_ns"] / 1e9)
+    stats[prefix + "parallel_tier_archive_service_s"] = (
+        stats[prefix + "parallel_tier_archive_service_ns"] / 1e9)
+    stats[prefix + "parallel_tier_hidden_s"] = (
+        stats[prefix + "parallel_tier_hidden_ns"] / 1e9)
 
 
 def _quantization_cache_identity(rc: "RuntimeConfig", store) -> str:
@@ -341,6 +465,10 @@ def _quantization_cache_identity(rc: "RuntimeConfig", store) -> str:
             f"q{rc.rerank_lm_head_bits}g{rc.rerank_lm_head_group_size}"
             f"k{rc.rerank_lm_head_candidates}"
         )
+        if rc.rerank_lm_head_source_fingerprint:
+            identity += (
+                "+rowpaged-"
+                + rc.rerank_lm_head_source_fingerprint[:16])
     if rc.resident_attention_mode:
         identity += (
             f"+residentattn-{rc.resident_attention_mode}"
@@ -510,6 +638,10 @@ class RuntimeConfig:
     prefetch_depth: int = 0  # 0 disables prefetch
     prefetch_workers: int = 0  # 0 = store default (raw: 1, packed: 2)
     max_kv_mb: int = 0  # 0 = unpaged KV (all resident); >0 enables disk spilling
+    # Explicit Qwen hybrid mode: durable journal tensors restore directly into
+    # bounded PagedKVCache pages and are never preloaded into the resident LRU.
+    # Default-off until the real 49K replay passes the cold/restart proof gate.
+    paged_kv_persist: bool = False
     adaptive_kv_spill_mb: int = 0  # 0 disables last-resort per-request paging;
     # when positive, ordinary hot KV remains preferred but an unsafe resident
     # admission falls back to this bounded exact BF16 disk-paged cache.
@@ -541,6 +673,21 @@ class RuntimeConfig:
     rerank_lm_head_mode: str = "mxfp4"
     rerank_lm_head_bits: int = 4
     rerank_lm_head_group_size: int = 32
+    rerank_lm_head_source: str = ""  # verified released BF16 checkpoint;
+    # row reads only, never pinned as one resident exact tensor
+    rerank_lm_head_source_fingerprint: str = ""
+    # Full exact-head scans used to measure actual shortlist recall. Disabled
+    # by default because each probe deliberately reads the complete 2.543 GB
+    # source head; N means every Nth reranked projection.
+    rerank_lm_head_recall_probe_every: int = 0
+    # Explicit privacy-safe promotion evidence. Each authoritative target
+    # projection is reduced to the exact winner's approximate rank plus two
+    # booleans; prompts, hidden states, logits, token IDs, and text never land
+    # on disk. Hard bounds and the offline 1000-position/100% gate live in
+    # runtime.lm_head_recall_capture. Empty keeps the path fully disabled.
+    rerank_lm_head_rank_capture_path: str = ""
+    rerank_lm_head_rank_capture_max_positions: int = 1200
+    rerank_lm_head_rank_capture_max_per_request: int = 128
     resident_fast_decode: bool = False  # fully-resident dense decode may build one lazy
     # graph across all layers instead of forcing a Metal synchronization per layer
     resident_fast_prefill_limit: int = 0  # maximum exact total position for the
@@ -656,6 +803,14 @@ class RuntimeConfig:
     # ordinary MLX reduction operators and 32-position state boundaries while
     # amortizing graph dispatch/optimization overhead.
     kimi_k3_compiled_kda_prefill: bool = False
+    # Opt-in byte-identical Qwen DeltaNet prefill graph compilation. Like the
+    # K3 path above, this traces the ordinary recurrence operators in bounded
+    # 32-position segments without the WY path's FP32 reassociation.
+    qwen_compiled_delta_prefill: bool = False
+    # Explicit lossy serial Metal scan. It preserves the causal recurrence but
+    # uses scalar in-kernel reductions whose FP32 association can differ from
+    # the released MLX operator tree.
+    qwen_native_fused_delta_prefill: bool = False
     # Chunkwise WY DeltaNet prefill. Numerically close but not
     # activation-identical across arbitrary checkpoint splits, so server.py
     # admits it automatically only for fast/lossy Qwen3.5/3.6 routes.
@@ -715,6 +870,11 @@ class RuntimeConfig:
     # declare rope_scaling. 0/1 = released RoPE; >1 = static YaRN extrapolation.
     qwen_yarn_factor: float = 0.0
     prefill_chunk_size: int = 0  # bound prefill compute/transient memory WITHOUT writing state
+    # Explicit Qwen3.5/Qwen3.8 hybrid safety cap applied after the live
+    # per-conversation choice and any memory-retry cap. 0 preserves the
+    # automatic ladder unchanged. Unlike prefill_chunk_size, this is a stable
+    # operator/profile policy and is never rewritten by a request.
+    qwen35_prefill_chunk_ceiling: int = 0
     # F94: layer-major (not chunk-major) dense prefill for qwen3_5 (dense
     # hybrid DeltaNet/full-attention, e.g. Qwen3.5-4B/9B, Qwen3.6-27B) --
     # fetches each layer's weights exactly once for the whole prefill instead
@@ -722,6 +882,11 @@ class RuntimeConfig:
     # StreamingEngine._layer_stationary_qwen35_sweep and CLAUDE.md's
     # 2026-07-23 note on why chunk-major re-reads dominate prefill time here.
     layer_stationary_prefill: bool = False
+    # Exact Qwen-only extension of layer-stationary prefill: capture the
+    # stable chat endpoint inside the same per-layer pass that consumes the
+    # trailing generation scaffold. Explicit opt-in until broad real-shape
+    # replay proves the new schedule beyond its focused oracle.
+    qwen_fused_boundary_scaffold_prefill: bool = False
     # Positions per MoE tile inside a layer-stationary DeepSeek V4 prefill.
     # Bounds the float32 hyper-connection carrier without costing weight
     # reads: a layer's routed experts stay resident across its own tiles.
@@ -901,6 +1066,7 @@ class RuntimeConfig:
             prefetch_depth=raw.get("prefetch", {}).get("depth", 0),
             prefetch_workers=raw.get("prefetch", {}).get("workers", 0),
             max_kv_mb=mem.get("max_kv_mb", 0),
+            paged_kv_persist=run.get("paged_kv_persist", False),
             release_paged_kv_after_generate=run.get(
                 "release_paged_kv_after_generate", False),
             stepped_kv_threshold=run.get("stepped_kv_threshold", 0),
@@ -928,6 +1094,17 @@ class RuntimeConfig:
             rerank_lm_head_bits=run.get("rerank_lm_head_bits", 4),
             rerank_lm_head_group_size=run.get(
                 "rerank_lm_head_group_size", 32),
+            rerank_lm_head_source=run.get("rerank_lm_head_source", ""),
+            rerank_lm_head_source_fingerprint=run.get(
+                "rerank_lm_head_source_fingerprint", ""),
+            rerank_lm_head_recall_probe_every=run.get(
+                "rerank_lm_head_recall_probe_every", 0),
+            rerank_lm_head_rank_capture_path=run.get(
+                "rerank_lm_head_rank_capture_path", ""),
+            rerank_lm_head_rank_capture_max_positions=run.get(
+                "rerank_lm_head_rank_capture_max_positions", 1200),
+            rerank_lm_head_rank_capture_max_per_request=run.get(
+                "rerank_lm_head_rank_capture_max_per_request", 128),
             resident_fast_decode=run.get("resident_fast_decode", False),
             resident_fast_prefill_limit=run.get(
                 "resident_fast_prefill_limit", 0),
@@ -989,6 +1166,8 @@ class RuntimeConfig:
                 "hot_prompt_kv_persist_max_mb", 0),
             qwen_yarn_factor=run.get("qwen_yarn_factor", 0.0),
             prefill_chunk_size=run.get("prefill_chunk_size", 0),
+            qwen35_prefill_chunk_ceiling=run.get(
+                "qwen35_prefill_chunk_ceiling", 0),
             prefill_last_token_separate=run.get(
                 "prefill_last_token_separate", False),
             prefill_checkpoint_every=run.get("prefill_checkpoint_every", 0),
@@ -1187,6 +1366,15 @@ class StreamingEngine:
                 "compiled and native-fused K3 KDA prefill are mutually "
                 "exclusive"
             )
+        if sum(map(bool, (
+            self.rc.qwen_compiled_delta_prefill,
+            self.rc.qwen_chunked_delta_prefill,
+            self.rc.qwen_native_fused_delta_prefill,
+        ))) > 1:
+            raise ValueError(
+                "compiled, chunked, and native-fused Qwen DeltaNet prefill "
+                "are mutually exclusive"
+            )
         if self.rc.kimi_k3_prefill_tile_policy not in (
             "fixed", "prompt-length"
         ):
@@ -1241,8 +1429,56 @@ class StreamingEngine:
             raise ValueError("vision_max_patches must be >= 0")
         if self.rc.rerank_lm_head and self.rc.rerank_lm_head_candidates <= 0:
             raise ValueError("rerank_lm_head_candidates must be positive")
+        if self.rc.rerank_lm_head_recall_probe_every < 0:
+            raise ValueError(
+                "rerank_lm_head_recall_probe_every must be non-negative")
+        if self.rc.rerank_lm_head_rank_capture_path:
+            from .lm_head_recall_capture import (
+                CAPTURE_MAX_PER_REQUEST_LIMIT,
+                CAPTURE_MAX_POSITIONS_LIMIT,
+                PROMOTION_K,
+                PROMOTION_MIN_POSITIONS,
+            )
+
+            if not self.rc.rerank_lm_head:
+                raise ValueError(
+                    "LM-head rank capture requires candidate reranking")
+            if self.rc.rerank_lm_head_candidates != PROMOTION_K:
+                raise ValueError(
+                    f"LM-head promotion capture requires K={PROMOTION_K}")
+            if not self.rc.rerank_lm_head_source_fingerprint:
+                raise ValueError(
+                    "LM-head rank capture requires a fingerprinted exact source")
+            if not PROMOTION_MIN_POSITIONS <= (
+                    self.rc.rerank_lm_head_rank_capture_max_positions
+                    ) <= CAPTURE_MAX_POSITIONS_LIMIT:
+                raise ValueError(
+                    "LM-head rank capture max positions must be in "
+                    f"[{PROMOTION_MIN_POSITIONS}, "
+                    f"{CAPTURE_MAX_POSITIONS_LIMIT}]")
+            if not 1 <= (
+                    self.rc.rerank_lm_head_rank_capture_max_per_request
+                    ) <= CAPTURE_MAX_PER_REQUEST_LIMIT:
+                raise ValueError(
+                    "LM-head rank capture per-request positions must be in "
+                    f"[1, {CAPTURE_MAX_PER_REQUEST_LIMIT}]")
+        if self.rc.rerank_lm_head_source or \
+                self.rc.rerank_lm_head_source_fingerprint:
+            fingerprint = self.rc.rerank_lm_head_source_fingerprint
+            if (not self.rc.rerank_lm_head_source
+                    or len(fingerprint) != 64
+                    or any(character not in "0123456789abcdef"
+                           for character in fingerprint)):
+                raise ValueError(
+                    "row-paged reranked LM head requires an exact source and "
+                    "64-character lowercase fingerprint")
         if self.rc.adaptive_chunk_safe_bytes < 0:
             raise ValueError("adaptive_chunk_safe_bytes must be >= 0")
+        if self.rc.qwen35_prefill_chunk_ceiling not in (
+                QWEN35_PREFILL_CHUNK_CEILINGS):
+            raise ValueError(
+                "qwen35_prefill_chunk_ceiling must be one of "
+                "0, 1, 8, 32, 128, or 512")
         if self.rc.prompt_kv_min_tokens < 0:
             raise ValueError("prompt_kv_min_tokens must be >= 0")
         if self.rc.prompt_kv_journal_chunk_size <= 0:
@@ -1285,6 +1521,18 @@ class StreamingEngine:
             raise ValueError(
                 "tool_pic_shared_pages is engine-local and does not yet support "
                 "KV spill or durable prompt/hot-KV persistence")
+        if self.rc.paged_kv_persist and (
+                not self.rc.max_kv_mb
+                or not self.rc.hot_prompt_kv
+                or not self.rc.hot_prompt_kv_persist_dir
+                or not self.rc.release_paged_kv_after_generate):
+            raise ValueError(
+                "paged_kv_persist requires paged KV, hot_prompt_kv, a durable "
+                "directory, and post-generation release")
+        if (self.rc.paged_kv_persist
+                and self.rc.qwen_fused_boundary_scaffold_prefill):
+            raise ValueError(
+                "paged durable KV requires an explicit stable-boundary sweep")
         if (self.rc.adaptive_chunk_size
                 and self.rc.adaptive_chunk_safe_bytes == 0
                 and not self.rc.governor):
@@ -1341,6 +1589,11 @@ class StreamingEngine:
         self._model_dir = self.store.dir
         self.cfg = self.store.config
         _apply_runtime_expert_top_k(self.rc, self.cfg)
+        if (self.rc.paged_kv_persist
+                and self.cfg.model_type not in ("qwen3_5", "qwen3_5_moe")):
+            raise ValueError(
+                "paged_kv_persist requires a qwen3_5/qwen3_5_moe hybrid "
+                f"checkpoint, got {self.cfg.model_type!r}")
         if (self.cfg.model_type in ("kimi_linear", "kimi_k3", "qwen3_5_moe", "qwen3_5")
                 and self.rc.prompt_kv_dir):
             raise ValueError(
@@ -1761,26 +2014,89 @@ class StreamingEngine:
         self._output_attn_res_proj_w = persistent.get("model.output_attn_res_proj.weight")
         self._output_attn_res_norm_w = persistent.get("model.output_attn_res_norm.weight")
         self._reranked_lm_head_bytes = 0
+        self._reranked_lm_head_exact_resident_bytes = 0
+        self._reranked_lm_head_source_fingerprint = ""
+        self._reranked_lm_head_approx_fingerprint = ""
         if self.rc.rerank_lm_head:
-            from .quant import QTensor, make_reranked_q_head
+            from .quant import (
+                QTensor, make_reranked_q_head,
+                make_row_paged_reranked_q_head)
 
             if self.cfg.tie_word_embeddings:
                 raise ValueError(
                     "rerank_lm_head currently requires an untied exact LM head")
             if self._streamed_lm_head is not None or self._lm_head_w is None:
                 raise ValueError(
-                    "rerank_lm_head requires a resident exact LM head")
-            if isinstance(self._lm_head_w, QTensor):
-                raise ValueError(
-                    "rerank_lm_head requires an unquantized exact LM head")
-            self._lm_head_w = make_reranked_q_head(
-                self._lm_head_w,
-                candidates=self.rc.rerank_lm_head_candidates,
-                group_size=self.rc.rerank_lm_head_group_size,
-                bits=self.rc.rerank_lm_head_bits,
-                mode=self.rc.rerank_lm_head_mode,
-            )
+                    "rerank_lm_head requires an available target LM head")
+            if self.rc.rerank_lm_head_source:
+                if not isinstance(self._lm_head_w, QTensor):
+                    raise ValueError(
+                        "row-paged rerank requires an on-disk quantized "
+                        "target LM head")
+                from .lm_head_stream import open_verified_exact_lm_head
+
+                exact_rows = open_verified_exact_lm_head(
+                    self._model_dir,
+                    self.rc.rerank_lm_head_source,
+                    self.rc.rerank_lm_head_source_fingerprint,
+                )
+                if (exact_rows.vocab != self.cfg.vocab_size
+                        or exact_rows.hidden != self.cfg.hidden_size):
+                    exact_rows.close()
+                    raise ValueError(
+                        "exact LM-head source shape does not match target config")
+                try:
+                    self._lm_head_w = make_row_paged_reranked_q_head(
+                        self._lm_head_w, exact_rows,
+                        candidates=self.rc.rerank_lm_head_candidates,
+                        recall_probe_every=(
+                            self.rc.rerank_lm_head_recall_probe_every))
+                except Exception:
+                    exact_rows.close()
+                    raise
+                self._reranked_lm_head_source_fingerprint = (
+                    self.rc.rerank_lm_head_source_fingerprint)
+            else:
+                if isinstance(self._lm_head_w, QTensor):
+                    raise ValueError(
+                        "resident rerank requires an unquantized exact LM head")
+                self._reranked_lm_head_exact_resident_bytes = (
+                    self._lm_head_w.nbytes)
+                self._lm_head_w = make_reranked_q_head(
+                    self._lm_head_w,
+                    candidates=self.rc.rerank_lm_head_candidates,
+                    group_size=self.rc.rerank_lm_head_group_size,
+                    bits=self.rc.rerank_lm_head_bits,
+                    mode=self.rc.rerank_lm_head_mode,
+                )
             self._reranked_lm_head_bytes = self._lm_head_w.approx.nbytes
+            if self.rc.rerank_lm_head_rank_capture_path:
+                from .lm_head_recall_capture import (
+                    AuthoritativeRankCapture,
+                    quantized_lm_head_artifact_identity,
+                )
+
+                if not self._reranked_lm_head_source_fingerprint:
+                    raise ValueError(
+                        "rank capture requires a row-paged exact BF16 source")
+                approximate_identity = quantized_lm_head_artifact_identity(
+                    self._model_dir)
+                self._reranked_lm_head_approx_fingerprint = (
+                    approximate_identity["fingerprint"])
+                self._lm_head_w.recall_rank_capture = AuthoritativeRankCapture(
+                    self.rc.rerank_lm_head_rank_capture_path,
+                    exact_source_fingerprint=(
+                        self._reranked_lm_head_source_fingerprint),
+                    approximate_artifact_fingerprint=(
+                        self._reranked_lm_head_approx_fingerprint),
+                    approximate_artifact_bytes=approximate_identity["bytes"],
+                    candidates=self.rc.rerank_lm_head_candidates,
+                    vocab=self.cfg.vocab_size,
+                    max_positions=(
+                        self.rc.rerank_lm_head_rank_capture_max_positions),
+                    max_positions_per_request=(
+                        self.rc.rerank_lm_head_rank_capture_max_per_request),
+                )
         self._tied_lm_head_w = None
         if self.cfg.tie_word_embeddings:
             from .quant import QTensor
@@ -2041,6 +2357,18 @@ class StreamingEngine:
         if self.rc.hot_prompt_kv and self.rc.hot_prompt_kv_persist_dir:
             from .hot_kv_persist import HotPromptKVPersistence
 
+            paged_cache_factory = None
+            if self.rc.paged_kv_persist:
+                from .kv_paged import PagedKVCache
+
+                paged_cache_factory = lambda num_layers: PagedKVCache(
+                    num_layers,
+                    max_bytes=self.rc.max_kv_mb * 1_000_000,
+                    spill_dir=self.rc.kv_spill_dir,
+                    page_positions=self.rc.kv_page_positions,
+                    compress_spill=self.rc.kv_spill_compress,
+                )
+
             self._hot_kv_persist = HotPromptKVPersistence(
                 self.rc.hot_prompt_kv_persist_dir, self._get_kv_fingerprint(),
                 self.rc.hot_prompt_kv_chunk_size,
@@ -2054,6 +2382,7 @@ class StreamingEngine:
                 require_recurrent=(
                     self.cfg.model_type in (
                         "kimi_linear", "kimi_k3", "qwen3_5_moe", "qwen3_5")),
+                paged_cache_factory=paged_cache_factory,
             )
             if not self._defer_persisted_kv_until_bootstrap:
                 for (tokens, kv, logits, prompt_length, prompt_logits,
@@ -3361,29 +3690,43 @@ class StreamingEngine:
                     "has no resolvable storage size")
                 return 0
             layer_bytes.append(self.store.storage_bytes(names))
-        budget = self.rc.pin_trunk_budget_mb * 1_000_000
+        pin_limit = self.rc.pin_trunk_budget_mb * 1_000_000
+        persistent_pinned = self.cache.pinned_bytes
+        budget = max(0, self.cache.max_bytes - persistent_pinned)
         expert_batch = (self.rc.expert_fetch_batch
                         or self.cfg.num_experts_per_tok or 1)
-        required_reserve = (expert_batch * self._expert_fetch_page_bytes
-                            + self._layer_transient_margin)
+        expert_reserve = (
+            expert_batch * self._expert_fetch_page_bytes
+            if self.cfg.num_experts else 0)
+        required_reserve = expert_reserve + self._layer_transient_margin
         reserve = max(self.rc.pin_trunk_expert_reserve_mb * 1_000_000,
                       required_reserve)
-        count = plan_pinned_prefix(layer_bytes, budget, reserve_bytes=reserve)
+        count = plan_pinned_prefix(
+            layer_bytes,
+            budget,
+            reserve_bytes=reserve,
+            pin_limit_bytes=pin_limit,
+            prefetch_depth=self.rc.prefetch_depth,
+        )
         self.planned_trunk_pin_bytes = sum(layer_bytes[:count])
         print(
             f"[engine] trunk pin plan: {count}/{num_layers} layers, "
             f"{self.planned_trunk_pin_bytes / 1e9:.3f}GB pinned of "
             f"{sum(layer_bytes) / 1e9:.3f}GB trunk "
-            f"(budget {budget / 1e9:.3f}GB, expert reserve "
+            f"(requested trunk cap {pin_limit / 1e9:.3f}GB, "
+            f"{persistent_pinned / 1e9:.3f}GB already pinned, "
+            f"{budget / 1e9:.3f}GB cache room, prefetch depth "
+            f"{self.rc.prefetch_depth}, expert reserve "
             f"{reserve / 1e9:.3f}GB, of which "
             f"{required_reserve / 1e9:.3f}GB is the mandatory expert-batch "
             f"floor)")
         from .cache_policy import prefetch_starvation_warning
 
         warning = prefetch_starvation_warning(
-            self.planned_trunk_pin_bytes, self.cache.max_bytes,
-            max(layer_bytes[:count] or [0]),
-            expert_batch * self._expert_fetch_page_bytes,
+            persistent_pinned + self.planned_trunk_pin_bytes,
+            self.cache.max_bytes,
+            max(layer_bytes[count:] or [0]),
+            expert_reserve + self._layer_transient_margin,
             self.rc.prefetch_depth)
         if warning:
             print(warning)
@@ -4236,7 +4579,11 @@ class StreamingEngine:
         """
         if constraint is None:
             return logits
-        from .quant import RerankedQHead, reranked_matmul
+        from .quant import (
+            RerankedQHead,
+            reranked_lm_head_capture_scope,
+            reranked_matmul,
+        )
 
         head = self._lm_head_weight()
         source = hidden if hidden is not None else self._h_last
@@ -4251,9 +4598,15 @@ class StreamingEngine:
                 normalized = mx.fast.rms_norm(
                     source[:, -1:, :], self._norm_w,
                     self.cfg.rms_norm_eps)
-            return reranked_matmul(
-                normalized, head,
-                logits_transform=constraint.mask_logits)[0, 0]
+            # A constrained request marks its ordinary unrestricted head
+            # projections provisional at the server request boundary. Only
+            # this grammar-aware rerank is an authoritative target decision
+            # and therefore eligible for promotion evidence.
+            with reranked_lm_head_capture_scope(
+                    head, "authoritative-target"):
+                return reranked_matmul(
+                    normalized, head,
+                    logits_transform=constraint.mask_logits)[0, 0]
         return constraint.mask_logits(logits)
 
     def _all_logits(self, hidden: mx.array) -> mx.array:
@@ -4407,6 +4760,10 @@ class StreamingEngine:
                         native_fused_decode=self.rc.native_fused_deltanet_decode,
                         chunked_delta_prefill=(
                             self.rc.qwen_chunked_delta_prefill),
+                        compiled_delta_prefill=(
+                            self.rc.qwen_compiled_delta_prefill),
+                        native_fused_delta_prefill=(
+                            self.rc.qwen_native_fused_delta_prefill),
                         defer_state_eval=True,
                     )
                 kda = getattr(kv, "kda_cache", None)
@@ -4651,6 +5008,10 @@ class StreamingEngine:
                     native_fused_decode=self.rc.native_fused_deltanet_decode,
                     chunked_delta_prefill=(
                         self.rc.qwen_chunked_delta_prefill),
+                    compiled_delta_prefill=(
+                        self.rc.qwen_compiled_delta_prefill),
+                    native_fused_delta_prefill=(
+                        self.rc.qwen_native_fused_delta_prefill),
                     profile=profiler,
                 )
             elif self.cfg.model_type == "jet_nemotron":
@@ -4781,7 +5142,9 @@ class StreamingEngine:
             tile_width: int, on_progress=None, *, layer_start: int = 0,
             layer_end: int | None = None,
             profile_path: str = "layer_stationary_qwen35",
-            positions3: mx.array | None = None) -> mx.array:
+            positions3: mx.array | None = None,
+            boundary_fork_at: int | None = None,
+            boundary_fork_kv: KVCache | None = None) -> mx.array:
         """F94 live path: layer-major (not chunk-major) prefill for qwen3_5/
         qwen3_5_moe (Qwen3.5-4B/9B, Qwen3.6-27B hybrid DeltaNet/full-attention
         layers). Fetches each layer's weights exactly once for the WHOLE
@@ -4846,18 +5209,40 @@ class StreamingEngine:
             raise ValueError(
                 "Qwen layer-stationary positions must have shape "
                 f"(3, {total})")
+        if boundary_fork_at is not None:
+            boundary_fork_at = int(boundary_fork_at)
+            if not 0 < boundary_fork_at < total:
+                raise ValueError(
+                    "Qwen boundary fork must be strictly inside the sweep")
+            if type(boundary_fork_kv) is not KVCache:
+                raise TypeError(
+                    "Qwen layer-stationary boundary fork requires plain KVCache")
+            if getattr(boundary_fork_kv, "kda_cache", None) is None:
+                raise ValueError(
+                    "Qwen layer-stationary boundary fork is missing recurrent state")
+        elif boundary_fork_kv is not None:
+            raise ValueError("boundary_fork_kv requires boundary_fork_at")
+        dense_mlp = not bool(self.cfg.num_experts)
+        # A dense MLP is position-independent.  Keep it on the same bounded
+        # row tiles as attention instead of materializing gate/up/down
+        # activations for the entire prompt (49K rows is ~11 GB for the 27B
+        # checkpoint).  Besides bounding memory, this matches the ordinary
+        # chunk-major dense path's call shapes.  Routed MoE retains its
+        # existing whole-range union so expert batching/fetch behavior is
+        # unchanged.
+        transient_positions = min(total, tile_width) if dense_mlp else total
         (self._layer_transient,
          self._layer_transient_margin) = _layer_transient_for_positions(
-             total,
+             transient_positions,
              getattr(
                  self, "_prefill_layer_transient_by_positions", {}
-             ).get(total, 0),
+             ).get(transient_positions, 0),
              getattr(self, "_decode_layer_transient", 0))
         profiler = self._request_profiler
         if profiler is not None:
             profiler.begin_sweep(total, path=profile_path)
         for i in range(layer_start, layer_end):
-            self._select_layer_transient(total, i)
+            self._select_layer_transient(transient_positions, i)
             if self.prefetcher:
                 for j in range(
                         i + 1,
@@ -4889,6 +5274,15 @@ class StreamingEngine:
             t0 = time.perf_counter()
             while pos < total:
                 end = min(pos + tile_width, total)
+                # A stable chat boundary can fall inside an ordinary prefill
+                # tile. Land on it exactly so this layer's recurrent/KV
+                # endpoint can be retained before the generation scaffold is
+                # consumed, while the same resident weights immediately
+                # continue through that scaffold. No arithmetic is reordered
+                # inside either side of the boundary.
+                if (boundary_fork_at is not None
+                        and pos < boundary_fork_at < end):
+                    end = boundary_fork_at
                 # Same per-tile proactive reserve _sweep does once per chunk
                 # (matching that granularity, not just once per layer), so a
                 # real mid-sweep pressure spike is caught at the same
@@ -4909,8 +5303,46 @@ class StreamingEngine:
                     native_fused_decode=self.rc.native_fused_deltanet_decode,
                     chunked_delta_prefill=(
                         self.rc.qwen_chunked_delta_prefill),
+                    compiled_delta_prefill=(
+                        self.rc.qwen_compiled_delta_prefill),
+                    native_fused_delta_prefill=(
+                        self.rc.qwen_native_fused_delta_prefill),
                 )
                 mx.eval(yt)
+                if (boundary_fork_at is not None
+                        and end == boundary_fork_at):
+                    # KVCache/KDAStateCache updates replace arrays rather than
+                    # mutating them in place. Sharing the evaluated endpoint
+                    # here is therefore copy-on-write: the following scaffold
+                    # tile installs new arrays in ``kv`` without changing the
+                    # retained stable-boundary branch.
+                    fork_arrays = []
+                    keys = kv.keys[i]
+                    values = kv.values[i]
+                    if keys is not None:
+                        fork_arrays.extend((keys, values))
+                    recurrent = getattr(kv, "kda_cache", None)
+                    fork_recurrent = boundary_fork_kv.kda_cache
+                    state = recurrent.state(i) if recurrent is not None else None
+                    history = (
+                        recurrent.conv_history(i)
+                        if recurrent is not None else None)
+                    if state is not None:
+                        fork_arrays.append(state)
+                    if history is not None:
+                        fork_arrays.extend(
+                            value for value in history if value is not None)
+                    if fork_arrays:
+                        mx.eval(*fork_arrays)
+                    if keys is not None:
+                        boundary_fork_kv.keys[i] = keys
+                        boundary_fork_kv.values[i] = values
+                        boundary_fork_kv._windows[i] = kv._windows[i]
+                        boundary_fork_kv._starts[i] = kv._starts[i]
+                    if state is not None:
+                        fork_recurrent.set_state(i, state)
+                    if history is not None:
+                        fork_recurrent.set_conv_history(i, tuple(history))
                 if profiler is not None and profiler.sync_substeps:
                     profiler.record_substep(
                         "attention", i,
@@ -4918,13 +5350,28 @@ class StreamingEngine:
                         positions=end - pos)
                 tiles.append(yt)
                 pos = end
-            x_after_attn = tiles[0] if len(tiles) == 1 else mx.concatenate(tiles, axis=1)
             mlp_t0 = time.perf_counter()
-            x = _qwen35_mlp_residual(
-                x_after_attn, w, f"model.layers.{i}", self.cfg, i,
-                self._get_experts,
-                iter_expert_batches=self._iter_expert_batches,
-                profile=profiler)
+            if dense_mlp and len(tiles) > 1:
+                mlp_tiles = []
+                for attention_tile in tiles:
+                    mlp_tile = _qwen35_mlp_residual(
+                        attention_tile, w, f"model.layers.{i}", self.cfg, i,
+                        self._get_experts,
+                        iter_expert_batches=self._iter_expert_batches,
+                        profile=profiler)
+                    mx.eval(mlp_tile)
+                    mlp_tiles.append(mlp_tile)
+                x = mx.concatenate(mlp_tiles, axis=1)
+            else:
+                x_after_attn = (
+                    tiles[0]
+                    if len(tiles) == 1
+                    else mx.concatenate(tiles, axis=1))
+                x = _qwen35_mlp_residual(
+                    x_after_attn, w, f"model.layers.{i}", self.cfg, i,
+                    self._get_experts,
+                    iter_expert_batches=self._iter_expert_batches,
+                    profile=profiler)
             mx.eval(x)
             if profiler is not None and profiler.sync_substeps:
                 profiler.record_substep(
@@ -4948,13 +5395,13 @@ class StreamingEngine:
                     "cache_source": "cold",
                 })
             self._record_layer_transient(
-                total, i,
+                transient_positions, i,
                 _resident_adjusted_transient(
                     active_before, mx.get_active_memory(),
                     mx.get_peak_memory()))
             self._note_true_peak()
             del w
-        self._restore_aggregate_layer_transient(total)
+        self._restore_aggregate_layer_transient(transient_positions)
         return x
 
     def _layer_stationary_gptoss_sweep(
@@ -5081,7 +5528,9 @@ class StreamingEngine:
 
     def _qwen35_lossy_suffix_prefill_sweep(
             self, x: mx.array, kv: KVCache, offset: int,
-            tile_width: int, on_progress=None) -> mx.array:
+            tile_width: int, on_progress=None, *,
+            stable_boundary_tokens: int | None = None,
+            boundary_fork_kv: KVCache | None = None) -> mx.array:
         """Run the fixed mixed-depth Qwen endpoint-packed prefill schedule.
 
         Every prompt position crosses the first ``early_layers`` blocks, so
@@ -5109,23 +5558,47 @@ class StreamingEngine:
         if prefix_tokens < 0 or suffix_tokens <= 0:
             raise ValueError("invalid Qwen lossy suffix-prefill token count")
         retained_tokens = prefix_tokens + suffix_tokens
-        if total_tokens <= retained_tokens:
+        stable_tokens = (
+            total_tokens
+            if stable_boundary_tokens is None
+            else int(stable_boundary_tokens))
+        if not 0 < stable_tokens <= total_tokens:
+            raise ValueError("invalid Qwen lossy stable-boundary token count")
+        if boundary_fork_kv is not None and stable_tokens >= total_tokens:
+            raise ValueError(
+                "a Qwen boundary fork requires a following scaffold")
+        boundary_fork_at = (
+            stable_tokens if boundary_fork_kv is not None else None)
+        if stable_tokens <= retained_tokens:
             return self._layer_stationary_qwen35_sweep(
                 x, kv, offset=offset, tile_width=tile_width,
-                on_progress=on_progress)
+                on_progress=on_progress,
+                boundary_fork_at=boundary_fork_at,
+                boundary_fork_kv=boundary_fork_kv)
 
         x = self._layer_stationary_qwen35_sweep(
             x, kv, offset=offset, tile_width=tile_width,
             on_progress=on_progress, layer_end=early_layers,
-            profile_path="qwen35_lossy_suffix_shallow")
-        suffix_start = total_tokens - suffix_tokens
+            profile_path="qwen35_lossy_suffix_shallow",
+            boundary_fork_at=boundary_fork_at,
+            boundary_fork_kv=boundary_fork_kv)
+        # When a generation scaffold follows the stable chat boundary, retain
+        # the configured anchor/suffix from the stable portion and append the
+        # scaffold. Selecting the suffix from ``total_tokens`` instead would
+        # silently replace recent user/tool evidence with scaffold tokens.
+        suffix_start = stable_tokens - suffix_tokens
+        scaffold = x[:, stable_tokens:, :]
         if prefix_tokens:
             x = mx.concatenate(
-                (x[:, :prefix_tokens, :], x[:, suffix_start:, :]), axis=1)
+                (x[:, :prefix_tokens, :],
+                 x[:, suffix_start:stable_tokens, :], scaffold), axis=1)
             positions = mx.concatenate((
                 mx.arange(offset, offset + prefix_tokens, dtype=mx.float32),
                 mx.arange(
-                    offset + suffix_start, offset + total_tokens,
+                    offset + suffix_start, offset + stable_tokens,
+                    dtype=mx.float32),
+                mx.arange(
+                    offset + stable_tokens, offset + total_tokens,
                     dtype=mx.float32),
             ))
             positions3 = mx.stack((positions, positions, positions), axis=0)
@@ -5139,7 +5612,10 @@ class StreamingEngine:
         return self._layer_stationary_qwen35_sweep(
             x, kv, offset=deep_offset, tile_width=tile_width,
             on_progress=on_progress, layer_start=early_layers,
-            profile_path=profile_path, positions3=positions3)
+            profile_path=profile_path, positions3=positions3,
+            boundary_fork_at=(
+                retained_tokens if boundary_fork_kv is not None else None),
+            boundary_fork_kv=boundary_fork_kv)
 
     def _layer_stationary_glm_sweep(
             self, x: mx.array, kv, offset: int, tile_width: int,
@@ -6674,7 +7150,11 @@ class StreamingEngine:
                             hidden, weights, prefix, self.cfg, kv, layer,
                             offset + position,
                             chunked_delta_prefill=(
-                                self.rc.qwen_chunked_delta_prefill))
+                                self.rc.qwen_chunked_delta_prefill),
+                            compiled_delta_prefill=(
+                                self.rc.qwen_compiled_delta_prefill),
+                            native_fused_delta_prefill=(
+                                self.rc.qwen_native_fused_delta_prefill))
                         capture_kda_position(layer, position)
                         hidden = _qwen35_mlp_residual(
                             attn_out, weights, prefix, self.cfg, layer,
@@ -6886,6 +7366,9 @@ class StreamingEngine:
                 f"k3dmlp{self.rc.kimi_k3_dense_mlp_tile_size}"
                 f"k3compiledkda{int(self.rc.kimi_k3_compiled_kda_prefill)}"
                 f"k3nativekda{int(self.rc.kimi_k3_native_fused_kda_prefill)}"
+                f"qwencompileddelta{int(self.rc.qwen_compiled_delta_prefill)}"
+                f"qwennativeprefill{int(self.rc.qwen_native_fused_delta_prefill)}"
+                f"qwenchunkeddelta{int(self.rc.qwen_chunked_delta_prefill)}"
                 f"k3scalesidecar{scale_sidecar_identity}"
                 f"k3nf12sidecar{nf12_sidecar_identity}"
                 f"k3nf12direct{int(self.rc.bf16_nf12_direct_linear)}"
@@ -6911,6 +7394,7 @@ class StreamingEngine:
                 f"residentmoe{int(self.rc.resident_moe_decode)}"
                 f"fswiglu{int(self.rc.fused_swiglu)}"
                 f"chunk{self.rc.prefill_chunk_size}"
+                f"qwenchunkceiling{self.rc.qwen35_prefill_chunk_ceiling}"
                 f"layerstationary{int(self.rc.layer_stationary_prefill)}"
                 f"qwensuffixdepth"
                 f"{self.rc.qwen_lossy_suffix_prefill_early_layers}"
@@ -6998,9 +7482,7 @@ class StreamingEngine:
             if self.rc.kimi_k3_mla_kv_spill_dir:
                 kv.enable_latent_disk_spill(
                     self.rc.kimi_k3_mla_kv_spill_dir)
-        if self.cfg.model_type in (
-                "kimi_linear", "kimi_k3", "qwen3_5_moe", "qwen3_5",
-                "jet_nemotron", "lfm2"):
+        if self.cfg.model_type in _HYBRID_RECURRENT_MODEL_TYPES:
             # KDA's recurrent state is fixed-size and not token-indexed. Exact
             # endpoint/extension retention and durable restore carry this
             # companion cache alongside attention KV; arbitrary prefix trims
@@ -7009,15 +7491,14 @@ class StreamingEngine:
             # KDAStateCache interface (.state/.set_state/.conv_history/
             # .set_conv_history) as Kimi Linear's KDA and Qwen3.5's DeltaNet
             # -- see runtime/jet_nemotron.py.
-            from .kda_state import KDAStateCache
-
-            kv.kda_cache = KDAStateCache(self.cfg.num_hidden_layers)
-            if (
-                self.cfg.model_type == "kimi_k3"
-                and self.rc.kimi_k3_kda_spill_dir
-            ):
-                kv.kda_cache.enable_disk_spill(
-                    self.rc.kimi_k3_kda_spill_dir)
+            attach_hybrid_recurrent_cache(
+                kv,
+                model_type=self.cfg.model_type,
+                num_hidden_layers=self.cfg.num_hidden_layers,
+                kda_spill_dir=(
+                    self.rc.kimi_k3_kda_spill_dir
+                    if self.cfg.model_type == "kimi_k3" else ""),
+            )
         return kv
 
     def _configure_restored_k3_spill(self, kv: KVCache) -> KVCache:
@@ -7128,6 +7609,11 @@ class StreamingEngine:
         self._expert_route_last_by_layer = {}
         self._expert_route_overlap_totals = {}
         request_cache_before = _cache_io_snapshot(self)
+        reranked_head = self._lm_head_w if self.rc.rerank_lm_head else None
+        reranked_telemetry_before = (
+            reranked_head.telemetry_snapshot()
+            if callable(getattr(reranked_head, "telemetry_snapshot", None))
+            else {})
         # F69 proof-carrying execution telemetry: validation harnesses can assert
         # that the feature under test actually ran instead of inferring it from a
         # config flag (a short prompt with chunk_size=4096 is a no-op).
@@ -7141,6 +7627,7 @@ class StreamingEngine:
             "prompt_cache_source": "cold",
             "hot_prompt_lcp_tokens": 0,
             "hot_prompt_reusable_prefix_tokens": 0,
+            "hot_prompt_longer_disk_prefix_tokens": 0,
             "prompt_cache_lookup_s": 0.0,
             "hot_prompt_lookup_s": 0.0,
             "disk_prompt_lookup_s": 0.0,
@@ -7148,6 +7635,8 @@ class StreamingEngine:
             "prompt_snapshot_write_s": 0.0,
             "postgen_snapshot_write_s": 0.0,
             "hot_prompt_kv_persist_write_s": 0.0,
+            "hot_prompt_hybrid_prefix_snapshot_tokens": 0,
+            "hot_prompt_boundary_matched_fork": 0,
             "hot_prompt_kv_gc_s": 0.0,
             "hot_prompt_kv_gc_removed": 0,
             "hot_prompt_kv_disk_hit": 0,
@@ -7184,6 +7673,12 @@ class StreamingEngine:
                 self.rc.qwen_lossy_suffix_prefill_prefix_tokens),
             "qwen_lossy_suffix_prefill_tokens": int(
                 self.rc.qwen_lossy_suffix_prefill_tokens),
+            "qwen_compiled_delta_prefill": int(
+                self.rc.qwen_compiled_delta_prefill),
+            "qwen_native_fused_delta_prefill": int(
+                self.rc.qwen_native_fused_delta_prefill),
+            "qwen_chunked_delta_prefill": int(
+                self.rc.qwen_chunked_delta_prefill),
             "suffix_decoding_enabled": int(self.rc.suffix_decoding),
             "suffix_decoding_used": 0,
             "suffix_decoding_fallback_reason": (
@@ -7229,11 +7724,26 @@ class StreamingEngine:
                 if self.rc.rerank_lm_head else 0
             ),
             "reranked_lm_head_approx_bytes": self._reranked_lm_head_bytes,
+            "reranked_lm_head_exact_resident_bytes": (
+                self._reranked_lm_head_exact_resident_bytes),
+            "reranked_lm_head_row_paged": int(bool(
+                self._reranked_lm_head_source_fingerprint)),
+            "reranked_lm_head_source_fingerprint": (
+                self._reranked_lm_head_source_fingerprint),
+            "reranked_lm_head_recall_probe_every": int(
+                self.rc.rerank_lm_head_recall_probe_every),
+            "reranked_lm_head_rank_capture": int(bool(
+                self.rc.rerank_lm_head_rank_capture_path)),
+            "reranked_lm_head_approx_fingerprint": (
+                self._reranked_lm_head_approx_fingerprint),
             "expert_top_k_by_layer": list(self.cfg.expert_top_k_by_layer),
             "weight_integrity_mode": (
                 self.store.integrity_mode
             ),
         }
+        if self.cfg.model_type in ("qwen3_5", "qwen3_5_moe"):
+            path_stats["qwen35_prefill_chunk_ceiling"] = int(
+                self.rc.qwen35_prefill_chunk_ceiling)
         tokenize_t0 = time.perf_counter()
         prepared_ids = getattr(prompt, "token_ids", None)
         tokens = (list(prepared_ids) if prepared_ids is not None
@@ -7334,6 +7844,7 @@ class StreamingEngine:
         persist_parent_chain: tuple[str, ...] = ()  # disk-segment parent for
         # this turn's save, if hot-kv persistence is enabled (see below)
         persist_parent_covered = 0  # exact token count `persist_parent_chain`
+        boundary_segment_chain: tuple[str, ...] = ()
         # covers -- always equals `best_matched` when a match wins (true for
         # all three cases: endpoint/branch/repeat), 0 when cold. MUST be
         # passed to save() explicitly rather than re-derived, since a
@@ -7344,8 +7855,10 @@ class StreamingEngine:
         # limits hybrid models to those two no-trim cases.
         recurrent_exact_only = self.cfg.model_type in (
             "kimi_linear", "kimi_k3", "qwen3_5_moe", "qwen3_5", "jet_nemotron")
-        hot_eligible = (self.rc.hot_prompt_kv and not self.rc.max_kv_mb
-                        and not force_adaptive_paged)
+        hot_eligible = bool(
+            self.rc.hot_prompt_kv
+            and (not self.rc.max_kv_mb or self.rc.paged_kv_persist)
+            and not force_adaptive_paged)
         resident_prompt_kv_bytes = self._project_dense_text_kv_bytes(len(tokens))
         configured_paged_mb = int(self.rc.max_kv_mb or 0)
         initial_paged_mb = (
@@ -7769,9 +8282,35 @@ class StreamingEngine:
                             if source_slot.kv is not kv:
                                 self._release_kv(source_slot.kv)
 
+            preferred_disk_match = None
+            if (kv is None
+                    and best_idx is not None
+                    and best_case == "extension"
+                    and self.cfg.model_type in ("qwen3_5", "qwen3_5_moe")
+                    and self._hot_kv_persist is not None
+                    and self._persisted_kv_restore_allowed()):
+                # A recently used shorter boundary can coexist in RAM with a
+                # strictly longer exact boundary on disk (for example after
+                # switching between two branches and restarting). The hybrid
+                # state cannot be trimmed, so ask the metadata journal whether
+                # a longer candidate exists before consuming the RAM slot.
+                # The threshold prevents payload hashing on the common path
+                # where memory is already longest.
+                preferred_disk_match = self._hot_kv_persist.find_best_match(
+                    tokens,
+                    self.rc.hot_prompt_kv_chunk_size,
+                    cache_namespace=cache_namespace,
+                    min_matched_exclusive=best_matched,
+                )
+                if preferred_disk_match is not None:
+                    path_stats[
+                        "hot_prompt_longer_disk_prefix_tokens"] = int(
+                            preferred_disk_match["matched"])
+
             if kv is not None:
                 pass
-            elif best_idx is not None and best_matched > 0:
+            elif (preferred_disk_match is None
+                  and best_idx is not None and best_matched > 0):
                 slot = self._hot_prompt_slots.pop(best_idx)  # consume: remove from the LRU
                 if self._hybrid_chunk_size_applies():
                     continued_chunk = self._select_prefill_chunk_size(slot)
@@ -7841,9 +8380,11 @@ class StreamingEngine:
                 # release persisted, unmatched resident branches first when
                 # the live ceiling cannot hold both states simultaneously.
                 if admit_hot_kv_growth(None):
-                    disk_match = self._hot_kv_persist.find_best_match(
-                        tokens, self.rc.hot_prompt_kv_chunk_size,
-                        cache_namespace=cache_namespace)
+                    disk_match = preferred_disk_match
+                    if disk_match is None:
+                        disk_match = self._hot_kv_persist.find_best_match(
+                            tokens, self.rc.hot_prompt_kv_chunk_size,
+                            cache_namespace=cache_namespace)
                     if disk_match is not None:
                         loaded = self._hot_kv_persist.load_matched_chain(
                             disk_match, self.cfg.num_hidden_layers)
@@ -7925,6 +8466,14 @@ class StreamingEngine:
                     page_positions=self.rc.kv_page_positions,
                     compress_spill=self.rc.kv_spill_compress,
                 )
+                attach_hybrid_recurrent_cache(
+                    kv,
+                    model_type=self.cfg.model_type,
+                    num_hidden_layers=self.cfg.num_hidden_layers,
+                    kda_spill_dir=(
+                        self.rc.kimi_k3_kda_spill_dir
+                        if self.cfg.model_type == "kimi_k3" else ""),
+                )
             else:
                 # F95: a genuinely NEW conversation -- no in-memory slot and
                 # no disk match (persistence is off by default now anyway).
@@ -7937,6 +8486,11 @@ class StreamingEngine:
                     self.rc.hot_prompt_kv_chunk_size = fresh_chunk
                 kv = self.new_kv(stepped=use_stepped_kv)
         self.last_kv = kv
+        effective_prefill_chunk = int(self.rc.prefill_chunk_size or 0)
+        path_stats["prefill_step_size"] = effective_prefill_chunk
+        if self.cfg.model_type in ("qwen3_5", "qwen3_5_moe"):
+            path_stats[
+                "qwen35_prefill_chunk_selected"] = effective_prefill_chunk
         if getattr(kv, "position_free", False):
             # The full request length is known before the first layer runs. Grow
             # the shared physical arrays once here instead of copying every
@@ -8012,6 +8566,7 @@ class StreamingEngine:
         # regardless of which of the three branches below actually ran.
         boundary_fork_tokens = 0
         boundary_fork_kv = None
+        deferred_qwen_boundary_tokens = 0
         if (exact_logits is None
                 and self.cfg.model_type == "deepseek_v4"
                 and self._dsv4_prompt_reuse):
@@ -8062,10 +8617,40 @@ class StreamingEngine:
             # tokens are exactly what ANY future continuation of this same
             # conversation is guaranteed to re-render byte-identically.
             if (recurrent_exact_only and hot_eligible
-                    and type(kv) is KVCache):
+                    and (type(kv) is KVCache or self.rc.paged_kv_persist)):
                 stable_boundary = int(
                     getattr(prompt, "stable_boundary_tokens", 0) or 0)
-                if pos < stable_boundary < len(tokens):
+                matched_boundary_fork = _fork_matched_hybrid_stable_boundary(
+                    kv,
+                    matched_tokens=pos,
+                    stable_boundary_tokens=stable_boundary,
+                    prompt_tokens=len(tokens),
+                )
+                if matched_boundary_fork is not None:
+                    # A restart/disk match can land exactly on the rendered
+                    # scaffold-free boundary. Suffix prefill consumes and
+                    # advances that matched state, so retain its cheap COW
+                    # fork now just as the cold path does when it computes up
+                    # to the boundary below. Without this equality arm, the
+                    # one-slot RAM tier replaces a useful stable prefix with a
+                    # post-generation recurrent endpoint that cannot be
+                    # rewound for regenerate/next-turn requests; every later
+                    # request is forced back to disk despite an exact match.
+                    boundary_fork_kv = matched_boundary_fork
+                    boundary_fork_tokens = stable_boundary
+                    path_stats[
+                        "hot_prompt_boundary_fork_tokens"] = stable_boundary
+                    path_stats["hot_prompt_boundary_matched_fork"] = 1
+                elif (self.rc.paged_kv_persist
+                        and pos == stable_boundary
+                        and persist_parent_covered == stable_boundary):
+                    # A disk-restored stable prefix is already the immutable
+                    # boundary checkpoint. Keep its chain as the endpoint
+                    # parent; do not clone or rewrite any KV pages.
+                    boundary_segment_chain = persist_parent_chain
+                    path_stats[
+                        "hot_prompt_boundary_fork_tokens"] = stable_boundary
+                elif pos < stable_boundary < len(tokens):
                     # Chunk this mini-sweep exactly like the ordinary prefill
                     # loop below -- an unchunked sweep of an entire first-turn
                     # prompt here would bypass the same peak-memory bound
@@ -8106,7 +8691,32 @@ class StreamingEngine:
                             "hot_boundary layer_stationary "
                             f"eligible={int(boundary_layer_stationary)} "
                             f"positions={stable_boundary - pos}")
-                    if boundary_layer_stationary:
+                    # Dense Qwen's generation scaffold can continue through
+                    # the same resident layer weights as the stable prefix.
+                    # Defer this one architecture to the complete-prompt
+                    # layer-stationary sweep below; that sweep captures every
+                    # layer's exact boundary endpoint before advancing the
+                    # scaffold. Other recurrent architectures retain their
+                    # already-gated separate boundary behavior.
+                    fuse_qwen_boundary_scaffold = bool(
+                        boundary_layer_stationary
+                        and self.cfg.model_type in ("qwen3_5", "qwen3_5_moe")
+                        and self.rc.qwen_fused_boundary_scaffold_prefill
+                        and self.rc.prefill_chunk_size
+                        and not self.rc.prefill_last_token_separate)
+                    if fuse_qwen_boundary_scaffold:
+                        boundary_fork_kv = fork_hybrid_kv_endpoint(kv)
+                        boundary_fork_tokens = stable_boundary
+                        deferred_qwen_boundary_tokens = stable_boundary
+                        path_stats[
+                            "hot_prompt_boundary_scaffold_fused"] = 1
+                        path_stats[
+                            "hot_prompt_boundary_fork_tokens"] = stable_boundary
+                        if self._request_profiler is not None:
+                            self._request_profiler.note(
+                                "hot_boundary scaffold_fused=1 "
+                                f"positions={len(tokens) - pos}")
+                    elif boundary_layer_stationary:
                         bx = self._embed(list(tokens[pos:stable_boundary]))
                         if self.cfg.model_type == "kimi_linear":
                             bx = self._layer_stationary_kimi_linear_sweep(
@@ -8174,12 +8784,41 @@ class StreamingEngine:
                                     "cache_source": path_stats[
                                         "prompt_cache_source"],
                                 })
-                    path_stats["hot_prompt_boundary_prefill_chunks"] = (
-                        -(-(stable_boundary - pos) // boundary_chunk))
-                    boundary_fork_kv = fork_hybrid_kv_endpoint(kv)
-                    boundary_fork_tokens = stable_boundary
-                    pos = stable_boundary
-                    path_stats["hot_prompt_boundary_fork_tokens"] = stable_boundary
+                    if not fuse_qwen_boundary_scaffold:
+                        path_stats["hot_prompt_boundary_prefill_chunks"] = (
+                            -(-(stable_boundary - pos) // boundary_chunk))
+                        if self.rc.paged_kv_persist:
+                            recurrent = getattr(kv, "kda_cache", None)
+                            if recurrent is None or self._hot_kv_persist is None:
+                                raise RuntimeError(
+                                    "paged Qwen boundary is missing durable "
+                                    "recurrent state")
+                            recurrent.synchronize()
+                            boundary_segment_chain = self._hot_kv_persist.save(
+                                parent_chain=persist_parent_chain,
+                                parent_covered=persist_parent_covered,
+                                tokens=tuple(tokens[:stable_boundary]),
+                                kv=kv,
+                                logits=None,
+                                prompt_logits=None,
+                                prompt_length=stable_boundary,
+                                reusable_prefix=stable_boundary,
+                                approximate=prompt_state_approximate,
+                                tool_capsules=(),
+                                cache_namespace=cache_namespace,
+                                checkpoint_kind="stable_prefix",
+                            )
+                            persist_parent_chain = boundary_segment_chain
+                            persist_parent_covered = stable_boundary
+                            path_stats[
+                                "hot_prompt_hybrid_prefix_snapshot_tokens"] = (
+                                    stable_boundary)
+                        else:
+                            boundary_fork_kv = fork_hybrid_kv_endpoint(kv)
+                            boundary_fork_tokens = stable_boundary
+                        pos = stable_boundary
+                        path_stats[
+                            "hot_prompt_boundary_fork_tokens"] = stable_boundary
             ckpt = self.rc.prefill_checkpoint_every
             # Memory chunking and persistent checkpoints are deliberately
             # separate. F37 v6 journals only new positions at a checkpoint; a
@@ -8267,6 +8906,9 @@ class StreamingEngine:
                     f"eligible={int(layer_stationary_eligible)} "
                     f"chunk={int(chunk or 0)} "
                     f"blockers={','.join(blockers) if blockers else 'none'}")
+            if deferred_qwen_boundary_tokens and not layer_stationary_eligible:
+                raise RuntimeError(
+                    "deferred Qwen boundary lost layer-stationary eligibility")
             if layer_stationary_eligible:
                 prefill_limit = (
                     len(tokens) - 1
@@ -8334,14 +8976,26 @@ class StreamingEngine:
                         if use_lossy_suffix:
                             xc = self._qwen35_lossy_suffix_prefill_sweep(
                                 xc, kv, offset=pos, tile_width=chunk,
-                                on_progress=on_progress)
+                                on_progress=on_progress,
+                                stable_boundary_tokens=(
+                                    deferred_qwen_boundary_tokens - pos
+                                    if deferred_qwen_boundary_tokens else None),
+                                boundary_fork_kv=(
+                                    boundary_fork_kv
+                                    if deferred_qwen_boundary_tokens else None))
                             prompt_state_approximate = True
                             path_stats[
                                 "qwen_lossy_suffix_prefill_used"] = 1
                         else:
                             xc = self._layer_stationary_qwen35_sweep(
                                 xc, kv, offset=pos, tile_width=chunk,
-                                on_progress=on_progress)
+                                on_progress=on_progress,
+                                boundary_fork_at=(
+                                    deferred_qwen_boundary_tokens - pos
+                                    if deferred_qwen_boundary_tokens else None),
+                                boundary_fork_kv=(
+                                    boundary_fork_kv
+                                    if deferred_qwen_boundary_tokens else None))
                     if stop_before == len(tokens):
                         layer_stationary_endpoint_x = xc
                         path_stats["layer_stationary_endpoint_fused"] = 1
@@ -9066,7 +9720,8 @@ class StreamingEngine:
             # pages only, so subsequent edited branches do not duplicate KV.
             kv.drop_rotated_view()
 
-        if (hot_eligible and isinstance(kv, KVCache)
+        if (hot_eligible and (
+                isinstance(kv, KVCache) or self.rc.paged_kv_persist)
                 and len(tokens) >= self.rc.hot_prompt_kv_min_tokens):
             # At this point the KV contains exactly the prompt plus every
             # generated token that was fed back (`generated[:-1]`).  `logits`
@@ -9082,9 +9737,47 @@ class StreamingEngine:
             segment_chain: tuple[str, ...] = ()
             if self._hot_kv_persist is not None:
                 persist_t0 = time.perf_counter()
+                endpoint_parent_chain = persist_parent_chain
+                endpoint_parent_covered = persist_parent_covered
+                # Qwen's useful next-turn endpoint is the exact chat-template
+                # boundary fork captured during prefill, not the later
+                # generation-scaffold endpoint. Persist that hybrid state as a
+                # typed, state-only checkpoint before the ordinary endpoint.
+                # Its full-attention KV segments also become the immutable
+                # parent of the later full endpoint, so this adds only the
+                # recurrent checkpoint payload rather than duplicating prefix
+                # KV bytes.
+                if (self.cfg.model_type in ("qwen3_5", "qwen3_5_moe")
+                        and boundary_fork_kv is not None
+                        and 0 < boundary_fork_tokens <= len(tokens)):
+                    boundary_recurrent = getattr(
+                        boundary_fork_kv, "kda_cache", None)
+                    if boundary_recurrent is None:
+                        raise RuntimeError(
+                            "Qwen stable boundary is missing recurrent state")
+                    boundary_recurrent.synchronize()
+                    boundary_segment_chain = self._hot_kv_persist.save(
+                        parent_chain=persist_parent_chain,
+                        parent_covered=persist_parent_covered,
+                        tokens=tuple(tokens[:boundary_fork_tokens]),
+                        kv=boundary_fork_kv,
+                        logits=None,
+                        prompt_logits=None,
+                        prompt_length=boundary_fork_tokens,
+                        reusable_prefix=boundary_fork_tokens,
+                        approximate=prompt_state_approximate,
+                        tool_capsules=(),
+                        cache_namespace=cache_namespace,
+                        checkpoint_kind="stable_prefix",
+                    )
+                    endpoint_parent_chain = boundary_segment_chain
+                    endpoint_parent_covered = boundary_fork_tokens
+                    path_stats[
+                        "hot_prompt_hybrid_prefix_snapshot_tokens"] = (
+                            boundary_fork_tokens)
                 segment_chain = self._hot_kv_persist.save(
-                    parent_chain=persist_parent_chain,
-                    parent_covered=persist_parent_covered,
+                    parent_chain=endpoint_parent_chain,
+                    parent_covered=endpoint_parent_covered,
                     tokens=full_tokens,
                     kv=kv,
                     logits=logits,
@@ -9102,20 +9795,24 @@ class StreamingEngine:
                     "kda_layers"]
                 path_stats["hot_prompt_k3_respill_mla_layers"] = respilled[
                     "mla_layers"]
-            new_slot = self._new_hot_prompt_slot(
-                recurrent_exact_only=recurrent_exact_only,
-                boundary_fork_kv=boundary_fork_kv,
-                boundary_fork_tokens=boundary_fork_tokens,
-                tokens=tokens, full_tokens=full_tokens, kv=kv, logits=logits,
-                prompt_endpoint_logits=prompt_endpoint_logits,
-                reusable_watermark=reusable_watermark,
-                prompt_state_approximate=prompt_state_approximate,
-                tool_capsules=tuple(getattr(prompt, "tool_capsules", ())),
-                segment_chain=segment_chain, cache_namespace=cache_namespace,
-            )
-            capacity_count, capacity_bytes = self._append_hot_prompt_slot(new_slot)
-            path_stats["hot_prompt_capacity_evicted_slots"] = capacity_count
-            path_stats["hot_prompt_capacity_evicted_bytes"] = capacity_bytes
+            if isinstance(kv, KVCache):
+                new_slot = self._new_hot_prompt_slot(
+                    recurrent_exact_only=recurrent_exact_only,
+                    boundary_fork_kv=boundary_fork_kv,
+                    boundary_fork_tokens=boundary_fork_tokens,
+                    tokens=tokens, full_tokens=full_tokens, kv=kv, logits=logits,
+                    prompt_endpoint_logits=prompt_endpoint_logits,
+                    reusable_watermark=reusable_watermark,
+                    prompt_state_approximate=prompt_state_approximate,
+                    tool_capsules=tuple(getattr(prompt, "tool_capsules", ())),
+                    segment_chain=segment_chain,
+                    boundary_segment_chain=boundary_segment_chain,
+                    cache_namespace=cache_namespace,
+                )
+                capacity_count, capacity_bytes = self._append_hot_prompt_slot(
+                    new_slot)
+                path_stats["hot_prompt_capacity_evicted_slots"] = capacity_count
+                path_stats["hot_prompt_capacity_evicted_bytes"] = capacity_bytes
             # Capacity eviction frees only the in-memory copy. Its disk
             # checkpoint is governed by the separate durable recency budget.
             if self._hot_kv_persist is not None:
@@ -9141,11 +9838,7 @@ class StreamingEngine:
         postgen_floor = int(
             self.rc.qwen_postgen_min_available_mb * 1_000_000)
         postgen_available_before = int(psutil.virtual_memory().available)
-        if (
-            self.rc.qwen_lossy_suffix_prefill_early_layers
-            and postgen_floor > 0
-            and postgen_available_before < postgen_floor
-        ):
+        if postgen_floor > 0 and postgen_available_before < postgen_floor:
             cache_before_trim = int(self.cache.total_bytes)
             requested_reclaim = (
                 postgen_floor - postgen_available_before + 128_000_000)
@@ -9180,6 +9873,17 @@ class StreamingEngine:
         _record_cache_io_delta(
             self, prefill_cache_after, path_stats, prefix="decode_",
             after=request_cache_after)
+        if reranked_telemetry_before:
+            reranked_after = reranked_head.telemetry_snapshot()
+            for key, value in reranked_after.items():
+                path_stats[f"reranked_lm_head_{key}"] = max(
+                    0, int(value) - int(reranked_telemetry_before.get(key, 0)))
+            recall_probes = path_stats[
+                "reranked_lm_head_candidate_recall_probes"]
+            recall_hits = path_stats[
+                "reranked_lm_head_candidate_recall_hits"]
+            path_stats["reranked_lm_head_candidate_recall"] = (
+                recall_hits / recall_probes if recall_probes else None)
         total_s = time.perf_counter() - request_t0
         execution_profile = (
             self._request_profiler.result(total_s)
@@ -9440,14 +10144,20 @@ class StreamingEngine:
         # overwritten by a post-cleanup memory sample that looks healthy again.
         retry_ceiling = int(getattr(
             self, "_hybrid_retry_chunk_ceiling", 0) or 0)
-        return min(selected, retry_ceiling) if retry_ceiling else selected
+        if retry_ceiling:
+            selected = min(selected, retry_ceiling)
+        configured_ceiling = int(getattr(
+            self.rc, "qwen35_prefill_chunk_ceiling", 0) or 0)
+        if configured_ceiling:
+            selected = min(selected, configured_ceiling)
+        return selected
 
     def _new_hot_prompt_slot(
             self, *, recurrent_exact_only: bool, boundary_fork_kv,
             boundary_fork_tokens: int, tokens, full_tokens, kv, logits,
             prompt_endpoint_logits, reusable_watermark: int,
             prompt_state_approximate: bool, tool_capsules, segment_chain,
-            cache_namespace: str) -> "_HotPromptSlot":
+            cache_namespace: str, boundary_segment_chain=()) -> "_HotPromptSlot":
         """F96: which state to retain for the next request on this lineage.
 
         For an ordinary (non-recurrent) model the full post-generation
@@ -9487,7 +10197,7 @@ class StreamingEngine:
                     self, "_active_k3_prefill_schedule", ""),
                 approximate=prompt_state_approximate,
                 tool_capsules=(),
-                segment_chain=(),
+                segment_chain=tuple(boundary_segment_chain),
                 cache_namespace=cache_namespace,
             )
         return _HotPromptSlot(
@@ -9581,8 +10291,16 @@ class StreamingEngine:
             self.prefetcher.close()
         if self.predictor is not None:
             self.predictor.save()
+        reranked_exact = getattr(self._lm_head_w, "exact", None)
+        if (reranked_exact is not None
+                and reranked_exact is not self._streamed_lm_head
+                and callable(getattr(reranked_exact, "close", None))):
+            reranked_exact.close()
         if self._streamed_lm_head is not None:
             self._streamed_lm_head.close()
         if self._embed_rows is not None:
             self._embed_rows.close()
+        close_store = getattr(self.store, "close", None)
+        if close_store is not None:
+            close_store()
         self.cache.clear()

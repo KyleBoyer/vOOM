@@ -2,9 +2,10 @@
 source for speculative decoding.
 
 Checkpoint block under the top-level ``mtp.`` prefix (DeepSeek-V3 style,
-mtp_num_hidden_layers=1, applied ONCE -- unlike GLM-5.2's MTP, which chains
-iteratively for up to 5 drafts, Qwen3.6's real checkpoints only ever draft
-ONE token ahead):
+``mtp_num_hidden_layers=1``).  Depth 1 remains the safe default.  Explicit
+depth 2 recurrently reuses the released single physical layer, feeding its
+post-block hidden state and first proposal into the second step before one
+width-3 exact target verification:
 
     e   = pre_fc_norm_embedding( embed(token_t) )
     hn  = pre_fc_norm_hidden( h )                  # h = trunk hidden at t-1
@@ -33,16 +34,14 @@ destructively each token, so a rejected draft can't simply be "trimmed" the
 way ordinary KV can (see runtime/kv_cache.py::KVCache.trim, which has no
 kda_cache branch -- a real, separate, NOT-currently-reachable gap in the
 generic suffix_decoding/speculative.py draft paths, guarded against
-elsewhere rather than fixed here). But Qwen3.6 only ever drafts ONE token
-(mtp_num_hidden_layers=1), so the rollback problem collapses to picking
-between exactly two states -- no chain of K checkpoints, no compact
-transition-factor math (contra the general case solved by SpecLA, arXiv
-2607.16673). KDAStateCache.fork() (kda_state.py) is already a cheap,
-existing snapshot primitive (list-shallow-copy, no array copies) with one
-prior caller (kv_cache.py's fork_hybrid_kv_endpoint, used by qwen3vl.py).
+elsewhere rather than fixed here).  The serial target verifier retains every
+strict recurrent prefix in a width-2 or width-3 window.  Rejection or a
+terminal token therefore installs the exact accepted KDA endpoint and trims
+ordinary target KV plus the MTP layer's own attention KV to the same prefix.
 
-Round structure (matching speculative.py's own "1 + k" verify convention,
-k=1 here): each round feeds ``[catchup_token, draft_token]`` through one
+Round structure (matching speculative.py's own "1 + k" verify convention):
+depth 1 feeds ``[catchup_token, draft_token]`` and depth 2 feeds
+``[catchup_token, draft1, draft2]`` through one
 layer-major sweep. Every position retains the ordinary one-token arithmetic
 shape inside that sweep, so MoE routing never widens into a two-position union
 and MXFP4 reductions remain identical to sequential decode. The verifier also
@@ -56,17 +55,16 @@ whose misses merely fail to save one.
 This module mirrors runtime/glm_mtp.py's structure and safety framing:
 greedy drafts require target argmax equality, while stochastic drafts use the
 standard exact p/q acceptance ratio and normalized positive-part (p-q)
-rejection residual. This is deliberately a NEW,
-SIMPLER engine (not a SpeculativeDecoder extension) because k is always 1
-here -- SpeculativeDecoder's adaptive-k controller, F48 byte-fitted
-telemetry, and multi-round bookkeeping are irrelevant complexity for a fixed
-k=1 target, and this keeps the already-provisional GLM path untouched.
+rejection residual, applied sequentially to q1 then q2.  This remains a small
+dedicated adapter rather than changing the provisional GLM path.
 """
 
 from __future__ import annotations
 
 import math
 import time
+from dataclasses import dataclass
+from typing import Iterable, Mapping, Sequence
 
 import mlx.core as mx
 
@@ -76,6 +74,413 @@ from .qwen35 import _full_attention, _moe, _swiglu, final_logits, qwen35_rms_nor
 from .sampler import (SamplingParams, filtered_probabilities, sample,
                       sample_probabilities,
                       speculative_residual_probabilities)
+
+
+def _reranked_head_telemetry_snapshot(target) -> dict[str, int]:
+    """Return target-owned sparse-head counters without requiring the feature.
+
+    ``StreamingEngine.generate`` snapshots these counters around an ordinary
+    request.  Native MTP bootstraps through that method and then performs its
+    own draft/verify projections, so retaining only bootstrap ``path_stats``
+    made a real eight-token request report one call even though every later
+    serial verifier position also traversed the same row-paged head.
+    """
+    head = getattr(target, "_lm_head_w", None)
+    snapshot = getattr(head, "telemetry_snapshot", None)
+    if not callable(snapshot):
+        return {}
+    return {key: int(value) for key, value in snapshot().items()}
+
+
+def _reranked_head_telemetry_delta(
+    before: Mapping[str, int], after: Mapping[str, int],
+) -> dict[str, int]:
+    return {
+        key: max(0, int(value) - int(before.get(key, 0)))
+        for key, value in after.items()
+    }
+
+
+def _accumulate_reranked_head_telemetry(
+    totals: dict[str, int], before: Mapping[str, int],
+    after: Mapping[str, int],
+) -> None:
+    for key, value in _reranked_head_telemetry_delta(before, after).items():
+        totals[key] = totals.get(key, 0) + value
+
+
+def _publish_reranked_head_telemetry(
+    path_stats: dict, prefix: str, values: Mapping[str, int],
+) -> None:
+    if not values:
+        return
+    for key, value in values.items():
+        path_stats[f"{prefix}{key}"] = int(value)
+    probes = int(values.get("candidate_recall_probes", 0))
+    hits = int(values.get("candidate_recall_hits", 0))
+    path_stats[f"{prefix}candidate_recall"] = (
+        hits / probes if probes else None)
+
+
+def _authoritative_target_logits(
+    target, logits: mx.array, constraint, position: int,
+) -> mx.array:
+    """Apply a sequential constraint before sparse-head candidate selection.
+
+    A verifier window projects every row up front, but grammar state advances
+    only after each preceding proposal is accepted or corrected.  Therefore a
+    constrained row must be reranked lazily from its matching hidden position;
+    masking the already-shortlisted unrestricted row can leave no legal token.
+    Plain/fake targets retain the historical post-projection mask fallback.
+    """
+    if constraint is None:
+        return logits
+    constraint_logits = getattr(target, "_constraint_logits", None)
+    hidden_window = getattr(target, "_h_window", None)
+    if callable(constraint_logits) and hidden_window is not None:
+        width = int(hidden_window.shape[1])
+        selected = int(position)
+        if selected < 0:
+            selected += width
+        if not 0 <= selected < width:
+            raise RuntimeError(
+                f"authoritative target position {position} is outside "
+                f"hidden window width {width}")
+        hidden = hidden_window[:, selected:selected + 1, :]
+        return constraint_logits(logits, constraint, hidden=hidden)
+    if callable(constraint_logits):
+        from .quant import RerankedQHead
+
+        if isinstance(getattr(target, "_lm_head_w", None), RerankedQHead):
+            raise RuntimeError(
+                "constrained row-paged target decision lacks its matching "
+                "verifier hidden position")
+    return constraint.mask_logits(logits)
+
+
+@dataclass(frozen=True)
+class ProposalQPolicy:
+    """A sparse proposal distribution evaluated by the offline replay tool.
+
+    ``temperature`` reshapes the captured draft probabilities/logits on the
+    selected top-k support. ``rank`` ignores their magnitudes and assigns a
+    power-law mass by draft rank.  These policies affect q only; the exact
+    target verifier remains authoritative.
+    """
+
+    kind: str
+    top_k: int
+    temperature: float = 1.0
+    rank_power: float = 1.0
+
+    def __post_init__(self) -> None:
+        if self.kind not in {"flat", "temperature", "rank"}:
+            raise ValueError(f"unsupported proposal-q policy kind {self.kind!r}")
+        if isinstance(self.top_k, bool) or self.top_k <= 0:
+            raise ValueError("proposal-q top_k must be positive")
+        if not math.isfinite(self.temperature) or self.temperature <= 0:
+            raise ValueError("proposal-q temperature must be finite and positive")
+        if not math.isfinite(self.rank_power) or self.rank_power < 0:
+            raise ValueError("proposal-q rank_power must be finite and non-negative")
+
+    @property
+    def name(self) -> str:
+        if self.kind == "flat":
+            return f"flat-k{self.top_k}"
+        if self.kind == "temperature":
+            return f"temperature-k{self.top_k}-t{self.temperature:g}"
+        return f"rank-k{self.top_k}-p{self.rank_power:g}"
+
+    def as_dict(self) -> dict:
+        result = {"name": self.name, "kind": self.kind, "top_k": self.top_k}
+        if self.kind == "temperature":
+            result["temperature"] = self.temperature
+        elif self.kind == "rank":
+            result["rank_power"] = self.rank_power
+        return result
+
+
+@dataclass(frozen=True)
+class ProposalQReplayRow:
+    """Sparse target/draft evidence for one already-verified MTP round.
+
+    Target probability is needed only on q's support because q is zero
+    elsewhere and therefore ``min(p, q)`` contributes zero there.  Capturing
+    16 ranked draft tokens is sufficient to replay every default policy,
+    without serializing a 248k-wide vocabulary row.
+    """
+
+    draft_token_ids: tuple[int, ...]
+    draft_values: tuple[float, ...]
+    target_probabilities: tuple[float, ...]
+    score_kind: str = "probabilities"
+    weight: float = 1.0
+
+    def __post_init__(self) -> None:
+        length = len(self.draft_values)
+        if length == 0:
+            raise ValueError("proposal-q replay row has empty draft support")
+        if len(self.draft_token_ids) != length:
+            raise ValueError("draft_token_ids and draft values differ in length")
+        if len(self.target_probabilities) != length:
+            raise ValueError("target probabilities and draft values differ in length")
+        if len(set(self.draft_token_ids)) != length:
+            raise ValueError("proposal-q replay row contains duplicate token ids")
+        if self.score_kind not in {"probabilities", "logits"}:
+            raise ValueError("score_kind must be 'probabilities' or 'logits'")
+        if not math.isfinite(self.weight) or self.weight <= 0:
+            raise ValueError("proposal-q replay row weight must be finite and positive")
+        if not all(math.isfinite(value) for value in self.draft_values):
+            raise ValueError("proposal-q draft values must be finite")
+        if self.score_kind == "probabilities" and (
+            any(value < 0 for value in self.draft_values)
+            or sum(self.draft_values) <= 0
+        ):
+            raise ValueError("captured draft probabilities must contain positive mass")
+        if any(
+            not math.isfinite(value) or value < 0 or value > 1
+            for value in self.target_probabilities
+        ):
+            raise ValueError("target probabilities must be finite values in [0, 1]")
+        if sum(self.target_probabilities) > 1.0001:
+            raise ValueError("captured target support mass exceeds one")
+
+    @classmethod
+    def from_mapping(cls, value: Mapping) -> "ProposalQReplayRow":
+        has_probabilities = "draft_probabilities" in value
+        has_logits = "draft_logits" in value
+        if has_probabilities == has_logits:
+            raise ValueError(
+                "each proposal-q replay row needs exactly one of "
+                "draft_probabilities or draft_logits")
+        key = "draft_probabilities" if has_probabilities else "draft_logits"
+        draft_values = tuple(float(item) for item in value[key])
+        token_ids = tuple(int(item) for item in value.get(
+            "draft_token_ids", range(len(draft_values))))
+        return cls(
+            draft_token_ids=token_ids,
+            draft_values=draft_values,
+            target_probabilities=tuple(
+                float(item) for item in value["target_probabilities"]),
+            score_kind=("probabilities" if has_probabilities else "logits"),
+            weight=float(value.get("weight", 1.0)),
+        )
+
+
+def default_proposal_q_policies(
+    top_ks: Sequence[int] = (1, 2, 4, 8, 16),
+    temperatures: Sequence[float] = (0.5, 0.75, 1.0, 1.25, 1.5, 2.0),
+    rank_powers: Sequence[float] = (0.5, 1.0, 2.0),
+) -> tuple[ProposalQPolicy, ...]:
+    """Return the content-independent policy grid used by offline replay."""
+    policies: list[ProposalQPolicy] = []
+    for top_k in top_ks:
+        policies.append(ProposalQPolicy("flat", int(top_k)))
+        if int(top_k) == 1:
+            continue
+        policies.extend(
+            ProposalQPolicy("temperature", int(top_k), temperature=float(value))
+            for value in temperatures
+        )
+        policies.extend(
+            ProposalQPolicy("rank", int(top_k), rank_power=float(value))
+            for value in rank_powers
+        )
+    if not policies:
+        raise ValueError("proposal-q policy grid is empty")
+    return tuple(policies)
+
+
+def proposal_q_distribution(
+    row: ProposalQReplayRow, policy: ProposalQPolicy,
+) -> tuple[float, ...]:
+    """Return q aligned with ``row`` while touching only its sparse support."""
+    ranked = sorted(
+        range(len(row.draft_values)),
+        key=lambda index: (-row.draft_values[index], index),
+    )
+    selected = ranked[:min(policy.top_k, len(ranked))]
+    masses: list[float]
+    if policy.kind == "flat":
+        masses = [1.0] * len(selected)
+    elif policy.kind == "rank":
+        masses = [
+            1.0 / ((rank + 1) ** policy.rank_power)
+            for rank in range(len(selected))
+        ]
+    elif row.score_kind == "logits":
+        maximum = max(row.draft_values[index] for index in selected)
+        masses = [
+            math.exp((row.draft_values[index] - maximum) / policy.temperature)
+            for index in selected
+        ]
+    else:
+        exponent = 1.0 / policy.temperature
+        masses = [row.draft_values[index] ** exponent for index in selected]
+    total = sum(masses)
+    if not math.isfinite(total) or total <= 0:
+        masses = [1.0] * len(selected)
+        total = float(len(selected))
+    q = [0.0] * len(row.draft_values)
+    for index, mass in zip(selected, masses, strict=True):
+        q[index] = mass / total
+    return tuple(q)
+
+
+def proposal_q_overlap(
+    row: ProposalQReplayRow, policy: ProposalQPolicy,
+) -> float:
+    """Expected exact Leviathan acceptance ``sum_i min(p_i, q_i)``."""
+    q = proposal_q_distribution(row, policy)
+    return sum(min(p_value, q_value) for p_value, q_value in zip(
+        row.target_probabilities, q, strict=True))
+
+
+def evaluate_proposal_q(
+    rows: Iterable[ProposalQReplayRow],
+    policy: ProposalQPolicy,
+    *,
+    target_sweep_bytes: int = 0,
+    draft_sweep_bytes: int = 0,
+) -> dict:
+    """Evaluate overlap plus I/O projections for a one-draft exact verifier."""
+    rows = tuple(rows)
+    if not rows:
+        raise ValueError("proposal-q evaluation needs at least one replay row")
+    if isinstance(target_sweep_bytes, bool) or target_sweep_bytes < 0:
+        raise ValueError("target_sweep_bytes must be non-negative")
+    if isinstance(draft_sweep_bytes, bool) or draft_sweep_bytes < 0:
+        raise ValueError("draft_sweep_bytes must be non-negative")
+    total_weight = sum(row.weight for row in rows)
+    overlap = sum(
+        row.weight * proposal_q_overlap(row, policy) for row in rows
+    ) / total_weight
+    emitted_per_sweep = 1.0 + overlap
+    result = {
+        "policy": policy.as_dict(),
+        "rows": len(rows),
+        "total_weight": total_weight,
+        "expected_acceptance": overlap,
+        "expected_emitted_tokens_per_target_sweep": emitted_per_sweep,
+        "projected_target_sweeps_per_1000_output_tokens": (
+            1000.0 / emitted_per_sweep),
+        "projected_target_sweep_savings_fraction": (
+            1.0 - 1.0 / emitted_per_sweep),
+    }
+    if target_sweep_bytes or draft_sweep_bytes:
+        round_bytes = int(target_sweep_bytes) + int(draft_sweep_bytes)
+        bytes_per_output = round_bytes / emitted_per_sweep
+        result.update({
+            "target_sweep_bytes": int(target_sweep_bytes),
+            "draft_sweep_bytes": int(draft_sweep_bytes),
+            "projected_bytes_per_target_sweep": round_bytes,
+            "projected_bytes_per_output_token": bytes_per_output,
+            "projected_total_bytes_per_1000_output_tokens": (
+                1000.0 * bytes_per_output),
+            "projected_byte_speedup_vs_plain_target": (
+                int(target_sweep_bytes) / bytes_per_output
+                if target_sweep_bytes and bytes_per_output else 0.0),
+        })
+    return result
+
+
+def calibrate_proposal_q(
+    calibration_rows: Iterable[ProposalQReplayRow],
+    validation_rows: Iterable[ProposalQReplayRow],
+    *,
+    policies: Sequence[ProposalQPolicy] | None = None,
+    target_sweep_bytes: int = 0,
+    draft_sweep_bytes: int = 0,
+) -> dict:
+    """Select q on calibration rows and report validation without leakage."""
+    calibration_rows = tuple(calibration_rows)
+    validation_rows = tuple(validation_rows)
+    if not calibration_rows or not validation_rows:
+        raise ValueError(
+            "proposal-q calibration and validation sets must both be non-empty")
+    policies = tuple(policies or default_proposal_q_policies())
+    if not policies:
+        raise ValueError("proposal-q calibration policy grid is empty")
+    candidates = []
+    selected_index = 0
+    selected_overlap = -1.0
+    for index, policy in enumerate(policies):
+        calibration = evaluate_proposal_q(
+            calibration_rows,
+            policy,
+            target_sweep_bytes=target_sweep_bytes,
+            draft_sweep_bytes=draft_sweep_bytes,
+        )
+        validation = evaluate_proposal_q(
+            validation_rows,
+            policy,
+            target_sweep_bytes=target_sweep_bytes,
+            draft_sweep_bytes=draft_sweep_bytes,
+        )
+        candidates.append({
+            "policy": policy.as_dict(),
+            "calibration": calibration,
+            "validation": validation,
+        })
+        candidate_overlap = calibration["expected_acceptance"]
+        # Strict greater-than preserves policy-grid order on ties and never
+        # consults validation evidence to make the selection.
+        if candidate_overlap > selected_overlap:
+            selected_index = index
+            selected_overlap = candidate_overlap
+    selected = candidates[selected_index]
+    flat_k4 = next(
+        (candidate for candidate in candidates
+         if candidate["policy"]["name"] == "flat-k4"),
+        None,
+    )
+    result = {
+        "schema_version": 1,
+        "selection_split": "calibration",
+        "validation_used_for_selection": False,
+        "exact_target_distribution": True,
+        "selected": selected,
+        "candidates": candidates,
+    }
+    if flat_k4 is not None:
+        result["flat_k4_baseline"] = flat_k4
+        result["selected_validation_overlap_gain_vs_flat_k4"] = (
+            selected["validation"]["expected_acceptance"]
+            - flat_k4["validation"]["expected_acceptance"])
+    return result
+
+
+def proposal_q_replay_record(
+    draft_probabilities: mx.array,
+    target_probabilities: mx.array,
+    max_rank: int = 16,
+    **metadata,
+) -> dict:
+    """Serialize only the ranked support needed by offline q calibration."""
+    if isinstance(max_rank, bool) or max_rank <= 0:
+        raise ValueError("proposal-q replay max_rank must be positive")
+    draft = draft_probabilities.reshape(-1)
+    target = target_probabilities.reshape(-1)
+    if draft.shape != target.shape:
+        raise ValueError(
+            "proposal-q replay target/draft vocabulary mismatch: "
+            f"target={target.shape}, draft={draft.shape}")
+    ranked = mx.argsort(draft)[::-1][:min(max_rank, int(draft.size))]
+    selected_draft = draft[ranked]
+    selected_target = target[ranked]
+    mx.eval(ranked, selected_draft, selected_target)
+    record = {
+        "draft_token_ids": [int(value) for value in ranked.tolist()],
+        "draft_probabilities": [
+            float(value) for value in selected_draft.tolist()],
+        "target_probabilities": [
+            float(value) for value in selected_target.tolist()],
+    }
+    record.update(metadata)
+    # Validate the emitted schema immediately; a malformed capture is worse
+    # than no capture because it can silently pick a bad q policy offline.
+    ProposalQReplayRow.from_mapping(record)
+    return record
 
 
 def _adaptive_mtp_should_disable(
@@ -131,18 +536,20 @@ def _verify_stochastic_mtp_token(
     return False, replacement, target_probabilities
 
 
-def _flat_top_k_draft_probabilities(
+def _filtered_draft_probabilities(
     draft_logits: mx.array,
     sampling: SamplingParams,
     history: list[int],
-    top_k: int,
     constraint=None,
 ) -> mx.array:
-    """Build q, tolerating disjoint sparse-head and grammar support.
+    """Filter draft logits, tolerating disjoint head/grammar support.
 
-    q may propose outside the target constraint without changing the target
-    distribution: such proposals have p=0 and speculative rejection samples
-    the normalized positive part of p-q.
+    A sparse released head can have no finite value inside the current grammar
+    support.  Falling back to its unconstrained ranking is still exact: any
+    illegal proposal has target probability zero and is rejected by the
+    authoritative verifier.  This helper is shared by serving q and optional
+    offline replay capture so calibration sees the distribution that actually
+    supplied the ranks.
     """
     # final_logits preserves the leading singleton batch dimension, whereas
     # the serial target verifier returns a rank-1 row. Normalize both the
@@ -155,6 +562,26 @@ def _flat_top_k_draft_probabilities(
     calibrated = filtered_probabilities(
         authoritative, sampling, history=history)
 
+    calibrated_mass = mx.sum(calibrated)
+    mx.eval(calibrated_mass)
+    calibrated_mass_value = float(calibrated_mass.item())
+    if (
+        (not math.isfinite(calibrated_mass_value)
+         or calibrated_mass_value <= 0)
+        and constraint is not None
+    ):
+        calibrated = filtered_probabilities(
+            values, sampling, history=history)
+    return calibrated.reshape(-1)
+
+
+def _flat_top_k_probabilities(
+    calibrated: mx.array,
+    top_k: int,
+) -> mx.array:
+    """Flatten q over the positive top-k ranks of a draft distribution."""
+    calibrated = calibrated.reshape(-1)
+
     def flattened(probabilities: mx.array) -> tuple[mx.array, mx.array]:
         selected_k = min(top_k, int(probabilities.size))
         ranked = mx.argsort(probabilities)[::-1]
@@ -166,16 +593,6 @@ def _flat_top_k_draft_probabilities(
     support_mass = mx.sum(positive)
     mx.eval(support_mass)
     support_mass_value = float(support_mass.item())
-    if (
-        (not math.isfinite(support_mass_value) or support_mass_value <= 0)
-        and constraint is not None
-    ):
-        calibrated = filtered_probabilities(
-            values, sampling, history=history)
-        support, positive = flattened(calibrated)
-        support_mass = mx.sum(positive)
-        mx.eval(support_mass)
-        support_mass_value = float(support_mass.item())
     if not math.isfinite(support_mass_value) or support_mass_value <= 0:
         # A numerically empty draft is still not a serving failure. Uniform q
         # is valid for Leviathan verification and will almost certainly be
@@ -196,7 +613,56 @@ def _flat_top_k_draft_probabilities(
     )
 
 
+def _proposal_q_probabilities(
+    calibrated: mx.array, policy: ProposalQPolicy,
+) -> mx.array:
+    """Apply a typed serving q policy to already-filtered draft mass."""
+    if policy.kind == "flat":
+        return _flat_top_k_probabilities(calibrated, policy.top_k)
+    calibrated = calibrated.reshape(-1).astype(mx.float32)
+    support_size = min(policy.top_k, int(calibrated.size))
+    support = mx.argsort(calibrated)[::-1][:support_size]
+    if policy.kind == "temperature":
+        selected = calibrated[support]
+        masses = mx.power(
+            mx.maximum(selected, mx.array(0.0, dtype=mx.float32)),
+            1.0 / policy.temperature,
+        )
+    else:
+        masses = mx.array([
+            1.0 / ((rank + 1) ** policy.rank_power)
+            for rank in range(support_size)
+        ], dtype=mx.float32)
+    total = mx.sum(masses)
+    mx.eval(total)
+    total_value = float(total.item())
+    if not math.isfinite(total_value) or total_value <= 0:
+        masses = mx.ones((support_size,), dtype=mx.float32)
+        total = mx.array(float(support_size), dtype=mx.float32)
+    return mx.put_along_axis(
+        mx.zeros(calibrated.shape, dtype=mx.float32),
+        support,
+        masses / total,
+        axis=0,
+    )
+
+
+def _flat_top_k_draft_probabilities(
+    draft_logits: mx.array,
+    sampling: SamplingParams,
+    history: list[int],
+    top_k: int,
+    constraint=None,
+) -> mx.array:
+    """Build a flat top-k q for exact Leviathan verification."""
+    calibrated = _filtered_draft_probabilities(
+        draft_logits, sampling, history, constraint)
+    return _flat_top_k_probabilities(calibrated, top_k)
+
+
 class QwenMTPDrafter:
+    _RELEASED_BF16_CACHE_KEY = "qwen35_mtp:released-bf16"
+
     def __init__(self, engine):
         self.engine = engine
         names = engine.store.names_with_prefix("mtp.")
@@ -211,8 +677,75 @@ class QwenMTPDrafter:
         # checkpoints' safetensors indices, not inferred.
         self._page_names = [n for n in names if ".mlp.experts." not in n]
 
-    def _weights(self) -> dict:
-        return self.engine.cache.get("qwen35_mtp", self._page_names)
+    def _weights(self, *, released_bf16: bool = False) -> dict:
+        # Representation is part of the cache identity.  MTPLX replaces the
+        # all-MXFP4 artifact's original draft block with an explicitly indexed
+        # released-BF16 sidecar; it must neither hit an earlier transformed
+        # page nor be admitted under the generic key for later transformed
+        # callers.  WeightStore independently makes the sidecar authoritative
+        # over stale raw-fast-tier entries with the same logical names.
+        key = (
+            self._RELEASED_BF16_CACHE_KEY
+            if released_bf16 else "qwen35_mtp")
+        return self.engine.cache.get(
+            key,
+            self._page_names,
+            apply_transform=not released_bf16,
+        )
+
+    def prepare_request_weights(self) -> dict | None:
+        """Load an explicit BF16 MTP sidecar for one speculative round.
+
+        WeightCache pinning is permanent and has no symmetric unpin.  A local
+        strong reference keeps the dense MTP block resident only while every
+        proposal depth in that round is evaluated.  The serving adapter drops
+        it before target verification, whose transient reserve otherwise has
+        to overlap the whole BF16 sidecar.  Raw BF16 checkpoints and ordinary
+        all-quantized artifacts deliberately stay on the existing demand path.
+        """
+        if not getattr(self.engine.store, "mtplx_mtp_sidecar", None):
+            return None
+        weights = self._weights(released_bf16=True)
+        try:
+            non_bf16 = [
+                f"{name}:{getattr(value, 'dtype', type(value).__name__)}"
+                for name, value in weights.items()
+                if not isinstance(value, mx.array) or value.dtype != mx.bfloat16
+            ]
+            if non_bf16:
+                raise ValueError(
+                    "MTPLX request weights must be plain released BF16 arrays, "
+                    f"found {non_bf16[:3]}")
+            mx.eval(*weights.values())
+            return weights
+        except BaseException:
+            # A malformed/cancelled load must not strand the large sidecar in
+            # the representation cache before the adapter owns the mapping.
+            self.release_request_weights(weights)
+            raise
+
+    def release_request_weights(self, weights: dict) -> dict:
+        """Drop a round-local BF16 sidecar before target verification.
+
+        Clear the caller-owned mapping before discarding the cache page so no
+        Python strong reference defeats the explicit MLX/file-mapping lifetime
+        boundary.  ``discard`` also clears device cache, but the explicit
+        ``mx.clear_cache`` is retained as a final barrier even if the page was
+        already pressure-evicted.
+        """
+        resident_bytes = sum(
+            int(getattr(value, "nbytes", 0)) for value in weights.values())
+        weights.clear()
+        discarded = False
+        try:
+            discarded = self.engine.cache.discard(
+                self._RELEASED_BF16_CACHE_KEY, self._page_names)
+        finally:
+            mx.clear_cache()
+        return {
+            "resident_bytes": resident_bytes,
+            "cache_discarded": int(discarded),
+        }
 
     def _get_experts(self, layer: int, expert_ids: list[int],
                       positions: dict[int, list[int]] | None = None) -> dict[int, dict]:
@@ -230,24 +763,27 @@ class QwenMTPDrafter:
         pages = self.engine.cache.get_many(items)
         return {e: pages[f"mtp_expert.{e}"] for e in expert_ids}
 
-    def draft_logits(
+    def draft_step(
         self, h_last: mx.array, last_token: int, mtp_kv, offset: int,
-    ) -> mx.array:
+        weights: dict | None = None,
+    ) -> tuple[mx.array, mx.array]:
         """h_last: (1, 1, hidden) trunk hidden (pre final-norm) at position
         offset-1 (i.e. the state that produced last_token). Returns the full
-        draft-logit vector for position offset+1. `offset` is the ABSOLUTE
+        draft-logit vector and the post-MTP hidden state.  The latter is the
+        released recurrent input to the same physical layer at draft depth 2.
+        `offset` is the ABSOLUTE
         sequence position of last_token (matching the trunk's own kv.offset
         convention, not a decode-session-local counter) -- RoPE inside this
         MTP layer must see real positions or acceptance rate silently
         degrades (never correctness: every draft is exactly re-verified
         against the trunk regardless of how it was positioned). mtp_kv
-        accumulates the MTP block's own (ordinary, non-recurrent) KV --
-        it is plain attention, so it never needs rollback: an unaccepted
-        draft's MTP-KV entry is harmless history for future drafts, not a
-        source of wrong output the way trunk kda_cache pollution would be."""
+        accumulates the MTP block's own ordinary attention KV.  The serving
+        adapter trims this cache to the accepted input prefix after every
+        recurrent proposal chain; keeping a rejected depth-2 input would not
+        change target correctness, but would silently degrade later q."""
         eng = self.engine
         cfg = eng.cfg
-        w = self._weights()
+        w = weights if weights is not None else self._weights()
         e = eng._embed([last_token])  # (1, 1, hidden), row-paged when enabled
         e = qwen35_rms_norm(e, w["mtp.pre_fc_norm_embedding.weight"], cfg.rms_norm_eps)
         hn = qwen35_rms_norm(h_last, w["mtp.pre_fc_norm_hidden.weight"], cfg.rms_norm_eps)
@@ -269,21 +805,45 @@ class QwenMTPDrafter:
         else:
             x = residual + _moe(
                 h, w, "mtp.layers.0", cfg, 0, self._get_experts)
-        logits = final_logits(
-            x, w["mtp.norm.weight"], eng._lm_head_weight(), cfg.rms_norm_eps)
-        mx.eval(logits)
-        return logits[-1]
+        shared_head = eng._lm_head_weight()
+        # The same physical output head serves both target verification and
+        # MTP proposals. Promotion evidence is target-only: mark this one
+        # proposal projection so the ranks-only capture cannot count draft
+        # hidden states toward its 1,000-position gate.
+        with quant.reranked_lm_head_capture_scope(shared_head, "mtp-draft"):
+            logits = final_logits(
+                x, w["mtp.norm.weight"], shared_head, cfg.rms_norm_eps)
+        mx.eval(logits, x)
+        # qwen35.final_logits already removes batch/sequence axes and returns
+        # one rank-1 vocabulary row. Indexing it again selected only the final
+        # vocabulary scalar, degenerating q to a one-token distribution (and
+        # making depth-2 fail its exact vocabulary-shape check). Preserve the
+        # complete released MTP head row for both draft depths.
+        if logits.ndim != 1 or int(logits.shape[0]) != int(cfg.vocab_size):
+            raise ValueError(
+                "Qwen MTP head must return one complete vocabulary row, "
+                f"got shape {tuple(logits.shape)} for vocab {cfg.vocab_size}")
+        return logits, x
+
+    def draft_logits(
+        self, h_last: mx.array, last_token: int, mtp_kv, offset: int,
+        weights: dict | None = None,
+    ) -> mx.array:
+        logits, _hidden = self.draft_step(
+            h_last, last_token, mtp_kv, offset, weights)
+        return logits
 
     def draft_token(
         self, h_last: mx.array, last_token: int, mtp_kv, offset: int,
+        weights: dict | None = None,
     ) -> int:
         return int(mx.argmax(self.draft_logits(
-            h_last, last_token, mtp_kv, offset)))
+            h_last, last_token, mtp_kv, offset, weights)))
 
 
 class QwenMTPSpeculativeEngine:
     """Serving adapter, mirroring SpeculativeEngine's shape: falls back to
-    the plain target engine for any request shape the (target-exact, k=1)
+    the plain target engine for any request shape the target-exact native-MTP
     verified-draft scheme doesn't cover. Attribute access delegates to the
     target so protocol rendering/telemetry see the real checkpoint,
     tokenizer, config, and execution profile."""
@@ -293,6 +853,9 @@ class QwenMTPSpeculativeEngine:
         min_output_tokens: int = 32, adaptive_stop: bool = True,
         adaptive_probe_rounds: int = 3, plain_warmup_tokens: int = 3,
         stochastic_draft_top_k: int = 4,
+        proposal_replay_top_k: int = 0,
+        depth: int = 1,
+        proposal_q_policy: ProposalQPolicy | None = None,
     ):
         if max_prompt_tokens <= 0:
             raise ValueError("max_prompt_tokens must be positive")
@@ -304,6 +867,10 @@ class QwenMTPSpeculativeEngine:
             raise ValueError("plain_warmup_tokens must be non-negative")
         if stochastic_draft_top_k <= 0:
             raise ValueError("stochastic_draft_top_k must be positive")
+        if isinstance(proposal_replay_top_k, bool) or proposal_replay_top_k < 0:
+            raise ValueError("proposal_replay_top_k must be non-negative")
+        if isinstance(depth, bool) or depth not in (1, 2):
+            raise ValueError("Qwen MTP depth must be 1 or 2")
         self.target = target
         self.drafter = QwenMTPDrafter(target)
         self.max_prompt_tokens = max_prompt_tokens
@@ -311,7 +878,24 @@ class QwenMTPSpeculativeEngine:
         self.adaptive_stop = bool(adaptive_stop)
         self.adaptive_probe_rounds = int(adaptive_probe_rounds)
         self.plain_warmup_tokens = int(plain_warmup_tokens)
-        self.stochastic_draft_top_k = int(stochastic_draft_top_k)
+        self.proposal_q_policy = (
+            proposal_q_policy
+            if proposal_q_policy is not None
+            else ProposalQPolicy("flat", int(stochastic_draft_top_k))
+        )
+        if not isinstance(self.proposal_q_policy, ProposalQPolicy):
+            raise TypeError("proposal_q_policy must be ProposalQPolicy")
+        self.stochastic_draft_top_k = self.proposal_q_policy.top_k
+        self.proposal_replay_top_k = int(proposal_replay_top_k)
+        self.depth = int(depth)
+        self.mtp_engine_identity = (
+            f"qwen-mtp-depth{self.depth}-{self.proposal_q_policy.name}"
+        )
+        if self.depth == 2 and not callable(getattr(
+            target, "forward_tokens_serial_positions", None
+        )):
+            raise ValueError(
+                "Qwen MTP depth 2 requires serial-position target verification")
         if (
             getattr(target.cfg, "num_experts", 0)
             and not callable(getattr(
@@ -384,6 +968,8 @@ class QwenMTPSpeculativeEngine:
 
         request_t0 = time.perf_counter()
         request_cache_before = _cache_io_snapshot(tgt)
+        request_rerank_before = _reranked_head_telemetry_snapshot(tgt)
+        draft_rerank_totals: dict[str, int] = {}
         eos = set(tgt.cfg.eos_token_ids)
         stop = stop or []
         bootstrap_generate = getattr(
@@ -420,7 +1006,14 @@ class QwenMTPSpeculativeEngine:
         decode_cache_before = _cache_io_snapshot(tgt)
         mtp_kv = KVCache(1)
         proposed = 0
+        verified_proposals = 0
         accepted = 0
+        speculative_rounds = 0
+        full_accept_rounds = 0
+        partial_accept_rounds = 0
+        rejected_rounds = 0
+        accepted_by_step = [0] * self.depth
+        verified_by_step = [0] * self.depth
         target_decode_sweeps = 0
         plain_decode_sweeps = 0
         warmup_decode_sweeps = 0
@@ -433,7 +1026,30 @@ class QwenMTPSpeculativeEngine:
         grammar_forced_tokens = 0
         grammar_forced_sweeps = 0
         stochastic_expected_acceptance_sum = 0.0
+        stochastic_first_step_expected_acceptance_sum = 0.0
+        stochastic_expected_acceptance_by_step = [0.0] * self.depth
+        mtp_kv_rollbacks = 0
+        target_prefix_rollbacks = 0
         round_outcomes: list[str] = []
+        proposal_replay_records: list[dict] = []
+        sidecar_round_loads = 0
+        sidecar_round_releases = 0
+        sidecar_read_bytes = 0
+        sidecar_loaded_resident_bytes = 0
+        sidecar_released_resident_bytes = 0
+        sidecar_peak_resident_bytes = 0
+        sidecar_cache_discards = 0
+        sidecar_load_s = 0.0
+        sidecar_release_s = 0.0
+        draft_round_s = 0.0
+        verifier_round_s = 0.0
+        verifier_input_positions = 0
+        verifier_committed_positions = 0
+        verifier_rolled_back_positions = 0
+        verifier_output_tokens = 0
+        verifier_accepted_draft_tokens = 0
+        verifier_correction_tokens = 0
+        verifier_bonus_tokens = 0
 
         # Invariant (matching speculative.py's documented one): all_tokens =
         # prompt + emitted; catchup_tok = all_tokens[-1] is sampled but not
@@ -492,13 +1108,35 @@ class QwenMTPSpeculativeEngine:
                 if delta:
                     on_token(delta)
 
+        def _candidate_terminal(candidate_tokens: list[int]) -> bool:
+            if not candidate_tokens:
+                return False
+            if candidate_tokens[-1] in eos:
+                return True
+            if len(emitted) + len(candidate_tokens) >= max_tokens:
+                return True
+            if grammar_completed:
+                return True
+            if stop:
+                return _stop_match(
+                    tgt.tokenizer.decode(emitted + candidate_tokens)
+                ) is not None
+            return False
+
         decode_t0 = time.perf_counter()
         while (len(emitted) < max_tokens and catchup_tok not in eos
                and not grammar_completed
                and stop_text is None):
-            accepted_round = False
-            retained_midpoint = None
-            retained_midpoint_lengths = None
+            speculative_round = False
+            round_rejected = False
+            round_verify_width = 0
+            round_start_offset = None
+            round_start_layer_lengths = None
+            round_layer_growth = None
+            round_capture_endpoint = False
+            round_serial_verify = False
+            round_mtp_start_lengths = None
+            round_bonus_candidate = False
             # Grammar-deterministic spans need target state updates, but no
             # target decisions.  Preserve StreamingEngine's jump-forward win
             # inside MTP by folding catchup + the whole forced run into one
@@ -566,8 +1204,8 @@ class QwenMTPSpeculativeEngine:
                     ]
                     next_catchup_tok = committed_forced[-1]
                 else:
-                    authoritative_logits = constraint.mask_logits(
-                        forced_logits[-1])
+                    authoritative_logits = _authoritative_target_logits(
+                        tgt, forced_logits[-1], constraint, -1)
                     next_free = sample(
                         authoritative_logits,
                         sampling,
@@ -589,10 +1227,8 @@ class QwenMTPSpeculativeEngine:
                     warmup_remaining -= 1
                     warmup_decode_sweeps += 1
                 mx.eval(plain_logits)
-                authoritative_logits = (
-                    constraint.mask_logits(plain_logits[-1])
-                    if constraint is not None else plain_logits[-1]
-                )
+                authoritative_logits = _authoritative_target_logits(
+                    tgt, plain_logits[-1], constraint, -1)
                 next_plain = sample(
                     authoritative_logits, sampling, history=all_tokens)
                 if constraint is not None:
@@ -603,181 +1239,304 @@ class QwenMTPSpeculativeEngine:
                 h_last = tgt._h_last
                 next_catchup_tok = new_tokens[0]
             else:
-                # Position of catchup_tok, matching kv.offset before this
-                # round's combined call feeds it.
+                speculative_round = True
+                speculative_rounds += 1
                 round_start_offset = kv.offset
                 layer_lengths_fn = getattr(kv, "layer_lengths", None)
                 round_start_layer_lengths = (
                     layer_lengths_fn() if callable(layer_lengths_fn) else None)
+                round_mtp_start_lengths = mtp_kv.layer_lengths()
                 # GLM's identical prefill-sync convention (glm_mtp.py:53-69,
                 # "entry i covers position i") confirms the MTP entry's RoPE
                 # position matches h_last's OWN position (round_start_offset-1,
                 # the state that produced catchup_tok) -- not catchup_tok's
                 # position. Only affects acceptance rate, never correctness.
-                draft_probabilities = None
-                if sampling.is_greedy:
-                    draft_tok = self.drafter.draft_token(
-                        h_last, catchup_tok, mtp_kv,
-                        round_start_offset - 1)
-                else:
-                    draft_logits = self.drafter.draft_logits(
-                        h_last, catchup_tok, mtp_kv,
-                        round_start_offset - 1)
-                    # A released MTP head can rank the right continuation but
-                    # be poorly calibrated as a sampler.  Flatten q over its
-                    # constrained top ranks instead of trusting raw
-                    # probabilities. Leviathan correction is exact for ANY q:
-                    # accept with min(1,p(d)/q(d)), otherwise sample
-                    # normalize((p-q)+). This preserves the target while
-                    # covering near-miss ranks that a delta proposal loses.
-                    draft_probabilities = _flat_top_k_draft_probabilities(
-                        draft_logits,
-                        sampling,
-                        all_tokens,
-                        self.stochastic_draft_top_k,
-                        constraint,
+                draft_tokens: list[int] = []
+                draft_probabilities: list[mx.array | None] = []
+                draft_rank_probabilities: list[mx.array | None] = []
+                draft_hidden = h_last
+                draft_input_token = catchup_tok
+                round_mtp_weights: dict | None = None
+                draft_rerank_before = _reranked_head_telemetry_snapshot(tgt)
+                draft_started = time.perf_counter()
+                try:
+                    prepare_request_weights = getattr(
+                        self.drafter, "prepare_request_weights", None)
+                    read_before = int(getattr(
+                        getattr(tgt.cache, "stats", None), "bytes_read", 0))
+                    sidecar_load_started = time.perf_counter()
+                    round_mtp_weights = (
+                        prepare_request_weights()
+                        if callable(prepare_request_weights) else None
                     )
-                    draft_tok = sample_probabilities(draft_probabilities)
-                proposed += 1
+                    if round_mtp_weights is not None:
+                        sidecar_load_s += (
+                            time.perf_counter() - sidecar_load_started)
+                    if round_mtp_weights is not None:
+                        resident_bytes = sum(
+                            int(value.nbytes)
+                            for value in round_mtp_weights.values()
+                        )
+                        sidecar_round_loads += 1
+                        sidecar_loaded_resident_bytes += resident_bytes
+                        sidecar_peak_resident_bytes = max(
+                            sidecar_peak_resident_bytes, resident_bytes)
+                        read_after = int(getattr(
+                            getattr(tgt.cache, "stats", None),
+                            "bytes_read", read_before))
+                        sidecar_read_bytes += max(0, read_after - read_before)
 
-                verify_tokens = [catchup_tok, draft_tok]
-                serial_verify = callable(getattr(
+                    for step in range(self.depth):
+                        if self.depth == 1:
+                            # Keep the established k=1 mock/API path unchanged.
+                            if sampling.is_greedy:
+                                draft_tok = self.drafter.draft_token(
+                                    draft_hidden, draft_input_token, mtp_kv,
+                                    round_start_offset - 1,
+                                    round_mtp_weights,
+                                )
+                                step_logits = None
+                            else:
+                                step_logits = self.drafter.draft_logits(
+                                    draft_hidden, draft_input_token, mtp_kv,
+                                    round_start_offset - 1,
+                                    round_mtp_weights,
+                                )
+                        else:
+                            draft_step = getattr(self.drafter, "draft_step", None)
+                            if not callable(draft_step):
+                                raise RuntimeError(
+                                    "Qwen MTP depth 2 drafter omits draft_step")
+                            step_logits, draft_hidden = draft_step(
+                                draft_hidden,
+                                draft_input_token,
+                                mtp_kv,
+                                round_start_offset - 1 + step,
+                                round_mtp_weights,
+                            )
+                            draft_tok = None
+
+                        step_rank_probabilities = None
+                        step_probabilities = None
+                        if sampling.is_greedy:
+                            if draft_tok is None:
+                                draft_tok = int(mx.argmax(step_logits))
+                        else:
+                            if step_logits is None:
+                                raise RuntimeError(
+                                    "stochastic Qwen MTP draft omitted logits")
+                            # q at depth 2 is generated before the target has
+                            # accepted d1 into a mutable grammar. Conditioning
+                            # q2 on the old grammar state would be wrong; leaving
+                            # q2 unconstrained is still distribution-exact because
+                            # the sequential target p2 below is authoritative.
+                            step_constraint = constraint if step == 0 else None
+                            step_rank_probabilities = (
+                                _filtered_draft_probabilities(
+                                    step_logits,
+                                    sampling,
+                                    all_tokens + draft_tokens,
+                                    step_constraint,
+                                )
+                            )
+                            step_probabilities = _proposal_q_probabilities(
+                                step_rank_probabilities,
+                                self.proposal_q_policy,
+                            )
+                            draft_tok = sample_probabilities(step_probabilities)
+
+                        draft_tokens.append(int(draft_tok))
+                        draft_probabilities.append(step_probabilities)
+                        draft_rank_probabilities.append(step_rank_probabilities)
+                        draft_input_token = int(draft_tok)
+                finally:
+                    # The target verifier's memory reserve must never overlap
+                    # the released-BF16 MTP sidecar. Clear the caller mapping,
+                    # then discard its representation-specific cache page.
+                    # Ordinary non-sidecar MTP returns None and keeps its
+                    # existing demand-cache behavior unchanged.
+                    if round_mtp_weights is not None:
+                        weights_to_release = round_mtp_weights
+                        round_mtp_weights = None
+                        release_request_weights = getattr(
+                            self.drafter, "release_request_weights", None)
+                        if not callable(release_request_weights):
+                            weights_to_release.clear()
+                            mx.clear_cache()
+                            raise RuntimeError(
+                                "BF16 MTP sidecar drafter omits round release")
+                        sidecar_release_started = time.perf_counter()
+                        release_info = release_request_weights(
+                            weights_to_release) or {}
+                        sidecar_release_s += (
+                            time.perf_counter() - sidecar_release_started)
+                        sidecar_round_releases += 1
+                        sidecar_released_resident_bytes += int(
+                            release_info.get("resident_bytes", 0))
+                        sidecar_cache_discards += int(
+                            release_info.get("cache_discarded", 0))
+                    draft_round_s += time.perf_counter() - draft_started
+                _accumulate_reranked_head_telemetry(
+                    draft_rerank_totals,
+                    draft_rerank_before,
+                    _reranked_head_telemetry_snapshot(tgt),
+                )
+
+                proposed += len(draft_tokens)
+                verify_tokens = [catchup_tok] + draft_tokens
+                round_verify_width = len(verify_tokens)
+                round_serial_verify = callable(getattr(
                     tgt, "forward_tokens_serial_positions", None))
-                capture_endpoint = bool(
-                    serial_verify
+                round_capture_endpoint = bool(
+                    round_serial_verify
                     and getattr(kv, "kda_cache", None) is not None
                 )
-                if serial_verify:
+                if round_serial_verify:
+                    verifier_started = time.perf_counter()
                     spec_logits = tgt.forward_tokens_serial_positions(
                         verify_tokens,
                         kv,
-                        capture_kda_endpoints=capture_endpoint,
+                        capture_kda_endpoints=round_capture_endpoint,
                     )
                     serial_verify_rounds += 1
                 else:
                     # Compatibility fallback for old dense adapters. MoE
                     # construction fails closed above when the exact verifier
                     # is unavailable.
+                    verifier_started = time.perf_counter()
                     spec_logits = tgt.forward_tokens(verify_tokens, kv)
                 target_decode_sweeps += 1
-                authoritative_logits = (
-                    constraint.mask_logits(spec_logits[0])
-                    if constraint is not None else spec_logits[0]
-                )
-                if sampling.is_greedy:
-                    draft_accepted = (
-                        int(mx.argmax(authoritative_logits)) == draft_tok)
-                    true_tok = (
-                        draft_tok if draft_accepted
-                        else int(mx.argmax(authoritative_logits))
-                    )
-                else:
-                    if draft_probabilities is None:
-                        raise RuntimeError(
-                            "stochastic Qwen MTP proposal omitted q distribution")
-                    draft_accepted, true_tok, _target_probabilities = (
-                        _verify_stochastic_mtp_token(
-                            draft_tok,
-                            draft_probabilities,
-                            authoritative_logits,
-                            sampling,
-                            all_tokens,
-                        )
-                    )
-                    overlap = mx.sum(mx.minimum(
-                        _target_probabilities, draft_probabilities))
-                    mx.eval(overlap)
-                    stochastic_expected_acceptance_sum += float(
-                        overlap.item())
-                retained_midpoint = (
-                    tgt.consume_serial_kda_endpoint(1)
-                    if capture_endpoint else None
-                )
                 if round_start_layer_lengths is not None:
                     serial_end_layer_lengths = kv.layer_lengths()
-                    layer_growth = tuple(
+                    round_layer_growth = tuple(
                         end - start for start, end in zip(
                             round_start_layer_lengths,
                             serial_end_layer_lengths,
                             strict=True,
                         )
                     )
-                    if any(growth not in (0, 2) for growth in layer_growth):
+                    if any(
+                        growth not in (0, round_verify_width)
+                        for growth in round_layer_growth
+                    ):
                         raise RuntimeError(
                             "serial Qwen verifier changed an attention layer "
                             "by an unexpected position count: "
-                            f"{layer_growth}")
-                    retained_midpoint_lengths = tuple(
-                        start + (1 if growth else 0)
-                        for start, growth in zip(
-                            round_start_layer_lengths, layer_growth, strict=True)
-                    )
-                if draft_accepted:
-                    # Accept: kv already reflects [..., catchup_tok, draft_tok]
-                    # from the single combined call above -- draft_tok is
-                    # committed, and spec_logits[1] is a genuinely free second
-                    # token from the SAME pass.
+                            f"{round_layer_growth}")
+
+                new_tokens = []
+                new_token_logits = []
+                accepted_prefix = 0
+                for step, draft_tok in enumerate(draft_tokens):
+                    authoritative_logits = _authoritative_target_logits(
+                        tgt, spec_logits[step], constraint, step)
+                    verified_proposals += 1
+                    verified_by_step[step] += 1
+                    if sampling.is_greedy:
+                        draft_accepted = (
+                            int(mx.argmax(authoritative_logits)) == draft_tok)
+                        true_tok = (
+                            draft_tok if draft_accepted
+                            else int(mx.argmax(authoritative_logits))
+                        )
+                    else:
+                        step_probabilities = draft_probabilities[step]
+                        if step_probabilities is None:
+                            raise RuntimeError(
+                                "stochastic Qwen MTP proposal omitted q")
+                        draft_accepted, true_tok, target_probabilities = (
+                            _verify_stochastic_mtp_token(
+                                draft_tok,
+                                step_probabilities,
+                                authoritative_logits,
+                                sampling,
+                                all_tokens + new_tokens,
+                            )
+                        )
+                        overlap = mx.sum(mx.minimum(
+                            target_probabilities, step_probabilities))
+                        mx.eval(overlap)
+                        overlap_value = float(overlap.item())
+                        stochastic_expected_acceptance_sum += overlap_value
+                        stochastic_expected_acceptance_by_step[step] += (
+                            overlap_value)
+                        if step == 0:
+                            stochastic_first_step_expected_acceptance_sum += (
+                                overlap_value)
+                        if self.proposal_replay_top_k:
+                            step_rank_probabilities = (
+                                draft_rank_probabilities[step])
+                            if step_rank_probabilities is None:
+                                raise RuntimeError(
+                                    "proposal-q replay omitted draft ranks")
+                            proposal_replay_records.append(
+                                proposal_q_replay_record(
+                                    step_rank_probabilities,
+                                    target_probabilities,
+                                    max_rank=self.proposal_replay_top_k,
+                                    proposal=int(draft_tok),
+                                    accepted=bool(draft_accepted),
+                                    history_length=(
+                                        len(all_tokens) + len(new_tokens)),
+                                    round_index=speculative_rounds - 1,
+                                    draft_step_index=step,
+                                )
+                            )
+
+                    if not draft_accepted:
+                        round_rejected = True
+                        rejected_rounds += 1
+                        if accepted_prefix:
+                            partial_accept_rounds += 1
+                        if constraint is not None:
+                            constraint.accept_token(true_tok)
+                            grammar_completed = bool(constraint.completed)
+                        new_tokens.append(int(true_tok))
+                        new_token_logits.append(authoritative_logits)
+                        break
+
                     accepted += 1
-                    round_outcomes.append("A")
-                    accepted_round = True
+                    accepted_prefix += 1
+                    accepted_by_step[step] += 1
                     if constraint is not None:
                         constraint.accept_token(draft_tok)
                         grammar_completed = bool(constraint.completed)
-                    if grammar_completed:
-                        new_tokens = [draft_tok]
-                        new_token_logits = [authoritative_logits]
-                        next_catchup_tok = draft_tok
-                    else:
-                        bonus_logits = (
-                            constraint.mask_logits(spec_logits[1])
-                            if constraint is not None else spec_logits[1]
-                        )
-                        bonus_tok = sample(
-                            bonus_logits,
-                            sampling,
-                            history=all_tokens + [draft_tok],
-                        )
-                        if constraint is not None:
-                            constraint.accept_token(bonus_tok)
-                            grammar_completed = bool(constraint.completed)
-                        new_tokens = [draft_tok, bonus_tok]
-                        new_token_logits = [authoritative_logits, bonus_logits]
-                        next_catchup_tok = bonus_tok
-                    h_last = tgt._h_last
+                    new_tokens.append(int(draft_tok))
+                    new_token_logits.append(authoritative_logits)
+                    if _candidate_terminal(new_tokens):
+                        break
+
+                all_drafts_accepted = (
+                    accepted_prefix == self.depth and not round_rejected)
+                if all_drafts_accepted:
+                    full_accept_rounds += 1
+                if self.depth == 1:
+                    round_outcomes.append("A" if all_drafts_accepted else "R")
+                elif round_rejected:
+                    round_outcomes.append(
+                        "R" if accepted_prefix == 0 else f"A{accepted_prefix}R")
                 else:
-                    # Position-zero logits already sampled the authoritative
-                    # next token. Keep the exact midpoint instead of restoring
-                    # and refeeding through another complete streamed sweep.
-                    midpoint_hidden = tgt._h_window[:, :1, :]
-                    round_outcomes.append("R")
-                    if capture_endpoint:
-                        if retained_midpoint is None:
-                            raise RuntimeError(
-                                "serial Qwen verifier did not retain its KDA "
-                                "midpoint")
-                        kda_endpoint_restores += 1
-                    # Mixed-depth endpoint-packed prefill gives upper full-
-                    # attention layers a compact suffix whose local length is
-                    # much smaller than the cache's aggregate offset. A global
-                    # trim therefore leaves the rejected draft resident in
-                    # those layers. Restore each layer to its checkpoint-local
-                    # midpoint instead (KVCache explicitly exposes this exact
-                    # rollback primitive for mixed-depth speculation).
-                    if retained_midpoint_lengths is not None:
-                        kv.trim_layer_lengths(retained_midpoint_lengths)
-                    else:
-                        kv.trim(round_start_offset + 1)
-                    if capture_endpoint:
-                        kv.kda_cache = retained_midpoint
+                    round_outcomes.append(f"A{accepted_prefix}")
+
+                if all_drafts_accepted and not _candidate_terminal(new_tokens):
+                    bonus_logits = _authoritative_target_logits(
+                        tgt, spec_logits[self.depth], constraint, self.depth)
+                    bonus_tok = sample(
+                        bonus_logits,
+                        sampling,
+                        history=all_tokens + new_tokens,
+                    )
                     if constraint is not None:
-                        constraint.accept_token(true_tok)
+                        constraint.accept_token(bonus_tok)
                         grammar_completed = bool(constraint.completed)
-                    new_tokens = [true_tok]
-                    new_token_logits = [authoritative_logits]
-                    h_last = midpoint_hidden
-                    tgt._h_last = midpoint_hidden
-                    next_catchup_tok = true_tok
-                    refeed_sweeps_saved += int(serial_verify)
+                    new_tokens.append(int(bonus_tok))
+                    new_token_logits.append(bonus_logits)
+                    round_bonus_candidate = True
+                next_catchup_tok = new_tokens[-1]
+                h_last = tgt._h_last
+                if round_rejected:
+                    refeed_sweeps_saved += int(round_serial_verify)
+                verifier_round_s += time.perf_counter() - verifier_started
 
             emitted_before_round = len(emitted)
             for tok, token_logits in zip(
@@ -803,22 +1562,98 @@ class QwenMTPSpeculativeEngine:
                 or emitted[-1] in eos
                 or grammar_completed
                 or len(emitted) >= max_tokens)
-            if (
-                accepted_round
-                and terminal_round
-                and len(emitted) - emitted_before_round == 1
-                and retained_midpoint is not None
-            ):
-                # The accepted draft itself became terminal. It is the final
-                # returned (unfed) token, so recurrent state must end after the
-                # catchup position, not after that draft.
-                kv.kda_cache = retained_midpoint
-                if retained_midpoint_lengths is not None:
-                    kv.trim_layer_lengths(retained_midpoint_lengths)
-                else:
-                    kv.trim(round_start_offset + 1)
-                tgt._h_last = tgt._h_window[:, :1, :]
-                kda_endpoint_restores += 1
+            if speculative_round:
+                # The final returned token is always the next round's
+                # still-unfed catchup.  Therefore a round that returned N
+                # tokens commits exactly catchup + the first N-1 returned
+                # positions from the width-(depth+1) verifier.  This one rule
+                # covers reject-at-0/1, full acceptance, EOS/stop at either
+                # proposal, grammar completion, and a short remaining budget.
+                emitted_this_round = len(emitted) - emitted_before_round
+                verifier_input_positions += round_verify_width
+                verifier_output_tokens += emitted_this_round
+                verifier_accepted_draft_tokens += min(
+                    accepted_prefix, emitted_this_round)
+                verifier_correction_tokens += int(
+                    round_rejected and emitted_this_round > accepted_prefix)
+                verifier_bonus_tokens += int(
+                    round_bonus_candidate
+                    and emitted_this_round > accepted_prefix)
+                target_fed_positions = min(
+                    round_verify_width,
+                    1 + max(0, emitted_this_round - 1),
+                )
+                verifier_committed_positions += target_fed_positions
+                verifier_rolled_back_positions += max(
+                    0, round_verify_width - target_fed_positions)
+                if target_fed_positions < round_verify_width:
+                    retained_prefix = (
+                        tgt.consume_serial_kda_endpoint(target_fed_positions)
+                        if round_capture_endpoint else None
+                    )
+                    if round_capture_endpoint and retained_prefix is None:
+                        raise RuntimeError(
+                            "serial Qwen verifier did not retain KDA prefix "
+                            f"{target_fed_positions}/{round_verify_width}")
+                    if (
+                        round_start_layer_lengths is not None
+                        and round_layer_growth is not None
+                    ):
+                        retained_lengths = tuple(
+                            start + (
+                                target_fed_positions if growth else 0)
+                            for start, growth in zip(
+                                round_start_layer_lengths,
+                                round_layer_growth,
+                                strict=True,
+                            )
+                        )
+                        kv.trim_layer_lengths(retained_lengths)
+                    else:
+                        kv.trim(round_start_offset + target_fed_positions)
+                    if round_capture_endpoint:
+                        kv.kda_cache = retained_prefix
+                        kda_endpoint_restores += 1
+                    hidden_window = getattr(tgt, "_h_window", None)
+                    if hidden_window is not None:
+                        prefix_hidden = hidden_window[
+                            :, target_fed_positions - 1:target_fed_positions, :]
+                        tgt._h_last = prefix_hidden
+                        h_last = prefix_hidden
+                    elif not terminal_round:
+                        raise RuntimeError(
+                            "Qwen MTP target omitted verifier hidden window")
+                    target_prefix_rollbacks += 1
+                elif round_capture_endpoint:
+                    # Drop strict-prefix snapshots; the full endpoint already
+                    # lives in kv.kda_cache.
+                    tgt.consume_serial_kda_endpoint(None)
+
+                mtp_end_lengths = mtp_kv.layer_lengths()
+                mtp_growth = tuple(
+                    end - start for start, end in zip(
+                        round_mtp_start_lengths,
+                        mtp_end_lengths,
+                        strict=True,
+                    )
+                )
+                if any(growth not in (0, self.depth) for growth in mtp_growth):
+                    raise RuntimeError(
+                        "recurrent Qwen MTP chain changed its KV by an "
+                        f"unexpected count: {mtp_growth}")
+                committed_mtp_steps = min(self.depth, target_fed_positions)
+                if committed_mtp_steps < self.depth:
+                    mtp_lengths = tuple(
+                        start + (committed_mtp_steps if growth else 0)
+                        for start, growth in zip(
+                            round_mtp_start_lengths,
+                            mtp_growth,
+                            strict=True,
+                        )
+                    )
+                    if mtp_lengths != mtp_end_lengths:
+                        mtp_kv.trim_layer_lengths(mtp_lengths)
+                        mtp_kv_rollbacks += 1
             # An accepted pair may encounter EOS/stop on its first token, in
             # which case ``next_catchup_tok`` is the unused bonus token. Never
             # continue from that uncommitted value (the old behavior leaked
@@ -837,11 +1672,11 @@ class QwenMTPSpeculativeEngine:
             if not adaptive_disabled and self.adaptive_stop:
                 adaptive_disabled = (
                     _adaptive_mtp_should_disable(
-                        proposed, accepted, adaptive_probe_limit)
+                        speculative_rounds, accepted, adaptive_probe_limit)
                     if sampling.is_greedy else
                     _adaptive_stochastic_mtp_should_disable(
-                        proposed,
-                        stochastic_expected_acceptance_sum,
+                        speculative_rounds,
+                        stochastic_first_step_expected_acceptance_sum,
                         adaptive_probe_limit,
                     )
                 )
@@ -859,23 +1694,59 @@ class QwenMTPSpeculativeEngine:
             kv.trim(endpoint)
         total_s = time.perf_counter() - request_t0
         path_stats = bootstrap_stats
+        plain_equivalent_sweeps = max(0, len(emitted) - 1)
+        target_sweeps_avoided = max(
+            0, plain_equivalent_sweeps - target_decode_sweeps)
         path_stats.update({
             "qwen_mtp_enabled": 1,
             "qwen_mtp_used": int(proposed > 0),
             "qwen_mtp_target_sweeps": target_decode_sweeps,
+            "qwen_mtp_plain_equivalent_target_sweeps": (
+                plain_equivalent_sweeps),
+            "qwen_mtp_target_sweeps_avoided": target_sweeps_avoided,
+            "qwen_mtp_target_tokens_per_sweep": (
+                plain_equivalent_sweeps / target_decode_sweeps
+                if target_decode_sweeps else 0.0),
+            "qwen_mtp_depth": self.depth,
+            "qwen_mtp_verify_width": self.depth + 1,
+            "qwen_mtp_speculative_rounds": speculative_rounds,
             "qwen_mtp_proposed": proposed,
+            "qwen_mtp_verified_proposals": verified_proposals,
             "qwen_mtp_accepted": accepted,
+            "qwen_mtp_accepted_by_step": list(accepted_by_step),
+            "qwen_mtp_verified_by_step": list(verified_by_step),
+            "qwen_mtp_full_accept_rounds": full_accept_rounds,
+            "qwen_mtp_partial_accept_rounds": partial_accept_rounds,
+            "qwen_mtp_rejected_rounds": rejected_rounds,
             "qwen_mtp_accept_rate": (
                 accepted / proposed if proposed else 0.0),
             "qwen_mtp_decode_tokens": max(0, len(emitted) - 1),
             "qwen_mtp_adaptive_disabled": int(adaptive_disabled),
             "qwen_mtp_probe_rounds": min(
-                proposed, adaptive_probe_limit),
+                speculative_rounds, adaptive_probe_limit),
             "qwen_mtp_plain_decode_sweeps": plain_decode_sweeps,
             "qwen_mtp_warmup_decode_sweeps": warmup_decode_sweeps,
             "qwen_mtp_serial_verify_rounds": serial_verify_rounds,
+            "qwen_mtp_verifier_input_positions": verifier_input_positions,
+            "qwen_mtp_verifier_committed_positions": (
+                verifier_committed_positions),
+            "qwen_mtp_verifier_rolled_back_positions": (
+                verifier_rolled_back_positions),
+            "qwen_mtp_verifier_output_tokens": verifier_output_tokens,
+            "qwen_mtp_verifier_tokens_per_sweep": (
+                verifier_output_tokens / speculative_rounds
+                if speculative_rounds else 0.0),
+            "qwen_mtp_verifier_accepted_draft_tokens": (
+                verifier_accepted_draft_tokens),
+            "qwen_mtp_verifier_correction_tokens": (
+                verifier_correction_tokens),
+            "qwen_mtp_verifier_bonus_tokens": verifier_bonus_tokens,
+            "qwen_mtp_draft_round_s": draft_round_s,
+            "qwen_mtp_verifier_round_s": verifier_round_s,
             "qwen_mtp_kda_endpoint_restores": kda_endpoint_restores,
             "qwen_mtp_refeed_sweeps_saved": refeed_sweeps_saved,
+            "qwen_mtp_target_prefix_rollbacks": target_prefix_rollbacks,
+            "qwen_mtp_draft_kv_rollbacks": mtp_kv_rollbacks,
             "qwen_mtp_constraint_verified": int(constraint is not None),
             "qwen_mtp_stochastic": int(not sampling.is_greedy),
             "qwen_mtp_stochastic_draft_argmax": int(
@@ -884,16 +1755,69 @@ class QwenMTPSpeculativeEngine:
             "qwen_mtp_stochastic_draft_top_k": (
                 self.stochastic_draft_top_k
                 if not sampling.is_greedy else 0),
+            "qwen_mtp_q_policy": self.proposal_q_policy.as_dict(),
+            "qwen_mtp_engine_identity": self.mtp_engine_identity,
             "qwen_mtp_stochastic_expected_acceptance": (
-                stochastic_expected_acceptance_sum / proposed
-                if not sampling.is_greedy and proposed else 0.0),
+                stochastic_expected_acceptance_sum / verified_proposals
+                if not sampling.is_greedy and verified_proposals else 0.0),
+            "qwen_mtp_stochastic_expected_acceptance_by_step": [
+                (
+                    stochastic_expected_acceptance_by_step[index]
+                    / verified_by_step[index]
+                    if not sampling.is_greedy and verified_by_step[index]
+                    else 0.0
+                )
+                for index in range(self.depth)
+            ],
             "qwen_mtp_grammar_forced_tokens": grammar_forced_tokens,
             "qwen_mtp_grammar_forced_sweeps": grammar_forced_sweeps,
             "qwen_mtp_round_outcomes": "".join(round_outcomes),
+            # Backward-compatible endpoint fields: the sidecar is no longer
+            # request-pinned and no round-local bytes remain at return.
+            "qwen_mtp_request_local_sidecar_pin": 0,
+            "qwen_mtp_request_local_sidecar_bytes": 0,
+            "qwen_mtp_bf16_sidecar_round_loads": sidecar_round_loads,
+            "qwen_mtp_bf16_sidecar_round_releases": sidecar_round_releases,
+            "qwen_mtp_bf16_sidecar_read_bytes": sidecar_read_bytes,
+            "qwen_mtp_bf16_sidecar_loaded_resident_bytes": (
+                sidecar_loaded_resident_bytes),
+            "qwen_mtp_bf16_sidecar_released_resident_bytes": (
+                sidecar_released_resident_bytes),
+            "qwen_mtp_bf16_sidecar_peak_resident_bytes": (
+                sidecar_peak_resident_bytes),
+            "qwen_mtp_bf16_sidecar_cache_discards": sidecar_cache_discards,
+            "qwen_mtp_bf16_sidecar_load_s": sidecar_load_s,
+            "qwen_mtp_bf16_sidecar_release_s": sidecar_release_s,
         })
+        if self.proposal_replay_top_k:
+            path_stats["qwen_mtp_proposal_q_replay"] = (
+                proposal_replay_records)
         if not proposed:
             path_stats["qwen_mtp_fallback_reason"] = (
                 "terminal-during-plain-warmup")
+
+        # Bootstrap path_stats contain only the one-token target.generate()
+        # delta. Replace that stale slice with the complete wrapper request,
+        # and split shared-head traffic into authoritative target versus draft
+        # projections. Target totals intentionally include bootstrap, every
+        # serial verification row (including bonus/correction rows), and any
+        # constraint-aware rerank from its matching retained hidden position.
+        request_rerank_totals = _reranked_head_telemetry_delta(
+            request_rerank_before,
+            _reranked_head_telemetry_snapshot(tgt),
+        )
+        target_rerank_totals = {
+            key: max(0, int(value) - int(draft_rerank_totals.get(key, 0)))
+            for key, value in request_rerank_totals.items()
+        }
+        _publish_reranked_head_telemetry(
+            path_stats, "reranked_lm_head_", request_rerank_totals)
+        _publish_reranked_head_telemetry(
+            path_stats, "qwen_mtp_target_reranked_lm_head_",
+            target_rerank_totals)
+        _publish_reranked_head_telemetry(
+            path_stats, "qwen_mtp_draft_reranked_lm_head_",
+            draft_rerank_totals)
 
         request_cache_after = _cache_io_snapshot(tgt)
         _record_cache_io_delta(

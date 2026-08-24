@@ -1,0 +1,12 @@
+schema: voom.runtime-profile.v1
+name: huihui-qwen38-27b-lossless-compiled-delta
+description: Explicit same-operator compiled DeltaNet candidate for released-BF16 Huihui Qwen3.8 27B.
+notes:
+  - "Uses the released BF16 checkpoint and preserves the sequential recurrence operators and 32-position evaluation cadence."
+  - "Real 27B cold four-token A/B is byte-identical, but short-request wall was 102.955s compiled versus 102.707s sequential; keep opt-in for long-context evaluation rather than promoting it."
+extends:
+  - huihui-qwen38-27b-lossless
+settings:
+  VMODEL_QWEN35_COMPILED_DELTA: true
+  VMODEL_QWEN35_CHUNKED_DELTA: false
+  VMODEL_QWEN35_NATIVE_FUSED_DELTA_PREFILL: false

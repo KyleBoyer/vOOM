@@ -82,6 +82,7 @@ from .kv_cache import KVCache
 
 _SEGMENT_FORMAT = "hot-kv-segment-v3"
 _CHECKPOINT_FORMAT = "hot-kv-checkpoint-v3"
+_CHECKPOINT_KINDS = frozenset(("endpoint", "stable_prefix"))
 
 
 def _canonical_json(value) -> bytes:
@@ -138,6 +139,22 @@ def _normalize_cache_namespace(value, *, strict: bool) -> str | None:
         return value
     if strict:
         raise ValueError("invalid prompt cache namespace")
+    return None
+
+
+def _normalize_checkpoint_kind(value, *, strict: bool) -> str | None:
+    """Validate whether a checkpoint owns endpoint logits or only state.
+
+    ``stable_prefix`` is the exact recurrent/KV fold at a Qwen hybrid chat
+    boundary.  It can seed a strict extension, but it deliberately carries no
+    claim about the distribution at that prefix.  Keeping this fact in the
+    checksummed manifest prevents a state-only prefix from being mistaken for
+    a zero-prefill endpoint after restart.
+    """
+    if value in _CHECKPOINT_KINDS:
+        return value
+    if strict:
+        raise ValueError("invalid prompt checkpoint kind")
     return None
 
 
@@ -274,6 +291,9 @@ def _score_match(new_tokens, cand_tokens, cand_prompt_length: int,
 
 
 def _slice_kv(kv: KVCache, start: int, end: int) -> dict[str, mx.array]:
+    paged_slice = getattr(kv, "persistence_slice", None)
+    if paged_slice is not None:
+        return paged_slice(start, end)
     arrays = {}
     for i in range(len(kv.keys)):
         key = kv.keys[i]
@@ -301,20 +321,22 @@ class HotPromptKVPersistence:
     def __init__(self, dir: str | Path, fingerprint: str, chunk_size: int,
                  max_checkpoints: int = 64, *, config=None,
                  require_dsa: bool = False, require_recurrent: bool = False,
-                 max_bytes: int = 0):
+                 max_bytes: int = 0, paged_cache_factory=None):
         self.dir = Path(dir)
         self.dir.mkdir(parents=True, exist_ok=True)
         # v3 makes every tensor payload and manifest an immutable, checksummed
         # generation. The identity bump prevents a v2 entry (whose semantic id
         # did not cover tensor bytes) from entering the verified journal.
         self.fp = (fingerprint + "|hot-kv-v3-durable-dsa"
-                   + ("|hybrid-recurrent-v1" if require_recurrent else ""))
+                   + ("|hybrid-recurrent-v1" if require_recurrent else "")
+                   + ("|paged-stream-v1" if paged_cache_factory else ""))
         self.chunk_size = chunk_size
         self.max_checkpoints = max_checkpoints
         self.max_bytes = max(0, int(max_bytes))
         self.config = config
         self.require_dsa = require_dsa
         self.require_recurrent = require_recurrent
+        self.paged_cache_factory = paged_cache_factory
         self._thread_lock = threading.RLock()
         self._lock_path = self.dir / ".journal.lock"
         self._lock_path.touch(exist_ok=True)
@@ -334,9 +356,14 @@ class HotPromptKVPersistence:
         return tuple(getattr(self.config, "kda_layers", ()))
 
     def _checkpoint_arrays(
-        self, kv: KVCache, logits: mx.array, prompt_logits: mx.array,
+        self, kv: KVCache, logits: mx.array | None,
+        prompt_logits: mx.array | None,
     ) -> dict[str, mx.array]:
-        arrays = {"logits": logits, "prompt_logits": prompt_logits}
+        arrays = {}
+        if logits is not None:
+            arrays["logits"] = logits
+        if prompt_logits is not None:
+            arrays["prompt_logits"] = prompt_logits
         recurrent = getattr(kv, "kda_cache", None)
         if recurrent is not None:
             arrays.update(recurrent.export_arrays())
@@ -355,12 +382,49 @@ class HotPromptKVPersistence:
             from .kda_state import KDAStateCache
 
             kv.kda_cache = KDAStateCache.from_arrays(
-                len(kv.keys), recurrent_arrays,
+                int(getattr(kv, "num_layers", len(getattr(kv, "keys", ())))),
+                recurrent_arrays,
                 expected_layers=self._recurrent_layers())
         except (TypeError, ValueError, RuntimeError) as error:
             print(
                 f"[hot-kv-persist] recurrent checkpoint rejected: "
                 f"{type(error).__name__}: {error}", flush=True)
+            return False
+        return True
+
+    def _full_attention_layers(self) -> tuple[int, ...]:
+        if self.config is None:
+            return ()
+        return tuple(
+            index for index, kind in enumerate(
+                tuple(getattr(self.config, "layer_types", ())))
+            if kind == "full_attention"
+        )
+
+    def _has_complete_full_attention(self, kv: KVCache) -> bool:
+        """Fail closed if a hybrid snapshot omitted conventional KV layers."""
+        if getattr(self.config, "model_type", "") not in (
+                "qwen3_5", "qwen3_5_moe"):
+            return True
+        layer_positions = getattr(kv, "layer_positions", None)
+        if layer_positions is not None:
+            missing = [
+                layer for layer in self._full_attention_layers()
+                if layer >= int(getattr(kv, "num_layers", 0))
+                or layer_positions(layer) != int(getattr(kv, "offset", -1))
+            ]
+        else:
+            missing = [
+                layer for layer in self._full_attention_layers()
+                if (layer >= len(kv.keys) or kv.keys[layer] is None
+                    or kv.values[layer] is None)
+            ]
+        if missing:
+            print(
+                "[hot-kv-persist] hybrid checkpoint is missing full-attention "
+                f"KV layers {missing}; refusing to use",
+                flush=True,
+            )
             return False
         return True
 
@@ -577,7 +641,10 @@ class HotPromptKVPersistence:
         if (not isinstance(meta, dict)
                 or meta.get("format") != _CHECKPOINT_FORMAT
                 or meta.get("id") != checkpoint_id
-                or meta.get("fp") != self.fp):
+                or meta.get("fp") != self.fp
+                or _normalize_checkpoint_kind(
+                    meta.get("checkpoint_kind", "endpoint"),
+                    strict=False) is None):
             return None
         core = {key: value for key, value in meta.items()
                 if key not in ("format", "id")}
@@ -594,10 +661,12 @@ class HotPromptKVPersistence:
         return meta
 
     def save(self, parent_chain: tuple[str, ...], parent_covered: int, tokens,
-             kv: KVCache, logits: mx.array, prompt_logits: mx.array,
+             kv: KVCache, logits: mx.array | None,
+             prompt_logits: mx.array | None,
              prompt_length: int, reusable_prefix: int,
              approximate: bool = False,
-             tool_capsules=(), cache_namespace: str = "default"
+             tool_capsules=(), cache_namespace: str = "default",
+             checkpoint_kind: str = "endpoint",
              ) -> tuple[str, ...]:
         # Hold a shared journal lock from parent validation through checkpoint
         # publication. GC's exclusive lock cannot retire a just-written segment
@@ -606,14 +675,15 @@ class HotPromptKVPersistence:
             return self._save_locked(
                 parent_chain, parent_covered, tokens, kv, logits,
                 prompt_logits, prompt_length, reusable_prefix, approximate,
-                tool_capsules, cache_namespace)
+                tool_capsules, cache_namespace, checkpoint_kind)
 
     def _save_locked(self, parent_chain: tuple[str, ...], parent_covered: int,
-                     tokens, kv: KVCache, logits: mx.array,
-                     prompt_logits: mx.array, prompt_length: int,
+                     tokens, kv: KVCache, logits: mx.array | None,
+                     prompt_logits: mx.array | None, prompt_length: int,
                      reusable_prefix: int,
                      approximate: bool = False,
-                     tool_capsules=(), cache_namespace: str = "default"
+                     tool_capsules=(), cache_namespace: str = "default",
+                     checkpoint_kind: str = "endpoint",
                      ) -> tuple[str, ...]:
         """Persist a slot as new segments on top of `parent_chain` (which the
         caller has already validated as a true prefix of `tokens`, covering
@@ -630,6 +700,35 @@ class HotPromptKVPersistence:
         construction). The caller already knows the true covered length
         (it's the same `matched` value the in-memory lookup computed)."""
         chunk = self.chunk_size
+        checkpoint_kind = _normalize_checkpoint_kind(
+            checkpoint_kind, strict=True)
+        if not 0 <= int(parent_covered) <= len(tokens):
+            raise ValueError("persisted parent coverage is outside token prefix")
+        if self.require_recurrent:
+            if getattr(kv, "kda_cache", None) is None:
+                raise ValueError("hybrid checkpoint is missing recurrent state")
+            if int(getattr(kv, "offset", -1)) != len(tokens):
+                raise ValueError(
+                    "hybrid checkpoint KV length does not match token prefix")
+            if not self._has_complete_full_attention(kv):
+                raise ValueError(
+                    "hybrid checkpoint is missing full-attention KV")
+        if checkpoint_kind == "endpoint":
+            if logits is None or prompt_logits is None:
+                raise ValueError(
+                    "endpoint checkpoint requires logits and prompt logits")
+        else:
+            if not self.require_recurrent:
+                raise ValueError(
+                    "stable-prefix checkpoint requires recurrent state")
+            if logits is not None or prompt_logits is not None:
+                raise ValueError(
+                    "stable-prefix checkpoint must not carry endpoint logits")
+            if (int(prompt_length) != len(tokens)
+                    or int(reusable_prefix) != len(tokens)):
+                raise ValueError(
+                    "stable-prefix checkpoint must cover its complete token "
+                    "prefix")
         tool_capsules = _normalize_tool_capsules(
             tool_capsules, int(prompt_length), strict=True)
         cache_namespace = _normalize_cache_namespace(
@@ -681,6 +780,7 @@ class HotPromptKVPersistence:
         core = {
             "fp": self.fp,
             "leaf": leaf,
+            "checkpoint_kind": checkpoint_kind,
             "prompt_length": int(prompt_length),
             "reusable_prefix": int(reusable_prefix),
             "approximate": bool(approximate),
@@ -751,7 +851,8 @@ class HotPromptKVPersistence:
         return tokens
 
     def find_best_match(self, tokens, chunk_size: int, *,
-                        cache_namespace: str = "default") -> dict | None:
+                        cache_namespace: str = "default",
+                        min_matched_exclusive: int = -1) -> dict | None:
         """Cheap (metadata-only, no tensors loaded) scan of every
         checkpoint for the best repeat/endpoint/extension/branch candidate against
         `tokens`. Intended to be called ONLY on a total in-memory miss --
@@ -760,7 +861,13 @@ class HotPromptKVPersistence:
         tasks sharing a preamble than fit in `hot_prompt_kv_slots`, but the
         shared prefix is still sitting on disk from an earlier task).
         Returns a dict describing the winner, with NO KV tensors loaded
-        yet -- pass it to load_matched_chain() to actually load."""
+        yet -- pass it to load_matched_chain() to actually load.
+
+        ``min_matched_exclusive`` lets a resident hybrid endpoint ask whether
+        disk has a strictly longer exact prefix. Candidates at or below that
+        length are discarded before payload hashing, keeping the common
+        already-longest in-memory path metadata-only.
+        """
         cache_namespace = _normalize_cache_namespace(
             cache_namespace, strict=True)
         candidates = []
@@ -802,6 +909,18 @@ class HotPromptKVPersistence:
             if scored is None:
                 continue
             case, matched, watermark, n_segments, lcp = scored
+            if matched <= int(min_matched_exclusive):
+                continue
+            checkpoint_kind = _normalize_checkpoint_kind(
+                meta.get("checkpoint_kind", "endpoint"), strict=False)
+            if checkpoint_kind is None:
+                continue
+            # A stable prefix owns only the exact hybrid state represented by
+            # its complete token chain.  It may seed a strict extension, but
+            # cannot serve an identical request without endpoint logits and
+            # cannot be trimmed/rewound to a branch.
+            if checkpoint_kind == "stable_prefix" and case != "extension":
+                continue
             if self.require_recurrent and (
                     not meta.get("recurrent_state", False)
                     or case not in ("endpoint", "extension")):
@@ -816,6 +935,7 @@ class HotPromptKVPersistence:
                 "chain": chain, "checkpoint_id": checkpoint_id,
                 "ckpt_payload": ckpt_payload, "mtime": mtime,
                 "approximate": bool(meta.get("approximate", False)),
+                "checkpoint_kind": checkpoint_kind,
                 "cache_namespace": persisted_namespace,
                 "tool_capsules": _normalize_tool_capsules(
                     meta.get("tool_capsules", ()),
@@ -877,6 +997,9 @@ class HotPromptKVPersistence:
         payload (checked again here, not just at metadata-scan time -- a
         .safetensors file can vanish or truncate independently of its
         .json sibling)."""
+        if self.paged_cache_factory is not None:
+            return self._load_chain_prefix_paged(
+                chain, num_layers, verified_files=verified_files)
         paths = [path for seg_id in chain for path in (
             self._segment_meta_path(seg_id),
             self._segment_payload_path(seg_id))]
@@ -958,6 +1081,63 @@ class HotPromptKVPersistence:
             print("[hot-kv-persist] checkpoint is missing required DSA state; "
                   "refusing to use", flush=True)
             return None
+        if self.require_recurrent and not self._has_complete_full_attention(kv):
+            return None
+        return tokens, kv
+
+    def _load_chain_prefix_paged(self, chain: list[str], num_layers: int,
+                                 verified_files=None):
+        """Restore one verified segment at a time into bounded exact pages."""
+        if self.require_dsa:
+            print("[hot-kv-persist] paged restore does not support DSA state; "
+                  "refusing to use", flush=True)
+            return None
+        paths = [path for seg_id in chain for path in (
+            self._segment_meta_path(seg_id),
+            self._segment_payload_path(seg_id))]
+        kv = self.paged_cache_factory(num_layers)
+        tokens: list[int] = []
+        try:
+            with self._lease(paths):
+                for seg_id in chain:
+                    segment_paths = (
+                        self._segment_meta_path(seg_id),
+                        self._segment_payload_path(seg_id),
+                    )
+                    meta = self._read_segment_meta(
+                        seg_id,
+                        verify_payload=not _signatures_match(
+                            segment_paths, verified_files),
+                    )
+                    if meta is None:
+                        raise ValueError(
+                            f"segment checksum/manifest validation failed: {seg_id}")
+                    if bool(meta.get("compressed_mla")):
+                        raise ValueError(
+                            "compressed MLA is unsupported by paged restore")
+                    arrays = mx.load(str(self._segment_payload_path(seg_id)))
+                    mx.eval(list(arrays.values()))
+                    start = len(tokens)
+                    tokens.extend(meta["tokens"])
+                    kv.append_persisted_segment(arrays, start, len(tokens))
+                    del arrays
+                    mx.clear_cache()
+        except Exception as error:
+            release = getattr(kv, "release", None)
+            if release is not None:
+                release()
+            print(
+                f"[hot-kv-persist] paged chain load failed: "
+                f"{type(error).__name__}: {error}", flush=True)
+            return None
+        if kv.offset != len(tokens):
+            kv.release()
+            print("[hot-kv-persist] paged chain length mismatch; refusing to use",
+                  flush=True)
+            return None
+        if self.require_recurrent and not self._has_complete_full_attention(kv):
+            kv.release()
+            return None
         return tokens, kv
 
     def load_matched_chain(self, match: dict, num_layers: int) -> tuple | None:
@@ -978,9 +1158,16 @@ class HotPromptKVPersistence:
             print(f"[hot-kv-persist] disk match leaf={match['leaf']}: "
                   f"reconstructed length {len(tokens)} != expected "
                   f"{match['matched']}, refusing to use", flush=True)
+            release = getattr(kv, "release", None)
+            if release is not None:
+                release()
             return None
         exact_logits = None
         ck = None
+        checkpoint_kind = _normalize_checkpoint_kind(
+            match.get("checkpoint_kind", "endpoint"), strict=False)
+        if checkpoint_kind is None:
+            return None
         if (self.require_recurrent
                 or match["case"] in ("repeat", "endpoint")):
             checkpoint_id = match["checkpoint_id"]
@@ -999,17 +1186,26 @@ class HotPromptKVPersistence:
                         raise ValueError(
                             "checkpoint checksum/manifest validation failed")
                     ck = mx.load(str(match["ckpt_payload"]))
-                    if "logits" not in ck or "prompt_logits" not in ck:
+                    if (checkpoint_kind == "endpoint"
+                            and ("logits" not in ck
+                                 or "prompt_logits" not in ck)):
                         raise KeyError("missing logits/prompt_logits")
-                    mx.eval([ck["logits"], ck["prompt_logits"]])
+                    mx.eval(list(ck.values()))
             except Exception as e:
                 print(f"[hot-kv-persist] disk match leaf={match['leaf']}: "
                       f"checkpoint payload load failed: {type(e).__name__}: "
                       f"{e}", flush=True)
+                release = getattr(kv, "release", None)
+                if release is not None:
+                    release()
                 return None
             if not self._attach_recurrent(kv, ck):
+                release = getattr(kv, "release", None)
+                if release is not None:
+                    release()
                 return None
-        if match["case"] in ("repeat", "endpoint"):
+        if (checkpoint_kind == "endpoint"
+                and match["case"] in ("repeat", "endpoint")):
             exact_logits = ck["prompt_logits"] if match["case"] == "repeat" else ck["logits"]
         checkpoint_id = match["checkpoint_id"]
         with self._locked(exclusive=False):
@@ -1029,6 +1225,11 @@ class HotPromptKVPersistence:
         first -- ready to append straight into `_hot_prompt_slots` in LRU
         order. Corrupt, fingerprint-mismatched, or broken-chain checkpoints
         are skipped, never fatal (same posture as F37)."""
+        # Paged durable state is intentionally disk-only between requests. A
+        # restart preload would eagerly create spill copies for every LRU slot
+        # before request admission and defeats the bounded representation.
+        if self.paged_cache_factory is not None:
+            return []
         entries = []
         for j in self.dir.glob("*.ckpt.json"):
             checkpoint_id = j.name[:-len(".ckpt.json")]
@@ -1039,7 +1240,18 @@ class HotPromptKVPersistence:
             if not meta.get("leaf") or not st.exists():
                 continue
             entries.append((st.stat().st_mtime, checkpoint_id, meta, st))
-        entries.sort(key=lambda e: e[0])  # oldest first
+        # Recurrent serving most often resumes a rendered conversation from
+        # its scaffold-free stable boundary. Prefer those state-only entries
+        # in the bounded RAM tier; exact full endpoints remain independently
+        # discoverable through find_best_match() on an in-memory miss.
+        entries.sort(key=lambda e: (
+            int(
+                self.require_recurrent
+                and e[2].get("checkpoint_kind") == "stable_prefix"),
+            (int(e[2].get("prompt_length", 0))
+             if e[2].get("checkpoint_kind") == "stable_prefix" else 0),
+            e[0],
+        ))
         if limit and len(entries) > limit:
             entries = entries[-limit:]  # keep the most-recently-used `limit`
 
@@ -1061,9 +1273,15 @@ class HotPromptKVPersistence:
                         raise ValueError(
                             "checkpoint checksum/manifest validation failed")
                     ck = mx.load(str(ckpt_payload))
-                    if "logits" not in ck or "prompt_logits" not in ck:
+                    checkpoint_kind = _normalize_checkpoint_kind(
+                        meta.get("checkpoint_kind", "endpoint"), strict=False)
+                    if checkpoint_kind is None:
+                        raise ValueError("invalid checkpoint kind")
+                    if (checkpoint_kind == "endpoint"
+                            and ("logits" not in ck
+                                 or "prompt_logits" not in ck)):
                         raise KeyError("missing logits/prompt_logits")
-                    mx.eval([ck["logits"], ck["prompt_logits"]])
+                    mx.eval(list(ck.values()))
             except Exception as e:
                 print(f"[hot-kv-persist] skip corrupt/unreadable checkpoint "
                       f"payload (leaf={leaf}): {type(e).__name__}: {e}", flush=True)
@@ -1086,8 +1304,12 @@ class HotPromptKVPersistence:
                       f"metadata (leaf={leaf})", flush=True)
                 continue
             out.append((
-                tuple(tokens), kv, ck["logits"], int(meta["prompt_length"]),
-                ck["prompt_logits"], int(meta["reusable_prefix"]),
+                tuple(tokens), kv,
+                ck.get("logits") if checkpoint_kind == "endpoint" else None,
+                int(meta["prompt_length"]),
+                (ck.get("prompt_logits")
+                 if checkpoint_kind == "endpoint" else None),
+                int(meta["reusable_prefix"]),
                 bool(meta.get("approximate", False)), tool_capsules,
                 tuple(chain), cache_namespace,
             ))

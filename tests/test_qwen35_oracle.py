@@ -190,17 +190,27 @@ def test_gated_delta_net_exact_endpoint_continuation_matches_one_shot():
         mx.array(hidden.numpy()), weights, prefix, _runtime_config(),
         full_cache, 0)
 
+    compiled_cache = KDAStateCache(2)
+    compiled = _gated_delta_net(
+        mx.array(hidden.numpy()), weights, prefix, _runtime_config(),
+        compiled_cache, 0, compiled_delta_prefill=True)
+
     split_cache = KDAStateCache(2)
     left = _gated_delta_net(
         mx.array(hidden[:, :4].numpy()), weights, prefix, _runtime_config(),
-        split_cache, 0)
+        split_cache, 0, compiled_delta_prefill=True)
     retained = split_cache.fork()
     right = _gated_delta_net(
         mx.array(hidden[:, 4:].numpy()), weights, prefix, _runtime_config(),
-        retained, 0)
+        retained, 0, compiled_delta_prefill=True)
     split = mx.concatenate((left, right), axis=1)
-    mx.eval(split, full)
+    mx.eval(
+        split, compiled, full,
+        retained.state(0), compiled_cache.state(0), full_cache.state(0))
+    assert np.array_equal(np.array(compiled), np.array(full))
     assert np.array_equal(np.array(split), np.array(full))
+    assert bool(mx.array_equal(compiled_cache.state(0), full_cache.state(0)))
+    assert bool(mx.array_equal(retained.state(0), full_cache.state(0)))
     assert retained.nbytes() > 0
 
 

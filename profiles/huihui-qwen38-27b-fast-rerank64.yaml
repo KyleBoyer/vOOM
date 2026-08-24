@@ -1,0 +1,14 @@
+schema: voom.runtime-profile.v1
+name: huihui-qwen38-27b-fast-rerank64
+description: Explicit Huihui all-MXFP4 candidate with 64-way exact BF16 row reranking.
+notes:
+  - "Lossy candidate selection remains lossy: exact BF16 scores are authoritative only inside the MXFP4 top-64 shortlist."
+  - "The exact 2.543 GB head is not resident; sorted candidate rows are coalesced and read from the pinned released checkpoint."
+  - "Do not promote until the real hidden-state candidate-recall corpus is 100%, the Plex whole-visible gate passes, and heterogeneous request shapes retain their witnesses."
+extends:
+  - huihui-qwen38-27b-fast-agent
+settings:
+  VMODEL_QWEN35_RERANK_LM_HEAD: true
+  VMODEL_QWEN35_RERANK_LM_HEAD_CANDIDATES: 64
+  VMODEL_QWEN35_RERANK_LM_HEAD_SOURCE: /Volumes/Workspace NVME/git/vOOM/models/Huihui-Qwen3.8-27B-abliterated
+  VMODEL_QWEN35_RERANK_LM_HEAD_SOURCE_FINGERPRINT: 02c9ed132c902d594ed8528dd4dd0b92a767980e7f6c071c49bc70d4d898a0d1

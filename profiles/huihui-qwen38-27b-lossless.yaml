@@ -1,0 +1,26 @@
+schema: voom.runtime-profile.v1
+name: huihui-qwen38-27b-lossless
+description: Released-BF16 Huihui Qwen3.8 27B with exact dense-Qwen scheduling.
+notes:
+  - Serves the downloaded abliterated checkpoint at its released BF16 precision; no serving-weight quantization or approximate prompt state is enabled.
+  - Layer-stationary prefill changes only the layer/tile loop order and is covered by the dense-Qwen byte-identical oracle.
+  - Native MTP drafts are never accepted without target verification and automatically disengage when they do not save streamed target sweeps.
+  - The 2.2 GB weight-cache ceiling, 2 GB live-allocation floor, and 6 GB post-generation cleanup target protect the 16 GB host; the exact paged/tiled allocations hold measured Metal below the stricter 8.5 GB project ceiling, and these controls alter residency only.
+  - Exact BF16 full-attention KV is bounded to 768 MB resident and spills bit-identical 256-position pages to the external workspace; this is required for the capture's 49K-token released-schema rendering.
+  - Dense MLP activations use the same 128-row tiles as attention; the operation is independent per row and the real Qwen greedy A/B remains byte-identical, while avoiding an 11 GB full-context transient.
+  - Tool schemas, messages, and sampling remain on the ordinary lossless request path; compose agent-tool-gateway separately only when catalog routing is desired.
+settings:
+  VMODEL_RESIDENT_BACKEND: voom
+  VMODEL_QWEN35_WEIGHT_CACHE_MB: 2200
+  VMODEL_QWEN35_MIN_AVAILABLE_MB: 2000
+  VMODEL_QWEN35_POSTGEN_MIN_AVAILABLE_MB: 6000
+  VMODEL_QWEN35_KV_MAX_MB: 768
+  VMODEL_QWEN35_KV_PREFILL_CHUNK_SIZE: 128
+  VMODEL_QWEN35_KV_SPILL_DIR: /Volumes/Workspace NVME/git/vOOM/.kv_spill/huihui-qwen38-27b-lossless
+  VMODEL_QWEN35_LAYER_STATIONARY_PREFILL: true
+  VMODEL_QWEN35_CHUNKED_DELTA: false
+  VMODEL_QWEN35_FP8_KV_CACHE: false
+  VMODEL_QWEN_MTP_SPECULATIVE: auto
+  VMODEL_QWEN_NGRAM_SPECULATIVE: false
+  VMODEL_ZMLX_FUSED_DELTANET_DECODE: false
+  VMODEL_NATIVE_FUSED_DELTANET_DECODE: false

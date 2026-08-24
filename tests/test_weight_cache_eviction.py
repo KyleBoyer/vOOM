@@ -7,6 +7,8 @@ import random
 import threading
 import time
 
+import pytest
+
 import runtime.weight_cache as cache_module
 from runtime.weight_cache import WeightCache
 
@@ -164,6 +166,25 @@ def test_prefetch_hit_updates_reserved_accounting_without_changing_total(
     assert cache.would_fit(95)
     assert cache.total_bytes == 10
     assert cache.stats.prefetch_hits == 1
+    assert cache.stats.prefetch_loads == 1
+    assert cache.stats.prefetch_loaded_bytes == 10
+    assert cache.stats.prefetch_useful_pages == 1
+    assert cache.stats.prefetch_useful_bytes == 10
+    assert cache.stats.prefetch_wasted_pages == 0
+
+
+def test_unused_prefetch_is_counted_as_waste_on_eviction(monkeypatch):
+    monkeypatch.setattr(cache_module, "_clear_device_cache", lambda: None)
+    cache = WeightCache(FakeStore(), max_bytes=10)
+    cache.get("unused", ["unused.weight"], origin="prefetch")
+
+    cache.max_bytes = 0
+    cache.trim_to(0)
+
+    assert cache.stats.prefetch_loads == 1
+    assert cache.stats.prefetch_useful_pages == 0
+    assert cache.stats.prefetch_wasted_pages == 1
+    assert cache.stats.prefetch_wasted_bytes == 10
 
 
 def test_replacing_a_pinned_page_keeps_byte_counters_exact(monkeypatch):
@@ -176,6 +197,50 @@ def test_replacing_a_pinned_page_keeps_byte_counters_exact(monkeypatch):
     assert cache.resident_keys == ["shared"]
     assert not cache.would_fit(81)
     assert cache.would_fit(80)
+
+
+def test_pin_fails_closed_before_pinned_pages_exceed_capacity(monkeypatch):
+    monkeypatch.setattr(cache_module, "_clear_device_cache", lambda: None)
+    cache = WeightCache(FakeStore(), max_bytes=10)
+    cache.pin("first", ["first.weight"])
+
+    with pytest.raises(MemoryError, match="weight-cache capacity"):
+        cache.pin("second", ["second.weight"])
+
+    assert cache.pinned_bytes == 10
+    assert cache.total_bytes == 10
+    assert cache.resident_keys == ["first"]
+
+
+def test_pinned_hits_and_resident_class_bytes_are_exact(monkeypatch):
+    monkeypatch.setattr(cache_module, "_clear_device_cache", lambda: None)
+    cache = WeightCache(FakeStore(), max_bytes=100)
+    cache.pin("pinned", ["pinned.weight"])
+    cache.get("prefetched", ["prefetched.weight"], origin="prefetch")
+
+    assert cache.pinned_bytes == 10
+    assert cache.prefetched_bytes == 10
+    cache.get("pinned", ["pinned.weight"])
+    assert cache.stats.pinned_hits == 1
+    assert cache.pinned_bytes == 10
+
+
+def test_demand_wait_on_inflight_prefetch_is_measured(monkeypatch):
+    monkeypatch.setattr(cache_module, "_clear_device_cache", lambda: None)
+    cache = WeightCache(FakeStore(delay=0.04), max_bytes=100)
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        prefetched = executor.submit(
+            cache.get, "shared", ["shared.weight"], "prefetch")
+        deadline = time.monotonic() + 1.0
+        while not cache.inflight("shared") and time.monotonic() < deadline:
+            time.sleep(0.001)
+        demanded = executor.submit(
+            cache.get, "shared", ["shared.weight"], "demand")
+        assert demanded.result() is prefetched.result()
+
+    assert cache.stats.prefetch_hits == 1
+    assert cache.stats.prefetch_waits == 1
+    assert cache.stats.prefetch_wait_s > 0
 
 
 def test_clear_releases_all_pages_and_reservations_once(monkeypatch):
@@ -203,6 +268,7 @@ def test_clear_releases_all_pages_and_reservations_once(monkeypatch):
             "demand.weight",
         )
     ]
+    assert cache.stats.prefetch_wasted_pages == 1
 
 
 def test_clear_refuses_to_race_an_inflight_fetch(monkeypatch):

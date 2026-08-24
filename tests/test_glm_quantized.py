@@ -113,3 +113,4 @@ def test_lossy_runtime_modes_have_distinct_prompt_cache_fingerprints():
     assert fingerprint(fused_swiglu=True) != base
     assert fingerprint(prefill_last_token_separate=True) != base
     assert fingerprint(layer_stationary_prefill=True) != base
+    assert fingerprint(qwen_chunked_delta_prefill=True) != base

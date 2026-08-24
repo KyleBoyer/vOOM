@@ -776,16 +776,6 @@ def _harmony_final_channel(text: str) -> str:
     return tail.strip() or (text or "")
 
 
-def _final_answer_slice(text: str) -> str:
-    """Prefer an explicitly labelled final selection over analysis prose."""
-    text = _harmony_final_channel(text)
-    markers = list(re.finditer(
-        r"(?im)^\s*(?:#{1,6}\s*)?(?:final\s+(?:list|answer)|"
-        r"titles\s+meeting\s+criteria|(?:let\s+me\s+)?re-verify)\s*:?\s*$",
-        text or ""))
-    return (text[markers[-1].end():] if markers else text).strip()
-
-
 def _explicit_kids_root_verification(text: str) -> bool:
     """Witness that both adversarial Kids rows were inspected and rejected."""
     lowered = text.lower()
@@ -821,7 +811,12 @@ def score_profile(calls: list[dict], final_text: str,
         len(numeric_offsets) >= 2
         and all(right > left for left, right in zip(
             numeric_offsets, numeric_offsets[1:])))
-    answer_text = _final_answer_slice(final_text)
+    # Score every character the user can see.  Harmony analysis is a separate
+    # protocol channel and is removed, but an ordinary visible "Final list:"
+    # heading is not a trust boundary: a bad prefix followed by a clean suffix
+    # is still a bad answer.  Previous marker slicing let exactly that output
+    # masquerade as 100/100.
+    answer_text = _harmony_final_channel(final_text).strip()
     # A model may implement the Kids exclusion by post-filtering in its
     # reasoning instead of via a tool argument, and that reasoning is the only
     # witness of it. Harmony now delivers reasoning out-of-band (it is no
@@ -891,6 +886,7 @@ def score_profile(calls: list[dict], final_text: str,
         "plex_call_count": len(plex_calls),
         "offsets": offsets,
         "answer_slice_used": answer_text != (final_text or "").strip(),
+        "whole_visible_output_scanned": True,
     }
 
 

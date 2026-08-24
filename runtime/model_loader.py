@@ -182,6 +182,10 @@ class WeightStore:
         self.parallel_tier_fetches = 0
         self.parallel_tier_fast_bytes = 0
         self.parallel_tier_archive_bytes = 0
+        self.parallel_tier_wall_ns = 0
+        self.parallel_tier_fast_service_ns = 0
+        self.parallel_tier_archive_service_ns = 0
+        self.parallel_tier_hidden_ns = 0
         self.safetensors_offset_order = bool(safetensors_offset_order)
         self._safetensors_headers: dict[str, dict] = {}
         self._safetensors_header_lock = threading.Lock()
@@ -271,6 +275,13 @@ class WeightStore:
         # fast tier staged (the common case).
         self._raw_fast_tier_manifest: dict[str, dict] | None = None
         self._raw_fast_tier_root: Path | None = None
+        # MLX establishes per-calling-thread resources on first evaluation.
+        # Creating a fresh ThreadPoolExecutor for every streamed layer/sweep
+        # therefore leaks thousands of retained worker resources during long
+        # out-of-core decode and eventually reaches Darwin's thread ceiling.
+        # One lazily-created worker preserves device overlap without thread
+        # churn; it lives for the same lifetime as this model store.
+        self._raw_fast_tier_executor = None
         # A model released GGUF-only (e.g. VibeThinker-3B's tool-calling
         # fine-tune -- no safetensors release exists at all) -- see
         # formats/gguf_reader.py. Populated below, alongside the ordinary
@@ -278,6 +289,10 @@ class WeightStore:
         self.gguf = None
         self._gguf_pending_real_names: dict[str, str] = {}
         self.mtplx_mtp_sidecar: str | None = None
+        self._mtplx_mtp_sidecar_names: frozenset[str] = frozenset()
+        self._mtplx_mtp_sidecar_sha256: str | None = None
+        self._mtplx_mtp_sidecar_layout: dict[str, tuple[str, tuple[int, ...], int]] = {}
+        self._mtplx_mtp_exact_fast_names: frozenset[str] = frozenset()
         self.config = ModelConfig.from_dir(self.dir)
         raw_config = json.loads(_read_text_retry(self.dir / "config.json"))
         text_config = raw_config.get("text_config", {})
@@ -370,13 +385,23 @@ class WeightStore:
                     if not sidecar_path.is_file():
                         raise FileNotFoundError(
                             f"MTPLX MTP sidecar is missing: {sidecar_path}")
+                    sidecar_tensors = mx.load(str(sidecar_path))
                     sidecar_names = [
-                        name for name in mx.load(str(sidecar_path))
+                        name for name in sidecar_tensors
                         if name.startswith("mtp.")
                     ]
                     if not sidecar_names:
                         raise ValueError(
                             f"MTPLX MTP sidecar has no mtp.* tensors: {sidecar_path}")
+                    non_bf16 = [
+                        f"{name}:{sidecar_tensors[name].dtype}"
+                        for name in sidecar_names
+                        if sidecar_tensors[name].dtype != mx.bfloat16
+                    ]
+                    if non_bf16:
+                        raise ValueError(
+                            "MTPLX MTP sidecar must preserve released BF16 "
+                            f"mtp.* tensors, found {non_bf16[:3]}")
                     collisions = sorted(set(sidecar_names) & set(self.weight_map))
                     if collisions:
                         raise ValueError(
@@ -385,6 +410,19 @@ class WeightStore:
                     self.weight_map.update(
                         {name: sidecar for name in sidecar_names})
                     self.mtplx_mtp_sidecar = sidecar
+                    self._mtplx_mtp_sidecar_names = frozenset(sidecar_names)
+                    sidecar_sha = index_metadata.get(
+                        "mtplx_mtp_sidecar_sha256")
+                    if isinstance(sidecar_sha, str) and len(sidecar_sha) == 64:
+                        self._mtplx_mtp_sidecar_sha256 = sidecar_sha
+                    self._mtplx_mtp_sidecar_layout = {
+                        name: (
+                            "BF16",
+                            tuple(int(value) for value in sidecar_tensors[name].shape),
+                            int(sidecar_tensors[name].nbytes),
+                        )
+                        for name in sidecar_names
+                    }
             elif not single.exists() and gguf_candidates:
                 # VibeThinker-3B's tool-calling fine-tune ships GGUF-only.
                 # Tensor names use llama.cpp's own naming scheme
@@ -750,6 +788,37 @@ class WeightStore:
                 int(self.ct_mxfp4_input_bytes),
                 int(self.ct_mxfp4_resident_bytes),
             )
+
+    def parallel_tier_snapshot(self) -> tuple[int, ...]:
+        """Return cumulative dual-device work and overlap evidence atomically."""
+        with self._stage_lock:
+            return (
+                int(self.parallel_tier_fetches),
+                int(self.parallel_tier_fast_bytes),
+                int(self.parallel_tier_archive_bytes),
+                int(self.parallel_tier_wall_ns),
+                int(self.parallel_tier_fast_service_ns),
+                int(self.parallel_tier_archive_service_ns),
+                int(self.parallel_tier_hidden_ns),
+            )
+
+    def _record_parallel_tier(
+        self, *, fast_bytes: int, archive_bytes: int, wall_ns: int,
+        fast_service_ns: int, archive_service_ns: int,
+    ) -> None:
+        # Sum(service times)-wall is the work overlapped across independent
+        # devices. Clamp orchestration/timer noise rather than reporting a
+        # negative hidden interval.
+        hidden_ns = max(
+            0, int(fast_service_ns) + int(archive_service_ns) - int(wall_ns))
+        with self._stage_lock:
+            self.parallel_tier_fetches += 1
+            self.parallel_tier_fast_bytes += int(fast_bytes)
+            self.parallel_tier_archive_bytes += int(archive_bytes)
+            self.parallel_tier_wall_ns += int(wall_ns)
+            self.parallel_tier_fast_service_ns += int(fast_service_ns)
+            self.parallel_tier_archive_service_ns += int(archive_service_ns)
+            self.parallel_tier_hidden_ns += hidden_ns
 
     def k3_scale_sidecar_snapshot(self) -> tuple[int, int, int, int]:
         """Return cumulative exact scale-overlay counters atomically."""
@@ -1306,13 +1375,75 @@ class WeightStore:
             return
         self._raw_fast_tier_manifest = {}
         for root in self.fast_dirs:
-            candidate = root / self.dir.name
+            # Callers historically supplied the parent fast-tier root, while
+            # server autodiscovery supplies the already model-specific path.
+            # Accept both forms so a discovered raw mirror does not become
+            # ``.../<model>/<model>/fast_tier_manifest.json`` and silently
+            # fall back to the slow checkpoint.
+            candidate = root if (
+                (root / "fast_tier_manifest.json").is_file()
+                or (root / "mtp-bf16-fast.manifest.json").is_file()
+            ) else root / self.dir.name
             manifest_path = candidate / "fast_tier_manifest.json"
-            if manifest_path.is_file():
-                self._raw_fast_tier_manifest = json.loads(
-                    manifest_path.read_text())
-                self._raw_fast_tier_root = candidate
-                return
+            mtp_manifest_path = candidate / "mtp-bf16-fast.manifest.json"
+            if not (manifest_path.is_file() or mtp_manifest_path.is_file()):
+                continue
+            manifest = (
+                json.loads(manifest_path.read_text())
+                if manifest_path.is_file() else {})
+            if not isinstance(manifest, dict):
+                raise ValueError("raw fast-tier manifest must be an object")
+            if mtp_manifest_path.is_file():
+                import hashlib
+
+                mtp_manifest = json.loads(mtp_manifest_path.read_text())
+                if (
+                    mtp_manifest.get("schema")
+                    != "voom.qwen-mtp-bf16-fast-tier.v1"
+                    or not self._mtplx_mtp_sidecar_sha256
+                    or mtp_manifest.get("source_sha256")
+                    != self._mtplx_mtp_sidecar_sha256
+                    or mtp_manifest.get("source_sidecar")
+                    != self.mtplx_mtp_sidecar
+                ):
+                    raise ValueError("BF16 MTP fast-tier source identity mismatch")
+                fast_file = mtp_manifest.get("fast_file")
+                if not (
+                    isinstance(fast_file, str)
+                    and Path(fast_file).name == fast_file
+                    and (candidate / fast_file).is_file()
+                ):
+                    raise ValueError("unsafe or missing BF16 MTP fast-tier file")
+                digest = hashlib.sha256()
+                with (candidate / fast_file).open("rb") as source:
+                    for chunk in iter(
+                            lambda: source.read(8 * 1024 * 1024), b""):
+                        digest.update(chunk)
+                if digest.hexdigest() != mtp_manifest.get("fast_file_sha256"):
+                    raise ValueError("BF16 MTP fast-tier SHA-256 mismatch")
+                tensors = mtp_manifest.get("tensors")
+                if not isinstance(tensors, dict) or not tensors:
+                    raise ValueError("BF16 MTP fast-tier has no tensor map")
+                exact_names = set()
+                for name, entry in tensors.items():
+                    layout = self._mtplx_mtp_sidecar_layout.get(name)
+                    if (
+                        layout is None
+                        or not isinstance(entry, dict)
+                        or entry.get("file") != fast_file
+                        or str(entry.get("dtype", "")).upper() != layout[0]
+                        or tuple(int(value) for value in entry.get("shape", ()))
+                        != layout[1]
+                        or int(entry.get("nbytes", -1)) != layout[2]
+                    ):
+                        raise ValueError(
+                            f"BF16 MTP fast-tier metadata mismatch: {name}")
+                    manifest[name] = entry
+                    exact_names.add(name)
+                self._mtplx_mtp_exact_fast_names = frozenset(exact_names)
+            self._raw_fast_tier_manifest = manifest
+            self._raw_fast_tier_root = candidate
+            return
 
     def _read_raw_fast_tier_tensors(
         self, names: list[str],
@@ -1461,6 +1592,26 @@ class WeightStore:
             return False
         return bool(devices) and source_device not in devices
 
+    def _raw_fast_tier_executor_for_reads(self):
+        """Return the store-lifetime worker used for independent-tier reads."""
+        import concurrent.futures as cf
+
+        with self._stage_lock:
+            if self._raw_fast_tier_executor is None:
+                self._raw_fast_tier_executor = cf.ThreadPoolExecutor(
+                    max_workers=1,
+                    thread_name_prefix="voom-fast-tier",
+                )
+            return self._raw_fast_tier_executor
+
+    def close(self) -> None:
+        """Join the optional fast-tier worker owned by this store."""
+        with self._stage_lock:
+            executor = self._raw_fast_tier_executor
+            self._raw_fast_tier_executor = None
+        if executor is not None:
+            executor.shutdown(wait=True, cancel_futures=True)
+
     def fetch(self, names: list[str]) -> tuple[dict[str, mx.array], float, int]:
         """Materialize tensors; return arrays, wall seconds, store-accounted bytes.
 
@@ -1541,18 +1692,35 @@ class WeightStore:
                             # The worker returns only bytes/numpy. vpack2.fetch
                             # remains on this thread because it materializes MLX
                             # arrays after its own I/O/decode worker pool joins.
+                            parallel_started_ns = time.perf_counter_ns()
+
+                            def load_fast_overlay_timed():
+                                started_ns = time.perf_counter_ns()
+                                value = self._decode_vpack2_fast_overlay(selected)
+                                return value, time.perf_counter_ns() - started_ns
+
                             with cf.ThreadPoolExecutor(max_workers=1) as pool:
                                 fast_future = pool.submit(
-                                    self._decode_vpack2_fast_overlay, selected)
+                                    load_fast_overlay_timed)
+                                archive_started_ns = time.perf_counter_ns()
                                 archive, _, archive_bytes = self.vpack2.fetch(
                                     remaining)
-                                decoded, fast_bytes = fast_future.result()
+                                archive_service_ns = (
+                                    time.perf_counter_ns() - archive_started_ns)
+                                (decoded, fast_bytes), fast_service_ns = (
+                                    fast_future.result())
+                            parallel_wall_ns = (
+                                time.perf_counter_ns() - parallel_started_ns)
                             fetched = dict(archive)
                             fetched.update(
                                 self._materialize_vpack2_fast_overlay(decoded))
-                            self.parallel_tier_fetches += 1
-                            self.parallel_tier_fast_bytes += fast_bytes
-                            self.parallel_tier_archive_bytes += archive_bytes
+                            self._record_parallel_tier(
+                                fast_bytes=fast_bytes,
+                                archive_bytes=archive_bytes,
+                                wall_ns=parallel_wall_ns,
+                                fast_service_ns=fast_service_ns,
+                                archive_service_ns=archive_service_ns,
+                            )
                         else:
                             if selected:
                                 decoded, fast_bytes = (
@@ -1712,10 +1880,14 @@ class WeightStore:
         self._ensure_raw_fast_tier_loaded()
         fast_names = [
             n for n in source_physical_names
-            if n in self._raw_fast_tier_manifest]
+            if (n in self._raw_fast_tier_manifest
+                and (
+                    n not in self._mtplx_mtp_sidecar_names
+                    or n in self._mtplx_mtp_exact_fast_names))]
+        fast_name_set = set(fast_names)
         slow_names = [
             n for n in source_physical_names
-            if n not in self._raw_fast_tier_manifest]
+            if n not in fast_name_set]
 
         by_shard: dict[str, list[str]] = defaultdict(list)
         for n in slow_names:
@@ -1778,20 +1950,38 @@ class WeightStore:
                     # identity and the explicit scheduling gate were both
                     # checked above; same-device and A/B-control paths remain
                     # serial.
-                    import concurrent.futures as cf
+                    fast_executor = (
+                        self._raw_fast_tier_executor_for_reads()
+                    )
+                    parallel_started_ns = time.perf_counter_ns()
 
-                    with cf.ThreadPoolExecutor(max_workers=1) as pool:
-                        fast_future = pool.submit(
-                            self._read_raw_fast_tier_tensors, fast_names)
-                        slow_out, slow_bytes = load_slow_names()
-                        fast_out, fast_bytes = fast_future.result()
+                    def load_fast_names_timed():
+                        started_ns = time.perf_counter_ns()
+                        value = self._read_raw_fast_tier_tensors(fast_names)
+                        return value, time.perf_counter_ns() - started_ns
+
+                    fast_future = fast_executor.submit(
+                        load_fast_names_timed)
+                    archive_started_ns = time.perf_counter_ns()
+                    slow_out, slow_bytes = load_slow_names()
+                    archive_service_ns = (
+                        time.perf_counter_ns() - archive_started_ns)
+                    (fast_out, fast_bytes), fast_service_ns = (
+                        fast_future.result())
+                    parallel_wall_ns = (
+                        time.perf_counter_ns() - parallel_started_ns)
                     out.update(slow_out)
                     out.update(fast_out)
                     self.fast_tier_bytes += fast_bytes
                     self.fast_tier_tensors += len(fast_names)
-                    self.parallel_tier_fetches += 1
-                    self.parallel_tier_fast_bytes += fast_bytes
-                    self.parallel_tier_archive_bytes += slow_bytes
+                    self.archive_bytes += slow_bytes
+                    self._record_parallel_tier(
+                        fast_bytes=fast_bytes,
+                        archive_bytes=slow_bytes,
+                        wall_ns=parallel_wall_ns,
+                        fast_service_ns=fast_service_ns,
+                        archive_service_ns=archive_service_ns,
+                    )
                 elif fast_names:
                     fast_out, fast_bytes = (
                         self._read_raw_fast_tier_tensors(fast_names)
@@ -1800,11 +1990,13 @@ class WeightStore:
                     self.fast_tier_bytes += fast_bytes
                     self.fast_tier_tensors += len(fast_names)
                     if by_shard:
-                        slow_out, _slow_bytes = load_slow_names()
+                        slow_out, slow_bytes = load_slow_names()
                         out.update(slow_out)
+                        self.archive_bytes += slow_bytes
                 elif by_shard:
-                    slow_out, _slow_bytes = load_slow_names()
+                    slow_out, slow_bytes = load_slow_names()
                     out.update(slow_out)
+                    self.archive_bytes += slow_bytes
                 nbytes = sum(a.nbytes for a in out.values())
                 for layer, nf12_names in nf12_names_by_layer.items():
                     nf12_out, nf12_bytes = self._decode_bf16_nf12_layer(

@@ -60,6 +60,45 @@ def test_compressed_page_round_trips_byte_identical():
         shutil.rmtree(spill_dir, ignore_errors=True)
 
 
+def test_budget_is_enforced_before_final_layer_for_layer_stationary_order(
+        tmp_path):
+    """A complete early layer must not remain resident until layer N-1."""
+    kv = PagedKVCache(
+        num_layers=4,
+        max_bytes=1,
+        spill_dir=tmp_path,
+        page_positions=4,
+        resident_pages=0,
+    )
+    k = mx.ones((1, 2, 4, 8), dtype=mx.bfloat16)
+    v = mx.zeros((1, 2, 4, 8), dtype=mx.bfloat16)
+    mx.eval(k, v)
+    kv.update(0, k, v)
+    assert kv.stats.spills == 1
+    assert not kv._pages[0][0].resident
+    kv.release()
+
+
+def test_budget_spills_completed_layer_before_active_layer(tmp_path):
+    """Layer-major attention must not reread its own growing history."""
+    page_bytes = 2 * 2 * 4 * 8 * 2  # K + V, BF16
+    kv = PagedKVCache(
+        num_layers=2,
+        max_bytes=page_bytes,
+        spill_dir=tmp_path,
+        page_positions=4,
+        resident_pages=0,
+    )
+    k = mx.ones((1, 2, 4, 8), dtype=mx.bfloat16)
+    v = mx.zeros((1, 2, 4, 8), dtype=mx.bfloat16)
+    mx.eval(k, v)
+    kv.update(0, k, v)
+    kv.update(1, k, v)
+    assert not kv._pages[0][0].resident
+    assert kv._pages[1][0].resident
+    kv.release()
+
+
 def test_compressed_and_uncompressed_spill_produce_identical_tokens():
     """End-to-end: same model/prompt/budget, compress on vs off -> identical
     generated token IDs. This is a pure byte-transform of the spilled bf16

@@ -116,6 +116,27 @@ def test_resume_rejects_changed_conversion_parameters(tmp_path):
         raise AssertionError("changed parameters were accepted for a resumed conversion")
 
 
+def test_uniform_conversion_resumes_historical_v2_state(tmp_path):
+    source, output = tmp_path / "source", tmp_path / "output"
+    _write_source(source)
+    output.mkdir()
+    (output / ".quantize-incomplete.json").write_text(json.dumps({
+        "version": 2,
+        "source": str(source.resolve()),
+        "profile": "experts",
+        "mode": "mxfp4",
+        "group_size": 32,
+        "bits": 4,
+        "completed_shards": [],
+        "weight_map": {},
+        "quantized_tensors": 0,
+        "total_size": 0,
+    }))
+
+    assert convert_model(source, output) == output
+    assert not (output / ".quantize-incomplete.json").exists()
+
+
 def test_qwen_fused_experts_are_split_and_prequantized(tmp_path):
     source, output = tmp_path / "qwen-source", tmp_path / "qwen-output"
     source.mkdir()

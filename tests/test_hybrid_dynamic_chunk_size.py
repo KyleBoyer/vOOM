@@ -14,14 +14,26 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 
-def _bare_engine(model_type: str, hot_kv_persist, hot_prompt_kv_chunk_size: int = 128):
+def test_prefill_chunk_ceiling_contract_is_sparse_and_default_neutral():
+    from runtime.engine import (
+        QWEN35_PREFILL_CHUNK_CEILINGS, RuntimeConfig)
+
+    assert QWEN35_PREFILL_CHUNK_CEILINGS == {0, 1, 8, 32, 128, 512}
+    assert RuntimeConfig().qwen35_prefill_chunk_ceiling == 0
+
+
+def _bare_engine(model_type: str, hot_kv_persist,
+                 hot_prompt_kv_chunk_size: int = 128,
+                 qwen35_prefill_chunk_ceiling: int = 0):
     from runtime.engine import StreamingEngine
 
     engine = StreamingEngine.__new__(StreamingEngine)
     engine.cfg = SimpleNamespace(model_type=model_type)
     engine._hot_kv_persist = hot_kv_persist
     engine.rc = SimpleNamespace(
-        hot_prompt_kv_chunk_size=hot_prompt_kv_chunk_size, adaptive_chunk_size=False)
+        hot_prompt_kv_chunk_size=hot_prompt_kv_chunk_size,
+        qwen35_prefill_chunk_ceiling=qwen35_prefill_chunk_ceiling,
+        adaptive_chunk_size=False)
     return engine
 
 
@@ -89,6 +101,35 @@ def test_select_chunk_size_samples_fresh_memory_for_new_conversation():
 
     with patch("runtime.engine.psutil.virtual_memory",
                return_value=SimpleNamespace(available=500_000_000)):
+        assert engine._select_prefill_chunk_size(None) == 8
+
+
+def test_explicit_ceiling_clamps_live_selection_but_zero_preserves_auto():
+    auto = _bare_engine("qwen3_5", hot_kv_persist=None)
+    capped = _bare_engine(
+        "qwen3_5", hot_kv_persist=None,
+        qwen35_prefill_chunk_ceiling=128)
+
+    with patch("runtime.engine.psutil.virtual_memory",
+               return_value=SimpleNamespace(available=10_000_000_000)):
+        assert auto._select_prefill_chunk_size(None) == 512
+        assert capped._select_prefill_chunk_size(None) == 128
+
+
+def test_explicit_ceiling_is_applied_after_retry_ceiling():
+    engine = _bare_engine(
+        "qwen3_5_moe", hot_kv_persist=None,
+        qwen35_prefill_chunk_ceiling=128)
+    engine._hybrid_retry_chunk_ceiling = 32
+
+    with patch("runtime.engine.psutil.virtual_memory",
+               return_value=SimpleNamespace(available=10_000_000_000)):
+        assert engine._select_prefill_chunk_size(None) == 32
+
+    engine.rc.qwen35_prefill_chunk_ceiling = 8
+    engine._hybrid_retry_chunk_ceiling = 128
+    with patch("runtime.engine.psutil.virtual_memory",
+               return_value=SimpleNamespace(available=10_000_000_000)):
         assert engine._select_prefill_chunk_size(None) == 8
 
 

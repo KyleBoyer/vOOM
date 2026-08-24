@@ -16,6 +16,8 @@ SDK sends whatever base_url + path you configure).
   POST /v1/messages                — Anthropic Messages API: {model, messages, max_tokens, system?, stop_sequences?}
                                       full tool_use/tool_result round trip, image/video (base64/url
                                       media blocks), streaming (typed SSE events), thinking param
+  POST /v1/qwen/layer-stationary/completions
+                                    — explicit/default-off bounded Qwen multi-request decode
 Response schemas for /v1/responses and /v1/messages are verified against the
 installed `openai`/`anthropic` SDKs' own Pydantic models
 (tests/test_multi_protocol_clients.py, tests/test_protocol_features.py), not
@@ -137,7 +139,8 @@ class PreparedPrompt(str):
 
     def __new__(cls, text: str, token_ids, tool_capsules=(),
                 cache_namespace: str = "default", force_paged_kv: bool = False,
-                stable_boundary_tokens: int = 0):
+                stable_boundary_tokens: int = 0,
+                rerank_capture_shape: dict | None = None):
         instance = super().__new__(cls, text)
         instance.token_ids = tuple(token_ids)
         # Optional (content-id, token-start, token-end) records used only by the
@@ -155,6 +158,9 @@ class PreparedPrompt(str):
         # 0 means "no hint" (not a recurrent-hybrid model, or the template's
         # add_generation_prompt=False rendering wasn't a clean prefix).
         instance.stable_boundary_tokens = int(stable_boundary_tokens or 0)
+        # RAM-only raw counts. The explicit LM-head evidence writer reduces
+        # these to coarse buckets before disk and rejects every other field.
+        instance.rerank_capture_shape = dict(rerank_capture_shape or {})
         return instance
 
 
@@ -999,6 +1005,42 @@ def _qwen_chunked_delta_policy(
     return False, "lossless-checkpoint-boundary"
 
 
+def _qwen_compiled_delta_policy(
+        requested: str, *, model_type: str) -> tuple[bool, str]:
+    """Admit same-operator compiled DeltaNet only by explicit opt-in."""
+    requested = str(requested or "0").strip().lower()
+    if requested not in ("0", "1"):
+        raise ValueError("VMODEL_QWEN35_COMPILED_DELTA must be 0 or 1")
+    if model_type not in ("qwen3_5", "qwen3_5_moe"):
+        return False, "unsupported-architecture"
+    if requested == "0":
+        return False, "operator-disabled"
+    return True, "operator-forced"
+
+
+def _qwen_delta_prefill_policies(
+    compiled_requested: str,
+    chunked_requested: str,
+    *,
+    mode: str,
+    model_type: str,
+) -> tuple[bool, str, bool, str]:
+    """Resolve exact compiled and reassociated chunked modes together."""
+    compiled, compiled_reason = _qwen_compiled_delta_policy(
+        compiled_requested, model_type=model_type)
+    chunked, chunked_reason = _qwen_chunked_delta_policy(
+        chunked_requested, mode=mode, model_type=model_type)
+    if compiled and chunked:
+        if str(chunked_requested).strip().lower() == "auto":
+            chunked = False
+            chunked_reason = "compiled-delta-selected"
+        else:
+            raise ValueError(
+                "VMODEL_QWEN35_COMPILED_DELTA and explicit "
+                "VMODEL_QWEN35_CHUNKED_DELTA=1 are mutually exclusive")
+    return compiled, compiled_reason, chunked, chunked_reason
+
+
 def _qwen_lossy_suffix_prefill_policy(
         requested: str, *, mode: str, total_layers: int,
         layer_types: tuple[str, ...] | list[str]) -> tuple[int, int, int]:
@@ -1113,6 +1155,7 @@ class EngineManager:
 
         from .config import ModelConfig
         from .engine import (
+            QWEN35_PREFILL_CHUNK_CEILINGS,
             RuntimeConfig,
             StreamingEngine,
             hybrid_min_weight_cache_floor_mb as _hybrid_min_weight_cache_floor_mb,
@@ -1134,10 +1177,69 @@ class EngineManager:
             "VMODEL_RESIDENT_BACKEND", "auto").strip().lower()
         qwen_mtp_request = os.environ.get(
             "VMODEL_QWEN_MTP_SPECULATIVE", "auto").strip().lower()
+        qwen_mtp_q_policy_kind = os.environ.get(
+            "VMODEL_QWEN_MTP_Q_POLICY", "flat").strip().lower()
+        try:
+            qwen_mtp_max_prompt_tokens = int(os.environ.get(
+                "VMODEL_QWEN_MTP_MAX_PROMPT_TOKENS", "32768"))
+            qwen_mtp_min_output_tokens = int(os.environ.get(
+                "VMODEL_QWEN_MTP_MIN_OUTPUT_TOKENS", "32"))
+            qwen_mtp_stochastic_draft_top_k = int(os.environ.get(
+                "VMODEL_QWEN_MTP_STOCHASTIC_DRAFT_TOP_K", "4"))
+            qwen_mtp_proposal_replay_top_k = int(os.environ.get(
+                "VMODEL_QWEN_MTP_PROPOSAL_REPLAY_TOP_K", "0"))
+            qwen_mtp_depth = int(os.environ.get(
+                "VMODEL_QWEN_MTP_DEPTH", "1"))
+            qwen_mtp_q_parameter = float(os.environ.get(
+                "VMODEL_QWEN_MTP_Q_PARAMETER", "1"))
+        except ValueError as error:
+            raise RequestValidationError(
+                "VMODEL_QWEN_MTP limits/replay/depth/q settings must be numeric"
+            ) from error
+        if qwen_mtp_max_prompt_tokens <= 0:
+            raise RequestValidationError(
+                "VMODEL_QWEN_MTP_MAX_PROMPT_TOKENS must be positive")
+        if qwen_mtp_min_output_tokens <= 1:
+            raise RequestValidationError(
+                "VMODEL_QWEN_MTP_MIN_OUTPUT_TOKENS must be greater than one")
+        if qwen_mtp_stochastic_draft_top_k <= 0:
+            raise RequestValidationError(
+                "VMODEL_QWEN_MTP_STOCHASTIC_DRAFT_TOP_K must be positive")
+        if qwen_mtp_proposal_replay_top_k < 0:
+            raise RequestValidationError(
+                "VMODEL_QWEN_MTP_PROPOSAL_REPLAY_TOP_K must be non-negative")
+        if qwen_mtp_depth not in (1, 2):
+            raise RequestValidationError(
+                "VMODEL_QWEN_MTP_DEPTH must be 1 or 2")
+        if qwen_mtp_q_policy_kind not in ("flat", "temperature", "rank"):
+            raise RequestValidationError(
+                "VMODEL_QWEN_MTP_Q_POLICY must be flat, temperature, or rank")
+        if not math.isfinite(qwen_mtp_q_parameter) or (
+            qwen_mtp_q_policy_kind == "temperature"
+            and qwen_mtp_q_parameter <= 0
+        ) or (
+            qwen_mtp_q_policy_kind == "rank"
+            and qwen_mtp_q_parameter < 0
+        ):
+            raise RequestValidationError(
+                "VMODEL_QWEN_MTP_Q_PARAMETER must be finite; temperature "
+                "requires >0 and rank requires >=0")
         qwen_moe_prefill_batch_request = os.environ.get(
             "VMODEL_QWEN_MOE_PREFILL_EXPERT_BATCH", "16").strip()
         qwen_moe_decode_batch_request = os.environ.get(
             "VMODEL_QWEN_MOE_DECODE_EXPERT_BATCH", "8").strip()
+        try:
+            qwen35_prefill_chunk_ceiling = int(os.environ.get(
+                "VMODEL_QWEN35_PREFILL_CHUNK_CEILING", "0"))
+        except ValueError as error:
+            raise RequestValidationError(
+                "VMODEL_QWEN35_PREFILL_CHUNK_CEILING must be an integer"
+            ) from error
+        if qwen35_prefill_chunk_ceiling not in (
+                QWEN35_PREFILL_CHUNK_CEILINGS):
+            raise RequestValidationError(
+                "VMODEL_QWEN35_PREFILL_CHUNK_CEILING must be one of "
+                "0, 1, 8, 32, 128, or 512")
         qwen_quant_lm_head_request = os.environ.get(
             "VMODEL_QWEN35_QUANT_LM_HEAD", "0").strip()
         if qwen_quant_lm_head_request not in ("0", "1"):
@@ -1158,6 +1260,60 @@ class EngineManager:
         if qwen_rerank_lm_head_candidates <= 0:
             raise RequestValidationError(
                 "VMODEL_QWEN35_RERANK_LM_HEAD_CANDIDATES must be positive")
+        qwen_rerank_lm_head_source = os.environ.get(
+            "VMODEL_QWEN35_RERANK_LM_HEAD_SOURCE", "").strip()
+        qwen_rerank_lm_head_source_fingerprint = os.environ.get(
+            "VMODEL_QWEN35_RERANK_LM_HEAD_SOURCE_FINGERPRINT", "").strip()
+        try:
+            qwen_rerank_lm_head_recall_probe_every = int(os.environ.get(
+                "VMODEL_QWEN35_RERANK_LM_HEAD_RECALL_PROBE_EVERY", "0"))
+        except ValueError as error:
+            raise RequestValidationError(
+                "VMODEL_QWEN35_RERANK_LM_HEAD_RECALL_PROBE_EVERY must be an "
+                "integer") from error
+        if qwen_rerank_lm_head_recall_probe_every < 0:
+            raise RequestValidationError(
+                "VMODEL_QWEN35_RERANK_LM_HEAD_RECALL_PROBE_EVERY must be "
+                "non-negative")
+        qwen_rerank_lm_head_rank_capture_path = os.environ.get(
+            "VMODEL_QWEN35_RERANK_LM_HEAD_RANK_CAPTURE", "").strip()
+        try:
+            qwen_rerank_lm_head_rank_capture_max_positions = int(os.environ.get(
+                "VMODEL_QWEN35_RERANK_LM_HEAD_RANK_CAPTURE_MAX_POSITIONS",
+                "1200"))
+            qwen_rerank_lm_head_rank_capture_max_per_request = int(
+                os.environ.get(
+                    "VMODEL_QWEN35_RERANK_LM_HEAD_RANK_CAPTURE_MAX_PER_REQUEST",
+                    "128"))
+        except ValueError as error:
+            raise RequestValidationError(
+                "VMODEL_QWEN35_RERANK_LM_HEAD_RANK_CAPTURE limits must be "
+                "integers") from error
+        if qwen_rerank_lm_head_rank_capture_path:
+            if qwen_rerank_lm_head_request != "1":
+                raise RequestValidationError(
+                    "LM-head rank capture requires "
+                    "VMODEL_QWEN35_RERANK_LM_HEAD=1")
+            if qwen_rerank_lm_head_candidates != 64:
+                raise RequestValidationError(
+                    "LM-head promotion capture requires exactly 64 candidates")
+            if not 1000 <= qwen_rerank_lm_head_rank_capture_max_positions <= 1200:
+                raise RequestValidationError(
+                    "LM-head rank capture max positions must be in [1000, 1200]")
+            if not 1 <= qwen_rerank_lm_head_rank_capture_max_per_request <= 128:
+                raise RequestValidationError(
+                    "LM-head rank capture per-request positions must be in [1, 128]")
+        if bool(qwen_rerank_lm_head_source) != bool(
+                qwen_rerank_lm_head_source_fingerprint):
+            raise RequestValidationError(
+                "VMODEL_QWEN35_RERANK_LM_HEAD_SOURCE and "
+                "VMODEL_QWEN35_RERANK_LM_HEAD_SOURCE_FINGERPRINT must be "
+                "set together")
+        if (qwen_rerank_lm_head_rank_capture_path
+                and not qwen_rerank_lm_head_source_fingerprint):
+            raise RequestValidationError(
+                "LM-head rank capture requires the verified exact BF16 source "
+                "and fingerprint")
         if (
             qwen_quant_lm_head_request == "1"
             and qwen_rerank_lm_head_request == "1"
@@ -1439,11 +1595,26 @@ class EngineManager:
         key = (
             str(model_dir), mode, yarn_factor.hex(),
             bool(requires_vision), resident_backend_request,
-            qwen_mtp_request, qwen_moe_prefill_batch_request,
+            qwen_mtp_request,
+            qwen_mtp_max_prompt_tokens,
+            qwen_mtp_min_output_tokens,
+            qwen_mtp_stochastic_draft_top_k,
+            qwen_mtp_proposal_replay_top_k,
+            qwen_mtp_depth,
+            qwen_mtp_q_policy_kind,
+            qwen_mtp_q_parameter.hex(),
+            qwen_moe_prefill_batch_request,
             qwen_moe_decode_batch_request,
+            qwen35_prefill_chunk_ceiling,
             qwen_quant_lm_head_request,
             qwen_rerank_lm_head_request,
             qwen_rerank_lm_head_candidates,
+            qwen_rerank_lm_head_source,
+            qwen_rerank_lm_head_source_fingerprint,
+            qwen_rerank_lm_head_recall_probe_every,
+            qwen_rerank_lm_head_rank_capture_path,
+            qwen_rerank_lm_head_rank_capture_max_positions,
+            qwen_rerank_lm_head_rank_capture_max_per_request,
             native_ct_mxfp4_request,
             k3_scale_sidecar_request,
             bf16_nf12_sidecar_request,
@@ -1493,11 +1664,26 @@ class EngineManager:
         key = (
             str(model_dir), mode, yarn_factor.hex(),
             bool(requires_vision), resident_backend_request,
-            qwen_mtp_request, qwen_moe_prefill_batch_request,
+            qwen_mtp_request,
+            qwen_mtp_max_prompt_tokens,
+            qwen_mtp_min_output_tokens,
+            qwen_mtp_stochastic_draft_top_k,
+            qwen_mtp_proposal_replay_top_k,
+            qwen_mtp_depth,
+            qwen_mtp_q_policy_kind,
+            qwen_mtp_q_parameter.hex(),
+            qwen_moe_prefill_batch_request,
             qwen_moe_decode_batch_request,
+            qwen35_prefill_chunk_ceiling,
             qwen_quant_lm_head_request,
             qwen_rerank_lm_head_request,
             qwen_rerank_lm_head_candidates,
+            qwen_rerank_lm_head_source,
+            qwen_rerank_lm_head_source_fingerprint,
+            qwen_rerank_lm_head_recall_probe_every,
+            qwen_rerank_lm_head_rank_capture_path,
+            qwen_rerank_lm_head_rank_capture_max_positions,
+            qwen_rerank_lm_head_rank_capture_max_per_request,
             native_ct_mxfp4_request,
             k3_scale_sidecar_request,
             bf16_nf12_sidecar_request,
@@ -1541,6 +1727,11 @@ class EngineManager:
         # retry behavior as WeightStore.
         cfg_probe = ModelConfig.from_dir(model_dir)
         mtype = cfg_probe.model_type
+        if (qwen_rerank_lm_head_rank_capture_path
+                and mtype != "qwen3_5"):
+            raise RequestValidationError(
+                "the authoritative K=64 rank capture currently requires the "
+                "dense Qwen3.5-family all-MXFP4 target")
         untied = not cfg_probe.tie_word_embeddings
         if mode == "lossless" and _is_voom_lossy_checkpoint(model_dir):
             raise RequestValidationError(
@@ -1611,6 +1802,9 @@ class EngineManager:
                                    raw_hash_value == "1"),
                                prefill_chunk_size=4096,
                                prefill_checkpoint_every=0)
+            if mtype in ("qwen3_5", "qwen3_5_moe"):
+                rc.qwen35_prefill_chunk_ceiling = (
+                    qwen35_prefill_chunk_ceiling)
             # Grammar fast-forward (token-level jump-forward decoding,
             # 2026-07-23): model-agnostic -- it lives entirely in the
             # constrained-decoding sampler loop, so it is read once here
@@ -2066,8 +2260,9 @@ class EngineManager:
                 # for every conversation (StreamingEngine.generate() skips
                 # the adaptive path whenever self._hot_kv_persist is not
                 # None), trading the new speed/IO benefit for durability.
-                rc.hot_prompt_kv_persist_dir = os.environ.get(
-                    "VMODEL_QWEN35_HOT_KV_PERSIST_DIR", "")
+                if not rc.qwen_lossy_suffix_prefill_early_layers:
+                    rc.hot_prompt_kv_persist_dir = os.environ.get(
+                        "VMODEL_QWEN35_HOT_KV_PERSIST_DIR", "")
                 try:
                     rc.max_weight_cache_mb = int(os.environ.get(
                         "VMODEL_QWEN35_WEIGHT_CACHE_MB",
@@ -2241,6 +2436,14 @@ class EngineManager:
                         "VMODEL_QWEN_MOE_LAYER_STATIONARY_PREFILL must be 0 or 1")
                 rc.layer_stationary_prefill = (
                     qwen_moe_layer_stationary == "1")
+                qwen_boundary_scaffold = os.environ.get(
+                    "VMODEL_QWEN35_FUSED_BOUNDARY_SCAFFOLD_PREFILL", "0")
+                if qwen_boundary_scaffold not in ("0", "1"):
+                    raise ValueError(
+                        "VMODEL_QWEN35_FUSED_BOUNDARY_SCAFFOLD_PREFILL must "
+                        "be 0 or 1")
+                rc.qwen_fused_boundary_scaffold_prefill = (
+                    qwen_boundary_scaffold == "1")
                 (rc.qwen_lossy_suffix_prefill_early_layers,
                  rc.qwen_lossy_suffix_prefill_prefix_tokens,
                  rc.qwen_lossy_suffix_prefill_tokens
@@ -2383,6 +2586,31 @@ class EngineManager:
                 # or forced paged-KV chunking is in play for a given request.
                 rc.layer_stationary_prefill = os.environ.get(
                     "VMODEL_QWEN35_LAYER_STATIONARY_PREFILL", "0") == "1"
+                qwen_boundary_scaffold = os.environ.get(
+                    "VMODEL_QWEN35_FUSED_BOUNDARY_SCAFFOLD_PREFILL", "0")
+                if qwen_boundary_scaffold not in ("0", "1"):
+                    raise ValueError(
+                        "VMODEL_QWEN35_FUSED_BOUNDARY_SCAFFOLD_PREFILL must "
+                        "be 0 or 1")
+                rc.qwen_fused_boundary_scaffold_prefill = (
+                    qwen_boundary_scaffold == "1")
+                (rc.qwen_lossy_suffix_prefill_early_layers,
+                 rc.qwen_lossy_suffix_prefill_prefix_tokens,
+                 rc.qwen_lossy_suffix_prefill_tokens
+                 ) = _qwen_lossy_suffix_prefill_policy(
+                    os.environ.get(
+                        "VMODEL_QWEN35_LOSSY_SUFFIX_PREFILL", ""),
+                    mode=mode,
+                    total_layers=int(cfg_probe.num_hidden_layers),
+                    layer_types=tuple(getattr(cfg_probe, "layer_types", ())),
+                )
+                if rc.qwen_lossy_suffix_prefill_early_layers:
+                    rc.layer_stationary_prefill = True
+                    # The durable format stores one uniform position count
+                    # per layer.  A mixed-depth endpoint deliberately does
+                    # not have that representation, so keep it process-local
+                    # rather than persisting an ambiguous checkpoint.
+                    rc.hot_prompt_kv_persist_dir = ""
                 try:
                     rc.hot_prompt_kv_slots = int(os.environ.get(
                         "VMODEL_QWEN35_HOT_KV_SLOTS", "2"))
@@ -2407,6 +2635,31 @@ class EngineManager:
                 if rc.hot_prompt_kv_min_available_mb < 0:
                     raise ValueError(
                         "VMODEL_QWEN35_MIN_AVAILABLE_MB must be non-negative")
+                try:
+                    rc.qwen_postgen_min_available_mb = int(os.environ.get(
+                        "VMODEL_QWEN35_POSTGEN_MIN_AVAILABLE_MB", "0"))
+                except ValueError as error:
+                    raise ValueError(
+                        "VMODEL_QWEN35_POSTGEN_MIN_AVAILABLE_MB must be an "
+                        "integer") from error
+                if rc.qwen_postgen_min_available_mb < 0:
+                    raise ValueError(
+                        "VMODEL_QWEN35_POSTGEN_MIN_AVAILABLE_MB must be "
+                        "non-negative")
+                qwen35_weight_cache_request = os.environ.get(
+                    "VMODEL_QWEN35_WEIGHT_CACHE_MB")
+                if qwen35_weight_cache_request is not None:
+                    try:
+                        rc.max_weight_cache_mb = int(
+                            qwen35_weight_cache_request)
+                    except ValueError as error:
+                        raise ValueError(
+                            "VMODEL_QWEN35_WEIGHT_CACHE_MB must be an "
+                            "integer") from error
+                    if not 1500 <= rc.max_weight_cache_mb <= 8500:
+                        raise ValueError(
+                            "VMODEL_QWEN35_WEIGHT_CACHE_MB must be in "
+                            "[1500, 8500]")
                 # F95 (2026-07-21): off by default now, per explicit user
                 # choice -- durable persistence bakes ONE chunk size into
                 # its on-disk format for the whole store, incompatible with
@@ -2417,12 +2670,49 @@ class EngineManager:
                 # for every conversation (StreamingEngine.generate() skips
                 # the adaptive path whenever self._hot_kv_persist is not
                 # None), trading the new speed/IO benefit for durability.
-                rc.hot_prompt_kv_persist_dir = os.environ.get(
-                    "VMODEL_QWEN35_HOT_KV_PERSIST_DIR", "")
+                if not rc.qwen_lossy_suffix_prefill_early_layers:
+                    rc.hot_prompt_kv_persist_dir = os.environ.get(
+                        "VMODEL_QWEN35_HOT_KV_PERSIST_DIR", "")
                 # lm_head streaming is the same unconditional, bit-identical
                 # win it is for the MoE sibling regardless of dense/MoE.
                 rc.pin_lm_head = False
                 rc.stream_lm_head = True
+                # A pre-quantized dense checkpoint cannot use the raw-BF16
+                # StreamedLMHead reader: its head is already an MLX QTensor.
+                # Give experiments an explicit way to keep that compact head
+                # resident across decode sweeps. This is a representation-
+                # preserving cache policy, but remains off until the live
+                # memory/prefetch ladder proves a net win on this 16 GB host.
+                qwen_pin_head = os.environ.get(
+                    "VMODEL_QWEN35_PIN_LM_HEAD", "0")
+                if qwen_pin_head not in ("0", "1"):
+                    raise ValueError(
+                        "VMODEL_QWEN35_PIN_LM_HEAD must be 0 or 1")
+                if qwen_pin_head == "1":
+                    rc.stream_lm_head = False
+                    rc.pin_lm_head = True
+                try:
+                    rc.pin_trunk_budget_mb = int(os.environ.get(
+                        "VMODEL_QWEN35_PIN_TRUNK_BUDGET_MB", "0"))
+                except ValueError as error:
+                    raise ValueError(
+                        "VMODEL_QWEN35_PIN_TRUNK_BUDGET_MB must be an integer"
+                    ) from error
+                if not 0 <= rc.pin_trunk_budget_mb <= 3000:
+                    raise ValueError(
+                        "VMODEL_QWEN35_PIN_TRUNK_BUDGET_MB must be in "
+                        "[0, 3000]")
+                try:
+                    rc.prefetch_depth = int(os.environ.get(
+                        "VMODEL_QWEN35_PREFETCH_DEPTH",
+                        str(rc.prefetch_depth)))
+                except ValueError as error:
+                    raise ValueError(
+                        "VMODEL_QWEN35_PREFETCH_DEPTH must be an integer"
+                    ) from error
+                if not 0 <= rc.prefetch_depth <= 4:
+                    raise ValueError(
+                        "VMODEL_QWEN35_PREFETCH_DEPTH must be in [0, 4]")
                 # 2026-07-23: dense qwen3_5 is fully dense (no MoE sparsity),
                 # so lossless decode touches every layer every token -- a
                 # flat 6000 MB cache against Qwen3.5-9B's real ~19.3 GB bf16
@@ -2438,11 +2728,12 @@ class EngineManager:
                 # maximum that leaves headroom for KV/activations/governor
                 # reservations within the ceiling (the live governor still
                 # shrinks this further under real pressure regardless).
-                rc.max_weight_cache_mb = min(
-                    8000,
-                    math.ceil(
-                        _checkpoint_payload_bytes(model_dir) * 1.07
-                        / 1_000_000))
+                if "VMODEL_QWEN35_WEIGHT_CACHE_MB" not in os.environ:
+                    rc.max_weight_cache_mb = min(
+                        8000,
+                        math.ceil(
+                            _checkpoint_payload_bytes(model_dir) * 1.07
+                            / 1_000_000))
                 # 2026-07-20: live-confirmed the SAME governor.reserve()
                 # failure mode as the MoE sibling above -- a real
                 # lossy-Qwen3.6-27B request (the largest dense model here)
@@ -2473,6 +2764,61 @@ class EngineManager:
                 rc.hot_prompt_kv_chunk_size = rc.prefill_chunk_size
                 rc.min_weight_cache_mb = _hybrid_min_weight_cache_floor_mb(
                     qwen35_dense_available_bytes)
+                try:
+                    qwen35_kv_max_mb = int(os.environ.get(
+                        "VMODEL_QWEN35_KV_MAX_MB", "0"))
+                    qwen35_kv_chunk = int(os.environ.get(
+                        "VMODEL_QWEN35_KV_PREFILL_CHUNK_SIZE", "128"))
+                except ValueError as error:
+                    raise ValueError(
+                        "VMODEL_QWEN35_KV limits must be integers") from error
+                if qwen35_kv_max_mb and not 128 <= qwen35_kv_max_mb <= 6000:
+                    raise ValueError(
+                        "VMODEL_QWEN35_KV_MAX_MB must be 0 or in [128, 6000]")
+                if not 1 <= qwen35_kv_chunk <= 512:
+                    raise ValueError(
+                        "VMODEL_QWEN35_KV_PREFILL_CHUNK_SIZE must be in "
+                        "[1, 512]")
+                qwen35_paged_persist = os.environ.get(
+                    "VMODEL_QWEN35_PAGED_KV_PERSIST", "0")
+                if qwen35_paged_persist not in ("0", "1"):
+                    raise ValueError(
+                        "VMODEL_QWEN35_PAGED_KV_PERSIST must be 0 or 1")
+                if qwen35_paged_persist == "1" and not qwen35_kv_max_mb:
+                    raise ValueError(
+                        "VMODEL_QWEN35_PAGED_KV_PERSIST requires "
+                        "VMODEL_QWEN35_KV_MAX_MB")
+                if qwen35_kv_max_mb:
+                    # Exact BF16 pages are the only safe way to admit the full
+                    # released-schema 49K-token harness shape on this 16 GB
+                    # host. The KDA recurrent companion remains resident;
+                    # only the conventional full-attention K/V history pages.
+                    rc.max_kv_mb = qwen35_kv_max_mb
+                    rc.release_paged_kv_after_generate = True
+                    rc.kv_page_positions = 256
+                    rc.kv_spill_dir = os.environ.get(
+                        "VMODEL_QWEN35_KV_SPILL_DIR",
+                        str(ROOT / ".kv_spill" / model_dir.name),
+                    )
+                    rc.kv_spill_compress = False
+                    rc.prefill_chunk_size = qwen35_kv_chunk
+                    rc.hot_prompt_kv_chunk_size = qwen35_kv_chunk
+                    if qwen35_paged_persist == "1":
+                        if not rc.hot_prompt_kv_persist_dir:
+                            raise ValueError(
+                                "VMODEL_QWEN35_PAGED_KV_PERSIST requires "
+                                "VMODEL_QWEN35_HOT_KV_PERSIST_DIR")
+                        if rc.qwen_fused_boundary_scaffold_prefill:
+                            raise ValueError(
+                                "paged durable KV is incompatible with fused "
+                                "boundary/scaffold prefill")
+                        rc.hot_prompt_kv = True
+                        rc.paged_kv_persist = True
+                    else:
+                        # Historical single-request paged profile: no durable
+                        # state and no in-memory hot cache.
+                        rc.hot_prompt_kv = False
+                        rc.hot_prompt_kv_persist_dir = ""
                 if mode in ("fast", "fast-long"):
                     # No expert-only profile exists for a dense checkpoint --
                     # full MXFP4 (attention + MLP + lm_head all quantized),
@@ -2483,7 +2829,45 @@ class EngineManager:
                     rc.quant_mode = "mxfp4"
                     rc.quant_group_size = 32
                     rc.quant_min_dim = 0
-                    rc.max_weight_cache_mb = 7000
+                    if qwen_rerank_lm_head_request == "1":
+                        if not qwen_rerank_lm_head_source:
+                            raise ValueError(
+                                "dense all-MXFP4 reranking requires "
+                                "VMODEL_QWEN35_RERANK_LM_HEAD_SOURCE and "
+                                "its fingerprint")
+                        # The target checkpoint already supplies the compact
+                        # MXFP4 shortlist projection. Pin only that ~0.28x
+                        # representation; exact BF16 candidate rows are read
+                        # from the separately fingerprinted released source.
+                        rc.stream_lm_head = False
+                        rc.pin_lm_head = True
+                        rc.quant_lm_head = True
+                        rc.rerank_lm_head = True
+                        rc.rerank_lm_head_mode = "mxfp4"
+                        rc.rerank_lm_head_bits = 4
+                        rc.rerank_lm_head_group_size = 32
+                        rc.rerank_lm_head_candidates = (
+                            qwen_rerank_lm_head_candidates)
+                        rc.rerank_lm_head_source = (
+                            qwen_rerank_lm_head_source)
+                        rc.rerank_lm_head_source_fingerprint = (
+                            qwen_rerank_lm_head_source_fingerprint)
+                        rc.rerank_lm_head_recall_probe_every = (
+                            qwen_rerank_lm_head_recall_probe_every)
+                        rc.rerank_lm_head_rank_capture_path = (
+                            qwen_rerank_lm_head_rank_capture_path)
+                        rc.rerank_lm_head_rank_capture_max_positions = (
+                            qwen_rerank_lm_head_rank_capture_max_positions)
+                        rc.rerank_lm_head_rank_capture_max_per_request = (
+                            qwen_rerank_lm_head_rank_capture_max_per_request)
+                    # Keep the measured 7 GB automatic default, but do not
+                    # overwrite an explicit operator/profile safety budget.
+                    # The earlier Qwen branch already parsed and range-checked
+                    # VMODEL_QWEN35_WEIGHT_CACHE_MB; dense fast mode used to
+                    # discard it here, making the documented control inert on
+                    # the largest (and most memory-sensitive) checkpoint.
+                    if "VMODEL_QWEN35_WEIGHT_CACHE_MB" not in os.environ:
+                        rc.max_weight_cache_mb = 7000
                     # SQ26: zmlx's fused DeltaNet decode kernels. Gated to
                     # fast/lossy mode ONLY, never lossless -- a real bf16
                     # precision difference exists per-call even though a real
@@ -3373,14 +3757,54 @@ class EngineManager:
             rc.kimi_k3_dense_mlp_short_tile_size = (
                 k3_dense_mlp_short_tile_size
             )
+            compiled_delta_request = os.environ.get(
+                "VMODEL_QWEN35_COMPILED_DELTA", "0")
             chunked_delta_request = os.environ.get(
                 "VMODEL_QWEN35_CHUNKED_DELTA", "auto")
+            native_delta_request = os.environ.get(
+                "VMODEL_QWEN35_NATIVE_FUSED_DELTA_PREFILL", "0")
+            if native_delta_request not in ("0", "1"):
+                raise RequestValidationError(
+                    "VMODEL_QWEN35_NATIVE_FUSED_DELTA_PREFILL must be 0 or 1")
             try:
-                (rc.qwen_chunked_delta_prefill,
-                 chunked_delta_reason) = _qwen_chunked_delta_policy(
-                    chunked_delta_request, mode=mode, model_type=mtype)
+                (rc.qwen_compiled_delta_prefill,
+                 compiled_delta_reason,
+                 rc.qwen_chunked_delta_prefill,
+                 chunked_delta_reason) = _qwen_delta_prefill_policies(
+                    compiled_delta_request,
+                    chunked_delta_request,
+                    mode=mode,
+                    model_type=mtype,
+                )
             except ValueError as error:
                 raise RequestValidationError(str(error)) from error
+            rc.qwen_native_fused_delta_prefill = bool(
+                native_delta_request == "1"
+                and mtype in ("qwen3_5", "qwen3_5_moe"))
+            native_delta_reason = (
+                "operator-disabled"
+                if native_delta_request == "0" else
+                "unsupported-architecture"
+                if mtype not in ("qwen3_5", "qwen3_5_moe") else
+                "operator-forced-lossy"
+            )
+            if rc.qwen_native_fused_delta_prefill:
+                if mode not in ("fast", "fast-long"):
+                    raise RequestValidationError(
+                        "VMODEL_QWEN35_NATIVE_FUSED_DELTA_PREFILL is lossy "
+                        "and requires a fast mode")
+                if rc.qwen_compiled_delta_prefill:
+                    raise RequestValidationError(
+                        "compiled and native-fused Qwen DeltaNet prefill are "
+                        "mutually exclusive")
+                if rc.qwen_chunked_delta_prefill:
+                    if str(chunked_delta_request).strip().lower() == "auto":
+                        rc.qwen_chunked_delta_prefill = False
+                        chunked_delta_reason = "native-fused-delta-selected"
+                    else:
+                        raise RequestValidationError(
+                            "explicit chunked and native-fused Qwen DeltaNet "
+                            "prefill are mutually exclusive")
             fp8_kv_request = os.environ.get(
                 "VMODEL_QWEN35_FP8_KV_CACHE", "0")
             if fp8_kv_request not in ("0", "1"):
@@ -3466,6 +3890,11 @@ class EngineManager:
                     f"chunk={rc.prefill_chunk_size} "
                     f"adaptive_chunk={int(rc.adaptive_chunk_size)} "
                     f"layer_stationary={int(rc.layer_stationary_prefill)} "
+                    f"compiled_delta={int(rc.qwen_compiled_delta_prefill)} "
+                    f"compiled_delta_reason={compiled_delta_reason} "
+                    f"native_delta="
+                    f"{int(rc.qwen_native_fused_delta_prefill)} "
+                    f"native_delta_reason={native_delta_reason} "
                     f"chunked_delta={int(rc.qwen_chunked_delta_prefill)} "
                     f"chunked_delta_reason={chunked_delta_reason} "
                     f"expert_batch={rc.expert_fetch_batch}/"
@@ -3716,20 +4145,19 @@ class EngineManager:
                 # shapes, and retained KDA midpoint restoration on rejection.
                 # This removes both causes of F110's older MoE regression
                 # without accepting any draft without target verification.
-                from .qwen35_mtp import QwenMTPSpeculativeEngine
+                from .qwen35_mtp import ProposalQPolicy, QwenMTPSpeculativeEngine
 
                 try:
-                    try:
-                        qwen_mtp_max_prompt_tokens = int(os.environ.get(
-                            "VMODEL_QWEN_MTP_MAX_PROMPT_TOKENS", "32768"))
-                        qwen_mtp_min_output_tokens = int(os.environ.get(
-                            "VMODEL_QWEN_MTP_MIN_OUTPUT_TOKENS", "32"))
-                        qwen_mtp_stochastic_draft_top_k = int(os.environ.get(
-                            "VMODEL_QWEN_MTP_STOCHASTIC_DRAFT_TOP_K", "4"))
-                    except ValueError as error:
-                        raise ValueError(
-                            "VMODEL_QWEN_MTP prompt/output limits must be integers"
-                        ) from error
+                    proposal_q_policy = ProposalQPolicy(
+                        qwen_mtp_q_policy_kind,
+                        qwen_mtp_stochastic_draft_top_k,
+                        temperature=(
+                            qwen_mtp_q_parameter
+                            if qwen_mtp_q_policy_kind == "temperature" else 1.0),
+                        rank_power=(
+                            qwen_mtp_q_parameter
+                            if qwen_mtp_q_policy_kind == "rank" else 1.0),
+                    )
                     self._engine = QwenMTPSpeculativeEngine(
                         target_engine,
                         max_prompt_tokens=qwen_mtp_max_prompt_tokens,
@@ -3743,6 +4171,10 @@ class EngineManager:
                         adaptive_stop=True,
                         stochastic_draft_top_k=(
                             qwen_mtp_stochastic_draft_top_k),
+                        proposal_replay_top_k=(
+                            qwen_mtp_proposal_replay_top_k),
+                        depth=qwen_mtp_depth,
+                        proposal_q_policy=proposal_q_policy,
                         plain_warmup_tokens=(
                             3 if qwen_mtp_request == "auto" else 0))
                     print(
@@ -3751,7 +4183,11 @@ class EngineManager:
                         f"prompt_limit={qwen_mtp_max_prompt_tokens} "
                         f"min_output={qwen_mtp_min_output_tokens} "
                         f"stochastic_draft_top_k="
-                        f"{qwen_mtp_stochastic_draft_top_k}",
+                        f"{qwen_mtp_stochastic_draft_top_k} "
+                        f"proposal_replay_top_k="
+                        f"{qwen_mtp_proposal_replay_top_k} "
+                        f"depth={qwen_mtp_depth} "
+                        f"q_policy={proposal_q_policy.name}",
                         flush=True,
                     )
                 except Exception as error:
@@ -5227,8 +5663,52 @@ def _engine_generate(engine, *args, expert_top_k: int = 0, **kwargs):
         cfg.expert_top_k_by_layer = schedule
         if rc is not None:
             rc.expert_top_k_by_layer = schedule
+    head = getattr(engine, "_lm_head_w", None)
+    rank_capture = getattr(head, "recall_rank_capture", None)
+    if rank_capture is not None:
+        from .lm_head_recall_capture import privacy_safe_request_shape
+        from .quant import reranked_lm_head_capture_scope
+
+        prompt = args[0] if args else ""
+        raw_shape = dict(getattr(prompt, "rerank_capture_shape", {}) or {})
+        prompt_tokens = raw_shape.get("prompt_tokens")
+        if prompt_tokens is None:
+            prepared = getattr(prompt, "token_ids", None)
+            prompt_tokens = (
+                len(prepared) if prepared is not None
+                else len(engine.tokenizer.encode(str(prompt)).ids))
+        sampling = kwargs.get("sampling")
+        shape = privacy_safe_request_shape(
+            prompt_tokens=int(prompt_tokens),
+            system_chars=int(raw_shape.get("system_chars", 0)),
+            tool_count=int(raw_shape.get("tool_count", 0)),
+            message_count=int(raw_shape.get("message_count", 1)),
+            developer=bool(raw_shape.get("developer", False)),
+            streaming=callable(kwargs.get("on_token")),
+            temperature_class=(
+                "greedy" if bool(getattr(sampling, "is_greedy", True))
+                else "stochastic"),
+            constrained=kwargs.get("constraint") is not None,
+        )
+        capture_context = rank_capture.request(shape)
+        # Grammar state is sequential and the legal shortlist is selected by
+        # StreamingEngine._constraint_logits. Suppress the earlier unrestricted
+        # projection so a constrained request contributes exactly its real
+        # authoritative decisions, never provisional full-vocabulary rows.
+        head_capture_context = reranked_lm_head_capture_scope(
+            head,
+            ("constraint-provisional"
+             if kwargs.get("constraint") is not None
+             else "authoritative-target"),
+        )
+    else:
+        from contextlib import nullcontext
+
+        capture_context = nullcontext()
+        head_capture_context = nullcontext()
     try:
-        result = generate(*args, **kwargs)
+        with capture_context, head_capture_context:
+            result = generate(*args, **kwargs)
     finally:
         if expert_top_k:
             cfg.expert_top_k_by_layer = old_cfg_schedule
@@ -5352,6 +5832,25 @@ def _hidden_gateway_terminal_pagination_synthesis(
         if message.get("role") == "user"
     ), "")
     return bool(_GATEWAY_PAGINATION_REQUEST_RE.search(user_text))
+
+
+def _hidden_gateway_deterministic_policy_render(
+        messages: list[dict], enabled: bool):
+    """Attempt an explicit fail-closed host policy render.
+
+    This switch is intentionally separate from generic terminal synthesis.
+    The policy adapter recognizes a complete typed tool-result contract; an
+    unsupported request returns no render and follows the ordinary model path.
+    Keeping the enable check in this production helper makes it directly
+    unit-testable and prevents a fixture-only 100/100 result from being
+    mistaken for a connected serving optimization.
+    """
+    from .policy_executor import (
+        PolicyRenderAttempt, attempt_completed_plex_policy)
+
+    if not enabled:
+        return PolicyRenderAttempt(None, "disabled")
+    return attempt_completed_plex_policy(messages)
 
 
 def _hidden_gateway_force_reason(messages: list[dict]) -> str | None:
@@ -6602,12 +7101,28 @@ def _prepare_chat_prompt(engine, model_dir: Path, messages: list[dict], reasonin
         f"prompt_token_cache_hit={metadata['prompt_token_cache_hit']}",
         flush=True,
     )
+    system_chars = sum(
+        len(json.dumps(
+            message.get("content", ""), ensure_ascii=False,
+            separators=(",", ":")))
+        for message in messages
+        if message.get("role") == "system"
+    )
     return (PreparedPrompt(
                 prompt, prompt_ids, tool_capsules,
                 cache_namespace=cache_namespace,
                 force_paged_kv=bool(
                     (resident_kv or {}).get("adaptive_spill_required", 0)),
-                stable_boundary_tokens=stable_boundary_tokens),
+                stable_boundary_tokens=stable_boundary_tokens,
+                rerank_capture_shape={
+                    "prompt_tokens": prompt_tokens,
+                    "system_chars": system_chars,
+                    "tool_count": requested,
+                    "message_count": len(messages),
+                    "developer": any(
+                        message.get("role") == "developer"
+                        for message in messages),
+                }),
             prompt_tokens, (
                 prompt_tools
                 if relevant_parameter_messages is not None else selected_tools),
@@ -7099,26 +7614,119 @@ def _vision_protocol_timing(result: dict) -> dict:
         "weight_cache_hits",
         "weight_cache_misses",
         "weight_cache_evictions",
+        "weight_cache_pinned_hits",
+        "weight_cache_prefetch_hits",
+        "weight_prefetch_waits",
+        "weight_prefetch_wait_ns",
+        "weight_prefetch_loads",
+        "weight_prefetch_loaded_bytes",
+        "weight_prefetch_load_ns",
+        "weight_prefetch_useful_pages",
+        "weight_prefetch_useful_bytes",
+        "weight_prefetch_useful_load_ns",
+        "weight_prefetch_wasted_pages",
+        "weight_prefetch_wasted_bytes",
+        "weight_prefetch_wasted_load_ns",
+        "parallel_tier_fetches",
+        "parallel_tier_fast_bytes",
+        "parallel_tier_archive_bytes",
+        "parallel_tier_wall_ns",
+        "parallel_tier_fast_service_ns",
+        "parallel_tier_archive_service_ns",
+        "parallel_tier_hidden_ns",
+        "weight_cache_pinned_bytes",
+        "weight_cache_prefetched_bytes",
+        "planned_trunk_pin_layers",
+        "planned_trunk_pin_bytes",
+        "qwen_compiled_delta_prefill",
+        "qwen_native_fused_delta_prefill",
+        "qwen_chunked_delta_prefill",
+        "reranked_lm_head_calls",
+        "reranked_lm_head_positions",
+        "reranked_lm_head_candidate_winner_changes",
+        "reranked_lm_head_candidate_recall_probes",
+        "reranked_lm_head_candidate_recall_hits",
+        "reranked_lm_head_candidate_read_calls",
+        "reranked_lm_head_candidate_read_extents",
+        "reranked_lm_head_candidate_rows_requested",
+        "reranked_lm_head_candidate_unique_rows_read",
+        "reranked_lm_head_candidate_bytes_read",
+        "reranked_lm_head_candidate_recall_full_scan_calls",
+        "reranked_lm_head_candidate_recall_full_scan_bytes",
+        "reranked_lm_head_candidate_rank_capture_positions",
+        "qwen_mtp_target_reranked_lm_head_calls",
+        "qwen_mtp_target_reranked_lm_head_positions",
+        "qwen_mtp_target_reranked_lm_head_candidate_winner_changes",
+        "qwen_mtp_target_reranked_lm_head_candidate_recall_probes",
+        "qwen_mtp_target_reranked_lm_head_candidate_recall_hits",
+        "qwen_mtp_target_reranked_lm_head_candidate_read_calls",
+        "qwen_mtp_target_reranked_lm_head_candidate_read_extents",
+        "qwen_mtp_target_reranked_lm_head_candidate_rows_requested",
+        "qwen_mtp_target_reranked_lm_head_candidate_unique_rows_read",
+        "qwen_mtp_target_reranked_lm_head_candidate_bytes_read",
+        "qwen_mtp_target_reranked_lm_head_candidate_recall_full_scan_calls",
+        "qwen_mtp_target_reranked_lm_head_candidate_recall_full_scan_bytes",
+        "qwen_mtp_target_reranked_lm_head_candidate_rank_capture_positions",
+        "qwen_mtp_draft_reranked_lm_head_calls",
+        "qwen_mtp_draft_reranked_lm_head_positions",
+        "qwen_mtp_draft_reranked_lm_head_candidate_winner_changes",
+        "qwen_mtp_draft_reranked_lm_head_candidate_recall_probes",
+        "qwen_mtp_draft_reranked_lm_head_candidate_recall_hits",
+        "qwen_mtp_draft_reranked_lm_head_candidate_read_calls",
+        "qwen_mtp_draft_reranked_lm_head_candidate_read_extents",
+        "qwen_mtp_draft_reranked_lm_head_candidate_rows_requested",
+        "qwen_mtp_draft_reranked_lm_head_candidate_unique_rows_read",
+        "qwen_mtp_draft_reranked_lm_head_candidate_bytes_read",
+        "qwen_mtp_draft_reranked_lm_head_candidate_recall_full_scan_calls",
+        "qwen_mtp_draft_reranked_lm_head_candidate_recall_full_scan_bytes",
+        "qwen_mtp_draft_reranked_lm_head_candidate_rank_capture_positions",
         "expert_cache_hits",
         "expert_cache_misses",
         "qwen_mtp_enabled",
         "qwen_mtp_used",
         "qwen_mtp_proposed",
+        "qwen_mtp_depth",
+        "qwen_mtp_verify_width",
+        "qwen_mtp_speculative_rounds",
+        "qwen_mtp_verified_proposals",
         "qwen_mtp_accepted",
+        "qwen_mtp_full_accept_rounds",
+        "qwen_mtp_partial_accept_rounds",
+        "qwen_mtp_rejected_rounds",
         "qwen_mtp_target_sweeps",
+        "qwen_mtp_plain_equivalent_target_sweeps",
+        "qwen_mtp_target_sweeps_avoided",
         "qwen_mtp_decode_tokens",
         "qwen_mtp_adaptive_disabled",
         "qwen_mtp_plain_decode_sweeps",
         "qwen_mtp_warmup_decode_sweeps",
         "qwen_mtp_serial_verify_rounds",
+        "qwen_mtp_verifier_input_positions",
+        "qwen_mtp_verifier_committed_positions",
+        "qwen_mtp_verifier_rolled_back_positions",
+        "qwen_mtp_verifier_output_tokens",
+        "qwen_mtp_verifier_accepted_draft_tokens",
+        "qwen_mtp_verifier_correction_tokens",
+        "qwen_mtp_verifier_bonus_tokens",
         "qwen_mtp_kda_endpoint_restores",
         "qwen_mtp_refeed_sweeps_saved",
+        "qwen_mtp_target_prefix_rollbacks",
+        "qwen_mtp_draft_kv_rollbacks",
         "qwen_mtp_constraint_verified",
         "qwen_mtp_stochastic",
         "qwen_mtp_stochastic_draft_argmax",
         "qwen_mtp_stochastic_draft_top_k",
         "qwen_mtp_grammar_forced_tokens",
         "qwen_mtp_grammar_forced_sweeps",
+        "qwen_mtp_request_local_sidecar_pin",
+        "qwen_mtp_request_local_sidecar_bytes",
+        "qwen_mtp_bf16_sidecar_round_loads",
+        "qwen_mtp_bf16_sidecar_round_releases",
+        "qwen_mtp_bf16_sidecar_read_bytes",
+        "qwen_mtp_bf16_sidecar_loaded_resident_bytes",
+        "qwen_mtp_bf16_sidecar_released_resident_bytes",
+        "qwen_mtp_bf16_sidecar_peak_resident_bytes",
+        "qwen_mtp_bf16_sidecar_cache_discards",
         "qwen_native_mtp_loaded",
         "qwen_native_mtp_enabled",
         "qwen_native_mtp_used",
@@ -7148,6 +7756,8 @@ def _vision_protocol_timing(result: dict) -> dict:
         "postgen_weight_cache_trim_released_bytes",
         "postgen_weight_cache_trim_available_before_bytes",
         "postgen_weight_cache_trim_available_after_bytes",
+        "qwen35_prefill_chunk_ceiling",
+        "qwen35_prefill_chunk_selected",
         "kimi_k3_prefill_tile_width",
         "kimi_k3_dense_mlp_tile_size",
         "kimi_k3_prefill_long_context_tokens",
@@ -7158,6 +7768,24 @@ def _vision_protocol_timing(result: dict) -> dict:
     optional_float_fields = (
         "qwen_mtp_accept_rate",
         "qwen_mtp_stochastic_expected_acceptance",
+        "weight_prefetch_wait_s",
+        "weight_prefetch_load_s",
+        "weight_prefetch_useful_load_s",
+        "weight_prefetch_wasted_load_s",
+        "weight_prefetch_hidden_lower_bound_s",
+        "parallel_tier_wall_s",
+        "parallel_tier_fast_service_s",
+        "parallel_tier_archive_service_s",
+        "parallel_tier_hidden_s",
+        "qwen_mtp_target_tokens_per_sweep",
+        "qwen_mtp_verifier_tokens_per_sweep",
+        "qwen_mtp_draft_round_s",
+        "qwen_mtp_verifier_round_s",
+        "qwen_mtp_bf16_sidecar_load_s",
+        "qwen_mtp_bf16_sidecar_release_s",
+        "reranked_lm_head_candidate_recall",
+        "qwen_mtp_target_reranked_lm_head_candidate_recall",
+        "qwen_mtp_draft_reranked_lm_head_candidate_recall",
         "resident_persistent_prompt_cache_load_s",
         "resident_persistent_prompt_cache_save_s",
     )
@@ -7171,6 +7799,20 @@ def _vision_protocol_timing(result: dict) -> dict:
     ):
         if key in stats or key in result:
             value[key] = str(metric(key) or "")
+    # Proposal calibration is explicit opt-in (the serving adapter emits it
+    # only when VMODEL_QWEN_MTP_PROPOSAL_REPLAY_TOP_K is positive). Preserve
+    # its small structured rows, plus the normalized policy/step counters,
+    # instead of silently dropping the evidence at the protocol boundary.
+    for key in (
+        "qwen_mtp_accepted_by_step",
+        "qwen_mtp_verified_by_step",
+        "qwen_mtp_stochastic_expected_acceptance_by_step",
+        "qwen_mtp_q_policy",
+        "qwen_mtp_engine_identity",
+        "qwen_mtp_proposal_q_replay",
+    ):
+        if key in stats or key in result:
+            value[key] = metric(key)
     return value
 
 
@@ -7216,6 +7858,8 @@ def _execution_profile_fields(engine) -> dict[str, object]:
             f"-g{rc.rerank_lm_head_group_size}"
             f"-rerank{rc.rerank_lm_head_candidates}"
         )
+        if getattr(rc, "rerank_lm_head_source_fingerprint", ""):
+            weight_profile += "+exact-row-paged"
     if rc is not None and getattr(rc, "resident_attention_mode", ""):
         weight_profile += (
             f"+attn-{rc.resident_attention_mode}"
@@ -7241,6 +7885,18 @@ def _execution_profile_fields(engine) -> dict[str, object]:
         "vmodel_weight_profile": weight_profile,
         "vmodel_backend": str(getattr(engine, "backend_name", "voom")),
     }
+    if rc is not None and getattr(rc, "qwen35_prefill_chunk_ceiling", 0):
+        fields["vmodel_qwen35_prefill_chunk_ceiling"] = int(
+            rc.qwen35_prefill_chunk_ceiling)
+    if rc is not None and getattr(
+            rc, "rerank_lm_head_source_fingerprint", ""):
+        fields.update({
+            "vmodel_lm_head_exact_rows": "released-bf16-row-paged",
+            "vmodel_lm_head_candidates": int(
+                rc.rerank_lm_head_candidates),
+            "vmodel_lm_head_source_fingerprint": (
+                rc.rerank_lm_head_source_fingerprint),
+        })
     if rc is not None and getattr(rc, "kimi_k3_compiled_kda_prefill", False):
         fields["vmodel_kda_prefill"] = "compiled-mlx-byte-identical"
     elif (
@@ -7557,7 +8213,8 @@ class Handler(BaseHTTPRequestHandler):
         """
         route = self._route()
         if route not in ("/completions", "/chat/completions",
-                         "/responses", "/messages"):
+                         "/responses", "/messages",
+                         "/qwen/layer-stationary/completions"):
             # The declared body has not been consumed, so this connection
             # cannot safely carry another keep-alive request.
             self.close_connection = True
@@ -7640,10 +8297,156 @@ class Handler(BaseHTTPRequestHandler):
             return None
         return raw, req, length
 
+    def _do_qwen_layer_stationary_batch(self, req: dict, length: int):
+        """Serve the explicit bounded Qwen multi-request endpoint.
+
+        ``do_POST`` already owns ``INFER_LOCK`` here.  Keeping this endpoint
+        separate from the ordinary protocol paths prevents it from silently
+        becoming an automatic queue/latency policy.
+        """
+        from .qwen35_multi_request_server import (
+            QwenMultiRequestServerConfig,
+            QwenMultiRequestValidationError,
+            parse_batch_payload,
+            run_qwen_multi_request_batch,
+            unwrap_qwen_target,
+        )
+
+        try:
+            config = QwenMultiRequestServerConfig.from_env()
+            if not config.enabled:
+                return self._json(404, {"error": (
+                    "Qwen layer-stationary batch serving is disabled; set "
+                    "VMODEL_QWEN_MULTI_REQUEST_BATCH=1 to expose it")})
+            requested_model = req.get("model")
+            if not isinstance(requested_model, str) or not requested_model:
+                raise QwenMultiRequestValidationError(
+                    "model must be a non-empty string")
+            items = parse_batch_payload(req, config)
+            model_id, suffix_mode = split_model_mode(requested_model)
+            requested_mode = (self.headers.get("X-VModel-Mode")
+                              or req.get("vmodel_mode")
+                              or suffix_mode or "lossless")
+            if not isinstance(requested_mode, str):
+                raise QwenMultiRequestValidationError(
+                    "vmodel_mode must be a string")
+            mode = requested_mode.lower()
+            if mode not in ("lossless", "fast"):
+                raise QwenMultiRequestValidationError(
+                    "vmodel_mode must be lossless|fast for Qwen multi-request serving")
+        except QwenMultiRequestValidationError as error:
+            raise RequestValidationError(str(error)) from error
+
+        try:
+            model_dir = _resolve(model_id)
+        except ModelDownloading as error:
+            elapsed = time.time() - error.status["started_at"]
+            return self._json(202, {
+                "error": (
+                    f"model '{model_id}' is not local yet -- a background "
+                    f"download started {elapsed:.0f}s ago; retry shortly"),
+                "vmodel_download_status": "downloading",
+                "elapsed_seconds": round(elapsed, 1),
+            })
+        except ModelDownloadFailed as error:
+            return self._json(422, {
+                "error": (
+                    f"model '{model_id}' could not be downloaded or loaded: "
+                    f"{error.error}"),
+                "vmodel_download_status": "failed",
+            })
+        if mode == "fast":
+            model_dir = _preferred_fast_artifact(model_dir)
+        engine = MANAGER.get(model_dir, mode, requires_vision=False)
+        try:
+            target = unwrap_qwen_target(engine)
+            prepared_items = []
+            total_prompt_tokens = 0
+            batch_namespace = f"qwen-layer-stationary:{uuid.uuid4().hex}"
+            for item in items:
+                token_ids = tuple(target.tokenizer.encode(item.prompt).ids)
+                if len(token_ids) > config.max_prompt_tokens:
+                    raise QwenMultiRequestValidationError(
+                        f"request {item.request_id!r} has {len(token_ids)} prompt "
+                        f"tokens; configured maximum is {config.max_prompt_tokens}")
+                total_prompt_tokens += len(token_ids)
+                _validate_context_budget(
+                    target, len(token_ids), item.max_tokens,
+                    prompt_label=f"request {item.request_id!r} prompt",
+                    output_label="max_tokens",
+                )
+                prepared_items.append(replace(
+                    item,
+                    prompt=PreparedPrompt(
+                        item.prompt,
+                        token_ids,
+                        cache_namespace=(
+                            f"{batch_namespace}:{item.request_id}"),
+                    ),
+                    prompt_token_ids=token_ids,
+                ))
+            if total_prompt_tokens > config.max_total_prompt_tokens:
+                raise QwenMultiRequestValidationError(
+                    f"batch has {total_prompt_tokens} total prompt tokens; "
+                    f"configured maximum is {config.max_total_prompt_tokens}")
+
+            def bootstrap(prompt, max_tokens, **kwargs):
+                return _engine_generate(
+                    target, prompt, max_tokens, **kwargs)
+
+            result = run_qwen_multi_request_batch(
+                target,
+                prepared_items,
+                max_requests=config.max_requests,
+                bootstrap_generate=bootstrap,
+            )
+        except QwenMultiRequestValidationError as error:
+            raise RequestValidationError(str(error)) from error
+
+        prompt_tokens = sum(
+            value["prompt_tokens"] for value in result["choices"])
+        completion_tokens = sum(
+            value["completion_tokens"] for value in result["choices"])
+        print(
+            f"[server] <- /qwen/layer-stationary/completions "
+            f"model={model_id} mode={mode} requests={len(prepared_items)} "
+            f"prompt_tokens={prompt_tokens} max_output_tokens="
+            f"{sum(item.max_tokens for item in prepared_items)} "
+            f"body_bytes={length}",
+            flush=True,
+        )
+        result["telemetry"].update({
+            "config_identity": config.identity,
+            "configured_max_requests": config.max_requests,
+            "configured_max_prompt_tokens": config.max_prompt_tokens,
+            "configured_max_total_prompt_tokens": (
+                config.max_total_prompt_tokens),
+            "configured_max_output_tokens": config.max_output_tokens,
+            "configured_max_total_output_tokens": (
+                config.max_total_output_tokens),
+        })
+        return self._json(200, {
+            "id": f"vmdl-batch-{uuid.uuid4().hex[:12]}",
+            "object": "qwen.layer_stationary.batch_completion",
+            "created": int(time.time()),
+            "model": model_id,
+            "vmodel_mode": mode,
+            "choices": result["choices"],
+            "usage": {
+                "prompt_tokens": prompt_tokens,
+                "completion_tokens": completion_tokens,
+                "total_tokens": prompt_tokens + completion_tokens,
+            },
+            "vmodel_multi_request_config": config.as_dict(),
+            "vmodel_multi_request_telemetry": result["telemetry"],
+        })
+
     def _do_post_locked(self):
         raw, req, length = self._parsed_request
         try:
             route = self._route()
+            if route == "/qwen/layer-stationary/completions":
+                return self._do_qwen_layer_stationary_batch(req, length)
             requested_model = req.get("model", "SmolLM2-135M")
             if not isinstance(requested_model, str) or not requested_model:
                 return self._json(400, {"error": "model must be a non-empty string"})
@@ -8300,6 +9103,10 @@ class Handler(BaseHTTPRequestHandler):
         gateway_literal_grounding = False
         gateway_terminal_pagination_synthesis_enabled = False
         gateway_terminal_pagination_synthesis = False
+        gateway_deterministic_policy_enabled = False
+        gateway_deterministic_policy_reason = "gateway-disabled"
+        gateway_deterministic_render = None
+        gateway_deterministic_tokens: tuple[int, ...] = ()
         gateway_terminal_context_profile = "none"
         gateway_terminal_context_reason = "not-terminal-synthesis"
         gateway_terminal_context_omitted_chars = 0
@@ -8396,6 +9203,36 @@ class Handler(BaseHTTPRequestHandler):
             gateway_terminal_pagination_synthesis = (
                 gateway_terminal_pagination_synthesis_enabled
                 and _hidden_gateway_terminal_pagination_synthesis(msgs))
+            gateway_deterministic_policy_value = os.environ.get(
+                "VMODEL_FAST_TOOL_GATEWAY_DETERMINISTIC_POLICY", "0")
+            if gateway_deterministic_policy_value not in ("0", "1"):
+                raise RequestValidationError(
+                    "VMODEL_FAST_TOOL_GATEWAY_DETERMINISTIC_POLICY must be "
+                    "0 or 1")
+            gateway_deterministic_policy_enabled = (
+                gateway_deterministic_policy_value == "1")
+            gateway_deterministic_policy_allowed = (
+                tool_choice == "auto" and self._structured_output is None)
+            gateway_deterministic_attempt = \
+                _hidden_gateway_deterministic_policy_render(
+                    msgs, gateway_deterministic_policy_enabled
+                    and gateway_deterministic_policy_allowed)
+            gateway_deterministic_policy_reason = (
+                gateway_deterministic_attempt.reason)
+            if (gateway_deterministic_policy_enabled
+                    and not gateway_deterministic_policy_allowed):
+                gateway_deterministic_policy_reason = (
+                    "unsupported-tool-choice-or-structured-output")
+            gateway_deterministic_render = gateway_deterministic_attempt.render
+            if gateway_deterministic_render is not None:
+                gateway_deterministic_tokens = tuple(
+                    engine.tokenizer.encode(
+                        gateway_deterministic_render.text).ids)
+                if len(gateway_deterministic_tokens) > max_output_tokens:
+                    gateway_deterministic_render = None
+                    gateway_deterministic_tokens = ()
+                    gateway_deterministic_policy_reason = (
+                        "deterministic-output-exceeds-request-budget")
             try:
                 (gateway_abstention_enabled,
                  gateway_abstention_reason) = \
@@ -8415,16 +9252,19 @@ class Handler(BaseHTTPRequestHandler):
                 max_activated=gateway_max_activated)
             gateway_force_reason = (
                 "client-required" if tool_choice == "required"
-                else None if gateway_terminal_pagination_synthesis
+                else None if (gateway_terminal_pagination_synthesis
+                              or gateway_deterministic_render is not None)
                 else _hidden_gateway_force_reason(msgs)
             )
             gateway_virtual_tools, gateway_virtual_raw = (
                 _hidden_gateway_virtual_pairs())
             prompt_catalog = (
-                [] if gateway_terminal_pagination_synthesis
+                [] if (gateway_terminal_pagination_synthesis
+                       or gateway_deterministic_render is not None)
                 else gateway_virtual_tools)
             prompt_raw_catalog = (
-                [] if gateway_terminal_pagination_synthesis
+                [] if (gateway_terminal_pagination_synthesis
+                       or gateway_deterministic_render is not None)
                 else gateway_virtual_raw)
             if gateway_terminal_pagination_synthesis:
                 try:
@@ -8463,37 +9303,59 @@ class Handler(BaseHTTPRequestHandler):
             prompt_raw_catalog = all_raw_tools
             decision_messages = msgs
 
-        prompt, prompt_tokens, prompt_tools, selected_raw_tools, tool_selection = \
-            _prepare_chat_prompt(
-                engine, model_dir, decision_messages, self._reasoning_effort,
-                prompt_catalog,
-                prompt_raw_catalog, mode, max_output_tokens,
-                enable_thinking=self._enable_thinking,
-                reasoning_requested=self._reasoning_requested,
-                cache_namespace=(
-                    "gateway_decision" if gateway_enabled else "default"),
-                # Nested parameter descriptions are expensive only while a
-                # broad catalog is still present.  A directly supplied small
-                # catalog is already selected, so preserve semantic contrasts
-                # (path vs section, movie vs TV ratings) just as the gateway's
-                # post-retrieval execution phase does.
-                preserve_tool_parameter_prose=(
-                    not gateway_enabled and len(prompt_catalog) <= 4))
+        if gateway_deterministic_render is not None:
+            # The typed executor already consumed the completed tool-result
+            # suffix.  Do not render/tokenize a model prompt for a response
+            # that will never enter the model.
+            prompt = ""
+            prompt_tokens = 0
+            prompt_tools = []
+            selected_raw_tools = []
+            tool_selection = {
+                "requested": len(all_tools),
+                "selected": 0,
+                "lossy_shortlist": False,
+                "shortlist_soft_limit": gateway_limit,
+                "pinned": gateway_pinned,
+                "schema_profile": "deterministic-policy-host",
+                "tool_retrieval_profile": "typed-policy-v1",
+            }
+        else:
+            (prompt, prompt_tokens, prompt_tools, selected_raw_tools,
+             tool_selection) = _prepare_chat_prompt(
+                    engine, model_dir, decision_messages,
+                    self._reasoning_effort, prompt_catalog,
+                    prompt_raw_catalog, mode, max_output_tokens,
+                    enable_thinking=self._enable_thinking,
+                    reasoning_requested=self._reasoning_requested,
+                    cache_namespace=(
+                        "gateway_decision" if gateway_enabled else "default"),
+                    # Nested parameter descriptions are expensive only while a
+                    # broad catalog is still present. A directly supplied
+                    # small catalog is already selected, so preserve semantic
+                    # contrasts just as post-retrieval execution does.
+                    preserve_tool_parameter_prose=(
+                        not gateway_enabled and len(prompt_catalog) <= 4))
         gateway_decision_choice = (
-            "none" if gateway_terminal_pagination_synthesis else
+            "none" if (gateway_terminal_pagination_synthesis
+                       or gateway_deterministic_render is not None) else
             _hidden_gateway_decision_choice(
                 tool_choice, gateway_force_reason,
                 bool(gateway_activated_names))
             if gateway_enabled else tool_choice)
-        self._constraint = _configure_constraint(
-            engine, self._structured_output, prompt_tools, gateway_decision_choice,
-            False if gateway_enabled else allow_parallel_tool_calls)
+        self._constraint = (
+            None if gateway_deterministic_render is not None else
+            _configure_constraint(
+                engine, self._structured_output, prompt_tools,
+                gateway_decision_choice,
+                False if gateway_enabled else allow_parallel_tool_calls))
         gateway_constraint = self._constraint
         # API response parsing never admits the gateway-only virtual function.
         # It may parse any caller-supplied real tool, while constrained decoding
         # ensures the model itself only sees/calls the phase's selected subset.
         response_parse_tools = (
-            [] if gateway_terminal_pagination_synthesis else all_tools)
+            [] if (gateway_terminal_pagination_synthesis
+                   or gateway_deterministic_render is not None) else all_tools)
         response_raw_tools = (
             requested_raw_tools if gateway_enabled or tool_choice == "none"
             else selected_raw_tools)
@@ -8605,6 +9467,57 @@ class Handler(BaseHTTPRequestHandler):
             """Run one hidden discovery decision and at most one real-tool pass."""
             nonlocal prompt, prompt_tokens, prompt_tools, selected_raw_tools
             nonlocal tool_selection
+
+            if gateway_deterministic_render is not None:
+                render = gateway_deterministic_render
+                result = {
+                    "text": render.text,
+                    "tokens": gateway_deterministic_tokens,
+                    "prompt_tokens": 0,
+                    "prefill_s": 0.0,
+                    "decode_s": 0.0,
+                    "first_token_s": 0.0,
+                    "total_s": 0.0,
+                    "termination_reason": "stop",
+                    "path_stats": {
+                        "prompt_cache_namespace": "gateway_policy_host",
+                        "prompt_cache_source": "host",
+                    },
+                    "execution_profile": {
+                        "level": "deterministic-policy-host",
+                        "hotspots": [],
+                    },
+                }
+                result["vmodel_cache_phases"] = [
+                    _cache_phase_telemetry("gateway_policy_render", result)]
+                tool_selection = {
+                    **tool_selection,
+                    "hidden_tool_gateway": True,
+                    "gateway_phase": "deterministic-policy-render",
+                    "gateway_decision_prompt_tokens": 0,
+                    "gateway_decision_output_tokens": 0,
+                    "gateway_search_rounds": 0,
+                    "gateway_deterministic_policy_enabled": int(
+                        gateway_deterministic_policy_enabled),
+                    "gateway_deterministic_policy_rendered": 1,
+                    "gateway_deterministic_policy_reason": (
+                        gateway_deterministic_policy_reason),
+                    "gateway_deterministic_policy_profile": render.profile,
+                    "gateway_deterministic_policy_pages": render.pages,
+                    "gateway_deterministic_policy_input_rows": (
+                        render.input_rows),
+                    "gateway_deterministic_policy_accepted_rows": (
+                        render.accepted_rows),
+                    "gateway_deterministic_policy_rejected_rows": (
+                        render.rejected_rows),
+                    "gateway_terminal_pagination_synthesis": int(
+                        gateway_terminal_pagination_synthesis),
+                    "gateway_terminal_pagination_synthesis_enabled": int(
+                        gateway_terminal_pagination_synthesis_enabled),
+                }
+                if on_token is not None and render.text:
+                    on_token(render.text)
+                return result
 
             host_query, gateway_query_context_profile = \
                 _hidden_gateway_semantic_query(msgs, gateway_force_reason)
@@ -8718,6 +9631,11 @@ class Handler(BaseHTTPRequestHandler):
                     gateway_terminal_pagination_synthesis),
                 "gateway_terminal_pagination_synthesis_enabled": int(
                     gateway_terminal_pagination_synthesis_enabled),
+                "gateway_deterministic_policy_enabled": int(
+                    gateway_deterministic_policy_enabled),
+                "gateway_deterministic_policy_rendered": 0,
+                "gateway_deterministic_policy_reason": (
+                    gateway_deterministic_policy_reason),
                 "gateway_terminal_context_profile": (
                     gateway_terminal_context_profile),
                 "gateway_terminal_context_reason": (

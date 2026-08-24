@@ -4,7 +4,7 @@ speculative decoding (QwenMTPSpeculativeEngine, runtime/qwen35_mtp.py).
 Every existing test for this feature (tests/test_qwen35_mtp_engine.py,
 tests/test_qwen35_mtp_rollback.py) exercises it against synthetic/mocked
 target engines -- never against a real checkpoint. This closes that gap
-against the real Qwen3.6-27B-mlx-all-mxfp4 checkpoint (prequantized,
+against a real dense 27B Qwen hybrid checkpoint (prequantized,
 resident_fast_decode -- the same compute-bound config F103 used, so the
 real speed benefit is measurable rather than swamped by disk I/O for
 this 18GB dense model), matching this project's "greedy A/B,
@@ -27,11 +27,20 @@ from runtime.engine import RuntimeConfig, StreamingEngine
 from runtime.qwen35_mtp import QwenMTPSpeculativeEngine
 from runtime.sampler import SamplingParams
 
-_REAL_MODEL_DIR = (
-    Path(__file__).resolve().parent.parent / "models" / "Qwen3.6-27B-mlx-all-mxfp4")
+_MODEL_ROOT = Path(__file__).resolve().parent.parent / "models"
+_REAL_MODEL_DIR = next(
+    (
+        path for path in (
+            _MODEL_ROOT / "Huihui-Qwen3.8-27B-abliterated-mlx-all-mxfp4",
+            _MODEL_ROOT / "Qwen3.6-27B-mlx-all-mxfp4",
+        )
+        if path.exists()
+    ),
+    _MODEL_ROOT / "Huihui-Qwen3.8-27B-abliterated-mlx-all-mxfp4",
+)
 _model_skip = pytest.mark.skipif(
     not _REAL_MODEL_DIR.exists(),
-    reason="real Qwen3.6-27B-mlx-all-mxfp4 checkpoint not present on this machine")
+    reason="real dense 27B Qwen MXFP4 checkpoint not present on this machine")
 
 _PROMPT = (
     "The capital of France is Paris. The capital of Germany is Berlin. "

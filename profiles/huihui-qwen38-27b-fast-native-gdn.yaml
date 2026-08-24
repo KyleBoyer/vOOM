@@ -1,0 +1,12 @@
+schema: voom.runtime-profile.v1
+name: huihui-qwen38-27b-fast-native-gdn
+description: Explicit lossy serial-Metal DeltaNet prefill candidate for Huihui Qwen3.8 27B.
+notes:
+  - "Extends the quality-gated fast agent route but replaces chunked WY DeltaNet prefill with a serial Metal kernel."
+  - "The recurrence is causal and numerically close, but scalar FP32 reductions change association; this profile is never lossless."
+  - "The composed H1/P2 cold capture retained the response hash and reduced prefill to 56.262s, but wall improved only 0.335s and the strict swap-out gate failed by 39,936 bytes; keep opt-in."
+extends:
+  - huihui-qwen38-27b-fast-agent
+settings:
+  VMODEL_QWEN35_CHUNKED_DELTA: false
+  VMODEL_QWEN35_NATIVE_FUSED_DELTA_PREFILL: true

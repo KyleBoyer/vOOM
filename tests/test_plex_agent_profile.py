@@ -86,7 +86,7 @@ def test_omitted_first_offset_uses_tool_schema_default_zero():
     assert result["checks"]["pagination_offset_increased"]["passed"]
 
 
-def test_explicit_post_filtering_and_final_section_are_scored_semantically():
+def test_visible_bad_prefix_cannot_be_hidden_behind_final_list_heading():
     calls = [
         _call(mediaType="all", ratingOperator="lte",
               movieRatingValue="PG-13", showRatingValue="TV-Y7",
@@ -108,13 +108,14 @@ DELTA_TVY7
 """
     result = score_profile(calls, text)
     assert result["checks"]["excluded_kids_root"]["passed"]
-    assert all(result["ineligible_titles_absent"].values())
-    assert result["answer_slice_used"]
-    assert result["score"] == 100
-    assert result["passed"]
+    assert not any(result["ineligible_titles_absent"].values())
+    assert not result["answer_slice_used"]
+    assert result["whole_visible_output_scanned"]
+    assert result["score"] == 85
+    assert not result["passed"]
 
 
-def test_reverification_heading_delimits_clean_selection_from_analysis():
+def test_visible_reverification_heading_does_not_amnesty_bad_titles():
     calls = [
         _call(mediaType="all", excludeRootFolderPath="/Kids/",
               ratingOperator="lte", movieRatingValue="PG-13",
@@ -132,8 +133,11 @@ CHARLIE_TVY
 DELTA_TVY7
 """
     result = score_profile(calls, text)
-    assert result["answer_slice_used"]
-    assert result["passed"]
+    assert not result["answer_slice_used"]
+    assert not result["ineligible_titles_absent"]["ECHO_R"]
+    assert not result["ineligible_titles_absent"]["JULIET_TVPG"]
+    assert result["score"] == 95
+    assert not result["passed"]
 
 
 def test_profile_can_explicitly_enable_reasoning_without_mutating_capture(tmp_path):

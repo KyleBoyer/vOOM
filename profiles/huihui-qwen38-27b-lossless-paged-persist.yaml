@@ -1,0 +1,13 @@
+schema: voom.runtime-profile.v1
+name: huihui-qwen38-27b-lossless-paged-persist
+description: Explicit released-BF16 Huihui route with disk-durable paged hybrid prefix checkpoints.
+notes:
+  - "Extends the corrected paged BF16 path and persists exact full-attention K/V plus every DeltaNet state and convolution history."
+  - "The journal is external-volume, checksummed, fingerprinted, disk-only, and used only for exact stable-boundary extensions; rewind and divergence fail closed."
+  - "The corrected 49K greedy cold/restart gate is byte-identical and the restart passes at 14.791s wall / 0.927GB Metal with zero weight reads. Keep this profile opt-in because cold journal construction adds a scaffold sweep, consumes 6.3GB, and exceeded the fixture's strict swap-out limit."
+extends:
+  - huihui-qwen38-27b-lossless
+settings:
+  VMODEL_QWEN35_FUSED_BOUNDARY_SCAFFOLD_PREFILL: false
+  VMODEL_QWEN35_HOT_KV_PERSIST_DIR: /Volumes/Workspace NVME/git/vOOM/.kv_prompts/huihui-qwen38-27b-lossless
+  VMODEL_QWEN35_PAGED_KV_PERSIST: true

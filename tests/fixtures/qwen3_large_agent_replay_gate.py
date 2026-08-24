@@ -1036,7 +1036,12 @@ def main() -> int:
     report = {
         "gate": "qwen3-large-agent-private-replay-v1",
         "capture": {
-            "label": known_label, "sha256": digest, "bytes": len(raw),
+            # Recompute from immutable input bytes here.  The expectation loop
+            # above also validates runtime profile/effective digests; it must
+            # never be able to overwrite the capture identity persisted in the
+            # proof artifact merely by reusing a local variable name.
+            "label": known_label,
+            "sha256": hashlib.sha256(raw).hexdigest(), "bytes": len(raw),
             "tools": capture_tools,
         },
         "request": {

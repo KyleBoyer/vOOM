@@ -1,4 +1,4 @@
-"""F128/F177: bounded fast-tier mirror of Kimi K3's always-touched tensors.
+"""F128/F177: bounded raw-safetensors fast-tier mirror.
 
 Unlike `formats/fast_tier.py` (which stages *predicted* hot experts ranked
 by learned routing heat -- the same weak-locality class this project's own
@@ -12,9 +12,12 @@ so there is no prediction risk -- only a real question of whether a second,
 comparably-fast local disk can serve them concurrently with the main
 external volume during a real fetch.
 
-Raw byte-exact copies (no MLX/dtype involvement at all) straight from each
-tensor's real safetensors data_offsets -- lossless by construction, not by
-re-verification after the fact.
+The byte copier is architecture-agnostic and is also useful for dense Qwen
+checkpoints: with a partial, layer-balanced mirror, each layer fetch can read
+from the internal and external NVMe devices concurrently. Raw byte-exact copies
+(no MLX/dtype involvement at all) come straight from each tensor's real
+safetensors data_offsets -- lossless by construction, not by re-verification
+after the fact.
 """
 
 from __future__ import annotations
@@ -30,7 +33,10 @@ from collections import defaultdict
 from pathlib import Path
 
 _EXPERT_RE = re.compile(r"block_sparse_moe\.experts\.")
-_LAYER_RE = re.compile(r"(?:^|\.)model\.layers\.(\d+)\.")
+_LAYER_RE = re.compile(
+    r"(?:^|\.)(?:model\.language_model|language_model\.model|model)"
+    r"\.layers\.(\d+)\."
+)
 MAX_INTERNAL_FAST_TIER_BYTES = 90_000_000_000
 MIN_INTERNAL_FREE_BYTES = 10_000_000_000
 MANIFEST_RESERVE_BYTES = 2_000_000
@@ -62,7 +68,8 @@ def _category(name: str) -> str | None:
     if _EXPERT_RE.search(name):
         return None
     if ("embed_tokens" in name or "lm_head" in name
-            or "vision_tower" in name or "mm_projector" in name):
+            or "vision_tower" in name or "mm_projector" in name
+            or ".visual." in name or name.startswith("visual.")):
         return None
     return "keep"
 

@@ -16,6 +16,7 @@ from __future__ import annotations
 
 from pathlib import Path
 import json
+import threading
 
 import mlx.core as mx
 import pytest
@@ -82,6 +83,34 @@ def test_budgeted_selection_balances_layers():
     assert selected_by_layer == {0: 60, 1: 60}
 
 
+def test_budgeted_selection_balances_qwen_multimodal_wrapper_layers():
+    """Qwen uses model.language_model.layers, unlike K3's older fixture."""
+    from formats.kimi_k3_fast_tier import _select_budgeted
+
+    candidates = [
+        {
+            "name": (
+                f"model.language_model.layers.{layer}.mlp.proj{index}.weight"
+            ),
+            "shard": f"{layer}.safetensors",
+            "offset": index * 60,
+            "nbytes": size,
+        }
+        for layer in (0, 1)
+        for index, size in enumerate((60, 40))
+    ]
+    selected = _select_budgeted(candidates, 120)
+    selected_by_layer = {
+        layer: sum(
+            item["nbytes"]
+            for item in selected
+            if f"layers.{layer}." in item["name"]
+        )
+        for layer in (0, 1)
+    }
+    assert selected_by_layer == {0: 60, 1: 60}
+
+
 def test_fast_tier_packs_selected_tensors_per_shard(tmp_path):
     from formats.kimi_k3_fast_tier import build_fast_tier
 
@@ -124,6 +153,40 @@ def test_fast_tier_packs_selected_tensors_per_shard(tmp_path):
         canonical = raw_name.removeprefix("language_model.")
         mx.eval(packed[canonical])
         assert packed[canonical].shape == (64,)
+
+    # WeightStore is used both directly with the parent root and by server
+    # autodiscovery with the already model-specific directory.  Both must
+    # resolve the same manifest rather than appending the model name twice.
+    from runtime.model_loader import WeightStore
+
+    for configured_dir in (fast_root, target):
+        store = WeightStore.__new__(WeightStore)
+        store.fast_dirs = [configured_dir]
+        store.dir = model_dir
+        store._raw_fast_tier_manifest = None
+        store._raw_fast_tier_root = None
+        store._ensure_raw_fast_tier_loaded()
+        assert store._raw_fast_tier_root == target
+        assert set(store._raw_fast_tier_manifest) == {
+            raw_name.removeprefix("language_model.") for raw_name in names
+        }
+
+
+def test_raw_fast_tier_reuses_one_store_lifetime_worker():
+    """Long decode must not construct a new MLX-calling thread per layer."""
+    from runtime.model_loader import WeightStore
+
+    store = WeightStore.__new__(WeightStore)
+    store._stage_lock = threading.Lock()
+    store._raw_fast_tier_executor = None
+    first = store._raw_fast_tier_executor_for_reads()
+    second = store._raw_fast_tier_executor_for_reads()
+    assert first is second
+    assert first.submit(lambda: 17).result() == 17
+    store.close()
+    assert store._raw_fast_tier_executor is None
+    with pytest.raises(RuntimeError, match="shutdown"):
+        first.submit(lambda: 18)
 
 
 @_model_skip

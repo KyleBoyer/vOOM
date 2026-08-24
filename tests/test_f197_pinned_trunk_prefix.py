@@ -149,3 +149,25 @@ def test_plan_pinned_prefix_handles_uneven_layers():
 def test_plan_pinned_prefix_rejects_nothing_fitting():
     assert plan_pinned_prefix([], 1_000) == 0
     assert plan_pinned_prefix([LAYER_BYTES] * 4, 0) == 0
+
+
+def test_plan_separates_pin_cap_from_total_cache_and_reserves_prefetch():
+    layers = [LAYER_BYTES] * 8
+    # The trunk may consume at most five layers, but depth two must leave three
+    # unpinned layer slots (one demand + two prefetched) plus one reserve slot.
+    assert plan_pinned_prefix(
+        layers,
+        8 * LAYER_BYTES,
+        reserve_bytes=LAYER_BYTES,
+        pin_limit_bytes=5 * LAYER_BYTES,
+        prefetch_depth=2,
+    ) == 4
+    # With 2 MB already consumed by persistent pins, the caller passes only
+    # the 6 MB remaining cache room and the safe prefix shrinks accordingly.
+    assert plan_pinned_prefix(
+        layers,
+        6 * LAYER_BYTES,
+        reserve_bytes=LAYER_BYTES,
+        pin_limit_bytes=5 * LAYER_BYTES,
+        prefetch_depth=2,
+    ) == 2

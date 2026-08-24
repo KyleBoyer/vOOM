@@ -8,6 +8,7 @@ import sys
 import tempfile
 import threading
 import time
+from contextlib import contextmanager
 from types import SimpleNamespace
 from pathlib import Path
 
@@ -39,6 +40,7 @@ from runtime.server import (Handler, INFER_LOCK, PreparedPrompt, PriorityLock, R
                             _HIDDEN_GATEWAY_TERMINAL_PAGINATION_POLICY,
                             _hidden_gateway_terminal_context,
                             _hidden_gateway_terminal_pagination_synthesis,
+                            _hidden_gateway_deterministic_policy_render,
                             _hidden_gateway_host_action,
                             _hidden_gateway_initial_pagination_defaults,
                             _hidden_gateway_pagination_call,
@@ -67,7 +69,9 @@ from runtime.server import (Handler, INFER_LOCK, PreparedPrompt, PriorityLock, R
                             _engine_generate,
                             _grammar_jump_forward_policy,
                             _has_own_method,
+                            _qwen_compiled_delta_policy,
                             _qwen_chunked_delta_policy,
+                            _qwen_delta_prefill_policies,
                             _qwen_lossy_suffix_prefill_policy,
                             _speculative_draft_for,
                             _request_reasoning_controls, _request_sampling,
@@ -178,15 +182,174 @@ def test_vision_protocol_timing_uses_generic_path_stats():
 
 
 def test_vision_protocol_timing_exposes_qwen_mtp_round_trace():
+    replay = [{"depth": 1, "draft_token_ids": [7, 9]}]
     timing = _vision_protocol_timing({
         "path_stats": {
             "qwen_mtp_used": 1,
             "qwen_mtp_round_outcomes": "AARRA",
+            "qwen_mtp_depth": 2,
+            "qwen_mtp_bf16_sidecar_round_loads": 3,
+            "qwen_mtp_bf16_sidecar_round_releases": 3,
+            "qwen_mtp_bf16_sidecar_read_bytes": 1234,
+            "qwen_mtp_target_sweeps": 5,
+            "qwen_mtp_plain_equivalent_target_sweeps": 8,
+            "qwen_mtp_target_sweeps_avoided": 3,
+            "qwen_mtp_target_tokens_per_sweep": 1.6,
+            "qwen_mtp_verifier_input_positions": 10,
+            "qwen_mtp_verifier_committed_positions": 8,
+            "qwen_mtp_verifier_rolled_back_positions": 2,
+            "qwen_mtp_verifier_output_tokens": 8,
+            "qwen_mtp_verifier_tokens_per_sweep": 1.6,
+            "qwen_mtp_verifier_accepted_draft_tokens": 4,
+            "qwen_mtp_verifier_correction_tokens": 1,
+            "qwen_mtp_verifier_bonus_tokens": 3,
+            "qwen_mtp_draft_round_s": 0.75,
+            "qwen_mtp_verifier_round_s": 2.5,
+            "qwen_mtp_accepted_by_step": [2, 1],
+            "qwen_mtp_q_policy": {"kind": "flat", "top_k": 4},
+            "qwen_mtp_proposal_q_replay": replay,
         },
     })
 
     assert timing["qwen_mtp_used"] == 1
     assert timing["qwen_mtp_round_outcomes"] == "AARRA"
+    assert timing["qwen_mtp_depth"] == 2
+    assert timing["qwen_mtp_bf16_sidecar_round_loads"] == 3
+    assert timing["qwen_mtp_bf16_sidecar_round_releases"] == 3
+    assert timing["qwen_mtp_bf16_sidecar_read_bytes"] == 1234
+    assert timing["qwen_mtp_target_sweeps"] == 5
+    assert timing["qwen_mtp_plain_equivalent_target_sweeps"] == 8
+    assert timing["qwen_mtp_target_sweeps_avoided"] == 3
+    assert timing["qwen_mtp_target_tokens_per_sweep"] == 1.6
+    assert timing["qwen_mtp_verifier_input_positions"] == 10
+    assert timing["qwen_mtp_verifier_committed_positions"] == 8
+    assert timing["qwen_mtp_verifier_rolled_back_positions"] == 2
+    assert timing["qwen_mtp_verifier_output_tokens"] == 8
+    assert timing["qwen_mtp_verifier_tokens_per_sweep"] == 1.6
+    assert timing["qwen_mtp_verifier_accepted_draft_tokens"] == 4
+    assert timing["qwen_mtp_verifier_correction_tokens"] == 1
+    assert timing["qwen_mtp_verifier_bonus_tokens"] == 3
+    assert timing["qwen_mtp_draft_round_s"] == 0.75
+    assert timing["qwen_mtp_verifier_round_s"] == 2.5
+    assert timing["qwen_mtp_accepted_by_step"] == [2, 1]
+    assert timing["qwen_mtp_q_policy"] == {"kind": "flat", "top_k": 4}
+    assert timing["qwen_mtp_proposal_q_replay"] == replay
+
+
+def test_protocol_timing_exposes_qwen35_prefill_ceiling_and_selection():
+    timing = _vision_protocol_timing({
+        "path_stats": {
+            "prefill_step_size": 128,
+            "qwen35_prefill_chunk_ceiling": 128,
+            "qwen35_prefill_chunk_selected": 128,
+        },
+    })
+
+    assert timing["prefill_step_size"] == 128
+    assert timing["qwen35_prefill_chunk_ceiling"] == 128
+    assert timing["qwen35_prefill_chunk_selected"] == 128
+
+
+def test_protocol_timing_exposes_qwen_delta_arithmetic_mode():
+    timing = _vision_protocol_timing({
+        "path_stats": {
+            "qwen_compiled_delta_prefill": 1,
+            "qwen_native_fused_delta_prefill": 0,
+            "qwen_chunked_delta_prefill": 0,
+        },
+    })
+
+    assert timing["qwen_compiled_delta_prefill"] == 1
+    assert timing["qwen_native_fused_delta_prefill"] == 0
+    assert timing["qwen_chunked_delta_prefill"] == 0
+
+
+def test_protocol_timing_exposes_pin_and_prefetch_measurements():
+    timing = _vision_protocol_timing({
+        "path_stats": {
+            "weight_cache_pinned_hits": 11,
+            "weight_cache_prefetch_hits": 7,
+            "weight_prefetch_waits": 3,
+            "weight_prefetch_wait_ns": 125_000_000,
+            "weight_prefetch_wait_s": 0.125,
+            "weight_prefetch_loads": 9,
+            "weight_prefetch_useful_pages": 7,
+            "weight_prefetch_wasted_pages": 2,
+            "weight_prefetch_hidden_lower_bound_s": 0.75,
+            "parallel_tier_fetches": 64,
+            "parallel_tier_fast_bytes": 40_000_000,
+            "parallel_tier_archive_bytes": 60_000_000,
+            "parallel_tier_hidden_s": 1.5,
+            "weight_cache_pinned_bytes": 400_000_000,
+            "weight_cache_prefetched_bytes": 200_000_000,
+            "planned_trunk_pin_layers": 4,
+            "planned_trunk_pin_bytes": 350_000_000,
+        },
+    })
+
+    assert timing["weight_cache_pinned_hits"] == 11
+    assert timing["weight_cache_prefetch_hits"] == 7
+    assert timing["weight_prefetch_waits"] == 3
+    assert timing["weight_prefetch_wait_ns"] == 125_000_000
+    assert timing["weight_prefetch_wait_s"] == 0.125
+    assert timing["weight_prefetch_loads"] == 9
+    assert timing["weight_prefetch_useful_pages"] == 7
+    assert timing["weight_prefetch_wasted_pages"] == 2
+    assert timing["weight_prefetch_hidden_lower_bound_s"] == 0.75
+    assert timing["parallel_tier_fetches"] == 64
+    assert timing["parallel_tier_fast_bytes"] == 40_000_000
+    assert timing["parallel_tier_archive_bytes"] == 60_000_000
+    assert timing["parallel_tier_hidden_s"] == 1.5
+    assert timing["weight_cache_pinned_bytes"] == 400_000_000
+    assert timing["weight_cache_prefetched_bytes"] == 200_000_000
+    assert timing["planned_trunk_pin_layers"] == 4
+    assert timing["planned_trunk_pin_bytes"] == 350_000_000
+
+
+def test_protocol_timing_exposes_row_paged_head_recall_measurements():
+    timing = _vision_protocol_timing({
+        "path_stats": {
+            # Depth-1 short8 ARRRA: bootstrap target=1, five verifier
+            # windows=10 target rows, and five shared-head draft rows.
+            "reranked_lm_head_calls": 16,
+            "reranked_lm_head_positions": 16,
+            "reranked_lm_head_candidate_winner_changes": 2,
+            "reranked_lm_head_candidate_recall_probes": 16,
+            "reranked_lm_head_candidate_recall_hits": 16,
+            "reranked_lm_head_candidate_recall": 1.0,
+            "reranked_lm_head_candidate_read_calls": 16,
+            "reranked_lm_head_candidate_bytes_read": 10_485_760,
+            "reranked_lm_head_candidate_recall_full_scan_calls": 16,
+            "reranked_lm_head_candidate_recall_full_scan_bytes": 40_684_748_800,
+            "qwen_mtp_target_reranked_lm_head_calls": 11,
+            "qwen_mtp_target_reranked_lm_head_positions": 11,
+            "qwen_mtp_target_reranked_lm_head_candidate_recall_probes": 11,
+            "qwen_mtp_target_reranked_lm_head_candidate_recall_hits": 11,
+            "qwen_mtp_target_reranked_lm_head_candidate_recall": 1.0,
+            "qwen_mtp_draft_reranked_lm_head_calls": 5,
+            "qwen_mtp_draft_reranked_lm_head_positions": 5,
+            "qwen_mtp_draft_reranked_lm_head_candidate_recall_probes": 5,
+            "qwen_mtp_draft_reranked_lm_head_candidate_recall_hits": 5,
+            "qwen_mtp_draft_reranked_lm_head_candidate_recall": 1.0,
+        },
+    })
+
+    assert timing["reranked_lm_head_calls"] == 16
+    assert timing["reranked_lm_head_candidate_winner_changes"] == 2
+    assert timing["reranked_lm_head_candidate_recall_probes"] == 16
+    assert timing["reranked_lm_head_candidate_recall_hits"] == 16
+    assert timing["reranked_lm_head_candidate_recall"] == 1.0
+    assert timing["reranked_lm_head_candidate_bytes_read"] == 10_485_760
+    assert timing[
+        "reranked_lm_head_candidate_recall_full_scan_bytes"] == 40_684_748_800
+    assert timing["qwen_mtp_target_reranked_lm_head_calls"] == 11
+    assert timing["qwen_mtp_target_reranked_lm_head_positions"] == 11
+    assert timing[
+        "qwen_mtp_target_reranked_lm_head_candidate_recall"] == 1.0
+    assert timing["qwen_mtp_draft_reranked_lm_head_calls"] == 5
+    assert timing["qwen_mtp_draft_reranked_lm_head_positions"] == 5
+    assert timing[
+        "qwen_mtp_draft_reranked_lm_head_candidate_recall"] == 1.0
 
 
 def test_response_write_timeout_releases_inference_lock(monkeypatch):
@@ -1399,6 +1562,31 @@ def test_qwen_chunked_delta_auto_is_lossy_only_and_overridable():
     ) == (False, "unsupported-architecture")
 
 
+def test_qwen_compiled_delta_is_explicit_and_architecture_scoped():
+    assert _qwen_compiled_delta_policy(
+        "0", model_type="qwen3_5",
+    ) == (False, "operator-disabled")
+    assert _qwen_compiled_delta_policy(
+        "1", model_type="qwen3_5_moe",
+    ) == (True, "operator-forced")
+    assert _qwen_compiled_delta_policy(
+        "1", model_type="glm_moe_dsa",
+    ) == (False, "unsupported-architecture")
+    with pytest.raises(ValueError, match="must be 0 or 1"):
+        _qwen_compiled_delta_policy("auto", model_type="qwen3_5")
+
+
+def test_qwen_compiled_delta_displaces_only_auto_chunked_mode():
+    assert _qwen_delta_prefill_policies(
+        "1", "auto", mode="fast", model_type="qwen3_5",
+    ) == (
+        True, "operator-forced", False, "compiled-delta-selected",
+    )
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        _qwen_delta_prefill_policies(
+            "1", "1", mode="fast", model_type="qwen3_5")
+
+
 def test_qwen_lossy_suffix_prefill_is_explicit_fixed_and_hybrid_safe():
     layer_types = [
         "linear_attention", "linear_attention", "linear_attention",
@@ -1580,6 +1768,122 @@ def test_hidden_gateway_terminal_pagination_synthesis_is_explicit_and_generic():
         _HIDDEN_GATEWAY_TERMINAL_PAGINATION_POLICY
     assert "do not add a table" in \
         _HIDDEN_GATEWAY_TERMINAL_PAGINATION_POLICY
+
+
+def test_hidden_gateway_deterministic_policy_is_explicit_and_production_connected():
+    user = (
+        "list the plex movies/tv shows rated PG13 or TV-7 or less and whose "
+        'root does not contain /Kids/. Make sure to paginate the listing')
+    messages = [{"role": "user", "content": user}]
+    for index, has_more in enumerate((True, False)):
+        call_id = f"call_{index}"
+        messages.extend(({
+            "role": "assistant", "content": "", "tool_calls": [{
+                "id": call_id, "type": "function", "function": {
+                    "name": "plugin__plex__plex_list_library",
+                    "arguments": json.dumps({
+                        "mediaType": "all", "ratingOperator": "lte",
+                        "movieRatingValue": "PG-13",
+                        "showRatingValue": "TV-Y7",
+                        "excludeRootFolderPath": "/Kids/",
+                        "limit": 50, "offset": index * 50,
+                    }),
+                },
+            }],
+        }, {
+            "role": "tool", "tool_call_id": call_id,
+            "content": json.dumps({
+                "movies": ([{
+                    "title": "ALPHA_G", "contentRating": "G",
+                    "rootFolderPath": "/Media/Movies",
+                    "plexLibrarySectionName": "Movies",
+                }] if index == 0 else []),
+                "series": [],
+                "movieHasMore": has_more,
+                "seriesHasMore": has_more,
+            }),
+        }))
+
+    disabled = _hidden_gateway_deterministic_policy_render(messages, False)
+    assert disabled.render is None
+    assert disabled.reason == "disabled"
+    enabled = _hidden_gateway_deterministic_policy_render(messages, True)
+    assert enabled.reason == "rendered"
+    assert enabled.render is not None
+    assert enabled.render.text == "Movies: ALPHA_G (G)\nTV Shows: None"
+
+
+def test_responses_deterministic_policy_bypasses_prompt_and_model(
+        monkeypatch, tmp_path):
+    call_id = "call_terminal"
+    messages = [{
+        "role": "user",
+        "content": (
+            "list the plex movies/tv shows rated PG13 or TV-7 or less and "
+            "whose root does not contain /Kids/. Make sure to paginate the "
+            "listing"),
+    }, {
+        "role": "assistant", "content": "", "tool_calls": [{
+            "id": call_id, "type": "function", "function": {
+                "name": "plugin__plex__plex_list_library",
+                "arguments": json.dumps({
+                    "mediaType": "all", "ratingOperator": "lte",
+                    "movieRatingValue": "PG-13",
+                    "showRatingValue": "TV-Y7",
+                    "excludeRootFolderPath": "/Kids/",
+                    "limit": 50, "offset": 0,
+                }),
+            },
+        }],
+    }, {
+        "role": "tool", "tool_call_id": call_id,
+        "content": json.dumps({
+            "movies": [{
+                "title": "ALPHA_G", "contentRating": "G",
+                "rootFolderPath": "/Media/Movies",
+                "plexLibrarySectionName": "Movies",
+            }],
+            "series": [], "movieHasMore": False, "seriesHasMore": False,
+        }),
+    }]
+    raw_tool = {
+        "type": "function", "name": "plugin__plex__plex_list_library",
+        "description": "List Plex media.",
+        "parameters": {"type": "object", "properties": {}},
+    }
+    engine = _fake_engine(model_type="qwen3_5")
+    handler = object.__new__(Handler)
+    handler._structured_output = None
+    handler._reasoning_effort = "low"
+    handler._enable_thinking = False
+    handler._reasoning_requested = False
+    handler._sampling = SimpleNamespace(profile="greedy")
+    handler._output_token_budget_source = "request"
+    responses = []
+    handler._json = lambda code, body: responses.append((code, body))
+    monkeypatch.setenv("VMODEL_FAST_TOOL_GATEWAY", "1")
+    monkeypatch.setenv(
+        "VMODEL_FAST_TOOL_GATEWAY_DETERMINISTIC_POLICY", "1")
+    monkeypatch.setattr(
+        "runtime.server._prepare_chat_prompt",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError(
+            "deterministic render must not build a model prompt")))
+    monkeypatch.setattr(
+        "runtime.server._engine_generate",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError(
+            "deterministic render must not run a model")))
+
+    handler._do_responses(
+        {}, "fixture", tmp_path, engine, "fast", 256, False, [],
+        [raw_tool], [raw_tool], "auto", True, messages, [])
+
+    assert responses[0][0] == 200
+    body = responses[0][1]
+    assert body["output_text"] == "Movies: ALPHA_G (G)\nTV Shows: None"
+    assert body["usage"]["input_tokens"] == 0
+    assert body["vmodel_tool_selection"][
+        "gateway_deterministic_policy_rendered"] == 1
+    assert body["vmodel_timing"]["total_engine_seconds"] == 0
 
 
 def test_hidden_gateway_host_route_only_skips_already_forced_decisions():
@@ -2568,6 +2872,298 @@ def test_dense_fast_paged_kv_profile_disables_incompatible_hot_paths(tmp_path):
     assert not rc.tool_pic
     assert not rc.tool_pic_shared_pages
     assert rc.hot_prompt_kv_persist_dir == ""
+
+
+def test_dense_qwen35_honors_postgen_cleanup_floor():
+    from unittest.mock import patch
+
+    from runtime.server import EngineManager
+
+    captured = []
+
+    class FakeEngine:
+        def __init__(self, _path, rc):
+            captured.append(rc)
+
+        def close(self):
+            pass
+
+    cfg = SimpleNamespace(
+        model_type="qwen3_5", tie_word_embeddings=False,
+        index_topk=0, vision_config=None, num_experts=0,
+        hidden_size=5120, intermediate_size=17408,
+        num_hidden_layers=64, num_attention_heads=24,
+        num_key_value_heads=4, head_dim=256, vocab_size=248320,
+        attention_bias=False, layer_types=(
+            "linear_attention", "linear_attention", "linear_attention",
+            "full_attention") * 16,
+    )
+    env = {
+        "VMODEL_QWEN35_POSTGEN_MIN_AVAILABLE_MB": "6000",
+        "VMODEL_QWEN35_WEIGHT_CACHE_MB": "2200",
+        "VMODEL_QWEN35_PREFILL_CHUNK_CEILING": "128",
+    }
+    manager = EngineManager()
+    with patch.dict(os.environ, env), \
+         patch("runtime.config.ModelConfig.from_dir", return_value=cfg), \
+         patch("runtime.path_resolver.resolve_model_dir",
+               side_effect=lambda path: path), \
+         patch("runtime.engine.StreamingEngine", FakeEngine), \
+         patch("runtime.server.psutil.virtual_memory",
+               return_value=SimpleNamespace(available=8_000_000_000)):
+        manager.get(Path("/tmp/fake-qwen38-dense"), "lossless")
+        os.environ["VMODEL_QWEN35_PREFILL_CHUNK_CEILING"] = "32"
+        manager.get(Path("/tmp/fake-qwen38-dense"), "lossless")
+
+    assert len(captured) == 2  # the ceiling participates in engine identity
+    assert captured[0].qwen_postgen_min_available_mb == 6000
+    assert captured[0].max_weight_cache_mb == 2200
+    assert captured[0].qwen35_prefill_chunk_ceiling == 128
+    assert captured[1].qwen35_prefill_chunk_ceiling == 32
+
+
+def test_dense_qwen35_paged_durable_prefix_is_explicit_and_disk_only(tmp_path):
+    from unittest.mock import patch
+
+    from runtime.server import EngineManager
+
+    captured = []
+
+    class FakeEngine:
+        def __init__(self, _path, rc):
+            captured.append(rc)
+
+        def close(self):
+            pass
+
+    cfg = SimpleNamespace(
+        model_type="qwen3_5", tie_word_embeddings=False,
+        index_topk=0, vision_config=None, num_experts=0,
+        hidden_size=5120, intermediate_size=17408,
+        num_hidden_layers=64, num_attention_heads=24,
+        num_key_value_heads=4, head_dim=256, vocab_size=248320,
+        attention_bias=False, layer_types=(
+            "linear_attention", "linear_attention", "linear_attention",
+            "full_attention") * 16,
+    )
+    env = {
+        "VMODEL_QWEN35_KV_MAX_MB": "768",
+        "VMODEL_QWEN35_KV_PREFILL_CHUNK_SIZE": "32",
+        "VMODEL_QWEN35_KV_SPILL_DIR": str(tmp_path / "spill"),
+        "VMODEL_QWEN35_HOT_KV_PERSIST_DIR": str(tmp_path / "journal"),
+        "VMODEL_QWEN35_PAGED_KV_PERSIST": "1",
+    }
+    with patch.dict(os.environ, env), \
+         patch("runtime.config.ModelConfig.from_dir", return_value=cfg), \
+         patch("runtime.path_resolver.resolve_model_dir",
+               side_effect=lambda path: path), \
+         patch("runtime.engine.StreamingEngine", FakeEngine), \
+         patch("runtime.server.psutil.virtual_memory",
+               return_value=SimpleNamespace(available=8_000_000_000)):
+        EngineManager().get(Path("/tmp/fake-qwen38-paged-durable"), "lossless")
+
+    rc = captured[0]
+    assert rc.max_kv_mb == 768
+    assert rc.paged_kv_persist
+    assert rc.hot_prompt_kv
+    assert rc.release_paged_kv_after_generate
+    assert rc.hot_prompt_kv_persist_dir == str(tmp_path / "journal")
+    assert rc.kv_spill_dir == str(tmp_path / "spill")
+    assert rc.prefill_chunk_size == rc.hot_prompt_kv_chunk_size == 32
+    assert not rc.qwen_fused_boundary_scaffold_prefill
+
+
+@pytest.mark.parametrize("value", ["-1", "2", "64", "513", "auto", "bad"])
+def test_qwen35_prefill_chunk_ceiling_rejects_non_ladder_values(value):
+    from unittest.mock import patch
+
+    from runtime.server import EngineManager
+
+    with patch.dict(os.environ, {
+            "VMODEL_QWEN35_PREFILL_CHUNK_CEILING": value,
+         }):
+        with pytest.raises(
+                RequestValidationError,
+                match="VMODEL_QWEN35_PREFILL_CHUNK_CEILING"):
+            EngineManager().get(Path("/tmp/not-opened-invalid-ceiling"), "fast")
+
+
+def test_dense_qwen35_wires_mixed_depth_suffix_and_disables_durable_store():
+    from unittest.mock import patch
+
+    from runtime.server import EngineManager
+
+    captured = []
+
+    class FakeEngine:
+        def __init__(self, _path, rc):
+            captured.append(rc)
+
+        def close(self):
+            pass
+
+    cfg = SimpleNamespace(
+        model_type="qwen3_5", tie_word_embeddings=False,
+        index_topk=0, vision_config=None, num_experts=0,
+        hidden_size=5120, intermediate_size=17408,
+        num_hidden_layers=64, num_attention_heads=24,
+        num_key_value_heads=4, head_dim=256, vocab_size=248320,
+        attention_bias=False, layer_types=(
+            "linear_attention", "linear_attention", "linear_attention",
+            "full_attention") * 16,
+    )
+    env = {
+        "VMODEL_QWEN35_LOSSY_SUFFIX_PREFILL": "16:1024",
+        "VMODEL_QWEN35_HOT_KV_PERSIST_DIR": "/tmp/must-not-be-used",
+    }
+    with patch.dict(os.environ, env), \
+         patch("runtime.config.ModelConfig.from_dir", return_value=cfg), \
+         patch("runtime.path_resolver.resolve_model_dir",
+               side_effect=lambda path: path), \
+         patch("runtime.engine.StreamingEngine", FakeEngine), \
+         patch("runtime.server.psutil.virtual_memory",
+               return_value=SimpleNamespace(available=8_000_000_000)):
+        EngineManager().get(Path("/tmp/fake-qwen38-dense-suffix"), "fast")
+
+    rc = captured[0]
+    assert rc.qwen_lossy_suffix_prefill_early_layers == 16
+    assert rc.qwen_lossy_suffix_prefill_prefix_tokens == 0
+    assert rc.qwen_lossy_suffix_prefill_tokens == 1024
+    assert rc.layer_stationary_prefill
+    assert rc.hot_prompt_kv_persist_dir == ""
+
+
+def test_dense_qwen35_wires_explicit_pin_and_prefetch_ladder():
+    from unittest.mock import patch
+
+    from runtime.server import EngineManager
+
+    captured = []
+
+    class FakeEngine:
+        def __init__(self, _path, rc):
+            captured.append(rc)
+
+        def close(self):
+            pass
+
+    cfg = SimpleNamespace(
+        model_type="qwen3_5", tie_word_embeddings=False,
+        index_topk=0, vision_config=None, num_experts=0,
+        hidden_size=5120, intermediate_size=17408,
+        num_hidden_layers=64, num_attention_heads=24,
+        num_key_value_heads=4, head_dim=256, vocab_size=248320,
+        attention_bias=False, layer_types=(
+            "linear_attention", "linear_attention", "linear_attention",
+            "full_attention") * 16,
+    )
+    env = {
+        "VMODEL_QWEN35_PIN_LM_HEAD": "1",
+        "VMODEL_QWEN35_PIN_TRUNK_BUDGET_MB": "1000",
+        "VMODEL_QWEN35_PREFETCH_DEPTH": "3",
+        "VMODEL_QWEN35_WEIGHT_CACHE_MB": "2200",
+    }
+    with patch.dict(os.environ, env), \
+         patch("runtime.config.ModelConfig.from_dir", return_value=cfg), \
+         patch("runtime.path_resolver.resolve_model_dir",
+               side_effect=lambda path: path), \
+         patch("runtime.engine.StreamingEngine", FakeEngine), \
+         patch("runtime.server.psutil.virtual_memory",
+               return_value=SimpleNamespace(available=8_000_000_000)):
+        EngineManager().get(Path("/tmp/fake-qwen38-dense-pin"), "fast")
+
+    rc = captured[0]
+    assert rc.pin_lm_head and not rc.stream_lm_head
+    assert rc.pin_trunk_budget_mb == 1000
+    assert rc.prefetch_depth == 3
+    assert rc.max_weight_cache_mb == 2200
+
+
+def test_dense_huihui_rerank64_uses_explicit_row_paged_exact_source():
+    from unittest.mock import patch
+
+    from runtime.server import EngineManager
+
+    captured = []
+
+    class FakeEngine:
+        def __init__(self, _path, rc):
+            captured.append(rc)
+
+        def close(self):
+            pass
+
+    cfg = SimpleNamespace(
+        model_type="qwen3_5", tie_word_embeddings=False,
+        index_topk=0, vision_config=None, num_experts=0,
+        hidden_size=5120, intermediate_size=17408,
+        num_hidden_layers=64, num_attention_heads=24,
+        num_key_value_heads=4, head_dim=256, vocab_size=248320,
+        attention_bias=False, layer_types=(
+            "linear_attention", "linear_attention", "linear_attention",
+            "full_attention") * 16,
+    )
+    fingerprint = "a" * 64
+    env = {
+        "VMODEL_QWEN35_RERANK_LM_HEAD": "1",
+        "VMODEL_QWEN35_RERANK_LM_HEAD_CANDIDATES": "64",
+        "VMODEL_QWEN35_RERANK_LM_HEAD_SOURCE": "/exact/huihui",
+        "VMODEL_QWEN35_RERANK_LM_HEAD_SOURCE_FINGERPRINT": fingerprint,
+        "VMODEL_QWEN35_RERANK_LM_HEAD_RECALL_PROBE_EVERY": "7",
+        "VMODEL_QWEN35_RERANK_LM_HEAD_RANK_CAPTURE": (
+            "/tmp/huihui-authoritative-ranks.jsonl"),
+        "VMODEL_QWEN35_RERANK_LM_HEAD_RANK_CAPTURE_MAX_POSITIONS": "1100",
+        "VMODEL_QWEN35_RERANK_LM_HEAD_RANK_CAPTURE_MAX_PER_REQUEST": "64",
+    }
+    with patch.dict(os.environ, env), \
+         patch("runtime.config.ModelConfig.from_dir", return_value=cfg), \
+         patch("runtime.path_resolver.resolve_model_dir",
+               side_effect=lambda path: path), \
+         patch("runtime.engine.StreamingEngine", FakeEngine), \
+         patch("runtime.server.psutil.virtual_memory",
+               return_value=SimpleNamespace(available=8_000_000_000)):
+        EngineManager().get(Path("/tmp/fake-huihui-all-mxfp4"), "fast")
+
+    rc = captured[0]
+    assert rc.rerank_lm_head
+    assert rc.rerank_lm_head_candidates == 64
+    assert rc.rerank_lm_head_source == "/exact/huihui"
+    assert rc.rerank_lm_head_source_fingerprint == fingerprint
+    assert rc.rerank_lm_head_recall_probe_every == 7
+    assert (rc.rerank_lm_head_rank_capture_path
+            == "/tmp/huihui-authoritative-ranks.jsonl")
+    assert rc.rerank_lm_head_rank_capture_max_positions == 1100
+    assert rc.rerank_lm_head_rank_capture_max_per_request == 64
+    assert rc.pin_lm_head and rc.quant_lm_head
+    assert not rc.stream_lm_head
+
+
+def test_dense_huihui_rerank_fails_closed_without_exact_source():
+    from unittest.mock import patch
+
+    from runtime.server import EngineManager
+
+    cfg = SimpleNamespace(
+        model_type="qwen3_5", tie_word_embeddings=False,
+        index_topk=0, vision_config=None, num_experts=0,
+        hidden_size=5120, intermediate_size=17408,
+        num_hidden_layers=64, num_attention_heads=24,
+        num_key_value_heads=4, head_dim=256, vocab_size=248320,
+        attention_bias=False, layer_types=(
+            "linear_attention", "linear_attention", "linear_attention",
+            "full_attention") * 16,
+    )
+    with patch.dict(os.environ, {
+            "VMODEL_QWEN35_RERANK_LM_HEAD": "1",
+         }), \
+         patch("runtime.config.ModelConfig.from_dir", return_value=cfg), \
+         patch("runtime.path_resolver.resolve_model_dir",
+               side_effect=lambda path: path), \
+         patch("runtime.server.psutil.virtual_memory",
+               return_value=SimpleNamespace(available=8_000_000_000)):
+        with pytest.raises(ValueError, match="requires.*SOURCE"):
+            EngineManager().get(
+                Path("/tmp/fake-huihui-missing-source"), "fast")
 
 
 def test_qwen3_fast_resident_kv_projection_rejects_real_harness_scale():
@@ -3736,6 +4332,24 @@ def test_execution_profile_discloses_effective_derived_artifact(tmp_path):
     }
 
 
+def test_execution_profile_discloses_qwen35_prefill_chunk_ceiling(tmp_path):
+    (tmp_path / "config.json").write_text("{}")
+    engine = SimpleNamespace(
+        _model_dir=tmp_path,
+        store=SimpleNamespace(quantization={}, on_disk_quantized=False),
+        rc=SimpleNamespace(
+            quant_bits=0,
+            rerank_lm_head=False,
+            resident_attention_mode="",
+            expert_top_k_by_layer=(),
+            qwen35_prefill_chunk_ceiling=128,
+        ),
+    )
+
+    assert _execution_profile_fields(engine)[
+        "vmodel_qwen35_prefill_chunk_ceiling"] == 128
+
+
 def test_execution_profile_discloses_reranked_head(tmp_path):
     (tmp_path / "config.json").write_text(json.dumps({
         "quantization": {"mode": "mxfp4", "bits": 4, "group_size": 32},
@@ -4356,6 +4970,63 @@ def test_engine_generate_uses_plain_targets_own_retry_method():
     assert result == {"via": "target-retry"}
     assert target.retry_calls == 1
     assert target.plain_calls == 0
+
+
+def test_engine_generate_scopes_privacy_safe_authoritative_rank_capture():
+    class Capture:
+        def __init__(self):
+            self.shapes = []
+            self.active = False
+
+        @contextmanager
+        def request(self, shape):
+            self.shapes.append(shape)
+            self.active = True
+            try:
+                yield
+            finally:
+                self.active = False
+
+    capture = Capture()
+
+    class Target:
+        def __init__(self):
+            self._lm_head_w = SimpleNamespace(recall_rank_capture=capture)
+            self.cfg = SimpleNamespace(model_type="qwen3_5")
+            self.rc = SimpleNamespace(expert_top_k_by_layer=())
+            self.tokenizer = _CharTokenizer()
+
+        def generate_with_memory_retry(self, *args, **kwargs):
+            assert capture.active
+            return {"via": "captured"}
+
+    prompt = PreparedPrompt(
+        "rendered", range(900),
+        rerank_capture_shape={
+            "prompt_tokens": 900,
+            "system_chars": 2000,
+            "tool_count": 134,
+            "message_count": 7,
+            "developer": True,
+        },
+    )
+    result = _engine_generate(
+        Target(), prompt, 8,
+        sampling=SimpleNamespace(is_greedy=False),
+        constraint=object(),
+        on_token=lambda _token: None,
+    )
+    assert result == {"via": "captured"}
+    assert capture.shapes == [{
+        "prompt_tokens_bucket": "513-2048",
+        "system_chars_bucket": "1025-8192",
+        "tool_count_bucket": "129+",
+        "message_count_bucket": "5-16",
+        "developer": True,
+        "streaming": True,
+        "temperature_class": "stochastic",
+        "constrained": True,
+    }]
 
 
 def test_engine_generate_scopes_and_restores_qwen_expert_top_k():

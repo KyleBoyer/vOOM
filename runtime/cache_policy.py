@@ -65,6 +65,8 @@ def plan_pinned_prefix(
     budget_bytes: int,
     *,
     reserve_bytes: int = 0,
+    pin_limit_bytes: int | None = None,
+    prefetch_depth: int = 0,
 ) -> int:
     """Return how many leading trunk layers to pin under a byte budget.
 
@@ -85,17 +87,28 @@ def plan_pinned_prefix(
     largest ``n`` satisfying the constraint rather than a single pass -- the
     same fixed point a ring-plus-pinned-prefix layout has to solve.
 
+    ``pin_limit_bytes`` is a separate cap on just the pinned prefix. This lets
+    callers account for already-pinned head/embedding pages in
+    ``budget_bytes`` without letting the trunk consume the entire remaining
+    cache. ``prefetch_depth`` reserves that many additional unpinned layer
+    pages alongside the one demanded layer, preventing a valid pin plan from
+    silently making every configured prefetch fail admission.
+
     Returns zero when nothing fits, which leaves the ordinary policy in charge.
     """
     sizes = [max(0, int(value)) for value in layer_bytes]
     budget = max(0, int(budget_bytes))
     reserve = max(0, int(reserve_bytes))
+    pin_limit = (budget if pin_limit_bytes is None
+                 else max(0, int(pin_limit_bytes)))
+    depth = max(0, int(prefetch_depth))
     best = 0
     prefix_total = 0
     for count in range(1, len(sizes) + 1):
         prefix_total += sizes[count - 1]
         streaming = max(sizes[count:], default=0)
-        if prefix_total + streaming + reserve <= budget:
+        if (prefix_total <= pin_limit
+                and prefix_total + streaming * (1 + depth) + reserve <= budget):
             best = count
     return best
 

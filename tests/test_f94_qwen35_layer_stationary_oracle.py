@@ -41,11 +41,18 @@ _PROMPT = (
 _CHUNK = 8
 
 
-def _run(layer_stationary: bool, count_fetches: bool = False, max_tokens: int = 6):
+def _run(
+    layer_stationary: bool, count_fetches: bool = False,
+    max_tokens: int = 6, *, compiled_delta: bool = False,
+    native_delta: bool = False,
+):
     rc = RuntimeConfig(
         prefill_chunk_size=_CHUNK,
         hot_prompt_kv_chunk_size=_CHUNK,
         layer_stationary_prefill=layer_stationary,
+        qwen_fused_boundary_scaffold_prefill=layer_stationary,
+        qwen_compiled_delta_prefill=compiled_delta,
+        qwen_native_fused_delta_prefill=native_delta,
     )
     engine = StreamingEngine(str(_REAL_MODEL_DIR), rc)
     fetch_counts: dict[str, int] = {}
@@ -66,7 +73,10 @@ def _run(layer_stationary: bool, count_fetches: bool = False, max_tokens: int = 
     return result, fetch_counts
 
 
-def _run_with_stable_boundary(layer_stationary: bool):
+def _run_with_stable_boundary(
+    layer_stationary: bool, *, fused: bool | None = None,
+    lossy_mixed_depth: bool = False,
+):
     """Exercise the server-style first-turn boundary fork, not a plain str."""
     from runtime.server import PreparedPrompt
 
@@ -74,9 +84,17 @@ def _run_with_stable_boundary(layer_stationary: bool):
         prefill_chunk_size=_CHUNK,
         hot_prompt_kv_chunk_size=_CHUNK,
         layer_stationary_prefill=layer_stationary,
+        qwen_fused_boundary_scaffold_prefill=(
+            layer_stationary if fused is None else fused),
         hot_prompt_kv=True,
         hot_prompt_kv_min_tokens=0,
         execution_profile="layers",
+        qwen_lossy_suffix_prefill_early_layers=(
+            4 if lossy_mixed_depth else 0),
+        qwen_lossy_suffix_prefill_prefix_tokens=(
+            2 if lossy_mixed_depth else 0),
+        qwen_lossy_suffix_prefill_tokens=(
+            8 if lossy_mixed_depth else 0),
     )
     engine = StreamingEngine(str(_REAL_MODEL_DIR), rc)
     try:
@@ -92,6 +110,34 @@ def _run_with_stable_boundary(layer_stationary: bool):
     return result
 
 
+def _run_with_paged_attention(tmp_path: Path):
+    """Force the alternate PagedKV constructor used by the 27B profile."""
+    rc = RuntimeConfig(
+        prefill_chunk_size=_CHUNK,
+        hot_prompt_kv_chunk_size=_CHUNK,
+        layer_stationary_prefill=True,
+        max_kv_mb=1,
+        kv_page_positions=8,
+        kv_spill_dir=str(tmp_path / "qwen-paged-kv"),
+    )
+    engine = StreamingEngine(str(_REAL_MODEL_DIR), rc)
+    try:
+        result = engine.generate(
+            _PROMPT, max_tokens=2,
+            sampling=SamplingParams(temperature=0.0))
+        kv = engine.last_kv
+        recurrent = getattr(kv, "kda_cache", None)
+        assert recurrent is not None
+        assert recurrent.nbytes() > 0
+        stats = {
+            "spills": int(kv.stats.spills),
+            "recurrent_bytes": int(recurrent.nbytes()),
+        }
+    finally:
+        engine.close()
+    return result, stats
+
+
 @_model_skip
 def test_layer_stationary_matches_chunk_major_byte_identical():
     baseline, _ = _run(layer_stationary=False)
@@ -104,6 +150,34 @@ def test_layer_stationary_matches_chunk_major_byte_identical():
 
 
 @_model_skip
+def test_compiled_delta_matches_sequential_on_real_checkpoint():
+    sequential, _ = _run(True, max_tokens=2, compiled_delta=False)
+    compiled, _ = _run(True, max_tokens=2, compiled_delta=True)
+    assert compiled["tokens"] == sequential["tokens"]
+    assert compiled["text"] == sequential["text"]
+    assert compiled["path_stats"]["qwen_compiled_delta_prefill"] == 1
+
+
+@_model_skip
+def test_paged_attention_preserves_real_qwen_recurrence_and_tokens(tmp_path):
+    unpaged, _ = _run(True, max_tokens=2)
+    paged, stats = _run_with_paged_attention(tmp_path)
+    assert stats["spills"] > 0
+    assert stats["recurrent_bytes"] > 0
+    assert paged["tokens"] == unpaged["tokens"]
+    assert paged["text"] == unpaged["text"]
+
+
+@_model_skip
+def test_native_delta_matches_short_real_checkpoint_witness():
+    sequential, _ = _run(True, max_tokens=2)
+    native, _ = _run(True, max_tokens=2, native_delta=True)
+    assert native["tokens"] == sequential["tokens"]
+    assert native["text"] == sequential["text"]
+    assert native["path_stats"]["qwen_native_fused_delta_prefill"] == 1
+
+
+@_model_skip
 def test_stable_boundary_uses_layer_stationary_and_stays_byte_identical():
     """A server PreparedPrompt's stable boundary must not bypass F94."""
     baseline = _run_with_stable_boundary(layer_stationary=False)
@@ -112,10 +186,39 @@ def test_stable_boundary_uses_layer_stationary_and_stays_byte_identical():
     assert layer_major["tokens"] == baseline["tokens"]
     assert layer_major["text"] == baseline["text"]
     paths = layer_major["execution_profile"]["phases"]["prefill"]["paths"]
+    # The stable boundary and its short generation scaffold share one
+    # layer-stationary trunk sweep. The boundary endpoint is captured inside
+    # that sweep before each layer advances the scaffold.
     assert paths.get("layer_stationary_qwen35", 0) == 1
     assert any(
         "hot_boundary layer_stationary eligible=1" in note
         for note in layer_major["execution_profile"]["notes"])
+    assert any(
+        "hot_boundary scaffold_fused=1" in note
+        for note in layer_major["execution_profile"]["notes"])
+    assert layer_major["path_stats"][
+        "hot_prompt_boundary_scaffold_fused"] == 1
+
+
+@_model_skip
+def test_lossy_mixed_depth_boundary_scaffold_fusion_matches_prior_target():
+    """The fused schedule is speed-only relative to the admitted lossy
+    target: it must preserve that target's tokens while removing its separate
+    scaffold trunk sweep."""
+    unfused = _run_with_stable_boundary(
+        True, fused=False, lossy_mixed_depth=True)
+    fused = _run_with_stable_boundary(
+        True, fused=True, lossy_mixed_depth=True)
+
+    assert fused["tokens"] == unfused["tokens"]
+    assert fused["text"] == unfused["text"]
+    fused_paths = fused["execution_profile"]["phases"]["prefill"]["paths"]
+    unfused_paths = unfused[
+        "execution_profile"]["phases"]["prefill"]["paths"]
+    assert fused_paths.get("qwen35_lossy_suffix_shallow", 0) == 1
+    assert fused_paths.get("qwen35_lossy_endpoint_packed_deep", 0) == 1
+    assert fused_paths.get("layer_stationary_qwen35", 0) == 0
+    assert unfused_paths.get("layer_stationary_qwen35", 0) == 1
 
 
 @_model_skip
@@ -154,3 +257,22 @@ def test_layer_stationary_fetches_each_layer_once_not_once_per_chunk():
         "-- if not, this test's own prompt/chunk-size setup no longer "
         "exercises the bug F94 fixes"
     )
+
+
+@_model_skip
+def test_dense_layer_stationary_mlp_is_tile_bounded(monkeypatch):
+    """Long dense prompts must not materialize a full-range MLP scratch."""
+    import runtime.qwen35 as qwen35
+
+    real_mlp = qwen35._qwen35_mlp_residual
+    widths: list[int] = []
+
+    def recording_mlp(x, *args, **kwargs):
+        widths.append(int(x.shape[1]))
+        return real_mlp(x, *args, **kwargs)
+
+    monkeypatch.setattr(qwen35, "_qwen35_mlp_residual", recording_mlp)
+    result, _ = _run(layer_stationary=True, max_tokens=1)
+    assert result["tokens"]
+    assert widths
+    assert max(widths) <= _CHUNK

@@ -328,6 +328,57 @@ def _sequential_gated_delta_rule(q, k, v, beta, decay, state):
     return mx.stack(outputs, axis=1), state
 
 
+@mx.compile
+def _compiled_gated_delta_segment(q, k, v, beta, decay, state):
+    """Trace one bounded segment of the reference recurrence unchanged."""
+    outputs = []
+    for position in range(q.shape[1]):
+        q_t = q[:, position]
+        k_t = k[:, position]
+        v_t = v[:, position]
+        state = state * mx.exp(decay[:, position])[..., None, None]
+        predicted = mx.sum(k_t[..., None] * state, axis=-2)
+        delta = (v_t - predicted) * beta[:, position, :, None]
+        state = state + k_t[..., None] * delta[..., None, :]
+        outputs.append(mx.sum(q_t[..., None] * state, axis=-2))
+    return mx.stack(outputs, axis=1), state
+
+
+def _compiled_gated_delta_rule(
+    q, k, v, beta, decay, state, segment: int = 32,
+):
+    """Compile the reference recurrence in bounded, byte-identical segments.
+
+    The segment body deliberately repeats `_sequential_gated_delta_rule`'s
+    operators and their order verbatim. Segment width 32 also preserves its
+    state-materialization cadence; unlike the WY path below, this does not
+    reassociate the FP32 recurrence. The final partial segment stays lazy just
+    as the reference path does until its caller materializes the returned
+    state.
+    """
+    length = int(q.shape[1])
+    if length <= 0 or segment <= 0:
+        raise ValueError(
+            "compiled Qwen DeltaNet requires positions and a positive segment")
+    outputs = []
+    for start in range(0, length, segment):
+        end = min(start + segment, length)
+        output, state = _compiled_gated_delta_segment(
+            q[:, start:end],
+            k[:, start:end],
+            v[:, start:end],
+            beta[:, start:end],
+            decay[:, start:end],
+            state,
+        )
+        if end % segment == 0:
+            mx.eval(state)
+        outputs.append(output)
+    if len(outputs) == 1:
+        return outputs[0], state
+    return mx.concatenate(outputs, axis=1), state
+
+
 _NATIVE_DELTANET_STEP_SOURCE = """
     uint dv = thread_position_in_grid.x;
     uint h  = thread_position_in_grid.y;
@@ -400,6 +451,82 @@ def _native_fused_gated_delta_step(q, k, v, beta, decay, state):
         grid=(Dv, H, B),
         threadgroup=(min(Dv, 256), 1, 1),
         output_shapes=[(B, H, Dv), state.shape],
+        output_dtypes=[state.dtype, state.dtype],
+    )
+    return outputs[0], outputs[1]
+
+
+_NATIVE_DELTANET_PREFILL_SOURCE = """
+    uint dv = thread_position_in_grid.x;
+    uint h  = thread_position_in_grid.y;
+    uint b  = thread_position_in_grid.z;
+    uint L  = q_shape[1];
+    uint H  = q_shape[2];
+    uint Dk = q_shape[3];
+    uint Dv = v_shape[3];
+    if (dv >= Dv) return;
+
+    uint state_base = ((b * H + h) * Dk) * Dv + dv;
+    for (uint t = 0; t < L; t++) {
+        uint bh = (b * L + t) * H + h;
+        float dec = exp(float(decay[bh]));
+        float bet = float(beta[bh]);
+        float vt = float(v[bh * Dv + dv]);
+
+        float predicted = 0.0f;
+        for (uint dk = 0; dk < Dk; dk++) {
+            uint index = state_base + dk * Dv;
+            float previous = (
+                t == 0 ? float(state[index]) : float(out_state[index]));
+            float decayed = previous * dec;
+            out_state[index] = decayed;
+            predicted += float(k[bh * Dk + dk]) * decayed;
+        }
+
+        float delta = (vt - predicted) * bet;
+        float value = 0.0f;
+        for (uint dk = 0; dk < Dk; dk++) {
+            uint index = state_base + dk * Dv;
+            float kk = float(k[bh * Dk + dk]);
+            float updated = float(out_state[index]) + kk * delta;
+            out_state[index] = updated;
+            value += float(q[bh * Dk + dk]) * updated;
+        }
+        out[bh * Dv + dv] = value;
+    }
+"""
+
+_native_deltanet_prefill_kernel = mx.fast.metal_kernel(
+    name="qwen35_deltanet_serial_prefill",
+    input_names=["q", "k", "v", "beta", "decay", "state"],
+    output_names=["out", "out_state"],
+    source=_NATIVE_DELTANET_PREFILL_SOURCE,
+)
+
+
+def _native_fused_gated_delta_prefill(q, k, v, beta, decay, state):
+    """Run a complete serial DeltaNet tile in one Metal dispatch.
+
+    One thread owns one recurrent-state value column and loops over positions
+    in released causal order. This removes the Python/per-position dispatch
+    chain but uses an explicit scalar reduction rather than MLX's ``mx.sum``
+    tree, so ordinary float32 association can differ. It is consequently a
+    lossy, explicit candidate even when a finite token corpus agrees.
+    """
+    B, L, H, Dk = q.shape
+    Dv = int(v.shape[-1])
+    if L <= 1:
+        raise ValueError(
+            "native fused DeltaNet prefill requires more than one position")
+    if (k.shape != q.shape or v.shape[:3] != (B, L, H)
+            or beta.shape != (B, L, H) or decay.shape != (B, L, H)
+            or state.shape != (B, H, Dk, Dv)):
+        raise ValueError("invalid native fused DeltaNet prefill geometry")
+    outputs = _native_deltanet_prefill_kernel(
+        inputs=[q, k, v, beta, decay, state],
+        grid=(Dv, H, B),
+        threadgroup=(min(Dv, 256), 1, 1),
+        output_shapes=[(B, L, H, Dv), state.shape],
         output_dtypes=[state.dtype, state.dtype],
     )
     return outputs[0], outputs[1]
@@ -487,6 +614,8 @@ def _gated_delta_net(
     defer_state_eval: bool = False,
     native_fused_decode: bool = False,
     chunked_delta_prefill: bool = False,
+    compiled_delta_prefill: bool = False,
+    native_fused_delta_prefill: bool = False,
 ) -> mx.array:
     batch, length, _ = h.shape
     key_heads = cfg.linear_num_key_heads
@@ -547,8 +676,21 @@ def _gated_delta_net(
     if state is None:
         state = mx.zeros(
             (batch, value_heads, key_dim, value_dim), dtype=mx.float32)
+    if sum(map(bool, (
+            chunked_delta_prefill,
+            compiled_delta_prefill,
+            native_fused_delta_prefill))) > 1:
+        raise ValueError(
+            "chunked, compiled, and native-fused Qwen DeltaNet prefill are "
+            "mutually exclusive")
     if chunked_delta_prefill and length > 1:
         output, state = _chunked_gated_delta_rule(q, k, v, beta, decay, state)
+    elif compiled_delta_prefill and length > 1:
+        output, state = _compiled_gated_delta_rule(
+            q, k, v, beta, decay, state)
+    elif native_fused_delta_prefill and length > 1:
+        output, state = _native_fused_gated_delta_prefill(
+            q, k, v, beta, decay, state)
     elif native_fused_decode and length == 1:
         # F103: hand-written mx.fast.metal_kernel fusion of the single-step
         # recurrence body. See _native_fused_gated_delta_step's docstring.
@@ -647,6 +789,8 @@ def _qwen35_attention_residual(
     defer_state_eval: bool = False,
     native_fused_decode: bool = False,
     chunked_delta_prefill: bool = False,
+    compiled_delta_prefill: bool = False,
+    native_fused_delta_prefill: bool = False,
 ) -> mx.array:
     """DeltaNet-or-full-attention + residual only, no MLP/MoE -- split out of
     run_qwen35_block (2026-07-25) so a caller can run attention per-tile
@@ -666,7 +810,9 @@ def _qwen35_attention_residual(
             zmlx_fused_decode=zmlx_fused_decode,
             defer_state_eval=defer_state_eval,
             native_fused_decode=native_fused_decode,
-            chunked_delta_prefill=chunked_delta_prefill)
+            chunked_delta_prefill=chunked_delta_prefill,
+            compiled_delta_prefill=compiled_delta_prefill,
+            native_fused_delta_prefill=native_fused_delta_prefill)
     elif layer_type == "full_attention":
         mixed = _full_attention(
             h, w, prefix, cfg, kv, layer, offset, positions3)
@@ -713,6 +859,8 @@ def run_qwen35_block(
     defer_state_eval: bool = False,
     native_fused_decode: bool = False,
     chunked_delta_prefill: bool = False,
+    compiled_delta_prefill: bool = False,
+    native_fused_delta_prefill: bool = False,
     profile=None,
 ) -> mx.array:
     """One Qwen3.5/3.6 decoder block (chunk-major / ordinary use). Thin
@@ -727,7 +875,9 @@ def run_qwen35_block(
         positions3=positions3, zmlx_fused_decode=zmlx_fused_decode,
         defer_state_eval=defer_state_eval,
         native_fused_decode=native_fused_decode,
-        chunked_delta_prefill=chunked_delta_prefill)
+        chunked_delta_prefill=chunked_delta_prefill,
+        compiled_delta_prefill=compiled_delta_prefill,
+        native_fused_delta_prefill=native_fused_delta_prefill)
     if profile is not None:
         profile.finish_substep(
             "attention", layer, attention_t0, x, positions=positions)
@@ -776,6 +926,9 @@ def multimodal_prefill(
             iter_expert_batches=engine._iter_expert_batches,
             positions3=positions3,
             chunked_delta_prefill=engine.rc.qwen_chunked_delta_prefill,
+            compiled_delta_prefill=engine.rc.qwen_compiled_delta_prefill,
+            native_fused_delta_prefill=(
+                engine.rc.qwen_native_fused_delta_prefill),
         )
         mx.eval(x)
     logits = engine._final_logits(x)
@@ -818,6 +971,9 @@ def multimodal_suffix_prefill(
             iter_expert_batches=engine._iter_expert_batches,
             positions3=suffix_positions,
             chunked_delta_prefill=engine.rc.qwen_chunked_delta_prefill,
+            compiled_delta_prefill=engine.rc.qwen_compiled_delta_prefill,
+            native_fused_delta_prefill=(
+                engine.rc.qwen_native_fused_delta_prefill),
         )
         mx.eval(x)
     logits = engine._final_logits(x)

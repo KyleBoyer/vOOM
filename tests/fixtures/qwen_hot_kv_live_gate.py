@@ -5,8 +5,9 @@ This complements ``tests/test_hot_prompt_kv.py``'s tiny deterministic fixture
 with the on-disk quantized Qwen checkpoint used by the lossy side quest.  It
 proves four properties in one run:
 
-* an identical prompt resumes after a fresh engine instance (restart);
-* regenerating the same prompt is an exact endpoint hit;
+* an identical prompt resumes after a fresh engine instance (restart), using
+  a scaffold-free stable prefix for recurrent Qwen and an endpoint otherwise;
+* regenerating the same prompt reuses the same architecture-valid state;
 * an edited suffix reuses only a chunk-aligned common prefix and remains
   token-identical to a cold engine (fork);
 * a task evicted from a one-slot in-memory LRU is recovered from the persisted
@@ -37,7 +38,10 @@ from runtime.server import PreparedPrompt  # noqa: E402
 
 def _config(persist_dir: Path | None, chunk_size: int) -> RuntimeConfig:
     return RuntimeConfig(
-        max_weight_cache_mb=1200,
+        # Qwen3.5-4B's exact embedding plus head pins are 1,271,403,520
+        # bytes. Keep the live gate above that real floor; WeightCache now
+        # correctly refuses an over-cap pin instead of silently exceeding it.
+        max_weight_cache_mb=1600,
         pin_embeddings=True,
         pin_lm_head=True,
         prefetch_depth=0,
@@ -72,16 +76,29 @@ def _shared_prompt_ids(engine: StreamingEngine, minimum: int) -> list[int]:
     ), minimum)
 
 
-def _prepared(label: str, ids: list[int]) -> PreparedPrompt:
+def _prepared(
+    label: str, ids: list[int], stable_boundary_tokens: int = 0,
+) -> PreparedPrompt:
     # PreparedPrompt proves the exact token sequence under test and avoids a
     # second tokenizer pass changing the intended branch boundary.
-    return PreparedPrompt(label, ids)
+    return PreparedPrompt(
+        label, ids, stable_boundary_tokens=stable_boundary_tokens)
 
 
-def _run(engine: StreamingEngine, label: str, ids: list[int], max_tokens: int):
+def _run(
+    engine: StreamingEngine,
+    label: str,
+    ids: list[int],
+    max_tokens: int,
+    *,
+    stable_boundary_tokens: int = 0,
+):
     started = time.perf_counter()
     result = engine.generate(
-        _prepared(label, ids), max_tokens=max_tokens, stop=[])
+        _prepared(label, ids, stable_boundary_tokens),
+        max_tokens=max_tokens,
+        stop=[],
+    )
     result["gate_wall_s"] = time.perf_counter() - started
     return result
 
@@ -99,6 +116,7 @@ def main() -> int:
     parser.add_argument("--chunk-size", type=int, default=256)
     parser.add_argument("--max-tokens", type=int, default=8)
     parser.add_argument("--persist-dir", type=Path)
+    parser.add_argument("--result-json", type=Path)
     parser.add_argument("--keep", action="store_true")
     args = parser.parse_args()
 
@@ -134,15 +152,26 @@ def main() -> int:
         prompt_a = shared + suffix_a
         prompt_b = shared + suffix_b
         unrelated = unrelated_prefix + unrelated_suffix
-        cold_a = _run(cold, "cold-a", prompt_a, args.max_tokens)
-        cold_b = _run(cold, "cold-b", prompt_b, args.max_tokens)
+        hybrid_recurrent = cold.cfg.model_type in (
+            "qwen3_5", "qwen3_5_moe", "kimi_linear", "kimi_k3")
+        shared_boundary = len(shared) if hybrid_recurrent else 0
+        unrelated_boundary = (
+            len(unrelated_prefix) if hybrid_recurrent else 0)
+        cold_a = _run(
+            cold, "cold-a", prompt_a, args.max_tokens,
+            stable_boundary_tokens=shared_boundary)
+        cold_b = _run(
+            cold, "cold-b", prompt_b, args.max_tokens,
+            stable_boundary_tokens=shared_boundary)
     finally:
         cold.close()
         mx.clear_cache()
 
     first = StreamingEngine(model, _config(persist_dir, args.chunk_size))
     try:
-        seeded = _run(first, "seed-a", prompt_a, args.max_tokens)
+        seeded = _run(
+            first, "seed-a", prompt_a, args.max_tokens,
+            stable_boundary_tokens=shared_boundary)
         seed_leaf = first._hot_prompt_slots[-1].segment_chain[-1]
     finally:
         first.close()
@@ -153,23 +182,29 @@ def main() -> int:
     restarted_engine = StreamingEngine(model, _config(persist_dir, args.chunk_size))
     try:
         restarted = _run(
-            restarted_engine, "restart-a", prompt_a, args.max_tokens)
+            restarted_engine, "restart-a", prompt_a, args.max_tokens,
+            stable_boundary_tokens=shared_boundary)
         restart_stats = restarted["path_stats"]
 
         regenerated = _run(
-            restarted_engine, "regenerate-a", prompt_a, args.max_tokens - 1)
+            restarted_engine, "regenerate-a", prompt_a, args.max_tokens - 1,
+            stable_boundary_tokens=shared_boundary)
         regenerate_stats = regenerated["path_stats"]
         regenerate_leaf = restarted_engine._hot_prompt_slots[-1].segment_chain[-1]
 
         forked = _run(
-            restarted_engine, "fork-b", prompt_b, args.max_tokens)
+            restarted_engine, "fork-b", prompt_b, args.max_tokens,
+            stable_boundary_tokens=shared_boundary)
         fork_stats = forked["path_stats"]
 
         # One slot means this unrelated, equally expensive task evicts B. A's
         # older checkpoint must remain discoverable through disk metadata.
-        _run(restarted_engine, "unrelated", unrelated, 3)
+        _run(
+            restarted_engine, "unrelated", unrelated, 3,
+            stable_boundary_tokens=unrelated_boundary)
         evicted = _run(
-            restarted_engine, "evicted-a", prompt_a, args.max_tokens)
+            restarted_engine, "evicted-a", prompt_a, args.max_tokens,
+            stable_boundary_tokens=shared_boundary)
         evicted_stats = evicted["path_stats"]
     finally:
         restarted_engine.close()
@@ -194,26 +229,46 @@ def main() -> int:
 
     require(restart_stats.get("prompt_cache_source") == "memory",
             "fresh engine did not preload the persisted checkpoint")
-    require(restart_stats.get("prompt_cache_exact_hit") == 1,
-            "restart was not an exact prompt endpoint hit")
+    require(restart_stats.get("prompt_cache_exact_hit") == (
+                0 if hybrid_recurrent else 1),
+            "restart hit kind did not match the model's cache semantics")
     require(regenerate_stats.get("prompt_cache_source") == "memory",
-            "regenerate did not reuse the in-memory prompt endpoint")
-    require(regenerate_stats.get("prompt_cache_exact_hit") == 1,
-            "regenerate was not an exact prompt endpoint hit")
+            "regenerate did not reuse the in-memory prompt state")
+    require(regenerate_stats.get("prompt_cache_exact_hit") == (
+                0 if hybrid_recurrent else 1),
+            "regenerate hit kind did not match the model's cache semantics")
     require(fork_stats.get("prompt_cache_source") in ("memory", "hot_disk"),
             "edited suffix did not reuse a persisted/in-memory prefix")
     require(0 < int(fork_stats.get("prompt_cache_prefix_tokens", 0)) < len(prompt_b),
             "fork did not reuse a strict proper prefix")
-    require(int(fork_stats.get("prompt_cache_prefix_tokens", 0)) % args.chunk_size == 0,
+    if hybrid_recurrent:
+        for label, stats in (
+            ("restart", restart_stats),
+            ("regenerate", regenerate_stats),
+            ("fork", fork_stats),
+            ("evicted", evicted_stats),
+        ):
+            require(
+                int(stats.get("prompt_cache_prefix_tokens", 0))
+                == shared_boundary,
+                f"{label} did not resume the exact stable boundary")
+    else:
+        require(
+            int(fork_stats.get("prompt_cache_prefix_tokens", 0))
+            % args.chunk_size == 0,
             "fork reuse was not chunk aligned")
     require(evicted_stats.get("prompt_cache_source") == "hot_disk",
             "evicted task was not recovered from the on-disk segment DAG")
     require(evicted_stats.get("hot_prompt_kv_disk_hit") == 1,
             "evicted task did not report a hot-disk hit")
-    require(evicted_stats.get("prompt_cache_exact_hit") == 1,
-            "evicted task recovery was not an exact prompt endpoint hit")
-    require(seed_leaf != regenerate_leaf,
-            "different-length regenerations unexpectedly collapsed to one leaf")
+    require(evicted_stats.get("prompt_cache_exact_hit") == (
+                0 if hybrid_recurrent else 1),
+            "evicted hit kind did not match the model's cache semantics")
+    require((seed_leaf == regenerate_leaf) if hybrid_recurrent else (
+                seed_leaf != regenerate_leaf),
+            ("hybrid stable boundary was not content-addressed across repeats"
+             if hybrid_recurrent else
+             "different-length regenerations unexpectedly collapsed to one leaf"))
 
     report = {
         "gate": "qwen-hot-kv-live-v1",
@@ -264,7 +319,14 @@ def main() -> int:
             (cold_a, cold_b, seeded, restarted, regenerated, forked, evicted)
         ) / 1e9, 3),
     }
-    print(json.dumps(report, indent=2))
+    rendered_report = json.dumps(report, indent=2)
+    print(rendered_report)
+    if args.result_json is not None:
+        result_path = args.result_json.expanduser().resolve()
+        result_path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = result_path.with_suffix(result_path.suffix + ".tmp")
+        temporary.write_text(rendered_report + "\n")
+        temporary.replace(result_path)
 
     if not args.keep:
         shutil.rmtree(persist_dir, ignore_errors=True)
