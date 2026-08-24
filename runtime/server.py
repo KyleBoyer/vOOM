@@ -1197,6 +1197,13 @@ class EngineManager:
             "VMODEL_QWEN_MTP_NGRAM_FIRST", "0").strip()
         qwen_mtp_q_policy_kind = os.environ.get(
             "VMODEL_QWEN_MTP_Q_POLICY", "flat").strip().lower()
+        dflash2_draft_request = os.environ.get(
+            "VMODEL_QWEN_DFLASH2_DRAFT", "").strip()
+        dflash2_proposal_policy = os.environ.get(
+            "VMODEL_QWEN_DFLASH2_PROPOSAL_POLICY", "selector"
+        ).strip().lower()
+        dflash2_release_request = os.environ.get(
+            "VMODEL_QWEN_DFLASH2_RELEASE_BETWEEN_SWEEPS", "1").strip()
         try:
             qwen_mtp_max_prompt_tokens = int(os.environ.get(
                 "VMODEL_QWEN_MTP_MAX_PROMPT_TOKENS", "32768"))
@@ -1210,9 +1217,17 @@ class EngineManager:
                 "VMODEL_QWEN_MTP_DEPTH", "1"))
             qwen_mtp_q_parameter = float(os.environ.get(
                 "VMODEL_QWEN_MTP_Q_PARAMETER", "1"))
+            dflash2_max_draft_tokens = int(os.environ.get(
+                "VMODEL_QWEN_DFLASH2_MAX_DRAFT_TOKENS", "4"))
+            dflash2_max_prompt_tokens = int(os.environ.get(
+                "VMODEL_QWEN_DFLASH2_MAX_PROMPT_TOKENS", "262144"))
+            dflash2_prompt_cache_min_tokens = int(os.environ.get(
+                "VMODEL_QWEN_DFLASH2_PROMPT_CACHE_MIN_TOKENS", "0"))
+            dflash2_load_margin_mb = int(os.environ.get(
+                "VMODEL_QWEN_DFLASH2_LOAD_MARGIN_MB", "400"))
         except ValueError as error:
             raise RequestValidationError(
-                "VMODEL_QWEN_MTP limits/replay/depth/q settings must be numeric"
+                "VMODEL Qwen MTP/DFlash2 settings must be numeric"
             ) from error
         if qwen_mtp_max_prompt_tokens <= 0:
             raise RequestValidationError(
@@ -1250,6 +1265,21 @@ class EngineManager:
             raise RequestValidationError(
                 "VMODEL_QWEN_MTP_Q_PARAMETER must be finite; temperature "
                 "requires >0 and rank requires >=0")
+        if dflash2_proposal_policy not in ("selector", "unary"):
+            raise RequestValidationError(
+                "VMODEL_QWEN_DFLASH2_PROPOSAL_POLICY must be selector or unary")
+        if dflash2_release_request not in ("0", "1"):
+            raise RequestValidationError(
+                "VMODEL_QWEN_DFLASH2_RELEASE_BETWEEN_SWEEPS must be 0 or 1")
+        if not 1 <= dflash2_max_draft_tokens <= 4:
+            raise RequestValidationError(
+                "VMODEL_QWEN_DFLASH2_MAX_DRAFT_TOKENS must be in [1, 4]")
+        if dflash2_max_prompt_tokens <= 0:
+            raise RequestValidationError(
+                "VMODEL_QWEN_DFLASH2_MAX_PROMPT_TOKENS must be positive")
+        if dflash2_prompt_cache_min_tokens < 0 or dflash2_load_margin_mb < 0:
+            raise RequestValidationError(
+                "VMODEL_QWEN_DFLASH2 cache minimum/load margin must be non-negative")
         qwen_moe_prefill_batch_request = os.environ.get(
             "VMODEL_QWEN_MOE_PREFILL_EXPERT_BATCH", "16").strip()
         qwen_moe_decode_batch_request = os.environ.get(
@@ -1636,6 +1666,13 @@ class EngineManager:
             str(model_dir), mode, yarn_factor.hex(),
             bool(requires_vision), resident_backend_request,
             dspark_request_identity,
+            dflash2_draft_request,
+            dflash2_max_draft_tokens,
+            dflash2_max_prompt_tokens,
+            dflash2_prompt_cache_min_tokens,
+            dflash2_proposal_policy,
+            dflash2_release_request,
+            dflash2_load_margin_mb,
             qwen_mtp_request,
             qwen_mtp_ngram_first_request,
             qwen_mtp_max_prompt_tokens,
@@ -1711,6 +1748,13 @@ class EngineManager:
             str(model_dir), mode, yarn_factor.hex(),
             bool(requires_vision), resident_backend_request,
             dspark_request_identity,
+            dflash2_draft_request,
+            dflash2_max_draft_tokens,
+            dflash2_max_prompt_tokens,
+            dflash2_prompt_cache_min_tokens,
+            dflash2_proposal_policy,
+            dflash2_release_request,
+            dflash2_load_margin_mb,
             qwen_mtp_request,
             qwen_mtp_ngram_first_request,
             qwen_mtp_max_prompt_tokens,
@@ -3558,6 +3602,9 @@ class EngineManager:
                 6000,
                 math.ceil(_dense_lossless_resident_bytes(cfg_probe) * 1.07 / 1_000_000),
             )
+            dflash2_dir = (
+                Path(dflash2_draft_request).expanduser().resolve()
+                if dflash2_draft_request else None)
             qwen2_adaptive_candidate = False
             qwen2_streamed_rc = None
             qwen2_resident_cache_mb = 0
@@ -4216,7 +4263,41 @@ class EngineManager:
                         f"DSpark not needed",
                         flush=True,
                     )
-            if dspark_dir is not None:
+            if dflash2_dir is not None:
+                from .dflash2_adapter import DFlash2SpeculativeEngine
+
+                try:
+                    self._engine = DFlash2SpeculativeEngine(
+                        target_engine,
+                        dflash2_dir,
+                        max_draft_tokens=dflash2_max_draft_tokens,
+                        max_prompt_tokens=dflash2_max_prompt_tokens,
+                        prompt_cache_min_tokens=(
+                            dflash2_prompt_cache_min_tokens),
+                        release_between_sweeps=(
+                            dflash2_release_request == "1"),
+                        drafter_load_margin_bytes=int(
+                            dflash2_load_margin_mb * 1_000_000),
+                        proposal_policy=dflash2_proposal_policy,
+                    )
+                    print(
+                        f"[server] target-verified DFlash2 speculation: "
+                        f"target={model_dir.name} draft={dflash2_dir.name} "
+                        f"cap={dflash2_max_draft_tokens} "
+                        f"prompt_limit={dflash2_max_prompt_tokens} "
+                        f"proposal_policy={dflash2_proposal_policy} "
+                        f"release_between_sweeps="
+                        f"{dflash2_release_request} "
+                        f"load_margin={dflash2_load_margin_mb}MB",
+                        flush=True,
+                    )
+                except Exception as error:
+                    target_engine.close()
+                    self._engine = None
+                    raise RequestValidationError(
+                        f"could not initialize DFlash2 draft "
+                        f"{dflash2_dir}: {error}") from error
+            elif dspark_dir is not None:
                 from .dspark import DSparkSpeculativeEngine
 
                 try:
@@ -7932,6 +8013,24 @@ def _vision_protocol_timing(result: dict) -> dict:
         "qwen_mtp_draft_reranked_lm_head_candidate_rank_capture_positions",
         "expert_cache_hits",
         "expert_cache_misses",
+        "speculative_enabled",
+        "speculative_used",
+        "speculative_k",
+        "speculative_target_sweeps",
+        "speculative_proposed",
+        "speculative_accepted",
+        "dflash2_checkpoint_block_size",
+        "dflash2_effective_block_size",
+        "dflash2_selector_top_k",
+        "dflash2_context_window_tokens",
+        "dflash2_candidate_recall_positions",
+        "dflash2_candidate_recall_hits",
+        "dflash2_unary_recall_positions",
+        "dflash2_unary_recall_hits",
+        "dspark_sidecar_round_loads",
+        "dspark_sidecar_round_releases",
+        "dspark_sidecar_loaded_bytes",
+        "dspark_sidecar_released_active_bytes",
         "qwen_mtp_enabled",
         "qwen_mtp_used",
         "qwen_mtp_proposed",
@@ -8064,6 +8163,11 @@ def _vision_protocol_timing(result: dict) -> dict:
         "reranked_lm_head_candidate_recall",
         "qwen_mtp_target_reranked_lm_head_candidate_recall",
         "qwen_mtp_draft_reranked_lm_head_candidate_recall",
+        "dflash2_candidate_recall",
+        "dflash2_unary_recall",
+        "dspark_context_s",
+        "dspark_sidecar_load_s",
+        "dspark_sidecar_release_s",
         "resident_persistent_prompt_cache_load_s",
         "resident_persistent_prompt_cache_save_s",
         "disk_prompt_lookup_s",
@@ -8075,6 +8179,9 @@ def _vision_protocol_timing(result: dict) -> dict:
     for key in (
         "qwen_mtp_round_outcomes",
         "qwen_mtp_proposal_sources",
+        "speculative_kind",
+        "dflash2_proposal_policy",
+        "dflash2_target_verifier",
         "kimi_k3_prefill_tile_policy",
         "kimi_k3_prefill_schedule",
     ):

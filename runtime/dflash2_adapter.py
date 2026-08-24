@@ -331,6 +331,33 @@ def build_proposal_block(
     return [int(pending_token)] + [int(mask_token_id)] * proposal_count
 
 
+def greedy_candidate_recall(
+    emitted: list[int],
+    rounds: list[tuple[int, int]],
+    candidate_rounds: list[list[list[int]]],
+) -> tuple[int, int]:
+    """Return target-decision count/hits inside the draft top-k support.
+
+    Only the accepted prefix and first mismatch affect greedy progress and can
+    be reconstructed from the committed stream. Rejected-tail predictions are
+    intentionally excluded instead of being guessed from later output.
+    """
+    positions = hits = 0
+    cursor = 1
+    for (proposed, accepted), candidates in zip(
+        rounds, candidate_rounds, strict=False,
+    ):
+        decisions = min(int(proposed), int(accepted) + 1)
+        for position in range(min(decisions, len(candidates))):
+            token_index = cursor + position
+            if token_index >= len(emitted):
+                break
+            positions += 1
+            hits += int(int(emitted[token_index]) in candidates[position])
+        cursor += int(accepted) + 1
+    return positions, hits
+
+
 def _sidecar_physical_names(
     config: DFlash2Config,
     *,
@@ -493,6 +520,11 @@ class DFlash2Drafter(nn.Module):
         self.confidence_head = None
         self._target_embed_provider = None
         self._target_lm_head_provider = None
+        # Host-only proposal diagnostics. Candidate IDs are copied only after
+        # the selector tensors have already been evaluated for generation, so
+        # this adds no target sweep or additional model projection.
+        self._last_candidate_ids: list[list[int]] = []
+        self._last_unary_tokens: list[int] = []
 
     @classmethod
     def load(
@@ -582,7 +614,13 @@ class DFlash2Drafter(nn.Module):
         ctx_caches: list[CtxCache],
         cap: int,
         sampling: SamplingParams,
+        proposal_policy: str = "selector",
     ) -> tuple[list[int], list[mx.array] | None, mx.array]:
+        if proposal_policy not in {"selector", "unary"}:
+            raise ValueError("DFlash2 proposal_policy must be selector or unary")
+        if proposal_policy == "unary" and not sampling.is_greedy:
+            raise ValueError(
+                "DFlash2 unary proposal policy is greedy-only")
         block_ids = build_proposal_block(
             pending_token, self.mask_token_id, self.config.block_size, cap)
         hidden = self._embed_block(block_ids)
@@ -590,6 +628,7 @@ class DFlash2Drafter(nn.Module):
             hidden = layer(hidden, block_offset, cache)
         proposal_hidden = self.norm(hidden)[:, 1:]
         logits = self._project_logits(proposal_hidden)
+        unary_proposals = mx.argmax(logits, axis=-1)
         proposals, candidates, sparse_q = self.candidate_selector.select(
             proposal_hidden,
             logits,
@@ -597,9 +636,19 @@ class DFlash2Drafter(nn.Module):
             0.0 if sampling.is_greedy else float(sampling.temperature),
         )
         if sparse_q is None:
-            mx.eval(proposals, candidates)
+            mx.eval(proposals, candidates, unary_proposals)
         else:
-            mx.eval(proposals, candidates, sparse_q)
+            mx.eval(proposals, candidates, sparse_q, unary_proposals)
+        self._last_candidate_ids = [
+            [int(token) for token in row]
+            for row in candidates[0].tolist()
+        ]
+        self._last_unary_tokens = [
+            int(token) for token in unary_proposals[0].tolist()
+        ]
+        if proposal_policy == "unary":
+            proposals = unary_proposals
+            sparse_q = None
         proposal_list = [int(token) for token in proposals[0].tolist()]
         distributions = None
         if sparse_q is not None:
@@ -623,11 +672,16 @@ class DFlash2SpeculativeDecoder(DSparkSpeculativeDecoder):
         release_between_sweeps: bool = True,
         drafter_storage_bytes: int = 0,
         drafter_load_margin_bytes: int = 400_000_000,
+        proposal_policy: str = "selector",
     ):
         if max_draft_tokens > MAX_QUANTIZED_PROPOSALS:
             raise ValueError(
                 "quantized MLX DFlash2 is capped at four proposals/block")
         validate_target_compatibility(drafter.config, target.cfg)
+        if proposal_policy not in {"selector", "unary"}:
+            raise ValueError(
+                "DFlash2 proposal_policy must be selector or unary")
+        self.proposal_policy = proposal_policy
         super().__init__(
             target,
             drafter,
@@ -640,6 +694,8 @@ class DFlash2SpeculativeDecoder(DSparkSpeculativeDecoder):
             drafter_storage_bytes=drafter_storage_bytes,
             drafter_load_margin_bytes=drafter_load_margin_bytes,
         )
+        self._candidate_rounds: list[list[list[int]]] = []
+        self._unary_rounds: list[list[int]] = []
 
     def _propose(
         self,
@@ -652,11 +708,35 @@ class DFlash2SpeculativeDecoder(DSparkSpeculativeDecoder):
     ):
         del history  # DFlash2 q is selector-conditional, not repetition-filtered.
         proposals, distributions, _hidden = self._ensure_drafter().propose_block(
-            pending, offset, ctx_caches, cap, sampling)
+            pending, offset, ctx_caches, cap, sampling,
+            proposal_policy=self.proposal_policy)
+        self._candidate_rounds.append([
+            list(row)
+            for row in self._ensure_drafter()._last_candidate_ids
+        ])
+        self._unary_rounds.append(list(
+            self._ensure_drafter()._last_unary_tokens))
         return proposals, distributions
 
     def generate(self, *args, **kwargs):
+        self._candidate_rounds.clear()
+        self._unary_rounds.clear()
         result = super().generate(*args, **kwargs)
+        # For greedy decoding, the committed stream plus each round's accepted
+        # prefix reconstructs every target decision that influenced progress.
+        # This lets us distinguish a selector miss from a base top-k miss
+        # without retaining logits or target hidden states.
+        candidate_positions = candidate_hits = 0
+        unary_positions = unary_hits = 0
+        emitted = [int(token) for token in result.get("tokens", ())]
+        stats = result.get("stats")
+        rounds = list(getattr(stats, "rounds", ()))
+        if kwargs.get("sampling") is None or kwargs["sampling"].is_greedy:
+            candidate_positions, candidate_hits = greedy_candidate_recall(
+                emitted, rounds, self._candidate_rounds)
+            unary_positions, unary_hits = greedy_candidate_recall(
+                emitted, rounds,
+                [[[token] for token in row] for row in self._unary_rounds])
         result.setdefault("path_stats", {}).update({
             "speculative_kind": "dflash2",
             "dflash2_enabled": 1,
@@ -665,6 +745,16 @@ class DFlash2SpeculativeDecoder(DSparkSpeculativeDecoder):
             "dflash2_selector_top_k": self._cfg.selector_top_k,
             "dflash2_context_window_tokens": self.context_window_tokens,
             "dflash2_target_verifier": "dspark-qwen-authoritative",
+            "dflash2_proposal_policy": self.proposal_policy,
+            "dflash2_candidate_recall_positions": candidate_positions,
+            "dflash2_candidate_recall_hits": candidate_hits,
+            "dflash2_candidate_recall": (
+                candidate_hits / candidate_positions
+                if candidate_positions else None),
+            "dflash2_unary_recall_positions": unary_positions,
+            "dflash2_unary_recall_hits": unary_hits,
+            "dflash2_unary_recall": (
+                unary_hits / unary_positions if unary_positions else None),
         })
         return result
 
@@ -683,6 +773,7 @@ class DFlash2SpeculativeEngine:
         release_between_sweeps: bool = True,
         drafter_load_margin_bytes: int = 400_000_000,
         verify_sidecar_hash: bool = True,
+        proposal_policy: str = "selector",
     ):
         if max_prompt_tokens <= 0:
             raise ValueError("DFlash2 max_prompt_tokens must be positive")
@@ -704,7 +795,10 @@ class DFlash2SpeculativeEngine:
                 prepare_for(draft_bytes)
             if target.governor is not None:
                 target.governor.reserve(
-                    draft_bytes, margin=drafter_load_margin_bytes)
+                    draft_bytes,
+                    margin=drafter_load_margin_bytes,
+                    reason="dflash2-sidecar-load",
+                )
             # The first construction below verified the content hash.  Round
             # reloads validate metadata/header identity without rereading the
             # entire 1.08 GB artifact solely to hash it again.
@@ -712,7 +806,8 @@ class DFlash2SpeculativeEngine:
                 draft_dir, verify_hash=False))
 
         if target.governor is not None:
-            target.governor.reserve(draft_bytes)
+            target.governor.reserve(
+                draft_bytes, reason="dflash2-sidecar-initial-load")
         drafter = bind(DFlash2Drafter.load(
             draft_dir, verify_hash=verify_sidecar_hash))
         if target.governor is not None:
@@ -726,6 +821,7 @@ class DFlash2SpeculativeEngine:
             release_between_sweeps=release_between_sweeps,
             drafter_storage_bytes=draft_bytes,
             drafter_load_margin_bytes=drafter_load_margin_bytes,
+            proposal_policy=proposal_policy,
         )
         self._speculative_k = self.decoder.max_draft_tokens
         self._speculative_draft_dir = draft_dir

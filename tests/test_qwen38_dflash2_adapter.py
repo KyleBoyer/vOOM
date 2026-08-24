@@ -22,6 +22,7 @@ from runtime.dflash2_adapter import (
     build_proposal_block,
     dflash2_sliding_mask,
     expand_sparse_candidate_probabilities,
+    greedy_candidate_recall,
     validate_target_compatibility,
 )
 from runtime.dflash2_schema import DFlash2Config, OFFICIAL_CONFIG
@@ -338,3 +339,19 @@ def test_sparse_q_shape_mismatch_fails_closed():
 
 def test_runtime_quantized_cap_constant_is_four():
     assert MAX_QUANTIZED_PROPOSALS == 4
+
+
+def test_greedy_candidate_recall_counts_only_progress_decisions():
+    # Bootstrap token 90, then: one accepted + mismatch, all accepted + bonus,
+    # and an immediate mismatch. Rejected tails are not observable progress.
+    emitted = [90, 11, 12, 21, 22, 23, 31]
+    rounds = [(4, 1), (2, 2), (3, 0)]
+    candidates = [
+        [[11, 41], [12, 42], [99], [98]],
+        [[21, 51], [22, 52]],
+        [[77, 78], [79], [80]],
+    ]
+    positions, hits = greedy_candidate_recall(
+        emitted, rounds, candidates)
+    assert positions == 5
+    assert hits == 4

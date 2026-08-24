@@ -4138,6 +4138,88 @@ def test_engine_manager_exposes_qwen38_dspark_only_by_explicit_path(tmp_path):
     assert discover.call_count == 3
 
 
+def test_engine_manager_wraps_qwen38_with_explicit_dflash2_and_keys_policy(tmp_path):
+    from unittest.mock import patch
+
+    from runtime.server import EngineManager
+
+    target_path = tmp_path / "Huihui-Qwen3.8-27B"
+    draft_path = tmp_path / "Qwen3.8-27B-DFlash2-mlx-affine4-g64"
+    target_path.mkdir()
+    draft_path.mkdir()
+    cfg = SimpleNamespace(
+        model_type="qwen3_5", tie_word_embeddings=False,
+        index_topk=0, vision_config=None, num_experts=0,
+        hidden_size=5120, intermediate_size=17408,
+        num_hidden_layers=64, num_attention_heads=24,
+        num_key_value_heads=4, head_dim=256, vocab_size=248320,
+        attention_bias=False, layer_types=(
+            "linear_attention", "linear_attention", "linear_attention",
+            "full_attention") * 16,
+    )
+    made = []
+
+    class FakeEngine:
+        def __init__(self, path, rc):
+            self.path, self.rc, self.closes = Path(path), rc, 0
+            self.cache = SimpleNamespace(max_bytes=2_000_000_000)
+            self.governor = None
+
+        def close(self):
+            self.closes += 1
+
+    class FakeDFlash2Engine:
+        def __init__(self, target, draft_dir, **kwargs):
+            self.target = target
+            self.draft_dir = Path(draft_dir)
+            self.kwargs = kwargs
+            self.closes = 0
+            made.append(self)
+
+        def close(self):
+            self.closes += 1
+            self.target.close()
+
+    manager = EngineManager()
+    env = {
+        "VMODEL_QWEN_DFLASH2_DRAFT": str(draft_path),
+        "VMODEL_QWEN_DFLASH2_MAX_DRAFT_TOKENS": "4",
+        "VMODEL_QWEN_DFLASH2_MAX_PROMPT_TOKENS": "262144",
+        "VMODEL_QWEN_DFLASH2_PROMPT_CACHE_MIN_TOKENS": "0",
+        "VMODEL_QWEN_DFLASH2_PROPOSAL_POLICY": "unary",
+        "VMODEL_QWEN_DFLASH2_RELEASE_BETWEEN_SWEEPS": "1",
+        "VMODEL_QWEN_DFLASH2_LOAD_MARGIN_MB": "400",
+        "VMODEL_QWEN_MTP_SPECULATIVE": "1",
+    }
+    with patch("runtime.config.ModelConfig.from_dir", return_value=cfg), \
+         patch("runtime.path_resolver.resolve_model_dir",
+               side_effect=lambda path: path), \
+         patch("runtime.server._dspark_draft_for", return_value=None), \
+         patch("runtime.engine.StreamingEngine", FakeEngine), \
+         patch("runtime.dflash2_adapter.DFlash2SpeculativeEngine",
+               FakeDFlash2Engine), \
+         patch.dict("os.environ", env), \
+         patch("runtime.server.psutil.virtual_memory",
+               return_value=SimpleNamespace(available=8_000_000_000)):
+        first = manager.get(target_path, "fast")
+        assert first.draft_dir == draft_path
+        assert first.kwargs == {
+            "max_draft_tokens": 4,
+            "max_prompt_tokens": 262144,
+            "prompt_cache_min_tokens": 0,
+            "release_between_sweeps": True,
+            "drafter_load_margin_bytes": 400_000_000,
+            "proposal_policy": "unary",
+        }
+        os.environ["VMODEL_QWEN_DFLASH2_PROPOSAL_POLICY"] = "selector"
+        second = manager.get(target_path, "fast")
+
+    assert len(made) == 2
+    assert first.closes == 1
+    assert first.target.closes == 1
+    assert second.kwargs["proposal_policy"] == "selector"
+
+
 def test_engine_manager_prefers_full_resident_qwen3_when_governor_admits_it(tmp_path):
     from unittest.mock import patch
 
