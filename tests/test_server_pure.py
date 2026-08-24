@@ -256,12 +256,32 @@ def test_protocol_timing_exposes_qwen_delta_arithmetic_mode():
             "qwen_compiled_delta_prefill": 1,
             "qwen_native_fused_delta_prefill": 0,
             "qwen_chunked_delta_prefill": 0,
+            "qwen_lossy_suffix_prefill_enabled": 1,
+            "qwen_lossy_suffix_prefill_used": 1,
+            "qwen_lossy_suffix_prefill_early_layers": 8,
+            "qwen_lossy_suffix_prefill_prefix_tokens": 0,
+            "qwen_lossy_suffix_prefill_tokens": 256,
+            "hot_prompt_kv_disk_hit": 1,
+            "hot_prompt_hybrid_prefix_snapshot_tokens": 6332,
+            "hot_prompt_admission_positions": 7,
+            "disk_prompt_lookup_s": 0.42,
+            "hot_prompt_kv_persist_write_s": 1.25,
         },
     })
 
     assert timing["qwen_compiled_delta_prefill"] == 1
     assert timing["qwen_native_fused_delta_prefill"] == 0
     assert timing["qwen_chunked_delta_prefill"] == 0
+    assert timing["qwen_lossy_suffix_prefill_enabled"] == 1
+    assert timing["qwen_lossy_suffix_prefill_used"] == 1
+    assert timing["qwen_lossy_suffix_prefill_early_layers"] == 8
+    assert timing["qwen_lossy_suffix_prefill_prefix_tokens"] == 0
+    assert timing["qwen_lossy_suffix_prefill_tokens"] == 256
+    assert timing["hot_prompt_kv_disk_hit"] == 1
+    assert timing["hot_prompt_hybrid_prefix_snapshot_tokens"] == 6332
+    assert timing["hot_prompt_admission_positions"] == 7
+    assert timing["disk_prompt_lookup_s"] == 0.42
+    assert timing["hot_prompt_kv_persist_write_s"] == 1.25
 
 
 def test_protocol_timing_exposes_pin_and_prefetch_measurements():
@@ -3031,6 +3051,55 @@ def test_dense_qwen35_wires_mixed_depth_suffix_and_disables_durable_store():
     assert rc.qwen_lossy_suffix_prefill_tokens == 1024
     assert rc.layer_stationary_prefill
     assert rc.hot_prompt_kv_persist_dir == ""
+
+
+def test_dense_qwen35_wires_explicit_mixed_depth_durable_store(tmp_path):
+    from unittest.mock import patch
+
+    from runtime.server import EngineManager
+
+    captured = []
+
+    class FakeEngine:
+        def __init__(self, _path, rc):
+            captured.append(rc)
+
+        def close(self):
+            pass
+
+    cfg = SimpleNamespace(
+        model_type="qwen3_5", tie_word_embeddings=False,
+        index_topk=0, vision_config=None, num_experts=0,
+        hidden_size=5120, intermediate_size=17408,
+        num_hidden_layers=64, num_attention_heads=24,
+        num_key_value_heads=4, head_dim=256, vocab_size=248320,
+        attention_bias=False, layer_types=(
+            "linear_attention", "linear_attention", "linear_attention",
+            "full_attention") * 16,
+    )
+    persist = tmp_path / "mixed"
+    env = {
+        "VMODEL_QWEN35_LOSSY_SUFFIX_PREFILL": "16:1024",
+        "VMODEL_QWEN35_MIXED_DEPTH_HOT_KV_PERSIST": "1",
+        "VMODEL_QWEN35_HOT_KV_PERSIST_DIR": str(persist),
+    }
+    manager = EngineManager()
+    with patch.dict(os.environ, env), \
+         patch("runtime.config.ModelConfig.from_dir", return_value=cfg), \
+         patch("runtime.path_resolver.resolve_model_dir",
+               side_effect=lambda path: path), \
+         patch("runtime.engine.StreamingEngine", FakeEngine), \
+         patch("runtime.server.psutil.virtual_memory",
+               return_value=SimpleNamespace(available=8_000_000_000)):
+        manager.get(Path("/tmp/fake-qwen38-dense-mixed-persist"), "fast")
+        os.environ["VMODEL_QWEN35_MIXED_DEPTH_HOT_KV_PERSIST"] = "0"
+        manager.get(Path("/tmp/fake-qwen38-dense-mixed-persist"), "fast")
+
+    assert len(captured) == 2
+    assert captured[0].hot_prompt_kv_persist_dir == str(persist)
+    assert captured[0].hot_prompt_kv_persist_max_checkpoints == 4
+    assert captured[0].hot_prompt_kv_persist_max_mb == 2048
+    assert captured[1].hot_prompt_kv_persist_dir == ""
 
 
 def test_dense_qwen35_wires_explicit_pin_and_prefetch_ladder():

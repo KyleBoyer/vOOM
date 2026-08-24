@@ -25,9 +25,10 @@ free-space floor.
 
 Cold A/B used the unmodified 178,616-byte, 134-tool captured request, streamed,
 with only the documented 16-token benchmark cap. Both arms used the same
-temporary 5.5 GB available/post-generation benchmark floors because the
-machine could not admit the run with the shipped 6 GB floor at the time. The
-profile's shipped 6 GB safety floor was not changed.
+5.5 GB available/post-generation floors. A later strict durable-prefix gate
+confirmed that floor on the shipped profile; 6 GB rejected a restored suffix
+before allocation even though the lower floor stayed under all Metal/swap
+limits.
 
 | Metric | External-only MTP | Exact two-SSD MTP | Change |
 |---|---:|---:|---:|
@@ -64,6 +65,56 @@ and achieved 1.875 output tokens per target sweep. New telemetry separates
 input, committed and rolled-back verifier positions, accepted/correction/bonus
 tokens, target sweeps avoided, tokens per sweep, and draft/verifier time.
 
+## Accepted: restart-safe mixed-depth prompt state, 75.10 seconds wall
+
+The ordinary exact hot-KV journal assumes every attention layer retains the
+same token count. The `16:1024` profile deliberately does not: its first four
+full-attention layers retain all 6,332 stable-boundary positions while the
+remaining twelve retain 1,024 packed suffix positions. Pretending those were
+uniform deltas would be incorrect.
+
+`runtime/qwen_mixed_depth_kv_persist.py` writes one immutable stable-prefix
+snapshot containing the actual local length of all 64 layers, complete K/V for
+all 16 full-attention layers, and state plus convolution history for all 48
+DeltaNet layers. The manifest and 464,993,106-byte safetensors payload are
+content-addressed and SHA-256 checked. Model, tokenizer, runtime source,
+quantization, RoPE and schedule changes fail closed through the engine KV
+fingerprint. Restore is allowed only when the snapshot tokens are a strict
+prefix of the new prompt; it never supplies endpoint logits and cannot rewind
+or branch.
+
+The one-time final-fingerprint seed used the unmodified capture with a
+one-token output cap, because no verifier/decode sweep is needed to construct
+prompt state. It finished in 82.096 seconds wall, wrote the 443 MiB on-disk
+snapshot in 0.516 seconds, peaked at 3.256 GB Metal and grew swap-outs by
+6.734 MB. After stopping the server and passing a fresh 30-second memory
+preflight, a new process served the unmodified capture with the ordinary
+16-token benchmark cap:
+
+| Metric | Empty persistent cache | Fresh-process restored cache |
+|---|---:|---:|
+| Cached prompt tokens | 0 | 6,332 / 6,339 |
+| Suffix prefill | 58.687 s (prior clean cold baseline) | 10.082 s |
+| Decode | 61.295 s | 60.893 s |
+| Engine | 119.983 s | 71.622 s |
+| End-to-end wall | 123.424 s | **75.104 s** |
+| Peak Metal | 3.199 GB | 2.469 GB |
+| Swap-out growth | baseline arm gate | **15.581 MB** |
+
+The restored run passed the fixture's explicit `<90s`, `hot_disk`, 5.5 GB
+available-memory, 8.5 GB Metal and 16 MB swap-out gates. It kept the baseline
+response SHA-256
+`9b170095a170f34a248af480bab274aef28f42ebf1504196bc28cc57e5b87b81`,
+accepted 8/8 released-BF16 MTP proposals and produced 1.875 target tokens per
+target sweep. This is an operational restart/warm-prefix result, not a claim
+that an empty-cache 16-token request is below 90 seconds.
+
+Artifacts:
+
+- `logs/sub90_mixed_kv_final_seed_capture1.json`
+- `logs/sub90_mixed_kv_final_restart.preflight.json`
+- `logs/sub90_mixed_kv_final_restart_capture16.json`
+
 ## Dual-disk and prefetch instrumentation
 
 New request telemetry reports per-device bytes, service time, parallel-fetch
@@ -88,6 +139,23 @@ body manifest was rejected and the original active manifest was restored.
 This shows that body-tier time is currently dominated by per-fetch loading and
 materialization as well as raw bytes; blindly moving more body bytes is not an
 improvement.
+
+## Rejected: per-layer fast-tier containers and narrower endpoint schedules
+
+The exact FreeToken-style layer-container builder copied every target tensor
+byte-for-byte into 65 final per-layer files (6.999 GB). This increased the
+governor's per-layer transient reserve to roughly 0.57 GB and forced the
+128/32/8/1 retry ladder without completing. The active body manifest was
+restored and all 65 derived files were removed, recovering 6.999 GB. The
+builder remains as a reproducible STOP experiment in
+`runtime/qwen_fast_tier_layerpack.py`; it does not participate in serving.
+
+The more aggressive content-blind `8:256` schedule preserved the captured
+response hash but only reduced prefill by 4.39 seconds and finished at
+119.60 seconds wall while growing swap-outs by 198 MB, so it was rejected.
+Task-scoped gateway context reduced the rendered execution prompt to 1,054
+tokens and preserved that same hash, but completed in 142.70 seconds under
+pressure and is not promoted. Neither experiment meets the memory/timing gate.
 
 ## Rejected: CPU dense projection offload
 

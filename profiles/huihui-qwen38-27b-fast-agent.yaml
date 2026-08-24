@@ -5,11 +5,12 @@ notes:
   - "This is an explicit lossy candidate: all-weight MXFP4, reassociated DeltaNet prefill, and a fixed mixed-depth 16:1024 schedule change the released computation."
   - "The schedule is content-blind and retains four times the late-layer depth and suffix budget of the established 9B 8:256 profile; it is not promoted merely from that analogy."
   - "Full execution context and released tool schemas remain available after hidden catalog selection; task-only execution context and grammar jump-forward stay disabled."
-  - "The 2.2 GB weight-cache ceiling and 6 GB post-generation/retention floors are machine-specific safety controls for the 16 GB host; they trade a small amount of decode I/O for avoiding macOS swap."
+  - "The 2.2 GB weight-cache ceiling and 5.5 GB post-generation/retention floors are machine-specific safety controls for the 16 GB host. The durable-prefix 16-token gate passed at 2.469 GB peak Metal and 15.581 MB swap-outs; the prior 6 GB floor rejected the restored suffix before allocation."
   - "The explicit 128-token prefill ceiling avoids the measured cold-start failure after an automatic 512-token selection near layer 39; the exact 128-token retry completed prefill on this host."
   - "Released-BF16 MTP uses a calibrated top-1 proposal distribution at depth 1. On the unmodified 134-tool capture this reduced target sweeps from 11 to 8, accepted 7/8 proposals, and cut measured decode from 86.424 to 68.440 seconds without changing the target output. Depth 2 was tested and rejected for this profile because its second-step overlap was poor, it saved no additional target sweep, and it was slower."
   - "The compact MXFP4 language-model head is pinned and the exact scheduler prefetches two layers. Their cold 134-tool gate preserved the response hash and reduced decode to 62.553 seconds. Adding a 1 GB trunk-pin request was rejected after the governor refused a verifier allocation, so trunk pinning remains off."
-  - "The released-BF16 MTP sidecar is split tensor-wise across the internal and external SSDs by a hashed fail-closed fast-tier manifest. On the unmodified 134-tool capture (16-token benchmark cap and identical temporary 5.5 GB admission floors in both arms), this cut MTP loading 36.96%, draft work 32.21%, decode 3.51%, and wall time 2.14% with an identical response hash. The shipped 6 GB safety floors remain unchanged."
+  - "The released-BF16 MTP sidecar is split tensor-wise across the internal and external SSDs by a hashed fail-closed fast-tier manifest. On the unmodified 134-tool capture (16-token benchmark cap and identical 5.5 GB admission floors in both arms), this cut MTP loading 36.96%, draft work 32.21%, decode 3.51%, and wall time 2.14% with an identical response hash."
+  - "Mixed-depth stable prompt state is persisted as a checksummed full snapshot with per-layer local KV lengths and complete DeltaNet state. It is eligible only for a strict token-prefix extension under the identical model/runtime/schedule fingerprint; it never supplies endpoint logits, rewinds, or branches."
   - "Filtered multi-page final answers require a deterministic policy adapter: the direct model-only synthesis was rejected at 87.5/100 and the generic terminal-synthesis experiment returned no final-channel text; the adapter scored 100/100."
   - "Use only after the captured Plex rubric, heterogeneous request-shape corpus, temperature matrix, memory ceiling, and BF16 comparison gates pass for this checkpoint."
 extends:
@@ -20,14 +21,15 @@ settings:
   VMODEL_FAST_TOOL_GATEWAY_DETERMINISTIC_POLICY: true
   VMODEL_RESIDENT_BACKEND: voom
   VMODEL_QWEN35_WEIGHT_CACHE_MB: 2200
-  VMODEL_QWEN35_MIN_AVAILABLE_MB: 6000
-  VMODEL_QWEN35_POSTGEN_MIN_AVAILABLE_MB: 6000
+  VMODEL_QWEN35_MIN_AVAILABLE_MB: 5500
+  VMODEL_QWEN35_POSTGEN_MIN_AVAILABLE_MB: 5500
   VMODEL_QWEN35_PREFILL_CHUNK_CEILING: 128
   VMODEL_QWEN35_PIN_LM_HEAD: true
   VMODEL_QWEN35_PREFETCH_DEPTH: 2
   VMODEL_QWEN35_LAYER_STATIONARY_PREFILL: true
   VMODEL_QWEN35_FUSED_BOUNDARY_SCAFFOLD_PREFILL: true
   VMODEL_QWEN35_LOSSY_SUFFIX_PREFILL: "16:1024"
+  VMODEL_QWEN35_MIXED_DEPTH_HOT_KV_PERSIST: true
   VMODEL_QWEN35_CHUNKED_DELTA: true
   VMODEL_QWEN35_FP8_KV_CACHE: false
   VMODEL_QWEN_MTP_SPECULATIVE: true

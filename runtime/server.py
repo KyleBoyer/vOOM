@@ -1228,6 +1228,15 @@ class EngineManager:
             "VMODEL_QWEN_MOE_PREFILL_EXPERT_BATCH", "16").strip()
         qwen_moe_decode_batch_request = os.environ.get(
             "VMODEL_QWEN_MOE_DECODE_EXPERT_BATCH", "8").strip()
+        qwen_lossy_suffix_request = os.environ.get(
+            "VMODEL_QWEN35_LOSSY_SUFFIX_PREFILL", "").strip()
+        qwen_hot_kv_persist_dir_request = os.environ.get(
+            "VMODEL_QWEN35_HOT_KV_PERSIST_DIR", "").strip()
+        qwen_mixed_depth_persist_request = os.environ.get(
+            "VMODEL_QWEN35_MIXED_DEPTH_HOT_KV_PERSIST", "0").strip()
+        if qwen_mixed_depth_persist_request not in ("0", "1"):
+            raise RequestValidationError(
+                "VMODEL_QWEN35_MIXED_DEPTH_HOT_KV_PERSIST must be 0 or 1")
         try:
             qwen35_prefill_chunk_ceiling = int(os.environ.get(
                 "VMODEL_QWEN35_PREFILL_CHUNK_CEILING", "0"))
@@ -1606,6 +1615,9 @@ class EngineManager:
             qwen_moe_prefill_batch_request,
             qwen_moe_decode_batch_request,
             qwen35_prefill_chunk_ceiling,
+            qwen_lossy_suffix_request,
+            qwen_hot_kv_persist_dir_request,
+            qwen_mixed_depth_persist_request,
             qwen_quant_lm_head_request,
             qwen_rerank_lm_head_request,
             qwen_rerank_lm_head_candidates,
@@ -1675,6 +1687,9 @@ class EngineManager:
             qwen_moe_prefill_batch_request,
             qwen_moe_decode_batch_request,
             qwen35_prefill_chunk_ceiling,
+            qwen_lossy_suffix_request,
+            qwen_hot_kv_persist_dir_request,
+            qwen_mixed_depth_persist_request,
             qwen_quant_lm_head_request,
             qwen_rerank_lm_head_request,
             qwen_rerank_lm_head_candidates,
@@ -2448,8 +2463,7 @@ class EngineManager:
                  rc.qwen_lossy_suffix_prefill_prefix_tokens,
                  rc.qwen_lossy_suffix_prefill_tokens
                  ) = _qwen_lossy_suffix_prefill_policy(
-                    os.environ.get(
-                        "VMODEL_QWEN35_LOSSY_SUFFIX_PREFILL", ""),
+                    qwen_lossy_suffix_request,
                     mode=mode,
                     total_layers=int(cfg_probe.num_hidden_layers),
                     layer_types=tuple(getattr(cfg_probe, "layer_types", ())),
@@ -2467,10 +2481,26 @@ class EngineManager:
                         "non-negative")
                 if rc.qwen_lossy_suffix_prefill_early_layers:
                     rc.layer_stationary_prefill = True
-                    # Durable hot-KV currently assumes uniform per-layer
-                    # position counts. Keep this mixed representation in RAM;
-                    # exact endpoint/extension reuse remains supported.
-                    rc.hot_prompt_kv_persist_dir = ""
+                    if qwen_mixed_depth_persist_request == "1":
+                        identity = hashlib.sha256(
+                            str(model_dir).encode()).hexdigest()[:16]
+                        rc.hot_prompt_kv_persist_dir = (
+                            qwen_hot_kv_persist_dir_request
+                            or str(ROOT / "logs"
+                                   / "qwen35_mixed_depth_hot_kv" / identity))
+                        rc.hot_prompt_kv_persist_max_checkpoints = min(
+                            rc.hot_prompt_kv_persist_max_checkpoints, 4)
+                        if not rc.hot_prompt_kv_persist_max_mb:
+                            rc.hot_prompt_kv_persist_max_mb = 2048
+                    else:
+                        # The ordinary durable journal assumes uniform
+                        # per-layer positions. The dedicated full-snapshot
+                        # format is separately explicit and fail-closed.
+                        rc.hot_prompt_kv_persist_dir = ""
+                elif qwen_mixed_depth_persist_request == "1":
+                    raise ValueError(
+                        "VMODEL_QWEN35_MIXED_DEPTH_HOT_KV_PERSIST requires "
+                        "VMODEL_QWEN35_LOSSY_SUFFIX_PREFILL")
                 if mode in ("fast", "fast-long"):
                     # Initial side-quest profile: quantize only expert MLP
                     # matrices. DeltaNet, gated full attention, routers, shared
@@ -2598,19 +2628,33 @@ class EngineManager:
                  rc.qwen_lossy_suffix_prefill_prefix_tokens,
                  rc.qwen_lossy_suffix_prefill_tokens
                  ) = _qwen_lossy_suffix_prefill_policy(
-                    os.environ.get(
-                        "VMODEL_QWEN35_LOSSY_SUFFIX_PREFILL", ""),
+                    qwen_lossy_suffix_request,
                     mode=mode,
                     total_layers=int(cfg_probe.num_hidden_layers),
                     layer_types=tuple(getattr(cfg_probe, "layer_types", ())),
                 )
                 if rc.qwen_lossy_suffix_prefill_early_layers:
                     rc.layer_stationary_prefill = True
-                    # The durable format stores one uniform position count
-                    # per layer.  A mixed-depth endpoint deliberately does
-                    # not have that representation, so keep it process-local
-                    # rather than persisting an ambiguous checkpoint.
-                    rc.hot_prompt_kv_persist_dir = ""
+                    if qwen_mixed_depth_persist_request == "1":
+                        identity = hashlib.sha256(
+                            str(model_dir).encode()).hexdigest()[:16]
+                        rc.hot_prompt_kv_persist_dir = (
+                            qwen_hot_kv_persist_dir_request
+                            or str(ROOT / "logs"
+                                   / "qwen35_mixed_depth_hot_kv" / identity))
+                        rc.hot_prompt_kv_persist_max_checkpoints = min(
+                            rc.hot_prompt_kv_persist_max_checkpoints, 4)
+                        if not rc.hot_prompt_kv_persist_max_mb:
+                            rc.hot_prompt_kv_persist_max_mb = 2048
+                    else:
+                        # The ordinary durable journal assumes uniform
+                        # per-layer positions. The dedicated full-snapshot
+                        # format is separately explicit and fail-closed.
+                        rc.hot_prompt_kv_persist_dir = ""
+                elif qwen_mixed_depth_persist_request == "1":
+                    raise ValueError(
+                        "VMODEL_QWEN35_MIXED_DEPTH_HOT_KV_PERSIST requires "
+                        "VMODEL_QWEN35_LOSSY_SUFFIX_PREFILL")
                 try:
                     rc.hot_prompt_kv_slots = int(os.environ.get(
                         "VMODEL_QWEN35_HOT_KV_SLOTS", "2"))
@@ -7641,6 +7685,14 @@ def _vision_protocol_timing(result: dict) -> dict:
         "qwen_compiled_delta_prefill",
         "qwen_native_fused_delta_prefill",
         "qwen_chunked_delta_prefill",
+        "qwen_lossy_suffix_prefill_enabled",
+        "qwen_lossy_suffix_prefill_used",
+        "qwen_lossy_suffix_prefill_early_layers",
+        "qwen_lossy_suffix_prefill_prefix_tokens",
+        "qwen_lossy_suffix_prefill_tokens",
+        "hot_prompt_kv_disk_hit",
+        "hot_prompt_hybrid_prefix_snapshot_tokens",
+        "hot_prompt_admission_positions",
         "reranked_lm_head_calls",
         "reranked_lm_head_positions",
         "reranked_lm_head_candidate_winner_changes",
@@ -7788,6 +7840,8 @@ def _vision_protocol_timing(result: dict) -> dict:
         "qwen_mtp_draft_reranked_lm_head_candidate_recall",
         "resident_persistent_prompt_cache_load_s",
         "resident_persistent_prompt_cache_save_s",
+        "disk_prompt_lookup_s",
+        "hot_prompt_kv_persist_write_s",
     )
     for key in optional_float_fields:
         if key in stats or key in result:

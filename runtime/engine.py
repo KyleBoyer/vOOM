@@ -2355,7 +2355,15 @@ class StreamingEngine:
         self._defer_persisted_kv_until_bootstrap = (
             self._should_defer_persisted_kv_until_bootstrap())
         if self.rc.hot_prompt_kv and self.rc.hot_prompt_kv_persist_dir:
-            from .hot_kv_persist import HotPromptKVPersistence
+            mixed_depth_persistence = bool(
+                self.cfg.model_type in ("qwen3_5", "qwen3_5_moe")
+                and self.rc.qwen_lossy_suffix_prefill_early_layers)
+            if mixed_depth_persistence:
+                from .qwen_mixed_depth_kv_persist import (
+                    QwenMixedDepthPromptPersistence,
+                )
+            else:
+                from .hot_kv_persist import HotPromptKVPersistence
 
             paged_cache_factory = None
             if self.rc.paged_kv_persist:
@@ -2369,21 +2377,37 @@ class StreamingEngine:
                     compress_spill=self.rc.kv_spill_compress,
                 )
 
-            self._hot_kv_persist = HotPromptKVPersistence(
-                self.rc.hot_prompt_kv_persist_dir, self._get_kv_fingerprint(),
-                self.rc.hot_prompt_kv_chunk_size,
-                max_checkpoints=self.rc.hot_prompt_kv_persist_max_checkpoints,
-                max_bytes=self.rc.hot_prompt_kv_persist_max_mb * 1_000_000,
-                config=self.cfg,
-                require_dsa=(
-                    self.cfg.model_type == "glm_moe_dsa"
-                    and bool(self.cfg.index_topk)
-                    and not self._dsa_elided),
-                require_recurrent=(
-                    self.cfg.model_type in (
-                        "kimi_linear", "kimi_k3", "qwen3_5_moe", "qwen3_5")),
-                paged_cache_factory=paged_cache_factory,
-            )
+            if mixed_depth_persistence:
+                if paged_cache_factory is not None:
+                    raise ValueError(
+                        "mixed-depth Qwen persistence requires resident KV")
+                self._hot_kv_persist = QwenMixedDepthPromptPersistence(
+                    self.rc.hot_prompt_kv_persist_dir,
+                    self._get_kv_fingerprint(),
+                    self.rc.hot_prompt_kv_chunk_size,
+                    max_checkpoints=(
+                        self.rc.hot_prompt_kv_persist_max_checkpoints),
+                    max_bytes=(
+                        self.rc.hot_prompt_kv_persist_max_mb * 1_000_000),
+                    config=self.cfg,
+                )
+            else:
+                self._hot_kv_persist = HotPromptKVPersistence(
+                    self.rc.hot_prompt_kv_persist_dir,
+                    self._get_kv_fingerprint(),
+                    self.rc.hot_prompt_kv_chunk_size,
+                    max_checkpoints=self.rc.hot_prompt_kv_persist_max_checkpoints,
+                    max_bytes=self.rc.hot_prompt_kv_persist_max_mb * 1_000_000,
+                    config=self.cfg,
+                    require_dsa=(
+                        self.cfg.model_type == "glm_moe_dsa"
+                        and bool(self.cfg.index_topk)
+                        and not self._dsa_elided),
+                    require_recurrent=(
+                        self.cfg.model_type in (
+                            "kimi_linear", "kimi_k3", "qwen3_5_moe", "qwen3_5")),
+                    paged_cache_factory=paged_cache_factory,
+                )
             if not self._defer_persisted_kv_until_bootstrap:
                 for (tokens, kv, logits, prompt_length, prompt_logits,
                      reusable_prefix, approximate, tool_capsules,
@@ -7650,6 +7674,7 @@ class StreamingEngine:
             "hot_prompt_admission_system_available_bytes": 0,
             "hot_prompt_admission_system_floor_bytes": 0,
             "hot_prompt_admission_governor_reservations": 0,
+            "hot_prompt_admission_positions": 0,
             "hot_prompt_capacity_evicted_slots": 0,
             "hot_prompt_capacity_evicted_bytes": 0,
             "tool_pic": 0,
@@ -8423,9 +8448,17 @@ class StreamingEngine:
             # token-at-a-time fallback still inherited the construction-time
             # 400 MB prefill pad and could be rejected before its first
             # size-one sweep had a chance to set the correct zero margin.
+            # A durable/in-memory prefix may leave only a tiny scaffold suffix.
+            # Size the phase reserve to work that will actually execute, not
+            # the complete rendered prompt. Using ``len(tokens)-1`` here made
+            # a 7-position restart inherit a 128-position transient estimate
+            # and could reject a safe restore before its first layer.
+            remaining_prefill_positions = max(1, len(tokens) - matched)
             admission_positions = min(
                 max(1, int(self.rc.prefill_chunk_size or 1)),
-                max(1, len(tokens) - 1))
+                remaining_prefill_positions)
+            path_stats["hot_prompt_admission_positions"] = (
+                admission_positions)
             position_transient = getattr(
                 self, "_prefill_layer_transient_by_positions", {}
             ).get(admission_positions, 0)
