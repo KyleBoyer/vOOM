@@ -1173,6 +1173,36 @@ class WeightStore:
             total += end - start
         return total
 
+    def mlx_quantized_resident_bytes(self, names: Sequence[str]) -> int:
+        """Exact payload bytes of standard MLX-quantized logical tensors.
+
+        ``_layer_names`` addresses one logical ``*.weight`` while a standard
+        MLX quantized checkpoint stores that weight plus scale/bias sidecars.
+        Calling :meth:`storage_bytes` on logical names alone therefore omits
+        the sidecars and underestimates the resident QTensor.  For this layout
+        each fetched physical array is retained directly by QTensor, so the
+        safetensors payload sum is also the cache-resident byte count without
+        reading model data. Return zero for any other layout or incomplete
+        metadata rather than returning an optimistic partial estimate.
+        """
+        if not self.on_disk_quantized:
+            return 0
+        physical: list[str] = []
+        seen: set[str] = set()
+        for name in names:
+            aux = self._quant_aux.get(name)
+            expanded = (
+                (name, aux.scales, aux.biases)
+                if aux is not None else (name,)
+            )
+            for value in expanded:
+                if value is not None and value not in seen:
+                    physical.append(value)
+                    seen.add(value)
+        if not physical or self.storage_bytes_unknown(physical):
+            return 0
+        return self.storage_bytes(physical)
+
     def _safetensors_entry(self, name: str) -> dict | None:
         """Locate one tensor's header entry by canonical or real name.
 

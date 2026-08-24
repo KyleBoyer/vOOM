@@ -74,6 +74,7 @@ from .qwen35 import _full_attention, _moe, _swiglu, final_logits, qwen35_rms_nor
 from .sampler import (SamplingParams, filtered_probabilities, sample,
                       sample_probabilities,
                       speculative_residual_probabilities)
+from .speculative import ngram_propose
 
 
 def _reranked_head_telemetry_snapshot(target) -> dict[str, int]:
@@ -906,6 +907,9 @@ class QwenMTPSpeculativeEngine:
         depth: int = 1,
         proposal_q_policy: ProposalQPolicy | None = None,
         adaptive_reprobe_interval: int = 4,
+        ngram_first: bool = False,
+        ngram_min_ngram: int = 2,
+        ngram_max_ngram: int = 6,
     ):
         if max_prompt_tokens <= 0:
             raise ValueError("max_prompt_tokens must be positive")
@@ -923,6 +927,20 @@ class QwenMTPSpeculativeEngine:
             raise ValueError("proposal_replay_top_k must be non-negative")
         if isinstance(depth, bool) or depth not in (1, 2):
             raise ValueError("Qwen MTP depth must be 1 or 2")
+        if not isinstance(ngram_first, bool):
+            raise TypeError("Qwen MTP ngram_first must be bool")
+        if (isinstance(ngram_min_ngram, bool)
+                or not isinstance(ngram_min_ngram, int)
+                or ngram_min_ngram <= 0):
+            raise ValueError("Qwen MTP minimum n-gram must be positive")
+        if (isinstance(ngram_max_ngram, bool)
+                or not isinstance(ngram_max_ngram, int)
+                or ngram_max_ngram < ngram_min_ngram):
+            raise ValueError(
+                "Qwen MTP maximum n-gram must be >= minimum n-gram")
+        if ngram_first and depth != 1:
+            raise ValueError(
+                "Qwen MTP n-gram-first cascade currently requires depth 1")
         self.target = target
         self.drafter = QwenMTPDrafter(target)
         self.max_prompt_tokens = max_prompt_tokens
@@ -941,8 +959,12 @@ class QwenMTPSpeculativeEngine:
         self.stochastic_draft_top_k = self.proposal_q_policy.top_k
         self.proposal_replay_top_k = int(proposal_replay_top_k)
         self.depth = int(depth)
+        self.ngram_first = ngram_first
+        self.ngram_min_ngram = int(ngram_min_ngram)
+        self.ngram_max_ngram = int(ngram_max_ngram)
         self.mtp_engine_identity = (
             f"qwen-mtp-depth{self.depth}-{self.proposal_q_policy.name}"
+            + ("-ngram-first" if self.ngram_first else "")
         )
         if self.depth == 2 and not callable(getattr(
             target, "forward_tokens_serial_positions", None
@@ -979,6 +1001,10 @@ class QwenMTPSpeculativeEngine:
             "qwen_mtp_enabled": 1,
             "qwen_mtp_used": 0,
             "qwen_mtp_fallback_reason": reason,
+            "qwen_mtp_ngram_first_enabled": int(self.ngram_first),
+            "qwen_mtp_ngram_first_eligible": int(
+                self.ngram_first and sampling is not None
+                and sampling.is_greedy),
         })
         return result
 
@@ -1040,6 +1066,9 @@ class QwenMTPSpeculativeEngine:
         bootstrap_stats.update({
             "qwen_mtp_enabled": 1,
             "qwen_mtp_used": 0,
+            "qwen_mtp_ngram_first_enabled": int(self.ngram_first),
+            "qwen_mtp_ngram_first_eligible": int(
+                self.ngram_first and sampling.is_greedy),
         })
         if (max_tokens == 1
                 or bootstrap.get("termination_reason") != "length"):
@@ -1096,6 +1125,16 @@ class QwenMTPSpeculativeEngine:
         mtp_kv_rollbacks = 0
         target_prefix_rollbacks = 0
         round_outcomes: list[str] = []
+        proposal_sources: list[str] = []
+        ngram_first_attempts = 0
+        ngram_first_matches = 0
+        ngram_first_proposed = 0
+        ngram_first_accepted = 0
+        ngram_first_rejected = 0
+        ngram_first_native_draft_bypasses = 0
+        native_mtp_proposed = 0
+        native_mtp_accepted = 0
+        native_mtp_rejected = 0
         proposal_replay_records: list[dict] = []
         sidecar_round_loads = 0
         sidecar_round_releases = 0
@@ -1341,9 +1380,32 @@ class QwenMTPSpeculativeEngine:
                 draft_hidden = h_last
                 draft_input_token = catchup_tok
                 round_mtp_weights: dict | None = None
+                ngram_candidate: int | None = None
+                round_proposal_source = "M"
                 draft_rerank_before = _reranked_head_telemetry_snapshot(tgt)
                 draft_started = time.perf_counter()
                 try:
+                    # A deterministic prompt-lookup hit is a zero-model first
+                    # choice.  It still enters the identical authoritative
+                    # target verification window below, so rejection and all
+                    # hybrid recurrent/KV rollback semantics stay target-owned.
+                    # Stochastic requests deliberately bypass this path: an
+                    # n-gram lookup does not define the full proposal q needed
+                    # for exact p/q acceptance and residual correction.
+                    if self.ngram_first and sampling.is_greedy:
+                        ngram_first_attempts += 1
+                        ngram_tokens = ngram_propose(
+                            all_tokens,
+                            1,
+                            self.ngram_max_ngram,
+                            self.ngram_min_ngram,
+                        )
+                        if ngram_tokens:
+                            ngram_candidate = int(ngram_tokens[0])
+                            round_proposal_source = "N"
+                            ngram_first_matches += 1
+                            ngram_first_native_draft_bypasses += 1
+
                     prepare_request_weights = getattr(
                         self.drafter, "prepare_request_weights", None)
                     read_before = int(getattr(
@@ -1351,10 +1413,14 @@ class QwenMTPSpeculativeEngine:
                     sidecar_load_started = time.perf_counter()
                     round_mtp_weights = (
                         prepare_request_weights()
-                        if callable(prepare_request_weights) else None
+                        if (ngram_candidate is None
+                            and callable(prepare_request_weights)) else None
                     )
-                    prepared_bytes = int(getattr(
-                        self.drafter, "last_cache_prepare_bytes", 0))
+                    prepared_bytes = (
+                        int(getattr(
+                            self.drafter, "last_cache_prepare_bytes", 0))
+                        if ngram_candidate is None else 0
+                    )
                     if prepared_bytes:
                         sidecar_cache_prepare_calls += 1
                         sidecar_cache_prepare_bytes += prepared_bytes
@@ -1383,7 +1449,10 @@ class QwenMTPSpeculativeEngine:
                     for step in range(self.depth):
                         if self.depth == 1:
                             # Keep the established k=1 mock/API path unchanged.
-                            if sampling.is_greedy:
+                            if ngram_candidate is not None:
+                                draft_tok = ngram_candidate
+                                step_logits = None
+                            elif sampling.is_greedy:
                                 draft_tok = self.drafter.draft_token(
                                     draft_hidden, draft_input_token, mtp_kv,
                                     round_start_offset - 1,
@@ -1477,6 +1546,11 @@ class QwenMTPSpeculativeEngine:
                 )
 
                 proposed += len(draft_tokens)
+                proposal_sources.append(round_proposal_source)
+                if round_proposal_source == "N":
+                    ngram_first_proposed += len(draft_tokens)
+                else:
+                    native_mtp_proposed += len(draft_tokens)
                 verify_tokens = [catchup_tok] + draft_tokens
                 round_verify_width = len(verify_tokens)
                 round_serial_verify = callable(getattr(
@@ -1602,6 +1676,12 @@ class QwenMTPSpeculativeEngine:
 
                 all_drafts_accepted = (
                     accepted_prefix == self.depth and not round_rejected)
+                if round_proposal_source == "N":
+                    ngram_first_accepted += accepted_prefix
+                    ngram_first_rejected += int(round_rejected)
+                else:
+                    native_mtp_accepted += accepted_prefix
+                    native_mtp_rejected += int(round_rejected)
                 if all_drafts_accepted:
                     full_accept_rounds += 1
                 if self.depth == 1:
@@ -1940,6 +2020,20 @@ class QwenMTPSpeculativeEngine:
                 if not sampling.is_greedy else 0),
             "qwen_mtp_q_policy": self.proposal_q_policy.as_dict(),
             "qwen_mtp_engine_identity": self.mtp_engine_identity,
+            "qwen_mtp_ngram_first_enabled": int(self.ngram_first),
+            "qwen_mtp_ngram_first_eligible": int(
+                self.ngram_first and sampling.is_greedy),
+            "qwen_mtp_ngram_first_attempts": ngram_first_attempts,
+            "qwen_mtp_ngram_first_matches": ngram_first_matches,
+            "qwen_mtp_ngram_first_proposed": ngram_first_proposed,
+            "qwen_mtp_ngram_first_accepted": ngram_first_accepted,
+            "qwen_mtp_ngram_first_rejected": ngram_first_rejected,
+            "qwen_mtp_ngram_first_native_draft_bypasses": (
+                ngram_first_native_draft_bypasses),
+            "qwen_mtp_native_draft_proposed": native_mtp_proposed,
+            "qwen_mtp_native_draft_accepted": native_mtp_accepted,
+            "qwen_mtp_native_draft_rejected": native_mtp_rejected,
+            "qwen_mtp_proposal_sources": "".join(proposal_sources),
             "qwen_mtp_stochastic_expected_acceptance": (
                 stochastic_expected_acceptance_sum / verified_proposals
                 if not sampling.is_greedy and verified_proposals else 0.0),

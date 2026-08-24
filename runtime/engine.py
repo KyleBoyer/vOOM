@@ -378,6 +378,27 @@ def _cache_io_snapshot(engine) -> tuple[int, ...]:
         int(engine.expert_hits),
         int(engine.expert_misses),
         int(getattr(governor, "reservations", 0) or 0),
+        int(getattr(governor, "reservation_calls", 0) or 0),
+        int(getattr(
+            governor, "reservation_fast_path_calls", 0) or 0),
+        int(getattr(
+            governor, "reservation_clear_cache_only_calls", 0) or 0),
+        int(getattr(
+            governor, "reservation_reason_counts", {}
+        ).get("serial-verify-layer-page", 0) or 0),
+        int(getattr(
+            governor, "reservation_reason_counts", {}
+        ).get("serial-verify-transient", 0) or 0),
+        int(getattr(
+            governor, "reservation_requested_bytes", 0) or 0),
+        int(getattr(
+            governor, "reservation_budget_reduced_bytes", 0) or 0),
+        int(getattr(
+            governor, "reservation_budget_restored_bytes", 0) or 0),
+        int(getattr(
+            governor, "reservation_cache_released_bytes", 0) or 0),
+        int(getattr(
+            governor, "reservation_unproductive_shrinks", 0) or 0),
         int(getattr(governor, "reservation_failures", 0) or 0),
         int(getattr(governor, "swap_pressure_events", 0) or 0),
         int(getattr(
@@ -410,7 +431,17 @@ def _record_cache_io_delta(
         "weight_prefetch_wasted_pages", "weight_prefetch_wasted_bytes",
         "weight_prefetch_wasted_load_ns",
         "expert_cache_hits", "expert_cache_misses",
-        "governor_reservations", "governor_reservation_failures",
+        "governor_reservations", "governor_reservation_calls",
+        "governor_reservation_fast_path_calls",
+        "governor_reservation_clear_cache_only_calls",
+        "governor_serial_verify_page_reservation_calls",
+        "governor_serial_verify_transient_reservation_calls",
+        "governor_reservation_requested_bytes",
+        "governor_reservation_budget_reduced_bytes",
+        "governor_reservation_budget_restored_bytes",
+        "governor_reservation_cache_released_bytes",
+        "governor_reservation_unproductive_shrinks",
+        "governor_reservation_failures",
         "governor_swap_pressure_events",
         "governor_swap_used_growth_bytes",
         "governor_swap_out_growth_bytes",
@@ -2956,15 +2987,16 @@ class StreamingEngine:
     ) -> int:
         """Conservative materialized trunk-page estimate for pre-fetch eviction.
 
+        Standard MLX quantization retains its physical weight/scale/bias arrays
+        directly, so safetensors metadata prices that representation exactly.
         K2.5's checkpoint stores its trunk/router/shared-expert tensors as BF16;
         only routed experts use compressed-tensors INT4 and they have their own
-        lifetime-bounded fetch path. Keeping this architecture-specific avoids
-        inventing unsafe generic estimates for packed/fused formats whose load
-        representation differs from their logical shapes.
+        lifetime-bounded fetch path. Other packed/fused formats remain on their
+        architecture-specific estimates because their load representation may
+        differ from their logical shapes.
         """
-        nf12 = getattr(
-            getattr(self, "store", None), "bf16_nf12_sidecar", None
-        )
+        store = getattr(self, "store", None)
+        nf12 = getattr(store, "bf16_nf12_sidecar", None)
         if nf12 is not None and nf12.has_layer(layer):
             entry = nf12.layer_entry(layer)
             # Admission must use the decoded cache representation, not the
@@ -3007,6 +3039,15 @@ class StreamingEngine:
                     - int(entry["selected_raw_bytes"]),
                 )
             return math.ceil(decoded_bytes * 1.05)
+        if getattr(store, "on_disk_quantized", False):
+            logical_names = (
+                self._layer_names(layer) if names is None else names)
+            resident_bytes = store.mlx_quantized_resident_bytes(
+                logical_names)
+            if resident_bytes > 0:
+                # Payload bytes are exact for the retained QTensor arrays;
+                # keep a small pad for container/alignment accounting.
+                return math.ceil(resident_bytes * 1.05)
         if self.cfg.model_type != "kimi_k25":
             return 0
         c = self.cfg
@@ -3035,6 +3076,29 @@ class StreamingEngine:
             params += 3 * h * c.moe_intermediate_size * max(1, c.n_shared_experts)
         # BF16 plus 5% for small architecture tensors/metadata omitted above.
         return math.ceil(params * 2 * 1.05)
+
+    def _prepare_serial_verify_layer_page(self, layer: int) -> int:
+        """Admit a verifier layer before fetching it into Metal memory.
+
+        The ordinary sweep performs this exact ordering. The serial verifier
+        historically loaded the page first and reserved only its much smaller
+        learned compute transient afterward. Under a tight Metal ceiling that
+        made a 10-MB scratch declaration inherit a layer page's overshoot and
+        repeatedly ratchet the cache budget. Evict within the current budget,
+        then reserve the still-unallocated page so worsening pressure refuses
+        before the fetch.
+        """
+        key = self._layer_key(layer)
+        if self.cache.contains(key):
+            return 0
+        incoming = int(self._layer_fetch_bytes_estimate(layer) or 0)
+        if incoming <= 0:
+            return 0
+        self.cache.prepare_for(incoming)
+        if self.governor is not None:
+            self.governor.reserve(
+                incoming, reason="serial-verify-layer-page")
+        return incoming
 
     def _checkpoint_payload_bytes(self) -> int:
         """Conservative physical payload estimate for resident qualification."""
@@ -7194,6 +7258,7 @@ class StreamingEngine:
                         min(layer + 1 + self.rc.prefetch_depth, n)):
                     self.prefetcher.schedule(
                         self._layer_key(nxt), self._layer_names(nxt))
+            self._prepare_serial_verify_layer_page(layer)
             t0 = time.perf_counter()
             weights = self.cache.get(
                 self._layer_key(layer), self._layer_names(layer))
@@ -7201,7 +7266,8 @@ class StreamingEngine:
             if self.governor is not None and self._layer_transient:
                 self.governor.reserve(
                     self._layer_transient,
-                    margin=self._layer_transient_margin)
+                    margin=self._layer_transient_margin,
+                    reason="serial-verify-transient")
 
             active_before = mx.get_active_memory()
             mx.reset_peak_memory()

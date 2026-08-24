@@ -1193,6 +1193,8 @@ class EngineManager:
         )
         qwen_mtp_request = os.environ.get(
             "VMODEL_QWEN_MTP_SPECULATIVE", "auto").strip().lower()
+        qwen_mtp_ngram_first_request = os.environ.get(
+            "VMODEL_QWEN_MTP_NGRAM_FIRST", "0").strip()
         qwen_mtp_q_policy_kind = os.environ.get(
             "VMODEL_QWEN_MTP_Q_POLICY", "flat").strip().lower()
         try:
@@ -1227,6 +1229,14 @@ class EngineManager:
         if qwen_mtp_depth not in (1, 2):
             raise RequestValidationError(
                 "VMODEL_QWEN_MTP_DEPTH must be 1 or 2")
+        if qwen_mtp_ngram_first_request not in ("0", "1"):
+            raise RequestValidationError(
+                "VMODEL_QWEN_MTP_NGRAM_FIRST must be 0 or 1")
+        qwen_mtp_ngram_first = qwen_mtp_ngram_first_request == "1"
+        if qwen_mtp_ngram_first and qwen_mtp_depth != 1:
+            raise RequestValidationError(
+                "VMODEL_QWEN_MTP_NGRAM_FIRST=1 requires "
+                "VMODEL_QWEN_MTP_DEPTH=1")
         if qwen_mtp_q_policy_kind not in ("flat", "temperature", "rank"):
             raise RequestValidationError(
                 "VMODEL_QWEN_MTP_Q_POLICY must be flat, temperature, or rank")
@@ -1627,6 +1637,7 @@ class EngineManager:
             bool(requires_vision), resident_backend_request,
             dspark_request_identity,
             qwen_mtp_request,
+            qwen_mtp_ngram_first_request,
             qwen_mtp_max_prompt_tokens,
             qwen_mtp_min_output_tokens,
             qwen_mtp_stochastic_draft_top_k,
@@ -1701,6 +1712,7 @@ class EngineManager:
             bool(requires_vision), resident_backend_request,
             dspark_request_identity,
             qwen_mtp_request,
+            qwen_mtp_ngram_first_request,
             qwen_mtp_max_prompt_tokens,
             qwen_mtp_min_output_tokens,
             qwen_mtp_stochastic_draft_top_k,
@@ -4341,6 +4353,7 @@ class EngineManager:
                         proposal_replay_top_k=(
                             qwen_mtp_proposal_replay_top_k),
                         depth=qwen_mtp_depth,
+                        ngram_first=qwen_mtp_ngram_first,
                         proposal_q_policy=proposal_q_policy,
                         plain_warmup_tokens=(
                             3 if qwen_mtp_request == "auto" else 0))
@@ -4354,6 +4367,7 @@ class EngineManager:
                         f"proposal_replay_top_k="
                         f"{qwen_mtp_proposal_replay_top_k} "
                         f"depth={qwen_mtp_depth} "
+                        f"ngram_first={int(qwen_mtp_ngram_first)} "
                         f"q_policy={proposal_q_policy.name}",
                         flush=True,
                     )
@@ -4366,13 +4380,12 @@ class EngineManager:
                     )
             elif (getattr(rc, "qwen_ngram_speculative", False)
                     and not target_engine.cfg.num_experts):
-                # F11: prompt-lookup/n-gram speculation, mutually exclusive
-                # with native MTP above for this first version -- both are
-                # verified-draft schemes over the same hybrid recurrent
-                # state, and combining them (falling back from a rejected
-                # n-gram round to an MTP-drafted one, say) is real added
-                # complexity with no evidence yet that it's worth it over
-                # picking whichever wins for a given workload.
+                # F11: standalone prompt-lookup/n-gram speculation remains
+                # mutually exclusive with native MTP.  The separately gated
+                # VMODEL_QWEN_MTP_NGRAM_FIRST=1 path is deliberately narrower:
+                # one zero-model deterministic proposal, then the existing
+                # native depth-1 MTP proposal only on lookup miss; both use the
+                # same authoritative target verifier.
                 #
                 # F112 (2026-07-25): real A/B against Qwen3.5-35B-A3B (MoE)
                 # found n-gram speculation is ALSO a real regression there
@@ -7944,6 +7957,17 @@ def _vision_protocol_timing(result: dict) -> dict:
         "qwen_mtp_stochastic_draft_top_k",
         "qwen_mtp_grammar_forced_tokens",
         "qwen_mtp_grammar_forced_sweeps",
+        "qwen_mtp_ngram_first_enabled",
+        "qwen_mtp_ngram_first_eligible",
+        "qwen_mtp_ngram_first_attempts",
+        "qwen_mtp_ngram_first_matches",
+        "qwen_mtp_ngram_first_proposed",
+        "qwen_mtp_ngram_first_accepted",
+        "qwen_mtp_ngram_first_rejected",
+        "qwen_mtp_ngram_first_native_draft_bypasses",
+        "qwen_mtp_native_draft_proposed",
+        "qwen_mtp_native_draft_accepted",
+        "qwen_mtp_native_draft_rejected",
         "qwen_mtp_request_local_sidecar_pin",
         "qwen_mtp_request_local_sidecar_bytes",
         "qwen_mtp_bf16_sidecar_round_loads",
@@ -8028,6 +8052,7 @@ def _vision_protocol_timing(result: dict) -> dict:
             value[key] = float(metric(key) or 0.0)
     for key in (
         "qwen_mtp_round_outcomes",
+        "qwen_mtp_proposal_sources",
         "kimi_k3_prefill_tile_policy",
         "kimi_k3_prefill_schedule",
     ):

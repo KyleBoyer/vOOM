@@ -449,7 +449,7 @@ def test_qwen_mtp_accepted_pair_stops_on_first_token_eos():
     target = _Target()
     engine = QwenMTPSpeculativeEngine(
         target, max_prompt_tokens=8, min_output_tokens=2,
-        plain_warmup_tokens=0)
+        plain_warmup_tokens=0, ngram_first=True)
     drafter = _RoundSidecarDrafter(target)
     engine.drafter = drafter
 
@@ -470,6 +470,16 @@ def test_qwen_mtp_accepted_pair_stops_on_first_token_eos():
     assert stats["qwen_mtp_bf16_sidecar_cache_discards"] == 1
     assert stats["qwen_mtp_request_local_sidecar_pin"] == 0
     assert stats["qwen_mtp_request_local_sidecar_bytes"] == 0
+    assert stats["qwen_mtp_ngram_first_enabled"] == 1
+    assert stats["qwen_mtp_ngram_first_eligible"] == 1
+    assert stats["qwen_mtp_ngram_first_attempts"] == 1
+    assert stats["qwen_mtp_ngram_first_matches"] == 0
+    assert stats["qwen_mtp_ngram_first_native_draft_bypasses"] == 0
+    assert stats["qwen_mtp_ngram_first_proposed"] == 0
+    assert stats["qwen_mtp_native_draft_proposed"] == 1
+    assert stats["qwen_mtp_native_draft_accepted"] == 1
+    assert stats["qwen_mtp_native_draft_rejected"] == 0
+    assert stats["qwen_mtp_proposal_sources"] == "M"
 
     # A continuing request reloads a fresh mapping in the next round rather
     # than retaining the released first-round page across verification.
@@ -506,6 +516,228 @@ def test_qwen_mtp_accepted_pair_stops_on_first_token_eos():
         failing_engine.generate("x", 32)
     assert events == ["load", "draft", "release"]
     assert all(mapping == {} for mapping in failing_drafter.mappings)
+
+
+@pytest.mark.parametrize("accepted", [True, False])
+def test_qwen_mtp_ngram_first_keeps_exact_target_state_and_acceptance_telemetry(
+    accepted,
+):
+    """A lookup hit bypasses the sidecar, never the authoritative target.
+
+    Both acceptance and correction retain the exact one-position serial KDA,
+    layer-length, hidden-state, and final-token-never-fed endpoint required by
+    ordinary Qwen hybrid decode.
+    """
+    from runtime.qwen35_mtp import QwenMTPSpeculativeEngine
+
+    midpoint = object()
+
+    class _KV:
+        def __init__(self):
+            self.offset = 4
+            self.kda_cache = object()
+            self.lengths = [4, 2]
+
+        def layer_lengths(self):
+            return tuple(self.lengths)
+
+        def trim_layer_lengths(self, lengths):
+            self.lengths = list(lengths)
+            self.offset = self.lengths[0]
+
+        def trim(self, offset):
+            self.offset = int(offset)
+
+        def nbytes(self):
+            return 0
+
+    class _Target(_Engine):
+        def __init__(self):
+            # [3, 4] is both an earlier prompt bigram and the final suffix
+            # after bootstrap emits 4, so real ngram_propose returns 3.
+            super().__init__("/models/target", ids=(1, 3, 4, 3))
+            self.cfg = SimpleNamespace(num_experts=8, eos_token_ids=())
+            self.cache = SimpleNamespace(
+                stats=SimpleNamespace(
+                    hits=0, misses=0, evictions=0, bytes_read=0),
+                total_bytes=0, max_bytes=1)
+            self.expert_hits = self.expert_misses = 0
+            for name in (
+                    "fast_tier_bytes", "archive_bytes",
+                    "parallel_tier_fetches", "parallel_tier_fast_bytes",
+                    "parallel_tier_archive_bytes"):
+                setattr(self.store, name, 0)
+            self.governor = None
+            self._layer_transient = self._prefill_layer_transient = 0
+            self._decode_layer_transient = self._layer_transient_margin = 0
+            self._token_transient = self._true_peak_metal_bytes = 0
+            self._request_profiler = None
+            self._hot_prompt_slots = []
+            self._h_last = mx.array([[[30.0]]])
+            self._h_window = self._h_last
+            self.last_kv = None
+            self.endpoint_requests = []
+
+        def generate(self, _prompt, max_tokens, **_kwargs):
+            assert max_tokens == 1
+            self.last_kv = _KV()
+            return {
+                "text": "4", "tokens": [4], "prefill_s": 0.0,
+                "first_token_s": 0.0, "decode_s": 0.0, "total_s": 0.0,
+                "termination_reason": "length", "stop_sequence": None,
+                "path_stats": {}, "prompt_tokens": 4,
+            }
+
+        def forward_tokens_serial_positions(
+            self, tokens, kv, *, capture_kda_endpoints=False,
+        ):
+            assert tokens == [4, 3]
+            assert capture_kda_endpoints
+            kv.offset += 2
+            kv.lengths = [value + 2 for value in kv.lengths]
+            self._h_window = mx.array([[[40.0], [90.0]]])
+            self._h_last = self._h_window[:, -1:, :]
+            logits = mx.zeros((2, 10))
+            logits = logits.at[0, 3 if accepted else 6].add(2)
+            return logits.at[1, 7].add(2)
+
+        def consume_serial_kda_endpoint(self, fed_positions):
+            self.endpoint_requests.append(fed_positions)
+            return midpoint if fed_positions == 1 else None
+
+    class _ForbiddenSidecar:
+        @staticmethod
+        def prepare_request_weights():
+            raise AssertionError("n-gram hit must not load the BF16 sidecar")
+
+        @staticmethod
+        def draft_token(*_args, **_kwargs):
+            raise AssertionError("n-gram hit must not call native MTP")
+
+    target = _Target()
+    engine = QwenMTPSpeculativeEngine(
+        target, max_prompt_tokens=8, min_output_tokens=2,
+        plain_warmup_tokens=0, adaptive_stop=False, ngram_first=True)
+    engine.drafter = _ForbiddenSidecar()
+
+    result = engine.generate("x", 2)
+    expected_token = 3 if accepted else 6
+    stats = result["path_stats"]
+
+    assert result["tokens"] == [4, expected_token]
+    assert result["kv_positions"] == 5
+    assert target.last_kv.lengths == [5, 3]
+    assert target.last_kv.kda_cache is midpoint
+    assert float(target._h_last.item()) == 40.0
+    assert target.endpoint_requests == [1]
+    assert stats["qwen_mtp_round_outcomes"] == ("A" if accepted else "R")
+    assert stats["qwen_mtp_proposal_sources"] == "N"
+    assert stats["qwen_mtp_ngram_first_attempts"] == 1
+    assert stats["qwen_mtp_ngram_first_matches"] == 1
+    assert stats["qwen_mtp_ngram_first_proposed"] == 1
+    assert stats["qwen_mtp_ngram_first_accepted"] == int(accepted)
+    assert stats["qwen_mtp_ngram_first_rejected"] == int(not accepted)
+    assert stats["qwen_mtp_ngram_first_native_draft_bypasses"] == 1
+    assert stats["qwen_mtp_native_draft_proposed"] == 0
+    assert stats["qwen_mtp_native_draft_accepted"] == 0
+    assert stats["qwen_mtp_native_draft_rejected"] == 0
+    assert stats["qwen_mtp_bf16_sidecar_round_loads"] == 0
+    assert stats["qwen_mtp_bf16_sidecar_round_releases"] == 0
+
+
+def test_qwen_mtp_ngram_first_never_proposes_without_exact_stochastic_q(
+    monkeypatch,
+):
+    """Lookup proposals have no full q, so categorical decode must use MTP."""
+    import runtime.qwen35_mtp as mtp_module
+    from runtime.qwen35_mtp import QwenMTPSpeculativeEngine
+    from runtime.sampler import SamplingParams
+
+    def forbidden_lookup(*_args, **_kwargs):
+        raise AssertionError("stochastic decode must not query n-gram proposals")
+
+    monkeypatch.setattr(mtp_module, "ngram_propose", forbidden_lookup)
+
+    class _KV:
+        def __init__(self):
+            self.offset = 3
+            self.kda_cache = None
+
+        def trim(self, offset):
+            self.offset = int(offset)
+
+        def nbytes(self):
+            return 0
+
+    class _Target(_Engine):
+        def __init__(self):
+            super().__init__("/models/target")
+            self.cache = SimpleNamespace(
+                stats=SimpleNamespace(
+                    hits=0, misses=0, evictions=0, bytes_read=0),
+                total_bytes=0, max_bytes=1)
+            self.expert_hits = self.expert_misses = 0
+            for name in (
+                    "fast_tier_bytes", "archive_bytes",
+                    "parallel_tier_fetches", "parallel_tier_fast_bytes",
+                    "parallel_tier_archive_bytes"):
+                setattr(self.store, name, 0)
+            self.governor = None
+            self._layer_transient = self._prefill_layer_transient = 0
+            self._decode_layer_transient = self._layer_transient_margin = 0
+            self._token_transient = self._true_peak_metal_bytes = 0
+            self._request_profiler = None
+            self._hot_prompt_slots = []
+            self._h_last = mx.zeros((1, 1, 1))
+            self._h_window = self._h_last
+            self.last_kv = None
+
+        def generate(self, _prompt, max_tokens, **_kwargs):
+            assert max_tokens == 1
+            self.last_kv = _KV()
+            return {
+                "text": "4", "tokens": [4], "prefill_s": 0.0,
+                "first_token_s": 0.0, "decode_s": 0.0, "total_s": 0.0,
+                "termination_reason": "length", "stop_sequence": None,
+                "path_stats": {}, "prompt_tokens": 3,
+            }
+
+        def forward_tokens_serial_positions(
+            self, tokens, kv, *, capture_kda_endpoints=False,
+        ):
+            assert tokens == [4, 9]
+            assert not capture_kda_endpoints
+            kv.offset += 2
+            self._h_window = mx.zeros((1, 2, 1))
+            self._h_last = self._h_window[:, -1:, :]
+            logits = mx.full((2, 12), -1000.0)
+            logits = logits.at[0, 9].add(1000.0)
+            return logits.at[1, 7].add(1000.0)
+
+    class _NativeDrafter:
+        @staticmethod
+        def draft_logits(*_args, **_kwargs):
+            return mx.full((12,), -1000.0).at[9].add(1000.0)
+
+    target = _Target()
+    engine = QwenMTPSpeculativeEngine(
+        target, max_prompt_tokens=8, min_output_tokens=2,
+        plain_warmup_tokens=0, adaptive_stop=False, ngram_first=True)
+    engine.drafter = _NativeDrafter()
+    result = engine.generate(
+        "x", 2, sampling=SamplingParams(temperature=1.0, seed=17))
+    stats = result["path_stats"]
+
+    assert result["tokens"] == [4, 9]
+    assert stats["qwen_mtp_ngram_first_enabled"] == 1
+    assert stats["qwen_mtp_ngram_first_eligible"] == 0
+    assert stats["qwen_mtp_ngram_first_attempts"] == 0
+    assert stats["qwen_mtp_ngram_first_matches"] == 0
+    assert stats["qwen_mtp_ngram_first_proposed"] == 0
+    assert stats["qwen_mtp_native_draft_proposed"] == 1
+    assert stats["qwen_mtp_native_draft_accepted"] == 1
+    assert stats["qwen_mtp_native_draft_rejected"] == 0
+    assert stats["qwen_mtp_proposal_sources"] == "M"
 
 
 def test_qwen_mtp_batches_grammar_forced_span_before_next_decision():

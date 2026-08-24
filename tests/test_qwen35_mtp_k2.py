@@ -323,6 +323,8 @@ def test_k2_constructor_is_strict_and_opt_in():
     for invalid in (0, 3, True, "2"):
         with pytest.raises(ValueError, match="depth must be 1 or 2"):
             QwenMTPSpeculativeEngine(target, depth=invalid)
+    with pytest.raises(ValueError, match="requires depth 1"):
+        QwenMTPSpeculativeEngine(target, depth=2, ngram_first=True)
 
 
 def test_server_q_policy_is_strict_and_part_of_engine_cache_identity():
@@ -330,6 +332,15 @@ def test_server_q_policy_is_strict_and_part_of_engine_cache_identity():
 
     with patch.dict(os.environ, {"VMODEL_QWEN_MTP_Q_POLICY": "mystery"}):
         with pytest.raises(RequestValidationError, match="flat, temperature"):
+            EngineManager().get(Path("/tmp/not-opened"), "fast")
+    with patch.dict(os.environ, {"VMODEL_QWEN_MTP_NGRAM_FIRST": "auto"}):
+        with pytest.raises(RequestValidationError, match="must be 0 or 1"):
+            EngineManager().get(Path("/tmp/not-opened"), "fast")
+    with patch.dict(os.environ, {
+        "VMODEL_QWEN_MTP_NGRAM_FIRST": "1",
+        "VMODEL_QWEN_MTP_DEPTH": "2",
+    }):
+        with pytest.raises(RequestValidationError, match="requires.*DEPTH=1"):
             EngineManager().get(Path("/tmp/not-opened"), "fast")
 
     made = []
@@ -360,7 +371,8 @@ def test_server_q_policy_is_strict_and_part_of_engine_cache_identity():
         "VMODEL_QWEN_MTP_Q_POLICY": "rank",
         "VMODEL_QWEN_MTP_Q_PARAMETER": "1",
         "VMODEL_QWEN_MTP_STOCHASTIC_DRAFT_TOP_K": "8",
-        "VMODEL_QWEN_MTP_DEPTH": "2",
+        "VMODEL_QWEN_MTP_DEPTH": "1",
+        "VMODEL_QWEN_MTP_NGRAM_FIRST": "0",
     }
     with patch.dict(os.environ, env), \
          patch("runtime.config.ModelConfig.from_dir", return_value=cfg), \
@@ -372,10 +384,14 @@ def test_server_q_policy_is_strict_and_part_of_engine_cache_identity():
         first = manager.get(Path("/tmp/fake-qwen-q-policy"), "fast")
         os.environ["VMODEL_QWEN_MTP_Q_PARAMETER"] = "2"
         second = manager.get(Path("/tmp/fake-qwen-q-policy"), "fast")
+        os.environ["VMODEL_QWEN_MTP_NGRAM_FIRST"] = "1"
+        third = manager.get(Path("/tmp/fake-qwen-q-policy"), "fast")
 
     assert first is made[0]
     assert second is made[1]
+    assert third is made[2]
     assert first.closes == 1
+    assert second.closes == 1
 
 
 def test_server_wires_typed_q_policy_and_explicit_depth_two():
@@ -438,5 +454,27 @@ def test_server_wires_typed_q_policy_and_explicit_depth_two():
 
     assert wrapped is captured[0]
     assert wrapped.kwargs["depth"] == 2
+    assert wrapped.kwargs["ngram_first"] is False
     policy = wrapped.kwargs["proposal_q_policy"]
     assert policy.name == "temperature-k8-t0.75"
+
+    env.update({
+        "VMODEL_QWEN_MTP_DEPTH": "1",
+        "VMODEL_QWEN_MTP_NGRAM_FIRST": "1",
+    })
+    with patch.dict(os.environ, env), \
+         patch("runtime.config.ModelConfig.from_dir", return_value=cfg), \
+         patch("runtime.path_resolver.resolve_model_dir",
+               side_effect=lambda path: path), \
+         patch("runtime.engine.StreamingEngine", FakeEngine), \
+         patch("runtime.qwen35_mtp.QwenMTPSpeculativeEngine", FakeMTP), \
+         patch("runtime.server._checkpoint_payload_bytes",
+               return_value=54_000_000_000), \
+         patch("runtime.server.psutil.virtual_memory",
+               return_value=SimpleNamespace(available=8_000_000_000)):
+        cascaded = EngineManager().get(
+            Path("/tmp/fake-qwen-ngram-mtp-wiring"), "fast")
+
+    assert cascaded is captured[1]
+    assert cascaded.kwargs["depth"] == 1
+    assert cascaded.kwargs["ngram_first"] is True

@@ -22,12 +22,18 @@ class FakeMX(types.ModuleType):
         self.active = active
         self.clears = 0
         self.info = {}
+        self.clear_release_after = None
+        self.clear_release_bytes = 0
 
     def get_active_memory(self):
         return self.active
 
     def clear_cache(self):
         self.clears += 1
+        if (self.clear_release_after is not None
+                and self.clears >= self.clear_release_after):
+            self.active = max(0, self.active - self.clear_release_bytes)
+            self.clear_release_after = None
 
     def device_info(self):
         return self.info
@@ -39,9 +45,10 @@ class FakeCache:
         self.max_bytes = max_bytes
         self._lock = threading.Lock()
         self.floor_after_evict = floor_after_evict
-        self.total_bytes = 0
+        self.total_bytes = max_bytes
 
     def _evict_locked(self):
+        self.total_bytes = min(self.total_bytes, self.max_bytes)
         if self.floor_after_evict is not None:
             self.mx.active = min(self.mx.active, self.floor_after_evict)
 
@@ -87,8 +94,18 @@ def make_governor(module, fake_mx, *, cache_max: int, floor: int,
     gov.metal_limit = int(10e9)
     gov.reservations = 0
     gov.reservation_failures = 0
+    gov.reservation_calls = 0
+    gov.reservation_fast_path_calls = 0
+    gov.reservation_clear_cache_only_calls = 0
+    gov.reservation_requested_bytes = 0
+    gov.reservation_budget_reduced_bytes = 0
+    gov.reservation_budget_restored_bytes = 0
+    gov.reservation_cache_released_bytes = 0
+    gov.reservation_unproductive_shrinks = 0
+    gov.reservation_reason_counts = {}
     gov.configured_max = cache_max
     gov.paused_prefetch = False
+    gov.shrinks = 0
     return gov
 
 
@@ -125,6 +142,8 @@ def test_reservation_remeasures_and_keeps_reclaiming_until_safe():
     # though plenty of reclaimable cache remained.
     def release_gradually():
         mx.active = max(int(9.0e9), mx.active - int(0.2e9))
+        gov.cache.total_bytes = min(
+            gov.cache.total_bytes, gov.cache.max_bytes)
 
     gov.cache._evict_locked = release_gradually
     gov.reserve(int(0.3e9), margin=int(0.4e9))
@@ -133,6 +152,112 @@ def test_reservation_remeasures_and_keeps_reclaiming_until_safe():
     assert gov.reservations >= 2
     assert gov.reservation_failures == 0
     assert gov.cache.max_bytes > gov.floor
+
+
+def test_zero_release_shrinks_do_not_persist_after_memory_resettles():
+    module, mx = load_pressure(int(4.995e9))
+    gov = make_governor(
+        module, mx, cache_max=int(2.2e9), floor=int(0.1e9))
+    gov.metal_limit = int(5e9)
+    # The cache is already almost empty. Lowering its budget cannot release
+    # memory; the fourth MLX-cache clear independently resolves a short-lived
+    # allocator high-water, reproducing the successful tiny-reserve ratchet.
+    gov.cache.total_bytes = int(0.1e9)
+    mx.clear_release_after = 4
+    mx.clear_release_bytes = int(0.02e9)
+
+    gov.reserve(
+        int(0.01e9), margin=0, reason="serial-verify-transient")
+
+    assert gov.cache.max_bytes == int(2.2e9)
+    assert gov.reservation_calls == 1
+    assert gov.reservation_unproductive_shrinks > 0
+    assert gov.reservation_cache_released_bytes == 0
+    assert gov.reservation_budget_reduced_bytes > 0
+    assert gov.reservation_budget_restored_bytes == (
+        gov.reservation_budget_reduced_bytes)
+    assert gov.reservation_reason_counts == {"serial-verify-transient": 1}
+    assert gov.reservation_failures == 0
+
+
+def test_productive_reclaim_keeps_reduced_budget_and_reason_telemetry():
+    module, mx = load_pressure(int(9.8e9))
+    gov = make_governor(
+        module, mx, cache_max=int(5e9), floor=int(1.5e9),
+        active_after_evict=int(9.0e9),
+    )
+    gov.reserve(
+        int(0.3e9), margin=int(0.4e9),
+        reason="serial-verify-layer-page",
+    )
+    assert gov.cache.max_bytes < int(5e9)
+    assert gov.reservation_cache_released_bytes > 0
+    assert gov.reservation_budget_restored_bytes == 0
+    assert gov.reservation_reason_counts == {
+        "serial-verify-layer-page": 1}
+
+
+def test_mixed_shrinks_retain_only_budget_backed_by_actual_eviction():
+    module, mx = load_pressure(int(4.995e9))
+    gov = make_governor(
+        module, mx, cache_max=int(2.2e9), floor=int(0.1e9))
+    gov.metal_limit = int(5e9)
+    # The first budget steps only close max-vs-resident slack. A later step
+    # evicts part of the 1.5GB resident cache, while independent allocator
+    # cleanup resolves the remaining projection. Only the actually evicted
+    # bytes warrant a persistent capacity reduction.
+    gov.cache.total_bytes = int(1.5e9)
+    mx.clear_release_after = 4
+    mx.clear_release_bytes = int(0.02e9)
+
+    gov.reserve(
+        int(0.01e9), margin=0, reason="serial-verify-transient")
+
+    persistent_reduction = int(2.2e9) - gov.cache.max_bytes
+    assert persistent_reduction == gov.reservation_cache_released_bytes
+    assert gov.reservation_unproductive_shrinks > 0
+    assert gov.reservation_budget_restored_bytes == (
+        gov.reservation_budget_reduced_bytes - persistent_reduction)
+    assert gov.reservation_failures == 0
+
+
+def test_concurrent_pressure_shrink_is_never_rolled_back():
+    module, mx = load_pressure(int(4.995e9))
+    gov = make_governor(
+        module, mx, cache_max=int(2.2e9), floor=int(0.1e9))
+    gov.metal_limit = int(5e9)
+    gov.cache.total_bytes = int(0.1e9)
+    mx.clear_release_after = 4
+    mx.clear_release_bytes = int(0.02e9)
+    ordinary_evict = gov.cache._evict_locked
+
+    def overlap_pressure_poll():
+        ordinary_evict()
+        gov.shrinks += 1
+
+    gov.cache._evict_locked = overlap_pressure_poll
+    gov.reserve(
+        int(0.01e9), margin=0, reason="serial-verify-transient")
+
+    assert gov.cache.max_bytes < int(2.2e9)
+    assert gov.reservation_budget_restored_bytes == 0
+    assert gov.shrinks > 0
+
+
+def test_unknown_legacy_caller_keeps_established_persistent_shrink():
+    module, mx = load_pressure(int(4.995e9))
+    gov = make_governor(
+        module, mx, cache_max=int(2.2e9), floor=int(0.1e9))
+    gov.metal_limit = int(5e9)
+    gov.cache.total_bytes = int(0.1e9)
+    mx.clear_release_after = 4
+    mx.clear_release_bytes = int(0.02e9)
+
+    gov.reserve(int(0.01e9), margin=0)
+
+    assert gov.cache.max_bytes < int(2.2e9)
+    assert gov.reservation_budget_restored_bytes == 0
+    assert gov.reservation_reason_counts == {"unspecified": 1}
 
 
 def test_admissible_units_uses_live_headroom_and_representation_size():

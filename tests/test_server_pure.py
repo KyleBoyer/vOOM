@@ -207,6 +207,18 @@ def test_vision_protocol_timing_exposes_qwen_mtp_round_trace():
             "qwen_mtp_verifier_bonus_tokens": 3,
             "qwen_mtp_draft_round_s": 0.75,
             "qwen_mtp_verifier_round_s": 2.5,
+            "qwen_mtp_ngram_first_enabled": 1,
+            "qwen_mtp_ngram_first_eligible": 1,
+            "qwen_mtp_ngram_first_attempts": 5,
+            "qwen_mtp_ngram_first_matches": 2,
+            "qwen_mtp_ngram_first_proposed": 2,
+            "qwen_mtp_ngram_first_accepted": 1,
+            "qwen_mtp_ngram_first_rejected": 1,
+            "qwen_mtp_ngram_first_native_draft_bypasses": 2,
+            "qwen_mtp_native_draft_proposed": 3,
+            "qwen_mtp_native_draft_accepted": 2,
+            "qwen_mtp_native_draft_rejected": 1,
+            "qwen_mtp_proposal_sources": "NMNMN",
             "qwen_mtp_accepted_by_step": [2, 1],
             "qwen_mtp_q_policy": {"kind": "flat", "top_k": 4},
             "qwen_mtp_proposal_q_replay": replay,
@@ -233,6 +245,18 @@ def test_vision_protocol_timing_exposes_qwen_mtp_round_trace():
     assert timing["qwen_mtp_verifier_bonus_tokens"] == 3
     assert timing["qwen_mtp_draft_round_s"] == 0.75
     assert timing["qwen_mtp_verifier_round_s"] == 2.5
+    assert timing["qwen_mtp_ngram_first_enabled"] == 1
+    assert timing["qwen_mtp_ngram_first_eligible"] == 1
+    assert timing["qwen_mtp_ngram_first_attempts"] == 5
+    assert timing["qwen_mtp_ngram_first_matches"] == 2
+    assert timing["qwen_mtp_ngram_first_proposed"] == 2
+    assert timing["qwen_mtp_ngram_first_accepted"] == 1
+    assert timing["qwen_mtp_ngram_first_rejected"] == 1
+    assert timing["qwen_mtp_ngram_first_native_draft_bypasses"] == 2
+    assert timing["qwen_mtp_native_draft_proposed"] == 3
+    assert timing["qwen_mtp_native_draft_accepted"] == 2
+    assert timing["qwen_mtp_native_draft_rejected"] == 1
+    assert timing["qwen_mtp_proposal_sources"] == "NMNMN"
     assert timing["qwen_mtp_accepted_by_step"] == [2, 1]
     assert timing["qwen_mtp_q_policy"] == {"kind": "flat", "top_k": 4}
     assert timing["qwen_mtp_proposal_q_replay"] == replay
@@ -5032,7 +5056,22 @@ def test_cache_io_delta_reports_only_current_request():
             fast_tier_bytes=100, archive_bytes=900,
             stage_snapshot=lambda: tuple(store_stages),
             k3_scale_sidecar_snapshot=lambda: tuple(scale_stages)),
-        governor=SimpleNamespace(reservations=2, reservation_failures=1),
+        governor=SimpleNamespace(
+            reservations=2,
+            reservation_calls=3,
+            reservation_fast_path_calls=1,
+            reservation_clear_cache_only_calls=1,
+            reservation_reason_counts={
+                "serial-verify-layer-page": 2,
+                "serial-verify-transient": 3,
+            },
+            reservation_requested_bytes=100,
+            reservation_budget_reduced_bytes=200,
+            reservation_budget_restored_bytes=50,
+            reservation_cache_released_bytes=150,
+            reservation_unproductive_shrinks=1,
+            reservation_failures=1,
+        ),
         expert_hits=4, expert_misses=5,
         _layer_transient=60, _token_transient=70,
     )
@@ -5044,6 +5083,18 @@ def test_cache_io_delta_reports_only_current_request():
     engine.expert_hits += 6
     engine.expert_misses += 7
     engine.governor.reservations += 8
+    engine.governor.reservation_calls += 9
+    engine.governor.reservation_fast_path_calls += 10
+    engine.governor.reservation_clear_cache_only_calls += 11
+    engine.governor.reservation_reason_counts[
+        "serial-verify-layer-page"] += 12
+    engine.governor.reservation_reason_counts[
+        "serial-verify-transient"] += 13
+    engine.governor.reservation_requested_bytes += 14
+    engine.governor.reservation_budget_reduced_bytes += 15
+    engine.governor.reservation_budget_restored_bytes += 16
+    engine.governor.reservation_cache_released_bytes += 17
+    engine.governor.reservation_unproductive_shrinks += 18
     engine.store.fast_tier_bytes += 9
     engine.store.archive_bytes += 10
     store_stages[0] += 11
@@ -5064,6 +5115,16 @@ def test_cache_io_delta_reports_only_current_request():
     assert stats["expert_cache_hits"] == 6
     assert stats["expert_cache_misses"] == 7
     assert stats["governor_reservations"] == 8
+    assert stats["governor_reservation_calls"] == 9
+    assert stats["governor_reservation_fast_path_calls"] == 10
+    assert stats["governor_reservation_clear_cache_only_calls"] == 11
+    assert stats["governor_serial_verify_page_reservation_calls"] == 12
+    assert stats["governor_serial_verify_transient_reservation_calls"] == 13
+    assert stats["governor_reservation_requested_bytes"] == 14
+    assert stats["governor_reservation_budget_reduced_bytes"] == 15
+    assert stats["governor_reservation_budget_restored_bytes"] == 16
+    assert stats["governor_reservation_cache_released_bytes"] == 17
+    assert stats["governor_reservation_unproductive_shrinks"] == 18
     assert stats["weight_fast_tier_bytes"] == 9
     assert stats["weight_archive_bytes"] == 10
     assert stats["ct_mxfp4_transform_ns"] == 11

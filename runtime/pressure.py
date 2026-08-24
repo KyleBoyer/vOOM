@@ -110,6 +110,18 @@ class MemoryGovernor:
         self.restores = 0
         self.reservations = 0  # F42: synchronous pre-allocation sheds
         self.reservation_failures = 0
+        # Reservation diagnostics distinguish useful cache reclamation from a
+        # budget-only ratchet. ``reservations`` above remains the historical
+        # count of shrink steps for compatibility with request telemetry.
+        self.reservation_calls = 0
+        self.reservation_fast_path_calls = 0
+        self.reservation_clear_cache_only_calls = 0
+        self.reservation_requested_bytes = 0
+        self.reservation_budget_reduced_bytes = 0
+        self.reservation_budget_restored_bytes = 0
+        self.reservation_cache_released_bytes = 0
+        self.reservation_unproductive_shrinks = 0
+        self.reservation_reason_counts: dict[str, int] = {}
         self.swap_pressure_events = 0
         self.swap_pressure_used_growth_bytes = 0
         self.swap_pressure_out_growth_bytes = 0
@@ -191,15 +203,33 @@ class MemoryGovernor:
 
     def _set_cache_max(self, nbytes: int):
         with self.cache._lock:
+            # WeightCache.total_bytes acquires this same non-reentrant lock;
+            # read its guarded counter directly while already inside it. Tiny
+            # pure-test caches expose only a plain total_bytes attribute.
+            if hasattr(self.cache, "_total_bytes"):
+                before = int(self.cache._total_bytes)
+            else:
+                before = int(getattr(self.cache, "total_bytes", 0) or 0)
             self.cache.max_bytes = nbytes
             self.cache._evict_locked()
+            if hasattr(self.cache, "_total_bytes"):
+                after = int(self.cache._total_bytes)
+            else:
+                after = int(getattr(self.cache, "total_bytes", 0) or 0)
+        return max(0, before - after)
 
     def _pause_prefetch(self, paused: bool):
         if self.prefetcher is not None:
             self.prefetcher.paused = paused
         self.paused_prefetch = paused
 
-    def reserve(self, incoming_bytes: int, margin: int = int(0.4e9)):
+    def reserve(
+        self,
+        incoming_bytes: int,
+        margin: int = int(0.4e9),
+        *,
+        reason: str = "",
+    ):
         """F42: synchronous pre-allocation reservation. The 2 s poll reacts AFTER
         a transient crosses the ceiling; callers that know a big allocation is
         coming (an expert batch fetch) declare it here first. If the projected
@@ -211,6 +241,11 @@ class MemoryGovernor:
         # the very scratch being declared, so counting both double-books it.
         incoming_bytes = int(incoming_bytes)
         margin = int(margin)
+        reason = str(reason or "unspecified")
+        self.reservation_calls += 1
+        self.reservation_requested_bytes += max(0, incoming_bytes)
+        self.reservation_reason_counts[reason] = (
+            self.reservation_reason_counts.get(reason, 0) + 1)
 
         def sample():
             active = mx.get_active_memory()
@@ -220,8 +255,10 @@ class MemoryGovernor:
             return active, available, ceiling, projected
 
         starting_cache_max = int(self.cache.max_bytes)
+        starting_pressure_shrinks = int(getattr(self, "shrinks", 0) or 0)
         active, available, ceiling, projected = sample()
         if projected <= ceiling:
+            self.reservation_fast_path_calls += 1
             return
         # Stop admitting speculative work while we try to make room. A running
         # fetch cannot be cancelled safely, but no new one should race this
@@ -230,6 +267,7 @@ class MemoryGovernor:
         mx.clear_cache()
         active, available, ceiling, projected = sample()
         if projected <= ceiling:
+            self.reservation_clear_cache_only_calls += 1
             return
 
         # One exact-overshoot shrink is not sufficient on unified memory:
@@ -240,6 +278,8 @@ class MemoryGovernor:
         # reclaimable cache remained.  Shrink by at least the ordinary governor
         # step, re-measure, and continue until the live projection fits or the
         # configured floor proves that the allocation is genuinely unsafe.
+        released_this_call = 0
+        reduced_this_call = 0
         while projected > ceiling and self.cache.max_bytes > self.floor:
             overshoot = projected - ceiling
             step = max(
@@ -248,10 +288,20 @@ class MemoryGovernor:
                 1,
             )
             new_max = max(self.floor, self.cache.max_bytes - step)
-            self._set_cache_max(new_max)
+            old_max = int(self.cache.max_bytes)
+            released = self._set_cache_max(new_max)
+            released_this_call += released
+            reduced = old_max - new_max
+            reduced_this_call += reduced
+            self.reservation_budget_reduced_bytes += reduced
+            self.reservation_cache_released_bytes += released
+            if released == 0:
+                self.reservation_unproductive_shrinks += 1
             self.reservations += 1
             print(f"[governor] RESERVE {incoming_bytes / 1e9:.2f}GB incoming -> "
-                  f"cache budget {new_max / 1e9:.1f}GB", flush=True)
+                  f"cache budget {new_max / 1e9:.1f}GB "
+                  f"(released {released / 1e6:.0f}MB, reason={reason})",
+                  flush=True)
             mx.clear_cache()
             active, available, ceiling, projected = sample()
 
@@ -283,8 +333,15 @@ class MemoryGovernor:
             # needlessly collapsed cache after the failed request's KV is
             # released. The pressure thread and the retry's own reservations
             # still reclaim pages against fresh live samples.
-            if self.cache.max_bytes < starting_cache_max:
+            pressure_shrank_concurrently = (
+                int(getattr(self, "shrinks", 0) or 0)
+                > starting_pressure_shrinks
+            )
+            if (self.cache.max_bytes < starting_cache_max
+                    and not pressure_shrank_concurrently):
+                restored = starting_cache_max - int(self.cache.max_bytes)
                 self._set_cache_max(starting_cache_max)
+                self.reservation_budget_restored_bytes += restored
             raise MemoryError(
                 "unsafe Metal reservation refused before allocation: "
                 f"active={active / 1e9:.2f}GB incoming={incoming_bytes / 1e9:.2f}GB "
@@ -292,6 +349,31 @@ class MemoryGovernor:
                 f"available={available / 1e9:.2f}GB "
                 f"ceiling={ceiling / 1e9:.2f}GB"
             )
+
+        # Serial verification now pre-admits every missing layer page. Within
+        # that bounded path, only the portion of a budget reduction that
+        # evicted real cache bytes can have made this allocation safe;
+        # MLX-cache cleanup or a fresher live-memory sample resolved the rest.
+        # Keeping that ineffective portion permanently caused repeated tiny
+        # scratch reservations to ratchet a mostly-empty Qwen cache to the
+        # floor. Restore the excess while retaining a conservative reduction
+        # equal to actual cache bytes released. This is intentionally scoped
+        # to the explicit serial-verifier reasons: older callers with unknown
+        # page estimates retain the established persistent-shrink behavior.
+        # Raising a limit allocates nothing, prefetch remains paused, and the
+        # next serial page admission still re-samples and fails closed.
+        retained_reduction = min(reduced_this_call, released_this_call)
+        target_max = starting_cache_max - retained_reduction
+        pressure_shrank_concurrently = (
+            int(getattr(self, "shrinks", 0) or 0)
+            > starting_pressure_shrinks
+        )
+        if (reason.startswith("serial-verify-")
+                and self.cache.max_bytes < target_max
+                and not pressure_shrank_concurrently):
+            restored = target_max - int(self.cache.max_bytes)
+            self._set_cache_max(target_max)
+            self.reservation_budget_restored_bytes += restored
 
     def fit_cache_to_live_headroom(self, margin: int = int(0.4e9)) -> int:
         """Cap future cache residency to the headroom sampled right now.
@@ -400,8 +482,13 @@ class MemoryGovernor:
 
     def summary(self) -> str:
         return (f"governor: {self.shrinks} shrinks, {self.restores} restores, "
-                f"{self.reservations} reservations, "
+                f"{self.reservations} reservation shrinks/"
+                f"{self.reservation_calls} calls, "
                 f"{self.reservation_failures} refused, "
+                f"reserve budget -{self.reservation_budget_reduced_bytes / 1e6:.0f}MB/"
+                f"+{self.reservation_budget_restored_bytes / 1e6:.0f}MB, "
+                f"cache released {self.reservation_cache_released_bytes / 1e6:.0f}MB, "
+                f"{self.reservation_unproductive_shrinks} zero-release shrinks, "
                 f"{self.swap_pressure_events} swap-pressure events "
                 f"(+{self.swap_pressure_used_growth_bytes / 1e6:.0f}MB used/"
                 f"{self.swap_pressure_out_growth_bytes / 1e6:.0f}MB out), "
