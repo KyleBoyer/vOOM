@@ -309,6 +309,24 @@ def _layer_transient_for_positions(
     return max(0, int(transient)), margin
 
 
+def _remaining_layer_transient_reserve(
+        measured_bytes: int, completed_output_bytes: int,
+) -> int:
+    """Avoid charging already-live dense output twice during a layer.
+
+    The measured layer high-water includes the prompt-sized list of evaluated
+    output tiles that exists immediately before their final concatenation.
+    During the next occurrence, those completed tiles are already included in
+    ``mx.get_active_memory()``. Subtract only their byte-exact payload from the
+    historical reserve; every other measured allocation remains reserved.
+    """
+    measured = int(measured_bytes)
+    completed = int(completed_output_bytes)
+    if measured < 0 or completed < 0:
+        raise ValueError("transient and completed output bytes must be non-negative")
+    return max(0, measured - completed)
+
+
 def _cache_io_snapshot(engine) -> tuple[int, ...]:
     """Cumulative counters used to derive one request's physical work."""
     stats = engine.cache.stats
@@ -2503,15 +2521,45 @@ class StreamingEngine:
                 if self.governor is not None else 0),
         }
 
-    def _project_dense_text_kv_bytes(self, positions: int) -> int:
+    def _project_dense_text_kv_bytes(
+            self, positions: int, *, stable_boundary_positions: int | None = None
+    ) -> int:
         if self.cfg.model_type in ("qwen3_5_moe", "qwen3_5"):
+            layer_types = tuple(self.cfg.layer_types)
             full_layers = sum(
-                layer_type == "full_attention"
-                for layer_type in self.cfg.layer_types)
+                layer_type == "full_attention" for layer_type in layer_types)
+            attention_positions = positions * full_layers
+            early_layers = int(
+                self.rc.qwen_lossy_suffix_prefill_early_layers or 0)
+            retained_tokens = (
+                int(self.rc.qwen_lossy_suffix_prefill_prefix_tokens or 0)
+                + int(self.rc.qwen_lossy_suffix_prefill_tokens or 0))
+            if (0 < early_layers < int(self.cfg.num_hidden_layers)
+                    and retained_tokens > 0 and positions > retained_tokens):
+                # The mixed-depth schedule sends every position through the
+                # shallow blocks, but only the configured prefix/suffix plus
+                # any generation scaffold through the deep blocks.  Admission
+                # must project that physical KV layout.  Charging every full-
+                # attention layer for the entire prompt overstates a 30K
+                # Huihui request by ~2.8 GB and rejects a layout that the
+                # unchanged memory governor can safely hold.
+                shallow_full_layers = sum(
+                    layer_type == "full_attention"
+                    for layer_type in layer_types[:early_layers])
+                deep_full_layers = full_layers - shallow_full_layers
+                stable = (
+                    positions if stable_boundary_positions is None
+                    else max(0, min(
+                        positions, int(stable_boundary_positions))))
+                deep_positions = min(stable, retained_tokens) + (
+                    positions - stable)
+                attention_positions = (
+                    positions * shallow_full_layers
+                    + deep_positions * deep_full_layers)
             attention = (
-                positions * full_layers * 2
+                attention_positions * 2
                 * int(self.cfg.num_key_value_heads)
-                * int(self.cfg.head_dim) * 2)
+                * int(self.cfg.head_dim) * 4)
             linear_layers = max(
                 0, int(self.cfg.num_hidden_layers) - full_layers)
             recurrent = (
@@ -2526,7 +2574,7 @@ class StreamingEngine:
             conv = (
                 linear_layers
                 * max(0, int(self.cfg.linear_conv_kernel_dim) - 1)
-                * conv_width * 2)
+                * conv_width * 4)
             return attention + recurrent + conv
         if (self.cfg.model_type not in ("qwen2", "qwen3")
                 or self.cfg.vision_config or self.cfg.num_experts):
@@ -5265,19 +5313,24 @@ class StreamingEngine:
         # chunk-major dense path's call shapes.  Routed MoE retains its
         # existing whole-range union so expert batching/fetch behavior is
         # unchanged.
-        transient_positions = min(total, tile_width) if dense_mlp else total
+        # Tile width controls operator scratch, but layer-stationary execution
+        # also retains/concatenates one output row per sequence position. A
+        # 30K shallow sweep and a 1K deep suffix with the same 32-row tile are
+        # therefore different memory shapes and must not share one learned
+        # high-water key.
+        transient_shape_positions = total
         (self._layer_transient,
          self._layer_transient_margin) = _layer_transient_for_positions(
-             transient_positions,
+             transient_shape_positions,
              getattr(
                  self, "_prefill_layer_transient_by_positions", {}
-             ).get(transient_positions, 0),
+             ).get(transient_shape_positions, 0),
              getattr(self, "_decode_layer_transient", 0))
         profiler = self._request_profiler
         if profiler is not None:
             profiler.begin_sweep(total, path=profile_path)
         for i in range(layer_start, layer_end):
-            self._select_layer_transient(transient_positions, i)
+            self._select_layer_transient(transient_shape_positions, i)
             if self.prefetcher:
                 for j in range(
                         i + 1,
@@ -5305,8 +5358,11 @@ class StreamingEngine:
             active_before = mx.get_active_memory()
             mx.reset_peak_memory()
             tiles = []
+            mlp_tile = None
+            x_after_attn = None
             pos = 0
             t0 = time.perf_counter()
+            dense_mlp_s = 0.0
             while pos < total:
                 end = min(pos + tile_width, total)
                 # A stable chat boundary can fall inside an ordinary prefill
@@ -5323,9 +5379,36 @@ class StreamingEngine:
                 # real mid-sweep pressure spike is caught at the same
                 # resolution the chunk-major path already catches it at.
                 if self.governor is not None and self._layer_transient:
-                    self.governor.reserve(
-                        self._layer_transient,
-                        margin=self._layer_transient_margin)
+                    signature = self._transient_layer_signature(i)
+                    observations = int(getattr(
+                        self, "_layer_transient_observation_counts", {}
+                    ).get((transient_shape_positions, signature), 0))
+                    completed_output_bytes = (
+                        pos * int(x.nbytes) // total if dense_mlp else 0)
+                    scratch_reserve = _remaining_layer_transient_reserve(
+                        self._layer_transient, completed_output_bytes)
+                    reserve_margin = (
+                        _recurring_layer_transient_reserve_margin(
+                            transient_shape_positions, observations))
+                    try:
+                        self.governor.reserve(
+                            scratch_reserve,
+                            margin=reserve_margin)
+                    except MemoryError:
+                        print(
+                            "[qwen35-prefill-admission] "
+                            f"layer={i} "
+                            f"signature={signature} "
+                            f"tile={end - pos} position={pos}/{total} "
+                            f"active={int(mx.get_active_memory())} "
+                            f"scratch={int(scratch_reserve)} "
+                            f"measured_scratch={int(self._layer_transient)} "
+                            f"completed_output={completed_output_bytes} "
+                            f"observations={observations} "
+                            f"margin={int(reserve_margin)}",
+                            flush=True,
+                        )
+                        raise
                 xt = x[:, pos:end, :]
                 tile_positions3 = (
                     None if positions3 is None else positions3[:, pos:end])
@@ -5383,20 +5466,32 @@ class StreamingEngine:
                         "attention", i,
                         time.perf_counter() - attention_t0,
                         positions=end - pos)
-                tiles.append(yt)
-                pos = end
-            mlp_t0 = time.perf_counter()
-            if dense_mlp and len(tiles) > 1:
-                mlp_tiles = []
-                for attention_tile in tiles:
+                if dense_mlp:
+                    # Dense SwiGLU is independent at every position and does
+                    # not participate in the next tile's attention/KV update.
+                    # Finish this tile now so the attention residual can be
+                    # released instead of retaining both prompt-sized
+                    # attention and MLP tile lists until the layer ends.
+                    tile_mlp_t0 = time.perf_counter()
                     mlp_tile = _qwen35_mlp_residual(
-                        attention_tile, w, f"model.layers.{i}", self.cfg, i,
+                        yt, w, f"model.layers.{i}", self.cfg, i,
                         self._get_experts,
                         iter_expert_batches=self._iter_expert_batches,
                         profile=profiler)
                     mx.eval(mlp_tile)
-                    mlp_tiles.append(mlp_tile)
-                x = mx.concatenate(mlp_tiles, axis=1)
+                    dense_mlp_s += time.perf_counter() - tile_mlp_t0
+                    tiles.append(mlp_tile)
+                    yt = None
+                    mlp_tile = None
+                else:
+                    tiles.append(yt)
+                pos = end
+            mlp_t0 = time.perf_counter()
+            if dense_mlp:
+                x = (
+                    tiles[0]
+                    if len(tiles) == 1
+                    else mx.concatenate(tiles, axis=1))
             else:
                 x_after_attn = (
                     tiles[0]
@@ -5408,9 +5503,21 @@ class StreamingEngine:
                     iter_expert_batches=self._iter_expert_batches,
                     profile=profiler)
             mx.eval(x)
+            # ``mx.concatenate`` materializes a new hidden-state array.  The
+            # per-tile attention/MLP arrays and the final views into the old
+            # hidden state are no longer needed after that evaluation.  Python
+            # loop locals otherwise retain one complete prompt-sized layer
+            # until the following iteration, needlessly adding hundreds of MB
+            # to long-context admission and peak Metal usage.
+            tiles.clear()
+            xt = None
+            yt = None
+            mlp_tile = None
+            x_after_attn = None
             if profiler is not None and profiler.sync_substeps:
                 profiler.record_substep(
-                    "mlp", i, time.perf_counter() - mlp_t0,
+                    "mlp", i,
+                    dense_mlp_s + time.perf_counter() - mlp_t0,
                     positions=total)
             compute_s = time.perf_counter() - t0
             self.timer.add("layer_compute", compute_s)
@@ -5430,13 +5537,13 @@ class StreamingEngine:
                     "cache_source": "cold",
                 })
             self._record_layer_transient(
-                transient_positions, i,
+                transient_shape_positions, i,
                 _resident_adjusted_transient(
                     active_before, mx.get_active_memory(),
                     mx.get_peak_memory()))
             self._note_true_peak()
             del w
-        self._restore_aggregate_layer_transient(transient_positions)
+        self._restore_aggregate_layer_transient(transient_shape_positions)
         return x
 
     def _layer_stationary_gptoss_sweep(
@@ -7895,7 +8002,21 @@ class StreamingEngine:
             self.rc.hot_prompt_kv
             and (not self.rc.max_kv_mb or self.rc.paged_kv_persist)
             and not force_adaptive_paged)
-        resident_prompt_kv_bytes = self._project_dense_text_kv_bytes(len(tokens))
+        stable_boundary_positions = int(
+            getattr(prompt, "stable_boundary_tokens", 0) or 0)
+        resident_prompt_kv_bytes = self._project_dense_text_kv_bytes(
+            len(tokens),
+            stable_boundary_positions=(stable_boundary_positions or None))
+        path_stats["prompt_kv_projected_bytes"] = int(
+            resident_prompt_kv_bytes)
+        path_stats["prompt_kv_projection"] = (
+            "qwen35_mixed_depth"
+            if (self.cfg.model_type in ("qwen3_5", "qwen3_5_moe")
+                and self.rc.qwen_lossy_suffix_prefill_early_layers
+                and len(tokens) > (
+                    self.rc.qwen_lossy_suffix_prefill_prefix_tokens
+                    + self.rc.qwen_lossy_suffix_prefill_tokens))
+            else "uniform")
         configured_paged_mb = int(self.rc.max_kv_mb or 0)
         initial_paged_mb = (
             configured_paged_mb
@@ -8530,6 +8651,10 @@ class StreamingEngine:
                     self.rc.hot_prompt_kv_chunk_size = fresh_chunk
                 kv = self.new_kv(stepped=use_stepped_kv)
         self.last_kv = kv
+        if self.cfg.model_type in ("qwen3_5", "qwen3_5_moe"):
+            self.rc.prefill_chunk_size = (
+                self._apply_qwen35_prefill_chunk_ceiling(
+                    self.rc.prefill_chunk_size))
         effective_prefill_chunk = int(self.rc.prefill_chunk_size or 0)
         path_stats["prefill_step_size"] = effective_prefill_chunk
         if self.cfg.model_type in ("qwen3_5", "qwen3_5_moe"):
@@ -10208,6 +10333,17 @@ class StreamingEngine:
             self, "_hybrid_retry_chunk_ceiling", 0) or 0)
         if retry_ceiling:
             selected = min(selected, retry_ceiling)
+        return self._apply_qwen35_prefill_chunk_ceiling(selected)
+
+    def _apply_qwen35_prefill_chunk_ceiling(self, selected: int) -> int:
+        """Clamp every Qwen prefill route, including durable persistence.
+
+        The per-conversation selector is skipped when a durable store owns a
+        fixed cache lineage. Compute tiling is not part of the mixed-depth
+        snapshot representation, so the operator ceiling must also be applied
+        at the common execution point instead of only inside that selector.
+        """
+        selected = max(0, int(selected))
         configured_ceiling = int(getattr(
             self.rc, "qwen35_prefill_chunk_ceiling", 0) or 0)
         if configured_ceiling:

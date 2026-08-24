@@ -1232,6 +1232,11 @@ class EngineManager:
             "VMODEL_QWEN35_LOSSY_SUFFIX_PREFILL", "").strip()
         qwen_hot_kv_persist_dir_request = os.environ.get(
             "VMODEL_QWEN35_HOT_KV_PERSIST_DIR", "").strip()
+        qwen_hot_kv_request = os.environ.get(
+            "VMODEL_QWEN35_HOT_KV", "1").strip()
+        if qwen_hot_kv_request not in ("0", "1"):
+            raise RequestValidationError(
+                "VMODEL_QWEN35_HOT_KV must be 0 or 1")
         qwen_mixed_depth_persist_request = os.environ.get(
             "VMODEL_QWEN35_MIXED_DEPTH_HOT_KV_PERSIST", "0").strip()
         if qwen_mixed_depth_persist_request not in ("0", "1"):
@@ -1616,6 +1621,7 @@ class EngineManager:
             qwen_moe_decode_batch_request,
             qwen35_prefill_chunk_ceiling,
             qwen_lossy_suffix_request,
+            qwen_hot_kv_request,
             qwen_hot_kv_persist_dir_request,
             qwen_mixed_depth_persist_request,
             qwen_quant_lm_head_request,
@@ -1688,6 +1694,7 @@ class EngineManager:
             qwen_moe_decode_batch_request,
             qwen35_prefill_chunk_ceiling,
             qwen_lossy_suffix_request,
+            qwen_hot_kv_request,
             qwen_hot_kv_persist_dir_request,
             qwen_mixed_depth_persist_request,
             qwen_quant_lm_head_request,
@@ -2234,7 +2241,7 @@ class EngineManager:
                 # the complete KVCache + KDAStateCache object and only accepts
                 # exact endpoints/extensions (never a trimmed branch).
                 rc.prompt_kv_dir = ""
-                rc.hot_prompt_kv = True
+                rc.hot_prompt_kv = qwen_hot_kv_request == "1"
                 # F11: prompt-lookup/n-gram speculation, mutually exclusive
                 # with native MTP (see EngineManager.get()'s construction
                 # site) -- opt-in only, real greedy-token
@@ -2481,7 +2488,8 @@ class EngineManager:
                         "non-negative")
                 if rc.qwen_lossy_suffix_prefill_early_layers:
                     rc.layer_stationary_prefill = True
-                    if qwen_mixed_depth_persist_request == "1":
+                    if (rc.hot_prompt_kv
+                            and qwen_mixed_depth_persist_request == "1"):
                         identity = hashlib.sha256(
                             str(model_dir).encode()).hexdigest()[:16]
                         rc.hot_prompt_kv_persist_dir = (
@@ -2497,7 +2505,8 @@ class EngineManager:
                         # per-layer positions. The dedicated full-snapshot
                         # format is separately explicit and fail-closed.
                         rc.hot_prompt_kv_persist_dir = ""
-                elif qwen_mixed_depth_persist_request == "1":
+                elif (rc.hot_prompt_kv
+                      and qwen_mixed_depth_persist_request == "1"):
                     raise ValueError(
                         "VMODEL_QWEN35_MIXED_DEPTH_HOT_KV_PERSIST requires "
                         "VMODEL_QWEN35_LOSSY_SUFFIX_PREFILL")
@@ -2600,7 +2609,7 @@ class EngineManager:
                 # DeltaNet-state reuse) and the fixed-chunk requirement it
                 # imposes carry over from the MoE sibling.
                 rc.prompt_kv_dir = ""
-                rc.hot_prompt_kv = True
+                rc.hot_prompt_kv = qwen_hot_kv_request == "1"
                 # F11: prompt-lookup/n-gram speculation, mutually exclusive
                 # with native MTP (see EngineManager.get()'s construction
                 # site) -- opt-in only, real greedy-token
@@ -2635,7 +2644,8 @@ class EngineManager:
                 )
                 if rc.qwen_lossy_suffix_prefill_early_layers:
                     rc.layer_stationary_prefill = True
-                    if qwen_mixed_depth_persist_request == "1":
+                    if (rc.hot_prompt_kv
+                            and qwen_mixed_depth_persist_request == "1"):
                         identity = hashlib.sha256(
                             str(model_dir).encode()).hexdigest()[:16]
                         rc.hot_prompt_kv_persist_dir = (
@@ -2651,7 +2661,8 @@ class EngineManager:
                         # per-layer positions. The dedicated full-snapshot
                         # format is separately explicit and fail-closed.
                         rc.hot_prompt_kv_persist_dir = ""
-                elif qwen_mixed_depth_persist_request == "1":
+                elif (rc.hot_prompt_kv
+                      and qwen_mixed_depth_persist_request == "1"):
                     raise ValueError(
                         "VMODEL_QWEN35_MIXED_DEPTH_HOT_KV_PERSIST requires "
                         "VMODEL_QWEN35_LOSSY_SUFFIX_PREFILL")
@@ -7606,6 +7617,10 @@ def _vision_protocol_timing(result: dict) -> dict:
             "request_system_available_bytes", default=0) or 0),
         "request_system_required_bytes": int(metric(
             "request_system_required_bytes", default=0) or 0),
+        "prompt_kv_projected_bytes": int(metric(
+            "prompt_kv_projected_bytes", default=0) or 0),
+        "prompt_kv_projection": str(metric(
+            "prompt_kv_projection", default="") or ""),
         "vision_cache_hits": int(metric("vision_cache_hits") or 0),
         "vision_cache_misses": int(metric("vision_cache_misses") or 0),
         "vision_prompt_cache_tower_skipped": int(metric(

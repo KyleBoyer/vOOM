@@ -267,6 +267,41 @@ Measured STOP decisions:
 - A 1GB trunk pin planned two layers / 0.383GB but caused a safe verifier
   reservation refusal. The head-only pin is retained; trunk pinning is off.
 
+## Large-context and sustained-output validation (2026-08-24)
+
+The old 16-token captures were scheduling probes, not realistic generation
+quality gates. A new deterministic HTTP fixture places two canaries at 13% and
+73% of a synthetic long prompt, requires their exact recovery, and records
+input/output counts, hashes, timings, KV geometry, Metal peak, available
+memory, and swap-out growth without retaining the private prompt or answer.
+
+The work exposed and fixed four generic long-context issues: mixed-depth KV
+admission now uses the real retained layer geometry and FP32 runtime KV dtype;
+the explicit Qwen prefill ceiling applies even with durable persistence;
+dense layer-stationary prefill releases/eagerly consumes evaluated tile
+temporaries; and transient history is keyed by the full layer-stationary
+sequence shape rather than tile width alone. Exact real-checkpoint oracles
+remained byte-identical after the lifetime/scheduling change.
+
+The fully passing sustained gate used `VMODEL_QWEN35_HOT_KV=0` to avoid
+retaining a second reusable boundary during a one-shot long generation. This
+strict, identity-bearing opt-out defaults to `1`, so ordinary serving behavior
+is unchanged. Results: 16,029 rendered input tokens, exactly 64 output tokens,
+both canaries, exact required prefix, 9 consecutive validation integers,
+144.034s prefill, 424.717s decode, 568.751s engine / 569.732s HTTP wall,
+3.580GB peak Metal, 36.323MB swap growth, and 6.557GB available at completion.
+The output hash matched the earlier cached-state semantic run exactly.
+
+A separate no-hot 30,029-input / 32-output run recovered both canaries with
+the exact prefix and marker at 4.055GB peak Metal and 28.754MB swap growth;
+prefill was 348.918s and decode 222.237s. It is a large-context retrieval and
+pressure pass, but the composite sustained-format fixture remains red because
+the 32-token truncation fit only one of the requested two validation integers.
+Do not report that artifact as a full composite pass. The combined 30K/128
+attempt also remains a STOP: prefill completed, but decode hit the memory floor
+and swap growth reached 706MB. The released model advertises 262,144 context;
+this work validates 30K on this machine, not the advertised maximum.
+
 ## Evidence
 
 - FreeToken audit, exact MTP two-SSD split, verifier/prefetch instrumentation,
@@ -297,6 +332,12 @@ Measured STOP decisions:
 - Native-GDN plus head-pin/prefetch composition:
   `logs/huihui_native_gdn_h1p2_capture16.json`
 - Focused quality gate: `logs/huihui_qwen38_fast_plex_focused_specific.json`
+- Passing 16K/64 sustained gate:
+  `logs/qwen38_large_context_16k_out64_nohot.json`
+- 30K/32 retrieval result (composite red only for second integer):
+  `logs/qwen38_large_context_30k_out32_nohot.json`
+- 30K/128 pressure STOP:
+  `logs/qwen38_large_context_30k_out128_shapeclass.json`
 - Historical invalid-KDA full-schema artifact:
   `logs/huihui_qwen38_lossless_capture1_paged_v4.json`
 - Profiles: `profiles/huihui-qwen38-27b-fast-agent.yaml`,

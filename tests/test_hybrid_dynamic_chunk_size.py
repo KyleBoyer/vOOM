@@ -32,6 +32,7 @@ def _bare_engine(model_type: str, hot_kv_persist,
     engine._hot_kv_persist = hot_kv_persist
     engine.rc = SimpleNamespace(
         hot_prompt_kv_chunk_size=hot_prompt_kv_chunk_size,
+        prefill_chunk_size=hot_prompt_kv_chunk_size,
         qwen35_prefill_chunk_ceiling=qwen35_prefill_chunk_ceiling,
         adaptive_chunk_size=False)
     return engine
@@ -131,6 +132,17 @@ def test_explicit_ceiling_is_applied_after_retry_ceiling():
     with patch("runtime.engine.psutil.virtual_memory",
                return_value=SimpleNamespace(available=10_000_000_000)):
         assert engine._select_prefill_chunk_size(None) == 8
+
+
+def test_explicit_ceiling_also_clamps_fixed_durable_execution():
+    engine = _bare_engine(
+        "qwen3_5", hot_kv_persist=object(),
+        hot_prompt_kv_chunk_size=512,
+        qwen35_prefill_chunk_ceiling=32)
+
+    assert not engine._hybrid_chunk_size_applies()
+    assert engine._apply_qwen35_prefill_chunk_ceiling(
+        engine.rc.prefill_chunk_size) == 32
 
 
 def test_two_conversations_can_use_different_chunk_sizes_independently():

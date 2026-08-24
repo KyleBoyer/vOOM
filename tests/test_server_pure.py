@@ -161,6 +161,8 @@ def test_vision_protocol_timing_uses_generic_path_stats():
         "request_incremental_projection_bytes": 0,
         "request_system_available_bytes": 0,
         "request_system_required_bytes": 0,
+        "prompt_kv_projected_bytes": 0,
+        "prompt_kv_projection": "",
         "vision_cache_hits": 2,
         "vision_cache_misses": 1,
         "vision_prompt_cache_tower_skipped": 1,
@@ -2922,6 +2924,7 @@ def test_dense_qwen35_honors_postgen_cleanup_floor():
         "VMODEL_QWEN35_POSTGEN_MIN_AVAILABLE_MB": "6000",
         "VMODEL_QWEN35_WEIGHT_CACHE_MB": "2200",
         "VMODEL_QWEN35_PREFILL_CHUNK_CEILING": "128",
+        "VMODEL_QWEN35_HOT_KV": "1",
     }
     manager = EngineManager()
     with patch.dict(os.environ, env), \
@@ -2934,12 +2937,28 @@ def test_dense_qwen35_honors_postgen_cleanup_floor():
         manager.get(Path("/tmp/fake-qwen38-dense"), "lossless")
         os.environ["VMODEL_QWEN35_PREFILL_CHUNK_CEILING"] = "32"
         manager.get(Path("/tmp/fake-qwen38-dense"), "lossless")
+        os.environ["VMODEL_QWEN35_HOT_KV"] = "0"
+        manager.get(Path("/tmp/fake-qwen38-dense"), "lossless")
 
-    assert len(captured) == 2  # the ceiling participates in engine identity
+    assert len(captured) == 3  # ceiling and hot-state policy are identities
     assert captured[0].qwen_postgen_min_available_mb == 6000
     assert captured[0].max_weight_cache_mb == 2200
     assert captured[0].qwen35_prefill_chunk_ceiling == 128
     assert captured[1].qwen35_prefill_chunk_ceiling == 32
+    assert captured[1].hot_prompt_kv
+    assert not captured[2].hot_prompt_kv
+
+
+@pytest.mark.parametrize("value", ["", "2", "true", "bad"])
+def test_qwen35_hot_kv_rejects_non_boolean_values(value):
+    from unittest.mock import patch
+
+    from runtime.server import EngineManager
+
+    with patch.dict(os.environ, {"VMODEL_QWEN35_HOT_KV": value}):
+        with pytest.raises(
+                RequestValidationError, match="VMODEL_QWEN35_HOT_KV"):
+            EngineManager().get(Path("/tmp/not-opened-invalid-hot-kv"), "fast")
 
 
 def test_dense_qwen35_paged_durable_prefix_is_explicit_and_disk_only(tmp_path):
