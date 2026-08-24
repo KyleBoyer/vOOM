@@ -71,6 +71,41 @@ from .sampler import (
 )
 
 
+def _target_io_snapshot(target):
+    """Snapshot target-page I/O when the wrapped engine exposes accounting.
+
+    DSpark/DFlash verification runs outside ``StreamingEngine.generate`` after
+    the bootstrap prefill.  Without a wrapper-level snapshot, the bootstrap's
+    path statistics are returned unchanged and every authoritative decode
+    sweep is incorrectly reported as zero target-weight traffic.  Tiny oracle
+    targets deliberately omit the cache/store surface and remain unaffected.
+    """
+    if not all(hasattr(target, name) for name in (
+        "cache", "store", "expert_hits", "expert_misses",
+    )):
+        return None
+    from .engine import _cache_io_snapshot
+
+    return _cache_io_snapshot(target)
+
+
+def _merge_target_io_stats(
+    target, before, prefill_after, request_after, path_stats: dict,
+) -> None:
+    """Replace bootstrap-only counters with whole speculative-request deltas."""
+    if before is None or prefill_after is None or request_after is None:
+        return
+    from .engine import _record_cache_io_delta
+
+    _record_cache_io_delta(
+        target, before, path_stats, after=request_after)
+    _record_cache_io_delta(
+        target, before, path_stats, prefix="prefill_", after=prefill_after)
+    _record_cache_io_delta(
+        target, prefill_after, path_stats, prefix="decode_",
+        after=request_after)
+
+
 @dataclass
 class DSparkConfig:
     hidden_size: int
@@ -1254,6 +1289,7 @@ class DSparkSpeculativeDecoder:
                  sampling: SamplingParams | None = None,
                  constraint=None) -> dict:
         target = self.target
+        request_cache_before = _target_io_snapshot(target)
         sampling = sampling or SamplingParams()
         sampling.seed_rng()
         stops = list(stop or [])
@@ -1471,6 +1507,7 @@ class DSparkSpeculativeDecoder:
                              "dspark-memory" if prompt_cache_hit else
                              "dspark-cold")})
 
+        prefill_cache_after = _target_io_snapshot(target)
         eos = set(target.cfg.eos_token_ids)
         decode_t0 = time.perf_counter()
         while (len(emitted) < max_tokens and pending not in eos
@@ -1834,7 +1871,8 @@ class DSparkSpeculativeDecoder:
                 target.governor.request_peak(),
                 mx.get_active_memory(),
             )
-        return {
+        request_cache_after = _target_io_snapshot(target)
+        result = {
             "text": final_text,
             "tokens": emitted,
             "prefill_s": prefill_s,
@@ -1935,6 +1973,14 @@ class DSparkSpeculativeDecoder:
                     stats.expert_prefetch_matched),
             },
         }
+        _merge_target_io_stats(
+            target,
+            request_cache_before,
+            prefill_cache_after,
+            request_cache_after,
+            result["path_stats"],
+        )
+        return result
 
 
 class DSparkSpeculativeEngine:

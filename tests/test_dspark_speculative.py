@@ -137,6 +137,38 @@ def test_forced_accept_none_partial_and_all_keep_exact_state():
                for cache in drafter.last_caches)
 
 
+def test_speculative_io_telemetry_spans_prefill_and_target_verification(
+    monkeypatch,
+):
+    """The wrapper must not return bootstrap-only target I/O counters."""
+    target = _Target()
+    drafter = _Drafter()
+    decoder = DSparkSpeculativeDecoder(target, drafter, max_draft_tokens=2)
+    proposals = iter(([7, 7], [3, 7], [5, 6]))
+    decoder._propose = lambda *_args: list(next(proposals))
+    snapshots = iter((10, 20, 70))
+    monkeypatch.setattr(
+        "runtime.dspark._target_io_snapshot",
+        lambda _target: next(snapshots),
+    )
+
+    def merge(_target, before, prefill_after, request_after, path_stats):
+        assert (before, prefill_after, request_after) == (10, 20, 70)
+        path_stats["weight_store_bytes_read"] = request_after - before
+        path_stats["prefill_weight_store_bytes_read"] = (
+            prefill_after - before)
+        path_stats["decode_weight_store_bytes_read"] = (
+            request_after - prefill_after)
+
+    monkeypatch.setattr("runtime.dspark._merge_target_io_stats", merge)
+
+    result = decoder.generate("ignored", max_tokens=7, stop=[])
+
+    assert result["path_stats"]["weight_store_bytes_read"] == 60
+    assert result["path_stats"]["prefill_weight_store_bytes_read"] == 10
+    assert result["path_stats"]["decode_weight_store_bytes_read"] == 50
+
+
 def test_ctx_cache_trim_rejects_negative_and_keeps_prefix():
     cache = CtxCache()
     cache.append(mx.zeros((1, 1, 4, 2)), mx.zeros((1, 1, 4, 2)))

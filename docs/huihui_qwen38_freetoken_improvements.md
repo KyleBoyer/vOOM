@@ -65,6 +65,31 @@ and achieved 1.875 output tokens per target sweep. New telemetry separates
 input, committed and rolled-back verifier positions, accepted/correction/bonus
 tokens, target sweeps avoided, tokens per sweep, and draft/verifier time.
 
+## Smaller proposal sidecar: official DFlash2, retained as short-shape opt-in
+
+FreeToken does not provide a trained next-token sidecar, so the next proposal
+source was the official Qwen3.8-27B DFlash2 checkpoint.  The runtime imports
+its five-layer, five-target-tap, sliding-window draft architecture and selector
+behind explicit configuration.  Local affine4/3/2 group-64 artifacts occupy
+1.083GB / 842.365MB / 601.847MB.  They are never verifiers: the unchanged
+target verifies every position and supplies the rejection correction or bonus
+token.
+
+The 2-bit artifact improved the unmodified capped capture by 5.68% and two
+runs of a different developer/two-tool shape by 7.77–16.58%, with target-output
+hashes unchanged.  It did not generalize to sustained output: at a request
+budget of 64, native MTP completed the function call in 201.708s with 84.2%
+acceptance, while DFlash2 took 246.971s with 18.2% acceptance.  Keeping even
+the 602MB draft resident alongside streamed target layers failed the hard
+governor on this 16GB machine, so reload cost cannot safely be hidden.  Native
+MTP remains the serving choice; DFlash2 is useful research evidence that a
+smaller sidecar can win only when its target-sweep reduction exceeds its load
+and proposal cost on the actual request shape.
+
+Primary implementation sources:
+https://huggingface.co/incoai/Qwen3.8-27B-DFlash2 and
+https://github.com/z-lab/dflash.
+
 ## Accepted: restart-safe mixed-depth prompt state, 75.10 seconds wall
 
 The ordinary exact hot-KV journal assumes every attention layer retains the
