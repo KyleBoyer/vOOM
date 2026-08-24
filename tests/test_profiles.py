@@ -106,6 +106,8 @@ def test_builtin_profiles_resolve_complete_agent_group():
     assert huihui_settings["VMODEL_QWEN35_PREFETCH_DEPTH"] == "2"
     assert huihui_settings[
         "VMODEL_QWEN35_MIXED_DEPTH_HOT_KV_PERSIST"] == "1"
+    assert huihui_settings[
+        "VMODEL_QWEN35_REUSABLE_USER_PREFIX"] == "1"
 
     persist_order, persist_settings = resolve_runtime_profiles(
         ("huihui-qwen38-27b-lossless-paged-persist",), catalog)

@@ -43,14 +43,17 @@ no private LM head, so the drafter shares the target's exact streamed output
 projection.  A lossy draft representation is safe: every proposed token still
 passes the released K3 target verifier below.
 
-Safety property unchanged from every other drafter in this runtime: the
-target ALWAYS verifies every proposed token exactly (F32's rollback
-invariant). A wrong or low-quality drafter can only reduce acceptance rate
-(speed), never change the emitted token stream — see
+Safety design unchanged from every other drafter in this runtime: the target
+computes the authoritative distribution for every proposed position.  With a
+correct architecture-specific recurrent rollback, a wrong or low-quality
+drafter can only reduce acceptance rate (speed), never change the emitted token
+stream.  K3 has released-weight rollback gates; Qwen3.8 stays experimental
+until its longer forced-rejection recurrent oracle passes.  See
 experiments/dspark_control.py for the strict token-identity gate.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import time
@@ -81,6 +84,10 @@ class DSparkConfig:
     mask_token_id: int
     target_layer_ids: list[int]
     model_type: str = "qwen3"
+    target_model_type: str = ""
+    share_target_embed: bool = False
+    share_target_lm_head: bool = False
+    logits_start: int = 0
     rms_norm_eps: float = 1e-6
     rope_theta: float = 1_000_000.0
     attention_bias: bool = False
@@ -96,6 +103,13 @@ class DSparkConfig:
     max_position_embeddings: int = 0
     rope_parameters: dict = field(default_factory=dict)
 
+    def __post_init__(self) -> None:
+        if not self.target_model_type:
+            self.target_model_type = (
+                "kimi_k3" if self.model_type == "k3_dspark" else "qwen3")
+        if self.model_type == "k3_dspark":
+            self.share_target_lm_head = True
+
     @classmethod
     def from_json(cls, path: str | Path) -> "DSparkConfig":
         c = json.loads(Path(path).read_text())
@@ -105,9 +119,15 @@ class DSparkConfig:
                 f"different tensor/config schema, not supported by this loader. Needs a "
                 f"DeepSpec-native standalone drafter (e.g. deepseek-ai/dspark_*_block7).")
         model_type = c.get("model_type")
+        dflash = c.get("dflash_config") or {}
+        specforge = bool(
+            model_type == "qwen3"
+            and dflash.get("projector_type") == "dspark")
         if model_type not in ("qwen3", "k3_dspark"):
             raise ValueError(
                 f"{path}: unsupported DSpark model_type={model_type!r}")
+        if specforge:
+            model_type = "qwen3_specforge"
         rp = c.get("rope_parameters") or {}
         if model_type == "k3_dspark":
             head_dim = (
@@ -129,9 +149,24 @@ class DSparkConfig:
             # Inferact's first public K3 DSpark config omitted block_size even
             # though the released checkpoint/model card fixes it at seven.
             block_size=c.get("block_size", 7),
-            mask_token_id=c["mask_token_id"],
-            target_layer_ids=list(c["target_layer_ids"]),
+            mask_token_id=(
+                dflash["mask_token_id"] if specforge else c["mask_token_id"]),
+            target_layer_ids=list(
+                dflash["target_layer_ids"] if specforge
+                else c["target_layer_ids"]),
             model_type=model_type,
+            target_model_type=((
+                "qwen3_5"
+                if (specforge and int(c.get("num_target_layers", 0)) == 64
+                    and int(c.get("vocab_size", 0)) == 248_320)
+                else "qwen3") if specforge else (
+                "kimi_k3" if model_type == "k3_dspark" else "qwen3")),
+            share_target_embed=specforge,
+            share_target_lm_head=specforge or model_type == "k3_dspark",
+            # RadixArk's SpecForge head predicts from its anchor slot. The
+            # inherited base-DFlash example used slot one and measured about
+            # 1.35 accepted tokens versus 3.42 from slot zero.
+            logits_start=(0 if specforge else int(c.get("logits_start", 0))),
             rms_norm_eps=c.get("rms_norm_eps", 1e-6),
             rope_theta=rp.get("rope_theta", c.get("rope_theta", 1_000_000.0)),
             attention_bias=c.get("attention_bias", False),
@@ -159,25 +194,202 @@ class CtxCache:
     def __init__(self):
         self.k: mx.array | None = None
         self.v: mx.array | None = None
+        self.position_start: int | None = None
+        self.position_end: int = 0
 
-    def append(self, k: mx.array, v: mx.array) -> None:
+    def append(
+        self, k: mx.array, v: mx.array, *, position_start: int | None = None,
+    ) -> None:
+        position_start = (
+            self.position_end if position_start is None
+            else int(position_start))
         if self.k is None:
             self.k, self.v = k, v
+            self.position_start = position_start
         else:
+            if position_start != self.position_end:
+                raise ValueError(
+                    "DSpark context append is not position-contiguous: "
+                    f"expected {self.position_end}, got {position_start}")
             self.k = mx.concatenate([self.k, k], axis=2)
             self.v = mx.concatenate([self.v, v], axis=2)
+        self.position_end = position_start + int(k.shape[2])
+
+    def fork(self) -> "CtxCache":
+        result = CtxCache()
+        result.k = self.k
+        result.v = self.v
+        result.position_start = self.position_start
+        result.position_end = self.position_end
+        return result
 
     def trim_to(self, length: int) -> None:
-        """Keep exactly the committed prefix after an early stop/EOS."""
+        """Keep context entries strictly before absolute ``length``."""
         if length < 0:
             raise ValueError("DSpark context length must be non-negative")
-        if self.k is not None and length < self.k.shape[2]:
-            self.k = self.k[:, :, :length, :]
-            self.v = self.v[:, :, :length, :]
+        start = int(self.position_start or 0)
+        keep = max(0, int(length) - start)
+        if self.k is not None and keep < self.k.shape[2]:
+            self.k = self.k[:, :, :keep, :]
+            self.v = self.v[:, :, :keep, :]
+            self.position_end = start + keep
 
     @property
     def length(self) -> int:
         return 0 if self.k is None else self.k.shape[2]
+
+
+class DSparkTapCollector:
+    """Turn target residual-stream taps into the drafter's context cache.
+
+    The normal lossless prefill presents the same contiguous position range at
+    every tapped target layer.  The explicit Huihui fast profile is different:
+    its early layers see the complete prompt while later layers see only the
+    final endpoint-packed suffix.  The deepest tap is authoritative about the
+    positions common to every feature source; earlier full-prompt taps are
+    sliced to that range before fusion.  Non-contiguous endpoint packing fails
+    closed for now because the drafter RoPE API below deliberately accepts one
+    contiguous absolute range at a time.
+    """
+
+    def __init__(
+        self, drafter: "DSparkDrafter", caches: list[CtxCache], *,
+        position_floor: int = 0,
+    ):
+        self.drafter = drafter
+        self.caches = caches
+        if int(position_floor) < 0:
+            raise ValueError("DSpark context position floor must be non-negative")
+        self.position_floor = int(position_floor)
+        self.tap_layers = tuple(int(v) for v in drafter.config.target_layer_ids)
+        self._wanted = set(self.tap_layers)
+        self._seen: dict[int, tuple[int, int, mx.array]] = {}
+        self.updates = 0
+        self.positions = 0
+        self.update_s = 0.0
+        self.attempts = 0
+
+    def begin_attempt(self) -> None:
+        """Discard partial tap context before a memory-retry replay.
+
+        ``generate_with_memory_retry`` can restart Qwen prefill after a governor
+        refusal.  Target KV is discarded by the engine, so the companion draft
+        context must restart at the same boundary rather than append a second
+        copy of whatever layers completed before the refusal.
+        """
+        self.attempts += 1
+        self._seen.clear()
+        for cache in self.caches:
+            cache.k = None
+            cache.v = None
+            cache.position_start = None
+            cache.position_end = 0
+
+    @staticmethod
+    def _contiguous_start(
+        hidden: mx.array, position_start: int | None,
+        positions: mx.array | None,
+    ) -> int:
+        width = int(hidden.shape[1])
+        if positions is None:
+            if position_start is None:
+                raise ValueError("DSpark tap omitted its absolute position")
+            return int(position_start)
+        mx.eval(positions)
+        values = [int(value) for value in positions.tolist()]
+        if len(values) != width or any(
+            value != values[0] + index
+            for index, value in enumerate(values)
+        ):
+            raise ValueError(
+                "DSpark tap collection currently requires contiguous "
+                "endpoint positions")
+        return values[0]
+
+    def observe(
+        self, layer: int, hidden: mx.array, *,
+        position_start: int | None = None,
+        positions: mx.array | None = None,
+    ) -> None:
+        layer = int(layer)
+        if layer not in self._wanted:
+            return
+        start = self._contiguous_start(hidden, position_start, positions)
+        self._seen[layer] = (start, start + int(hidden.shape[1]), hidden)
+        if not all(value in self._seen for value in self.tap_layers):
+            return
+
+        canonical_start, canonical_end, _ = self._seen[self.tap_layers[-1]]
+        if canonical_end <= self.position_floor:
+            self._seen.clear()
+            return
+        canonical_start = max(canonical_start, self.position_floor)
+        aligned = []
+        for tap in self.tap_layers:
+            start_i, end_i, hidden_i = self._seen[tap]
+            if start_i > canonical_start or end_i < canonical_end:
+                raise ValueError(
+                    "DSpark target taps do not share the deepest contiguous "
+                    f"range: layer {tap}=[{start_i},{end_i}) versus "
+                    f"[{canonical_start},{canonical_end})")
+            left = canonical_start - start_i
+            aligned.append(hidden_i[:, left:left + canonical_end - canonical_start, :])
+
+        started = time.perf_counter()
+        self.drafter.update_context(
+            mx.concatenate(aligned, axis=-1),
+            canonical_start,
+            self.caches,
+        )
+        mx.eval(*[
+            value
+            for cache in self.caches
+            for value in (cache.k, cache.v)
+            if value is not None
+        ])
+        self.update_s += time.perf_counter() - started
+        self.updates += 1
+        self.positions += canonical_end - canonical_start
+        self._seen.clear()
+
+    def finish(self, expected_end: int) -> None:
+        if self._seen:
+            raise RuntimeError(
+                "target prefill ended with an incomplete DSpark tap set: "
+                f"{sorted(self._seen)}")
+        if not self.caches or any(
+            cache.position_end != int(expected_end) for cache in self.caches
+        ):
+            raise RuntimeError(
+                "DSpark context did not reach the target prompt endpoint")
+
+
+class _DSparkBootstrapPrompt(str):
+    """Prepared-prompt-compatible view with an isolated hot-cache lineage."""
+
+    def __new__(cls, prompt, token_ids):
+        instance = super().__new__(cls, str(prompt))
+        instance.token_ids = tuple(int(value) for value in token_ids)
+        instance.tool_capsules = tuple(
+            getattr(prompt, "tool_capsules", ()))
+        base_namespace = str(
+            getattr(prompt, "cache_namespace", "default") or "default")
+        digest = hashlib.sha256(
+            b"".join(int(value).to_bytes(4, "little") for value in token_ids)
+        ).hexdigest()[:16]
+        instance.cache_namespace = f"dspark:{base_namespace}:{digest}"
+        instance.force_paged_kv = bool(
+            getattr(prompt, "force_paged_kv", False))
+        # A target-only checkpoint cannot restore the companion DSpark context
+        # after a process restart. Keep the complete target+draft endpoint in
+        # DSpark's own in-process COW cache below, but never admit this bootstrap
+        # into the ordinary target slot/journal tiers where the absent draft
+        # state could turn a future apparent hit into an invalid partial prefill.
+        instance.disable_hot_prompt_kv = True
+        instance.stable_boundary_tokens = 0
+        instance.rerank_capture_shape = dict(
+            getattr(prompt, "rerank_capture_shape", {}) or {})
+        return instance
 
 
 class DSparkAttention(nn.Module):
@@ -188,6 +400,24 @@ class DSparkAttention(nn.Module):
         self.head_dim = cfg.head_dim
         self.scale = self.head_dim ** -0.5
         self.rope_theta = cfg.rope_theta
+        self._rope_freqs = None
+        self._rope_scale = 1.0
+        rope_type = cfg.rope_parameters.get(
+            "rope_type", cfg.rope_parameters.get("type", "default"))
+        if rope_type == "yarn":
+            from .rope import yarn_parameters
+
+            rp = cfg.rope_parameters
+            denominators, rope_scale = yarn_parameters(
+                self.head_dim,
+                self.rope_theta,
+                float(rp["factor"]),
+                int(rp["original_max_position_embeddings"]),
+                beta_fast=float(rp.get("beta_fast", 32.0)),
+                beta_slow=float(rp.get("beta_slow", 1.0)),
+            )
+            self._rope_freqs = mx.array(denominators, dtype=mx.float32)
+            self._rope_scale = float(rope_scale)
 
         h, b = cfg.hidden_size, cfg.attention_bias
         self.q_proj = nn.Linear(h, self.n_heads * self.head_dim, bias=b)
@@ -199,8 +429,15 @@ class DSparkAttention(nn.Module):
 
     def _rope(self, x: mx.array, offset) -> mx.array:
         # matches runtime/layer_runner.py's existing Qwen convention exactly
-        return mx.fast.rope(x, self.head_dim, traditional=False, base=self.rope_theta,
-                            scale=1.0, offset=offset)
+        if self._rope_freqs is None:
+            value = mx.fast.rope(
+                x, self.head_dim, traditional=False, base=self.rope_theta,
+                scale=1.0, offset=offset)
+        else:
+            value = mx.fast.rope(
+                x, self.head_dim, traditional=False, base=None,
+                freqs=self._rope_freqs, scale=1.0, offset=offset)
+        return value * self._rope_scale
 
     def _kv(self, x: mx.array):
         b, s, _ = x.shape
@@ -213,7 +450,9 @@ class DSparkAttention(nn.Module):
         committed positions. Projects to K/V, ropes K at its absolute
         position, appends to the persistent context cache. V is not roped."""
         k, v = self._kv(fused_new)
-        cache.append(self._rope(k, offset=ctx_offset), v)
+        cache.append(
+            self._rope(k, offset=ctx_offset), v,
+            position_start=ctx_offset)
 
     def attend(self, hidden: mx.array, block_offset: int, cache: CtxCache) -> mx.array:
         """hidden: (1, block_size, hidden) — the block's own positions. Q from
@@ -336,7 +575,9 @@ class K3DSparkAttention(nn.Module):
         c_kv, k_pe = self._latent(fused_new, ctx_offset)
         # CtxCache's names are deliberately representation-agnostic: K3's
         # ``k`` is the compressed content latent and ``v`` is shared k_pe.
-        cache.append(c_kv[:, None, :, :], k_pe)
+        cache.append(
+            c_kv[:, None, :, :], k_pe,
+            position_start=ctx_offset)
 
     def attend(
         self, hidden: mx.array, block_offset: int, cache: CtxCache
@@ -459,7 +700,11 @@ class DSparkDrafter(nn.Module):
         self.block_size = cfg.block_size
         self.mask_token_id = cfg.mask_token_id
 
-        self.embed_tokens = nn.Embedding(cfg.vocab_size, cfg.hidden_size)
+        self.embed_tokens = (
+            None if cfg.share_target_embed
+            else nn.Embedding(cfg.vocab_size, cfg.hidden_size))
+        self._target_embed_provider = None
+        self._target_lm_head_provider = None
         if cfg.model_type == "k3_dspark":
             self.context_proj = nn.Linear(
                 len(cfg.target_layer_ids) * cfg.target_hidden_size,
@@ -474,7 +719,6 @@ class DSparkDrafter(nn.Module):
             ]
             self.final_norm = nn.RMSNorm(
                 cfg.hidden_size, eps=cfg.rms_norm_eps)
-            self._target_lm_head_provider = None
         else:
             self.fc = nn.Linear(
                 len(cfg.target_layer_ids) * cfg.hidden_size,
@@ -489,8 +733,9 @@ class DSparkDrafter(nn.Module):
             ]
             self.norm = nn.RMSNorm(
                 cfg.hidden_size, eps=cfg.rms_norm_eps)
-            self.lm_head = nn.Linear(
-                cfg.hidden_size, cfg.vocab_size, bias=False)
+            self.lm_head = (
+                None if cfg.share_target_lm_head
+                else nn.Linear(cfg.hidden_size, cfg.vocab_size, bias=False))
 
         self.markov_head = VanillaMarkov(cfg) if cfg.markov_rank > 0 else None
         self.confidence_head = None
@@ -552,14 +797,32 @@ class DSparkDrafter(nn.Module):
         return self.hidden_norm(self.fc(target_hidden_cat))
 
     def bind_target_lm_head(self, provider) -> None:
-        if self.config.model_type == "k3_dspark":
-            self._target_lm_head_provider = provider
+        if not self.config.share_target_lm_head:
+            raise ValueError("this DSpark checkpoint owns its LM head")
+        self._target_lm_head_provider = provider
+
+    def bind_target_embed(self, provider) -> None:
+        if not self.config.share_target_embed:
+            raise ValueError("this DSpark checkpoint owns its embedding")
+        self._target_embed_provider = provider
+
+    def _embed_block(self, token_ids: list[int]) -> mx.array:
+        if self.embed_tokens is not None:
+            return self.embed_tokens(mx.array([token_ids]))
+        if self._target_embed_provider is None:
+            raise RuntimeError("DSpark requires the target token embedding")
+        value = self._target_embed_provider(token_ids)
+        if value.ndim != 3 or value.shape[:2] != (1, len(token_ids)):
+            raise RuntimeError(
+                "DSpark target embedding provider returned an invalid shape: "
+                f"{tuple(value.shape)}")
+        return value
 
     def _project_logits(self, hidden: mx.array) -> mx.array:
-        if self.config.model_type != "k3_dspark":
+        if getattr(self, "lm_head", None) is not None:
             return self.lm_head(hidden)
         if self._target_lm_head_provider is None:
-            raise RuntimeError("K3 DSpark requires the target LM head")
+            raise RuntimeError("DSpark requires the target LM head")
         head = self._target_lm_head_provider()
         from .lm_head_stream import StreamedLMHead
 
@@ -584,7 +847,7 @@ class DSparkDrafter(nn.Module):
         position i's logits come from the block's position i (0-indexed),
         which attends bidirectionally to the whole context + block."""
         block_ids = [pending_token] + [self.mask_token_id] * (self.block_size - 1)
-        h = self.embed_tokens(mx.array([block_ids]))
+        h = self._embed_block(block_ids)
         for layer, cache in zip(self.layers, ctx_caches):
             h = layer(h, block_offset, cache)
         h = (
@@ -592,7 +855,8 @@ class DSparkDrafter(nn.Module):
             if self.config.model_type == "k3_dspark"
             else self.norm(h)
         )
-        head_hidden = h[:, :cap, :]
+        start = int(self.config.logits_start)
+        head_hidden = h[:, start:start + cap, :]
         return self._project_logits(head_hidden)[0], head_hidden[0]
 
     def sample_block_greedy(self, base_logits: mx.array, first_prev_token: int) -> list[int]:
@@ -680,12 +944,19 @@ class DSparkStats:
     kda_factor_restores: int = 0
     kda_factor_restore_s: float = 0.0
     kda_refeed_sweeps: int = 0
+    qwen_kda_endpoint_restores: int = 0
     expert_prefetch_router_bytes: int = 0
     expert_prefetch_planned_bytes: int = 0
     expert_prefetch_pages: int = 0
     expert_prefetch_predicted: int = 0
     expert_prefetch_authoritative: int = 0
     expert_prefetch_matched: int = 0
+    sidecar_round_loads: int = 0
+    sidecar_round_releases: int = 0
+    sidecar_load_s: float = 0.0
+    sidecar_release_s: float = 0.0
+    sidecar_loaded_bytes: int = 0
+    sidecar_released_active_bytes: int = 0
     rounds: list[tuple[int, int]] = field(default_factory=list)
 
 
@@ -705,9 +976,14 @@ class DSparkSpeculativeDecoder:
                  max_draft_tokens: int = 4,
                  confidence_threshold: float = 0.0,
                  prompt_cache_min_tokens: int = 2048,
+                 context_window_tokens: int = 0,
                  expert_prefetcher=None,
                  expert_prefetch_depth: int = 0,
-                 native_kda_factor_commit: bool = False):
+                 native_kda_factor_commit: bool = False,
+                 drafter_loader=None,
+                 release_between_sweeps: bool = False,
+                 drafter_storage_bytes: int = 0,
+                 drafter_load_margin_bytes: int = 0):
         cfg = drafter.config
         if max_draft_tokens <= 0:
             raise ValueError("DSpark max_draft_tokens must be positive")
@@ -715,9 +991,10 @@ class DSparkSpeculativeDecoder:
             raise ValueError("DSpark confidence_threshold must be in [0, 1]")
         if prompt_cache_min_tokens < 0:
             raise ValueError("DSpark prompt_cache_min_tokens must be >= 0")
+        if context_window_tokens < 0:
+            raise ValueError("DSpark context_window_tokens must be >= 0")
         draft_model_type = getattr(cfg, "model_type", "qwen3")
-        expected_target = (
-            "kimi_k3" if draft_model_type == "k3_dspark" else "qwen3")
+        expected_target = getattr(cfg, "target_model_type", "qwen3")
         if target.cfg.model_type != expected_target:
             raise ValueError(
                 f"DSpark {draft_model_type} checkpoint needs a "
@@ -734,9 +1011,18 @@ class DSparkSpeculativeDecoder:
             raise ValueError("DSpark target_layer_ids are incompatible with the target")
         self.target = target
         self.drafter = drafter
-        self.max_draft_tokens = min(max_draft_tokens, cfg.block_size)
+        self._cfg = cfg
+        self._drafter_loader = drafter_loader
+        self.release_between_sweeps = bool(release_between_sweeps)
+        self.drafter_storage_bytes = max(0, int(drafter_storage_bytes))
+        self.drafter_load_margin_bytes = max(
+            0, int(drafter_load_margin_bytes))
+        self.max_draft_tokens = min(
+            max_draft_tokens,
+            cfg.block_size - int(getattr(cfg, "logits_start", 0)))
         self.confidence_threshold = confidence_threshold
         self.prompt_cache_min_tokens = prompt_cache_min_tokens
+        self.context_window_tokens = int(context_window_tokens)
         self._prompt_cache = None
         self.expert_prefetcher = expert_prefetcher
         self.expert_prefetch_depth = max(0, int(expert_prefetch_depth))
@@ -745,6 +1031,44 @@ class DSparkSpeculativeDecoder:
         # factor replay remains the lossless default until a released-model
         # greedy token-identity gate admits this kernel.
         self.native_kda_factor_commit = bool(native_kda_factor_commit)
+
+    def _ensure_drafter(self, stats: DSparkStats | None = None):
+        if self.drafter is not None:
+            return self.drafter
+        if not callable(self._drafter_loader):
+            raise RuntimeError("DSpark drafter was released without a loader")
+        started = time.perf_counter()
+        drafter = self._drafter_loader()
+        if drafter.config != self._cfg:
+            raise RuntimeError("reloaded DSpark sidecar config changed")
+        self.drafter = drafter
+        if stats is not None:
+            stats.sidecar_round_loads += 1
+            stats.sidecar_load_s += time.perf_counter() - started
+            stats.sidecar_loaded_bytes += self.drafter_storage_bytes
+        return drafter
+
+    def _release_drafter(self, stats: DSparkStats | None = None) -> int:
+        """End the draft-weight lifetime before a target verification sweep.
+
+        Context K/V belongs to the request and remains exact.  Only the
+        lossy proposal model is dropped; the released target therefore never
+        overlaps its largest streamed layer with the sidecar allocation.
+        """
+        if not self.release_between_sweeps or self.drafter is None:
+            return 0
+        active_before = int(mx.get_active_memory())
+        started = time.perf_counter()
+        drafter = self.drafter
+        self.drafter = None
+        del drafter
+        mx.clear_cache()
+        released = max(0, active_before - int(mx.get_active_memory()))
+        if stats is not None:
+            stats.sidecar_round_releases += 1
+            stats.sidecar_release_s += time.perf_counter() - started
+            stats.sidecar_released_active_bytes += released
+        return released
 
     def clear_prompt_cache(self) -> None:
         self._prompt_cache = None
@@ -765,7 +1089,8 @@ class DSparkSpeculativeDecoder:
         sampling: SamplingParams,
         history: list[int],
     ):
-        base_logits, head_hidden = self.drafter.draft_block(
+        drafter = self._ensure_drafter()
+        base_logits, head_hidden = drafter.draft_block(
             pending, offset, ctx_caches, cap)
         if self.expert_prefetcher is not None:
             plan = self.expert_prefetcher.build(head_hidden[:cap])
@@ -774,17 +1099,17 @@ class DSparkSpeculativeDecoder:
             self.target._dspark_expert_prefetch_depth = (
                 self.expert_prefetch_depth)
         if sampling.is_greedy:
-            draft_arr = self.drafter.sample_block(base_logits, pending)
+            draft_arr = drafter.sample_block(base_logits, pending)
             mx.eval(draft_arr)
             proposals = [int(token) for token in draft_arr.tolist()]
             distributions = None
         else:
-            proposals, distributions = self.drafter.sample_block_exact(
+            proposals, distributions = drafter.sample_block_exact(
                 base_logits, pending, sampling, history)
         if (self.confidence_threshold > 0.0
-                and self.drafter.confidence_head is not None):
+                and drafter.confidence_head is not None):
             prev = mx.array([pending] + proposals[:-1])
-            confidence = self.drafter.confidence_survival(head_hidden, prev)
+            confidence = drafter.confidence_survival(head_hidden, prev)
             mx.eval(confidence)
             survival = 1.0
             keep = 0
@@ -836,7 +1161,7 @@ class DSparkSpeculativeDecoder:
 
     def _tapped_context(self) -> mx.array:
         target = self.target
-        ids = self.drafter.config.target_layer_ids
+        ids = self._cfg.target_layer_ids
         missing = [layer for layer in ids if layer not in target._tap_hidden]
         if missing:
             raise RuntimeError(f"target did not capture DSpark tap layers {missing}")
@@ -844,7 +1169,8 @@ class DSparkSpeculativeDecoder:
 
     def generate(self, prompt: str, max_tokens: int = 64, on_token=None,
                  stop=None, on_progress=None, *, encoded_ids=None,
-                 sampling: SamplingParams | None = None) -> dict:
+                 sampling: SamplingParams | None = None,
+                 constraint=None) -> dict:
         target = self.target
         sampling = sampling or SamplingParams()
         sampling.seed_rng()
@@ -889,20 +1215,36 @@ class DSparkSpeculativeDecoder:
         )
         prompt_cache_lookup_s = time.perf_counter() - lookup_t0
         prompt_cache_hit = cached is not None
-        if prompt_cache_hit:
-            _, target_kv, ctx_caches, prompt_last_logits = cached
-            # Transfer sole ownership into the request.  A failed request must
-            # not leave partially advanced state eligible for a later repeat.
+        hybrid_qwen = (
+            getattr(self._cfg, "target_model_type", "qwen3")
+            == "qwen3_5")
+        bootstrap_path_stats: dict = {}
+        bootstrap_first_token_s = 0.0
+        if prompt_cache_hit and hybrid_qwen:
+            from .kv_cache import fork_hybrid_kv_endpoint
+
+            (_, cached_target_kv, cached_ctx, prompt_last_logits,
+             prompt_last_hidden) = cached
+            target_kv = fork_hybrid_kv_endpoint(cached_target_kv)
+            ctx_caches = [cache.fork() for cache in cached_ctx]
+            target.last_kv = target_kv
+        elif prompt_cache_hit:
+            (_, target_kv, ctx_caches, prompt_last_logits,
+             prompt_last_hidden) = cached
+            # Historical dense/K3 behavior transfers sole ownership. Hybrid
+            # Qwen keeps one immutable COW prompt endpoint above instead.
             self._prompt_cache = None
         else:
             if cache_eligible:
                 # Release a divergent cached prompt before allocating another
                 # multi-hundred-MB target/context pair.
                 self._prompt_cache = None
-            target_kv = target.new_kv(stepped=use_stepped)
-            ctx_caches = self.drafter.make_ctx_cache()
+            target_kv = None if hybrid_qwen else target.new_kv(
+                stepped=use_stepped)
+            ctx_caches = self._ensure_drafter().make_ctx_cache()
             prompt_last_logits = None
-        taps = set(self.drafter.config.target_layer_ids)
+            prompt_last_hidden = None
+        taps = set(self._cfg.target_layer_ids)
         stats = DSparkStats()
 
         prefill_t0 = time.perf_counter()
@@ -910,22 +1252,108 @@ class DSparkSpeculativeDecoder:
             # Keep the historical synthetic prefill sweep so target_sweeps-1
             # remains decode sweeps in telemetry.
             stats.target_sweeps += 1
+        elif hybrid_qwen:
+            context_floor = (
+                max(0, len(ids) - self.context_window_tokens)
+                if self.context_window_tokens else 0)
+            collector = DSparkTapCollector(
+                self._ensure_drafter(), ctx_caches,
+                position_floor=context_floor)
+            target.begin_dspark_tap_capture(collector)
+            try:
+                bootstrap_prompt = _DSparkBootstrapPrompt(prompt, ids)
+                target_generate = getattr(
+                    target, "generate_with_memory_retry", None)
+                if target_generate is None:
+                    target_generate = target.generate
+                bootstrap = target_generate(
+                    bootstrap_prompt,
+                    1,
+                    sampling=sampling,
+                    on_progress=on_progress,
+                    constraint=constraint,
+                )
+            finally:
+                target.end_dspark_tap_capture(collector)
+            collector.finish(len(ids))
+            collector_update_s = collector.update_s
+            # The collector otherwise owns the same large module after tap
+            # collection has completed, defeating the round lifetime below.
+            collector = None
+            stats.context_s += collector_update_s
+            stats.target_sweeps += 1
+            bootstrap_path_stats = dict(bootstrap.get("path_stats", {}))
+            bootstrap_first_token_s = float(
+                bootstrap.get("first_token_s", 0.0))
+            target_kv = target.last_kv
+            if target_kv is None:
+                raise RuntimeError(
+                    "DSpark target bootstrap did not retain its prompt endpoint")
+
+            endpoint_slot = None
+            hot_slots = getattr(target, "_hot_prompt_slots", None)
+            if hot_slots is not None:
+                for index, slot in enumerate(hot_slots):
+                    if getattr(slot, "kv", None) is target_kv:
+                        endpoint_slot = hot_slots.pop(index)
+                        break
+            prompt_last_logits = (
+                getattr(endpoint_slot, "logits", None)
+                if endpoint_slot is not None else None)
+            if prompt_last_logits is None:
+                prompt_last_logits = target._final_logits(target._h_last)
+                mx.eval(prompt_last_logits)
+            prompt_last_hidden = target._h_last
+            mx.eval(prompt_last_hidden)
+            pending = int(bootstrap["tokens"][0])
+
+            if cache_eligible:
+                from .kv_cache import fork_hybrid_kv_endpoint
+
+                self._prompt_cache = (
+                    prompt_cache_key,
+                    target_kv,
+                    ctx_caches,
+                    prompt_last_logits,
+                    prompt_last_hidden,
+                )
+                target_kv = fork_hybrid_kv_endpoint(target_kv)
+                ctx_caches = [cache.fork() for cache in ctx_caches]
+                target.last_kv = target_kv
         else:
             logits = target.forward_tokens(ids, target_kv, tap_layers=taps)
             prompt_last_logits = logits[-1]
-            mx.eval(prompt_last_logits)
+            prompt_last_hidden = getattr(target, "_h_last", None)
+            mx.eval(*(
+                (prompt_last_logits, prompt_last_hidden)
+                if prompt_last_hidden is not None else (prompt_last_logits,)))
             stats.target_sweeps += 1
             context = self._tapped_context()
             ctx_t0 = time.perf_counter()
-            self.drafter.update_context(context, 0, ctx_caches)
+            self._ensure_drafter(stats).update_context(
+                context, 0, ctx_caches)
             mx.async_eval([cache.k for cache in ctx_caches])
             stats.context_s += time.perf_counter() - ctx_t0
             target._tap_hidden = {}
-        pending = sample_probabilities(filtered_probabilities(
-            prompt_last_logits, sampling, history=ids))
+        if not (hybrid_qwen and not prompt_cache_hit):
+            pending_logits = prompt_last_logits
+            if constraint is not None:
+                constraint_logits = getattr(
+                    target, "_constraint_logits", None)
+                if callable(constraint_logits) and prompt_last_hidden is not None:
+                    pending_logits = constraint_logits(
+                        pending_logits, constraint, hidden=prompt_last_hidden)
+                else:
+                    pending_logits = constraint.mask_logits(pending_logits)
+            pending = sample_probabilities(filtered_probabilities(
+                pending_logits, sampling, history=ids))
+            if constraint is not None:
+                constraint.accept_token(pending)
         emitted = [pending]
         prefill_s = time.perf_counter() - prefill_t0
-        first_token_s = time.perf_counter() - request_t0
+        first_token_s = (
+            bootstrap_first_token_s
+            if bootstrap_first_token_s else time.perf_counter() - request_t0)
         stop_text = None
         matched_stop_sequence = None
         if stops:
@@ -952,6 +1380,7 @@ class DSparkSpeculativeDecoder:
         eos = set(target.cfg.eos_token_ids)
         decode_t0 = time.perf_counter()
         while (len(emitted) < max_tokens and pending not in eos
+               and not (constraint is not None and constraint.completed)
                and stop_text is None):
             # Every round emits at most cap accepted drafts plus one target
             # token.  Bounding cap keeps endpoint KV/context exact at the
@@ -961,10 +1390,11 @@ class DSparkSpeculativeDecoder:
                 max_tokens - len(emitted) - 1,
             )
             base = target_kv.offset
-            if any(cache.length != base for cache in ctx_caches):
+            if any(cache.position_end != base for cache in ctx_caches):
                 raise RuntimeError(
                     "DSpark context/target KV desync before proposal: "
-                    f"kv={base}, ctx={[cache.length for cache in ctx_caches]}")
+                    f"kv={base}, ctx_end="
+                    f"{[cache.position_end for cache in ctx_caches]}")
 
             if cap > 0:
                 draft_t0 = time.perf_counter()
@@ -987,20 +1417,37 @@ class DSparkSpeculativeDecoder:
                 proposals = []
                 draft_probabilities = [] if not sampling.is_greedy else None
 
+            # Proposal tensors are evaluated before this boundary.  The target
+            # is the verifier and never needs draft weights, so avoid making
+            # every streamed target layer compete with the resident sidecar.
+            self._release_drafter(stats)
+
             verify_t0 = time.perf_counter()
             verify_ids = [pending] + proposals
-            kda_checkpoint = (
+            round_layer_lengths = (
+                target_kv.layer_lengths()
+                if callable(getattr(target_kv, "layer_lengths", None))
+                else None)
+            k3_kda_checkpoint = (
                 target_kv.kda_cache.fork()
                 if (target.cfg.model_type == "kimi_k3"
                     and getattr(target_kv, "kda_cache", None) is not None)
                 else None
             )
+            qwen_kda_checkpoint = (
+                target_kv.kda_cache.fork()
+                if (target.cfg.model_type in ("qwen3_5", "qwen3_5_moe")
+                    and getattr(target_kv, "kda_cache", None) is not None)
+                else None
+            )
             capture_kda_factors = bool(
-                kda_checkpoint is not None
+                k3_kda_checkpoint is not None
                 and len(verify_ids) > 1
                 and callable(getattr(
                     target, "consume_serial_kda_factors", None))
             )
+            capture_qwen_endpoints = bool(
+                qwen_kda_checkpoint is not None and len(verify_ids) > 1)
             try:
                 if capture_kda_factors:
                     verified = target.forward_tokens_serial_positions(
@@ -1009,16 +1456,31 @@ class DSparkSpeculativeDecoder:
                         tap_layers=taps,
                         capture_kda_factors=True,
                     )
+                elif capture_qwen_endpoints:
+                    verified = target.forward_tokens_serial_positions(
+                        verify_ids,
+                        target_kv,
+                        tap_layers=taps,
+                        capture_kda_endpoints=True,
+                    )
                 else:
                     verified = target.forward_tokens_serial_positions(
                         verify_ids, target_kv, tap_layers=taps)
             except BaseException:
                 target._dspark_expert_prefetch_plan = None
-                if target_kv.offset > base:
+                if round_layer_lengths is not None:
+                    target_kv.trim_layer_lengths(round_layer_lengths)
+                elif target_kv.offset > base:
                     target_kv.trim(base)
-                if kda_checkpoint is not None:
-                    target_kv.kda_cache = kda_checkpoint
-                    kda_checkpoint.cancel_factor_capture()
+                if k3_kda_checkpoint is not None:
+                    target_kv.kda_cache = k3_kda_checkpoint
+                    k3_kda_checkpoint.cancel_factor_capture()
+                if qwen_kda_checkpoint is not None:
+                    target_kv.kda_cache = qwen_kda_checkpoint
+                    consume_endpoint = getattr(
+                        target, "consume_serial_kda_endpoint", None)
+                    if callable(consume_endpoint):
+                        consume_endpoint(None)
                 consume_factors = getattr(
                     target, "consume_serial_kda_factors", None)
                 if consume_factors is not None:
@@ -1042,7 +1504,67 @@ class DSparkSpeculativeDecoder:
             stats.verify_s += time.perf_counter() - verify_t0
             stats.target_sweeps += 1
 
-            if sampling.is_greedy:
+            if constraint is not None:
+                from .qwen35_mtp import _authoritative_target_logits
+
+                accepted = 0
+                committed = []
+                constrained_terminal = False
+                for index, proposal in enumerate(proposals):
+                    authoritative = _authoritative_target_logits(
+                        target, verified[index], constraint, index)
+                    if sampling.is_greedy:
+                        target_token = int(mx.argmax(authoritative).item())
+                        proposal_accepted = proposal == target_token
+                    else:
+                        if draft_probabilities is None:
+                            raise RuntimeError(
+                                "stochastic DSpark proposal omitted q")
+                        p = filtered_probabilities(
+                            authoritative, sampling,
+                            history=ids + emitted + committed)
+                        q = draft_probabilities[index]
+                        mx.eval(p, q)
+                        p_token = float(p[proposal].item())
+                        q_token = float(q[proposal].item())
+                        ratio = (
+                            1.0 if q_token <= 0
+                            else min(1.0, p_token / q_token))
+                        proposal_accepted = (
+                            float(mx.random.uniform().item()) <= ratio)
+                        target_token = (
+                            proposal if proposal_accepted else
+                            sample_probabilities(
+                                speculative_residual_probabilities(p, q)))
+                    committed.append(
+                        int(proposal if proposal_accepted else target_token))
+                    constraint.accept_token(committed[-1])
+                    if proposal_accepted:
+                        accepted += 1
+                    candidate = emitted + committed
+                    constrained_terminal = bool(
+                        constraint.completed
+                        or committed[-1] in eos
+                        or len(candidate) >= max_tokens
+                        or (
+                            stops
+                            and self._stop_match(
+                                target.tokenizer.decode(candidate), stops)
+                            is not None))
+                    if not proposal_accepted or constrained_terminal:
+                        break
+                if (accepted == len(proposals)
+                        and len(committed) == len(proposals)
+                        and not constrained_terminal):
+                    bonus_logits = _authoritative_target_logits(
+                        target, verified[len(proposals)], constraint,
+                        len(proposals))
+                    bonus = sample_probabilities(filtered_probabilities(
+                        bonus_logits, sampling,
+                        history=ids + emitted + committed))
+                    committed.append(bonus)
+                    constraint.accept_token(bonus)
+            elif sampling.is_greedy:
                 predictions = [int(token) for token in
                                mx.argmax(
                                    verified, axis=-1
@@ -1070,9 +1592,54 @@ class DSparkSpeculativeDecoder:
             # Only the anchor and accepted proposal prefix are committed input
             # positions.  The target token is the next pending output and has
             # not yet entered either state.
-            tapped = self._tapped_context()[:, :accepted + 1, :]
-            target_kv.trim(base + accepted + 1)
-            if kda_checkpoint is not None:
+            planned_emit = len(committed)
+            for index, token in enumerate(committed):
+                candidate = emitted + committed[:index + 1]
+                terminal = token in eos or len(candidate) >= max_tokens
+                if stops and self._stop_match(
+                        target.tokenizer.decode(candidate), stops) is not None:
+                    terminal = True
+                if terminal:
+                    planned_emit = index + 1
+                    break
+            committed_inputs = min(
+                len(verify_ids), 1 + max(0, planned_emit - 1))
+            tapped = self._tapped_context()[:, :committed_inputs, :]
+            if qwen_kda_checkpoint is not None:
+                end_lengths = target_kv.layer_lengths()
+                growth = tuple(
+                    end - start for start, end in zip(
+                        round_layer_lengths, end_lengths, strict=True))
+                width = len(verify_ids)
+                if any(value not in (0, width) for value in growth):
+                    raise RuntimeError(
+                        "DSpark Qwen verifier changed a layer by an "
+                        f"unexpected count: {growth}")
+                if committed_inputs < width:
+                    retained = target.consume_serial_kda_endpoint(
+                        committed_inputs)
+                    if retained is None:
+                        raise RuntimeError(
+                            "DSpark Qwen verifier omitted the accepted KDA "
+                            "endpoint")
+                    target_kv.trim_layer_lengths(tuple(
+                        start + (committed_inputs if value else 0)
+                        for start, value in zip(
+                            round_layer_lengths, growth, strict=True)
+                    ))
+                    target_kv.kda_cache = retained
+                    stats.qwen_kda_endpoint_restores += 1
+                else:
+                    target.consume_serial_kda_endpoint(None)
+                hidden_window = getattr(target, "_h_window", None)
+                if hidden_window is None:
+                    raise RuntimeError(
+                        "DSpark Qwen verifier omitted its hidden window")
+                target._h_last = hidden_window[
+                    :, committed_inputs - 1:committed_inputs, :]
+            else:
+                target_kv.trim(base + committed_inputs)
+            if k3_kda_checkpoint is not None:
                 consume_factors = getattr(
                     target, "consume_serial_kda_factors", None)
                 factor_window = (
@@ -1081,7 +1648,7 @@ class DSparkSpeculativeDecoder:
                     and consume_factors is not None
                     else None
                 )
-                if accepted < len(proposals):
+                if committed_inputs < len(verify_ids):
                     if factor_window is not None:
                         stats.kda_factor_bytes_peak = max(
                             stats.kda_factor_bytes_peak,
@@ -1089,8 +1656,8 @@ class DSparkSpeculativeDecoder:
                         )
                         restore_t0 = time.perf_counter()
                         target_kv.kda_cache = factor_window.commit_prefix(
-                            kda_checkpoint,
-                            accepted + 1,
+                            k3_kda_checkpoint,
+                            committed_inputs,
                             native_fused=self.native_kda_factor_commit,
                         )
                         stats.kda_factor_restore_s += (
@@ -1100,14 +1667,15 @@ class DSparkSpeculativeDecoder:
                         # Fail-slow exact fallback.  It is expected only for a
                         # custom K3 target lacking factor capture.
                         target_kv.trim(base)
-                        target_kv.kda_cache = kda_checkpoint
-                        replay = verify_ids[:accepted + 1]
+                        target_kv.kda_cache = k3_kda_checkpoint
+                        replay = verify_ids[:committed_inputs]
                         replay_logits = target.forward_tokens_serial_positions(
                             replay, target_kv)
                         mx.eval(replay_logits)
                         stats.kda_refeed_sweeps += 1
             ctx_t0 = time.perf_counter()
-            self.drafter.update_context(tapped, base, ctx_caches)
+            self._ensure_drafter(stats).update_context(
+                tapped, base, ctx_caches)
             mx.async_eval([cache.k for cache in ctx_caches])
             stats.context_s += time.perf_counter() - ctx_t0
             target._tap_hidden = {}
@@ -1130,7 +1698,12 @@ class DSparkSpeculativeDecoder:
                     break
 
             endpoint = len(ids) + len(emitted) - 1
-            if target_kv.offset > endpoint:
+            if hybrid_qwen:
+                if target_kv.offset != endpoint:
+                    raise RuntimeError(
+                        "DSpark Qwen verifier did not land on the released "
+                        f"endpoint: kv={target_kv.offset}, expected={endpoint}")
+            elif target_kv.offset > endpoint:
                 target_kv.trim(endpoint)
             for cache in ctx_caches:
                 cache.trim_to(endpoint)
@@ -1145,8 +1718,11 @@ class DSparkSpeculativeDecoder:
         decode_s = time.perf_counter() - decode_t0
         endpoint_kv_bytes = target_kv.nbytes()
         endpoint_kv_positions = target_kv.offset
-        prompt_cache_stored = False
-        if (cache_eligible and target_kv.offset >= len(ids)
+        prompt_cache_stored = bool(
+            hybrid_qwen and cache_eligible and self._prompt_cache is not None
+            and self._prompt_cache[0] == prompt_cache_key)
+        if (not hybrid_qwen and cache_eligible
+                and target_kv.offset >= len(ids)
                 and all(cache.length >= len(ids) for cache in ctx_caches)):
             target_kv.trim(len(ids))
             for cache in ctx_caches:
@@ -1154,7 +1730,7 @@ class DSparkSpeculativeDecoder:
             mx.eval(prompt_last_logits)
             self._prompt_cache = (
                 prompt_cache_key, target_kv, ctx_caches,
-                prompt_last_logits)
+                prompt_last_logits, prompt_last_hidden)
             prompt_cache_stored = True
         total_s = time.perf_counter() - request_t0
         target._note_true_peak()
@@ -1179,11 +1755,13 @@ class DSparkSpeculativeDecoder:
             "stop_sequence": matched_stop_sequence,
             "termination_reason": (
                 "stop_sequence" if stop_text is not None else
+                "grammar" if constraint is not None and constraint.completed else
                 "eos" if emitted[-1] in eos else "length"),
             "true_peak_metal_bytes": target._true_peak_metal_bytes,
             "prompt_tokens": len(ids),
             "stats": stats,
             "path_stats": {
+                **bootstrap_path_stats,
                 "prompt_cache_exact_hit": int(prompt_cache_hit),
                 "prompt_cache_prefix_tokens": (
                     len(ids) if prompt_cache_hit else 0),
@@ -1205,9 +1783,10 @@ class DSparkSpeculativeDecoder:
                 "speculative_proposed": stats.proposed,
                 "speculative_accepted": stats.accepted,
                 "speculative_draft_oov_fallbacks": 0,
-                "dspark_block_size": self.drafter.block_size,
+                "dspark_block_size": self._cfg.block_size,
                 "dspark_confidence_threshold": self.confidence_threshold,
                 "dspark_context_s": stats.context_s,
+                "dspark_context_window_tokens": self.context_window_tokens,
                 "dspark_kda_factor_bytes_peak": (
                     stats.kda_factor_bytes_peak),
                 "dspark_kda_factor_restores": stats.kda_factor_restores,
@@ -1215,6 +1794,35 @@ class DSparkSpeculativeDecoder:
                 "dspark_kda_factor_native_fused": int(
                     self.native_kda_factor_commit),
                 "dspark_kda_refeed_sweeps": stats.kda_refeed_sweeps,
+                "dspark_qwen_kda_endpoint_restores": (
+                    stats.qwen_kda_endpoint_restores),
+                "dspark_target_model_type": (
+                    getattr(
+                        self._cfg, "target_model_type", "qwen3")),
+                "dspark_shared_target_embedding": int(
+                    getattr(
+                        self._cfg, "share_target_embed", False)),
+                "dspark_shared_target_lm_head": int(
+                    getattr(
+                        self._cfg, "share_target_lm_head", False)),
+                "dspark_sidecar_release_between_sweeps": int(
+                    self.release_between_sweeps),
+                "dspark_sidecar_round_loads": stats.sidecar_round_loads,
+                "dspark_sidecar_round_releases": stats.sidecar_round_releases,
+                "dspark_sidecar_load_s": stats.sidecar_load_s,
+                "dspark_sidecar_release_s": stats.sidecar_release_s,
+                "dspark_sidecar_loaded_bytes": stats.sidecar_loaded_bytes,
+                "dspark_sidecar_load_margin_bytes": (
+                    self.drafter_load_margin_bytes),
+                "dspark_sidecar_released_active_bytes": (
+                    stats.sidecar_released_active_bytes),
+                "dspark_constraint_verified": int(constraint is not None),
+                "dspark_context_physical_positions": (
+                    ctx_caches[0].length if ctx_caches else 0),
+                "dspark_context_position_start": (
+                    ctx_caches[0].position_start if ctx_caches else None),
+                "dspark_context_position_end": (
+                    ctx_caches[0].position_end if ctx_caches else 0),
                 "dspark_expert_prefetch_router_bytes": (
                     stats.expert_prefetch_router_bytes),
                 "dspark_expert_prefetch_planned_bytes": (
@@ -1239,28 +1847,58 @@ class DSparkSpeculativeEngine:
                  max_prompt_tokens: int = 2048,
                  confidence_threshold: float = 0.0,
                  prompt_cache_min_tokens: int = 2048,
+                 context_window_tokens: int = 0,
                  expert_prefetch_budget_mb: int = 0,
                  expert_prefetch_per_layer: int = 8,
                  expert_prefetch_min_margin: float = 0.0,
                  expert_prefetch_depth: int = 2,
-                 native_kda_factor_commit: bool = False):
+                 native_kda_factor_commit: bool = False,
+                 release_between_sweeps: bool = False,
+                 drafter_load_margin_bytes: int = int(0.4e9)):
         if max_prompt_tokens <= 0:
             raise ValueError("DSpark max_prompt_tokens must be positive")
         self.target = target
+        if drafter_load_margin_bytes < 0:
+            raise ValueError("DSpark drafter load margin must be non-negative")
+        self.drafter_load_margin_bytes = int(drafter_load_margin_bytes)
         draft_dir = Path(draft_dir)
+        try:
+            draft_bytes = (draft_dir / "model.safetensors").stat().st_size
+        except OSError:
+            draft_bytes = 0
+
+        def load_drafter():
+            # The next draft round is a caller-known lifetime.  Shed consumed
+            # target pages first, then admit the compact sidecar against the
+            # same hard system/Metal floor used by streamed target layers.
+            prepare_for = getattr(target.cache, "prepare_for", None)
+            if draft_bytes and callable(prepare_for):
+                prepare_for(draft_bytes)
+            if target.governor is not None and draft_bytes:
+                target.governor.reserve(
+                    draft_bytes, margin=self.drafter_load_margin_bytes)
+            loaded = DSparkDrafter.load(draft_dir)
+            if loaded.config.share_target_lm_head:
+                loaded.bind_target_lm_head(target._lm_head_weight)
+            if loaded.config.share_target_embed:
+                loaded.bind_target_embed(
+                    lambda token_ids: target._embed(list(token_ids)))
+            if target.governor is not None:
+                target.governor.fit_cache_to_live_headroom()
+            return loaded
+
         if target.governor is not None:
             # The drafter is a persistent resident allocation outside the
             # target WeightCache.  Admit it against the same sampled
             # device/system ceiling before materializing its BF16 tensors.
-            try:
-                draft_bytes = (draft_dir / "model.safetensors").stat().st_size
-            except OSError:
-                draft_bytes = 0
             if draft_bytes:
                 target.governor.reserve(draft_bytes)
-        self.drafter = DSparkDrafter.load(draft_dir)
-        if self.drafter.config.model_type == "k3_dspark":
-            self.drafter.bind_target_lm_head(target._lm_head_weight)
+        drafter = DSparkDrafter.load(draft_dir)
+        if drafter.config.share_target_lm_head:
+            drafter.bind_target_lm_head(target._lm_head_weight)
+        if drafter.config.share_target_embed:
+            drafter.bind_target_embed(
+                lambda token_ids: target._embed(list(token_ids)))
         if target.governor is not None:
             # A large configured target cache is a performance ceiling, not a
             # fixed machine cap.  Fit its *additional* residency around the
@@ -1290,19 +1928,28 @@ class DSparkSpeculativeEngine:
             target._dspark_expert_prefetcher = (
                 self._expert_page_prefetcher)
         self.decoder = DSparkSpeculativeDecoder(
-            target, self.drafter,
+            target, drafter,
             max_draft_tokens=max_draft_tokens,
             confidence_threshold=confidence_threshold,
             prompt_cache_min_tokens=prompt_cache_min_tokens,
+            context_window_tokens=context_window_tokens,
             expert_prefetcher=expert_prefetcher,
             expert_prefetch_depth=expert_prefetch_depth,
             native_kda_factor_commit=native_kda_factor_commit,
+            drafter_loader=load_drafter,
+            release_between_sweeps=release_between_sweeps,
+            drafter_storage_bytes=draft_bytes,
+            drafter_load_margin_bytes=self.drafter_load_margin_bytes,
         )
         self.max_prompt_tokens = max_prompt_tokens
         self._speculative_k = self.decoder.max_draft_tokens
         self._speculative_draft_dir = draft_dir
         self._speculative_kind = "dspark"
         self._closed = False
+
+    @property
+    def drafter(self):
+        return self.decoder.drafter if self.decoder is not None else None
 
     def __getattr__(self, name):
         return getattr(self.target, name)
@@ -1312,6 +1959,7 @@ class DSparkSpeculativeEngine:
                          sampling: SamplingParams | None = None,
                          constraint=None):
         self.decoder.clear_prompt_cache()
+        self.decoder._release_drafter()
         kwargs = {"on_token": on_token, "stop": stop,
                   "on_progress": on_progress}
         if sampling is not None:
@@ -1339,10 +1987,6 @@ class DSparkSpeculativeEngine:
                  stop=None, on_progress=None,
                  sampling: SamplingParams | None = None,
                  constraint=None):
-        if constraint is not None:
-            return self._target_generate(
-                "constrained-decoding", prompt, max_tokens, on_token, stop,
-                on_progress, sampling, constraint)
         prepared_ids = getattr(prompt, "token_ids", None)
         ids = (list(prepared_ids) if prepared_ids is not None
                else list(self.target.tokenizer.encode(prompt).ids))
@@ -1350,9 +1994,13 @@ class DSparkSpeculativeEngine:
             return self._target_generate(
                 "prompt-limit", prompt, max_tokens, on_token, stop, on_progress,
                 sampling, constraint)
-        return self.decoder.generate(
-            prompt, max_tokens, on_token=on_token, stop=stop,
-            on_progress=on_progress, encoded_ids=ids, sampling=sampling)
+        try:
+            return self.decoder.generate(
+                prompt, max_tokens, on_token=on_token, stop=stop,
+                on_progress=on_progress, encoded_ids=ids, sampling=sampling,
+                constraint=constraint)
+        finally:
+            self.decoder._release_drafter()
 
     def release_request_state(self):
         self.decoder.clear_prompt_cache()
@@ -1363,8 +2011,8 @@ class DSparkSpeculativeEngine:
             return
         self._closed = True
         self.decoder.clear_prompt_cache()
+        self.decoder._release_drafter()
         self.decoder = None
-        self.drafter = None
         try:
             if self._expert_page_prefetcher is not None:
                 self._expert_page_prefetcher.close()

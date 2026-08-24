@@ -1175,6 +1175,22 @@ class EngineManager:
                     "VMODEL_FAST_LONG_YARN_FACTOR must be finite and greater than 1")
         resident_backend_request = os.environ.get(
             "VMODEL_RESIDENT_BACKEND", "auto").strip().lower()
+        dspark_request_identity = tuple(
+            os.environ.get(name, default).strip()
+            for name, default in (
+                ("VMODEL_DSPARK_DRAFT", "auto"),
+                ("VMODEL_DSPARK_MAX_DRAFT_TOKENS", "4"),
+                ("VMODEL_DSPARK_MAX_PROMPT_TOKENS", "2048"),
+                ("VMODEL_DSPARK_CONFIDENCE_THRESHOLD", "0"),
+                ("VMODEL_DSPARK_PROMPT_CACHE_MIN_TOKENS", "2048"),
+                ("VMODEL_DSPARK_CONTEXT_TOKENS", "0"),
+                ("VMODEL_DSPARK_RELEASE_BETWEEN_SWEEPS", "1"),
+                ("VMODEL_DSPARK_LOAD_MARGIN_MB", "64"),
+                ("VMODEL_DSPARK_TARGET_PREFETCH_WORKERS", "2"),
+                ("VMODEL_DSPARK_TARGET_PREFETCH_DEPTH", "4"),
+                ("VMODEL_DSPARK_TARGET_CACHE_MB", ""),
+            )
+        )
         qwen_mtp_request = os.environ.get(
             "VMODEL_QWEN_MTP_SPECULATIVE", "auto").strip().lower()
         qwen_mtp_q_policy_kind = os.environ.get(
@@ -1609,6 +1625,7 @@ class EngineManager:
         key = (
             str(model_dir), mode, yarn_factor.hex(),
             bool(requires_vision), resident_backend_request,
+            dspark_request_identity,
             qwen_mtp_request,
             qwen_mtp_max_prompt_tokens,
             qwen_mtp_min_output_tokens,
@@ -1682,6 +1699,7 @@ class EngineManager:
         key = (
             str(model_dir), mode, yarn_factor.hex(),
             bool(requires_vision), resident_backend_request,
+            dspark_request_identity,
             qwen_mtp_request,
             qwen_mtp_max_prompt_tokens,
             qwen_mtp_min_output_tokens,
@@ -3519,6 +3537,9 @@ class EngineManager:
             dspark_prompt_limit = 2048
             dspark_confidence_threshold = 0.0
             dspark_prompt_cache_min_tokens = 2048
+            dspark_context_tokens = 0
+            dspark_release_between_sweeps = False
+            dspark_load_margin_mb = 400
             dspark_target_prefetch_workers = 2
             dspark_target_prefetch_depth = 4
             dspark_target_cache_mb = max(
@@ -3641,6 +3662,8 @@ class EngineManager:
                         "VMODEL_DSPARK_CONFIDENCE_THRESHOLD", "0"))
                     dspark_prompt_cache_min_tokens = int(os.environ.get(
                         "VMODEL_DSPARK_PROMPT_CACHE_MIN_TOKENS", "2048"))
+                    dspark_context_tokens = int(os.environ.get(
+                        "VMODEL_DSPARK_CONTEXT_TOKENS", "0"))
                     dspark_target_prefetch_workers = int(os.environ.get(
                         "VMODEL_DSPARK_TARGET_PREFETCH_WORKERS", "2"))
                     dspark_target_prefetch_depth = int(os.environ.get(
@@ -3659,9 +3682,9 @@ class EngineManager:
                         or not 0.0 <= dspark_confidence_threshold <= 1.0):
                     raise RequestValidationError(
                         "VMODEL_DSPARK_CONFIDENCE_THRESHOLD must be finite and in [0, 1]")
-                if dspark_prompt_cache_min_tokens < 0:
+                if dspark_prompt_cache_min_tokens < 0 or dspark_context_tokens < 0:
                     raise RequestValidationError(
-                        "VMODEL_DSPARK_PROMPT_CACHE_MIN_TOKENS must be >= 0")
+                        "VMODEL DSpark prompt-cache/context tokens must be >= 0")
                 if (dspark_target_prefetch_workers <= 0
                         or dspark_target_prefetch_depth <= 0
                         or dspark_target_cache_mb <= 0):
@@ -3722,6 +3745,8 @@ class EngineManager:
                         "VMODEL_DSPARK_CONFIDENCE_THRESHOLD", "0"))
                     dspark_prompt_cache_min_tokens = int(os.environ.get(
                         "VMODEL_DSPARK_PROMPT_CACHE_MIN_TOKENS", "0"))
+                    dspark_context_tokens = int(os.environ.get(
+                        "VMODEL_DSPARK_CONTEXT_TOKENS", "0"))
                 except ValueError as error:
                     raise RequestValidationError(
                         "VMODEL K3 DSpark limits must be numeric"
@@ -3734,9 +3759,84 @@ class EngineManager:
                         or not 0 <= dspark_confidence_threshold <= 1):
                     raise RequestValidationError(
                         "VMODEL_DSPARK_CONFIDENCE_THRESHOLD must be in [0, 1]")
-                if dspark_prompt_cache_min_tokens < 0:
+                if dspark_prompt_cache_min_tokens < 0 or dspark_context_tokens < 0:
                     raise RequestValidationError(
-                        "VMODEL_DSPARK_PROMPT_CACHE_MIN_TOKENS must be >= 0")
+                        "VMODEL DSpark prompt-cache/context tokens must be >= 0")
+
+            # Qwen3.8's 1.36B SpecForge DSpark head is a target-specific
+            # sidecar: it reuses the target embedding/head and consumes five
+            # hidden-state taps from the ordinary hybrid prefill/verifier. Keep
+            # it explicit until a heterogeneous real-request corpus clears the
+            # default-on gate; draft quantization can change acceptance/speed,
+            # but every released target decision remains authoritative.
+            qwen38_dspark_explicit = (
+                mtype == "qwen3_5"
+                and not getattr(cfg_probe, "num_experts", 0)
+                and dspark_override.lower() not in (
+                    "", "auto", "0", "off", "false", "none", "disabled")
+            )
+            if qwen38_dspark_explicit:
+                dspark_dir = _dspark_draft_for(model_dir, cfg_probe)
+                try:
+                    dspark_cap = int(os.environ.get(
+                        "VMODEL_DSPARK_MAX_DRAFT_TOKENS", "2"))
+                    dspark_prompt_limit = int(os.environ.get(
+                        "VMODEL_DSPARK_MAX_PROMPT_TOKENS", "262144"))
+                    dspark_confidence_threshold = float(os.environ.get(
+                        "VMODEL_DSPARK_CONFIDENCE_THRESHOLD", "0"))
+                    dspark_prompt_cache_min_tokens = int(os.environ.get(
+                        "VMODEL_DSPARK_PROMPT_CACHE_MIN_TOKENS", "2048"))
+                    dspark_context_tokens = int(os.environ.get(
+                        "VMODEL_DSPARK_CONTEXT_TOKENS", "1024"))
+                    dspark_release_value = os.environ.get(
+                        "VMODEL_DSPARK_RELEASE_BETWEEN_SWEEPS", "1"
+                    ).strip()
+                    dspark_load_margin_mb = int(os.environ.get(
+                        "VMODEL_DSPARK_LOAD_MARGIN_MB", "64"))
+                    dspark_target_prefetch_workers = int(os.environ.get(
+                        "VMODEL_DSPARK_TARGET_PREFETCH_WORKERS", "2"))
+                    dspark_target_prefetch_depth = int(os.environ.get(
+                        "VMODEL_DSPARK_TARGET_PREFETCH_DEPTH", "4"))
+                    cache_override = os.environ.get(
+                        "VMODEL_DSPARK_TARGET_CACHE_MB", "").strip()
+                    # The compact draft is round-local: it is released before
+                    # target verification, then reloaded after target layers
+                    # have surrendered their transient page. The 2.2 GB cache
+                    # ceiling preserves useful prefetch residency, while the
+                    # live governor still shrinks it around prompt state.
+                    dspark_target_cache_mb = int(cache_override or "2200")
+                except ValueError as error:
+                    raise RequestValidationError(
+                        "VMODEL Qwen3.8 DSpark limits must be numeric"
+                    ) from error
+                if not 1 <= dspark_cap <= 7 or dspark_prompt_limit <= 0:
+                    raise RequestValidationError(
+                        "VMODEL Qwen3.8 DSpark cap must be in [1, 7] and "
+                        "prompt limit positive")
+                if (not math.isfinite(dspark_confidence_threshold)
+                        or not 0 <= dspark_confidence_threshold <= 1):
+                    raise RequestValidationError(
+                        "VMODEL_DSPARK_CONFIDENCE_THRESHOLD must be in [0, 1]")
+                if dspark_prompt_cache_min_tokens < 0 or dspark_context_tokens < 0:
+                    raise RequestValidationError(
+                        "VMODEL DSpark prompt-cache/context tokens must be >= 0")
+                if dspark_release_value not in ("0", "1"):
+                    raise RequestValidationError(
+                        "VMODEL_DSPARK_RELEASE_BETWEEN_SWEEPS must be 0 or 1")
+                dspark_release_between_sweeps = dspark_release_value == "1"
+                if not 32 <= dspark_load_margin_mb <= 400:
+                    raise RequestValidationError(
+                        "VMODEL_DSPARK_LOAD_MARGIN_MB must be in [32, 400]")
+                if (dspark_target_prefetch_workers <= 0
+                        or dspark_target_prefetch_depth <= 0
+                        or not 1500 <= dspark_target_cache_mb <= 7000):
+                    raise RequestValidationError(
+                        "VMODEL Qwen3.8 DSpark target prefetch settings must "
+                        "be positive and target cache must be in [1500, 7000]")
+                rc.prefetch_workers = dspark_target_prefetch_workers
+                rc.prefetch_depth = dspark_target_prefetch_depth
+                rc.max_weight_cache_mb = min(
+                    rc.max_weight_cache_mb, dspark_target_cache_mb)
 
             qwen_mtp_reason = "not-qwen"
             if mtype in ("qwen3_5", "qwen3_5_moe"):
@@ -4108,18 +4208,30 @@ class EngineManager:
                 from .dspark import DSparkSpeculativeEngine
 
                 try:
-                    self._engine = DSparkSpeculativeEngine(
-                        target_engine, dspark_dir,
+                    dspark_kwargs = dict(
                         max_draft_tokens=dspark_cap,
                         max_prompt_tokens=dspark_prompt_limit,
                         confidence_threshold=dspark_confidence_threshold,
                         prompt_cache_min_tokens=(
                             dspark_prompt_cache_min_tokens),
+                        context_window_tokens=dspark_context_tokens,
+                    )
+                    if dspark_release_between_sweeps:
+                        dspark_kwargs["release_between_sweeps"] = True
+                        dspark_kwargs["drafter_load_margin_bytes"] = int(
+                            dspark_load_margin_mb * 1_000_000)
+                    self._engine = DSparkSpeculativeEngine(
+                        target_engine, dspark_dir,
+                        **dspark_kwargs,
                     )
                     print(
-                        f"[server] exact DSpark speculation: "
+                        f"[server] target-verified DSpark speculation: "
                         f"target={model_dir.name} draft={dspark_dir.name} "
                         f"cap={dspark_cap} prompt_limit={dspark_prompt_limit} "
+                        f"context_tokens={dspark_context_tokens} "
+                        f"release_between_sweeps="
+                        f"{int(dspark_release_between_sweeps)} "
+                        f"load_margin={dspark_load_margin_mb}MB "
                         f"confidence={dspark_confidence_threshold:g} "
                         f"prefetch={dspark_target_prefetch_workers}/"
                         f"{dspark_target_prefetch_depth} "
@@ -6916,7 +7028,8 @@ def _hybrid_stable_boundary_tokens(
         engine, model_dir: Path, messages: list[dict], reasoning: str,
         prompt_tools: list[dict] | None, prompt_ids: tuple[int, ...], *,
         compact_json: bool, enable_thinking: bool | None,
-        reasoning_requested: bool, canonical_hermes_tools: bool) -> int:
+        reasoning_requested: bool, canonical_hermes_tools: bool,
+        reusable_user_prefix: bool = False) -> int:
     """Token count of this same conversation WITHOUT the trailing generation
     scaffold (``add_generation_prompt=False``), for recurrent hybrid models.
 
@@ -6939,6 +7052,36 @@ def _hybrid_stable_boundary_tokens(
         return 0
     if not getattr(engine.rc, "hot_prompt_kv", False):
         return 0
+    if reusable_user_prefix:
+        # A full scaffold-free boundary still includes the latest user turn.
+        # Appending one instruction therefore inserts tokens *before* the
+        # saved endpoint and defeats strict recurrent-prefix reuse.  Persist a
+        # second, earlier semantic boundary immediately before the latest user
+        # turn. It remains an exact prefix because tools/system policy and all
+        # prior turns are rendered identically, while arbitrary user suffixes
+        # are prefilled from this immutable recurrent state.
+        latest_user = next((
+            index for index in range(len(messages) - 1, -1, -1)
+            if messages[index].get("role") == "user"
+        ), None)
+        if latest_user is not None and latest_user > 0:
+            probe_messages = [dict(message) for message in messages]
+            probe_messages[latest_user]["content"] = ""
+            reusable_prompt = _chat_prompt(
+                engine, model_dir, probe_messages, reasoning,
+                tools=prompt_tools, compact_json=compact_json,
+                enable_thinking=enable_thinking,
+                reasoning_requested=reasoning_requested,
+                canonical_hermes_tools=canonical_hermes_tools)
+            reusable_ids, _offsets, _cache_hit = _prepared_prompt_ids(
+                engine, reusable_prompt)
+            n = 0
+            for left, right in zip(prompt_ids, reusable_ids):
+                if left != right:
+                    break
+                n += 1
+            if 0 < n < len(prompt_ids):
+                return n
     boundary_prompt = _chat_prompt(
         engine, model_dir, messages, reasoning, tools=prompt_tools,
         compact_json=compact_json, enable_thinking=enable_thinking,
@@ -7065,11 +7208,17 @@ def _prepare_chat_prompt(engine, model_dir: Path, messages: list[dict], reasonin
         canonical_hermes_tools=canonical_hermes_tools)
     prompt_ids, prompt_offsets, prompt_token_cache_hit = _prepared_prompt_ids(
         engine, prompt)
+    reusable_user_prefix_value = os.environ.get(
+        "VMODEL_QWEN35_REUSABLE_USER_PREFIX", "0").strip()
+    if reusable_user_prefix_value not in ("0", "1"):
+        raise RequestValidationError(
+            "VMODEL_QWEN35_REUSABLE_USER_PREFIX must be 0 or 1")
     stable_boundary_tokens = _hybrid_stable_boundary_tokens(
         engine, model_dir, messages, reasoning, prompt_tools, prompt_ids,
         compact_json=compact_json, enable_thinking=effective_enable_thinking,
         reasoning_requested=reasoning_requested,
-        canonical_hermes_tools=canonical_hermes_tools)
+        canonical_hermes_tools=canonical_hermes_tools,
+        reusable_user_prefix=reusable_user_prefix_value == "1")
     tool_capsules = (
         _tool_capsule_spans(
             prompt, prompt_tools, prompt_ids, prompt_offsets)
@@ -7116,6 +7265,8 @@ def _prepare_chat_prompt(engine, model_dir: Path, messages: list[dict], reasonin
         ),
         "tool_capsule_spans": len(tool_capsules),
         "prompt_token_cache_hit": int(prompt_token_cache_hit),
+        "reusable_user_prefix": int(reusable_user_prefix_value == "1"),
+        "stable_boundary_tokens": stable_boundary_tokens,
         "thinking_profile": (
             "enabled" if effective_enable_thinking is True else
             "disabled" if effective_enable_thinking is False else

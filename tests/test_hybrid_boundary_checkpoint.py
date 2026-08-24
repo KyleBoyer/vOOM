@@ -252,5 +252,30 @@ def test_hybrid_stable_boundary_tokens_against_real_chat_template():
             "start of a real second turn -- this is the exact divergence "
             "that made the old (full-endpoint) retention never match again"
         )
+
+        # The opt-in serving boundary is earlier still: it excludes the latest
+        # mutable user turn while retaining the identical system/tool prefix.
+        # Two different first-turn requests must therefore extend one exact
+        # recurrent checkpoint rather than matching an exact-request hash.
+        shared_system = {"role": "system", "content": "Keep answers brief."}
+        request_a = [shared_system, {
+            "role": "user", "content": "Count the red objects."}]
+        request_b = [shared_system, {
+            "role": "user", "content": "Count the blue objects instead."}]
+        prompt_a = _chat_prompt(
+            engine, _REAL_MODEL_DIR, request_a, "low",
+            enable_thinking=False)
+        prompt_b = _chat_prompt(
+            engine, _REAL_MODEL_DIR, request_b, "low",
+            enable_thinking=False)
+        ids_a, _offsets_a, _hit_a = _prepared_prompt_ids(engine, prompt_a)
+        ids_b, _offsets_b, _hit_b = _prepared_prompt_ids(engine, prompt_b)
+        reusable = _hybrid_stable_boundary_tokens(
+            engine, _REAL_MODEL_DIR, request_a, "low", None, ids_a,
+            compact_json=False, enable_thinking=False,
+            reasoning_requested=False, canonical_hermes_tools=False,
+            reusable_user_prefix=True)
+        assert 0 < reusable < min(len(ids_a), len(ids_b))
+        assert tuple(ids_a[:reusable]) == tuple(ids_b[:reusable])
     finally:
         engine.close()

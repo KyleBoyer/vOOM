@@ -1973,6 +1973,12 @@ class StreamingEngine:
         # whole-call tracker above, by resetting this one before each chunk.
         self._chunk_peak_metal_bytes = 0
         self._tap_hidden: dict[int, mx.array] = {}  # F62: optional hidden-state taps
+        # A DSpark bootstrap can subscribe to the ordinary prefill schedule so
+        # target feature taps are consumed while the streamed/layer-stationary
+        # sweep is already resident. This avoids a second complete target
+        # prefill. Explicit per-call ``tap_layers`` (verification) remains
+        # independent and takes precedence.
+        self._dspark_tap_collector = None
         # F189: optional exact recurrent endpoints retained by the most recent
         # layer-major verify sweep. They are consumed immediately after target
         # acceptance is known; ordinary calls leave this empty.
@@ -4702,6 +4708,23 @@ class StreamingEngine:
         return layer_runner.all_logits(
             hidden, self._norm_w, head, self.cfg.rms_norm_eps)
 
+    def begin_dspark_tap_capture(self, collector) -> None:
+        if self._dspark_tap_collector is not None:
+            raise RuntimeError("a DSpark target-tap capture is already active")
+        expected = tuple(int(v) for v in collector.tap_layers)
+        if not expected:
+            raise ValueError("DSpark target-tap capture needs at least one layer")
+        if expected != tuple(sorted(set(expected))):
+            raise ValueError("DSpark target-tap layers must be unique and ordered")
+        if expected[-1] >= self.cfg.num_hidden_layers:
+            raise ValueError("DSpark target-tap layer is outside the target")
+        self._dspark_tap_collector = collector
+
+    def end_dspark_tap_capture(self, collector) -> None:
+        if self._dspark_tap_collector is not collector:
+            raise RuntimeError("DSpark target-tap capture ownership changed")
+        self._dspark_tap_collector = None
+
     # ---- inference --------------------------------------------------------
 
     def _sweep(self, x: mx.array, kv: KVCache, offset: int,
@@ -4713,6 +4736,10 @@ class StreamingEngine:
         # entries from a PRIOR tapped call, so _tap_hidden never holds data
         # from a call other than the most recent one. See
         # tests/test_f62_hidden_taps.py for the tap-on/off identity proof.
+        collector = (
+            self._dspark_tap_collector if tap_layers is None else None)
+        if collector is not None:
+            tap_layers = collector.tap_layers
         self._tap_hidden = {}
         position_count = int(x.shape[1])
         profiler = self._request_profiler
@@ -5177,6 +5204,8 @@ class StreamingEngine:
                 )
             if tap_layers is not None and i in tap_layers:
                 self._tap_hidden[i] = x  # read-only capture; x itself is untouched
+                if collector is not None:
+                    collector.observe(i, x, position_start=offset)
             if (self.rc.router_lookahead and moe and self.prefetcher
                     and i + 1 < n and x.shape[1] == 1):
                 # F45 — decode only: prefill's multi-position unions flooded the
@@ -5327,6 +5356,7 @@ class StreamingEngine:
              ).get(transient_shape_positions, 0),
              getattr(self, "_decode_layer_transient", 0))
         profiler = self._request_profiler
+        tap_collector = self._dspark_tap_collector
         if profiler is not None:
             profiler.begin_sweep(total, path=profile_path)
         for i in range(layer_start, layer_end):
@@ -5503,6 +5533,15 @@ class StreamingEngine:
                     iter_expert_batches=self._iter_expert_batches,
                     profile=profiler)
             mx.eval(x)
+            if (tap_collector is not None
+                    and i in tap_collector.tap_layers):
+                tap_collector.observe(
+                    i,
+                    x,
+                    position_start=(offset if positions3 is None else None),
+                    positions=(
+                        None if positions3 is None else positions3[0]),
+                )
             # ``mx.concatenate`` materializes a new hidden-state array.  The
             # per-tile attention/MLP arrays and the final views into the old
             # hidden state are no longer needed after that evaluation.  Python
@@ -7718,6 +7757,8 @@ class StreamingEngine:
         self._request_profiler = (
             telemetry.RequestProfiler(self.rc.execution_profile)
             if self.rc.execution_profile else None)
+        if self._dspark_tap_collector is not None:
+            self._dspark_tap_collector.begin_attempt()
         if self._request_profiler is not None:
             self._request_profiler.set_phase("prefill")
         sampling = sampling or SamplingParams()
@@ -8001,7 +8042,8 @@ class StreamingEngine:
         hot_eligible = bool(
             self.rc.hot_prompt_kv
             and (not self.rc.max_kv_mb or self.rc.paged_kv_persist)
-            and not force_adaptive_paged)
+            and not force_adaptive_paged
+            and not bool(getattr(prompt, "disable_hot_prompt_kv", False)))
         stable_boundary_positions = int(
             getattr(prompt, "stable_boundary_tokens", 0) or 0)
         resident_prompt_kv_bytes = self._project_dense_text_kv_bytes(

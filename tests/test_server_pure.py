@@ -3880,13 +3880,14 @@ def test_engine_manager_wraps_streamed_lossless_qwen3_with_dspark(tmp_path):
     class FakeDSparkEngine:
         def __init__(self, target, draft_dir, *, max_draft_tokens,
                      max_prompt_tokens, confidence_threshold,
-                     prompt_cache_min_tokens):
+                     prompt_cache_min_tokens, context_window_tokens):
             self.target = target
             self.draft_dir = Path(draft_dir)
             self.max_draft_tokens = max_draft_tokens
             self.max_prompt_tokens = max_prompt_tokens
             self.confidence_threshold = confidence_threshold
             self.prompt_cache_min_tokens = prompt_cache_min_tokens
+            self.context_window_tokens = context_window_tokens
             self.closes = 0
 
         def close(self):
@@ -3953,7 +3954,7 @@ def test_engine_manager_exposes_k3_dspark_only_by_explicit_path(tmp_path):
     class FakeDSparkEngine:
         def __init__(self, target, draft_dir, *, max_draft_tokens,
                      max_prompt_tokens, confidence_threshold,
-                     prompt_cache_min_tokens):
+                     prompt_cache_min_tokens, context_window_tokens):
             self.target = target
             self.draft_dir = Path(draft_dir)
             self.max_draft_tokens = max_draft_tokens
@@ -3981,6 +3982,92 @@ def test_engine_manager_exposes_k3_dspark_only_by_explicit_path(tmp_path):
     assert wrapped.max_draft_tokens == 6
     assert wrapped.max_prompt_tokens == 1_048_576
     discover.assert_called_once()
+
+
+def test_engine_manager_exposes_qwen38_dspark_only_by_explicit_path(tmp_path):
+    from unittest.mock import patch
+
+    from runtime.server import EngineManager
+
+    target_path = tmp_path / "Huihui-Qwen3.8-27B"
+    draft_path = tmp_path / "Qwen3.8-27B-DSpark-Agentic-4bit"
+    target_path.mkdir()
+    draft_path.mkdir()
+    cfg = SimpleNamespace(
+        model_type="qwen3_5", tie_word_embeddings=False,
+        index_topk=0, vision_config=None, num_experts=0,
+        hidden_size=5120, intermediate_size=17408,
+        num_hidden_layers=64, num_attention_heads=24,
+        num_key_value_heads=4, head_dim=256, vocab_size=248320,
+        attention_bias=False, layer_types=(
+            "linear_attention", "linear_attention", "linear_attention",
+            "full_attention") * 16,
+    )
+    made = []
+
+    class FakeEngine:
+        def __init__(self, path, rc):
+            self.path, self.rc, self.closes = Path(path), rc, 0
+            self.cache = SimpleNamespace(max_bytes=2_000_000_000)
+            self.governor = None
+
+        def close(self):
+            self.closes += 1
+
+    class FakeDSparkEngine:
+        def __init__(self, target, draft_dir, **kwargs):
+            self.target = target
+            self.draft_dir = Path(draft_dir)
+            self.kwargs = kwargs
+            self.closes = 0
+            made.append(self)
+
+        def close(self):
+            self.closes += 1
+            self.target.close()
+
+    manager = EngineManager()
+    env = {
+        "VMODEL_DSPARK_DRAFT": str(draft_path),
+        "VMODEL_DSPARK_MAX_DRAFT_TOKENS": "2",
+        "VMODEL_DSPARK_MAX_PROMPT_TOKENS": "262144",
+        "VMODEL_QWEN_MTP_SPECULATIVE": "0",
+    }
+    with patch("runtime.config.ModelConfig.from_dir", return_value=cfg), \
+         patch("runtime.path_resolver.resolve_model_dir",
+               side_effect=lambda path: path), \
+         patch("runtime.server._dspark_draft_for",
+               return_value=draft_path) as discover, \
+         patch("runtime.engine.StreamingEngine", FakeEngine), \
+         patch("runtime.dspark.DSparkSpeculativeEngine", FakeDSparkEngine), \
+         patch.dict("os.environ", env), \
+         patch("runtime.server.psutil.virtual_memory",
+               return_value=SimpleNamespace(available=8_000_000_000)):
+        first = manager.get(target_path, "fast")
+        assert first.kwargs["max_draft_tokens"] == 2
+        assert first.kwargs["max_prompt_tokens"] == 262144
+        assert first.kwargs["prompt_cache_min_tokens"] == 2048
+        assert first.kwargs["context_window_tokens"] == 1024
+        assert first.kwargs["release_between_sweeps"] is True
+        assert first.kwargs["drafter_load_margin_bytes"] == 64_000_000
+        assert first.target.rc.max_weight_cache_mb == 2200
+        assert first.target.rc.prefetch_workers == 2
+        assert first.target.rc.prefetch_depth == 4
+
+        # Drafter lifetime is part of engine identity; disabling the Qwen
+        # default must not reuse a release-enabled engine.
+        os.environ["VMODEL_DSPARK_RELEASE_BETWEEN_SWEEPS"] = "0"
+        second = manager.get(target_path, "fast")
+        assert "release_between_sweeps" not in second.kwargs
+
+        # The rest of the DSpark settings remain identity inputs as well.
+        os.environ["VMODEL_DSPARK_MAX_DRAFT_TOKENS"] = "3"
+        third = manager.get(target_path, "fast")
+
+    assert len(made) == 3
+    assert third.kwargs["max_draft_tokens"] == 3
+    assert first.closes == 1
+    assert discover.call_count == 3
 
 
 def test_engine_manager_prefers_full_resident_qwen3_when_governor_admits_it(tmp_path):

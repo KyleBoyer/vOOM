@@ -168,6 +168,42 @@ def test_exact_repeat_reuses_target_and_drafter_prompt_state():
     assert warm["path_stats"]["prompt_cache_source"] == "dspark-memory"
 
 
+def test_constrained_dspark_keeps_target_grammar_authoritative():
+    class Constraint:
+        def __init__(self):
+            self.allowed = [1, 6]
+            self.accepted = []
+
+        @property
+        def completed(self):
+            return len(self.accepted) == len(self.allowed)
+
+        def mask_logits(self, logits):
+            token = self.allowed[len(self.accepted)]
+            masked = mx.full(logits.shape, -mx.inf)
+            masked[token] = logits[token]
+            return masked
+
+        def accept_token(self, token):
+            assert token == self.allowed[len(self.accepted)]
+            self.accepted.append(int(token))
+
+    target = _Target()
+    drafter = _Drafter()
+    decoder = DSparkSpeculativeDecoder(target, drafter, max_draft_tokens=2)
+    decoder._propose = lambda *_args: [7, 7]
+    constraint = Constraint()
+
+    result = decoder.generate(
+        "ignored", max_tokens=4, stop=[], constraint=constraint)
+
+    assert result["tokens"] == [1, 6]
+    assert constraint.completed
+    assert result["termination_reason"] == "grammar"
+    assert result["path_stats"]["dspark_constraint_verified"] == 1
+    assert result["stats"].accepted == 0
+
+
 def test_k3_mla_draft_uses_compressed_context_and_shared_target_head():
     cfg = DSparkConfig(
         hidden_size=8,
