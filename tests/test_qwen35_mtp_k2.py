@@ -325,6 +325,11 @@ def test_k2_constructor_is_strict_and_opt_in():
             QwenMTPSpeculativeEngine(target, depth=invalid)
     with pytest.raises(ValueError, match="requires depth 1"):
         QwenMTPSpeculativeEngine(target, depth=2, ngram_first=True)
+    for invalid in (0, 5, True, "4"):
+        with pytest.raises(ValueError, match="draft width must be in"):
+            QwenMTPSpeculativeEngine(
+                target, ngram_first=True,
+                ngram_max_draft_tokens=invalid)
 
 
 def test_server_q_policy_is_strict_and_part_of_engine_cache_identity():

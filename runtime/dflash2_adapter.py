@@ -1,0 +1,793 @@
+"""Default-off Qwen3.8 DFlash2 adapter over the DSpark target verifier.
+
+The architecture is adapted from z-lab/dflash's ``dflash/model_mlx.py`` at
+revision ``07ebd93db9f472af339b644bb70221ad8428328a`` (Copyright (c) 2026
+Z Lab, MIT).  The complete MIT notice is retained in :mod:`runtime.dflash2`.
+This module is vOOM-specific glue: exact target compatibility, target residual
+taps, bounded sliding draft context, sparse proposal-q expansion, and reuse of
+DSpark's target-authoritative Qwen KV/DeltaNet commit path.
+
+There is intentionally no server/profile registration here.  Constructing
+``DFlash2SpeculativeEngine`` is an explicit research action, and the built
+sidecar continues to declare ``enabled_by_default=false``.  Promotion still
+requires the real long forced-rejection recurrent-state oracle.
+"""
+
+from __future__ import annotations
+
+import json
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
+
+import mlx.core as mx
+import mlx.nn as nn
+
+from .dflash2 import (
+    CandidateSelector,
+    GroupedDynamicCausalConv,
+)
+from .dflash2_schema import (
+    DFlash2Config,
+    OFFICIAL_REVISION,
+    OFFICIAL_WEIGHTS_SHA256,
+    _read_safetensors_header,
+    sha256_file,
+)
+from .dflash2_sidecar import MANIFEST_NAME, MANIFEST_SCHEMA, SIDECAR_SCHEMA
+from .dspark import (
+    CtxCache,
+    DSparkAttention,
+    DSparkMLP,
+    DSparkSpeculativeDecoder,
+)
+from .sampler import SamplingParams
+
+
+MAX_QUANTIZED_BLOCK_SIZE = 5
+MAX_QUANTIZED_PROPOSALS = MAX_QUANTIZED_BLOCK_SIZE - 1
+
+
+@dataclass(frozen=True)
+class DFlash2RuntimeConfig:
+    checkpoint: DFlash2Config
+    model_type: str = "qwen3_dflash2"
+    target_model_type: str = "qwen3_5"
+    share_target_embed: bool = True
+    share_target_lm_head: bool = True
+    logits_start: int = 1
+
+    @property
+    def hidden_size(self):
+        return self.checkpoint.hidden_size
+
+    @property
+    def intermediate_size(self):
+        return self.checkpoint.intermediate_size
+
+    @property
+    def vocab_size(self):
+        return self.checkpoint.vocab_size
+
+    @property
+    def num_hidden_layers(self):
+        return self.checkpoint.num_hidden_layers
+
+    @property
+    def num_attention_heads(self):
+        return self.checkpoint.num_attention_heads
+
+    @property
+    def num_key_value_heads(self):
+        return self.checkpoint.num_key_value_heads
+
+    @property
+    def head_dim(self):
+        return self.checkpoint.head_dim
+
+    @property
+    def rms_norm_eps(self):
+        return self.checkpoint.rms_norm_eps
+
+    @property
+    def rope_theta(self):
+        return self.checkpoint.rope_theta
+
+    @property
+    def rope_parameters(self):
+        return {
+            "rope_theta": self.checkpoint.rope_theta,
+            "rope_type": self.checkpoint.rope_type,
+        }
+
+    @property
+    def attention_bias(self):
+        return False
+
+    @property
+    def target_hidden_size(self):
+        return self.checkpoint.hidden_size
+
+    @property
+    def block_size(self):
+        return self.checkpoint.block_size
+
+    @property
+    def mask_token_id(self):
+        return self.checkpoint.mask_token_id
+
+    @property
+    def target_layer_ids(self):
+        return list(self.checkpoint.target_layer_ids)
+
+    @property
+    def sliding_window(self):
+        return self.checkpoint.sliding_window
+
+    @property
+    def conv_kernel_size(self):
+        return self.checkpoint.conv_kernel_size
+
+    @property
+    def conv_group_size(self):
+        return self.checkpoint.conv_group_size
+
+    @property
+    def selector_rank(self):
+        return self.checkpoint.selector_rank
+
+    @property
+    def selector_top_k(self):
+        return self.checkpoint.selector_top_k
+
+
+def _target_value(target_config, name: str, default=None):
+    return getattr(target_config, name, default)
+
+
+def validate_target_compatibility(
+    config: DFlash2RuntimeConfig,
+    target_config,
+) -> None:
+    """Fail closed on target architecture, not target weight identity.
+
+    Huihui's abliterated target intentionally differs from the official target
+    used to train the drafter; exact verification permits that difference.
+    Tensor geometry, tokenizer vocabulary, RoPE, and hybrid layer topology are
+    not interchangeable and must still match.
+    """
+    checkpoint = config.checkpoint
+    expected = {
+        "model_type": "qwen3_5",
+        "hidden_size": checkpoint.hidden_size,
+        "intermediate_size": checkpoint.intermediate_size,
+        "vocab_size": checkpoint.vocab_size,
+        "num_hidden_layers": checkpoint.num_target_layers,
+        "rope_theta": checkpoint.rope_theta,
+        "max_position_embeddings": checkpoint.max_position_embeddings,
+        "tie_word_embeddings": False,
+        "attention_bias": False,
+    }
+    mismatches = []
+    for name, value in expected.items():
+        actual = _target_value(target_config, name)
+        if actual != value:
+            mismatches.append(f"{name}={actual!r} (expected {value!r})")
+
+    layer_types = tuple(_target_value(target_config, "layer_types", ()))
+    expected_layers = tuple(
+        "full_attention" if (index + 1) % 4 == 0 else "linear_attention"
+        for index in range(checkpoint.num_target_layers))
+    if layer_types != expected_layers:
+        mismatches.append("layer_types do not match Qwen3.8's 3:1 hybrid layout")
+
+    # These are target-side Qwen3.8 shapes, intentionally distinct from the
+    # smaller attention geometry inside the draft checkpoint.
+    qwen38_target = {
+        "num_attention_heads": 24,
+        "num_key_value_heads": 4,
+        "head_dim": 256,
+        "full_attention_interval": 4,
+        "linear_num_key_heads": 16,
+        "linear_num_value_heads": 48,
+        "linear_key_head_dim": 128,
+        "linear_value_head_dim": 128,
+        "linear_conv_kernel_dim": 4,
+    }
+    if checkpoint.num_target_layers == 64 and checkpoint.hidden_size == 5120:
+        for name, value in qwen38_target.items():
+            actual = _target_value(target_config, name)
+            if actual != value:
+                mismatches.append(f"{name}={actual!r} (expected {value!r})")
+    if mismatches:
+        raise ValueError(
+            "DFlash2/target compatibility failure: " + "; ".join(mismatches))
+
+
+class DFlash2Attention(DSparkAttention):
+    """DFlash cross-attention with the published noncausal sliding mask."""
+
+    def __init__(self, config: DFlash2RuntimeConfig):
+        super().__init__(config)
+        self.sliding_window = config.sliding_window
+
+    def attend(
+        self, hidden: mx.array, block_offset: int, cache: CtxCache,
+    ) -> mx.array:
+        batch, query_length, _ = hidden.shape
+        queries = self.q_proj(hidden).reshape(
+            batch, query_length, self.n_heads, self.head_dim)
+        queries = self._rope(
+            self.q_norm(queries).transpose(0, 2, 1, 3),
+            offset=block_offset,
+        )
+        block_keys, block_values = self._kv(hidden)
+        block_keys = self._rope(block_keys, offset=block_offset)
+        keys = (
+            mx.concatenate([cache.k, block_keys], axis=2)
+            if cache.k is not None else block_keys)
+        values = (
+            mx.concatenate([cache.v, block_values], axis=2)
+            if cache.v is not None else block_values)
+        context_length = 0 if cache.k is None else int(cache.k.shape[2])
+
+        mask = dflash2_sliding_mask(
+            context_length, query_length, self.sliding_window)
+        output = mx.fast.scaled_dot_product_attention(
+            queries, keys, values, scale=self.scale, mask=mask)
+        output = output.transpose(0, 2, 1, 3).reshape(
+            batch, query_length, -1)
+        return self.o_proj(output)
+
+
+def dflash2_sliding_mask(
+    context_length: int,
+    query_length: int,
+    sliding_window: int,
+) -> mx.array:
+    """Published noncausal-block/sliding-context DFlash attention mask."""
+    if min(context_length, query_length) < 0 or sliding_window <= 0:
+        raise ValueError("DFlash2 attention mask dimensions are invalid")
+    query = context_length + mx.arange(query_length)[:, None]
+    key = mx.arange(context_length + query_length)[None]
+    context = mx.logical_and(
+        key < context_length,
+        query - key < sliding_window,
+    )
+    # is_causal=false is architectural: every draft position can attend every
+    # position in the same noisy proposal block, including later mask slots.
+    block = key >= context_length
+    return mx.logical_or(context, block)
+
+
+class DFlash2DecoderLayer(nn.Module):
+    def __init__(self, config: DFlash2RuntimeConfig):
+        super().__init__()
+        self.self_attn = DFlash2Attention(config)
+        self.mlp = DSparkMLP(config)
+        self.input_layernorm = nn.RMSNorm(
+            config.hidden_size, eps=config.rms_norm_eps)
+        self.post_attention_layernorm = nn.RMSNorm(
+            config.hidden_size, eps=config.rms_norm_eps)
+        self.attention_conv = GroupedDynamicCausalConv(
+            config.hidden_size,
+            config.conv_kernel_size,
+            config.conv_group_size,
+        )
+        self.mlp_conv = GroupedDynamicCausalConv(
+            config.hidden_size,
+            config.conv_kernel_size,
+            config.conv_group_size,
+        )
+
+    def __call__(
+        self, hidden: mx.array, block_offset: int, cache: CtxCache,
+    ) -> mx.array:
+        residual = hidden
+        hidden, kernel = self.attention_conv.prepare(
+            self.input_layernorm(hidden))
+        hidden = residual + self.attention_conv.finish(
+            self.self_attn.attend(hidden, block_offset, cache), kernel)
+        residual = hidden
+        hidden, kernel = self.mlp_conv.prepare(
+            self.post_attention_layernorm(hidden))
+        return residual + self.mlp_conv.finish(self.mlp(hidden), kernel)
+
+
+def expand_sparse_candidate_probabilities(
+    candidates: mx.array,
+    probabilities: mx.array,
+    vocab_size: int,
+) -> list[mx.array]:
+    """Expand conditional top-k selector q rows for DSpark's exact verifier."""
+    if candidates.ndim != 2 or probabilities.ndim != 2:
+        raise ValueError("DFlash2 sparse q inputs must be rank 2")
+    if candidates.shape != probabilities.shape:
+        raise ValueError("DFlash2 candidate IDs and q shapes differ")
+    if vocab_size <= 0:
+        raise ValueError("DFlash2 vocabulary size must be positive")
+    rows = []
+    for position in range(candidates.shape[0]):
+        row = mx.zeros((vocab_size,), dtype=mx.float32).at[
+            candidates[position]
+        ].add(probabilities[position].astype(mx.float32))
+        rows.append(row)
+    return rows
+
+
+def build_proposal_block(
+    pending_token: int,
+    mask_token_id: int,
+    checkpoint_block_size: int,
+    proposal_count: int,
+) -> list[int]:
+    """Build the exact Q4 runtime block (anchor plus at most four masks)."""
+    if proposal_count <= 0 or proposal_count > MAX_QUANTIZED_PROPOSALS:
+        raise ValueError(
+            f"DFlash2 quantized proposal count must be in [1, "
+            f"{MAX_QUANTIZED_PROPOSALS}]")
+    if proposal_count >= checkpoint_block_size:
+        raise ValueError("DFlash2 proposal count exceeds checkpoint block")
+    return [int(pending_token)] + [int(mask_token_id)] * proposal_count
+
+
+def _sidecar_physical_names(
+    config: DFlash2Config,
+    *,
+    bits: int,
+    group_size: int,
+    mode: str,
+) -> set[str]:
+    names = set()
+    for source_name, spec in config.expected_tensor_specs().items():
+        output_name = (
+            f"{source_name}.weight"
+            if source_name in {
+                "candidate_selector.predecessor_codebook",
+                "candidate_selector.successor_codebook",
+            }
+            else source_name)
+        if len(spec.shape) != 2 or spec.shape[-1] % group_size:
+            names.add(output_name)
+            continue
+        names.add(output_name)
+        stem = output_name[:-len(".weight")]
+        names.add(f"{stem}.scales")
+        if mode == "affine":
+            names.add(f"{stem}.biases")
+    return names
+
+
+def inspect_runtime_sidecar(
+    model_dir: str | Path,
+    *,
+    verify_hash: bool = True,
+    require_official_geometry: bool = True,
+) -> tuple[DFlash2RuntimeConfig, set[str], dict[str, Any]]:
+    model_dir = Path(model_dir).resolve()
+    raw = json.loads((model_dir / "config.json").read_text())
+    checkpoint = DFlash2Config.from_mapping(raw)
+    if require_official_geometry:
+        checkpoint.validate_official_qwen38()
+    sidecar = raw.get("vmodel_sidecar")
+    if not isinstance(sidecar, dict):
+        raise ValueError("DFlash2 artifact has no vmodel_sidecar identity")
+    required_sidecar = {
+        "schema": SIDECAR_SCHEMA,
+        "draft_only_quantization": True,
+        "target_verifier_required": True,
+        "recurrent_rollback_oracle_required": True,
+        "runtime_supported": False,
+        "enabled_by_default": False,
+    }
+    if any(
+        sidecar.get(name) != value for name, value in required_sidecar.items()
+    ):
+        raise ValueError("DFlash2 sidecar identity/default-off contract mismatch")
+    if require_official_geometry and (
+        sidecar.get("source_revision") != OFFICIAL_REVISION
+        or sidecar.get("source_sha256") != OFFICIAL_WEIGHTS_SHA256
+    ):
+        raise ValueError("DFlash2 sidecar official source identity mismatch")
+    manifest = json.loads((model_dir / MANIFEST_NAME).read_text())
+    if not isinstance(manifest, dict) or manifest.get("schema") != MANIFEST_SCHEMA:
+        raise ValueError("DFlash2 sidecar manifest schema mismatch")
+    conversion = manifest.get("conversion")
+    if not isinstance(conversion, dict):
+        raise ValueError("DFlash2 sidecar manifest omits conversion identity")
+    quantization = raw.get("quantization")
+    expected_quantization = {
+        name: conversion.get(name) for name in ("bits", "group_size", "mode")}
+    if quantization != expected_quantization:
+        raise ValueError("DFlash2 config/manifest quantization mismatch")
+    bits = int(quantization["bits"])
+    group_size = int(quantization["group_size"])
+    mode = str(quantization["mode"])
+    if (bits, group_size, mode) != (4, 64, "affine"):
+        raise ValueError(
+            "DFlash2 runtime requires the pinned affine4/group64 sidecar")
+
+    proof = manifest.get("proof")
+    serving = manifest.get("serving")
+    if not isinstance(proof, dict) or not isinstance(serving, dict):
+        raise ValueError("DFlash2 sidecar manifest omits proof/serving gates")
+    required_proof = {
+        "source_full_sha256_verified": True,
+        "source_header_validated": True,
+        "target_weights_copied": False,
+        "recurrent_rollback_proven": False,
+        "runtime_supported": False,
+    }
+    required_serving = {
+        "enabled_by_default": False,
+        "runtime_supported": False,
+        "target_verifier_required": True,
+        "recurrent_rollback_oracle_required": True,
+        "planned_proposal_count": (
+            min(checkpoint.block_size, MAX_QUANTIZED_BLOCK_SIZE) - 1),
+        "upstream_mlx_recommended_block_size": min(
+            checkpoint.block_size, MAX_QUANTIZED_BLOCK_SIZE),
+    }
+    if any(proof.get(name) != value for name, value in required_proof.items()):
+        raise ValueError("DFlash2 sidecar proof gate mismatch")
+    if any(serving.get(name) != value
+           for name, value in required_serving.items()):
+        raise ValueError("DFlash2 sidecar default-off serving gate mismatch")
+
+    weights_path = model_dir / "model.safetensors"
+    header, _header_bytes, file_bytes = _read_safetensors_header(weights_path)
+    metadata = header.pop("__metadata__", {})
+    if not isinstance(metadata, dict):
+        raise ValueError("DFlash2 sidecar safetensors metadata is invalid")
+    expected_metadata = {
+        "format": "mlx",
+        "vmodel_kind": "target-verified-dflash2-draft-sidecar",
+        "runtime_supported": "false",
+        "source_sha256": sidecar["source_sha256"],
+        "source_revision": sidecar["source_revision"],
+    }
+    if any(metadata.get(name) != value
+           for name, value in expected_metadata.items()):
+        raise ValueError("DFlash2 safetensors identity mismatch")
+    physical_names = set(header)
+    expected_names = _sidecar_physical_names(
+        checkpoint, bits=bits, group_size=group_size, mode=mode)
+    if physical_names != expected_names:
+        raise ValueError(
+            "DFlash2 sidecar tensor set mismatch: "
+            f"missing={sorted(expected_names - physical_names)[:8]} "
+            f"unexpected={sorted(physical_names - expected_names)[:8]}")
+    output = manifest.get("output")
+    if not isinstance(output, dict) or output.get("weights_bytes") != file_bytes:
+        raise ValueError("DFlash2 sidecar byte size differs from manifest")
+    if verify_hash and sha256_file(weights_path) != output.get("weights_sha256"):
+        raise ValueError("DFlash2 sidecar SHA-256 differs from manifest")
+    return DFlash2RuntimeConfig(checkpoint), physical_names, manifest
+
+
+class DFlash2Drafter(nn.Module):
+    """Standalone draft model; the target owns embedding and LM head."""
+
+    def __init__(self, config: DFlash2RuntimeConfig):
+        super().__init__()
+        self.config = config
+        self.block_size = config.block_size
+        self.mask_token_id = config.mask_token_id
+        self.fc = nn.Linear(
+            len(config.target_layer_ids) * config.hidden_size,
+            config.hidden_size,
+            bias=False,
+        )
+        self.hidden_norm = nn.RMSNorm(
+            config.hidden_size, eps=config.rms_norm_eps)
+        self.layers = [
+            DFlash2DecoderLayer(config)
+            for _ in range(config.num_hidden_layers)]
+        self.norm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.candidate_selector = CandidateSelector(
+            config.hidden_size,
+            config.vocab_size,
+            config.selector_rank,
+            config.selector_top_k,
+        )
+        self.confidence_head = None
+        self._target_embed_provider = None
+        self._target_lm_head_provider = None
+
+    @classmethod
+    def load(
+        cls,
+        model_dir: str | Path,
+        *,
+        verify_hash: bool = True,
+        require_official_geometry: bool = True,
+    ) -> "DFlash2Drafter":
+        config, physical_names, _manifest = inspect_runtime_sidecar(
+            model_dir,
+            verify_hash=verify_hash,
+            require_official_geometry=require_official_geometry,
+        )
+        raw = json.loads((Path(model_dir) / "config.json").read_text())
+        quantization = raw["quantization"]
+        model = cls(config)
+        nn.quantize(
+            model,
+            group_size=int(quantization["group_size"]),
+            bits=int(quantization["bits"]),
+            mode=quantization.get("mode", "affine"),
+            class_predicate=lambda module_path, _module: (
+                f"{module_path}.scales" in physical_names),
+        )
+        model.load_weights(str(Path(model_dir) / "model.safetensors"))
+        mx.eval(model.parameters())
+        return model
+
+    def bind_target_embed(self, provider) -> None:
+        self._target_embed_provider = provider
+
+    def bind_target_lm_head(self, provider) -> None:
+        self._target_lm_head_provider = provider
+
+    def make_ctx_cache(self) -> list[CtxCache]:
+        return [CtxCache() for _ in self.layers]
+
+    def _embed_block(self, token_ids: list[int]) -> mx.array:
+        if self._target_embed_provider is None:
+            raise RuntimeError("DFlash2 requires the target token embedding")
+        value = self._target_embed_provider(token_ids)
+        if value.ndim != 3 or value.shape[:2] != (1, len(token_ids)):
+            raise RuntimeError(
+                "DFlash2 target embedding provider returned an invalid shape")
+        return value
+
+    def _project_logits(self, hidden: mx.array) -> mx.array:
+        if self._target_lm_head_provider is None:
+            raise RuntimeError("DFlash2 requires the target LM head")
+        head = self._target_lm_head_provider()
+        from .lm_head_stream import StreamedLMHead
+
+        if isinstance(head, StreamedLMHead):
+            return head.logits(hidden)
+        from .layer_runner import _linear
+
+        return _linear(
+            hidden, {"dflash2_target_head.weight": head},
+            "dflash2_target_head")
+
+    @staticmethod
+    def _trim_context_left(cache: CtxCache, max_length: int) -> None:
+        drop = max(0, cache.length - max_length)
+        if drop <= 0:
+            return
+        cache.k = cache.k[:, :, drop:, :]
+        cache.v = cache.v[:, :, drop:, :]
+        cache.position_start = int(cache.position_start or 0) + drop
+
+    def update_context(
+        self,
+        target_hidden_cat: mx.array,
+        ctx_offset: int,
+        ctx_caches: list[CtxCache],
+    ) -> None:
+        fused = self.hidden_norm(self.fc(target_hidden_cat))
+        max_context = self.config.sliding_window - 1
+        for layer, cache in zip(self.layers, ctx_caches, strict=True):
+            layer.self_attn.update_ctx(fused, ctx_offset, cache)
+            self._trim_context_left(cache, max_context)
+
+    def propose_block(
+        self,
+        pending_token: int,
+        block_offset: int,
+        ctx_caches: list[CtxCache],
+        cap: int,
+        sampling: SamplingParams,
+    ) -> tuple[list[int], list[mx.array] | None, mx.array]:
+        block_ids = build_proposal_block(
+            pending_token, self.mask_token_id, self.config.block_size, cap)
+        hidden = self._embed_block(block_ids)
+        for layer, cache in zip(self.layers, ctx_caches, strict=True):
+            hidden = layer(hidden, block_offset, cache)
+        proposal_hidden = self.norm(hidden)[:, 1:]
+        logits = self._project_logits(proposal_hidden)
+        proposals, candidates, sparse_q = self.candidate_selector.select(
+            proposal_hidden,
+            logits,
+            mx.array([pending_token]),
+            0.0 if sampling.is_greedy else float(sampling.temperature),
+        )
+        if sparse_q is None:
+            mx.eval(proposals, candidates)
+        else:
+            mx.eval(proposals, candidates, sparse_q)
+        proposal_list = [int(token) for token in proposals[0].tolist()]
+        distributions = None
+        if sparse_q is not None:
+            distributions = expand_sparse_candidate_probabilities(
+                candidates[0], sparse_q[0], self.config.vocab_size)
+            mx.eval(*distributions)
+        return proposal_list, distributions, proposal_hidden[0]
+
+
+class DFlash2SpeculativeDecoder(DSparkSpeculativeDecoder):
+    """DFlash proposal source with DSpark's target-authoritative verifier."""
+
+    def __init__(
+        self,
+        target,
+        drafter: DFlash2Drafter,
+        *,
+        max_draft_tokens: int = MAX_QUANTIZED_PROPOSALS,
+        prompt_cache_min_tokens: int = 2048,
+        drafter_loader=None,
+        release_between_sweeps: bool = True,
+        drafter_storage_bytes: int = 0,
+        drafter_load_margin_bytes: int = 400_000_000,
+    ):
+        if max_draft_tokens > MAX_QUANTIZED_PROPOSALS:
+            raise ValueError(
+                "quantized MLX DFlash2 is capped at four proposals/block")
+        validate_target_compatibility(drafter.config, target.cfg)
+        super().__init__(
+            target,
+            drafter,
+            max_draft_tokens=max_draft_tokens,
+            confidence_threshold=0.0,
+            prompt_cache_min_tokens=prompt_cache_min_tokens,
+            context_window_tokens=drafter.config.sliding_window - 1,
+            drafter_loader=drafter_loader,
+            release_between_sweeps=release_between_sweeps,
+            drafter_storage_bytes=drafter_storage_bytes,
+            drafter_load_margin_bytes=drafter_load_margin_bytes,
+        )
+
+    def _propose(
+        self,
+        pending: int,
+        offset: int,
+        ctx_caches: list[CtxCache],
+        cap: int,
+        sampling: SamplingParams,
+        history: list[int],
+    ):
+        del history  # DFlash2 q is selector-conditional, not repetition-filtered.
+        proposals, distributions, _hidden = self._ensure_drafter().propose_block(
+            pending, offset, ctx_caches, cap, sampling)
+        return proposals, distributions
+
+    def generate(self, *args, **kwargs):
+        result = super().generate(*args, **kwargs)
+        result.setdefault("path_stats", {}).update({
+            "speculative_kind": "dflash2",
+            "dflash2_enabled": 1,
+            "dflash2_checkpoint_block_size": self._cfg.block_size,
+            "dflash2_effective_block_size": self.max_draft_tokens + 1,
+            "dflash2_selector_top_k": self._cfg.selector_top_k,
+            "dflash2_context_window_tokens": self.context_window_tokens,
+            "dflash2_target_verifier": "dspark-qwen-authoritative",
+        })
+        return result
+
+
+class DFlash2SpeculativeEngine:
+    """Explicit engine wrapper; intentionally absent from server dispatch."""
+
+    def __init__(
+        self,
+        target,
+        draft_dir: str | Path,
+        *,
+        max_draft_tokens: int = MAX_QUANTIZED_PROPOSALS,
+        max_prompt_tokens: int = 262_144,
+        prompt_cache_min_tokens: int = 2048,
+        release_between_sweeps: bool = True,
+        drafter_load_margin_bytes: int = 400_000_000,
+        verify_sidecar_hash: bool = True,
+    ):
+        if max_prompt_tokens <= 0:
+            raise ValueError("DFlash2 max_prompt_tokens must be positive")
+        self.target = target
+        self.max_prompt_tokens = max_prompt_tokens
+        self._closed = False
+        draft_dir = Path(draft_dir)
+        draft_bytes = (draft_dir / "model.safetensors").stat().st_size
+
+        def bind(drafter):
+            drafter.bind_target_lm_head(target._lm_head_weight)
+            drafter.bind_target_embed(
+                lambda token_ids: target._embed(list(token_ids)))
+            return drafter
+
+        def load_drafter():
+            prepare_for = getattr(target.cache, "prepare_for", None)
+            if callable(prepare_for):
+                prepare_for(draft_bytes)
+            if target.governor is not None:
+                target.governor.reserve(
+                    draft_bytes, margin=drafter_load_margin_bytes)
+            # The first construction below verified the content hash.  Round
+            # reloads validate metadata/header identity without rereading the
+            # entire 1.08 GB artifact solely to hash it again.
+            return bind(DFlash2Drafter.load(
+                draft_dir, verify_hash=False))
+
+        if target.governor is not None:
+            target.governor.reserve(draft_bytes)
+        drafter = bind(DFlash2Drafter.load(
+            draft_dir, verify_hash=verify_sidecar_hash))
+        if target.governor is not None:
+            target.governor.fit_cache_to_live_headroom()
+        self.decoder = DFlash2SpeculativeDecoder(
+            target,
+            drafter,
+            max_draft_tokens=max_draft_tokens,
+            prompt_cache_min_tokens=prompt_cache_min_tokens,
+            drafter_loader=load_drafter,
+            release_between_sweeps=release_between_sweeps,
+            drafter_storage_bytes=draft_bytes,
+            drafter_load_margin_bytes=drafter_load_margin_bytes,
+        )
+        self._speculative_k = self.decoder.max_draft_tokens
+        self._speculative_draft_dir = draft_dir
+        self._speculative_kind = "dflash2"
+
+    def __getattr__(self, name):
+        return getattr(self.target, name)
+
+    def _target_generate(self, reason: str, prompt: str, max_tokens: int,
+                         **kwargs):
+        self.decoder.clear_prompt_cache()
+        self.decoder._release_drafter()
+        generate = getattr(
+            self.target, "generate_with_memory_retry", self.target.generate)
+        result = generate(prompt, max_tokens, **kwargs)
+        result.setdefault("path_stats", {}).update({
+            "speculative_enabled": 1,
+            "speculative_used": 0,
+            "speculative_kind": "dflash2",
+            "speculative_fallback_reason": reason,
+            "speculative_k": self._speculative_k,
+        })
+        return result
+
+    def generate(self, prompt: str, max_tokens: int = 64, on_token=None,
+                 stop=None, on_progress=None,
+                 sampling: SamplingParams | None = None,
+                 constraint=None):
+        prepared = getattr(prompt, "token_ids", None)
+        ids = (list(prepared) if prepared is not None
+               else list(self.target.tokenizer.encode(prompt).ids))
+        kwargs = {
+            "on_token": on_token,
+            "stop": stop,
+            "on_progress": on_progress,
+            "sampling": sampling,
+            "constraint": constraint,
+        }
+        kwargs = {name: value for name, value in kwargs.items()
+                  if value is not None}
+        if len(ids) > self.max_prompt_tokens:
+            return self._target_generate(
+                "prompt-limit", prompt, max_tokens, **kwargs)
+        try:
+            return self.decoder.generate(
+                prompt,
+                max_tokens,
+                encoded_ids=ids,
+                **kwargs,
+            )
+        finally:
+            self.decoder._release_drafter()
+
+    def release_request_state(self):
+        self.decoder.clear_prompt_cache()
+        self.target.release_request_state()
+
+    def close(self):
+        if self._closed:
+            return
+        self._closed = True
+        self.decoder._release_drafter()
+        close = getattr(self.target, "close", None)
+        if callable(close):
+            close()

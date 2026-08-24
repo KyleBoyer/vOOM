@@ -518,25 +518,25 @@ def test_qwen_mtp_accepted_pair_stops_on_first_token_eos():
     assert all(mapping == {} for mapping in failing_drafter.mappings)
 
 
-@pytest.mark.parametrize("accepted", [True, False])
+@pytest.mark.parametrize("accepted_prefix", range(5))
 def test_qwen_mtp_ngram_first_keeps_exact_target_state_and_acceptance_telemetry(
-    accepted,
+    accepted_prefix,
 ):
-    """A lookup hit bypasses the sidecar, never the authoritative target.
+    """Exhaust every accept/reject prefix of a four-token lookup hit.
 
-    Both acceptance and correction retain the exact one-position serial KDA,
-    layer-length, hidden-state, and final-token-never-fed endpoint required by
-    ordinary Qwen hybrid decode.
+    Acceptance, correction, and output-budget termination retain the exact
+    serial KDA, layer-length, hidden-state, and final-token-never-fed endpoint.
     """
     from runtime.qwen35_mtp import QwenMTPSpeculativeEngine
 
-    midpoint = object()
+    proposals = [10, 11, 12, 13]
+    midpoints = {fed: object() for fed in range(1, 5)}
 
     class _KV:
         def __init__(self):
-            self.offset = 4
+            self.offset = 8
             self.kda_cache = object()
-            self.lengths = [4, 2]
+            self.lengths = [8, 2]
 
         def layer_lengths(self):
             return tuple(self.lengths)
@@ -553,10 +553,11 @@ def test_qwen_mtp_ngram_first_keeps_exact_target_state_and_acceptance_telemetry(
 
     class _Target(_Engine):
         def __init__(self):
-            # [3, 4] is both an earlier prompt bigram and the final suffix
-            # after bootstrap emits 4, so real ngram_propose returns 3.
-            super().__init__("/models/target", ids=(1, 3, 4, 3))
-            self.cfg = SimpleNamespace(num_experts=8, eos_token_ids=())
+            # The earlier [3, 4] is followed by all four proposals; bootstrap
+            # recreates that suffix at the prompt endpoint.
+            super().__init__(
+                "/models/target", ids=(1, 3, 4, 10, 11, 12, 13, 3))
+            self.cfg = SimpleNamespace(num_experts=8, eos_token_ids=(9, 13))
             self.cache = SimpleNamespace(
                 stats=SimpleNamespace(
                     hits=0, misses=0, evictions=0, bytes_read=0),
@@ -585,25 +586,29 @@ def test_qwen_mtp_ngram_first_keeps_exact_target_state_and_acceptance_telemetry(
                 "text": "4", "tokens": [4], "prefill_s": 0.0,
                 "first_token_s": 0.0, "decode_s": 0.0, "total_s": 0.0,
                 "termination_reason": "length", "stop_sequence": None,
-                "path_stats": {}, "prompt_tokens": 4,
+                "path_stats": {}, "prompt_tokens": 8,
             }
 
         def forward_tokens_serial_positions(
             self, tokens, kv, *, capture_kda_endpoints=False,
         ):
-            assert tokens == [4, 3]
+            assert tokens == [4, *proposals]
             assert capture_kda_endpoints
-            kv.offset += 2
-            kv.lengths = [value + 2 for value in kv.lengths]
-            self._h_window = mx.array([[[40.0], [90.0]]])
+            kv.offset += 5
+            kv.lengths = [value + 5 for value in kv.lengths]
+            kv.kda_cache = object()
+            self._h_window = mx.array(
+                [[[100.0], [101.0], [102.0], [103.0], [104.0]]])
             self._h_last = self._h_window[:, -1:, :]
-            logits = mx.zeros((2, 10))
-            logits = logits.at[0, 3 if accepted else 6].add(2)
-            return logits.at[1, 7].add(2)
+            logits = mx.full((5, 16), -100.0)
+            for step, proposal in enumerate(proposals):
+                winner = proposal if step < accepted_prefix else 9
+                logits = logits.at[step, winner].add(200.0)
+            return logits.at[4, 7].add(200.0)
 
         def consume_serial_kda_endpoint(self, fed_positions):
             self.endpoint_requests.append(fed_positions)
-            return midpoint if fed_positions == 1 else None
+            return midpoints.get(fed_positions)
 
     class _ForbiddenSidecar:
         @staticmethod
@@ -620,23 +625,39 @@ def test_qwen_mtp_ngram_first_keeps_exact_target_state_and_acceptance_telemetry(
         plain_warmup_tokens=0, adaptive_stop=False, ngram_first=True)
     engine.drafter = _ForbiddenSidecar()
 
-    result = engine.generate("x", 2)
-    expected_token = 3 if accepted else 6
+    result = engine.generate("x", 6)
+    rejected = accepted_prefix < len(proposals)
+    expected_tokens = [4, *proposals[:accepted_prefix]]
+    if rejected:
+        expected_tokens.append(9)
+    fed_positions = len(expected_tokens) - 1
     stats = result["path_stats"]
 
-    assert result["tokens"] == [4, expected_token]
-    assert result["kv_positions"] == 5
-    assert target.last_kv.lengths == [5, 3]
-    assert target.last_kv.kda_cache is midpoint
-    assert float(target._h_last.item()) == 40.0
-    assert target.endpoint_requests == [1]
-    assert stats["qwen_mtp_round_outcomes"] == ("A" if accepted else "R")
+    assert result["tokens"] == expected_tokens
+    assert result["kv_positions"] == 8 + fed_positions
+    assert target.last_kv.lengths == [8 + fed_positions, 2 + fed_positions]
+    assert target.last_kv.kda_cache is midpoints[fed_positions]
+    assert float(target._h_last.item()) == 99.0 + fed_positions
+    assert target.endpoint_requests == [fed_positions]
+    assert stats["qwen_mtp_round_outcomes"] == (
+        "R" if accepted_prefix == 0 else
+        f"A{accepted_prefix}R" if rejected else "A4")
     assert stats["qwen_mtp_proposal_sources"] == "N"
     assert stats["qwen_mtp_ngram_first_attempts"] == 1
     assert stats["qwen_mtp_ngram_first_matches"] == 1
-    assert stats["qwen_mtp_ngram_first_proposed"] == 1
-    assert stats["qwen_mtp_ngram_first_accepted"] == int(accepted)
-    assert stats["qwen_mtp_ngram_first_rejected"] == int(not accepted)
+    assert stats["qwen_mtp_ngram_first_max_draft_tokens"] == 4
+    assert stats["qwen_mtp_ngram_first_max_proposed_per_round"] == 4
+    assert stats["qwen_mtp_verify_width"] == 5
+    assert stats["qwen_mtp_max_verify_width_observed"] == 5
+    assert stats["qwen_mtp_ngram_first_proposed"] == 4
+    assert stats["qwen_mtp_ngram_first_accepted"] == accepted_prefix
+    assert stats["qwen_mtp_ngram_first_rejected"] == int(rejected)
+    expected_verified = min(4, accepted_prefix + int(rejected))
+    assert stats["qwen_mtp_verified_proposals"] == expected_verified
+    assert stats["qwen_mtp_ngram_first_accepted_by_step"] == [
+        int(step < accepted_prefix) for step in range(4)]
+    assert stats["qwen_mtp_ngram_first_verified_by_step"] == [
+        int(step < expected_verified) for step in range(4)]
     assert stats["qwen_mtp_ngram_first_native_draft_bypasses"] == 1
     assert stats["qwen_mtp_native_draft_proposed"] == 0
     assert stats["qwen_mtp_native_draft_accepted"] == 0

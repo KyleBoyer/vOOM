@@ -910,6 +910,7 @@ class QwenMTPSpeculativeEngine:
         ngram_first: bool = False,
         ngram_min_ngram: int = 2,
         ngram_max_ngram: int = 6,
+        ngram_max_draft_tokens: int = 4,
     ):
         if max_prompt_tokens <= 0:
             raise ValueError("max_prompt_tokens must be positive")
@@ -938,6 +939,11 @@ class QwenMTPSpeculativeEngine:
                 or ngram_max_ngram < ngram_min_ngram):
             raise ValueError(
                 "Qwen MTP maximum n-gram must be >= minimum n-gram")
+        if (isinstance(ngram_max_draft_tokens, bool)
+                or not isinstance(ngram_max_draft_tokens, int)
+                or not 1 <= ngram_max_draft_tokens <= 4):
+            raise ValueError(
+                "Qwen MTP n-gram draft width must be in [1, 4]")
         if ngram_first and depth != 1:
             raise ValueError(
                 "Qwen MTP n-gram-first cascade currently requires depth 1")
@@ -962,9 +968,13 @@ class QwenMTPSpeculativeEngine:
         self.ngram_first = ngram_first
         self.ngram_min_ngram = int(ngram_min_ngram)
         self.ngram_max_ngram = int(ngram_max_ngram)
+        self.ngram_max_draft_tokens = int(ngram_max_draft_tokens)
         self.mtp_engine_identity = (
             f"qwen-mtp-depth{self.depth}-{self.proposal_q_policy.name}"
-            + ("-ngram-first" if self.ngram_first else "")
+            + (
+                f"-ngram-first-k{self.ngram_max_draft_tokens}"
+                if self.ngram_first else ""
+            )
         )
         if self.depth == 2 and not callable(getattr(
             target, "forward_tokens_serial_positions", None
@@ -1132,6 +1142,9 @@ class QwenMTPSpeculativeEngine:
         ngram_first_accepted = 0
         ngram_first_rejected = 0
         ngram_first_native_draft_bypasses = 0
+        ngram_first_accepted_by_step = [0] * self.ngram_max_draft_tokens
+        ngram_first_verified_by_step = [0] * self.ngram_max_draft_tokens
+        ngram_first_max_proposed_per_round = 0
         native_mtp_proposed = 0
         native_mtp_accepted = 0
         native_mtp_rejected = 0
@@ -1158,6 +1171,7 @@ class QwenMTPSpeculativeEngine:
         verifier_accepted_draft_tokens = 0
         verifier_correction_tokens = 0
         verifier_bonus_tokens = 0
+        max_verify_width_observed = 0
 
         # Invariant (matching speculative.py's documented one): all_tokens =
         # prompt + emitted; catchup_tok = all_tokens[-1] is sampled but not
@@ -1380,7 +1394,7 @@ class QwenMTPSpeculativeEngine:
                 draft_hidden = h_last
                 draft_input_token = catchup_tok
                 round_mtp_weights: dict | None = None
-                ngram_candidate: int | None = None
+                ngram_tokens: list[int] = []
                 round_proposal_source = "M"
                 draft_rerank_before = _reranked_head_telemetry_snapshot(tgt)
                 draft_started = time.perf_counter()
@@ -1394,14 +1408,23 @@ class QwenMTPSpeculativeEngine:
                     # for exact p/q acceptance and residual correction.
                     if self.ngram_first and sampling.is_greedy:
                         ngram_first_attempts += 1
+                        remaining_outputs = max_tokens - len(emitted)
+                        # Leave room for the verifier's authoritative bonus
+                        # when possible. With one output slot left, one draft
+                        # is still useful and its overfed input is rolled back
+                        # by the same final-token-never-fed endpoint rule.
+                        ngram_width = min(
+                            self.ngram_max_draft_tokens,
+                            max(1, remaining_outputs - 1),
+                        )
                         ngram_tokens = ngram_propose(
                             all_tokens,
-                            1,
+                            ngram_width,
                             self.ngram_max_ngram,
                             self.ngram_min_ngram,
                         )
                         if ngram_tokens:
-                            ngram_candidate = int(ngram_tokens[0])
+                            ngram_tokens = [int(token) for token in ngram_tokens]
                             round_proposal_source = "N"
                             ngram_first_matches += 1
                             ngram_first_native_draft_bypasses += 1
@@ -1413,13 +1436,13 @@ class QwenMTPSpeculativeEngine:
                     sidecar_load_started = time.perf_counter()
                     round_mtp_weights = (
                         prepare_request_weights()
-                        if (ngram_candidate is None
+                        if (not ngram_tokens
                             and callable(prepare_request_weights)) else None
                     )
                     prepared_bytes = (
                         int(getattr(
                             self.drafter, "last_cache_prepare_bytes", 0))
-                        if ngram_candidate is None else 0
+                        if not ngram_tokens else 0
                     )
                     if prepared_bytes:
                         sidecar_cache_prepare_calls += 1
@@ -1446,13 +1469,16 @@ class QwenMTPSpeculativeEngine:
                             "bytes_read", read_before))
                         sidecar_read_bytes += max(0, read_after - read_before)
 
-                    for step in range(self.depth):
+                    if ngram_tokens:
+                        draft_tokens.extend(ngram_tokens)
+                        draft_probabilities.extend([None] * len(ngram_tokens))
+                        draft_rank_probabilities.extend(
+                            [None] * len(ngram_tokens))
+
+                    for step in range(0 if ngram_tokens else self.depth):
                         if self.depth == 1:
                             # Keep the established k=1 mock/API path unchanged.
-                            if ngram_candidate is not None:
-                                draft_tok = ngram_candidate
-                                step_logits = None
-                            elif sampling.is_greedy:
+                            if sampling.is_greedy:
                                 draft_tok = self.drafter.draft_token(
                                     draft_hidden, draft_input_token, mtp_kv,
                                     round_start_offset - 1,
@@ -1549,10 +1575,16 @@ class QwenMTPSpeculativeEngine:
                 proposal_sources.append(round_proposal_source)
                 if round_proposal_source == "N":
                     ngram_first_proposed += len(draft_tokens)
+                    ngram_first_max_proposed_per_round = max(
+                        ngram_first_max_proposed_per_round,
+                        len(draft_tokens),
+                    )
                 else:
                     native_mtp_proposed += len(draft_tokens)
                 verify_tokens = [catchup_tok] + draft_tokens
                 round_verify_width = len(verify_tokens)
+                max_verify_width_observed = max(
+                    max_verify_width_observed, round_verify_width)
                 round_serial_verify = callable(getattr(
                     tgt, "forward_tokens_serial_positions", None))
                 round_capture_endpoint = bool(
@@ -1599,7 +1631,10 @@ class QwenMTPSpeculativeEngine:
                     authoritative_logits = _authoritative_target_logits(
                         tgt, spec_logits[step], constraint, step)
                     verified_proposals += 1
-                    verified_by_step[step] += 1
+                    if round_proposal_source == "N":
+                        ngram_first_verified_by_step[step] += 1
+                    else:
+                        verified_by_step[step] += 1
                     if sampling.is_greedy:
                         draft_accepted = (
                             int(mx.argmax(authoritative_logits)) == draft_tok)
@@ -1665,7 +1700,10 @@ class QwenMTPSpeculativeEngine:
 
                     accepted += 1
                     accepted_prefix += 1
-                    accepted_by_step[step] += 1
+                    if round_proposal_source == "N":
+                        ngram_first_accepted_by_step[step] += 1
+                    else:
+                        accepted_by_step[step] += 1
                     if constraint is not None:
                         constraint.accept_token(draft_tok)
                         grammar_completed = bool(constraint.completed)
@@ -1674,8 +1712,10 @@ class QwenMTPSpeculativeEngine:
                     if _candidate_terminal(new_tokens):
                         break
 
+                round_draft_width = len(draft_tokens)
                 all_drafts_accepted = (
-                    accepted_prefix == self.depth and not round_rejected)
+                    accepted_prefix == round_draft_width
+                    and not round_rejected)
                 if round_proposal_source == "N":
                     ngram_first_accepted += accepted_prefix
                     ngram_first_rejected += int(round_rejected)
@@ -1684,7 +1724,14 @@ class QwenMTPSpeculativeEngine:
                     native_mtp_rejected += int(round_rejected)
                 if all_drafts_accepted:
                     full_accept_rounds += 1
-                if self.depth == 1:
+                if round_proposal_source == "N" and round_draft_width > 1:
+                    if round_rejected:
+                        round_outcomes.append(
+                            "R" if accepted_prefix == 0
+                            else f"A{accepted_prefix}R")
+                    else:
+                        round_outcomes.append(f"A{accepted_prefix}")
+                elif self.depth == 1:
                     round_outcomes.append("A" if all_drafts_accepted else "R")
                 elif round_rejected:
                     round_outcomes.append(
@@ -1694,7 +1741,8 @@ class QwenMTPSpeculativeEngine:
 
                 if all_drafts_accepted and not _candidate_terminal(new_tokens):
                     bonus_logits = _authoritative_target_logits(
-                        tgt, spec_logits[self.depth], constraint, self.depth)
+                        tgt, spec_logits[round_draft_width], constraint,
+                        round_draft_width)
                     bonus_tok = sample(
                         bonus_logits,
                         sampling,
@@ -1740,7 +1788,7 @@ class QwenMTPSpeculativeEngine:
                 # The final returned token is always the next round's
                 # still-unfed catchup.  Therefore a round that returned N
                 # tokens commits exactly catchup + the first N-1 returned
-                # positions from the width-(depth+1) verifier.  This one rule
+                # positions from this round's verifier window. This one rule
                 # covers reject-at-0/1, full acceptance, EOS/stop at either
                 # proposal, grammar completion, and a short remaining budget.
                 emitted_this_round = len(emitted) - emitted_before_round
@@ -1960,7 +2008,9 @@ class QwenMTPSpeculativeEngine:
                 plain_equivalent_sweeps / target_decode_sweeps
                 if target_decode_sweeps else 0.0),
             "qwen_mtp_depth": self.depth,
-            "qwen_mtp_verify_width": self.depth + 1,
+            "qwen_mtp_verify_width": max(
+                self.depth + 1, max_verify_width_observed),
+            "qwen_mtp_max_verify_width_observed": max_verify_width_observed,
             "qwen_mtp_speculative_rounds": speculative_rounds,
             "qwen_mtp_proposed": proposed,
             "qwen_mtp_verified_proposals": verified_proposals,
@@ -2023,6 +2073,8 @@ class QwenMTPSpeculativeEngine:
             "qwen_mtp_ngram_first_enabled": int(self.ngram_first),
             "qwen_mtp_ngram_first_eligible": int(
                 self.ngram_first and sampling.is_greedy),
+            "qwen_mtp_ngram_first_max_draft_tokens": (
+                self.ngram_max_draft_tokens),
             "qwen_mtp_ngram_first_attempts": ngram_first_attempts,
             "qwen_mtp_ngram_first_matches": ngram_first_matches,
             "qwen_mtp_ngram_first_proposed": ngram_first_proposed,
@@ -2030,6 +2082,12 @@ class QwenMTPSpeculativeEngine:
             "qwen_mtp_ngram_first_rejected": ngram_first_rejected,
             "qwen_mtp_ngram_first_native_draft_bypasses": (
                 ngram_first_native_draft_bypasses),
+            "qwen_mtp_ngram_first_accepted_by_step": list(
+                ngram_first_accepted_by_step),
+            "qwen_mtp_ngram_first_verified_by_step": list(
+                ngram_first_verified_by_step),
+            "qwen_mtp_ngram_first_max_proposed_per_round": (
+                ngram_first_max_proposed_per_round),
             "qwen_mtp_native_draft_proposed": native_mtp_proposed,
             "qwen_mtp_native_draft_accepted": native_mtp_accepted,
             "qwen_mtp_native_draft_rejected": native_mtp_rejected,

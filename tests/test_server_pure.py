@@ -190,6 +190,7 @@ def test_vision_protocol_timing_exposes_qwen_mtp_round_trace():
             "qwen_mtp_used": 1,
             "qwen_mtp_round_outcomes": "AARRA",
             "qwen_mtp_depth": 2,
+            "qwen_mtp_max_verify_width_observed": 5,
             "qwen_mtp_bf16_sidecar_round_loads": 3,
             "qwen_mtp_bf16_sidecar_round_releases": 3,
             "qwen_mtp_bf16_sidecar_read_bytes": 1234,
@@ -209,6 +210,8 @@ def test_vision_protocol_timing_exposes_qwen_mtp_round_trace():
             "qwen_mtp_verifier_round_s": 2.5,
             "qwen_mtp_ngram_first_enabled": 1,
             "qwen_mtp_ngram_first_eligible": 1,
+            "qwen_mtp_ngram_first_max_draft_tokens": 4,
+            "qwen_mtp_ngram_first_max_proposed_per_round": 4,
             "qwen_mtp_ngram_first_attempts": 5,
             "qwen_mtp_ngram_first_matches": 2,
             "qwen_mtp_ngram_first_proposed": 2,
@@ -220,6 +223,8 @@ def test_vision_protocol_timing_exposes_qwen_mtp_round_trace():
             "qwen_mtp_native_draft_rejected": 1,
             "qwen_mtp_proposal_sources": "NMNMN",
             "qwen_mtp_accepted_by_step": [2, 1],
+            "qwen_mtp_ngram_first_accepted_by_step": [1, 0, 0, 0],
+            "qwen_mtp_ngram_first_verified_by_step": [1, 1, 0, 0],
             "qwen_mtp_q_policy": {"kind": "flat", "top_k": 4},
             "qwen_mtp_proposal_q_replay": replay,
         },
@@ -228,6 +233,7 @@ def test_vision_protocol_timing_exposes_qwen_mtp_round_trace():
     assert timing["qwen_mtp_used"] == 1
     assert timing["qwen_mtp_round_outcomes"] == "AARRA"
     assert timing["qwen_mtp_depth"] == 2
+    assert timing["qwen_mtp_max_verify_width_observed"] == 5
     assert timing["qwen_mtp_bf16_sidecar_round_loads"] == 3
     assert timing["qwen_mtp_bf16_sidecar_round_releases"] == 3
     assert timing["qwen_mtp_bf16_sidecar_read_bytes"] == 1234
@@ -247,6 +253,8 @@ def test_vision_protocol_timing_exposes_qwen_mtp_round_trace():
     assert timing["qwen_mtp_verifier_round_s"] == 2.5
     assert timing["qwen_mtp_ngram_first_enabled"] == 1
     assert timing["qwen_mtp_ngram_first_eligible"] == 1
+    assert timing["qwen_mtp_ngram_first_max_draft_tokens"] == 4
+    assert timing["qwen_mtp_ngram_first_max_proposed_per_round"] == 4
     assert timing["qwen_mtp_ngram_first_attempts"] == 5
     assert timing["qwen_mtp_ngram_first_matches"] == 2
     assert timing["qwen_mtp_ngram_first_proposed"] == 2
@@ -258,6 +266,8 @@ def test_vision_protocol_timing_exposes_qwen_mtp_round_trace():
     assert timing["qwen_mtp_native_draft_rejected"] == 1
     assert timing["qwen_mtp_proposal_sources"] == "NMNMN"
     assert timing["qwen_mtp_accepted_by_step"] == [2, 1]
+    assert timing["qwen_mtp_ngram_first_accepted_by_step"] == [1, 0, 0, 0]
+    assert timing["qwen_mtp_ngram_first_verified_by_step"] == [1, 1, 0, 0]
     assert timing["qwen_mtp_q_policy"] == {"kind": "flat", "top_k": 4}
     assert timing["qwen_mtp_proposal_q_replay"] == replay
 

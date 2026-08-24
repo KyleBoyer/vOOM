@@ -12,8 +12,13 @@ from pathlib import Path
 import mlx.core as mx
 import pytest
 
+from runtime.dflash2_adapter import inspect_runtime_sidecar
 from runtime.dflash2_schema import DFlash2Config
-from runtime.dflash2_sidecar import build_sidecar, validate_sidecar
+from runtime.dflash2_sidecar import (
+    MANIFEST_NAME,
+    build_sidecar,
+    validate_sidecar,
+)
 
 
 REVISION = "a" * 40
@@ -133,3 +138,35 @@ def test_sidecar_validator_rejects_config_quantization_tamper(tmp_path):
 
     with pytest.raises(ValueError, match="quantization metadata mismatch"):
         validate_sidecar(source, output, **common)
+
+
+def test_runtime_header_accepts_pinned_q4_and_fails_closed_on_promotion_tamper(
+    tmp_path,
+):
+    source = tmp_path / "source"
+    output = tmp_path / "sidecar"
+    common = _write_source(source)
+    build_sidecar(
+        source, output, min_free_bytes=0, group_size=64, bits=4,
+        mode="affine", **common)
+
+    config, physical_names, manifest = inspect_runtime_sidecar(
+        output, require_official_geometry=False)
+    assert config.checkpoint.target_layer_ids == (0, 2)
+    assert len(physical_names) == manifest["output"]["tensor_count"]
+
+    config_path = output / "config.json"
+    raw = json.loads(config_path.read_text())
+    raw["vmodel_sidecar"]["enabled_by_default"] = True
+    config_path.write_text(json.dumps(raw))
+    with pytest.raises(ValueError, match="default-off contract"):
+        inspect_runtime_sidecar(output, require_official_geometry=False)
+
+    raw["vmodel_sidecar"]["enabled_by_default"] = False
+    config_path.write_text(json.dumps(raw))
+    manifest_path = output / MANIFEST_NAME
+    raw_manifest = json.loads(manifest_path.read_text())
+    raw_manifest["serving"]["runtime_supported"] = True
+    manifest_path.write_text(json.dumps(raw_manifest))
+    with pytest.raises(ValueError, match="default-off serving gate"):
+        inspect_runtime_sidecar(output, require_official_geometry=False)
