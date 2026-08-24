@@ -96,9 +96,9 @@ def test_builtin_profiles_resolve_complete_agent_group():
     )
     assert huihui_settings[
         "VMODEL_QWEN35_PREFILL_CHUNK_CEILING"] == "128"
-    assert huihui_settings["VMODEL_QWEN35_MIN_AVAILABLE_MB"] == "5500"
+    assert huihui_settings["VMODEL_QWEN35_MIN_AVAILABLE_MB"] == "5300"
     assert huihui_settings[
-        "VMODEL_QWEN35_POSTGEN_MIN_AVAILABLE_MB"] == "5500"
+        "VMODEL_QWEN35_POSTGEN_MIN_AVAILABLE_MB"] == "5300"
     assert huihui_settings["VMODEL_QWEN_MTP_DEPTH"] == "1"
     assert huihui_settings[
         "VMODEL_QWEN_MTP_STOCHASTIC_DRAFT_TOP_K"] == "1"

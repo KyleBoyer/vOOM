@@ -114,3 +114,9 @@ def test_mixed_depth_store_ignores_endpoint_checkpoint(tmp_path):
         checkpoint_kind="endpoint",
     ) == ("stable",)
     assert not list(tmp_path.glob("*.mixed.json"))
+
+
+def test_mixed_depth_store_declares_approximate_stable_prefix_requirement(
+        tmp_path):
+    store = _store(tmp_path)
+    assert store.requires_approximate_stable_prefix is True

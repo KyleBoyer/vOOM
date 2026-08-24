@@ -152,6 +152,23 @@ def test_matched_stable_boundary_is_forked_before_suffix_mutates_source():
         ) is None
 
 
+def test_mixed_depth_disk_boundary_is_skipped_for_exact_short_prompt():
+    from runtime.engine import _stable_boundary_persistence_allowed
+
+    mixed_store = SimpleNamespace(
+        requires_approximate_stable_prefix=True)
+    ordinary_store = SimpleNamespace()
+
+    assert not _stable_boundary_persistence_allowed(
+        mixed_store, approximate=False)
+    assert _stable_boundary_persistence_allowed(
+        mixed_store, approximate=True)
+    assert _stable_boundary_persistence_allowed(
+        ordinary_store, approximate=False)
+    assert not _stable_boundary_persistence_allowed(
+        None, approximate=True)
+
+
 def test_non_recurrent_model_always_uses_full_endpoint_even_with_a_fork():
     """A boundary fork should never even be produced for an ordinary
     attention-KV model (the fork site in generate() is itself gated on

@@ -46,6 +46,12 @@ _FORMAT = "qwen-mixed-depth-stable-prefix-v1"
 class QwenMixedDepthPromptPersistence:
     """Checksummed full snapshots for Qwen mixed-depth stable prefixes."""
 
+    # Short prompts can stay on the ordinary exact path when the configured
+    # suffix window already covers the whole request.  Their state is not a
+    # mixed-depth snapshot and must be retained only by the in-memory hot slot;
+    # the engine consults this capability before calling ``save``.
+    requires_approximate_stable_prefix = True
+
     def __init__(
         self,
         directory: str | Path,

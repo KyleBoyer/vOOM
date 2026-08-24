@@ -92,6 +92,17 @@ def _fork_matched_hybrid_stable_boundary(
     return None
 
 
+def _stable_boundary_persistence_allowed(persistence, *, approximate: bool) -> bool:
+    """Whether a stable boundary is representable by this disk format."""
+    if persistence is None:
+        return False
+    return bool(
+        approximate
+        or not getattr(
+            persistence, "requires_approximate_stable_prefix", False)
+    )
+
+
 def hybrid_prefill_chunk_size(available_bytes: int, model_scale: int = 0) -> int:
     """F94/F95: descending chunk-size ladder for qwen3_5/qwen3_5_moe's fixed,
     hot_prompt_kv-compatible prefill chunk (GLM's live adaptive_chunk_size
@@ -9780,9 +9791,19 @@ class StreamingEngine:
                 # parent of the later full endpoint, so this adds only the
                 # recurrent checkpoint payload rather than duplicating prefix
                 # KV bytes.
-                if (self.cfg.model_type in ("qwen3_5", "qwen3_5_moe")
-                        and boundary_fork_kv is not None
-                        and 0 < boundary_fork_tokens <= len(tokens)):
+                stable_boundary_available = bool(
+                    self.cfg.model_type in ("qwen3_5", "qwen3_5_moe")
+                    and boundary_fork_kv is not None
+                    and 0 < boundary_fork_tokens <= len(tokens)
+                )
+                stable_boundary_persistable = bool(
+                    stable_boundary_available
+                    and _stable_boundary_persistence_allowed(
+                        self._hot_kv_persist,
+                        approximate=prompt_state_approximate,
+                    )
+                )
+                if stable_boundary_persistable:
                     boundary_recurrent = getattr(
                         boundary_fork_kv, "kda_cache", None)
                     if boundary_recurrent is None:
@@ -9808,6 +9829,14 @@ class StreamingEngine:
                     path_stats[
                         "hot_prompt_hybrid_prefix_snapshot_tokens"] = (
                             boundary_fork_tokens)
+                elif stable_boundary_available:
+                    # The configured mixed-depth schedule is content-blind,
+                    # but a short request may fit wholly inside its suffix
+                    # window and therefore remain exact.  Such state is a
+                    # valid in-memory boundary fork, not a mixed-depth disk
+                    # snapshot.  Skipping it is both safe and observable.
+                    path_stats[
+                        "hot_prompt_mixed_depth_snapshot_skipped_exact"] = 1
                 segment_chain = self._hot_kv_persist.save(
                     parent_chain=endpoint_parent_chain,
                     parent_covered=endpoint_parent_covered,
