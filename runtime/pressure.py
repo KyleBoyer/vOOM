@@ -350,16 +350,18 @@ class MemoryGovernor:
                 f"ceiling={ceiling / 1e9:.2f}GB"
             )
 
-        # Serial verification now pre-admits every missing layer page. Within
-        # that bounded path, only the portion of a budget reduction that
+        # Dense-Qwen prefill and serial verification now pre-admit every
+        # missing layer page. Within those bounded paths, only the portion of
+        # a budget reduction that
         # evicted real cache bytes can have made this allocation safe;
         # MLX-cache cleanup or a fresher live-memory sample resolved the rest.
         # Keeping that ineffective portion permanently caused repeated tiny
         # scratch reservations to ratchet a mostly-empty Qwen cache to the
         # floor. Restore the excess while retaining a conservative reduction
         # equal to actual cache bytes released. This is intentionally scoped
-        # to the explicit serial-verifier reasons: older callers with unknown
-        # page estimates retain the established persistent-shrink behavior.
+        # to explicit, physically priced Qwen page admissions: older callers
+        # with unknown page estimates retain the established persistent-shrink
+        # behavior.
         # Raising a limit allocates nothing, prefetch remains paused, and the
         # next serial page admission still re-samples and fails closed.
         retained_reduction = min(reduced_this_call, released_this_call)
@@ -368,7 +370,11 @@ class MemoryGovernor:
             int(getattr(self, "shrinks", 0) or 0)
             > starting_pressure_shrinks
         )
-        if (reason.startswith("serial-verify-")
+        reversible_admission = (
+            reason.startswith("serial-verify-")
+            or reason == "qwen-prefill-layer-page"
+        )
+        if (reversible_admission
                 and self.cache.max_bytes < target_max
                 and not pressure_shrank_concurrently):
             restored = target_max - int(self.cache.max_bytes)

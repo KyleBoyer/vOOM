@@ -390,6 +390,12 @@ def _cache_io_snapshot(engine) -> tuple[int, ...]:
             governor, "reservation_reason_counts", {}
         ).get("serial-verify-transient", 0) or 0),
         int(getattr(
+            governor, "reservation_reason_counts", {}
+        ).get("qwen-prefill-layer-page", 0) or 0),
+        int(getattr(
+            governor, "reservation_reason_counts", {}
+        ).get("qwen-prefill-transient", 0) or 0),
+        int(getattr(
             governor, "reservation_requested_bytes", 0) or 0),
         int(getattr(
             governor, "reservation_budget_reduced_bytes", 0) or 0),
@@ -436,6 +442,8 @@ def _record_cache_io_delta(
         "governor_reservation_clear_cache_only_calls",
         "governor_serial_verify_page_reservation_calls",
         "governor_serial_verify_transient_reservation_calls",
+        "governor_qwen_prefill_page_reservation_calls",
+        "governor_qwen_prefill_transient_reservation_calls",
         "governor_reservation_requested_bytes",
         "governor_reservation_budget_reduced_bytes",
         "governor_reservation_budget_restored_bytes",
@@ -5442,7 +5450,10 @@ class StreamingEngine:
                 if incoming_page:
                     self.cache.prepare_for(incoming_page)
                     if self.governor is not None:
-                        self.governor.reserve(incoming_page)
+                        self.governor.reserve(
+                            incoming_page,
+                            reason="qwen-prefill-layer-page",
+                        )
             w = self.cache.get(layer_key, layer_names)
             if self._dsv4_packed_trunk:
                 w = self._materialize_packed_trunk(w)
@@ -5487,7 +5498,9 @@ class StreamingEngine:
                     try:
                         self.governor.reserve(
                             scratch_reserve,
-                            margin=reserve_margin)
+                            margin=reserve_margin,
+                            reason="qwen-prefill-transient",
+                        )
                     except MemoryError:
                         print(
                             "[qwen35-prefill-admission] "

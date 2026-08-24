@@ -352,6 +352,40 @@ def test_protocol_timing_exposes_pin_and_prefetch_measurements():
     assert timing["planned_trunk_pin_bytes"] == 350_000_000
 
 
+def test_protocol_timing_exposes_governor_admission_measurements():
+    timing = _vision_protocol_timing({
+        "path_stats": {
+            "weight_cache_resident_bytes": 675_000_000,
+            "weight_cache_budget_bytes": 860_000_000,
+            "governor_reservations": 12,
+            "governor_reservation_calls": 300,
+            "governor_reservation_fast_path_calls": 280,
+            "governor_reservation_clear_cache_only_calls": 3,
+            "governor_serial_verify_page_reservation_calls": 64,
+            "governor_serial_verify_transient_reservation_calls": 64,
+            "governor_qwen_prefill_page_reservation_calls": 64,
+            "governor_qwen_prefill_transient_reservation_calls": 128,
+            "governor_reservation_requested_bytes": 1_000_000_000,
+            "governor_reservation_budget_reduced_bytes": 400_000_000,
+            "governor_reservation_budget_restored_bytes": 200_000_000,
+            "governor_reservation_cache_released_bytes": 200_000_000,
+            "governor_reservation_unproductive_shrinks": 5,
+            "governor_reservation_failures": 0,
+        },
+    })
+
+    assert timing["weight_cache_resident_bytes"] == 675_000_000
+    assert timing["weight_cache_budget_bytes"] == 860_000_000
+    assert timing["governor_reservations"] == 12
+    assert timing["governor_reservation_calls"] == 300
+    assert timing["governor_serial_verify_page_reservation_calls"] == 64
+    assert timing["governor_qwen_prefill_page_reservation_calls"] == 64
+    assert timing["governor_reservation_budget_reduced_bytes"] == 400_000_000
+    assert timing["governor_reservation_budget_restored_bytes"] == 200_000_000
+    assert timing["governor_reservation_cache_released_bytes"] == 200_000_000
+    assert timing["governor_reservation_unproductive_shrinks"] == 5
+
+
 def test_protocol_timing_exposes_row_paged_head_recall_measurements():
     timing = _vision_protocol_timing({
         "path_stats": {
@@ -5064,6 +5098,8 @@ def test_cache_io_delta_reports_only_current_request():
             reservation_reason_counts={
                 "serial-verify-layer-page": 2,
                 "serial-verify-transient": 3,
+                "qwen-prefill-layer-page": 4,
+                "qwen-prefill-transient": 5,
             },
             reservation_requested_bytes=100,
             reservation_budget_reduced_bytes=200,
@@ -5090,11 +5126,15 @@ def test_cache_io_delta_reports_only_current_request():
         "serial-verify-layer-page"] += 12
     engine.governor.reservation_reason_counts[
         "serial-verify-transient"] += 13
-    engine.governor.reservation_requested_bytes += 14
-    engine.governor.reservation_budget_reduced_bytes += 15
-    engine.governor.reservation_budget_restored_bytes += 16
-    engine.governor.reservation_cache_released_bytes += 17
-    engine.governor.reservation_unproductive_shrinks += 18
+    engine.governor.reservation_reason_counts[
+        "qwen-prefill-layer-page"] += 14
+    engine.governor.reservation_reason_counts[
+        "qwen-prefill-transient"] += 15
+    engine.governor.reservation_requested_bytes += 16
+    engine.governor.reservation_budget_reduced_bytes += 17
+    engine.governor.reservation_budget_restored_bytes += 18
+    engine.governor.reservation_cache_released_bytes += 19
+    engine.governor.reservation_unproductive_shrinks += 20
     engine.store.fast_tier_bytes += 9
     engine.store.archive_bytes += 10
     store_stages[0] += 11
@@ -5120,11 +5160,13 @@ def test_cache_io_delta_reports_only_current_request():
     assert stats["governor_reservation_clear_cache_only_calls"] == 11
     assert stats["governor_serial_verify_page_reservation_calls"] == 12
     assert stats["governor_serial_verify_transient_reservation_calls"] == 13
-    assert stats["governor_reservation_requested_bytes"] == 14
-    assert stats["governor_reservation_budget_reduced_bytes"] == 15
-    assert stats["governor_reservation_budget_restored_bytes"] == 16
-    assert stats["governor_reservation_cache_released_bytes"] == 17
-    assert stats["governor_reservation_unproductive_shrinks"] == 18
+    assert stats["governor_qwen_prefill_page_reservation_calls"] == 14
+    assert stats["governor_qwen_prefill_transient_reservation_calls"] == 15
+    assert stats["governor_reservation_requested_bytes"] == 16
+    assert stats["governor_reservation_budget_reduced_bytes"] == 17
+    assert stats["governor_reservation_budget_restored_bytes"] == 18
+    assert stats["governor_reservation_cache_released_bytes"] == 19
+    assert stats["governor_reservation_unproductive_shrinks"] == 20
     assert stats["weight_fast_tier_bytes"] == 9
     assert stats["weight_archive_bytes"] == 10
     assert stats["ct_mxfp4_transform_ns"] == 11
