@@ -8031,6 +8031,8 @@ def _vision_protocol_timing(result: dict) -> dict:
         "dspark_sidecar_round_releases",
         "dspark_sidecar_loaded_bytes",
         "dspark_sidecar_released_active_bytes",
+        "dspark_deferred_context_positions",
+        "dspark_deferred_context_bytes_peak",
         "qwen_mtp_enabled",
         "qwen_mtp_used",
         "qwen_mtp_proposed",

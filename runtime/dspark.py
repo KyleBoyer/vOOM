@@ -253,17 +253,32 @@ class DSparkTapCollector:
     """
 
     def __init__(
-        self, drafter: "DSparkDrafter", caches: list[CtxCache], *,
+        self, drafter: "DSparkDrafter | None", caches: list[CtxCache], *,
         position_floor: int = 0,
+        tap_layers: tuple[int, ...] | list[int] | None = None,
+        defer_updates: bool = False,
     ):
         self.drafter = drafter
         self.caches = caches
         if int(position_floor) < 0:
             raise ValueError("DSpark context position floor must be non-negative")
         self.position_floor = int(position_floor)
-        self.tap_layers = tuple(int(v) for v in drafter.config.target_layer_ids)
+        if tap_layers is None:
+            if drafter is None:
+                raise ValueError(
+                    "deferred DSpark tap collection requires tap_layers")
+            tap_layers = drafter.config.target_layer_ids
+        self.tap_layers = tuple(int(v) for v in tap_layers)
+        if not self.tap_layers:
+            raise ValueError("DSpark tap collection requires at least one layer")
+        self.defer_updates = bool(defer_updates)
+        if drafter is None and not self.defer_updates:
+            raise ValueError("immediate DSpark tap collection needs a drafter")
         self._wanted = set(self.tap_layers)
         self._seen: dict[int, tuple[int, int, mx.array]] = {}
+        self._deferred_chunks: list[tuple[int, mx.array]] = []
+        self.deferred_bytes_peak = 0
+        self._deferred_end: int | None = None
         self.updates = 0
         self.positions = 0
         self.update_s = 0.0
@@ -279,6 +294,12 @@ class DSparkTapCollector:
         """
         self.attempts += 1
         self._seen.clear()
+        self._deferred_chunks.clear()
+        self.deferred_bytes_peak = 0
+        self._deferred_end = None
+        self.updates = 0
+        self.positions = 0
+        self.update_s = 0.0
         for cache in self.caches:
             cache.k = None
             cache.v = None
@@ -335,20 +356,37 @@ class DSparkTapCollector:
             left = canonical_start - start_i
             aligned.append(hidden_i[:, left:left + canonical_end - canonical_start, :])
 
-        started = time.perf_counter()
-        self.drafter.update_context(
-            mx.concatenate(aligned, axis=-1),
-            canonical_start,
-            self.caches,
-        )
-        mx.eval(*[
-            value
-            for cache in self.caches
-            for value in (cache.k, cache.v)
-            if value is not None
-        ])
-        self.update_s += time.perf_counter() - started
-        self.updates += 1
+        fused = mx.concatenate(aligned, axis=-1)
+        if self.defer_updates:
+            if (self._deferred_end is not None
+                    and canonical_start != self._deferred_end):
+                raise ValueError(
+                    "deferred DSpark taps are not contiguous: "
+                    f"expected {self._deferred_end}, got {canonical_start}")
+            # Materialize now so the retained bounded window does not keep the
+            # target layers' larger lazy graphs alive until the sidecar loads.
+            mx.eval(fused)
+            self._deferred_chunks.append((canonical_start, fused))
+            self._deferred_end = canonical_end
+            retained = sum(
+                int(value.nbytes) for _offset, value in self._deferred_chunks)
+            self.deferred_bytes_peak = max(
+                self.deferred_bytes_peak, retained)
+        else:
+            started = time.perf_counter()
+            self.drafter.update_context(
+                fused,
+                canonical_start,
+                self.caches,
+            )
+            mx.eval(*[
+                value
+                for cache in self.caches
+                for value in (cache.k, cache.v)
+                if value is not None
+            ])
+            self.update_s += time.perf_counter() - started
+            self.updates += 1
         self.positions += canonical_end - canonical_start
         self._seen.clear()
 
@@ -357,11 +395,45 @@ class DSparkTapCollector:
             raise RuntimeError(
                 "target prefill ended with an incomplete DSpark tap set: "
                 f"{sorted(self._seen)}")
+        if self.defer_updates:
+            if self._deferred_end != int(expected_end):
+                raise RuntimeError(
+                    "deferred DSpark taps did not reach the target prompt "
+                    "endpoint")
+            return
         if not self.caches or any(
-            cache.position_end != int(expected_end) for cache in self.caches
-        ):
+                cache.position_end != int(expected_end) for cache in self.caches):
             raise RuntimeError(
                 "DSpark context did not reach the target prompt endpoint")
+
+    def materialize(self, drafter: "DSparkDrafter") -> None:
+        """Project a bounded retained tap window after target prefill.
+
+        DFlash2's quantized sidecar is intentionally absent while the larger
+        target streams its prompt layers. Only fused released target residuals
+        are retained, then projected into request-local draft K/V afterward.
+        """
+        if not self.defer_updates:
+            raise RuntimeError("immediate DSpark collector cannot materialize")
+        if any(cache.length for cache in self.caches):
+            raise RuntimeError("deferred DSpark context cache is not empty")
+        started = time.perf_counter()
+        for offset, fused in self._deferred_chunks:
+            drafter.update_context(fused, offset, self.caches)
+            mx.eval(*[
+                value
+                for cache in self.caches
+                for value in (cache.k, cache.v)
+                if value is not None
+            ])
+            self.updates += 1
+        self.update_s += time.perf_counter() - started
+        if not self.caches or any(
+                cache.position_end != self._deferred_end
+                for cache in self.caches):
+            raise RuntimeError(
+                "materialized DSpark context missed the retained endpoint")
+        self._deferred_chunks.clear()
 
 
 class _DSparkBootstrapPrompt(str):
@@ -957,6 +1029,8 @@ class DSparkStats:
     sidecar_release_s: float = 0.0
     sidecar_loaded_bytes: int = 0
     sidecar_released_active_bytes: int = 0
+    deferred_context_positions: int = 0
+    deferred_context_bytes_peak: int = 0
     rounds: list[tuple[int, int]] = field(default_factory=list)
 
 
@@ -1031,6 +1105,12 @@ class DSparkSpeculativeDecoder:
         # factor replay remains the lossless default until a released-model
         # greedy token-identity gate admits this kernel.
         self.native_kda_factor_commit = bool(native_kda_factor_commit)
+        # Large proposal models can retain a bounded target-tap window during
+        # prompt streaming and project it only after the target sweep.
+        self.defer_prompt_context_updates = False
+
+    def _new_ctx_caches(self) -> list[CtxCache]:
+        return self._ensure_drafter().make_ctx_cache()
 
     def _ensure_drafter(self, stats: DSparkStats | None = None):
         if self.drafter is not None:
@@ -1241,7 +1321,7 @@ class DSparkSpeculativeDecoder:
                 self._prompt_cache = None
             target_kv = None if hybrid_qwen else target.new_kv(
                 stepped=use_stepped)
-            ctx_caches = self._ensure_drafter().make_ctx_cache()
+            ctx_caches = self._new_ctx_caches()
             prompt_last_logits = None
             prompt_last_hidden = None
         taps = set(self._cfg.target_layer_ids)
@@ -1257,8 +1337,15 @@ class DSparkSpeculativeDecoder:
                 max(0, len(ids) - self.context_window_tokens)
                 if self.context_window_tokens else 0)
             collector = DSparkTapCollector(
-                self._ensure_drafter(), ctx_caches,
-                position_floor=context_floor)
+                (None if self.defer_prompt_context_updates
+                 else self._ensure_drafter()),
+                ctx_caches,
+                position_floor=context_floor,
+                tap_layers=(
+                    self._cfg.target_layer_ids
+                    if self.defer_prompt_context_updates else None),
+                defer_updates=self.defer_prompt_context_updates,
+            )
             target.begin_dspark_tap_capture(collector)
             try:
                 bootstrap_prompt = _DSparkBootstrapPrompt(prompt, ids)
@@ -1276,6 +1363,11 @@ class DSparkSpeculativeDecoder:
             finally:
                 target.end_dspark_tap_capture(collector)
             collector.finish(len(ids))
+            if self.defer_prompt_context_updates:
+                stats.deferred_context_positions = collector.positions
+                stats.deferred_context_bytes_peak = (
+                    collector.deferred_bytes_peak)
+                collector.materialize(self._ensure_drafter(stats))
             collector_update_s = collector.update_s
             # The collector otherwise owns the same large module after tap
             # collection has completed, defeating the round lifetime below.
@@ -1787,6 +1879,10 @@ class DSparkSpeculativeDecoder:
                 "dspark_confidence_threshold": self.confidence_threshold,
                 "dspark_context_s": stats.context_s,
                 "dspark_context_window_tokens": self.context_window_tokens,
+                "dspark_deferred_context_positions": (
+                    stats.deferred_context_positions),
+                "dspark_deferred_context_bytes_peak": (
+                    stats.deferred_context_bytes_peak),
                 "dspark_kda_factor_bytes_peak": (
                     stats.kda_factor_bytes_peak),
                 "dspark_kda_factor_restores": stats.kda_factor_restores,

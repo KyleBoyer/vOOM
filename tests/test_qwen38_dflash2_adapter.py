@@ -313,6 +313,67 @@ def test_exact_qwen38_taps_are_fused_in_declared_order_across_chunks():
     assert cache.length == 7
 
 
+def test_dflash_taps_defer_weighted_projection_until_after_target_prefill():
+    drafter = _RecordingTapDrafter()
+    cache = CtxCache()
+    collector = DSparkTapCollector(
+        None,
+        [cache],
+        tap_layers=TAPS,
+        position_floor=2,
+        defer_updates=True,
+    )
+    collector.begin_attempt()
+
+    for start, width in ((0, 3), (3, 4)):
+        positions = mx.arange(start, start + width, dtype=mx.float32)
+        for layer in reversed(TAPS):
+            hidden = (positions + layer * 1000).reshape(1, width, 1)
+            collector.observe(layer, hidden, position_start=start)
+
+    collector.finish(7)
+    assert drafter.updates == []
+    assert cache.length == 0
+    assert collector.positions == 5
+    assert collector.deferred_bytes_peak == 5 * len(TAPS) * 4
+
+    collector.materialize(drafter)
+    assert [offset for offset, _hidden in drafter.updates] == [2, 3]
+    assert cache.position_start == 2
+    assert cache.position_end == 7
+    assert cache.length == 5
+    assert collector.updates == 2
+
+
+def test_deferred_taps_fail_closed_on_gaps_and_incomplete_endpoint():
+    collector = DSparkTapCollector(
+        None, [CtxCache()], tap_layers=TAPS, defer_updates=True)
+    collector.begin_attempt()
+    for layer in TAPS:
+        collector.observe(
+            layer,
+            mx.zeros((1, 1, 1), dtype=mx.float32),
+            position_start=0,
+        )
+    with pytest.raises(RuntimeError, match="did not reach"):
+        collector.finish(3)
+
+    for layer in TAPS[:-1]:
+        collector.observe(
+            layer,
+            mx.zeros((1, 1, 1), dtype=mx.float32),
+            position_start=2,
+        )
+    # The second chunk begins at 2, leaving position 1 absent. The mismatch is
+    # detected as soon as the final tap completes that set.
+    with pytest.raises(ValueError, match="not contiguous"):
+        collector.observe(
+            TAPS[-1],
+            mx.zeros((1, 1, 1), dtype=mx.float32),
+            position_start=2,
+        )
+
+
 def test_dflash_context_left_trim_preserves_absolute_endpoint_and_recent_values():
     cache = CtxCache()
     keys = mx.arange(7, dtype=mx.float32).reshape(1, 1, 7, 1)

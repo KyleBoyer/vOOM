@@ -694,8 +694,14 @@ class DFlash2SpeculativeDecoder(DSparkSpeculativeDecoder):
             drafter_storage_bytes=drafter_storage_bytes,
             drafter_load_margin_bytes=drafter_load_margin_bytes,
         )
+        self.defer_prompt_context_updates = True
         self._candidate_rounds: list[list[list[int]]] = []
         self._unary_rounds: list[list[int]] = []
+
+    def _new_ctx_caches(self) -> list[CtxCache]:
+        # Cache containers have no weights. Construct them without making the
+        # 1.08 GB draft sidecar resident during target prompt streaming.
+        return [CtxCache() for _ in range(self._cfg.num_hidden_layers)]
 
     def _propose(
         self,
@@ -826,6 +832,10 @@ class DFlash2SpeculativeEngine:
         self._speculative_k = self.decoder.max_draft_tokens
         self._speculative_draft_dir = draft_dir
         self._speculative_kind = "dflash2"
+        if release_between_sweeps:
+            # Construction validates and binds the artifact. The first request
+            # reloads it only after the target prompt endpoint is complete.
+            self.decoder._release_drafter()
 
     def __getattr__(self, name):
         return getattr(self.target, name)
