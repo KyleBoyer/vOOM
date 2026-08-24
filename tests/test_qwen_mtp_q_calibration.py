@@ -146,6 +146,8 @@ def test_round_local_weights_activate_only_for_validated_sidecar():
     class Store:
         def __init__(self, sidecar):
             self.mtplx_mtp_sidecar = sidecar
+            self._mtplx_mtp_sidecar_layout = {
+                "mtp.norm.weight": ("BF16", (4,), 8)}
 
         def names_with_prefix(self, prefix):
             assert prefix == "mtp."
@@ -155,6 +157,8 @@ def test_round_local_weights_activate_only_for_validated_sidecar():
         def __init__(self):
             self.calls = 0
             self.discards = 0
+            self.prepares = []
+            self.total_bytes = 24
             self.weights = {
                 "mtp.norm.weight": mx.ones((4,), dtype=mx.bfloat16)}
 
@@ -164,6 +168,10 @@ def test_round_local_weights_activate_only_for_validated_sidecar():
             assert names == ["mtp.norm.weight"]
             assert not apply_transform
             return self.weights
+
+        def prepare_for(self, incoming_bytes):
+            self.prepares.append(int(incoming_bytes))
+            self.total_bytes = 16
 
         def discard(self, key, names):
             self.discards += 1
@@ -175,6 +183,8 @@ def test_round_local_weights_activate_only_for_validated_sidecar():
     drafter = QwenMTPDrafter(SimpleNamespace(
         store=Store("mtp.safetensors"), cache=cache))
     retained = drafter.prepare_request_weights()
+    assert cache.prepares == [8]
+    assert drafter.last_cache_prepare_released_bytes == 8
     assert retained is cache.weights
     assert cache.calls == 1
     release = drafter.release_request_weights(retained)

@@ -52,7 +52,9 @@ target-verified native MTP. The MTP module is the released BF16 tensor set,
 loaded only for one speculative round and released before the target sweep.
 Calibration selects a top-1 proposal distribution at depth 1. The compact
 MXFP4 language-model head is pinned and two-layer prefetch is enabled; a trunk
-pin is not. MTP automatically disengages after repeated draft rejections.
+pin is not. MTP measures its draft/target break-even window, temporarily
+disengages after a complete unhelpful window, and periodically re-probes so a
+poor opening region cannot hide a later predictable span.
 Grammar jump-forward and experimental fused DeltaNet kernels stay off because
 they do not have an accepted quality case here.
 
@@ -292,6 +294,17 @@ both canaries, exact required prefix, 9 consecutive validation integers,
 3.580GB peak Metal, 36.323MB swap growth, and 6.557GB available at completion.
 The output hash matched the earlier cached-state semantic run exactly.
 
+That run also exposed a decode-policy bottleneck: MTP rejected the first three
+tokens and then stayed disabled for all 60 remaining sweeps.  The measured
+adaptive policy now waits for the break-even window (14 rounds in the replay)
+and periodically re-probes.  The same fresh-process 16,029/64 request accepted
+26/37 verified proposals and required only 37 target sweeps.  Decode fell to
+260.446s, engine time to 386.718s, and HTTP wall to 387.700s; output SHA-256 was
+unchanged.  Before each known 849.399MB sidecar allocation, consumed target
+pages are evicted using the exact header size.  That made the final gate
+pressure-clean at 4.015GB peak Metal, 16.564MB swap-out growth, and 6.365GB
+available, without a decode regression versus the unguarded corrected run.
+
 A separate no-hot 30,029-input / 32-output run recovered both canaries with
 the exact prefix and marker at 4.055GB peak Metal and 28.754MB swap growth;
 prefill was 348.918s and decode 222.237s. It is a large-context retrieval and
@@ -334,6 +347,8 @@ this work validates 30K on this machine, not the advertised maximum.
 - Focused quality gate: `logs/huihui_qwen38_fast_plex_focused_specific.json`
 - Passing 16K/64 sustained gate:
   `logs/qwen38_large_context_16k_out64_nohot.json`
+- Passing 16K/64 adaptive-MTP/cache-overlap gate:
+  `logs/qwen38_large_context_16k_out64_mtp_recovery_cache_prepare.json`
 - 30K/32 retrieval result (composite red only for second integer):
   `logs/qwen38_large_context_30k_out32_nohot.json`
 - 30K/128 pressure STOP:

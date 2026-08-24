@@ -53,6 +53,7 @@ class _Engine:
 
 def test_qwen_mtp_adaptive_break_even_uses_refeed_free_rejection_math():
     from runtime.qwen35_mtp import (
+        _adaptive_break_even_probe_rounds,
         _adaptive_mtp_should_disable,
         _adaptive_stochastic_mtp_should_disable,
     )
@@ -64,6 +65,116 @@ def test_qwen_mtp_adaptive_break_even_uses_refeed_free_rejection_math():
     assert _adaptive_stochastic_mtp_should_disable(3, 0.12, 3)
     assert not _adaptive_stochastic_mtp_should_disable(3, 0.18, 3)
     assert not _adaptive_stochastic_mtp_should_disable(2, 0.0, 3)
+    # The observed Huihui cost shape is about 0.54s of draft work for a
+    # 7.2s target sweep: three misses are much too little evidence. The
+    # measured break-even window is 14 rounds, bounded to 16 under even
+    # cheaper/noisier drafts.
+    assert _adaptive_break_even_probe_rounds(0.54, 7.2, 3) == 14
+    assert _adaptive_break_even_probe_rounds(0.1, 7.2, 3) == 16
+    assert _adaptive_break_even_probe_rounds(4.0, 7.2, 3) == 3
+    assert _adaptive_break_even_probe_rounds(0.0, 0.0, 3) == 3
+    with pytest.raises(ValueError, match="maximum adaptive probe"):
+        _adaptive_break_even_probe_rounds(1.0, 1.0, 4, 3)
+
+
+def test_qwen_mtp_adaptive_cooldown_reprobes_and_reactivates(monkeypatch):
+    """A bad opening region must not permanently hide a later useful draft."""
+    import runtime.qwen35_mtp as mtp_module
+    from runtime.qwen35_mtp import QwenMTPSpeculativeEngine
+
+    monkeypatch.setattr(
+        mtp_module, "_adaptive_break_even_probe_rounds",
+        lambda *_args, **_kwargs: 3)
+
+    class KV:
+        def __init__(self):
+            self.offset = 3
+            self.kda_cache = None
+
+        def trim(self, offset):
+            self.offset = int(offset)
+
+        def nbytes(self):
+            return 0
+
+    class Target(_Engine):
+        def __init__(self):
+            super().__init__("/models/target")
+            self.cfg = SimpleNamespace(num_experts=0, eos_token_ids=())
+            self.cache = SimpleNamespace(
+                stats=SimpleNamespace(
+                    hits=0, misses=0, evictions=0, bytes_read=0),
+                total_bytes=0, max_bytes=1)
+            for name in (
+                "fast_tier_bytes", "archive_bytes", "parallel_tier_fetches",
+                "parallel_tier_fast_bytes", "parallel_tier_archive_bytes",
+            ):
+                setattr(self.store, name, 0)
+            self.expert_hits = self.expert_misses = 0
+            self.governor = None
+            self._layer_transient = self._prefill_layer_transient = 0
+            self._decode_layer_transient = self._layer_transient_margin = 0
+            self._token_transient = self._true_peak_metal_bytes = 0
+            self._request_profiler = None
+            self._hot_prompt_slots = []
+            self._h_last = mx.zeros((1, 1, 1))
+            self._h_window = self._h_last
+            self.last_kv = None
+            self.accepts = iter((False, False, False, True, False, False))
+            self.plain_calls = 0
+
+        def generate(self, _prompt, max_tokens, **_kwargs):
+            assert max_tokens == 1
+            self.last_kv = KV()
+            return {
+                "text": "4", "tokens": [4], "prefill_s": 0.0,
+                "first_token_s": 0.0, "decode_s": 0.0, "total_s": 0.0,
+                "termination_reason": "length", "stop_sequence": None,
+                "path_stats": {}, "prompt_tokens": 3,
+            }
+
+        def forward_tokens_serial_positions(
+            self, tokens, kv, *, capture_kda_endpoints=False,
+        ):
+            assert tokens == [tokens[0], 9]
+            assert not capture_kda_endpoints
+            accepted = next(self.accepts)
+            kv.offset += 2
+            self._h_window = mx.zeros((1, 2, 1))
+            self._h_last = self._h_window[:, -1:, :]
+            logits = mx.zeros((2, 12))
+            logits = logits.at[0, 9 if accepted else 6].add(2)
+            return logits.at[1, 7].add(2)
+
+        def forward_tokens(self, tokens, kv):
+            assert len(tokens) == 1
+            self.plain_calls += 1
+            kv.offset += 1
+            self._h_window = self._h_last = mx.zeros((1, 1, 1))
+            return mx.zeros((1, 12)).at[0, 6].add(2)
+
+    class Drafter:
+        @staticmethod
+        def draft_token(*_args, **_kwargs):
+            return 9
+
+    target = Target()
+    engine = QwenMTPSpeculativeEngine(
+        target, max_prompt_tokens=8, min_output_tokens=2,
+        plain_warmup_tokens=0, adaptive_probe_rounds=3,
+        adaptive_reprobe_interval=2)
+    engine.drafter = Drafter()
+    result = engine.generate("x", 10)
+    stats = result["path_stats"]
+
+    assert len(result["tokens"]) == 10
+    assert target.plain_calls == 2
+    assert stats["qwen_mtp_round_outcomes"] == "RRRARR"
+    assert stats["qwen_mtp_adaptive_disable_events"] == 1
+    assert stats["qwen_mtp_adaptive_cooldown_sweeps"] == 2
+    assert stats["qwen_mtp_adaptive_recovery_probes"] == 1
+    assert stats["qwen_mtp_adaptive_reactivations"] == 1
+    assert stats["qwen_mtp_target_sweeps_avoided"] == 1
 
 
 def test_qwen_mtp_adapter_preserves_constraint_on_short_budget_fallback():

@@ -503,6 +503,31 @@ def _adaptive_stochastic_mtp_should_disable(
     )
 
 
+def _adaptive_break_even_probe_rounds(
+    draft_s: float,
+    target_s: float,
+    minimum_rounds: int,
+    maximum_rounds: int = 16,
+) -> int:
+    """Return a bounded, measured all-reject probe budget.
+
+    A successful depth-1 proposal avoids approximately one future target
+    sweep. Therefore an all-reject probe can spend roughly
+    ``target_s / draft_s`` rounds before one later acceptance would no longer
+    repay its accumulated draft overhead. The bounds make startup timing
+    noise harmless and cap regret on genuinely incompatible domains.
+    """
+    if minimum_rounds <= 0:
+        raise ValueError("minimum adaptive probe rounds must be positive")
+    if maximum_rounds < minimum_rounds:
+        raise ValueError(
+            "maximum adaptive probe rounds must be at least the minimum")
+    if draft_s <= 0.0 or target_s <= 0.0:
+        return minimum_rounds
+    measured = int(math.ceil(target_s / draft_s))
+    return min(maximum_rounds, max(minimum_rounds, measured))
+
+
 def _verify_stochastic_mtp_token(
     proposal: int,
     draft_probabilities: mx.array,
@@ -676,6 +701,8 @@ class QwenMTPDrafter:
         # Real tensor names confirmed directly against both released
         # checkpoints' safetensors indices, not inferred.
         self._page_names = [n for n in names if ".mlp.experts." not in n]
+        self.last_cache_prepare_bytes = 0
+        self.last_cache_prepare_released_bytes = 0
 
     def _weights(self, *, released_bf16: bool = False) -> dict:
         # Representation is part of the cache identity.  MTPLX replaces the
@@ -705,6 +732,28 @@ class QwenMTPDrafter:
         """
         if not getattr(self.engine.store, "mtplx_mtp_sidecar", None):
             return None
+        layout = getattr(
+            self.engine.store, "_mtplx_mtp_sidecar_layout", {})
+        expected_resident = sum(
+            int(layout[name][2])
+            for name in self._page_names
+            if name in layout
+        )
+        self.last_cache_prepare_bytes = expected_resident
+        cache_before = int(getattr(self.engine.cache, "total_bytes", 0))
+        prepare_for = getattr(self.engine.cache, "prepare_for", None)
+        if expected_resident and callable(prepare_for):
+            # The cache otherwise discovers this 849 MB page only after it has
+            # already been materialized, briefly overlapping a full target
+            # LRU and delegating the excess to macOS compression/swap. The
+            # sidecar header gives an exact size, so shed consumed target pages
+            # before the allocation. Pinned head rows remain protected.
+            prepare_for(expected_resident)
+        self.last_cache_prepare_released_bytes = max(
+            0,
+            cache_before - int(getattr(
+                self.engine.cache, "total_bytes", cache_before)),
+        )
         weights = self._weights(released_bf16=True)
         try:
             non_bf16 = [
@@ -856,6 +905,7 @@ class QwenMTPSpeculativeEngine:
         proposal_replay_top_k: int = 0,
         depth: int = 1,
         proposal_q_policy: ProposalQPolicy | None = None,
+        adaptive_reprobe_interval: int = 4,
     ):
         if max_prompt_tokens <= 0:
             raise ValueError("max_prompt_tokens must be positive")
@@ -865,6 +915,8 @@ class QwenMTPSpeculativeEngine:
             raise ValueError("adaptive_probe_rounds must be positive")
         if plain_warmup_tokens < 0:
             raise ValueError("plain_warmup_tokens must be non-negative")
+        if adaptive_reprobe_interval <= 0:
+            raise ValueError("adaptive_reprobe_interval must be positive")
         if stochastic_draft_top_k <= 0:
             raise ValueError("stochastic_draft_top_k must be positive")
         if isinstance(proposal_replay_top_k, bool) or proposal_replay_top_k < 0:
@@ -878,6 +930,7 @@ class QwenMTPSpeculativeEngine:
         self.adaptive_stop = bool(adaptive_stop)
         self.adaptive_probe_rounds = int(adaptive_probe_rounds)
         self.plain_warmup_tokens = int(plain_warmup_tokens)
+        self.adaptive_reprobe_interval = int(adaptive_reprobe_interval)
         self.proposal_q_policy = (
             proposal_q_policy
             if proposal_q_policy is not None
@@ -1016,10 +1069,22 @@ class QwenMTPSpeculativeEngine:
         verified_by_step = [0] * self.depth
         target_decode_sweeps = 0
         plain_decode_sweeps = 0
+        plain_timed_sweeps = 0
         warmup_decode_sweeps = 0
         warmup_remaining = self.plain_warmup_tokens
         adaptive_disabled = False
+        adaptive_disabled_ever = False
         adaptive_probe_limit = self.adaptive_probe_rounds
+        adaptive_effective_probe_limit = adaptive_probe_limit
+        adaptive_window_rounds = 0
+        adaptive_window_accepted = 0
+        adaptive_window_expected_acceptance = 0.0
+        adaptive_cooldown_remaining = 0
+        adaptive_cooldown_sweeps = 0
+        adaptive_disable_events = 0
+        adaptive_recovery_probe = False
+        adaptive_recovery_probes = 0
+        adaptive_reactivations = 0
         serial_verify_rounds = 0
         kda_endpoint_restores = 0
         refeed_sweeps_saved = 0
@@ -1039,10 +1104,14 @@ class QwenMTPSpeculativeEngine:
         sidecar_released_resident_bytes = 0
         sidecar_peak_resident_bytes = 0
         sidecar_cache_discards = 0
+        sidecar_cache_prepare_calls = 0
+        sidecar_cache_prepare_bytes = 0
+        sidecar_cache_prepare_released_bytes = 0
         sidecar_load_s = 0.0
         sidecar_release_s = 0.0
         draft_round_s = 0.0
         verifier_round_s = 0.0
+        plain_round_s = 0.0
         verifier_input_positions = 0
         verifier_committed_positions = 0
         verifier_rolled_back_positions = 0
@@ -1219,7 +1288,11 @@ class QwenMTPSpeculativeEngine:
                         for index in range(len(committed_forced))
                     ] + [authoritative_logits]
                     next_catchup_tok = next_free
-            elif warmup_remaining or adaptive_disabled:
+            elif (
+                warmup_remaining
+                or (adaptive_disabled and adaptive_cooldown_remaining > 0)
+            ):
+                plain_started = time.perf_counter()
                 plain_logits = tgt.forward_tokens([catchup_tok], kv)
                 target_decode_sweeps += 1
                 plain_decode_sweeps += 1
@@ -1238,9 +1311,20 @@ class QwenMTPSpeculativeEngine:
                 new_token_logits = [authoritative_logits]
                 h_last = tgt._h_last
                 next_catchup_tok = new_tokens[0]
+                plain_round_s += time.perf_counter() - plain_started
+                plain_timed_sweeps += 1
+                if adaptive_disabled and not warmup_remaining:
+                    adaptive_cooldown_sweeps += 1
+                    adaptive_cooldown_remaining -= 1
+                    if adaptive_cooldown_remaining == 0:
+                        adaptive_disabled = False
+                        adaptive_recovery_probe = True
             else:
                 speculative_round = True
                 speculative_rounds += 1
+                round_accepted_before = accepted
+                round_expected_acceptance_before = (
+                    stochastic_first_step_expected_acceptance_sum)
                 round_start_offset = kv.offset
                 layer_lengths_fn = getattr(kv, "layer_lengths", None)
                 round_start_layer_lengths = (
@@ -1269,6 +1353,16 @@ class QwenMTPSpeculativeEngine:
                         prepare_request_weights()
                         if callable(prepare_request_weights) else None
                     )
+                    prepared_bytes = int(getattr(
+                        self.drafter, "last_cache_prepare_bytes", 0))
+                    if prepared_bytes:
+                        sidecar_cache_prepare_calls += 1
+                        sidecar_cache_prepare_bytes += prepared_bytes
+                        sidecar_cache_prepare_released_bytes += int(getattr(
+                            self.drafter,
+                            "last_cache_prepare_released_bytes",
+                            0,
+                        ))
                     if round_mtp_weights is not None:
                         sidecar_load_s += (
                             time.perf_counter() - sidecar_load_started)
@@ -1665,21 +1759,70 @@ class QwenMTPSpeculativeEngine:
             # every rejected draft now emits one authoritative token in the
             # same target sweep the ordinary path required, while every
             # accepted draft emits two and saves a complete target sweep.
-            # The released draft head is only one extra layer, so any observed
-            # acceptance is useful; disable only after an all-reject probe.
-            # This still bounds truly incompatible prompt/template domains
-            # without throwing away later wins after a mixed A/R prefix.
-            if not adaptive_disabled and self.adaptive_stop:
-                adaptive_disabled = (
-                    _adaptive_mtp_should_disable(
-                        speculative_rounds, accepted, adaptive_probe_limit)
-                    if sampling.is_greedy else
-                    _adaptive_stochastic_mtp_should_disable(
-                        speculative_rounds,
-                        stochastic_first_step_expected_acceptance_sum,
+            # The released draft head is only one extra layer, so one accepted
+            # token can repay several rejected probes. Size the initial window
+            # from the measured target/draft cost instead of disabling forever
+            # after three possibly unrepresentative tokens. A failed window
+            # enters a bounded plain cooldown, then performs one recovery probe
+            # so a later predictable region can reactivate speculation.
+            if speculative_round and self.adaptive_stop:
+                round_accepted = accepted - round_accepted_before
+                round_expected_acceptance = (
+                    stochastic_first_step_expected_acceptance_sum
+                    - round_expected_acceptance_before)
+                adaptive_effective_probe_limit = (
+                    _adaptive_break_even_probe_rounds(
+                        draft_round_s,
+                        verifier_round_s,
                         adaptive_probe_limit,
                     )
                 )
+                if adaptive_recovery_probe:
+                    adaptive_recovery_probes += 1
+                    recovery_useful = (
+                        round_accepted > 0 if sampling.is_greedy
+                        else round_expected_acceptance >= 0.05
+                    )
+                    adaptive_recovery_probe = False
+                    if recovery_useful:
+                        adaptive_reactivations += 1
+                        adaptive_window_rounds = 0
+                        adaptive_window_accepted = 0
+                        adaptive_window_expected_acceptance = 0.0
+                    else:
+                        adaptive_disabled = True
+                        adaptive_disabled_ever = True
+                        adaptive_disable_events += 1
+                        adaptive_cooldown_remaining = (
+                            self.adaptive_reprobe_interval)
+                else:
+                    adaptive_window_rounds += 1
+                    adaptive_window_accepted += round_accepted
+                    adaptive_window_expected_acceptance += (
+                        round_expected_acceptance)
+                    if adaptive_window_rounds >= adaptive_effective_probe_limit:
+                        disable_window = (
+                            _adaptive_mtp_should_disable(
+                                adaptive_window_rounds,
+                                adaptive_window_accepted,
+                                adaptive_effective_probe_limit,
+                            )
+                            if sampling.is_greedy else
+                            _adaptive_stochastic_mtp_should_disable(
+                                adaptive_window_rounds,
+                                adaptive_window_expected_acceptance,
+                                adaptive_effective_probe_limit,
+                            )
+                        )
+                        if disable_window:
+                            adaptive_disabled = True
+                            adaptive_disabled_ever = True
+                            adaptive_disable_events += 1
+                            adaptive_cooldown_remaining = (
+                                self.adaptive_reprobe_interval)
+                        adaptive_window_rounds = 0
+                        adaptive_window_accepted = 0
+                        adaptive_window_expected_acceptance = 0.0
 
         final_text = stop_text if stop_text is not None else tgt.tokenizer.decode(emitted)
         if stream_decoder is not None:
@@ -1697,6 +1840,32 @@ class QwenMTPSpeculativeEngine:
         plain_equivalent_sweeps = max(0, len(emitted) - 1)
         target_sweeps_avoided = max(
             0, plain_equivalent_sweeps - target_decode_sweeps)
+        average_plain_target_s = (
+            plain_round_s / plain_timed_sweeps
+            if plain_timed_sweeps else (
+                verifier_round_s / speculative_rounds
+                if speculative_rounds else 0.0
+            )
+        )
+        average_draft_s = (
+            draft_round_s / speculative_rounds
+            if speculative_rounds else 0.0)
+        average_verifier_s = (
+            verifier_round_s / speculative_rounds
+            if speculative_rounds else 0.0)
+        estimated_mtp_net_s = (
+            target_sweeps_avoided * average_plain_target_s
+            - draft_round_s
+            - speculative_rounds * max(
+                0.0, average_verifier_s - average_plain_target_s)
+        )
+        estimated_break_even_accept_rate = (
+            (
+                average_draft_s
+                + max(0.0, average_verifier_s - average_plain_target_s)
+            ) / average_plain_target_s
+            if average_plain_target_s > 0.0 else 0.0
+        )
         path_stats.update({
             "qwen_mtp_enabled": 1,
             "qwen_mtp_used": int(proposed > 0),
@@ -1704,6 +1873,9 @@ class QwenMTPSpeculativeEngine:
             "qwen_mtp_plain_equivalent_target_sweeps": (
                 plain_equivalent_sweeps),
             "qwen_mtp_target_sweeps_avoided": target_sweeps_avoided,
+            "qwen_mtp_estimated_net_saved_s": estimated_mtp_net_s,
+            "qwen_mtp_estimated_break_even_accept_rate": (
+                estimated_break_even_accept_rate),
             "qwen_mtp_target_tokens_per_sweep": (
                 plain_equivalent_sweeps / target_decode_sweeps
                 if target_decode_sweeps else 0.0),
@@ -1721,10 +1893,20 @@ class QwenMTPSpeculativeEngine:
             "qwen_mtp_accept_rate": (
                 accepted / proposed if proposed else 0.0),
             "qwen_mtp_decode_tokens": max(0, len(emitted) - 1),
-            "qwen_mtp_adaptive_disabled": int(adaptive_disabled),
+            "qwen_mtp_adaptive_disabled": int(adaptive_disabled_ever),
+            "qwen_mtp_adaptive_currently_disabled": int(adaptive_disabled),
             "qwen_mtp_probe_rounds": min(
                 speculative_rounds, adaptive_probe_limit),
+            "qwen_mtp_effective_probe_rounds": (
+                adaptive_effective_probe_limit),
+            "qwen_mtp_adaptive_disable_events": adaptive_disable_events,
+            "qwen_mtp_adaptive_reprobe_interval": (
+                self.adaptive_reprobe_interval),
+            "qwen_mtp_adaptive_cooldown_sweeps": adaptive_cooldown_sweeps,
+            "qwen_mtp_adaptive_recovery_probes": adaptive_recovery_probes,
+            "qwen_mtp_adaptive_reactivations": adaptive_reactivations,
             "qwen_mtp_plain_decode_sweeps": plain_decode_sweeps,
+            "qwen_mtp_plain_timed_sweeps": plain_timed_sweeps,
             "qwen_mtp_warmup_decode_sweeps": warmup_decode_sweeps,
             "qwen_mtp_serial_verify_rounds": serial_verify_rounds,
             "qwen_mtp_verifier_input_positions": verifier_input_positions,
@@ -1743,6 +1925,7 @@ class QwenMTPSpeculativeEngine:
             "qwen_mtp_verifier_bonus_tokens": verifier_bonus_tokens,
             "qwen_mtp_draft_round_s": draft_round_s,
             "qwen_mtp_verifier_round_s": verifier_round_s,
+            "qwen_mtp_plain_round_s": plain_round_s,
             "qwen_mtp_kda_endpoint_restores": kda_endpoint_restores,
             "qwen_mtp_refeed_sweeps_saved": refeed_sweeps_saved,
             "qwen_mtp_target_prefix_rollbacks": target_prefix_rollbacks,
@@ -1786,6 +1969,12 @@ class QwenMTPSpeculativeEngine:
             "qwen_mtp_bf16_sidecar_peak_resident_bytes": (
                 sidecar_peak_resident_bytes),
             "qwen_mtp_bf16_sidecar_cache_discards": sidecar_cache_discards,
+            "qwen_mtp_bf16_sidecar_cache_prepare_calls": (
+                sidecar_cache_prepare_calls),
+            "qwen_mtp_bf16_sidecar_cache_prepare_bytes": (
+                sidecar_cache_prepare_bytes),
+            "qwen_mtp_bf16_sidecar_cache_prepare_released_bytes": (
+                sidecar_cache_prepare_released_bytes),
             "qwen_mtp_bf16_sidecar_load_s": sidecar_load_s,
             "qwen_mtp_bf16_sidecar_release_s": sidecar_release_s,
         })
