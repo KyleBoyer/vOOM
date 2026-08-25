@@ -214,6 +214,9 @@ def test_vision_protocol_timing_exposes_qwen_mtp_round_trace():
             "qwen_mtp_verifier_bonus_tokens": 3,
             "qwen_mtp_draft_round_s": 0.75,
             "qwen_mtp_verifier_round_s": 2.5,
+            "qwen_mtp_grammar_aware_draft_enabled": 1,
+            "qwen_mtp_grammar_masked_draft_tokens": 5,
+            "qwen_mtp_grammar_masked_draft_rounds": 5,
             "qwen_mtp_ngram_first_enabled": 1,
             "qwen_mtp_ngram_first_eligible": 1,
             "qwen_mtp_ngram_first_max_draft_tokens": 4,
@@ -263,6 +266,9 @@ def test_vision_protocol_timing_exposes_qwen_mtp_round_trace():
     assert timing["qwen_mtp_verifier_bonus_tokens"] == 3
     assert timing["qwen_mtp_draft_round_s"] == 0.75
     assert timing["qwen_mtp_verifier_round_s"] == 2.5
+    assert timing["qwen_mtp_grammar_aware_draft_enabled"] == 1
+    assert timing["qwen_mtp_grammar_masked_draft_tokens"] == 5
+    assert timing["qwen_mtp_grammar_masked_draft_rounds"] == 5
     assert timing["qwen_mtp_ngram_first_enabled"] == 1
     assert timing["qwen_mtp_ngram_first_eligible"] == 1
     assert timing["qwen_mtp_ngram_first_max_draft_tokens"] == 4
@@ -3214,6 +3220,7 @@ def test_dense_qwen35_wires_explicit_mixed_depth_durable_store(tmp_path):
     env = {
         "VMODEL_QWEN35_LOSSY_SUFFIX_PREFILL": "16:1024",
         "VMODEL_QWEN35_MIXED_DEPTH_HOT_KV_PERSIST": "1",
+        "VMODEL_QWEN35_MIXED_DEPTH_ENDPOINT_PERSIST": "1",
         "VMODEL_QWEN35_HOT_KV_PERSIST_DIR": str(persist),
     }
     manager = EngineManager()
@@ -3225,14 +3232,37 @@ def test_dense_qwen35_wires_explicit_mixed_depth_durable_store(tmp_path):
          patch("runtime.server.psutil.virtual_memory",
                return_value=SimpleNamespace(available=8_000_000_000)):
         manager.get(Path("/tmp/fake-qwen38-dense-mixed-persist"), "fast")
+        os.environ["VMODEL_QWEN35_MIXED_DEPTH_ENDPOINT_PERSIST"] = "0"
+        manager.get(Path("/tmp/fake-qwen38-dense-mixed-persist"), "fast")
         os.environ["VMODEL_QWEN35_MIXED_DEPTH_HOT_KV_PERSIST"] = "0"
         manager.get(Path("/tmp/fake-qwen38-dense-mixed-persist"), "fast")
 
-    assert len(captured) == 2
+    assert len(captured) == 3
     assert captured[0].hot_prompt_kv_persist_dir == str(persist)
     assert captured[0].hot_prompt_kv_persist_max_checkpoints == 4
     assert captured[0].hot_prompt_kv_persist_max_mb == 2048
-    assert captured[1].hot_prompt_kv_persist_dir == ""
+    assert captured[0].qwen_mixed_depth_endpoint_persist
+    assert captured[1].hot_prompt_kv_persist_dir == str(persist)
+    assert not captured[1].qwen_mixed_depth_endpoint_persist
+    assert captured[2].hot_prompt_kv_persist_dir == ""
+
+
+def test_dense_qwen35_mixed_depth_endpoint_persist_is_strict_and_dependent():
+    from unittest.mock import patch
+
+    from runtime.server import EngineManager, RequestValidationError
+
+    with patch.dict(os.environ, {
+        "VMODEL_QWEN35_MIXED_DEPTH_ENDPOINT_PERSIST": "auto",
+    }):
+        with pytest.raises(RequestValidationError, match="must be 0 or 1"):
+            EngineManager().get(Path("/tmp/not-opened"), "fast")
+    with patch.dict(os.environ, {
+        "VMODEL_QWEN35_MIXED_DEPTH_ENDPOINT_PERSIST": "1",
+        "VMODEL_QWEN35_MIXED_DEPTH_HOT_KV_PERSIST": "0",
+    }):
+        with pytest.raises(RequestValidationError, match="requires"):
+            EngineManager().get(Path("/tmp/not-opened"), "fast")
 
 
 def test_dense_qwen35_wires_explicit_pin_and_prefetch_ladder():

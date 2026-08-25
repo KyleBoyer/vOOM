@@ -1043,6 +1043,7 @@ class QwenMTPSpeculativeEngine:
         ngram_max_ngram: int = 6,
         ngram_max_draft_tokens: int = 4,
         native_tree_width: int = 0,
+        grammar_aware_draft: bool = False,
     ):
         if max_prompt_tokens <= 0:
             raise ValueError("max_prompt_tokens must be positive")
@@ -1097,6 +1098,8 @@ class QwenMTPSpeculativeEngine:
         ):
             raise ValueError(
                 "Qwen MTP native proposal trees require dense qwen3_5")
+        if not isinstance(grammar_aware_draft, bool):
+            raise TypeError("Qwen MTP grammar_aware_draft must be bool")
         self.target = target
         self.drafter = QwenMTPDrafter(target)
         self.max_prompt_tokens = max_prompt_tokens
@@ -1120,6 +1123,7 @@ class QwenMTPSpeculativeEngine:
         self.ngram_max_ngram = int(ngram_max_ngram)
         self.ngram_max_draft_tokens = int(ngram_max_draft_tokens)
         self.native_tree_width = int(native_tree_width)
+        self.grammar_aware_draft = grammar_aware_draft
         weight_identity = self.drafter.request_weight_representation
         self.mtp_engine_identity = (
             f"qwen-mtp-depth{self.depth}-{self.proposal_q_policy.name}"
@@ -1135,6 +1139,7 @@ class QwenMTPSpeculativeEngine:
                 f"-native-tree-w{self.native_tree_width}"
                 if self.native_tree_width else ""
             )
+            + ("-grammar-aware-draft" if self.grammar_aware_draft else "")
         )
         if self.depth == 2 and not callable(getattr(
             target, "forward_tokens_serial_positions", None
@@ -1195,6 +1200,8 @@ class QwenMTPSpeculativeEngine:
             "qwen_mtp_native_tree_width": self.native_tree_width,
             "qwen_mtp_native_tree_eligible": int(
                 self._native_tree_request_eligible(sampling, constraint)),
+            "qwen_mtp_grammar_aware_draft_enabled": int(
+                self.grammar_aware_draft),
         })
         return result
 
@@ -1268,6 +1275,8 @@ class QwenMTPSpeculativeEngine:
             "qwen_mtp_native_tree_width": self.native_tree_width,
             "qwen_mtp_native_tree_eligible": int(
                 self._native_tree_request_eligible(sampling, constraint)),
+            "qwen_mtp_grammar_aware_draft_enabled": int(
+                self.grammar_aware_draft),
         })
         if (max_tokens == 1
                 or bootstrap.get("termination_reason") != "length"):
@@ -1318,6 +1327,8 @@ class QwenMTPSpeculativeEngine:
         refeed_sweeps_saved = 0
         grammar_forced_tokens = 0
         grammar_forced_sweeps = 0
+        grammar_masked_draft_tokens = 0
+        grammar_masked_draft_rounds = 0
         stochastic_expected_acceptance_sum = 0.0
         stochastic_first_step_expected_acceptance_sum = 0.0
         stochastic_expected_acceptance_by_step = [0.0] * self.depth
@@ -1689,7 +1700,10 @@ class QwenMTPSpeculativeEngine:
                         if self.depth == 1:
                             # Keep the established k=1 mock/API path unchanged.
                             if sampling.is_greedy:
-                                if round_native_tree:
+                                if (round_native_tree or (
+                                    self.grammar_aware_draft
+                                    and constraint is not None
+                                )):
                                     step_logits = self.drafter.draft_logits(
                                         draft_hidden, draft_input_token, mtp_kv,
                                         round_start_offset - 1,
@@ -1727,6 +1741,22 @@ class QwenMTPSpeculativeEngine:
                         step_probabilities = None
                         if sampling.is_greedy:
                             if draft_tok is None:
+                                # The target already applies this exact grammar
+                                # before accepting/correcting the proposal.  Use
+                                # the same current-state mask for the first MTP
+                                # proposal so an obviously illegal raw argmax
+                                # does not force a full target-sweep rejection.
+                                # At depth two the grammar has not yet accepted
+                                # d1 while d2 is drafted, so only step zero is
+                                # eligible.  Target verification remains fully
+                                # authoritative either way.
+                                if (self.grammar_aware_draft
+                                        and constraint is not None
+                                        and step == 0):
+                                    step_logits = constraint.mask_logits(
+                                        step_logits)
+                                    grammar_masked_draft_tokens += 1
+                                    grammar_masked_draft_rounds += 1
                                 draft_tok = int(mx.argmax(step_logits))
                         else:
                             if step_logits is None:
@@ -2463,6 +2493,12 @@ class QwenMTPSpeculativeEngine:
             ],
             "qwen_mtp_grammar_forced_tokens": grammar_forced_tokens,
             "qwen_mtp_grammar_forced_sweeps": grammar_forced_sweeps,
+            "qwen_mtp_grammar_aware_draft_enabled": int(
+                self.grammar_aware_draft),
+            "qwen_mtp_grammar_masked_draft_tokens": (
+                grammar_masked_draft_tokens),
+            "qwen_mtp_grammar_masked_draft_rounds": (
+                grammar_masked_draft_rounds),
             "qwen_mtp_round_outcomes": "".join(round_outcomes),
             # Representation-neutral round-page counters.  They describe the
             # actual proposal page (released BF16 or packed MXFP4) without

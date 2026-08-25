@@ -7,11 +7,13 @@ suffix (and, optionally, a prefix anchor).  This module therefore persists a
 complete *stable-boundary* snapshot with the actual local length of every
 attention layer instead of pretending those arrays are token-aligned deltas.
 
-Only strict extensions are eligible for restore.  The snapshot carries no
-endpoint logits and cannot serve an exact-hit, rewind, or branch.  Model,
-runtime, RoPE, quantization, and mixed-depth schedule identity are inherited
-from StreamingEngine's KV fingerprint; manifests and safetensors payloads are
-content-addressed and SHA-256 verified before any tensor is trusted.
+Stable-boundary snapshots are eligible only for strict extensions and carry no
+endpoint logits.  A separately typed prompt-endpoint snapshot may serve an
+identical prompt (with its exact stored logits) or a strict extension, but
+never a rewind or branch.  Model, runtime, RoPE, quantization, and mixed-depth
+schedule identity are inherited from StreamingEngine's KV fingerprint;
+manifests and safetensors payloads are content-addressed and SHA-256 verified
+before any tensor is trusted.
 """
 
 from __future__ import annotations
@@ -41,6 +43,7 @@ from .kv_cache import KVCache
 
 
 _FORMAT = "qwen-mixed-depth-stable-prefix-v1"
+_ENDPOINT_STATE_FORMAT = "logits-hidden-v1"
 
 
 class QwenMixedDepthPromptPersistence:
@@ -51,6 +54,7 @@ class QwenMixedDepthPromptPersistence:
     # mixed-depth snapshot and must be retained only by the in-memory hot slot;
     # the engine consults this capability before calling ``save``.
     requires_approximate_stable_prefix = True
+    supports_prompt_endpoint_snapshot = True
 
     def __init__(
         self,
@@ -61,6 +65,7 @@ class QwenMixedDepthPromptPersistence:
         config,
         max_checkpoints: int = 8,
         max_bytes: int = 0,
+        allow_prompt_endpoint: bool = False,
     ):
         self.dir = Path(directory)
         self.dir.mkdir(parents=True, exist_ok=True)
@@ -69,6 +74,7 @@ class QwenMixedDepthPromptPersistence:
         self.config = config
         self.max_checkpoints = max(0, int(max_checkpoints))
         self.max_bytes = max(0, int(max_bytes))
+        self.allow_prompt_endpoint = bool(allow_prompt_endpoint)
         self._thread_lock = threading.RLock()
         self._lock_path = self.dir / ".mixed-depth.lock"
         self._lock_path.touch(exist_ok=True)
@@ -122,8 +128,16 @@ class QwenMixedDepthPromptPersistence:
             or meta.get("format") != _FORMAT
             or meta.get("id") != snapshot_id
             or meta.get("fp") != self.fp
-            or meta.get("checkpoint_kind") != "stable_prefix"
+            or meta.get("checkpoint_kind") not in (
+                "stable_prefix", "prompt_endpoint")
         ):
+            return None
+        if (meta.get("checkpoint_kind") == "prompt_endpoint"
+                and not self.allow_prompt_endpoint):
+            return None
+        if (meta.get("checkpoint_kind") == "prompt_endpoint"
+                and meta.get("endpoint_state_format")
+                != _ENDPOINT_STATE_FORMAT):
             return None
         core = {key: value for key, value in meta.items() if key not in ("format", "id")}
         if _content_id(_FORMAT, core) != snapshot_id:
@@ -155,7 +169,9 @@ class QwenMixedDepthPromptPersistence:
             return None
         return meta
 
-    def _existing_snapshot(self, tokens, cache_namespace: str) -> str | None:
+    def _existing_snapshot(
+        self, tokens, cache_namespace: str, checkpoint_kind: str,
+    ) -> str | None:
         wanted = list(map(int, tokens))
         for path in self.dir.glob("*.mixed.json"):
             snapshot_id = path.name[:-len(".mixed.json")]
@@ -164,13 +180,17 @@ class QwenMixedDepthPromptPersistence:
                 meta is not None
                 and meta["tokens"] == wanted
                 and meta.get("cache_namespace", "default") == cache_namespace
+                and meta.get("checkpoint_kind") == checkpoint_kind
             ):
                 os.utime(path, None)
                 os.utime(self._payload_path(snapshot_id), None)
                 return snapshot_id
         return None
 
-    def _snapshot_arrays(self, kv: KVCache) -> dict[str, mx.array]:
+    def _snapshot_arrays(
+        self, kv: KVCache, logits: mx.array | None = None,
+        hidden: mx.array | None = None,
+    ) -> dict[str, mx.array]:
         if type(kv) is not KVCache or kv.compressed_mla:
             raise ValueError("mixed-depth persistence requires a plain KVCache")
         arrays: dict[str, mx.array] = {}
@@ -188,6 +208,23 @@ class QwenMixedDepthPromptPersistence:
         if recurrent is None:
             raise ValueError("mixed-depth snapshot is missing recurrent state")
         arrays.update(recurrent.export_arrays())
+        if logits is not None:
+            if (not isinstance(logits, mx.array)
+                    or not logits.shape
+                    or int(logits.shape[-1]) != int(self.config.vocab_size)):
+                raise ValueError(
+                    "mixed-depth endpoint logits do not match the vocabulary")
+            arrays["logits"] = logits
+        if hidden is not None:
+            if (not isinstance(hidden, mx.array)
+                    or len(hidden.shape) != 3
+                    or tuple(map(int, hidden.shape[:2])) != (1, 1)
+                    or int(hidden.shape[-1])
+                    != int(self.config.hidden_size)):
+                raise ValueError(
+                    "mixed-depth endpoint hidden state does not match "
+                    "the model")
+            arrays["hidden"] = hidden
         return arrays
 
     def save(
@@ -217,7 +254,8 @@ class QwenMixedDepthPromptPersistence:
             raise ValueError("mixed-depth stable prefix length mismatch")
 
         with self._locked(exclusive=True):
-            existing = self._existing_snapshot(tokens, cache_namespace)
+            existing = self._existing_snapshot(
+                tokens, cache_namespace, "stable_prefix")
             if existing is not None:
                 return (existing,)
             arrays = self._snapshot_arrays(kv)
@@ -250,6 +288,70 @@ class QwenMixedDepthPromptPersistence:
             _fsync_dir(self.dir)
             return (snapshot_id,)
 
+    def save_prompt_endpoint(
+        self,
+        tokens,
+        kv: KVCache,
+        logits: mx.array,
+        hidden: mx.array,
+        *,
+        approximate: bool,
+        cache_namespace: str = "default",
+    ) -> tuple[str, ...]:
+        """Persist prompt state before decode mutates it.
+
+        The synchronous call site owns the exact prompt endpoint at this
+        instant, so no recurrent rewind or KV trimming is involved.  Restores
+        remain limited to an identical prompt or a strict extension.
+        """
+        if not self.allow_prompt_endpoint:
+            raise ValueError(
+                "mixed-depth prompt endpoint persistence is disabled")
+        tokens = tuple(map(int, tokens))
+        cache_namespace = _normalize_cache_namespace(
+            cache_namespace, strict=True)
+        if not approximate:
+            raise ValueError(
+                "mixed-depth endpoint persistence requires approximate state")
+        if kv.offset != len(tokens):
+            raise ValueError("mixed-depth prompt endpoint length mismatch")
+
+        with self._locked(exclusive=True):
+            existing = self._existing_snapshot(
+                tokens, cache_namespace, "prompt_endpoint")
+            if existing is not None:
+                return (existing,)
+            arrays = self._snapshot_arrays(kv, logits, hidden)
+            mx.eval(list(arrays.values()))
+            tmp, payload_sha256, payload_bytes = _write_safetensors_temp(
+                self.dir, arrays)
+            core = {
+                "fp": self.fp,
+                "checkpoint_kind": "prompt_endpoint",
+                "endpoint_state_format": _ENDPOINT_STATE_FORMAT,
+                "tokens": list(tokens),
+                "prompt_length": len(tokens),
+                "approximate": True,
+                "cache_namespace": cache_namespace,
+                "layer_lengths": list(kv.layer_lengths()),
+                "layer_starts": list(map(int, kv._starts)),
+                "payload_sha256": payload_sha256,
+                "payload_bytes": payload_bytes,
+            }
+            snapshot_id = _content_id(_FORMAT, core)
+            try:
+                _publish_temp_immutable(
+                    tmp, self._payload_path(snapshot_id), payload_sha256)
+                _publish_json_immutable(
+                    self._meta_path(snapshot_id),
+                    {"format": _FORMAT, "id": snapshot_id, **core},
+                )
+            except Exception:
+                tmp.unlink(missing_ok=True)
+                raise
+            _fsync_dir(self.dir)
+            return (snapshot_id,)
+
     def find_best_match(
         self,
         tokens,
@@ -270,23 +372,29 @@ class QwenMixedDepthPromptPersistence:
             if meta is None or meta.get("cache_namespace", "default") != namespace:
                 continue
             candidate = tuple(meta["tokens"])
-            if (
-                len(candidate) <= int(min_matched_exclusive)
-                or len(requested) <= len(candidate)
-                or requested[:len(candidate)] != candidate
-            ):
+            checkpoint_kind = meta.get("checkpoint_kind")
+            exact_endpoint = bool(
+                checkpoint_kind == "prompt_endpoint"
+                and len(requested) == len(candidate)
+                and requested == candidate)
+            extension = bool(
+                len(requested) > len(candidate)
+                and requested[:len(candidate)] == candidate)
+            if (len(candidate) <= int(min_matched_exclusive)
+                    or not (exact_endpoint or extension)):
                 continue
             try:
                 mtime = path.stat().st_mtime_ns
             except OSError:
                 mtime = 0
-            candidates.append((len(candidate), mtime, snapshot_id, meta))
+            candidates.append((
+                len(candidate), int(exact_endpoint), mtime, snapshot_id, meta))
         candidates.sort(reverse=True)
-        for matched, _mtime, snapshot_id, meta in candidates:
+        for matched, exact_endpoint, _mtime, snapshot_id, meta in candidates:
             if self._read_meta(snapshot_id, verify_payload=True) is None:
                 continue
             return {
-                "case": "extension",
+                "case": "endpoint" if exact_endpoint else "extension",
                 "matched": matched,
                 "watermark": 0,
                 "n_segments": 1,
@@ -295,7 +403,7 @@ class QwenMixedDepthPromptPersistence:
                 "chain": (snapshot_id,),
                 "checkpoint_id": snapshot_id,
                 "approximate": True,
-                "checkpoint_kind": "stable_prefix",
+                "checkpoint_kind": meta.get("checkpoint_kind"),
                 "cache_namespace": namespace,
             }
         return None
@@ -328,6 +436,9 @@ class QwenMixedDepthPromptPersistence:
         expected_names = set(recurrent_names)
         for layer in attention_layers:
             expected_names.update((f"k{layer}", f"v{layer}"))
+        checkpoint_kind = meta.get("checkpoint_kind")
+        if checkpoint_kind == "prompt_endpoint":
+            expected_names.update(("logits", "hidden"))
         if set(arrays) != expected_names:
             return None
 
@@ -355,7 +466,23 @@ class QwenMixedDepthPromptPersistence:
                 flush=True,
             )
             return None
-        return tuple(meta["tokens"]), kv, None
+        exact_logits = None
+        exact_hidden = None
+        if match.get("case") == "endpoint":
+            if checkpoint_kind != "prompt_endpoint":
+                return None
+            exact_logits = arrays["logits"]
+            if (not exact_logits.shape
+                    or int(exact_logits.shape[-1])
+                    != int(self.config.vocab_size)):
+                return None
+            exact_hidden = arrays["hidden"]
+            if (len(exact_hidden.shape) != 3
+                    or tuple(map(int, exact_hidden.shape[:2])) != (1, 1)
+                    or int(exact_hidden.shape[-1])
+                    != int(self.config.hidden_size)):
+                return None
+        return tuple(meta["tokens"]), kv, exact_logits, exact_hidden
 
     def load_all(self, num_layers: int, limit: int) -> list[tuple]:
         del num_layers, limit

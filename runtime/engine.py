@@ -988,6 +988,9 @@ class RuntimeConfig:
     qwen_lossy_suffix_prefill_early_layers: int = 0
     qwen_lossy_suffix_prefill_prefix_tokens: int = 0
     qwen_lossy_suffix_prefill_tokens: int = 0
+    # Default-off durable exact-prompt endpoint for the mixed-depth sidequest
+    # journal. Stable pre-user boundaries remain independently enabled.
+    qwen_mixed_depth_endpoint_persist: bool = False
     # Optional system-available floor enforced after a mixed-depth Qwen
     # response by shedding consumed LRU weight pages. Kept separate from the
     # pre-allocation/hot-KV admission floor so it cannot perturb the arithmetic
@@ -1244,6 +1247,8 @@ class RuntimeConfig:
                 "qwen35_prefill_chunk_ceiling", 0),
             qwen35_serial_verify_exact_page_admission=run.get(
                 "qwen35_serial_verify_exact_page_admission", False),
+            qwen_mixed_depth_endpoint_persist=run.get(
+                "qwen_mixed_depth_endpoint_persist", False),
             prefill_last_token_separate=run.get(
                 "prefill_last_token_separate", False),
             prefill_checkpoint_every=run.get("prefill_checkpoint_every", 0),
@@ -2472,6 +2477,8 @@ class StreamingEngine:
                     max_bytes=(
                         self.rc.hot_prompt_kv_persist_max_mb * 1_000_000),
                     config=self.cfg,
+                    allow_prompt_endpoint=(
+                        self.rc.qwen_mixed_depth_endpoint_persist),
                 )
             else:
                 self._hot_kv_persist = HotPromptKVPersistence(
@@ -8140,6 +8147,7 @@ class StreamingEngine:
         kv_store = None
         matched = 0
         exact_logits = None
+        exact_hidden = None
         precomputed_prompt_logits = None  # lossy PIC fills a complete prompt KV
         prompt_state_approximate = False
         reusable_watermark = 0
@@ -8706,10 +8714,18 @@ class StreamingEngine:
                         loaded = self._hot_kv_persist.load_matched_chain(
                             disk_match, self.cfg.num_hidden_layers)
                         if loaded is not None:
-                            loaded_tokens, loaded_kv, loaded_exact_logits = loaded
+                            if len(loaded) == 4:
+                                (loaded_tokens, loaded_kv,
+                                 loaded_exact_logits,
+                                 loaded_exact_hidden) = loaded
+                            else:
+                                (loaded_tokens, loaded_kv,
+                                 loaded_exact_logits) = loaded
+                                loaded_exact_hidden = None
                             kv = self._configure_restored_k3_spill(loaded_kv)
                             matched = disk_match["matched"]
                             exact_logits = loaded_exact_logits
+                            exact_hidden = loaded_exact_hidden
                             reusable_watermark = disk_match["watermark"]
                             persist_parent_chain = tuple(
                                 disk_match["chain"][: disk_match["n_segments"]])
@@ -8912,6 +8928,9 @@ class StreamingEngine:
                 path_stats["prompt_cache_prefix_tokens"] = len(tokens)
         if exact_logits is not None:
             logits = exact_logits  # exact hit: zero sweeps
+            if exact_hidden is not None:
+                self._h_window = exact_hidden
+                self._h_last = exact_hidden[:, -1:, :]
             path_stats["prompt_cache_exact_hit"] = 1
         elif precomputed_prompt_logits is not None:
             # The selective PIC sweep already produced the complete prompt KV
@@ -9501,6 +9520,32 @@ class StreamingEngine:
             self._h_window = x
             self._h_last = x[:, -1:, :]
             logits = self._final_logits(x)
+        if (
+            hot_eligible
+            and exact_logits is None
+            and prompt_state_approximate
+            and self.rc.qwen_mixed_depth_endpoint_persist
+            and self._hot_kv_persist is not None
+            and getattr(
+                self._hot_kv_persist,
+                "supports_prompt_endpoint_snapshot",
+                False,
+            )
+        ):
+            endpoint_write_t0 = time.perf_counter()
+            endpoint_chain = self._hot_kv_persist.save_prompt_endpoint(
+                tokens,
+                kv,
+                logits,
+                self._h_last,
+                approximate=True,
+                cache_namespace=cache_namespace,
+            )
+            path_stats["hot_prompt_endpoint_snapshot_tokens"] = len(tokens)
+            path_stats["hot_prompt_endpoint_snapshot_write_s"] = (
+                time.perf_counter() - endpoint_write_t0)
+            path_stats["hot_prompt_endpoint_snapshot_id"] = (
+                endpoint_chain[-1] if endpoint_chain else "")
         sampled_logits = self._constraint_logits(logits, constraint)
         next_tok = sample(sampled_logits, sampling, history=tokens)
         if constraint is not None:

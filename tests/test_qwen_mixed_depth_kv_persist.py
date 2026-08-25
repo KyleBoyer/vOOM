@@ -1,6 +1,7 @@
 from types import SimpleNamespace
 
 import mlx.core as mx
+import pytest
 
 from runtime.kda_state import KDAStateCache
 from runtime.kv_cache import KVCache
@@ -13,6 +14,8 @@ def _config():
     return SimpleNamespace(
         model_type="qwen3_5",
         num_hidden_layers=4,
+        hidden_size=3,
+        vocab_size=11,
         layer_types=(
             "linear_attention", "full_attention",
             "linear_attention", "full_attention",
@@ -36,10 +39,11 @@ def _mixed_kv():
     return kv
 
 
-def _store(tmp_path, fingerprint="fixture"):
+def _store(tmp_path, fingerprint="fixture", *, allow_endpoint=False):
     return QwenMixedDepthPromptPersistence(
         tmp_path, fingerprint, 4, config=_config(),
         max_checkpoints=2, max_bytes=10_000_000,
+        allow_prompt_endpoint=allow_endpoint,
     )
 
 
@@ -66,9 +70,11 @@ def test_mixed_depth_snapshot_restores_strict_extension_exactly(tmp_path):
         tokens + (9, 10), 4, cache_namespace="gateway")
     assert match["case"] == "extension"
     assert match["matched"] == 7
-    restored_tokens, restored, exact_logits = store.load_matched_chain(match, 4)
+    (restored_tokens, restored, exact_logits,
+     exact_hidden) = store.load_matched_chain(match, 4)
     assert restored_tokens == tokens
     assert exact_logits is None
+    assert exact_hidden is None
     assert restored.offset == 7
     assert restored.layer_lengths() == (0, 7, 0, 3)
     for layer in (1, 3):
@@ -105,7 +111,62 @@ def test_mixed_depth_snapshot_fails_closed_on_corruption_and_fingerprint(tmp_pat
         tokens + (8,), 4, cache_namespace="gateway") is None
 
 
-def test_mixed_depth_store_ignores_endpoint_checkpoint(tmp_path):
+def test_mixed_depth_prompt_endpoint_restores_logits_only_on_exact_match(
+        tmp_path):
+    store = _store(tmp_path, allow_endpoint=True)
+    tokens = tuple(range(7))
+    source = _mixed_kv()
+    logits = mx.arange(11, dtype=mx.float32).reshape(1, 1, 11)
+    hidden = mx.arange(3, dtype=mx.bfloat16).reshape(1, 1, 3)
+    chain = store.save_prompt_endpoint(
+        tokens, source, logits, hidden, approximate=True,
+        cache_namespace="gateway")
+    assert store.save_prompt_endpoint(
+        tokens, source, logits, hidden, approximate=True,
+        cache_namespace="gateway") == chain
+
+    exact = store.find_best_match(
+        tokens, 4, cache_namespace="gateway")
+    assert exact["case"] == "endpoint"
+    (restored_tokens, restored, restored_logits,
+     restored_hidden) = store.load_matched_chain(exact, 4)
+    assert restored_tokens == tokens
+    assert restored.offset == len(tokens)
+    assert mx.array_equal(restored_logits, logits).item()
+    assert mx.array_equal(restored_hidden, hidden).item()
+
+    extension = store.find_best_match(
+        tokens + (9,), 4, cache_namespace="gateway")
+    assert extension["case"] == "extension"
+    (_tokens, _restored, extension_logits,
+     extension_hidden) = store.load_matched_chain(extension, 4)
+    assert extension_logits is None
+    assert extension_hidden is None
+
+
+def test_mixed_depth_prompt_endpoint_is_opt_in_on_write_and_read(tmp_path):
+    disabled = _store(tmp_path)
+    with pytest.raises(ValueError, match="endpoint persistence is disabled"):
+        disabled.save_prompt_endpoint(
+            tuple(range(7)), _mixed_kv(),
+            mx.arange(11, dtype=mx.float32).reshape(1, 1, 11),
+            mx.arange(3, dtype=mx.bfloat16).reshape(1, 1, 3),
+            approximate=True,
+        )
+
+    enabled = _store(tmp_path, allow_endpoint=True)
+    tokens = tuple(range(7))
+    enabled.save_prompt_endpoint(
+        tokens, _mixed_kv(),
+        mx.arange(11, dtype=mx.float32).reshape(1, 1, 11),
+        mx.arange(3, dtype=mx.bfloat16).reshape(1, 1, 3),
+        approximate=True,
+    )
+    assert disabled.find_best_match(tokens, 4) is None
+
+
+def test_mixed_depth_generic_postgeneration_endpoint_is_still_ignored(
+        tmp_path):
     store = _store(tmp_path)
     assert store.save(
         ("stable",), 7, tuple(range(8)), _mixed_kv(),

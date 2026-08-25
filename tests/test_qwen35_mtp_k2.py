@@ -339,6 +339,8 @@ def test_k2_constructor_is_strict_and_opt_in():
             QwenMTPSpeculativeEngine(
                 target, ngram_first=True,
                 ngram_max_draft_tokens=invalid)
+    with pytest.raises(TypeError, match="grammar_aware_draft must be bool"):
+        QwenMTPSpeculativeEngine(target, grammar_aware_draft=1)
 
 
 def test_server_q_policy_is_strict_and_part_of_engine_cache_identity():
@@ -348,6 +350,11 @@ def test_server_q_policy_is_strict_and_part_of_engine_cache_identity():
         with pytest.raises(RequestValidationError, match="flat, temperature"):
             EngineManager().get(Path("/tmp/not-opened"), "fast")
     with patch.dict(os.environ, {"VMODEL_QWEN_MTP_NGRAM_FIRST": "auto"}):
+        with pytest.raises(RequestValidationError, match="must be 0 or 1"):
+            EngineManager().get(Path("/tmp/not-opened"), "fast")
+    with patch.dict(os.environ, {
+        "VMODEL_QWEN_MTP_GRAMMAR_AWARE_DRAFT": "auto",
+    }):
         with pytest.raises(RequestValidationError, match="must be 0 or 1"):
             EngineManager().get(Path("/tmp/not-opened"), "fast")
     with patch.dict(os.environ, {
@@ -408,6 +415,7 @@ def test_server_q_policy_is_strict_and_part_of_engine_cache_identity():
         "VMODEL_QWEN_MTP_DEPTH": "1",
         "VMODEL_QWEN_MTP_NGRAM_FIRST": "0",
         "VMODEL_QWEN_MTP_TREE_WIDTH": "0",
+        "VMODEL_QWEN_MTP_GRAMMAR_AWARE_DRAFT": "0",
         "VMODEL_QWEN35_SERIAL_VERIFY_EXACT_PAGE_ADMISSION": "0",
     }
     with patch.dict(os.environ, env), \
@@ -429,16 +437,20 @@ def test_server_q_policy_is_strict_and_part_of_engine_cache_identity():
             "VMODEL_QWEN35_SERIAL_VERIFY_EXACT_PAGE_ADMISSION"
         ] = "1"
         fifth = manager.get(Path("/tmp/fake-qwen-q-policy"), "fast")
+        os.environ["VMODEL_QWEN_MTP_GRAMMAR_AWARE_DRAFT"] = "1"
+        sixth = manager.get(Path("/tmp/fake-qwen-q-policy"), "fast")
 
     assert first is made[0]
     assert second is made[1]
     assert third is made[2]
     assert fourth is made[3]
     assert fifth is made[4]
+    assert sixth is made[5]
     assert first.closes == 1
     assert second.closes == 1
     assert third.closes == 1
     assert fourth.closes == 1
+    assert fifth.closes == 1
 
 
 def test_server_wires_typed_q_policy_and_explicit_depth_two():
@@ -486,6 +498,7 @@ def test_server_wires_typed_q_policy_and_explicit_depth_two():
         "VMODEL_QWEN_MTP_STOCHASTIC_DRAFT_TOP_K": "8",
         "VMODEL_QWEN_MTP_DEPTH": "2",
         "VMODEL_QWEN_MTP_TREE_WIDTH": "0",
+        "VMODEL_QWEN_MTP_GRAMMAR_AWARE_DRAFT": "1",
     }
     with patch.dict(os.environ, env), \
          patch("runtime.config.ModelConfig.from_dir", return_value=cfg), \
@@ -503,6 +516,7 @@ def test_server_wires_typed_q_policy_and_explicit_depth_two():
     assert wrapped is captured[0]
     assert wrapped.kwargs["depth"] == 2
     assert wrapped.kwargs["ngram_first"] is False
+    assert wrapped.kwargs["grammar_aware_draft"] is True
     policy = wrapped.kwargs["proposal_q_policy"]
     assert policy.name == "temperature-k8-t0.75"
 
@@ -526,6 +540,7 @@ def test_server_wires_typed_q_policy_and_explicit_depth_two():
     assert cascaded is captured[1]
     assert cascaded.kwargs["depth"] == 1
     assert cascaded.kwargs["ngram_first"] is True
+    assert cascaded.kwargs["grammar_aware_draft"] is True
 
     env.update({
         "VMODEL_QWEN_MTP_NGRAM_FIRST": "0",
@@ -548,3 +563,4 @@ def test_server_wires_typed_q_policy_and_explicit_depth_two():
     assert tree.kwargs["depth"] == 1
     assert tree.kwargs["ngram_first"] is False
     assert tree.kwargs["native_tree_width"] == 4
+    assert tree.kwargs["grammar_aware_draft"] is True

@@ -79,6 +79,36 @@ A bounded exact-scheduling ladder then measured:
 | MXFP4 head pin + prefetch 2 | 60.362s | 62.553s | **125.717s** | same hash; profile setting |
 | previous row + 1GB trunk request | — | — | 92.215s to refusal | rejected; unsafe verifier reservation |
 
+Two additional optimizations are available as explicit opt-ins while their
+heterogeneous replay matrix is accumulated:
+
+```bash
+VMODEL_QWEN_MTP_GRAMMAR_AWARE_DRAFT=1 \
+VMODEL_QWEN35_MIXED_DEPTH_ENDPOINT_PERSIST=1 \
+.venv/bin/python -u -m runtime.server \
+  --profile huihui-qwen38-27b-fast-agent --port 8077
+```
+
+The first masks each greedy native-MTP proposal with the request's current
+grammar before the ordinary target verifier runs.  On the tracked
+developer-message/two-tool/max-32 shape this preserved the response hash,
+raised native-MTP acceptance from 6/13 to 9/10, and reduced decode from
+101.719s to 78.840s.  It remains default-off because this is one constrained
+request family; stochastic sampling retains the established unmodified path.
+
+The second adds a separately typed, checksummed prompt endpoint to the
+mixed-depth journal.  It records complete full-attention KV, every DeltaNet
+state and convolution history, the prompt logits, and the final hidden row
+needed by native MTP.  An identical prompt may restore all of that state; a
+strict extension may reuse only the state, while rewinds and branches fail
+closed.  A fresh-process replay restored 1,481/1,481 tokens, performed zero
+prefill weight reads, emitted the identical function call, and completed in
+**77.977s wall** (0.009s prefill, 74.187s decode, 2.452GB peak Metal).  Changing
+only the user text correctly rejected the exact endpoint, reused the separate
+1,410-token pre-user boundary, and produced a different valid tool call in
+102.141s.  Both live rows used the real pinned 134-tool capture as the source;
+the declared developer/two-tool scenario and max-32 cap are harness mutations.
+
 The output cap is a benchmark modification and is stated with every result.
 The messages and 134-tool incoming catalog retain their captured shape, but
 the gateway and mixed-depth suffix are intentionally lossy execution policies.

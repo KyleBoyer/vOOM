@@ -1210,6 +1210,8 @@ class EngineManager:
             "VMODEL_QWEN_MTP_SPECULATIVE", "auto").strip().lower()
         qwen_mtp_ngram_first_request = os.environ.get(
             "VMODEL_QWEN_MTP_NGRAM_FIRST", "0").strip()
+        qwen_mtp_grammar_aware_draft_request = os.environ.get(
+            "VMODEL_QWEN_MTP_GRAMMAR_AWARE_DRAFT", "0").strip()
         qwen_mtp_q_policy_kind = os.environ.get(
             "VMODEL_QWEN_MTP_Q_POLICY", "flat").strip().lower()
         dflash2_draft_request = os.environ.get(
@@ -1282,6 +1284,11 @@ class EngineManager:
             raise RequestValidationError(
                 "VMODEL_QWEN_MTP_NGRAM_FIRST must be 0 or 1")
         qwen_mtp_ngram_first = qwen_mtp_ngram_first_request == "1"
+        if qwen_mtp_grammar_aware_draft_request not in ("0", "1"):
+            raise RequestValidationError(
+                "VMODEL_QWEN_MTP_GRAMMAR_AWARE_DRAFT must be 0 or 1")
+        qwen_mtp_grammar_aware_draft = (
+            qwen_mtp_grammar_aware_draft_request == "1")
         if qwen_mtp_ngram_first and qwen_mtp_depth != 1:
             raise RequestValidationError(
                 "VMODEL_QWEN_MTP_NGRAM_FIRST=1 requires "
@@ -1364,6 +1371,16 @@ class EngineManager:
         if qwen_mixed_depth_persist_request not in ("0", "1"):
             raise RequestValidationError(
                 "VMODEL_QWEN35_MIXED_DEPTH_HOT_KV_PERSIST must be 0 or 1")
+        qwen_mixed_depth_endpoint_request = os.environ.get(
+            "VMODEL_QWEN35_MIXED_DEPTH_ENDPOINT_PERSIST", "0").strip()
+        if qwen_mixed_depth_endpoint_request not in ("0", "1"):
+            raise RequestValidationError(
+                "VMODEL_QWEN35_MIXED_DEPTH_ENDPOINT_PERSIST must be 0 or 1")
+        if (qwen_mixed_depth_endpoint_request == "1"
+                and qwen_mixed_depth_persist_request != "1"):
+            raise RequestValidationError(
+                "VMODEL_QWEN35_MIXED_DEPTH_ENDPOINT_PERSIST=1 requires "
+                "VMODEL_QWEN35_MIXED_DEPTH_HOT_KV_PERSIST=1")
         try:
             qwen35_prefill_chunk_ceiling = int(os.environ.get(
                 "VMODEL_QWEN35_PREFILL_CHUNK_CEILING", "0"))
@@ -1756,6 +1773,7 @@ class EngineManager:
             dflash2_tree_budget,
             qwen_mtp_request,
             qwen_mtp_ngram_first_request,
+            qwen_mtp_grammar_aware_draft_request,
             qwen_mtp_max_prompt_tokens,
             qwen_mtp_min_output_tokens,
             qwen_mtp_stochastic_draft_top_k,
@@ -1772,6 +1790,7 @@ class EngineManager:
             qwen_hot_kv_request,
             qwen_hot_kv_persist_dir_request,
             qwen_mixed_depth_persist_request,
+            qwen_mixed_depth_endpoint_request,
             qwen_quant_lm_head_request,
             qwen_rerank_lm_head_request,
             qwen_rerank_lm_head_candidates,
@@ -1847,6 +1866,7 @@ class EngineManager:
             dflash2_tree_budget,
             qwen_mtp_request,
             qwen_mtp_ngram_first_request,
+            qwen_mtp_grammar_aware_draft_request,
             qwen_mtp_max_prompt_tokens,
             qwen_mtp_min_output_tokens,
             qwen_mtp_stochastic_draft_top_k,
@@ -1863,6 +1883,7 @@ class EngineManager:
             qwen_hot_kv_request,
             qwen_hot_kv_persist_dir_request,
             qwen_mixed_depth_persist_request,
+            qwen_mixed_depth_endpoint_request,
             qwen_quant_lm_head_request,
             qwen_rerank_lm_head_request,
             qwen_rerank_lm_head_candidates,
@@ -1995,6 +2016,8 @@ class EngineManager:
                     qwen35_prefill_chunk_ceiling)
                 rc.qwen35_serial_verify_exact_page_admission = (
                     qwen35_exact_page_admission_request == "1")
+                rc.qwen_mixed_depth_endpoint_persist = (
+                    qwen_mixed_depth_endpoint_request == "1")
             # Grammar fast-forward (token-level jump-forward decoding,
             # 2026-07-23): model-agnostic -- it lives entirely in the
             # constrained-decoding sampler loop, so it is read once here
@@ -4552,6 +4575,8 @@ class EngineManager:
                             qwen_mtp_proposal_replay_top_k),
                         depth=qwen_mtp_depth,
                         native_tree_width=qwen_mtp_tree_width,
+                        grammar_aware_draft=(
+                            qwen_mtp_grammar_aware_draft),
                         ngram_first=qwen_mtp_ngram_first,
                         proposal_q_policy=proposal_q_policy,
                         plain_warmup_tokens=(
@@ -4567,6 +4592,8 @@ class EngineManager:
                         f"{qwen_mtp_proposal_replay_top_k} "
                         f"depth={qwen_mtp_depth} "
                         f"tree_width={qwen_mtp_tree_width} "
+                        f"grammar_aware_draft="
+                        f"{int(qwen_mtp_grammar_aware_draft)} "
                         f"ngram_first={int(qwen_mtp_ngram_first)} "
                         f"q_policy={proposal_q_policy.name}",
                         flush=True,
@@ -8090,6 +8117,7 @@ def _vision_protocol_timing(result: dict) -> dict:
         "qwen_lossy_suffix_prefill_tokens",
         "hot_prompt_kv_disk_hit",
         "hot_prompt_hybrid_prefix_snapshot_tokens",
+        "hot_prompt_endpoint_snapshot_tokens",
         "hot_prompt_admission_positions",
         "reranked_lm_head_calls",
         "reranked_lm_head_positions",
@@ -8222,6 +8250,9 @@ def _vision_protocol_timing(result: dict) -> dict:
         "qwen_mtp_native_tree_factor_bytes_peak",
         "qwen_mtp_grammar_forced_tokens",
         "qwen_mtp_grammar_forced_sweeps",
+        "qwen_mtp_grammar_aware_draft_enabled",
+        "qwen_mtp_grammar_masked_draft_tokens",
+        "qwen_mtp_grammar_masked_draft_rounds",
         "qwen_mtp_ngram_first_enabled",
         "qwen_mtp_ngram_first_eligible",
         "qwen_mtp_ngram_first_max_draft_tokens",
@@ -8338,6 +8369,7 @@ def _vision_protocol_timing(result: dict) -> dict:
         "resident_persistent_prompt_cache_save_s",
         "disk_prompt_lookup_s",
         "hot_prompt_kv_persist_write_s",
+        "hot_prompt_endpoint_snapshot_write_s",
     )
     for key in optional_float_fields:
         if key in stats or key in result:

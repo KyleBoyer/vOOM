@@ -1078,6 +1078,112 @@ def test_qwen_mtp_batches_grammar_forced_span_before_next_decision():
     assert result["path_stats"]["qwen_mtp_round_outcomes"] == "F2"
 
 
+def test_qwen_mtp_masks_greedy_draft_with_current_grammar_before_verify():
+    """An illegal raw MTP argmax must not spend a target sweep on rejection."""
+    from runtime.qwen35_mtp import QwenMTPSpeculativeEngine
+
+    class _Constraint:
+        def __init__(self):
+            self.accepted = []
+            self.completed = False
+
+        def mask_logits(self, logits):
+            legal = 5 if self.accepted == [4] else 7
+            masked = mx.full(logits.shape, -1e9)
+            return masked.at[..., legal].add(
+                1e9 + logits.reshape(-1)[legal])
+
+        def accept_token(self, token):
+            self.accepted.append(int(token))
+
+    class _KV:
+        def __init__(self):
+            self.offset = 3
+            self.kda_cache = None
+
+        def trim(self, offset):
+            self.offset = int(offset)
+
+        def nbytes(self):
+            return 0
+
+    class _Target(_Engine):
+        def __init__(self):
+            super().__init__("/models/target")
+            self.cache = SimpleNamespace(
+                stats=SimpleNamespace(
+                    hits=0, misses=0, evictions=0, bytes_read=0),
+                total_bytes=0, max_bytes=1)
+            self.expert_hits = self.expert_misses = 0
+            for name in (
+                "fast_tier_bytes", "archive_bytes", "parallel_tier_fetches",
+                "parallel_tier_fast_bytes", "parallel_tier_archive_bytes",
+            ):
+                setattr(self.store, name, 0)
+            self.governor = None
+            self._layer_transient = self._prefill_layer_transient = 0
+            self._decode_layer_transient = self._layer_transient_margin = 0
+            self._token_transient = self._true_peak_metal_bytes = 0
+            self._request_profiler = None
+            self._hot_prompt_slots = []
+            self._h_last = self._h_window = mx.zeros((1, 1, 1))
+            self.last_kv = None
+
+        def generate(self, _prompt, max_tokens, **kwargs):
+            assert max_tokens == 1
+            kwargs["constraint"].accept_token(4)
+            self.last_kv = _KV()
+            return {
+                "text": "4", "tokens": [4], "prefill_s": 0.0,
+                "first_token_s": 0.0, "decode_s": 0.0, "total_s": 0.0,
+                "termination_reason": "length", "stop_sequence": None,
+                "path_stats": {}, "prompt_tokens": 3,
+            }
+
+        def forward_tokens_serial_positions(
+            self, tokens, kv, *, capture_kda_endpoints=False,
+        ):
+            assert tokens == [4, 5]
+            assert not capture_kda_endpoints
+            kv.offset += 2
+            self._h_window = mx.zeros((1, 2, 1))
+            self._h_last = self._h_window[:, -1:, :]
+            logits = mx.full((2, 12), -100.0)
+            logits = logits.at[0, 5].add(200.0)
+            return logits.at[1, 7].add(200.0)
+
+    class _Drafter:
+        @staticmethod
+        def draft_logits(*_args, **_kwargs):
+            # Raw winner 9 is illegal; legal token 5 has the next score.
+            logits = mx.full((12,), -100.0)
+            logits = logits.at[9].add(300.0)
+            return logits.at[5].add(200.0)
+
+        @staticmethod
+        def draft_token(*_args, **_kwargs):
+            raise AssertionError("constrained greedy draft must request logits")
+
+    target = _Target()
+    engine = QwenMTPSpeculativeEngine(
+        target, max_prompt_tokens=8, min_output_tokens=2,
+        plain_warmup_tokens=0, adaptive_stop=False,
+        grammar_aware_draft=True)
+    engine.drafter = _Drafter()
+    constraint = _Constraint()
+
+    result = engine.generate("x", 3, constraint=constraint)
+    stats = result["path_stats"]
+
+    assert result["tokens"] == [4, 5, 7]
+    assert constraint.accepted == [4, 5, 7]
+    assert stats["qwen_mtp_round_outcomes"] == "A"
+    assert stats["qwen_mtp_target_sweeps"] == 1
+    assert stats["qwen_mtp_grammar_aware_draft_enabled"] == 1
+    assert stats["qwen_mtp_grammar_masked_draft_tokens"] == 1
+    assert stats["qwen_mtp_grammar_masked_draft_rounds"] == 1
+
+
 def test_qwen_mtp_rejection_restores_serial_kda_midpoint_without_refeed():
     from runtime.qwen35_mtp import QwenMTPSpeculativeEngine
 
