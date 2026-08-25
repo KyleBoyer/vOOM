@@ -105,19 +105,27 @@ class _AdmissionGovernor:
         self.events = events
         self.refuse = refuse
 
-    def reserve(self, incoming, *, reason):
-        self.events.append(("reserve", incoming, reason))
+    def reserve(self, incoming, *, margin, reason):
+        self.events.append(("reserve", incoming, margin, reason))
         if self.refuse:
             raise MemoryError("unsafe synthetic reservation")
 
 
-def _admission_engine(events, *, hit=False, refuse=False):
+def _admission_engine(
+    events, *, hit=False, refuse=False, exact_page_admission=True,
+):
     return SimpleNamespace(
         cache=_AdmissionCache(events, hit=hit),
         governor=_AdmissionGovernor(events, refuse=refuse),
         _layer_key=lambda layer: f"layer.{layer}",
         _layer_names=lambda layer: [f"layer.{layer}.weight"],
         _layer_fetch_bytes_estimate=lambda _layer: 123,
+        _layer_transient_margin=17,
+        rc=SimpleNamespace(
+            qwen35_serial_verify_exact_page_admission=(
+                exact_page_admission
+            ),
+        ),
     )
 
 
@@ -133,7 +141,7 @@ def test_serial_verifier_reserves_missing_page_before_fetch():
     assert events == [
         ("contains", "layer.3"),
         ("prepare", 123),
-        ("reserve", 123, "serial-verify-layer-page"),
+        ("reserve", 123, 17, "serial-verify-layer-page"),
         ("fetch", "layer.3", ("layer.3.weight",)),
     ]
 
@@ -148,13 +156,23 @@ def test_serial_verifier_refuses_before_fetch_and_cache_hit_skips_admission():
     assert refusal_events == [
         ("contains", "layer.4"),
         ("prepare", 123),
-        ("reserve", 123, "serial-verify-layer-page"),
+        ("reserve", 123, 17, "serial-verify-layer-page"),
     ]
 
     hit_events = []
     hit = _admission_engine(hit_events, hit=True)
     assert StreamingEngine._prepare_serial_verify_layer_page(hit, 4) == 0
     assert hit_events == [("contains", "layer.4")]
+
+
+def test_serial_verifier_exact_page_margin_is_explicit_opt_in():
+    from runtime.engine import StreamingEngine
+
+    events = []
+    engine = _admission_engine(events, exact_page_admission=False)
+    assert StreamingEngine._prepare_serial_verify_layer_page(engine, 5) == 123
+    assert events[-1] == (
+        "reserve", 123, 400_000_000, "serial-verify-layer-page")
 
 
 def test_serial_verifier_schedules_future_pages_after_current_admission():

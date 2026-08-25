@@ -943,6 +943,12 @@ class RuntimeConfig:
     # automatic ladder unchanged. Unlike prefill_chunk_size, this is a stable
     # operator/profile policy and is never rewritten by a request.
     qwen35_prefill_chunk_ceiling: int = 0
+    # Explicit verifier-memory experiment.  Standard MLX QTensor pages have an
+    # exact metadata-derived payload estimate plus a 5% pad, so a caller may
+    # reuse the selected one-position compute margin instead of reserve()'s
+    # generic 400-MB unknown-allocation margin.  Default false preserves the
+    # conservative historical admission policy.
+    qwen35_serial_verify_exact_page_admission: bool = False
     # F94: layer-major (not chunk-major) dense prefill for qwen3_5 (dense
     # hybrid DeltaNet/full-attention, e.g. Qwen3.5-4B/9B, Qwen3.6-27B) --
     # fetches each layer's weights exactly once for the whole prefill instead
@@ -1236,6 +1242,8 @@ class RuntimeConfig:
             prefill_chunk_size=run.get("prefill_chunk_size", 0),
             qwen35_prefill_chunk_ceiling=run.get(
                 "qwen35_prefill_chunk_ceiling", 0),
+            qwen35_serial_verify_exact_page_admission=run.get(
+                "qwen35_serial_verify_exact_page_admission", False),
             prefill_last_token_separate=run.get(
                 "prefill_last_token_separate", False),
             prefill_checkpoint_every=run.get("prefill_checkpoint_every", 0),
@@ -3104,8 +3112,29 @@ class StreamingEngine:
             return 0
         self.cache.prepare_for(incoming)
         if self.governor is not None:
+            # The page estimate above already prices every retained QTensor
+            # array and carries its own 5% representation/alignment pad.  Do
+            # not add reserve()'s generic 400-MB *second* uncertainty charge:
+            # serial verification selects the one-position arithmetic margin
+            # immediately before this call, and then uses that same learned
+            # margin for the compute-transient admission after the page is
+            # resident.  Passing it here keeps the two phases on one safety
+            # model instead of rejecting a known ~203-MB page while separately
+            # preserving hundreds of megabytes for the same operation.
+            exact_page_admission = bool(getattr(
+                self.rc,
+                "qwen35_serial_verify_exact_page_admission",
+                False,
+            ))
             self.governor.reserve(
-                incoming, reason="serial-verify-layer-page")
+                incoming,
+                margin=(
+                    int(self._layer_transient_margin)
+                    if exact_page_admission
+                    else 400_000_000
+                ),
+                reason="serial-verify-layer-page",
+            )
         return incoming
 
     def _checkpoint_payload_bytes(self) -> int:
@@ -8015,6 +8044,8 @@ class StreamingEngine:
         if self.cfg.model_type in ("qwen3_5", "qwen3_5_moe"):
             path_stats["qwen35_prefill_chunk_ceiling"] = int(
                 self.rc.qwen35_prefill_chunk_ceiling)
+            path_stats["qwen35_serial_verify_exact_page_admission"] = int(
+                self.rc.qwen35_serial_verify_exact_page_admission)
         tokenize_t0 = time.perf_counter()
         prepared_ids = getattr(prompt, "token_ids", None)
         tokens = (list(prepared_ids) if prepared_ids is not None

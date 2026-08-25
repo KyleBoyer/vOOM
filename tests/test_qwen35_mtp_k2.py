@@ -325,6 +325,15 @@ def test_k2_constructor_is_strict_and_opt_in():
             QwenMTPSpeculativeEngine(target, depth=invalid)
     with pytest.raises(ValueError, match="requires depth 1"):
         QwenMTPSpeculativeEngine(target, depth=2, ngram_first=True)
+    for invalid in (1, 5, True, "4"):
+        with pytest.raises(ValueError, match="tree width must be 0 or"):
+            QwenMTPSpeculativeEngine(target, native_tree_width=invalid)
+    with pytest.raises(ValueError, match="trees currently require depth 1"):
+        QwenMTPSpeculativeEngine(
+            target, depth=2, native_tree_width=2)
+    with pytest.raises(ValueError, match="cannot be combined"):
+        QwenMTPSpeculativeEngine(
+            target, ngram_first=True, native_tree_width=2)
     for invalid in (0, 5, True, "4"):
         with pytest.raises(ValueError, match="draft width must be in"):
             QwenMTPSpeculativeEngine(
@@ -346,6 +355,26 @@ def test_server_q_policy_is_strict_and_part_of_engine_cache_identity():
         "VMODEL_QWEN_MTP_DEPTH": "2",
     }):
         with pytest.raises(RequestValidationError, match="requires.*DEPTH=1"):
+            EngineManager().get(Path("/tmp/not-opened"), "fast")
+    with patch.dict(os.environ, {"VMODEL_QWEN_MTP_TREE_WIDTH": "1"}):
+        with pytest.raises(RequestValidationError, match="must be 0 or"):
+            EngineManager().get(Path("/tmp/not-opened"), "fast")
+    with patch.dict(os.environ, {
+        "VMODEL_QWEN35_SERIAL_VERIFY_EXACT_PAGE_ADMISSION": "yes",
+    }):
+        with pytest.raises(RequestValidationError, match="must be 0 or 1"):
+            EngineManager().get(Path("/tmp/not-opened"), "fast")
+    with patch.dict(os.environ, {
+        "VMODEL_QWEN_MTP_TREE_WIDTH": "2",
+        "VMODEL_QWEN_MTP_DEPTH": "2",
+    }):
+        with pytest.raises(RequestValidationError, match="requires.*DEPTH=1"):
+            EngineManager().get(Path("/tmp/not-opened"), "fast")
+    with patch.dict(os.environ, {
+        "VMODEL_QWEN_MTP_TREE_WIDTH": "2",
+        "VMODEL_QWEN_MTP_NGRAM_FIRST": "1",
+    }):
+        with pytest.raises(RequestValidationError, match="cannot be combined"):
             EngineManager().get(Path("/tmp/not-opened"), "fast")
 
     made = []
@@ -378,6 +407,8 @@ def test_server_q_policy_is_strict_and_part_of_engine_cache_identity():
         "VMODEL_QWEN_MTP_STOCHASTIC_DRAFT_TOP_K": "8",
         "VMODEL_QWEN_MTP_DEPTH": "1",
         "VMODEL_QWEN_MTP_NGRAM_FIRST": "0",
+        "VMODEL_QWEN_MTP_TREE_WIDTH": "0",
+        "VMODEL_QWEN35_SERIAL_VERIFY_EXACT_PAGE_ADMISSION": "0",
     }
     with patch.dict(os.environ, env), \
          patch("runtime.config.ModelConfig.from_dir", return_value=cfg), \
@@ -391,12 +422,23 @@ def test_server_q_policy_is_strict_and_part_of_engine_cache_identity():
         second = manager.get(Path("/tmp/fake-qwen-q-policy"), "fast")
         os.environ["VMODEL_QWEN_MTP_NGRAM_FIRST"] = "1"
         third = manager.get(Path("/tmp/fake-qwen-q-policy"), "fast")
+        os.environ["VMODEL_QWEN_MTP_NGRAM_FIRST"] = "0"
+        os.environ["VMODEL_QWEN_MTP_TREE_WIDTH"] = "4"
+        fourth = manager.get(Path("/tmp/fake-qwen-q-policy"), "fast")
+        os.environ[
+            "VMODEL_QWEN35_SERIAL_VERIFY_EXACT_PAGE_ADMISSION"
+        ] = "1"
+        fifth = manager.get(Path("/tmp/fake-qwen-q-policy"), "fast")
 
     assert first is made[0]
     assert second is made[1]
     assert third is made[2]
+    assert fourth is made[3]
+    assert fifth is made[4]
     assert first.closes == 1
     assert second.closes == 1
+    assert third.closes == 1
+    assert fourth.closes == 1
 
 
 def test_server_wires_typed_q_policy_and_explicit_depth_two():
@@ -443,6 +485,7 @@ def test_server_wires_typed_q_policy_and_explicit_depth_two():
         "VMODEL_QWEN_MTP_Q_PARAMETER": "0.75",
         "VMODEL_QWEN_MTP_STOCHASTIC_DRAFT_TOP_K": "8",
         "VMODEL_QWEN_MTP_DEPTH": "2",
+        "VMODEL_QWEN_MTP_TREE_WIDTH": "0",
     }
     with patch.dict(os.environ, env), \
          patch("runtime.config.ModelConfig.from_dir", return_value=cfg), \
@@ -483,3 +526,25 @@ def test_server_wires_typed_q_policy_and_explicit_depth_two():
     assert cascaded is captured[1]
     assert cascaded.kwargs["depth"] == 1
     assert cascaded.kwargs["ngram_first"] is True
+
+    env.update({
+        "VMODEL_QWEN_MTP_NGRAM_FIRST": "0",
+        "VMODEL_QWEN_MTP_TREE_WIDTH": "4",
+    })
+    with patch.dict(os.environ, env), \
+         patch("runtime.config.ModelConfig.from_dir", return_value=cfg), \
+         patch("runtime.path_resolver.resolve_model_dir",
+               side_effect=lambda path: path), \
+         patch("runtime.engine.StreamingEngine", FakeEngine), \
+         patch("runtime.qwen35_mtp.QwenMTPSpeculativeEngine", FakeMTP), \
+         patch("runtime.server._checkpoint_payload_bytes",
+               return_value=54_000_000_000), \
+         patch("runtime.server.psutil.virtual_memory",
+               return_value=SimpleNamespace(available=8_000_000_000)):
+        tree = EngineManager().get(
+            Path("/tmp/fake-qwen-native-mtp-tree-wiring"), "fast")
+
+    assert tree is captured[2]
+    assert tree.kwargs["depth"] == 1
+    assert tree.kwargs["ngram_first"] is False
+    assert tree.kwargs["native_tree_width"] == 4

@@ -320,12 +320,16 @@ def test_protocol_timing_exposes_qwen35_prefill_ceiling_and_selection():
             "prefill_step_size": 128,
             "qwen35_prefill_chunk_ceiling": 128,
             "qwen35_prefill_chunk_selected": 128,
+            "qwen35_serial_verify_exact_page_admission": 1,
+            "qwen_mtp_native_tree_selected_rank_counts": [1, 9, 0],
         },
     })
 
     assert timing["prefill_step_size"] == 128
     assert timing["qwen35_prefill_chunk_ceiling"] == 128
     assert timing["qwen35_prefill_chunk_selected"] == 128
+    assert timing["qwen35_serial_verify_exact_page_admission"] == 1
+    assert timing["qwen_mtp_native_tree_selected_rank_counts"] == [1, 9, 0]
 
 
 def test_protocol_timing_exposes_qwen_delta_arithmetic_mode():

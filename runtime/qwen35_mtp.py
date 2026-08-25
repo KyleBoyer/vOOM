@@ -159,6 +159,18 @@ def _authoritative_target_logits(
     return constraint.mask_logits(logits)
 
 
+def _authoritative_target_logits_from_hidden(
+    target, logits: mx.array, constraint, hidden: mx.array,
+) -> mx.array:
+    """Apply the current grammar to one explicit tree-node hidden row."""
+    if constraint is None:
+        return logits
+    constraint_logits = getattr(target, "_constraint_logits", None)
+    if callable(constraint_logits):
+        return constraint_logits(logits, constraint, hidden=hidden)
+    return constraint.mask_logits(logits)
+
+
 @dataclass(frozen=True)
 class ProposalQPolicy:
     """A sparse proposal distribution evaluated by the offline replay tool.
@@ -686,6 +698,48 @@ def _flat_top_k_draft_probabilities(
     return _flat_top_k_probabilities(calibrated, top_k)
 
 
+def _native_mtp_sibling_tree(
+    root_token: int,
+    logits: mx.array,
+    width: int,
+):
+    """Build one target-verified sibling level from a native MTP row.
+
+    The released MTP layer is evaluated once. Its highest-scoring distinct
+    tokens become siblings under the still-unfed target ``root_token``. The
+    tree changes proposal scheduling only: the target evaluates every sibling
+    and its argmax chooses the sole committed branch.
+    """
+    from .speculative_tree import SpeculativeTree, validate_tree
+
+    width = int(width)
+    if width < 2:
+        raise ValueError("native MTP sibling width must be at least two")
+    row = logits.reshape(-1)
+    vocab = int(row.shape[0])
+    if width > vocab:
+        raise ValueError(
+            f"native MTP sibling width {width} exceeds vocabulary {vocab}")
+    candidates = mx.argpartition(-row, kth=width - 1)[:width]
+    scores = mx.take(row, candidates)
+    candidates = mx.take(candidates, mx.argsort(-scores))
+    mx.eval(candidates)
+    token_ids = [int(root_token), *(
+        int(token) for token in candidates.tolist())]
+    children = [{
+        token: index for index, token in enumerate(token_ids[1:], start=1)
+    }]
+    children.extend({} for _ in range(width))
+    tree = SpeculativeTree(
+        token_ids=tuple(token_ids),
+        depths=(0, *(1 for _ in range(width))),
+        parents=(-1, *(0 for _ in range(width))),
+        children=tuple(children),
+    )
+    validate_tree(tree)
+    return tree
+
+
 class QwenMTPDrafter:
     _RELEASED_BF16_CACHE_KEY = "qwen35_mtp:released-bf16"
     _PACKED_MXFP4_CACHE_KEY = "qwen35_mtp:proposal-mxfp4-q4-g32"
@@ -988,6 +1042,7 @@ class QwenMTPSpeculativeEngine:
         ngram_min_ngram: int = 2,
         ngram_max_ngram: int = 6,
         ngram_max_draft_tokens: int = 4,
+        native_tree_width: int = 0,
     ):
         if max_prompt_tokens <= 0:
             raise ValueError("max_prompt_tokens must be positive")
@@ -1024,6 +1079,24 @@ class QwenMTPSpeculativeEngine:
         if ngram_first and depth != 1:
             raise ValueError(
                 "Qwen MTP n-gram-first cascade currently requires depth 1")
+        if (isinstance(native_tree_width, bool)
+                or not isinstance(native_tree_width, int)
+                or native_tree_width not in (0, 2, 3, 4)):
+            raise ValueError(
+                "Qwen MTP native tree width must be 0 or in [2, 4]")
+        if native_tree_width and depth != 1:
+            raise ValueError(
+                "Qwen MTP native proposal trees currently require depth 1")
+        if native_tree_width and ngram_first:
+            raise ValueError(
+                "Qwen MTP native proposal trees cannot be combined with "
+                "n-gram-first")
+        if native_tree_width and (
+            getattr(target.cfg, "model_type", None) != "qwen3_5"
+            or getattr(target.cfg, "num_experts", 0)
+        ):
+            raise ValueError(
+                "Qwen MTP native proposal trees require dense qwen3_5")
         self.target = target
         self.drafter = QwenMTPDrafter(target)
         self.max_prompt_tokens = max_prompt_tokens
@@ -1046,6 +1119,7 @@ class QwenMTPSpeculativeEngine:
         self.ngram_min_ngram = int(ngram_min_ngram)
         self.ngram_max_ngram = int(ngram_max_ngram)
         self.ngram_max_draft_tokens = int(ngram_max_draft_tokens)
+        self.native_tree_width = int(native_tree_width)
         weight_identity = self.drafter.request_weight_representation
         self.mtp_engine_identity = (
             f"qwen-mtp-depth{self.depth}-{self.proposal_q_policy.name}"
@@ -1056,6 +1130,10 @@ class QwenMTPSpeculativeEngine:
             + (
                 f"-ngram-first-k{self.ngram_max_draft_tokens}"
                 if self.ngram_first else ""
+            )
+            + (
+                f"-native-tree-w{self.native_tree_width}"
+                if self.native_tree_width else ""
             )
         )
         if self.depth == 2 and not callable(getattr(
@@ -1073,6 +1151,23 @@ class QwenMTPSpeculativeEngine:
 
     def __getattr__(self, name):
         return getattr(self.target, name)
+
+    def _native_tree_request_eligible(
+        self, sampling: SamplingParams | None, constraint,
+    ) -> bool:
+        return bool(
+            self.native_tree_width > 0
+            and sampling is not None
+            and sampling.is_greedy
+            and sampling.repetition_penalty == 1.0
+            and (
+                constraint is None
+                or (
+                    callable(getattr(constraint, "mask_logits", None))
+                    and callable(getattr(constraint, "accept_token", None))
+                )
+            )
+        )
 
     def _target_generate(self, reason: str, prompt, max_tokens, on_token,
                           stop, on_progress, sampling, constraint) -> dict:
@@ -1097,6 +1192,9 @@ class QwenMTPSpeculativeEngine:
             "qwen_mtp_ngram_first_eligible": int(
                 self.ngram_first and sampling is not None
                 and sampling.is_greedy),
+            "qwen_mtp_native_tree_width": self.native_tree_width,
+            "qwen_mtp_native_tree_eligible": int(
+                self._native_tree_request_eligible(sampling, constraint)),
         })
         return result
 
@@ -1167,6 +1265,9 @@ class QwenMTPSpeculativeEngine:
             "qwen_mtp_ngram_first_enabled": int(self.ngram_first),
             "qwen_mtp_ngram_first_eligible": int(
                 self.ngram_first and sampling.is_greedy),
+            "qwen_mtp_native_tree_width": self.native_tree_width,
+            "qwen_mtp_native_tree_eligible": int(
+                self._native_tree_request_eligible(sampling, constraint)),
         })
         if (max_tokens == 1
                 or bootstrap.get("termination_reason") != "length"):
@@ -1236,6 +1337,21 @@ class QwenMTPSpeculativeEngine:
         native_mtp_proposed = 0
         native_mtp_accepted = 0
         native_mtp_rejected = 0
+        native_tree_rounds = 0
+        native_tree_hits = 0
+        native_tree_misses = 0
+        # Index zero is a complete sibling miss; indices 1..width are the
+        # MTP-logit ranks selected by the authoritative target root.  This is
+        # the offline decision statistic for choosing width 2/3/4 without
+        # rerunning a wider tree merely to discover that its last branches are
+        # never useful.
+        native_tree_selected_rank_counts = [
+            0 for _ in range(self.native_tree_width + 1)
+        ]
+        native_tree_nodes_verified = 0
+        native_tree_paths_committed = 0
+        native_tree_factor_bytes_peak = 0
+        native_tree_factor_commit_s = 0.0
         proposal_replay_records: list[dict] = []
         sidecar_round_loads = 0
         sidecar_round_releases = 0
@@ -1347,6 +1463,9 @@ class QwenMTPSpeculativeEngine:
             round_serial_verify = False
             round_mtp_start_lengths = None
             round_bonus_candidate = False
+            round_tree_verification = None
+            round_tree_selected_path = None
+            round_native_tree = False
             # Grammar-deterministic spans need target state updates, but no
             # target decisions.  Preserve StreamingEngine's jump-forward win
             # inside MTP by folding catchup + the whole forced run into one
@@ -1484,6 +1603,9 @@ class QwenMTPSpeculativeEngine:
                 round_mtp_weights: dict | None = None
                 ngram_tokens: list[int] = []
                 round_proposal_source = "M"
+                round_native_tree = self._native_tree_request_eligible(
+                    sampling, constraint)
+                native_tree = None
                 draft_rerank_before = _reranked_head_telemetry_snapshot(tgt)
                 draft_started = time.perf_counter()
                 try:
@@ -1567,12 +1689,20 @@ class QwenMTPSpeculativeEngine:
                         if self.depth == 1:
                             # Keep the established k=1 mock/API path unchanged.
                             if sampling.is_greedy:
-                                draft_tok = self.drafter.draft_token(
-                                    draft_hidden, draft_input_token, mtp_kv,
-                                    round_start_offset - 1,
-                                    round_mtp_weights,
-                                )
-                                step_logits = None
+                                if round_native_tree:
+                                    step_logits = self.drafter.draft_logits(
+                                        draft_hidden, draft_input_token, mtp_kv,
+                                        round_start_offset - 1,
+                                        round_mtp_weights,
+                                    )
+                                    draft_tok = None
+                                else:
+                                    draft_tok = self.drafter.draft_token(
+                                        draft_hidden, draft_input_token, mtp_kv,
+                                        round_start_offset - 1,
+                                        round_mtp_weights,
+                                    )
+                                    step_logits = None
                             else:
                                 step_logits = self.drafter.draft_logits(
                                     draft_hidden, draft_input_token, mtp_kv,
@@ -1626,6 +1756,20 @@ class QwenMTPSpeculativeEngine:
                         draft_probabilities.append(step_probabilities)
                         draft_rank_probabilities.append(step_rank_probabilities)
                         draft_input_token = int(draft_tok)
+
+                    if round_native_tree:
+                        if step_logits is None:
+                            raise RuntimeError(
+                                "native MTP proposal tree omitted draft logits")
+                        native_tree = _native_mtp_sibling_tree(
+                            catchup_tok,
+                            (
+                                constraint.mask_logits(step_logits)
+                                if constraint is not None else step_logits
+                            ),
+                            self.native_tree_width,
+                        )
+                        draft_tokens = list(native_tree.token_ids[1:])
                 finally:
                     # The target verifier's memory reserve must never overlap
                     # the released-BF16 MTP sidecar. Clear the caller mapping,
@@ -1673,28 +1817,44 @@ class QwenMTPSpeculativeEngine:
                 round_verify_width = len(verify_tokens)
                 max_verify_width_observed = max(
                     max_verify_width_observed, round_verify_width)
-                round_serial_verify = callable(getattr(
-                    tgt, "forward_tokens_serial_positions", None))
-                round_capture_endpoint = bool(
-                    round_serial_verify
-                    and getattr(kv, "kda_cache", None) is not None
-                )
-                if round_serial_verify:
-                    verifier_started = time.perf_counter()
-                    spec_logits = tgt.forward_tokens_serial_positions(
-                        verify_tokens,
-                        kv,
-                        capture_kda_endpoints=round_capture_endpoint,
+                verifier_started = time.perf_counter()
+                if round_native_tree:
+                    if native_tree is None:
+                        raise RuntimeError(
+                            "native MTP sibling verifier omitted its tree")
+                    from .qwen35_tree_verify import verify_qwen35_tree
+
+                    round_tree_verification = verify_qwen35_tree(
+                        tgt, native_tree, kv)
+                    spec_logits = round_tree_verification.logits
+                    native_tree_rounds += 1
+                    native_tree_nodes_verified += len(native_tree.token_ids)
+                    native_tree_factor_bytes_peak = max(
+                        native_tree_factor_bytes_peak,
+                        round_tree_verification.factors.nbytes(),
                     )
-                    serial_verify_rounds += 1
                 else:
-                    # Compatibility fallback for old dense adapters. MoE
-                    # construction fails closed above when the exact verifier
-                    # is unavailable.
-                    verifier_started = time.perf_counter()
-                    spec_logits = tgt.forward_tokens(verify_tokens, kv)
+                    round_serial_verify = callable(getattr(
+                        tgt, "forward_tokens_serial_positions", None))
+                    round_capture_endpoint = bool(
+                        round_serial_verify
+                        and getattr(kv, "kda_cache", None) is not None
+                    )
+                    if round_serial_verify:
+                        spec_logits = tgt.forward_tokens_serial_positions(
+                            verify_tokens,
+                            kv,
+                            capture_kda_endpoints=round_capture_endpoint,
+                        )
+                        serial_verify_rounds += 1
+                    else:
+                        # Compatibility fallback for old dense adapters. MoE
+                        # construction fails closed above when the exact verifier
+                        # is unavailable.
+                        spec_logits = tgt.forward_tokens(verify_tokens, kv)
                 target_decode_sweeps += 1
-                if round_start_layer_lengths is not None:
+                if (not round_native_tree
+                        and round_start_layer_lengths is not None):
                     serial_end_layer_lengths = kv.layer_lengths()
                     round_layer_growth = tuple(
                         end - start for start, end in zip(
@@ -1715,137 +1875,209 @@ class QwenMTPSpeculativeEngine:
                 new_tokens = []
                 new_token_logits = []
                 accepted_prefix = 0
-                for step, draft_tok in enumerate(draft_tokens):
-                    authoritative_logits = _authoritative_target_logits(
-                        tgt, spec_logits[step], constraint, step)
-                    verified_proposals += 1
-                    if round_proposal_source == "N":
-                        ngram_first_verified_by_step[step] += 1
-                    else:
-                        verified_by_step[step] += 1
-                    if sampling.is_greedy:
-                        draft_accepted = (
-                            int(mx.argmax(authoritative_logits)) == draft_tok)
-                        true_tok = (
-                            draft_tok if draft_accepted
-                            else int(mx.argmax(authoritative_logits))
-                        )
-                    else:
-                        step_probabilities = draft_probabilities[step]
-                        if step_probabilities is None:
-                            raise RuntimeError(
-                                "stochastic Qwen MTP proposal omitted q")
-                        draft_accepted, true_tok, target_probabilities = (
-                            _verify_stochastic_mtp_token(
-                                draft_tok,
-                                step_probabilities,
-                                authoritative_logits,
-                                sampling,
-                                all_tokens + new_tokens,
-                            )
-                        )
-                        overlap = mx.sum(mx.minimum(
-                            target_probabilities, step_probabilities))
-                        mx.eval(overlap)
-                        overlap_value = float(overlap.item())
-                        stochastic_expected_acceptance_sum += overlap_value
-                        stochastic_expected_acceptance_by_step[step] += (
-                            overlap_value)
-                        if step == 0:
-                            stochastic_first_step_expected_acceptance_sum += (
-                                overlap_value)
-                        if self.proposal_replay_top_k:
-                            step_rank_probabilities = (
-                                draft_rank_probabilities[step])
-                            if step_rank_probabilities is None:
-                                raise RuntimeError(
-                                    "proposal-q replay omitted draft ranks")
-                            proposal_replay_records.append(
-                                proposal_q_replay_record(
-                                    step_rank_probabilities,
-                                    target_probabilities,
-                                    max_rank=self.proposal_replay_top_k,
-                                    proposal=int(draft_tok),
-                                    accepted=bool(draft_accepted),
-                                    history_length=(
-                                        len(all_tokens) + len(new_tokens)),
-                                    round_index=speculative_rounds - 1,
-                                    draft_step_index=step,
+                if round_native_tree:
+                    root_logits = _authoritative_target_logits_from_hidden(
+                        tgt,
+                        spec_logits[0],
+                        constraint,
+                        round_tree_verification.hidden_nodes[0],
+                    )
+                    target_root = sample(
+                        root_logits, sampling, history=all_tokens)
+                    selected_node = native_tree.children[0].get(target_root)
+                    selected_rank = (
+                        int(selected_node) if selected_node is not None else 0
+                    )
+                    native_tree_selected_rank_counts[selected_rank] += 1
+                    accepted_prefix = int(selected_node is not None)
+                    round_tree_selected_path = (
+                        (0, int(selected_node))
+                        if selected_node is not None else (0,)
+                    )
+                    verified_proposals += len(draft_tokens)
+                    verified_by_step[0] += len(draft_tokens)
+                    round_rejected = accepted_prefix == 0
+                    if accepted_prefix:
+                        accepted += 1
+                        accepted_by_step[0] += 1
+                        native_mtp_accepted += 1
+                        native_tree_hits += 1
+                        if constraint is not None:
+                            constraint.accept_token(target_root)
+                            grammar_completed = bool(constraint.completed)
+                        new_tokens = [int(target_root)]
+                        new_token_logits = [root_logits]
+                        if not _candidate_terminal(new_tokens):
+                            bonus_logits = (
+                                _authoritative_target_logits_from_hidden(
+                                    tgt,
+                                    spec_logits[selected_node],
+                                    constraint,
+                                    round_tree_verification.hidden_nodes[
+                                        selected_node],
                                 )
                             )
-
-                    if not draft_accepted:
-                        round_rejected = True
-                        rejected_rounds += 1
-                        if accepted_prefix:
-                            partial_accept_rounds += 1
-                        if constraint is not None:
-                            constraint.accept_token(true_tok)
-                            grammar_completed = bool(constraint.completed)
-                        new_tokens.append(int(true_tok))
-                        new_token_logits.append(authoritative_logits)
-                        break
-
-                    accepted += 1
-                    accepted_prefix += 1
-                    if round_proposal_source == "N":
-                        ngram_first_accepted_by_step[step] += 1
+                            bonus_tok = sample(
+                                bonus_logits,
+                                sampling,
+                                history=all_tokens + new_tokens,
+                            )
+                            if constraint is not None:
+                                constraint.accept_token(bonus_tok)
+                                grammar_completed = bool(constraint.completed)
+                            new_tokens.append(int(bonus_tok))
+                            new_token_logits.append(bonus_logits)
+                            round_bonus_candidate = True
+                        full_accept_rounds += 1
+                        round_outcomes.append("A")
                     else:
-                        accepted_by_step[step] += 1
-                    if constraint is not None:
-                        constraint.accept_token(draft_tok)
-                        grammar_completed = bool(constraint.completed)
-                    new_tokens.append(int(draft_tok))
-                    new_token_logits.append(authoritative_logits)
-                    if _candidate_terminal(new_tokens):
-                        break
-
-                round_draft_width = len(draft_tokens)
-                all_drafts_accepted = (
-                    accepted_prefix == round_draft_width
-                    and not round_rejected)
-                if round_proposal_source == "N":
-                    ngram_first_accepted += accepted_prefix
-                    ngram_first_rejected += int(round_rejected)
-                else:
-                    native_mtp_accepted += accepted_prefix
-                    native_mtp_rejected += int(round_rejected)
-                if all_drafts_accepted:
-                    full_accept_rounds += 1
-                if round_proposal_source == "N" and round_draft_width > 1:
+                        rejected_rounds += 1
+                        native_mtp_rejected += 1
+                        native_tree_misses += 1
+                        if constraint is not None:
+                            constraint.accept_token(target_root)
+                            grammar_completed = bool(constraint.completed)
+                        new_tokens = [int(target_root)]
+                        new_token_logits = [root_logits]
+                        round_outcomes.append("R")
+                    next_catchup_tok = new_tokens[-1]
                     if round_rejected:
+                        refeed_sweeps_saved += 1
+                else:
+                    for step, draft_tok in enumerate(draft_tokens):
+                        authoritative_logits = _authoritative_target_logits(
+                            tgt, spec_logits[step], constraint, step)
+                        verified_proposals += 1
+                        if round_proposal_source == "N":
+                            ngram_first_verified_by_step[step] += 1
+                        else:
+                            verified_by_step[step] += 1
+                        if sampling.is_greedy:
+                            draft_accepted = (
+                                int(mx.argmax(authoritative_logits)) == draft_tok)
+                            true_tok = (
+                                draft_tok if draft_accepted
+                                else int(mx.argmax(authoritative_logits))
+                            )
+                        else:
+                            step_probabilities = draft_probabilities[step]
+                            if step_probabilities is None:
+                                raise RuntimeError(
+                                    "stochastic Qwen MTP proposal omitted q")
+                            draft_accepted, true_tok, target_probabilities = (
+                                _verify_stochastic_mtp_token(
+                                    draft_tok,
+                                    step_probabilities,
+                                    authoritative_logits,
+                                    sampling,
+                                    all_tokens + new_tokens,
+                                )
+                            )
+                            overlap = mx.sum(mx.minimum(
+                                target_probabilities, step_probabilities))
+                            mx.eval(overlap)
+                            overlap_value = float(overlap.item())
+                            stochastic_expected_acceptance_sum += overlap_value
+                            stochastic_expected_acceptance_by_step[step] += (
+                                overlap_value)
+                            if step == 0:
+                                stochastic_first_step_expected_acceptance_sum += (
+                                    overlap_value)
+                            if self.proposal_replay_top_k:
+                                step_rank_probabilities = (
+                                    draft_rank_probabilities[step])
+                                if step_rank_probabilities is None:
+                                    raise RuntimeError(
+                                        "proposal-q replay omitted draft ranks")
+                                proposal_replay_records.append(
+                                    proposal_q_replay_record(
+                                        step_rank_probabilities,
+                                        target_probabilities,
+                                        max_rank=self.proposal_replay_top_k,
+                                        proposal=int(draft_tok),
+                                        accepted=bool(draft_accepted),
+                                        history_length=(
+                                            len(all_tokens) + len(new_tokens)),
+                                        round_index=speculative_rounds - 1,
+                                        draft_step_index=step,
+                                    )
+                                )
+
+                        if not draft_accepted:
+                            round_rejected = True
+                            rejected_rounds += 1
+                            if accepted_prefix:
+                                partial_accept_rounds += 1
+                            if constraint is not None:
+                                constraint.accept_token(true_tok)
+                                grammar_completed = bool(constraint.completed)
+                            new_tokens.append(int(true_tok))
+                            new_token_logits.append(authoritative_logits)
+                            break
+
+                        accepted += 1
+                        accepted_prefix += 1
+                        if round_proposal_source == "N":
+                            ngram_first_accepted_by_step[step] += 1
+                        else:
+                            accepted_by_step[step] += 1
+                        if constraint is not None:
+                            constraint.accept_token(draft_tok)
+                            grammar_completed = bool(constraint.completed)
+                        new_tokens.append(int(draft_tok))
+                        new_token_logits.append(authoritative_logits)
+                        if _candidate_terminal(new_tokens):
+                            break
+
+                    round_draft_width = len(draft_tokens)
+                    all_drafts_accepted = (
+                        accepted_prefix == round_draft_width
+                        and not round_rejected)
+                    if round_proposal_source == "N":
+                        ngram_first_accepted += accepted_prefix
+                        ngram_first_rejected += int(round_rejected)
+                    else:
+                        native_mtp_accepted += accepted_prefix
+                        native_mtp_rejected += int(round_rejected)
+                    if all_drafts_accepted:
+                        full_accept_rounds += 1
+                    if round_proposal_source == "N" and round_draft_width > 1:
+                        if round_rejected:
+                            round_outcomes.append(
+                                "R" if accepted_prefix == 0
+                                else f"A{accepted_prefix}R")
+                        else:
+                            round_outcomes.append(f"A{accepted_prefix}")
+                    elif self.depth == 1:
+                        round_outcomes.append(
+                            "A" if all_drafts_accepted else "R")
+                    elif round_rejected:
                         round_outcomes.append(
                             "R" if accepted_prefix == 0
                             else f"A{accepted_prefix}R")
                     else:
                         round_outcomes.append(f"A{accepted_prefix}")
-                elif self.depth == 1:
-                    round_outcomes.append("A" if all_drafts_accepted else "R")
-                elif round_rejected:
-                    round_outcomes.append(
-                        "R" if accepted_prefix == 0 else f"A{accepted_prefix}R")
-                else:
-                    round_outcomes.append(f"A{accepted_prefix}")
 
-                if all_drafts_accepted and not _candidate_terminal(new_tokens):
-                    bonus_logits = _authoritative_target_logits(
-                        tgt, spec_logits[round_draft_width], constraint,
-                        round_draft_width)
-                    bonus_tok = sample(
-                        bonus_logits,
-                        sampling,
-                        history=all_tokens + new_tokens,
-                    )
-                    if constraint is not None:
-                        constraint.accept_token(bonus_tok)
-                        grammar_completed = bool(constraint.completed)
-                    new_tokens.append(int(bonus_tok))
-                    new_token_logits.append(bonus_logits)
-                    round_bonus_candidate = True
-                next_catchup_tok = new_tokens[-1]
-                h_last = tgt._h_last
-                if round_rejected:
-                    refeed_sweeps_saved += int(round_serial_verify)
+                    if (all_drafts_accepted
+                            and not _candidate_terminal(new_tokens)):
+                        bonus_logits = _authoritative_target_logits(
+                            tgt, spec_logits[round_draft_width], constraint,
+                            round_draft_width)
+                        bonus_tok = sample(
+                            bonus_logits,
+                            sampling,
+                            history=all_tokens + new_tokens,
+                        )
+                        if constraint is not None:
+                            constraint.accept_token(bonus_tok)
+                            grammar_completed = bool(constraint.completed)
+                        new_tokens.append(int(bonus_tok))
+                        new_token_logits.append(bonus_logits)
+                        round_bonus_candidate = True
+                    next_catchup_tok = new_tokens[-1]
+                    h_last = tgt._h_last
+                    if round_rejected:
+                        refeed_sweeps_saved += int(round_serial_verify)
                 verifier_round_s += time.perf_counter() - verifier_started
 
             emitted_before_round = len(emitted)
@@ -1896,7 +2128,25 @@ class QwenMTPSpeculativeEngine:
                 verifier_committed_positions += target_fed_positions
                 verifier_rolled_back_positions += max(
                     0, round_verify_width - target_fed_positions)
-                if target_fed_positions < round_verify_width:
+                if round_tree_verification is not None:
+                    if round_tree_selected_path is None:
+                        raise RuntimeError(
+                            "native MTP tree omitted its selected path")
+                    commit_path = round_tree_selected_path[
+                        :target_fed_positions]
+                    if len(commit_path) != target_fed_positions:
+                        raise RuntimeError(
+                            "native MTP tree cannot commit the emitted prefix")
+                    commit_started = time.perf_counter()
+                    round_tree_verification.commit(
+                        commit_path, target=tgt, kv=kv)
+                    native_tree_factor_commit_s += (
+                        time.perf_counter() - commit_started)
+                    native_tree_paths_committed += 1
+                    h_last = tgt._h_last
+                    del round_tree_verification, spec_logits
+                    mx.clear_cache()
+                elif target_fed_positions < round_verify_width:
                     retained_prefix = (
                         tgt.consume_serial_kda_endpoint(target_fed_positions)
                         if round_capture_endpoint else None
@@ -2158,6 +2408,25 @@ class QwenMTPSpeculativeEngine:
                 if not sampling.is_greedy else 0),
             "qwen_mtp_q_policy": self.proposal_q_policy.as_dict(),
             "qwen_mtp_engine_identity": self.mtp_engine_identity,
+            "qwen_mtp_native_tree_width": self.native_tree_width,
+            "qwen_mtp_native_tree_eligible": int(
+                self._native_tree_request_eligible(sampling, constraint)),
+            "qwen_mtp_native_tree_rounds": native_tree_rounds,
+            "qwen_mtp_native_tree_hits": native_tree_hits,
+            "qwen_mtp_native_tree_misses": native_tree_misses,
+            "qwen_mtp_native_tree_selected_rank_counts": (
+                native_tree_selected_rank_counts),
+            "qwen_mtp_native_tree_hit_rate": (
+                native_tree_hits / native_tree_rounds
+                if native_tree_rounds else 0.0),
+            "qwen_mtp_native_tree_nodes_verified": (
+                native_tree_nodes_verified),
+            "qwen_mtp_native_tree_paths_committed": (
+                native_tree_paths_committed),
+            "qwen_mtp_native_tree_factor_bytes_peak": (
+                native_tree_factor_bytes_peak),
+            "qwen_mtp_native_tree_factor_commit_s": (
+                native_tree_factor_commit_s),
             "qwen_mtp_ngram_first_enabled": int(self.ngram_first),
             "qwen_mtp_ngram_first_eligible": int(
                 self.ngram_first and sampling.is_greedy),

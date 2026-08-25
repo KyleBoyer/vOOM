@@ -761,6 +761,215 @@ def test_qwen_mtp_ngram_first_never_proposes_without_exact_stochastic_q(
     assert stats["qwen_mtp_proposal_sources"] == "M"
 
 
+@pytest.mark.parametrize(
+    (
+        "root_winner,eos,max_tokens,expected_tokens,"
+        "expected_commit_tokens,constrained"
+    ),
+    [
+        (10, (), 3, [4, 10, 7], [4, 10], False),
+        (6, (), 2, [4, 6], [4], False),
+        (10, (10,), 8, [4, 10], [4], False),
+        (6, (), 3, [4, 10, 7], [4, 10], True),
+    ],
+)
+def test_qwen_mtp_native_sibling_tree_commits_only_target_selected_path(
+    monkeypatch, root_winner, eos, max_tokens, expected_tokens,
+    expected_commit_tokens, constrained,
+):
+    """Top-k siblings share one sweep without changing target-owned state."""
+    from runtime.qwen35_mtp import QwenMTPSpeculativeEngine
+    from runtime.sampler import SamplingParams
+
+    committed_paths = []
+    verified_trees = []
+
+    class _Constraint:
+        profile = "native-tree-test"
+
+        def __init__(self):
+            self.accepted = []
+            self.completed = False
+
+        def mask_logits(self, logits):
+            allowed = 10 if self.accepted == [4] else 7
+            masked = mx.full(logits.shape, -1e9)
+            return masked.at[allowed].add(
+                1e9 + logits.reshape(-1)[allowed])
+
+        def accept_token(self, token):
+            self.accepted.append(int(token))
+
+    class _KV:
+        def __init__(self):
+            self.offset = 3
+            self.lengths = [3, 1]
+            self.kda_cache = SimpleNamespace(synchronize=lambda: None)
+
+        def layer_lengths(self):
+            return tuple(self.lengths)
+
+        def trim(self, offset):
+            self.offset = int(offset)
+
+        def nbytes(self):
+            return 0
+
+    class _Target(_Engine):
+        def __init__(self):
+            super().__init__("/models/target")
+            self.cfg = SimpleNamespace(
+                model_type="qwen3_5", num_experts=0,
+                eos_token_ids=tuple(eos))
+            self.cache = SimpleNamespace(
+                stats=SimpleNamespace(
+                    hits=0, misses=0, evictions=0, bytes_read=0),
+                total_bytes=0, max_bytes=1)
+            self.expert_hits = self.expert_misses = 0
+            for name in (
+                    "fast_tier_bytes", "archive_bytes",
+                    "parallel_tier_fetches", "parallel_tier_fast_bytes",
+                    "parallel_tier_archive_bytes"):
+                setattr(self.store, name, 0)
+            self.governor = None
+            self._layer_transient = self._prefill_layer_transient = 0
+            self._decode_layer_transient = self._layer_transient_margin = 0
+            self._token_transient = self._true_peak_metal_bytes = 0
+            self._request_profiler = None
+            self._hot_prompt_slots = []
+            self._h_last = mx.array([[[30.0]]])
+            self._h_window = self._h_last
+            self.last_kv = None
+            self.effective_max_position_embeddings = 0
+            self.rope_profile = "test"
+            self.constraint_hidden = []
+
+        def generate(self, _prompt, max_tokens, **_kwargs):
+            assert max_tokens == 1
+            if _kwargs.get("constraint") is not None:
+                _kwargs["constraint"].accept_token(4)
+            self.last_kv = _KV()
+            return {
+                "text": "4", "tokens": [4], "prefill_s": 0.0,
+                "first_token_s": 0.0, "decode_s": 0.0, "total_s": 0.0,
+                "termination_reason": "length", "stop_sequence": None,
+                "path_stats": {}, "prompt_tokens": 3,
+            }
+
+        def forward_tokens_serial_positions(self, *_args, **_kwargs):
+            raise AssertionError("native sibling tree must use tree verification")
+
+        def _constraint_logits(self, logits, constraint, hidden=None):
+            self.constraint_hidden.append(float(hidden.item()))
+            return constraint.mask_logits(logits)
+
+    class _Drafter:
+        def __init__(self):
+            self.mtp_kv = None
+
+        def draft_logits(self, _hidden, _token, mtp_kv, _offset, _weights=None):
+            self.mtp_kv = mtp_kv
+            item = mx.ones((1, 1, 1, 1))
+            mtp_kv.update(0, item, item)
+            logits = mx.full((16,), -100.0)
+            logits = logits.at[9].add(104.0)
+            logits = logits.at[10].add(103.0)
+            return logits.at[11].add(102.0)
+
+    class _Factors:
+        @staticmethod
+        def nbytes():
+            return 321
+
+    class _Verification:
+        def __init__(self, tree):
+            self.tree = tree
+            self.factors = _Factors()
+            self.hidden_nodes = tuple(
+                mx.array([[[40.0 + float(node)]]])
+                for node in range(len(tree.token_ids)))
+            self.logits = mx.full((len(tree.token_ids), 16), -100.0)
+            self.logits = self.logits.at[0, root_winner].add(200.0)
+            for node in range(1, len(tree.token_ids)):
+                self.logits = self.logits.at[node, 7].add(200.0)
+
+        def commit(self, path, *, target, kv):
+            selected = tuple(path)
+            committed_paths.append(selected)
+            kv.offset += len(selected)
+            kv.lengths = [value + len(selected) for value in kv.lengths]
+            kv.kda_cache = SimpleNamespace(
+                selected=selected, synchronize=lambda: None)
+            target._h_window = mx.array([[
+                [40.0 + float(node)] for node in selected]])
+            target._h_last = target._h_window[:, -1:, :]
+
+    def fake_verify(_target, tree, kv):
+        verified_trees.append(tree)
+        if constrained:
+            assert tree.token_ids[0] == 4
+            assert len(tree.token_ids) == 4
+            assert 10 in tree.children[0]
+        else:
+            assert tree.token_ids == (4, 9, 10, 11)
+        assert tree.parents == (-1, 0, 0, 0)
+        assert kv.layer_lengths() == (3, 1)
+        return _Verification(tree)
+
+    monkeypatch.setattr(
+        "runtime.qwen35_tree_verify.verify_qwen35_tree", fake_verify)
+    target = _Target()
+    engine = QwenMTPSpeculativeEngine(
+        target, max_prompt_tokens=8, min_output_tokens=2,
+        plain_warmup_tokens=0, adaptive_stop=False, native_tree_width=3)
+    assert not engine._native_tree_request_eligible(
+        SamplingParams(repetition_penalty=1.1), None)
+    assert not engine._native_tree_request_eligible(SamplingParams(), object())
+    drafter = _Drafter()
+    engine.drafter = drafter
+    constraint = _Constraint() if constrained else None
+
+    result = engine.generate("x", max_tokens, constraint=constraint)
+    stats = result["path_stats"]
+    expected_path = committed_paths[0]
+    expected_hit = int(constrained or root_winner == 10)
+
+    assert result["tokens"] == expected_tokens
+    assert [
+        verified_trees[0].token_ids[node] for node in expected_path
+    ] == expected_commit_tokens
+    assert target.last_kv.offset == 3 + len(expected_path)
+    assert target.last_kv.lengths == [
+        3 + len(expected_path), 1 + len(expected_path)]
+    assert target.last_kv.kda_cache.selected == expected_path
+    assert drafter.mtp_kv.layer_lengths() == (1,)
+    assert stats["qwen_mtp_native_tree_width"] == 3
+    assert stats["qwen_mtp_native_tree_eligible"] == 1
+    assert stats["qwen_mtp_native_tree_rounds"] == 1
+    assert stats["qwen_mtp_native_tree_hits"] == expected_hit
+    assert stats["qwen_mtp_native_tree_misses"] == 1 - expected_hit
+    expected_rank = (
+        1 if constrained else (2 if root_winner == 10 else 0)
+    )
+    expected_rank_counts = [0, 0, 0, 0]
+    expected_rank_counts[expected_rank] = 1
+    assert stats["qwen_mtp_native_tree_selected_rank_counts"] == (
+        expected_rank_counts)
+    assert stats["qwen_mtp_native_tree_nodes_verified"] == 4
+    assert stats["qwen_mtp_native_tree_paths_committed"] == 1
+    assert stats["qwen_mtp_native_tree_factor_bytes_peak"] == 321
+    assert stats["qwen_mtp_verify_width"] == 4
+    assert stats["qwen_mtp_verified_proposals"] == 3
+    assert stats["qwen_mtp_accepted"] == expected_hit
+    assert stats["qwen_mtp_verifier_committed_positions"] == len(expected_path)
+    assert stats["qwen_mtp_verifier_rolled_back_positions"] == (
+        4 - len(expected_path))
+    if constrained:
+        assert constraint.accepted == expected_tokens
+        selected = verified_trees[0].children[0][10]
+        assert target.constraint_hidden == [40.0, 40.0 + selected]
+
+
 def test_qwen_mtp_batches_grammar_forced_span_before_next_decision():
     """Jump-forward and MTP compose: deterministic grammar tokens share one
     target sweep and the draft head is reserved for genuinely free choices."""

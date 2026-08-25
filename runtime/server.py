@@ -1236,6 +1236,8 @@ class EngineManager:
                 "VMODEL_QWEN_MTP_PROPOSAL_REPLAY_TOP_K", "0"))
             qwen_mtp_depth = int(os.environ.get(
                 "VMODEL_QWEN_MTP_DEPTH", "1"))
+            qwen_mtp_tree_width = int(os.environ.get(
+                "VMODEL_QWEN_MTP_TREE_WIDTH", "0"))
             qwen_mtp_q_parameter = float(os.environ.get(
                 "VMODEL_QWEN_MTP_Q_PARAMETER", "1"))
             dflash2_max_draft_tokens = int(os.environ.get(
@@ -1273,6 +1275,9 @@ class EngineManager:
         if qwen_mtp_depth not in (1, 2):
             raise RequestValidationError(
                 "VMODEL_QWEN_MTP_DEPTH must be 1 or 2")
+        if qwen_mtp_tree_width not in (0, 2, 3, 4):
+            raise RequestValidationError(
+                "VMODEL_QWEN_MTP_TREE_WIDTH must be 0 or in [2, 4]")
         if qwen_mtp_ngram_first_request not in ("0", "1"):
             raise RequestValidationError(
                 "VMODEL_QWEN_MTP_NGRAM_FIRST must be 0 or 1")
@@ -1281,6 +1286,14 @@ class EngineManager:
             raise RequestValidationError(
                 "VMODEL_QWEN_MTP_NGRAM_FIRST=1 requires "
                 "VMODEL_QWEN_MTP_DEPTH=1")
+        if qwen_mtp_tree_width and qwen_mtp_depth != 1:
+            raise RequestValidationError(
+                "VMODEL_QWEN_MTP_TREE_WIDTH requires "
+                "VMODEL_QWEN_MTP_DEPTH=1")
+        if qwen_mtp_tree_width and qwen_mtp_ngram_first:
+            raise RequestValidationError(
+                "VMODEL_QWEN_MTP_TREE_WIDTH cannot be combined with "
+                "VMODEL_QWEN_MTP_NGRAM_FIRST=1")
         if qwen_mtp_q_policy_kind not in ("flat", "temperature", "rank"):
             raise RequestValidationError(
                 "VMODEL_QWEN_MTP_Q_POLICY must be flat, temperature, or rank")
@@ -1363,6 +1376,14 @@ class EngineManager:
             raise RequestValidationError(
                 "VMODEL_QWEN35_PREFILL_CHUNK_CEILING must be one of "
                 "0, 1, 8, 32, 128, or 512")
+        qwen35_exact_page_admission_request = os.environ.get(
+            "VMODEL_QWEN35_SERIAL_VERIFY_EXACT_PAGE_ADMISSION", "0"
+        ).strip()
+        if qwen35_exact_page_admission_request not in ("0", "1"):
+            raise RequestValidationError(
+                "VMODEL_QWEN35_SERIAL_VERIFY_EXACT_PAGE_ADMISSION must be "
+                "0 or 1"
+            )
         qwen_quant_lm_head_request = os.environ.get(
             "VMODEL_QWEN35_QUANT_LM_HEAD", "0").strip()
         if qwen_quant_lm_head_request not in ("0", "1"):
@@ -1740,11 +1761,13 @@ class EngineManager:
             qwen_mtp_stochastic_draft_top_k,
             qwen_mtp_proposal_replay_top_k,
             qwen_mtp_depth,
+            qwen_mtp_tree_width,
             qwen_mtp_q_policy_kind,
             qwen_mtp_q_parameter.hex(),
             qwen_moe_prefill_batch_request,
             qwen_moe_decode_batch_request,
             qwen35_prefill_chunk_ceiling,
+            qwen35_exact_page_admission_request,
             qwen_lossy_suffix_request,
             qwen_hot_kv_request,
             qwen_hot_kv_persist_dir_request,
@@ -1829,11 +1852,13 @@ class EngineManager:
             qwen_mtp_stochastic_draft_top_k,
             qwen_mtp_proposal_replay_top_k,
             qwen_mtp_depth,
+            qwen_mtp_tree_width,
             qwen_mtp_q_policy_kind,
             qwen_mtp_q_parameter.hex(),
             qwen_moe_prefill_batch_request,
             qwen_moe_decode_batch_request,
             qwen35_prefill_chunk_ceiling,
+            qwen35_exact_page_admission_request,
             qwen_lossy_suffix_request,
             qwen_hot_kv_request,
             qwen_hot_kv_persist_dir_request,
@@ -1968,6 +1993,8 @@ class EngineManager:
             if mtype in ("qwen3_5", "qwen3_5_moe"):
                 rc.qwen35_prefill_chunk_ceiling = (
                     qwen35_prefill_chunk_ceiling)
+                rc.qwen35_serial_verify_exact_page_admission = (
+                    qwen35_exact_page_admission_request == "1")
             # Grammar fast-forward (token-level jump-forward decoding,
             # 2026-07-23): model-agnostic -- it lives entirely in the
             # constrained-decoding sampler loop, so it is read once here
@@ -4524,6 +4551,7 @@ class EngineManager:
                         proposal_replay_top_k=(
                             qwen_mtp_proposal_replay_top_k),
                         depth=qwen_mtp_depth,
+                        native_tree_width=qwen_mtp_tree_width,
                         ngram_first=qwen_mtp_ngram_first,
                         proposal_q_policy=proposal_q_policy,
                         plain_warmup_tokens=(
@@ -4538,6 +4566,7 @@ class EngineManager:
                         f"proposal_replay_top_k="
                         f"{qwen_mtp_proposal_replay_top_k} "
                         f"depth={qwen_mtp_depth} "
+                        f"tree_width={qwen_mtp_tree_width} "
                         f"ngram_first={int(qwen_mtp_ngram_first)} "
                         f"q_policy={proposal_q_policy.name}",
                         flush=True,
@@ -8183,6 +8212,14 @@ def _vision_protocol_timing(result: dict) -> dict:
         "qwen_mtp_stochastic",
         "qwen_mtp_stochastic_draft_argmax",
         "qwen_mtp_stochastic_draft_top_k",
+        "qwen_mtp_native_tree_width",
+        "qwen_mtp_native_tree_eligible",
+        "qwen_mtp_native_tree_rounds",
+        "qwen_mtp_native_tree_hits",
+        "qwen_mtp_native_tree_misses",
+        "qwen_mtp_native_tree_nodes_verified",
+        "qwen_mtp_native_tree_paths_committed",
+        "qwen_mtp_native_tree_factor_bytes_peak",
         "qwen_mtp_grammar_forced_tokens",
         "qwen_mtp_grammar_forced_sweeps",
         "qwen_mtp_ngram_first_enabled",
@@ -8251,6 +8288,7 @@ def _vision_protocol_timing(result: dict) -> dict:
         "postgen_weight_cache_trim_available_after_bytes",
         "qwen35_prefill_chunk_ceiling",
         "qwen35_prefill_chunk_selected",
+        "qwen35_serial_verify_exact_page_admission",
         "kimi_k3_prefill_tile_width",
         "kimi_k3_dense_mlp_tile_size",
         "kimi_k3_prefill_long_context_tokens",
@@ -8277,6 +8315,8 @@ def _vision_protocol_timing(result: dict) -> dict:
         "qwen_mtp_plain_round_s",
         "qwen_mtp_estimated_net_saved_s",
         "qwen_mtp_estimated_break_even_accept_rate",
+        "qwen_mtp_native_tree_hit_rate",
+        "qwen_mtp_native_tree_factor_commit_s",
         "qwen_mtp_proposal_page_load_s",
         "qwen_mtp_proposal_page_release_s",
         "qwen_mtp_bf16_sidecar_load_s",
@@ -8322,6 +8362,7 @@ def _vision_protocol_timing(result: dict) -> dict:
     for key in (
         "qwen_mtp_accepted_by_step",
         "qwen_mtp_verified_by_step",
+        "qwen_mtp_native_tree_selected_rank_counts",
         "qwen_mtp_ngram_first_accepted_by_step",
         "qwen_mtp_ngram_first_verified_by_step",
         "qwen_mtp_stochastic_expected_acceptance_by_step",
