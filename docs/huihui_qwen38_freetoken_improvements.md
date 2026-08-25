@@ -152,6 +152,24 @@ On the accepted capture, all 19 prefetched pages were consumed, none waited or
 were wasted, and at least 1.966 seconds of load time was hidden. The current
 prefetch depth of two remains the measured choice.
 
+### Rejected: a second target-page prefetch worker
+
+A fresh 2026-08-25 run temporarily exposed a two-worker dense-Qwen prefetch
+arm and replayed the byte-identical 178,616-byte / 134-tool capture with the
+existing depth-two schedule and 16-token benchmark cap.  The required
+30-second preflight passed with zero swap growth and 6.72GB available.  All 64
+prefill layers completed, but the first native-MTP verifier sweep failed closed
+after 105.3571 seconds: the governor correctly refused a 0.21GB target page at
+2.06GB active plus the unchanged 0.40GB safety margin, with only 5.57GB system
+memory available.  Physical swap-outs had already grown by 7.70MB.
+
+This is a safety regression, not a timing win.  Two workers can leave an extra
+materialized page in flight while the serial verifier needs its authoritative
+page.  The temporary serving knob was removed, the one-worker default remains
+unchanged, and no retry with a lower memory floor is admissible.  Evidence:
+`logs/memory_preflight_qwen_prefetch_workers2_capture16_20260825.json` and
+`logs/huihui_prefetch_workers2_depth2_capture16_20260825.json`.
+
 ## Rejected: moving more target-body tensors to the external SSD
 
 `runtime/qwen_fast_tier_rebalance.py` tested reducing the internal trunk share
