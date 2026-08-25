@@ -103,9 +103,15 @@ def make_governor(module, fake_mx, *, cache_max: int, floor: int,
     gov.reservation_cache_released_bytes = 0
     gov.reservation_unproductive_shrinks = 0
     gov.reservation_reason_counts = {}
+    gov.phase_budget_restore_calls = 0
+    gov.phase_budget_restore_bytes = 0
+    gov.phase_budget_restore_reason_counts = {}
     gov.configured_max = cache_max
     gov.paused_prefetch = False
     gov.shrinks = 0
+    gov.warn = int(2e9)
+    gov.green = int(3.5e9)
+    gov._last_swap_pressure_at = None
     return gov
 
 
@@ -278,6 +284,50 @@ def test_unknown_legacy_caller_keeps_established_persistent_shrink():
     assert gov.cache.max_bytes < int(2.2e9)
     assert gov.reservation_budget_restored_bytes == 0
     assert gov.reservation_reason_counts == {"unspecified": 1}
+
+
+def test_completed_phase_restores_limit_once_without_allocating(monkeypatch):
+    module, mx = load_pressure(int(3e9))
+    gov = make_governor(
+        module, mx, cache_max=int(2.2e9), floor=int(0.1e9))
+    gov.cache.max_bytes = int(0.1e9)
+    gov.cache.total_bytes = int(0.1e9)
+    monkeypatch.setattr(
+        module.psutil, "virtual_memory",
+        lambda: types.SimpleNamespace(available=int(6e9)))
+
+    restored = gov.restore_phase_budget(
+        int(2.2e9), starting_pressure_shrinks=0,
+        reason="qwen-mtp-paged-bootstrap")
+
+    assert restored == int(2.1e9)
+    assert gov.cache.max_bytes == int(2.2e9)
+    assert gov.cache.total_bytes == int(0.1e9)
+    assert gov.phase_budget_restore_calls == 1
+    assert gov.phase_budget_restore_bytes == int(2.1e9)
+    assert gov.phase_budget_restore_reason_counts == {
+        "qwen-mtp-paged-bootstrap": 1}
+
+
+def test_completed_phase_restore_refuses_concurrent_or_live_pressure(monkeypatch):
+    module, mx = load_pressure(int(3e9))
+    gov = make_governor(
+        module, mx, cache_max=int(2.2e9), floor=int(0.1e9))
+    gov.cache.max_bytes = int(0.1e9)
+    monkeypatch.setattr(
+        module.psutil, "virtual_memory",
+        lambda: types.SimpleNamespace(available=int(6e9)))
+    gov.shrinks = 1
+    assert gov.restore_phase_budget(
+        int(2.2e9), starting_pressure_shrinks=0) == 0
+
+    gov.shrinks = 0
+    monkeypatch.setattr(
+        module.psutil, "virtual_memory",
+        lambda: types.SimpleNamespace(available=int(1.9e9)))
+    assert gov.restore_phase_budget(
+        int(2.2e9), starting_pressure_shrinks=0) == 0
+    assert gov.cache.max_bytes == int(0.1e9)
 
 
 def test_admissible_units_uses_live_headroom_and_representation_size():

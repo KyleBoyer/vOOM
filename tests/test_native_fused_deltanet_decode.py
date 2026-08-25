@@ -102,6 +102,18 @@ def test_native_kernel_is_a_true_no_op_when_disabled():
     assert "native_fused_decode and length == 1" in src
 
 
+def test_serial_verifier_forwards_fused_decode_policy_to_both_qwen_paths():
+    """The dense batched-MLP and fallback/MoE verifier branches must not
+    silently drop the decode-kernel policy while ordinary decode honors it."""
+    import inspect
+
+    from runtime.engine import StreamingEngine
+
+    src = inspect.getsource(StreamingEngine.forward_tokens_serial_positions)
+    assert src.count("self.rc.native_fused_deltanet_decode") == 2
+    assert src.count("self.rc.zmlx_fused_deltanet_decode") == 2
+
+
 def _run(native_fused: bool, max_tokens: int = 24):
     from runtime.engine import RuntimeConfig, StreamingEngine
     from runtime.sampler import SamplingParams

@@ -1212,8 +1212,14 @@ class EngineManager:
             "VMODEL_QWEN_MTP_NGRAM_FIRST", "0").strip()
         qwen_mtp_grammar_aware_draft_request = os.environ.get(
             "VMODEL_QWEN_MTP_GRAMMAR_AWARE_DRAFT", "0").strip()
+        qwen_mtp_ablation_direction_request = os.environ.get(
+            "VMODEL_QWEN_MTP_ABLATION_DIRECTION", "").strip()
         qwen_mtp_q_policy_kind = os.environ.get(
             "VMODEL_QWEN_MTP_Q_POLICY", "flat").strip().lower()
+        qwen_ar_draft_request = os.environ.get(
+            "VMODEL_QWEN_AR_DRAFT", "").strip()
+        qwen_ar_draft_retain_request = os.environ.get(
+            "VMODEL_QWEN_AR_DRAFT_RETAIN_WEIGHTS", "0").strip()
         dflash2_draft_request = os.environ.get(
             "VMODEL_QWEN_DFLASH2_DRAFT", "").strip()
         dflash2_proposal_policy = os.environ.get(
@@ -1242,6 +1248,10 @@ class EngineManager:
                 "VMODEL_QWEN_MTP_TREE_WIDTH", "0"))
             qwen_mtp_q_parameter = float(os.environ.get(
                 "VMODEL_QWEN_MTP_Q_PARAMETER", "1"))
+            qwen_mtp_ablation_strength = float(os.environ.get(
+                "VMODEL_QWEN_MTP_ABLATION_STRENGTH", "1.299626796174988"))
+            qwen_ar_draft_prefill_step_size = int(os.environ.get(
+                "VMODEL_QWEN_AR_DRAFT_PREFILL_STEP_SIZE", "512"))
             dflash2_max_draft_tokens = int(os.environ.get(
                 "VMODEL_QWEN_DFLASH2_MAX_DRAFT_TOKENS", "4"))
             dflash2_max_prompt_tokens = int(os.environ.get(
@@ -1301,6 +1311,42 @@ class EngineManager:
             raise RequestValidationError(
                 "VMODEL_QWEN_MTP_TREE_WIDTH cannot be combined with "
                 "VMODEL_QWEN_MTP_NGRAM_FIRST=1")
+        if not 1 <= qwen_ar_draft_prefill_step_size <= 4096:
+            raise RequestValidationError(
+                "VMODEL_QWEN_AR_DRAFT_PREFILL_STEP_SIZE must be in [1, 4096]")
+        if qwen_ar_draft_retain_request not in ("0", "1"):
+            raise RequestValidationError(
+                "VMODEL_QWEN_AR_DRAFT_RETAIN_WEIGHTS must be 0 or 1")
+        qwen_ar_draft_retain = qwen_ar_draft_retain_request == "1"
+        if qwen_ar_draft_retain and not qwen_ar_draft_request:
+            raise RequestValidationError(
+                "VMODEL_QWEN_AR_DRAFT_RETAIN_WEIGHTS=1 requires "
+                "VMODEL_QWEN_AR_DRAFT")
+        if qwen_ar_draft_request and qwen_mtp_request == "0":
+            raise RequestValidationError(
+                "VMODEL_QWEN_AR_DRAFT requires Qwen target verification; "
+                "VMODEL_QWEN_MTP_SPECULATIVE cannot be 0")
+        if qwen_ar_draft_request and qwen_mtp_tree_width:
+            raise RequestValidationError(
+                "VMODEL_QWEN_AR_DRAFT cannot be combined with a native MTP tree")
+        if qwen_ar_draft_request and qwen_mtp_ablation_direction_request:
+            raise RequestValidationError(
+                "VMODEL_QWEN_MTP_ABLATION_DIRECTION requires the native MTP "
+                "drafter and cannot be combined with VMODEL_QWEN_AR_DRAFT")
+        if dflash2_draft_request and qwen_mtp_ablation_direction_request:
+            raise RequestValidationError(
+                "VMODEL_QWEN_MTP_ABLATION_DIRECTION cannot be combined with "
+                "VMODEL_QWEN_DFLASH2_DRAFT")
+        if qwen_ar_draft_request and dflash2_draft_request:
+            raise RequestValidationError(
+                "VMODEL_QWEN_AR_DRAFT and VMODEL_QWEN_DFLASH2_DRAFT are "
+                "mutually exclusive")
+        if qwen_ar_draft_request and dspark_request_identity[0].lower() not in (
+            "", "auto", "0", "off", "false", "none", "disabled",
+        ):
+            raise RequestValidationError(
+                "VMODEL_QWEN_AR_DRAFT and an explicit VMODEL_DSPARK_DRAFT "
+                "are mutually exclusive")
         if qwen_mtp_q_policy_kind not in ("flat", "temperature", "rank"):
             raise RequestValidationError(
                 "VMODEL_QWEN_MTP_Q_POLICY must be flat, temperature, or rank")
@@ -1314,6 +1360,11 @@ class EngineManager:
             raise RequestValidationError(
                 "VMODEL_QWEN_MTP_Q_PARAMETER must be finite; temperature "
                 "requires >0 and rank requires >=0")
+        if not math.isfinite(qwen_mtp_ablation_strength) or not (
+            0.0 < qwen_mtp_ablation_strength <= 2.0
+        ):
+            raise RequestValidationError(
+                "VMODEL_QWEN_MTP_ABLATION_STRENGTH must be in (0, 2]")
         if dflash2_proposal_policy not in ("selector", "unary"):
             raise RequestValidationError(
                 "VMODEL_QWEN_DFLASH2_PROPOSAL_POLICY must be selector or unary")
@@ -1780,6 +1831,8 @@ class EngineManager:
             qwen_mtp_request,
             qwen_mtp_ngram_first_request,
             qwen_mtp_grammar_aware_draft_request,
+            qwen_mtp_ablation_direction_request,
+            qwen_mtp_ablation_strength.hex(),
             qwen_mtp_max_prompt_tokens,
             qwen_mtp_min_output_tokens,
             qwen_mtp_stochastic_draft_top_k,
@@ -1788,6 +1841,9 @@ class EngineManager:
             qwen_mtp_tree_width,
             qwen_mtp_q_policy_kind,
             qwen_mtp_q_parameter.hex(),
+            qwen_ar_draft_request,
+            qwen_ar_draft_retain_request,
+            qwen_ar_draft_prefill_step_size,
             qwen_moe_prefill_batch_request,
             qwen_moe_decode_batch_request,
             qwen35_prefill_chunk_ceiling,
@@ -1874,6 +1930,8 @@ class EngineManager:
             qwen_mtp_request,
             qwen_mtp_ngram_first_request,
             qwen_mtp_grammar_aware_draft_request,
+            qwen_mtp_ablation_direction_request,
+            qwen_mtp_ablation_strength.hex(),
             qwen_mtp_max_prompt_tokens,
             qwen_mtp_min_output_tokens,
             qwen_mtp_stochastic_draft_top_k,
@@ -1882,6 +1940,9 @@ class EngineManager:
             qwen_mtp_tree_width,
             qwen_mtp_q_policy_kind,
             qwen_mtp_q_parameter.hex(),
+            qwen_ar_draft_request,
+            qwen_ar_draft_retain_request,
+            qwen_ar_draft_prefill_step_size,
             qwen_moe_prefill_batch_request,
             qwen_moe_decode_batch_request,
             qwen35_prefill_chunk_ceiling,
@@ -3732,6 +3793,9 @@ class EngineManager:
             dflash2_dir = (
                 Path(dflash2_draft_request).expanduser().resolve()
                 if dflash2_draft_request else None)
+            qwen_ar_draft_dir = (
+                Path(qwen_ar_draft_request).expanduser().resolve()
+                if qwen_ar_draft_request else None)
             qwen2_adaptive_candidate = False
             qwen2_streamed_rc = None
             qwen2_resident_cache_mb = 0
@@ -4557,7 +4621,33 @@ class EngineManager:
                 # without accepting any draft without target verification.
                 from .qwen35_mtp import ProposalQPolicy, QwenMTPSpeculativeEngine
 
+                ar_drafter = None
                 try:
+                    mtp_ablation = None
+                    if qwen_mtp_ablation_direction_request:
+                        from .dflash2_ablation import (
+                            load_artifact as load_mtp_ablation_artifact)
+                        from .dflash2_schema import OFFICIAL_REVISION
+
+                        mtp_ablation = load_mtp_ablation_artifact(
+                            Path(qwen_mtp_ablation_direction_request)
+                            .expanduser().resolve(),
+                            target_config=model_dir / "config.json",
+                            draft_revision=OFFICIAL_REVISION,
+                            hidden_size=cfg_probe.hidden_size,
+                        )
+                    if qwen_ar_draft_dir is not None:
+                        from .qwen35_ar_draft import ResidentQwenARDrafter
+
+                        ar_drafter = ResidentQwenARDrafter.from_model_dir(
+                            qwen_ar_draft_dir,
+                            target_dir=model_dir,
+                            target_cfg=cfg_probe,
+                            prefill_step_size=(
+                                qwen_ar_draft_prefill_step_size),
+                            retain_for_target_verification=(
+                                qwen_ar_draft_retain),
+                        )
                     proposal_q_policy = ProposalQPolicy(
                         qwen_mtp_q_policy_kind,
                         qwen_mtp_stochastic_draft_top_k,
@@ -4589,6 +4679,14 @@ class EngineManager:
                             qwen_mtp_grammar_aware_draft),
                         ngram_first=qwen_mtp_ngram_first,
                         proposal_q_policy=proposal_q_policy,
+                        drafter=ar_drafter,
+                        mtp_ablation_direction=(
+                            mtp_ablation.direction
+                            if mtp_ablation is not None else None),
+                        mtp_ablation_strength=qwen_mtp_ablation_strength,
+                        mtp_ablation_fingerprint=(
+                            mtp_ablation.fingerprint
+                            if mtp_ablation is not None else ""),
                         plain_warmup_tokens=(
                             3 if qwen_mtp_request == "auto" else 0))
                     print(
@@ -4605,10 +4703,31 @@ class EngineManager:
                         f"grammar_aware_draft="
                         f"{int(qwen_mtp_grammar_aware_draft)} "
                         f"ngram_first={int(qwen_mtp_ngram_first)} "
+                        f"draft_source="
+                        f"{'resident-ar' if ar_drafter is not None else 'native-mtp'} "
+                        f"ar_draft="
+                        f"{qwen_ar_draft_dir.name if qwen_ar_draft_dir else 'off'} "
+                        f"ar_retain={int(qwen_ar_draft_retain)} "
+                        f"mtp_ablation="
+                        f"{mtp_ablation.fingerprint[:12] if mtp_ablation else 'off'} "
+                        f"mtp_ablation_strength={qwen_mtp_ablation_strength:g} "
                         f"q_policy={proposal_q_policy.name}",
                         flush=True,
                     )
                 except Exception as error:
+                    if ar_drafter is not None:
+                        ar_drafter.close()
+                    if (qwen_ar_draft_dir is not None
+                            or qwen_mtp_ablation_direction_request):
+                        target_engine.close()
+                        self._engine = None
+                        candidate = (
+                            str(qwen_ar_draft_dir)
+                            if qwen_ar_draft_dir is not None else
+                            qwen_mtp_ablation_direction_request)
+                        raise RequestValidationError(
+                            f"could not initialize explicit Qwen draft "
+                            f"candidate {candidate}: {error}") from error
                     self._engine = target_engine
                     print(
                         f"[server] Qwen MTP speculation skipped "
@@ -7134,6 +7253,23 @@ def _hidden_tool_gateway_enabled(mode: str, tool_count: int, tool_choice: str) -
         raise RequestValidationError("VMODEL_FAST_TOOL_GATEWAY must be 0 or 1")
     if value == "0" or mode not in ("fast", "fast-long") or tool_count <= 0:
         return False
+    minimum_text = os.environ.get("VMODEL_FAST_TOOL_GATEWAY_MIN_TOOLS", "1")
+    try:
+        minimum_tools = int(minimum_text)
+    except ValueError as error:
+        raise RequestValidationError(
+            "VMODEL_FAST_TOOL_GATEWAY_MIN_TOOLS must be a positive integer"
+        ) from error
+    if minimum_tools <= 0:
+        raise RequestValidationError(
+            "VMODEL_FAST_TOOL_GATEWAY_MIN_TOOLS must be a positive integer")
+    # The extra discovery turn only pays for itself when there is a catalog to
+    # reduce. Keep the historical default of one for compatibility; named
+    # profiles can set a content-blind lower bound after heterogeneous replay.
+    # A directly supplied smaller catalog retains its full schemas and the
+    # ordinary authoritative constrained-decoding path.
+    if tool_count < minimum_tools:
+        return False
     # A named function is already the smallest correct catalog. `none` has no
     # prompt tools after request normalization. Auto/required benefit from the
     # hidden discovery round.
@@ -8276,6 +8412,31 @@ def _vision_protocol_timing(result: dict) -> dict:
         "qwen_mtp_native_draft_proposed",
         "qwen_mtp_native_draft_accepted",
         "qwen_mtp_native_draft_rejected",
+        "qwen_mtp_ar_draft_proposed",
+        "qwen_mtp_ar_draft_accepted",
+        "qwen_mtp_ar_draft_rejected",
+        "qwen_mtp_ar_draft_round_sync_steps",
+        "qwen_mtp_ar_draft_proposal_steps",
+        "qwen_mtp_ar_draft_commit_replay_steps",
+        "qwen_mtp_ar_draft_peak_cache_bytes",
+        "qwen_mtp_ar_draft_backend_loads",
+        "qwen_mtp_ar_draft_backend_unloads",
+        "qwen_mtp_ar_draft_verification_suspends",
+        "qwen_mtp_ar_draft_verification_released_active_bytes",
+        "qwen_mtp_ar_draft_verification_retain_enabled",
+        "qwen_mtp_ar_draft_verification_retained_rounds",
+        "qwen_mtp_ar_draft_verification_retained_active_bytes_peak",
+        "qwen_mtp_ablation_enabled",
+        "qwen_mtp_staged_draft_load",
+        "qwen_mtp_staged_target_cache_released_bytes",
+        "qwen_mtp_paged_bootstrap_endpoint_retained",
+        "qwen_mtp_paged_bootstrap_cache_budget_before_bytes",
+        "qwen_mtp_paged_bootstrap_cache_budget_after_bytes",
+        "qwen_mtp_paged_bootstrap_budget_restored_bytes",
+        "paged_kv_spills",
+        "paged_kv_reloads",
+        "paged_kv_spill_bytes_raw",
+        "paged_kv_spill_bytes_compressed",
         "qwen_mtp_request_local_sidecar_pin",
         "qwen_mtp_request_local_sidecar_bytes",
         "qwen_mtp_proposal_page_round_loads",
@@ -8357,6 +8518,14 @@ def _vision_protocol_timing(result: dict) -> dict:
         "qwen_mtp_target_batched_mlp_layers",
         "qwen_mtp_target_batched_mlp_positions",
         "qwen_mtp_target_batched_mlp_s",
+        "qwen_mtp_target_page_prepare_s",
+        "qwen_mtp_target_cache_prepare_s",
+        "qwen_mtp_target_page_reserve_s",
+        "qwen_mtp_target_reserve_s",
+        "qwen_mtp_target_weight_wait_s",
+        "qwen_mtp_target_linear_layer_compute_s",
+        "qwen_mtp_target_full_layer_compute_s",
+        "qwen_mtp_target_head_s",
         "qwen_mtp_plain_round_s",
         "qwen_mtp_estimated_net_saved_s",
         "qwen_mtp_estimated_break_even_accept_rate",
@@ -8366,6 +8535,18 @@ def _vision_protocol_timing(result: dict) -> dict:
         "qwen_mtp_proposal_page_release_s",
         "qwen_mtp_bf16_sidecar_load_s",
         "qwen_mtp_bf16_sidecar_release_s",
+        "qwen_mtp_ar_draft_request_prefill_s",
+        "qwen_mtp_ar_draft_cleanup_s",
+        "qwen_mtp_ar_draft_round_sync_s",
+        "qwen_mtp_ar_draft_proposal_s",
+        "qwen_mtp_ar_draft_commit_replay_s",
+        "qwen_mtp_ar_draft_backend_load_s",
+        "qwen_mtp_ar_draft_backend_unload_s",
+        "qwen_mtp_ar_draft_verification_suspend_s",
+        "qwen_mtp_ablation_strength",
+        "qwen_mtp_staged_draft_load_s",
+        "paged_kv_spill_seconds",
+        "paged_kv_reload_seconds",
         "reranked_lm_head_candidate_recall",
         "qwen_mtp_target_reranked_lm_head_candidate_recall",
         "qwen_mtp_draft_reranked_lm_head_candidate_recall",
@@ -8392,6 +8573,8 @@ def _vision_protocol_timing(result: dict) -> dict:
         "qwen_mtp_round_outcomes",
         "qwen_mtp_proposal_sources",
         "qwen_mtp_proposal_weight_representation",
+        "qwen_mtp_ar_draft_identity",
+        "qwen_mtp_ablation_fingerprint",
         "speculative_kind",
         "dflash2_proposal_policy",
         "dflash2_target_verifier",

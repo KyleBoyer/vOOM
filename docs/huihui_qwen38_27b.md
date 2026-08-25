@@ -9,6 +9,8 @@ The released checkpoint is pinned to Hugging Face revision
 - Fast all-MXFP4 derivative: `models/Huihui-Qwen3.8-27B-abliterated-mlx-all-mxfp4`
 - Released-BF16 MTP sidecar for the fast target:
   `models/Huihui-Qwen3.8-27B-abliterated-mlx-all-mxfp4/mtp-bf16.safetensors`
+- Experimental Qwen3.5-0.8B affine4/group64 proposal sidecar:
+  `models/Qwen3.5-0.8B-mlx-all-draft-affine4`
 - Quality-oriented mixed derivative:
   `models/Huihui-Qwen3.8-27B-abliterated-mlx-mixed-a8-last4-mtpbf16`
 - Internal raw fast tier: `~/vmodel_fast_tier/Huihui-Qwen3.8-27B-abliterated`
@@ -50,9 +52,11 @@ fetches, row-paged embeddings, layer-stationary prefill, a 16-layer full-depth
 anchor followed by a 1,024-token mixed-depth suffix, chunked DeltaNet, and
 target-verified native MTP. The MTP module is the released BF16 tensor set,
 loaded only for one speculative round and released before the target sweep.
-Calibration selects a top-1 proposal distribution at depth 1. The compact
-MXFP4 language-model head is pinned and two-layer prefetch is enabled; a trunk
-pin is not. MTP measures its draft/target break-even window, temporarily
+The named profile uses a top-1 proposal distribution at depth four, masks
+greedy proposals with the active grammar, and batches only the
+position-independent verifier MLP. The compact MXFP4 language-model head is
+pinned and two-layer prefetch is enabled; a trunk pin is not. MTP measures its
+draft/target break-even window, temporarily
 disengages after a complete unhelpful window, and periodically re-probes so a
 poor opening region cannot hide a later predictable span.
 Grammar jump-forward and experimental fused DeltaNet kernels stay off because
@@ -79,8 +83,8 @@ A bounded exact-scheduling ladder then measured:
 | MXFP4 head pin + prefetch 2 | 60.362s | 62.553s | **125.717s** | same hash; profile setting |
 | previous row + 1GB trunk request | — | — | 92.215s to refusal | rejected; unsafe verifier reservation |
 
-Two additional optimizations are available as explicit opt-ins while their
-heterogeneous replay matrix is accumulated:
+The profile now includes the measured depth-four, grammar-aware, batched-MLP
+decode stack. To isolate an older depth-two comparison manually:
 
 ```bash
 VMODEL_QWEN_MTP_GRAMMAR_AWARE_DRAFT=1 \
@@ -94,8 +98,9 @@ The first masks each greedy native-MTP proposal with the request's current
 grammar before the ordinary target verifier runs.  On the tracked
 developer-message/two-tool/max-32 shape this preserved the response hash,
 raised native-MTP acceptance from 6/13 to 9/10, and reduced decode from
-101.719s to 78.840s.  It remains default-off because this is one constrained
-request family; stochastic sampling retains the established unmodified path.
+101.719s to 78.840s.  It remains off in the generic server defaults; the named
+Huihui fast profile now opts in after the later multi-shape gates.  Stochastic
+sampling retains the established unmodified path.
 For depth two, the drafter now advances an independent fork of the grammar
 through provisional tokens, so the second proposal is conditioned without
 mutating the authoritative verifier state.  Against that same declared
@@ -105,8 +110,8 @@ completed in **69.983s wall** (0.006s prefill, 66.407s decode, 2.486GB peak
 Metal).  That is 10.3% faster than the 77.977s depth-one endpoint replay.  The
 cold depth-two seed took 102.901s because changing MTP depth correctly changed
 the cache fingerprint and forced a 34.874s prefill; its decode was 64.619s.
-Depth two and grammar-aware drafting remain explicit opt-ins pending the full
-heterogeneous replay corpus.
+Depth two is retained only as an explicit comparison; the named profile now
+uses the later depth-four result.
 
 The same exact recurrent verifier is now bounded at depth four.  It retains a
 KDA/KV/hidden endpoint for every possible accepted prefix and commits only the
@@ -116,12 +121,20 @@ accepted 14/24 drafts, reduced target sweeps from eight to six, preserved the
 same response hash, and measured **57.411s wall** (0.006s prefill, 53.802s
 decode, 3.557GB peak Metal, 4.260MB swap-out growth).  An in-process repeat was
 51.526s.  The result is 26.4% faster than the 69.983s depth-two restart and
-56.1% faster than the 130.632s original cold depth-one baseline, but depth four
-remains opt-in for the same anti-overfit reason.  A measured depth-five probe
+56.1% faster than the 130.632s original cold depth-one baseline.  Depth four
+remains opt-in globally and is enabled only by the named Huihui fast profile.
+A measured depth-five probe
 was rejected: its fifth-step acceptance was 0/2, target sweeps rose to seven,
 and the cached wall regressed to 63.201s.
 
-An additional default-off verifier schedule is available with
+The selected profile also passes sustained generation rather than only the
+short tool fixtures.  On the deterministic 16,029-input / 64-output gate it
+recovered both deep canaries, preserved the historical output SHA, and emitted
+nine validation integers.  Relative to the prior depth-one target-verified
+gate, depth four reduced target sweeps 37 -> 27 and wall 387.700s -> 335.281s
+(13.52%), with 3.857GB peak Metal and 15.286MB swap-out growth.
+
+An additional verifier schedule is available with
 `VMODEL_QWEN35_SERIAL_VERIFY_BATCHED_MLP=1`.  It preserves canonical
 position order for every full-attention and DeltaNet operation, then evaluates
 only the position-independent dense SwiGLU residual for all verifier rows in
@@ -134,7 +147,8 @@ input tokens, no tools, no developer message, and a different direct science
 prompt emitted the same complete 29-token answer under both schedules; wall
 fell from 110.304s to **106.903s** and decode from 100.599s to **97.191s**.
 The latter exercised 4,160 verifier positions across 832 batched layer calls.
-The setting remains opt-in: the first fingerprint-changing cold 1,481-token
+The setting remains opt-in globally and is selected by the named Huihui fast
+profile: the first fingerprint-changing cold 1,481-token
 seed completed prefill but hit the unchanged Metal admission ceiling before
 decode, whereas its clean endpoint restart passed.  It is a measured schedule
 win, not a broadly promoted default.
@@ -167,6 +181,18 @@ state, and convolution-history drift at every selectable prefix, and the live
 science answer and 15/52 MTP acceptance pattern stayed identical.  It was not
 a speed win: 624 batched DeltaNet calls consumed 8.551s and decode regressed
 from 97.191s to 104.716s.  The experimental runtime flag was removed.
+
+The existing hand-written fused single-position DeltaNet kernel was then
+audited against this verifier.  That audit found and fixed a real plumbing
+gap: both serial-verifier Qwen branches had omitted the otherwise explicit
+`native_fused_deltanet_decode`/zmlx policy, so an initial 113.918s run had not
+actually exercised the kernel.  With the policy correctly forwarded, the
+complete science-answer hash and the full 15/52 acceptance trace remained
+identical, but decode regressed from 97.191s to 104.766s, wall reached
+114.907s, and the candidate failed the swap-out gate.  The kernel remains
+explicit/off for this profile.  The forwarding fix is retained so the opt-in
+means what it says; it is a no-op while disabled.  Evidence:
+`logs/qwen38_mtp_depth4_serial_native_fused_science32_20260825.json`.
 
 Compact Delta-factor rollback was rejected for the serial MTP chain.  The
 Qwen scalar-gate replay now has an array-equal oracle at every prefix, and the
@@ -345,9 +371,11 @@ Implemented and measured items:
 
 - **Released-BF16 MTP sidecar:** 15 tensors, 849,398,784 payload bytes, byte-
   equal to the pinned source. Round-local lifetime prevents the sidecar from
-  colliding with the target verifier. Depth-1 `flat-k1` reduced the historical
-  11 target sweeps to 8. Depth 2 saved no additional sweep and was 1.8s slower,
-  so it remains opt-in and the profile stays at depth 1.
+  colliding with the target verifier. The initial depth-1 `flat-k1` gate
+  reduced the historical 11 target sweeps to 8. The later exact-state depth-4
+  verifier, grammar-aware proposals, and batched verifier MLP passed the
+  unmodified capture plus developer/two-tool and no-tool science shapes and
+  are now composed only in the named fast profile.
 - **Exact compiled DeltaNet segments:** array-equal output/state gates pass at
   lengths 1/2/31/32/33/64/127/128 and split boundaries. A Huihui-shape
   weights-free probe measured 54.708ms sequential versus 42.144ms compiled

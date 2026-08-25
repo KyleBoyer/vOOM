@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import queue
 import threading
+import time
 
 from .weight_cache import WeightCache
 
@@ -121,6 +122,24 @@ class Prefetcher:
             # Fail closed: EngineManager must not construct a replacement while
             # an old worker may still finish a lazy MLX/NAS transaction.
             raise RuntimeError(f"prefetch workers did not stop during close: {alive}")
+
+    def pause_and_wait_idle(self, timeout_s: float = 15.0) -> None:
+        """Stop new hints and wait until every accepted hint has completed.
+
+        Model-lifetime transitions use this before evicting cache pages.  A
+        page producer that is still evaluating after the trim could otherwise
+        repopulate the just-freed residency while an auxiliary model loads.
+        """
+        self.paused = True
+        deadline = time.monotonic() + max(0.0, float(timeout_s))
+        while True:
+            with self._lock:
+                if not self._scheduled:
+                    return
+            if time.monotonic() >= deadline:
+                raise TimeoutError(
+                    "prefetch workers did not become idle before staged load")
+            time.sleep(0.01)
 
     def summary(self) -> str:
         return (

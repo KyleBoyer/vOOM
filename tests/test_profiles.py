@@ -99,7 +99,11 @@ def test_builtin_profiles_resolve_complete_agent_group():
     assert huihui_settings["VMODEL_QWEN35_MIN_AVAILABLE_MB"] == "5300"
     assert huihui_settings[
         "VMODEL_QWEN35_POSTGEN_MIN_AVAILABLE_MB"] == "5300"
-    assert huihui_settings["VMODEL_QWEN_MTP_DEPTH"] == "1"
+    assert huihui_settings["VMODEL_QWEN_MTP_DEPTH"] == "4"
+    assert huihui_settings[
+        "VMODEL_QWEN_MTP_GRAMMAR_AWARE_DRAFT"] == "1"
+    assert huihui_settings[
+        "VMODEL_QWEN35_SERIAL_VERIFY_BATCHED_MLP"] == "1"
     assert huihui_settings[
         "VMODEL_QWEN_MTP_STOCHASTIC_DRAFT_TOP_K"] == "1"
     assert huihui_settings["VMODEL_QWEN35_PIN_LM_HEAD"] == "1"

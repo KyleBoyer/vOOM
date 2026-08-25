@@ -177,6 +177,9 @@ class _FakeMatcher:
     def is_completed(self) -> bool:
         return False
 
+    def is_terminated(self) -> bool:
+        return False
+
     def fork(self):
         return _FakeMatcher(
             allow_all=self._allow_all, accept=self._accept)
@@ -229,6 +232,43 @@ def test_accepted_token_completes_normally():
     constraint.mask_logits(mx.zeros((8,)))
     constraint.accept_token(3)
     assert not constraint.completed
+
+
+def test_terminated_auto_grammar_stops_before_requesting_another_mask():
+    class _TerminatingMatcher(_FakeMatcher):
+        def __init__(self):
+            super().__init__(allow_all=True, accept=True)
+            self.terminated = False
+            self.mask_calls = 0
+
+        def fill_next_token_bitmask(self, bitmask) -> bool:
+            if self.terminated:
+                raise RuntimeError("mask requested after stop token")
+            self.mask_calls += 1
+            return super().fill_next_token_bitmask(bitmask)
+
+        def accept_token(self, token: int) -> bool:
+            self.terminated = True
+            return True
+
+        def is_terminated(self) -> bool:
+            return self.terminated
+
+    matcher = _TerminatingMatcher()
+    constraint = GrammarConstraint(
+        matcher=matcher,
+        vocab_size=8,
+        profile="auto_tool_schema",
+        stop_on_complete=False,
+    )
+    constraint.mask_logits(mx.zeros((8,)))
+    constraint.accept_token(3)
+
+    assert constraint.completed
+    assert constraint.is_terminated()
+    # This used to call xgrammar again and raise.  It must now be a no-op.
+    constraint.mask_logits(mx.zeros((8,)))
+    assert matcher.mask_calls == 1
 
 
 def test_grammar_constraint_fork_is_independent():

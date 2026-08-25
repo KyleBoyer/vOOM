@@ -144,6 +144,8 @@ def test_serial_verifier_reserves_missing_page_before_fetch():
         ("reserve", 123, 17, "serial-verify-layer-page"),
         ("fetch", "layer.3", ("layer.3.weight",)),
     ]
+    assert engine._qwen35_serial_verify_cache_prepare_s >= 0.0
+    assert engine._qwen35_serial_verify_page_reserve_s >= 0.0
 
 
 def test_serial_verifier_refuses_before_fetch_and_cache_hit_skips_admission():
@@ -158,6 +160,8 @@ def test_serial_verifier_refuses_before_fetch_and_cache_hit_skips_admission():
         ("prepare", 123),
         ("reserve", 123, 17, "serial-verify-layer-page"),
     ]
+    assert refusal._qwen35_serial_verify_cache_prepare_s >= 0.0
+    assert refusal._qwen35_serial_verify_page_reserve_s >= 0.0
 
     hit_events = []
     hit = _admission_engine(hit_events, hit=True)

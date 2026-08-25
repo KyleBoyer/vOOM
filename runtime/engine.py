@@ -2016,6 +2016,14 @@ class StreamingEngine:
         self._qwen35_serial_verify_batched_mlp_layers = 0
         self._qwen35_serial_verify_batched_mlp_positions = 0
         self._qwen35_serial_verify_batched_mlp_s = 0.0
+        self._qwen35_serial_verify_page_prepare_s = 0.0
+        self._qwen35_serial_verify_cache_prepare_s = 0.0
+        self._qwen35_serial_verify_page_reserve_s = 0.0
+        self._qwen35_serial_verify_reserve_s = 0.0
+        self._qwen35_serial_verify_weight_wait_s = 0.0
+        self._qwen35_serial_verify_linear_layer_compute_s = 0.0
+        self._qwen35_serial_verify_full_layer_compute_s = 0.0
+        self._qwen35_serial_verify_head_s = 0.0
         self._layer_transient_margin = 400_000_000
         self._token_transient = 0  # F42: whole-token transient (greedy sync point)
         # 2026-07-13: F42's own per-layer/per-token mx.reset_peak_memory() calls
@@ -3128,7 +3136,11 @@ class StreamingEngine:
         incoming = int(self._layer_fetch_bytes_estimate(layer) or 0)
         if incoming <= 0:
             return 0
+        cache_prepare_t0 = time.perf_counter()
         self.cache.prepare_for(incoming)
+        self._qwen35_serial_verify_cache_prepare_s = float(getattr(
+            self, "_qwen35_serial_verify_cache_prepare_s", 0.0
+        )) + (time.perf_counter() - cache_prepare_t0)
         if self.governor is not None:
             # The page estimate above already prices every retained QTensor
             # array and carries its own 5% representation/alignment pad.  Do
@@ -3144,15 +3156,21 @@ class StreamingEngine:
                 "qwen35_serial_verify_exact_page_admission",
                 False,
             ))
-            self.governor.reserve(
-                incoming,
-                margin=(
-                    int(self._layer_transient_margin)
-                    if exact_page_admission
-                    else 400_000_000
-                ),
-                reason="serial-verify-layer-page",
-            )
+            page_reserve_t0 = time.perf_counter()
+            try:
+                self.governor.reserve(
+                    incoming,
+                    margin=(
+                        int(self._layer_transient_margin)
+                        if exact_page_admission
+                        else 400_000_000
+                    ),
+                    reason="serial-verify-layer-page",
+                )
+            finally:
+                self._qwen35_serial_verify_page_reserve_s = float(getattr(
+                    self, "_qwen35_serial_verify_page_reserve_s", 0.0
+                )) + (time.perf_counter() - page_reserve_t0)
         return incoming
 
     def _checkpoint_payload_bytes(self) -> int:
@@ -7312,16 +7330,27 @@ class StreamingEngine:
                     int(getattr(
                         self, "_dspark_expert_prefetch_depth", 0)),
                 )
+            page_prepare_t0 = time.perf_counter()
             self._prepare_serial_verify_layer_page(layer)
+            if qwen_family:
+                self._qwen35_serial_verify_page_prepare_s += (
+                    time.perf_counter() - page_prepare_t0)
             t0 = time.perf_counter()
             weights = self.cache.get(
                 self._layer_key(layer), self._layer_names(layer))
-            self.timer.add("weights_wait", time.perf_counter() - t0)
+            weight_wait_s = time.perf_counter() - t0
+            self.timer.add("weights_wait", weight_wait_s)
+            if qwen_family:
+                self._qwen35_serial_verify_weight_wait_s += weight_wait_s
             if self.governor is not None and self._layer_transient:
+                reserve_t0 = time.perf_counter()
                 self.governor.reserve(
                     self._layer_transient,
                     margin=self._layer_transient_margin,
                     reason="serial-verify-transient")
+                if qwen_family:
+                    self._qwen35_serial_verify_reserve_s += (
+                        time.perf_counter() - reserve_t0)
             # Schedule future I/O only after the current demand page and its
             # compute transient have passed live admission.  Scheduling two
             # ~203 MB Huihui pages first made the current reservation inherit
@@ -7337,6 +7366,7 @@ class StreamingEngine:
                     self.prefetcher.schedule(
                         self._layer_key(nxt), self._layer_names(nxt))
 
+            layer_compute_t0 = time.perf_counter()
             active_before = mx.get_active_memory()
             mx.reset_peak_memory()
             if kimi_k3_family:
@@ -7456,6 +7486,10 @@ class StreamingEngine:
                             self.rc.qwen_compiled_delta_prefill),
                         native_fused_delta_prefill=(
                             self.rc.qwen_native_fused_delta_prefill),
+                        zmlx_fused_decode=(
+                            self.rc.zmlx_fused_deltanet_decode),
+                        native_fused_decode=(
+                            self.rc.native_fused_deltanet_decode),
                     )
                     capture_kda_position(layer, position)
                     attn_positions.append(attn_out)
@@ -7514,7 +7548,11 @@ class StreamingEngine:
                             compiled_delta_prefill=(
                                 self.rc.qwen_compiled_delta_prefill),
                             native_fused_delta_prefill=(
-                                self.rc.qwen_native_fused_delta_prefill))
+                                self.rc.qwen_native_fused_delta_prefill),
+                            zmlx_fused_decode=(
+                                self.rc.zmlx_fused_deltanet_decode),
+                            native_fused_decode=(
+                                self.rc.native_fused_deltanet_decode))
                         capture_kda_position(layer, position)
                         hidden = _qwen35_mlp_residual(
                             attn_out, weights, prefix, self.cfg, layer,
@@ -7567,6 +7605,14 @@ class StreamingEngine:
             # single layer barrier for the position outputs. The lazy KV chain
             # still orders position N before N+1.
             mx.eval(*next_positions)
+            if qwen_family:
+                compute_s = time.perf_counter() - layer_compute_t0
+                if self.cfg.layer_types[layer] == "linear_attention":
+                    self._qwen35_serial_verify_linear_layer_compute_s += (
+                        compute_s)
+                else:
+                    self._qwen35_serial_verify_full_layer_compute_s += (
+                        compute_s)
             positions = next_positions
             if tapset is not None and layer in tapset:
                 # Preserve the same post-layer residual stream exposed by
@@ -7607,6 +7653,7 @@ class StreamingEngine:
             mx.eval(x_all)
             positions = [x_all[:, p:p + 1, :] for p in range(x_all.shape[1])]
 
+        head_t0 = time.perf_counter()
         head = self._lm_head_weight()
         from .lm_head_stream import StreamedLMHead
 
@@ -7639,6 +7686,9 @@ class StreamingEngine:
                 logits.append(value)
             result = mx.stack(logits)
         mx.eval(result)
+        if qwen_family:
+            self._qwen35_serial_verify_head_s += (
+                time.perf_counter() - head_t0)
         self._h_window = mx.concatenate(positions, axis=1)
         self._h_last = positions[-1]
         self._serial_kda_endpoints = serial_kda_endpoints
@@ -7961,6 +8011,14 @@ class StreamingEngine:
         self._qwen35_serial_verify_batched_mlp_layers = 0
         self._qwen35_serial_verify_batched_mlp_positions = 0
         self._qwen35_serial_verify_batched_mlp_s = 0.0
+        self._qwen35_serial_verify_page_prepare_s = 0.0
+        self._qwen35_serial_verify_cache_prepare_s = 0.0
+        self._qwen35_serial_verify_page_reserve_s = 0.0
+        self._qwen35_serial_verify_reserve_s = 0.0
+        self._qwen35_serial_verify_weight_wait_s = 0.0
+        self._qwen35_serial_verify_linear_layer_compute_s = 0.0
+        self._qwen35_serial_verify_full_layer_compute_s = 0.0
+        self._qwen35_serial_verify_head_s = 0.0
         self._true_peak_metal_bytes = mx.get_active_memory()  # see _note_true_peak
         if self.governor is not None:
             self.governor.reset_request_peak(self._true_peak_metal_bytes)
@@ -8825,8 +8883,7 @@ class StreamingEngine:
             # a 7-position restart inherit a 128-position transient estimate
             # and could reject a safe restore before its first layer.
             remaining_prefill_positions = max(1, len(tokens) - matched)
-            admission_positions = min(
-                max(1, int(self.rc.prefill_chunk_size or 1)),
+            admission_positions = self._prefill_admission_positions(
                 remaining_prefill_positions)
             path_stats["hot_prompt_admission_positions"] = (
                 admission_positions)
@@ -10620,6 +10677,23 @@ class StreamingEngine:
         if configured_ceiling:
             selected = min(selected, configured_ceiling)
         return selected
+
+    def _prefill_admission_positions(self, remaining_positions: int) -> int:
+        """Return the imminent prefill width used for hot-KV admission.
+
+        Admission runs before a new Qwen conversation finalizes its adaptive
+        chunk selection.  The explicit operator ceiling is nevertheless
+        already authoritative: charging a stale 128/512-position transient
+        while execution is capped at 32 rejected the 16K gate before its
+        first allocation.  Apply the same ceiling here so admission and the
+        later sweep describe one physical shape.
+        """
+        remaining = max(1, int(remaining_positions))
+        selected = max(1, int(self.rc.prefill_chunk_size or 1))
+        if self.cfg.model_type in ("qwen3_5", "qwen3_5_moe"):
+            selected = max(
+                1, self._apply_qwen35_prefill_chunk_ceiling(selected))
+        return min(selected, remaining)
 
     def _new_hot_prompt_slot(
             self, *, recurrent_exact_only: bool, boundary_fork_kv,

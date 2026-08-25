@@ -47,16 +47,18 @@ class MixedPrecisionSpec:
     body: str = "mxfp4"
 
     def validate(self, total_layers: int) -> None:
-        if self.attention not in ("bf16", "mxfp8"):
-            raise ValueError("attention precision must be bf16 or mxfp8")
+        if self.attention not in ("bf16", "mxfp8", "mxfp4"):
+            raise ValueError(
+                "attention precision must be bf16, mxfp8, or mxfp4")
         if self.last_bf16_layers not in (0, 1, 2, 4):
             raise ValueError("last_bf16_layers must be one of 0, 1, 2, 4")
         if self.last_bf16_layers > total_layers:
             raise ValueError("last_bf16_layers exceeds checkpoint depth")
         if self.mtp not in ("bf16", "mxfp8", "mxfp4"):
             raise ValueError("MTP precision must be bf16, mxfp8, or mxfp4")
-        if self.body != "mxfp4":
-            raise ValueError("the current mixed planner requires body=mxfp4")
+        if self.body not in ("mxfp4", "affine3"):
+            raise ValueError(
+                "body precision must be mxfp4 or affine3")
 
 
 def _json_atomic(path: Path, value: dict) -> None:
@@ -197,6 +199,17 @@ def _estimated_bytes(info: TensorLayout, storage: str) -> int:
         for dimension in info.shape:
             values *= dimension
         return values * 2
+    if storage == "affine3":
+        # MLX affine-3/group-64: three packed bits per value plus one BF16
+        # scale and one BF16 bias per 64-value group. Qwen's selected matrices
+        # are group-aligned, so no packed-lane or group tail is needed.
+        rows = 1
+        for dimension in info.shape[:-1]:
+            rows *= dimension
+        columns = info.shape[-1]
+        if columns % 64:
+            return info.source_bytes
+        return rows * columns * 3 // 8 + rows * (columns // 64) * 4
     if storage not in ("mxfp4", "mxfp8"):
         return info.source_bytes
     bits = 4 if storage == "mxfp4" else 8
@@ -234,6 +247,12 @@ def create_plan(
             storage = spec.attention
         elif component == "mtp":
             storage = spec.mtp
+        elif component in ("lm_head", "other"):
+            # Keep the vocabulary decision surface and non-text/vision modules
+            # at the already validated MXFP4 precision even when the bulk text
+            # MLP body is narrowed. The affine3 experiment is intentionally
+            # component-scoped, not a catch-all checkpoint rewrite.
+            storage = "mxfp4"
         else:
             storage = spec.body
         estimated = _estimated_bytes(info, storage)
@@ -344,9 +363,11 @@ def _main() -> None:
     one = commands.add_parser("plan")
     one.add_argument("source", type=Path)
     one.add_argument("output", type=Path)
-    one.add_argument("--attention", choices=("bf16", "mxfp8"), default="bf16")
+    one.add_argument(
+        "--attention", choices=("bf16", "mxfp8", "mxfp4"), default="bf16")
     one.add_argument("--last-bf16-layers", type=int, choices=(0, 1, 2, 4), default=0)
     one.add_argument("--mtp", choices=("bf16", "mxfp8", "mxfp4"), default="bf16")
+    one.add_argument("--body", choices=("mxfp4", "affine3"), default="mxfp4")
     matrix = commands.add_parser("matrix")
     matrix.add_argument("source", type=Path)
     matrix.add_argument("output", type=Path)
@@ -359,7 +380,8 @@ def _main() -> None:
         value = create_plan(args.source, MixedPrecisionSpec(
             attention=args.attention,
             last_bf16_layers=args.last_bf16_layers,
-            mtp=args.mtp))
+            mtp=args.mtp,
+            body=args.body))
         _json_atomic(args.output, value)
     elif args.command == "matrix":
         value = create_matrix(args.source, args.plan_dir)

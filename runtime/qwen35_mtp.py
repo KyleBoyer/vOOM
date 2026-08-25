@@ -79,6 +79,36 @@ from .speculative import ngram_propose
 _GREEDY_DRAFT_MARGIN_THRESHOLDS = (0.25, 0.5, 1.0, 2.0, 4.0, 8.0, 16.0)
 
 
+class _QwenMTPBootstrapPrompt(str):
+    """Prepared-prompt-compatible view that transfers paged KV to MTP.
+
+    Server paging profiles normally release their request-local spill cache
+    before ``StreamingEngine.generate`` returns.  Native MTP deliberately
+    calls that method for a one-token bootstrap and immediately consumes the
+    exact prompt endpoint, so this internal call must retain the paged cache
+    until the speculative adapter finishes.  All cache identity/boundary
+    fields remain unchanged; only the post-generate lifetime is extended.
+    """
+
+    def __new__(cls, prompt, token_ids):
+        instance = super().__new__(cls, str(prompt))
+        instance.token_ids = tuple(int(value) for value in token_ids)
+        instance.tool_capsules = tuple(
+            getattr(prompt, "tool_capsules", ()))
+        instance.cache_namespace = str(
+            getattr(prompt, "cache_namespace", "default") or "default")
+        instance.force_paged_kv = bool(
+            getattr(prompt, "force_paged_kv", False))
+        instance.stable_boundary_tokens = int(
+            getattr(prompt, "stable_boundary_tokens", 0) or 0)
+        instance.rerank_capture_shape = dict(
+            getattr(prompt, "rerank_capture_shape", {}) or {})
+        instance.disable_hot_prompt_kv = bool(
+            getattr(prompt, "disable_hot_prompt_kv", False))
+        instance.retain_paged_kv_after_generate = True
+        return instance
+
+
 def _reranked_head_telemetry_snapshot(target) -> dict[str, int]:
     """Return target-owned sparse-head counters without requiring the feature.
 
@@ -767,6 +797,9 @@ class QwenMTPDrafter:
 
     def __init__(self, engine):
         self.engine = engine
+        self._ablation_direction: mx.array | None = None
+        self._ablation_strength = 0.0
+        self._ablation_fingerprint = ""
         names = engine.store.names_with_prefix("mtp.")
         if not names:
             raise ValueError(
@@ -786,6 +819,47 @@ class QwenMTPDrafter:
             self.request_weight_representation = (
                 getattr(engine.store, "mtp_proposal_representation", None)
                 or "demand-cache")
+
+    def set_ablation(
+        self,
+        direction,
+        *,
+        strength: float,
+        fingerprint: str,
+    ) -> None:
+        """Project the target-measured Huihui direction from MTP branches.
+
+        This changes proposals only. The unchanged target still verifies and
+        corrects every token, so a better or worse direction can affect
+        acceptance/latency but never the distribution released to the user.
+        """
+        direction = mx.array(direction).astype(mx.float32)
+        if direction.ndim != 1 or int(direction.shape[0]) != int(
+                self.engine.cfg.hidden_size):
+            raise ValueError("Qwen MTP ablation direction width mismatch")
+        if not math.isfinite(float(strength)) or not 0.0 < float(strength) <= 2.0:
+            raise ValueError("Qwen MTP ablation strength must be in (0, 2]")
+        if len(fingerprint) != 64 or any(
+            character not in "0123456789abcdef" for character in fingerprint
+        ):
+            raise ValueError("Qwen MTP ablation fingerprint must be SHA-256")
+        mx.eval(direction)
+        norm_squared = float(mx.sum(direction * direction).item())
+        if not math.isfinite(norm_squared) or not math.isclose(
+            norm_squared, 1.0, rel_tol=0.0, abs_tol=2e-5,
+        ):
+            raise ValueError("Qwen MTP ablation direction must be unit-normalized")
+        self._ablation_direction = direction
+        self._ablation_strength = float(strength)
+        self._ablation_fingerprint = str(fingerprint)
+
+    def _project_branch(self, branch: mx.array) -> mx.array:
+        if self._ablation_direction is None:
+            return branch
+        from .dflash2 import project_out_direction
+
+        return project_out_direction(
+            branch, self._ablation_direction, self._ablation_strength)
 
     def _weights(self, *, representation: str = "demand-cache") -> dict:
         # Representation is part of the cache identity.  MTPLX replaces the
@@ -979,15 +1053,17 @@ class QwenMTPDrafter:
         residual = x
         h = qwen35_rms_norm(x, w["mtp.layers.0.input_layernorm.weight"], cfg.rms_norm_eps)
         attn = _full_attention(h, w, "mtp.layers.0", cfg, mtp_kv, 0, offset)
+        attn = self._project_branch(attn)
         x = residual + attn
         residual = x
         h = qwen35_rms_norm(
             x, w["mtp.layers.0.post_attention_layernorm.weight"], cfg.rms_norm_eps)
         if not cfg.num_experts:
-            x = residual + _swiglu(h, w, "mtp.layers.0.mlp")
+            mlp = _swiglu(h, w, "mtp.layers.0.mlp")
         else:
-            x = residual + _moe(
+            mlp = _moe(
                 h, w, "mtp.layers.0", cfg, 0, self._get_experts)
+        x = residual + self._project_branch(mlp)
         shared_head = eng._lm_head_weight()
         # The same physical output head serves both target verification and
         # MTP proposals. Promotion evidence is target-only: mark this one
@@ -1046,6 +1122,10 @@ class QwenMTPSpeculativeEngine:
         ngram_max_draft_tokens: int = 4,
         native_tree_width: int = 0,
         grammar_aware_draft: bool = False,
+        drafter=None,
+        mtp_ablation_direction=None,
+        mtp_ablation_strength: float = 1.0,
+        mtp_ablation_fingerprint: str = "",
     ):
         if max_prompt_tokens <= 0:
             raise ValueError("max_prompt_tokens must be positive")
@@ -1104,7 +1184,24 @@ class QwenMTPSpeculativeEngine:
         if not isinstance(grammar_aware_draft, bool):
             raise TypeError("Qwen MTP grammar_aware_draft must be bool")
         self.target = target
-        self.drafter = QwenMTPDrafter(target)
+        self.drafter = drafter if drafter is not None else QwenMTPDrafter(target)
+        self.proposal_source = str(getattr(
+            self.drafter, "proposal_source", "M"))
+        if len(self.proposal_source) != 1 or self.proposal_source not in {"M", "A"}:
+            raise ValueError(
+                "Qwen speculative drafter proposal_source must be M or A")
+        if mtp_ablation_direction is not None:
+            if self.proposal_source != "M":
+                raise ValueError(
+                    "Qwen MTP ablation requires the native MTP drafter")
+            set_ablation = getattr(self.drafter, "set_ablation", None)
+            if not callable(set_ablation):
+                raise RuntimeError("native Qwen MTP drafter omits ablation support")
+            set_ablation(
+                mtp_ablation_direction,
+                strength=mtp_ablation_strength,
+                fingerprint=mtp_ablation_fingerprint,
+            )
         self.max_prompt_tokens = max_prompt_tokens
         self.min_output_tokens = min_output_tokens
         self.adaptive_stop = bool(adaptive_stop)
@@ -1143,6 +1240,15 @@ class QwenMTPSpeculativeEngine:
                 if self.native_tree_width else ""
             )
             + ("-grammar-aware-draft" if self.grammar_aware_draft else "")
+            + (
+                f"-mtp-ablation-{mtp_ablation_fingerprint[:12]}-"
+                f"s{float(mtp_ablation_strength):g}"
+                if mtp_ablation_direction is not None else ""
+            )
+            + (
+                f"-draft-{getattr(self.drafter, 'identity', self.proposal_source)}"
+                if self.proposal_source != "M" else ""
+            )
         )
         if self.depth > 1 and not callable(getattr(
             target, "forward_tokens_serial_positions", None
@@ -1160,11 +1266,20 @@ class QwenMTPSpeculativeEngine:
     def __getattr__(self, name):
         return getattr(self.target, name)
 
+    def close(self) -> None:
+        drafter_close = getattr(self.drafter, "close", None)
+        try:
+            if callable(drafter_close):
+                drafter_close()
+        finally:
+            self.target.close()
+
     def _native_tree_request_eligible(
         self, sampling: SamplingParams | None, constraint,
     ) -> bool:
         return bool(
             self.native_tree_width > 0
+            and self.proposal_source == "M"
             and sampling is not None
             and sampling.is_greedy
             and sampling.repetition_penalty == 1.0
@@ -1176,6 +1291,60 @@ class QwenMTPSpeculativeEngine:
                 )
             )
         )
+
+    def _stage_drafter_after_target_prefill(self) -> dict[str, int | float]:
+        """Make target prefill and a resident auxiliary draft non-overlapping."""
+        if not bool(getattr(self.drafter, "staged_load", False)):
+            return {
+                "qwen_mtp_staged_draft_load": 0,
+                "qwen_mtp_staged_target_cache_released_bytes": 0,
+                "qwen_mtp_staged_draft_load_s": 0.0,
+            }
+        if bool(getattr(self.drafter, "weights_loaded", False)):
+            return {
+                "qwen_mtp_staged_draft_load": 0,
+                "qwen_mtp_staged_target_cache_released_bytes": 0,
+                "qwen_mtp_staged_draft_load_s": 0.0,
+            }
+        target = self.target
+        prefetcher = getattr(target, "prefetcher", None)
+        was_paused = bool(getattr(prefetcher, "paused", False))
+        started = time.perf_counter()
+        try:
+            if prefetcher is not None:
+                prefetcher.pause_and_wait_idle()
+            cache = target.cache
+            released = int(cache.trim_to(cache.pinned_bytes))
+            mx.clear_cache()
+            ensure_loaded = getattr(self.drafter, "ensure_loaded", None)
+            if not callable(ensure_loaded):
+                raise RuntimeError("staged Qwen AR draft has no loader")
+            ensure_loaded()
+        finally:
+            if prefetcher is not None:
+                prefetcher.paused = was_paused
+        return {
+            "qwen_mtp_staged_draft_load": 1,
+            "qwen_mtp_staged_target_cache_released_bytes": released,
+            "qwen_mtp_staged_draft_load_s": time.perf_counter() - started,
+        }
+
+    def _suspend_drafter_for_target_verification(
+        self,
+    ) -> dict[str, int | float]:
+        """Release an external AR draft's weights before a target sweep.
+
+        Native MTP has its own round-page release immediately after proposal
+        generation.  A resident autoregressive drafter needs the same lifetime
+        boundary, but preserves its private prompt/recurrent caches so it can
+        resume from the exact target-committed endpoint after verification.
+        Drafters without this explicit hook retain the established behavior.
+        """
+        suspend = getattr(
+            self.drafter, "suspend_for_target_verification", None)
+        if not callable(suspend):
+            return {"suspended": 0, "released_active_bytes": 0, "seconds": 0.0}
+        return dict(suspend() or {})
 
     def _target_generate(self, reason: str, prompt, max_tokens, on_token,
                           stop, on_progress, sampling, constraint) -> dict:
@@ -1247,6 +1416,9 @@ class QwenMTPSpeculativeEngine:
 
         request_t0 = time.perf_counter()
         request_cache_before = _cache_io_snapshot(tgt)
+        bootstrap_cache_budget = int(getattr(tgt.cache, "max_bytes", 0) or 0)
+        bootstrap_pressure_shrinks = int(getattr(
+            getattr(tgt, "governor", None), "shrinks", 0) or 0)
         request_rerank_before = _reranked_head_telemetry_snapshot(tgt)
         draft_rerank_totals: dict[str, int] = {}
         eos = set(tgt.cfg.eos_token_ids)
@@ -1261,7 +1433,8 @@ class QwenMTPSpeculativeEngine:
         }
         if constraint is not None:
             bootstrap_kwargs["constraint"] = constraint
-        bootstrap = bootstrap_generate(prompt, 1, **bootstrap_kwargs)
+        bootstrap_prompt = _QwenMTPBootstrapPrompt(prompt, ids)
+        bootstrap = bootstrap_generate(bootstrap_prompt, 1, **bootstrap_kwargs)
         bootstrap_stats = dict(bootstrap.get("path_stats") or {})
         request_weight_representation = str(getattr(
             # Legacy/custom drafters with a prepare/release API represented
@@ -1296,7 +1469,36 @@ class QwenMTPSpeculativeEngine:
         if kv is None:
             raise RuntimeError(
                 "Qwen MTP bootstrap did not retain its exact target KV endpoint")
+        bootstrap_budget_restored = 0
+        rc = getattr(tgt, "rc", None)
+        restore_phase_budget = getattr(
+            getattr(tgt, "governor", None), "restore_phase_budget", None)
+        if (callable(restore_phase_budget)
+                and int(getattr(rc, "max_kv_mb", 0) or 0) > 0):
+            bootstrap_budget_restored = int(restore_phase_budget(
+                bootstrap_cache_budget,
+                starting_pressure_shrinks=bootstrap_pressure_shrinks,
+                reason="qwen-mtp-paged-bootstrap",
+            ))
+        bootstrap_stats.update({
+            "qwen_mtp_paged_bootstrap_endpoint_retained": int(
+                int(getattr(rc, "max_kv_mb", 0) or 0) > 0),
+            "qwen_mtp_paged_bootstrap_cache_budget_before_bytes": (
+                bootstrap_cache_budget),
+            "qwen_mtp_paged_bootstrap_cache_budget_after_bytes": int(
+                getattr(tgt.cache, "max_bytes", 0) or 0),
+            "qwen_mtp_paged_bootstrap_budget_restored_bytes": (
+                bootstrap_budget_restored),
+        })
         decode_cache_before = _cache_io_snapshot(tgt)
+        bootstrap_stats.update(self._stage_drafter_after_target_prefill())
+        drafter_request_prefill_s = 0.0
+        begin_draft_request = getattr(self.drafter, "begin_request", None)
+        if callable(begin_draft_request):
+            drafter_prefill_started = time.perf_counter()
+            begin_draft_request(ids)
+            drafter_request_prefill_s = (
+                time.perf_counter() - drafter_prefill_started)
         mtp_kv = KVCache(1)
         proposed = 0
         verified_proposals = 0
@@ -1351,6 +1553,9 @@ class QwenMTPSpeculativeEngine:
         native_mtp_proposed = 0
         native_mtp_accepted = 0
         native_mtp_rejected = 0
+        ar_draft_proposed = 0
+        ar_draft_accepted = 0
+        ar_draft_rejected = 0
         native_tree_rounds = 0
         native_tree_hits = 0
         native_tree_misses = 0
@@ -1538,6 +1743,7 @@ class QwenMTPSpeculativeEngine:
                     if terminal_forced else committed_forced
                 )
                 verify_tokens = [catchup_tok] + feed_forced
+                self._suspend_drafter_for_target_verification()
                 serial_verify = callable(getattr(
                     tgt, "forward_tokens_serial_positions", None))
                 if serial_verify:
@@ -1580,6 +1786,7 @@ class QwenMTPSpeculativeEngine:
                 or (adaptive_disabled and adaptive_cooldown_remaining > 0)
             ):
                 plain_started = time.perf_counter()
+                self._suspend_drafter_for_target_verification()
                 plain_logits = tgt.forward_tokens([catchup_tok], kv)
                 target_decode_sweeps += 1
                 plain_decode_sweeps += 1
@@ -1627,17 +1834,27 @@ class QwenMTPSpeculativeEngine:
                 draft_rank_probabilities: list[mx.array | None] = []
                 draft_ranked_tokens: list[tuple[int, ...] | None] = []
                 draft_margin_buckets: list[int | None] = []
+                round_draft_steps_run = 0
                 draft_hidden = h_last
                 draft_input_token = catchup_tok
                 round_mtp_weights: dict | None = None
                 ngram_tokens: list[int] = []
-                round_proposal_source = "M"
+                round_proposal_source = self.proposal_source
                 round_native_tree = self._native_tree_request_eligible(
                     sampling, constraint)
                 native_tree = None
                 draft_rerank_before = _reranked_head_telemetry_snapshot(tgt)
                 draft_started = time.perf_counter()
                 try:
+                    # A preceding target sweep may have left the external AR
+                    # draft weight-suspended. Reclaim target LRU pages before
+                    # restoring it; its private exact state survived outside
+                    # the backend object.
+                    self._stage_drafter_after_target_prefill()
+                    begin_draft_round = getattr(
+                        self.drafter, "begin_round", None)
+                    if callable(begin_draft_round):
+                        begin_draft_round(all_tokens)
                     # A deterministic prompt-lookup hit is a zero-model first
                     # choice.  It still enters the identical authoritative
                     # target verification window below, so rejection and all
@@ -1733,6 +1950,15 @@ class QwenMTPSpeculativeEngine:
                                 draft_constraint = None
 
                     for step in range(0 if ngram_tokens else self.depth):
+                        # A grammar-aware draft fork may have consumed a stop
+                        # token on the previous provisional step.  xgrammar
+                        # has no legal next state after termination; end the
+                        # proposal chain here and let the target verify the
+                        # shorter, exact prefix.
+                        if (draft_constraint is not None
+                                and bool(getattr(
+                                    draft_constraint, "completed", False))):
+                            break
                         if self.depth == 1:
                             # Keep the established k=1 mock/API path unchanged.
                             if sampling.is_greedy:
@@ -1772,6 +1998,8 @@ class QwenMTPSpeculativeEngine:
                                 round_mtp_weights,
                             )
                             draft_tok = None
+
+                        round_draft_steps_run += 1
 
                         step_rank_probabilities = None
                         step_probabilities = None
@@ -1859,6 +2087,9 @@ class QwenMTPSpeculativeEngine:
                         if (sampling.is_greedy
                                 and draft_constraint is not None):
                             draft_constraint.accept_token(draft_tok)
+                            if bool(getattr(
+                                    draft_constraint, "completed", False)):
+                                break
 
                     if round_native_tree:
                         if step_logits is None:
@@ -1899,6 +2130,7 @@ class QwenMTPSpeculativeEngine:
                             release_info.get("resident_bytes", 0))
                         sidecar_cache_discards += int(
                             release_info.get("cache_discarded", 0))
+                    self._suspend_drafter_for_target_verification()
                     draft_round_s += time.perf_counter() - draft_started
                 _accumulate_reranked_head_telemetry(
                     draft_rerank_totals,
@@ -1914,8 +2146,10 @@ class QwenMTPSpeculativeEngine:
                         ngram_first_max_proposed_per_round,
                         len(draft_tokens),
                     )
-                else:
+                elif round_proposal_source == "M":
                     native_mtp_proposed += len(draft_tokens)
+                else:
+                    ar_draft_proposed += len(draft_tokens)
                 verify_tokens = [catchup_tok] + draft_tokens
                 round_verify_width = len(verify_tokens)
                 max_verify_width_observed = max(
@@ -2166,9 +2400,12 @@ class QwenMTPSpeculativeEngine:
                     if round_proposal_source == "N":
                         ngram_first_accepted += accepted_prefix
                         ngram_first_rejected += int(round_rejected)
-                    else:
+                    elif round_proposal_source == "M":
                         native_mtp_accepted += accepted_prefix
                         native_mtp_rejected += int(round_rejected)
+                    else:
+                        ar_draft_accepted += accepted_prefix
+                        ar_draft_rejected += int(round_rejected)
                     if all_drafts_accepted:
                         full_accept_rounds += 1
                     if round_proposal_source == "N" and round_draft_width > 1:
@@ -2348,12 +2585,16 @@ class QwenMTPSpeculativeEngine:
                         strict=True,
                     )
                 )
-                if any(growth not in (0, self.depth) for growth in mtp_growth):
+                if any(
+                    growth not in (0, round_draft_steps_run)
+                    for growth in mtp_growth
+                ):
                     raise RuntimeError(
                         "recurrent Qwen MTP chain changed its KV by an "
                         f"unexpected count: {mtp_growth}")
-                committed_mtp_steps = min(self.depth, target_fed_positions)
-                if committed_mtp_steps < self.depth:
+                committed_mtp_steps = min(
+                    round_draft_steps_run, target_fed_positions)
+                if committed_mtp_steps < round_draft_steps_run:
                     mtp_lengths = tuple(
                         start + (committed_mtp_steps if growth else 0)
                         for start, growth in zip(
@@ -2365,6 +2606,34 @@ class QwenMTPSpeculativeEngine:
                     if mtp_lengths != mtp_end_lengths:
                         mtp_kv.trim_layer_lengths(mtp_lengths)
                         mtp_kv_rollbacks += 1
+                commit_draft_inputs = getattr(
+                    self.drafter, "commit_target_inputs", None)
+                if callable(commit_draft_inputs):
+                    emitted_round_tokens = emitted[emitted_before_round:]
+                    committed_inputs = [
+                        int(catchup_tok),
+                        *map(int, emitted_round_tokens[:-1]),
+                    ]
+                    if len(committed_inputs) != target_fed_positions:
+                        raise RuntimeError(
+                            "Qwen AR draft commit width differs from target "
+                            f"endpoint: {len(committed_inputs)} != "
+                            f"{target_fed_positions}")
+                    # The request ends immediately after a terminal round, so
+                    # reloading 1-2 GB of proposal weights solely to construct
+                    # state that end_request discards would be pure overhead.
+                    # Ordinary/custom drafters retain their old commit hook;
+                    # only a weight-suspendable external draft skips it.
+                    if not (
+                        terminal_round
+                        and callable(getattr(
+                            self.drafter,
+                            "suspend_for_target_verification",
+                            None,
+                        ))
+                    ):
+                        self._stage_drafter_after_target_prefill()
+                        commit_draft_inputs(committed_inputs)
             # An accepted pair may encounter EOS/stop on its first token, in
             # which case ``next_catchup_tok`` is the unused bonus token. Never
             # continue from that uncommitted value (the old behavior leaked
@@ -2452,6 +2721,19 @@ class QwenMTPSpeculativeEngine:
         endpoint = len(ids) + len(emitted) - 1
         if kv.offset > endpoint:
             kv.trim(endpoint)
+        drafter_telemetry_fn = getattr(
+            self.drafter, "telemetry_snapshot", None)
+        drafter_telemetry = (
+            dict(drafter_telemetry_fn())
+            if callable(drafter_telemetry_fn) else {})
+        drafter_cleanup_s = 0.0
+        end_draft_request = getattr(self.drafter, "end_request", None)
+        if callable(end_draft_request):
+            drafter_cleanup_started = time.perf_counter()
+            end_draft_request()
+            drafter_cleanup_s = time.perf_counter() - drafter_cleanup_started
+            if callable(drafter_telemetry_fn):
+                drafter_telemetry = dict(drafter_telemetry_fn())
         total_s = time.perf_counter() - request_t0
         path_stats = bootstrap_stats
         plain_equivalent_sweeps = max(0, len(emitted) - 1)
@@ -2550,6 +2832,22 @@ class QwenMTPSpeculativeEngine:
                 tgt, "_qwen35_serial_verify_batched_mlp_positions", 0)),
             "qwen_mtp_target_batched_mlp_s": float(getattr(
                 tgt, "_qwen35_serial_verify_batched_mlp_s", 0.0)),
+            "qwen_mtp_target_page_prepare_s": float(getattr(
+                tgt, "_qwen35_serial_verify_page_prepare_s", 0.0)),
+            "qwen_mtp_target_cache_prepare_s": float(getattr(
+                tgt, "_qwen35_serial_verify_cache_prepare_s", 0.0)),
+            "qwen_mtp_target_page_reserve_s": float(getattr(
+                tgt, "_qwen35_serial_verify_page_reserve_s", 0.0)),
+            "qwen_mtp_target_reserve_s": float(getattr(
+                tgt, "_qwen35_serial_verify_reserve_s", 0.0)),
+            "qwen_mtp_target_weight_wait_s": float(getattr(
+                tgt, "_qwen35_serial_verify_weight_wait_s", 0.0)),
+            "qwen_mtp_target_linear_layer_compute_s": float(getattr(
+                tgt, "_qwen35_serial_verify_linear_layer_compute_s", 0.0)),
+            "qwen_mtp_target_full_layer_compute_s": float(getattr(
+                tgt, "_qwen35_serial_verify_full_layer_compute_s", 0.0)),
+            "qwen_mtp_target_head_s": float(getattr(
+                tgt, "_qwen35_serial_verify_head_s", 0.0)),
             "qwen_mtp_plain_round_s": plain_round_s,
             "qwen_mtp_kda_endpoint_restores": kda_endpoint_restores,
             "qwen_mtp_refeed_sweeps_saved": refeed_sweeps_saved,
@@ -2605,6 +2903,57 @@ class QwenMTPSpeculativeEngine:
             "qwen_mtp_native_draft_proposed": native_mtp_proposed,
             "qwen_mtp_native_draft_accepted": native_mtp_accepted,
             "qwen_mtp_native_draft_rejected": native_mtp_rejected,
+            "qwen_mtp_ar_draft_proposed": ar_draft_proposed,
+            "qwen_mtp_ar_draft_accepted": ar_draft_accepted,
+            "qwen_mtp_ar_draft_rejected": ar_draft_rejected,
+            "qwen_mtp_ar_draft_request_prefill_s": (
+                drafter_request_prefill_s),
+            "qwen_mtp_ar_draft_cleanup_s": drafter_cleanup_s,
+            "qwen_mtp_ar_draft_round_sync_s": float(
+                drafter_telemetry.get("round_sync_s", 0.0)),
+            "qwen_mtp_ar_draft_round_sync_steps": int(
+                drafter_telemetry.get("round_sync_steps", 0)),
+            "qwen_mtp_ar_draft_proposal_s": float(
+                drafter_telemetry.get("proposal_s", 0.0)),
+            "qwen_mtp_ar_draft_proposal_steps": int(
+                drafter_telemetry.get("proposal_steps", 0)),
+            "qwen_mtp_ar_draft_commit_replay_s": float(
+                drafter_telemetry.get("commit_replay_s", 0.0)),
+            "qwen_mtp_ar_draft_commit_replay_steps": int(
+                drafter_telemetry.get("commit_replay_steps", 0)),
+            "qwen_mtp_ar_draft_peak_cache_bytes": int(
+                drafter_telemetry.get("peak_cache_bytes", 0)),
+            "qwen_mtp_ar_draft_backend_load_s": float(
+                drafter_telemetry.get("backend_load_s", 0.0)),
+            "qwen_mtp_ar_draft_backend_loads": int(
+                drafter_telemetry.get("backend_loads", 0)),
+            "qwen_mtp_ar_draft_backend_unload_s": float(
+                drafter_telemetry.get("backend_unload_s", 0.0)),
+            "qwen_mtp_ar_draft_backend_unloads": int(
+                drafter_telemetry.get("backend_unloads", 0)),
+            "qwen_mtp_ar_draft_verification_suspends": int(
+                drafter_telemetry.get("verification_suspends", 0)),
+            "qwen_mtp_ar_draft_verification_suspend_s": float(
+                drafter_telemetry.get("verification_suspend_s", 0.0)),
+            "qwen_mtp_ar_draft_verification_released_active_bytes": int(
+                drafter_telemetry.get(
+                    "verification_released_active_bytes", 0)),
+            "qwen_mtp_ar_draft_verification_retain_enabled": int(
+                drafter_telemetry.get("verification_retain_enabled", 0)),
+            "qwen_mtp_ar_draft_verification_retained_rounds": int(
+                drafter_telemetry.get("verification_retained_rounds", 0)),
+            "qwen_mtp_ar_draft_verification_retained_active_bytes_peak": int(
+                drafter_telemetry.get(
+                    "verification_retained_active_bytes_peak", 0)),
+            "qwen_mtp_ar_draft_identity": str(
+                drafter_telemetry.get(
+                    "identity", getattr(self.drafter, "identity", ""))),
+            "qwen_mtp_ablation_enabled": int(
+                getattr(self.drafter, "_ablation_direction", None) is not None),
+            "qwen_mtp_ablation_strength": float(getattr(
+                self.drafter, "_ablation_strength", 0.0)),
+            "qwen_mtp_ablation_fingerprint": str(getattr(
+                self.drafter, "_ablation_fingerprint", "")),
             "qwen_mtp_proposal_sources": "".join(proposal_sources),
             "qwen_mtp_stochastic_expected_acceptance": (
                 stochastic_expected_acceptance_sum / verified_proposals
@@ -2741,6 +3090,24 @@ class QwenMTPSpeculativeEngine:
             tgt, decode_cache_before, path_stats, prefix="decode_",
             after=request_cache_after)
 
+        # The bootstrap result only observed the first target token. Publish
+        # the complete paged-cache lifetime before the server profile releases
+        # the request-local endpoint and unlinks its spill pages.
+        paged_stats = getattr(kv, "stats", None)
+        if paged_stats is not None:
+            path_stats.update({
+                "paged_kv_spills": int(getattr(paged_stats, "spills", 0)),
+                "paged_kv_reloads": int(getattr(paged_stats, "reloads", 0)),
+                "paged_kv_spill_seconds": float(
+                    getattr(paged_stats, "spill_s", 0.0)),
+                "paged_kv_reload_seconds": float(
+                    getattr(paged_stats, "reload_s", 0.0)),
+                "paged_kv_spill_bytes_raw": int(
+                    getattr(paged_stats, "spill_bytes_raw", 0)),
+                "paged_kv_spill_bytes_compressed": int(
+                    getattr(paged_stats, "spill_bytes_compressed", 0)),
+            })
+
         # Restore a truthful full endpoint slot only when the bootstrap slot
         # itself owned this KV. A separately forked stable-boundary slot is
         # already the correct reusable artifact and was intentionally left in
@@ -2788,4 +3155,17 @@ class QwenMTPSpeculativeEngine:
         }
         if execution_profile is not None:
             result["execution_profile"] = execution_profile
+        release_internal_paged_kv = bool(
+            int(getattr(rc, "max_kv_mb", 0) or 0) > 0
+            and bool(getattr(rc, "release_paged_kv_after_generate", False)))
+        if release_internal_paged_kv:
+            tgt.last_kv = None
+            release_kv = getattr(tgt, "_release_kv", None)
+            if callable(release_kv):
+                release_kv(kv)
+            else:
+                release = getattr(kv, "release", None)
+                if callable(release):
+                    release()
+            mx.clear_cache()
         return result

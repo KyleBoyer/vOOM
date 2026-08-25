@@ -122,6 +122,9 @@ class MemoryGovernor:
         self.reservation_cache_released_bytes = 0
         self.reservation_unproductive_shrinks = 0
         self.reservation_reason_counts: dict[str, int] = {}
+        self.phase_budget_restore_calls = 0
+        self.phase_budget_restore_bytes = 0
+        self.phase_budget_restore_reason_counts: dict[str, int] = {}
         self.swap_pressure_events = 0
         self.swap_pressure_used_growth_bytes = 0
         self.swap_pressure_out_growth_bytes = 0
@@ -410,6 +413,51 @@ class MemoryGovernor:
                 flush=True,
             )
         return self.cache.max_bytes
+
+    def restore_phase_budget(
+        self,
+        target_max: int,
+        *,
+        starting_pressure_shrinks: int,
+        reason: str = "",
+    ) -> int:
+        """Restore only a completed phase's cache *limit*, when still safe.
+
+        Long Qwen prefill declares the same large scratch lifetime once per
+        tile.  Productive evictions are intentionally retained by
+        :meth:`reserve`, but accumulating those reductions across hundreds of
+        finished tiles can leave decode at the 100-MB floor.  Restoring after
+        every tile was measured to oscillate and regress; this boundary hook
+        raises the non-allocating limit once, after prefill scratch is dead.
+
+        A concurrent pressure-thread shrink, recent swap pressure, or a live
+        WARN sample makes this a no-op.  Subsequent page admissions still
+        reserve against fresh measurements before allocating anything.
+        """
+        target = min(max(0, int(target_max)), int(self.configured_max))
+        current = int(self.cache.max_bytes)
+        if target <= current:
+            return 0
+        if int(self.shrinks) != int(starting_pressure_shrinks):
+            return 0
+        now = time.monotonic()
+        if not _swap_restore_ready(now, self._last_swap_pressure_at):
+            return 0
+        available = int(psutil.virtual_memory().available)
+        active = int(mx.get_active_memory())
+        if available <= int(self.warn):
+            return 0
+        if active > self._metal_ceiling(active, available):
+            return 0
+        self._set_cache_max(target)
+        restored = target - current
+        self.reservation_budget_restored_bytes += restored
+        self.phase_budget_restore_calls += 1
+        self.phase_budget_restore_bytes += restored
+        label = str(reason or "unspecified")
+        self.phase_budget_restore_reason_counts[label] = (
+            self.phase_budget_restore_reason_counts.get(label, 0) + 1)
+        return restored
 
     # ---- loop ----------------------------------------------------------
 

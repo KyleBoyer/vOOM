@@ -12,8 +12,34 @@ import pytest
 
 from runtime.kv_cache import KVCache
 from runtime.qwen35_mtp import (
+    _QwenMTPBootstrapPrompt,
     ProposalQPolicy, QwenMTPDrafter, QwenMTPSpeculativeEngine)
 from runtime.sampler import SamplingParams
+
+
+def test_mtp_bootstrap_prompt_retains_paged_endpoint_and_identity():
+    class Prompt(str):
+        pass
+
+    prompt = Prompt("rendered")
+    prompt.tool_capsules = (("tool", 1, 2),)
+    prompt.cache_namespace = "execution"
+    prompt.force_paged_kv = True
+    prompt.stable_boundary_tokens = 17
+    prompt.rerank_capture_shape = {"tool_count": 2}
+    prompt.disable_hot_prompt_kv = False
+
+    bootstrap = _QwenMTPBootstrapPrompt(prompt, (3, 4, 5))
+
+    assert str(bootstrap) == "rendered"
+    assert bootstrap.token_ids == (3, 4, 5)
+    assert bootstrap.tool_capsules == (("tool", 1, 2),)
+    assert bootstrap.cache_namespace == "execution"
+    assert bootstrap.force_paged_kv is True
+    assert bootstrap.stable_boundary_tokens == 17
+    assert bootstrap.rerank_capture_shape == {"tool_count": 2}
+    assert bootstrap.disable_hot_prompt_kv is False
+    assert bootstrap.retain_paged_kv_after_generate is True
 
 
 class _Encoding:
@@ -42,6 +68,7 @@ class _TargetKV:
         self.offset = 3
         self.lengths = [3, 1]
         self.kda_cache = _Endpoint(0)
+        self.released = False
 
     def layer_lengths(self):
         return tuple(self.lengths)
@@ -56,6 +83,9 @@ class _TargetKV:
 
     def nbytes(self):
         return 0
+
+    def release(self):
+        self.released = True
 
 
 class _Store:
@@ -101,15 +131,19 @@ class _Target:
         self.effective_max_position_embeddings = 0
         self.rope_profile = "test"
         self.last_kv = None
+        self.bootstrap_prompt = None
+        self.bootstrap_kv = None
         self.endpoint_requests = []
         self.serial_calls = []
         self.endpoints = {index: _Endpoint(index) for index in (1, 2, 3)}
 
     def generate(self, _prompt, max_tokens, **kwargs):
         assert max_tokens == 1
+        self.bootstrap_prompt = _prompt
         if kwargs.get("constraint") is not None:
             kwargs["constraint"].accept_token(4)
         self.last_kv = _TargetKV()
+        self.bootstrap_kv = self.last_kv
         return {
             "text": "4", "tokens": [4], "prefill_s": 0.0,
             "first_token_s": 0.0, "decode_s": 0.0, "total_s": 0.0,
@@ -219,6 +253,47 @@ class _WideRecurrentDrafter(_RecurrentDrafter):
         return logits, mx.array([[[1000.0 + step]]])
 
 
+class _ExternalARDrafter:
+    proposal_source = "A"
+    request_weight_representation = "resident-ar-mxfp4"
+    identity = "fake-qwen-ar"
+
+    def __init__(self):
+        self.calls = []
+        self.begin_requests = []
+        self.begin_rounds = []
+        self.commits = []
+        self.ended = 0
+
+    def begin_request(self, ids):
+        self.begin_requests.append(list(ids))
+
+    def begin_round(self, all_tokens):
+        self.begin_rounds.append(list(all_tokens))
+
+    def draft_step(self, hidden, token, _mtp_kv, offset, _weights=None):
+        step = len(self.calls)
+        self.calls.append({"token": int(token), "offset": int(offset)})
+        proposal = _WideTarget.draft_tokens[step]
+        logits = mx.full((16,), -100.0).at[proposal].add(200.0)
+        return logits, hidden
+
+    def commit_target_inputs(self, tokens):
+        self.commits.append(list(tokens))
+
+    def telemetry_snapshot(self):
+        return {
+            "identity": self.identity,
+            "proposal_steps": len(self.calls),
+            "commit_replay_steps": sum(map(len, self.commits)),
+            "round_sync_steps": 0,
+            "peak_cache_bytes": 1234,
+        }
+
+    def end_request(self):
+        self.ended += 1
+
+
 def test_released_drafter_step_returns_post_block_hidden(monkeypatch):
     weights = {
         "mtp.pre_fc_norm_embedding.weight": mx.ones((1,)),
@@ -262,6 +337,61 @@ def test_released_drafter_step_returns_post_block_hidden(monkeypatch):
     assert logits.shape == (1,)
     assert logits.tolist() == [17.0]
     assert mtp_kv.layer_lengths() == (1,)
+
+
+def test_native_mtp_ablation_projects_branches_not_accumulated_residual(
+    monkeypatch,
+):
+    weights = {
+        "mtp.pre_fc_norm_embedding.weight": mx.ones((2,)),
+        "mtp.pre_fc_norm_hidden.weight": mx.ones((2,)),
+        "mtp.fc.weight": mx.ones((2, 4)),
+        "mtp.layers.0.input_layernorm.weight": mx.ones((2,)),
+        "mtp.layers.0.post_attention_layernorm.weight": mx.ones((2,)),
+        "mtp.norm.weight": mx.ones((2,)),
+    }
+
+    def fake_attention(_h, _w, _prefix, _cfg, kv, _layer, _offset):
+        item = mx.ones((1, 1, 1, 1))
+        kv.update(0, item, item)
+        return mx.array([[[3.0, 4.0]]])
+
+    monkeypatch.setattr(
+        "runtime.qwen35_mtp.qwen35_rms_norm", lambda value, _w, _eps: value)
+    monkeypatch.setattr(
+        "runtime.qwen35_mtp.quant.matmul",
+        lambda _value, _weight: mx.array([[[1.0, 2.0]]]),
+    )
+    monkeypatch.setattr("runtime.qwen35_mtp._full_attention", fake_attention)
+    monkeypatch.setattr(
+        "runtime.qwen35_mtp._swiglu",
+        lambda _h, _w, _prefix: mx.array([[[5.0, 6.0]]]),
+    )
+    monkeypatch.setattr(
+        "runtime.qwen35_mtp.final_logits",
+        lambda hidden, _norm, _head, _eps: hidden.reshape(-1),
+    )
+    engine = SimpleNamespace(
+        store=SimpleNamespace(names_with_prefix=lambda prefix: (
+            list(weights) if prefix == "mtp." else [])),
+        cache=SimpleNamespace(get=lambda _key, _names: weights),
+        cfg=SimpleNamespace(
+            num_experts=0, rms_norm_eps=0.0, vocab_size=2, hidden_size=2),
+        _embed=lambda _tokens: mx.zeros((1, 1, 2)),
+        _lm_head_weight=lambda: mx.ones((2, 2)),
+    )
+    drafter = QwenMTPDrafter(engine)
+    drafter.set_ablation(
+        [1.0, 0.0], strength=1.0, fingerprint="a" * 64)
+
+    logits, hidden = drafter.draft_step(
+        mx.zeros((1, 1, 2)), 7, KVCache(1), 2, weights)
+
+    # Attention [3,4] -> [0,4], residual [1,2] -> [1,6].
+    # MLP [5,6] -> [0,6], final hidden -> [1,12]. The accumulated
+    # residual's first component survives, proving only writers are projected.
+    assert hidden.tolist() == [[[1.0, 12.0]]]
+    assert logits.tolist() == [1.0, 12.0]
 
 
 @pytest.mark.parametrize(
@@ -313,6 +443,91 @@ def test_k2_accept_prefixes_match_ordinary_state_oracle(
         2, accepted_prefix + 1)
     assert stats["qwen_mtp_target_prefix_rollbacks"] == int(expected_fed < 3)
     assert stats["qwen_mtp_draft_kv_rollbacks"] == int(mtp_length < 2)
+
+
+def test_paged_bootstrap_restores_phase_budget_then_releases_endpoint():
+    class Governor:
+        shrinks = 0
+
+        def __init__(self):
+            self.calls = []
+
+        def restore_phase_budget(
+            self, target_max, *, starting_pressure_shrinks, reason,
+        ):
+            self.calls.append(
+                (target_max, starting_pressure_shrinks, reason))
+            return 2_100_000_000
+
+        def request_peak(self):
+            return 0
+
+    target = _Target(0)
+    target.cache.max_bytes = 2_200_000_000
+    target.rc = SimpleNamespace(
+        max_kv_mb=768, release_paged_kv_after_generate=True)
+    target.governor = Governor()
+    target.released_kv = None
+
+    def release_kv(kv):
+        target.released_kv = kv
+        kv.release()
+
+    target._release_kv = release_kv
+    engine = QwenMTPSpeculativeEngine(
+        target,
+        max_prompt_tokens=8,
+        min_output_tokens=2,
+        plain_warmup_tokens=0,
+        adaptive_stop=False,
+        depth=2,
+    )
+    engine.drafter = _RecurrentDrafter()
+
+    result = engine.generate("x", 2)
+
+    assert target.governor.calls == [(
+        2_200_000_000, 0, "qwen-mtp-paged-bootstrap")]
+    assert target.bootstrap_prompt.retain_paged_kv_after_generate is True
+    assert target.last_kv is None
+    assert target.released_kv is target.bootstrap_kv
+    assert target.bootstrap_kv.released is True
+    assert result["path_stats"][
+        "qwen_mtp_paged_bootstrap_budget_restored_bytes"] == 2_100_000_000
+
+
+def test_paged_wrapper_publishes_complete_reuse_and_spill_telemetry():
+    target = _Target(0)
+    target.rc = SimpleNamespace(
+        max_kv_mb=768, release_paged_kv_after_generate=False)
+    engine = QwenMTPSpeculativeEngine(
+        target,
+        max_prompt_tokens=8,
+        min_output_tokens=2,
+        plain_warmup_tokens=0,
+        adaptive_stop=False,
+        depth=2,
+    )
+    engine.drafter = _RecurrentDrafter()
+    original_generate = target.generate
+
+    def generate(*args, **kwargs):
+        result = original_generate(*args, **kwargs)
+        target.last_kv.stats = SimpleNamespace(
+            spills=7,
+            reloads=5,
+            spill_s=0.7,
+            reload_s=0.5,
+            spill_bytes_raw=700,
+            spill_bytes_compressed=350,
+        )
+        return result
+
+    target.generate = generate
+    stats = engine.generate("x", 2)["path_stats"]
+
+    assert stats["paged_kv_spills"] == 7
+    assert stats["paged_kv_reloads"] == 5
 
 
 def test_k2_greedy_rank_capture_identifies_rescuable_second_choice():
@@ -428,6 +643,148 @@ def test_k4_every_accepted_prefix_matches_ordinary_state_oracle(
         expected_mtp_length < 4)
 
 
+@pytest.mark.parametrize("accepted_prefix", range(5))
+def test_external_ar_draft_commits_only_authoritative_target_prefix(
+    accepted_prefix,
+):
+    target = _WideTarget(accepted_prefix)
+    drafter = _ExternalARDrafter()
+    engine = QwenMTPSpeculativeEngine(
+        target,
+        max_prompt_tokens=8,
+        min_output_tokens=2,
+        plain_warmup_tokens=0,
+        adaptive_stop=False,
+        depth=4,
+        drafter=drafter,
+    )
+
+    result = engine.generate("x", accepted_prefix + 2)
+
+    accepted_tokens = list(_WideTarget.draft_tokens[:accepted_prefix])
+    final_token = (
+        8 if accepted_prefix == 4
+        else _WideTarget.correction_tokens[accepted_prefix]
+    )
+    assert result["tokens"] == [4, *accepted_tokens, final_token]
+    assert drafter.begin_requests == [[1, 2, 3]]
+    assert drafter.begin_rounds == [[1, 2, 3, 4]]
+    assert drafter.commits == [[4, *accepted_tokens]]
+    assert drafter.ended == 1
+    assert [call["token"] for call in drafter.calls] == [4, 10, 11, 12]
+    # A resident AR draft owns no native-MTP attention cache.  Target recurrent
+    # rollback remains identical and the empty compatibility cache never grows.
+    assert target.last_kv.offset == 3 + accepted_prefix + 1
+    stats = result["path_stats"]
+    assert stats["qwen_mtp_proposal_sources"] == "A"
+    assert stats["qwen_mtp_proposal_weight_representation"] == (
+        "resident-ar-mxfp4")
+    assert stats["qwen_mtp_native_draft_proposed"] == 0
+    assert stats["qwen_mtp_native_draft_accepted"] == 0
+    assert stats["qwen_mtp_native_draft_rejected"] == 0
+    assert stats["qwen_mtp_ar_draft_proposed"] == 4
+    assert stats["qwen_mtp_ar_draft_accepted"] == accepted_prefix
+    assert stats["qwen_mtp_ar_draft_rejected"] == int(accepted_prefix < 4)
+    assert stats["qwen_mtp_ar_draft_proposal_steps"] == 4
+    assert stats["qwen_mtp_ar_draft_commit_replay_steps"] == (
+        accepted_prefix + 1)
+    assert stats["qwen_mtp_ar_draft_peak_cache_bytes"] == 1234
+    assert stats["qwen_mtp_ar_draft_identity"] == "fake-qwen-ar"
+
+
+def test_staged_ar_weights_are_suspended_during_authoritative_target_sweep():
+    events = []
+
+    class _Cache:
+        pinned_bytes = 17
+        total_bytes = 0
+        max_bytes = 1
+        stats = SimpleNamespace(
+            hits=0, misses=0, evictions=0, bytes_read=0)
+
+        def trim_to(self, target):
+            events.append(("trim", target))
+            return 0
+
+    class _Prefetcher:
+        paused = False
+
+        def pause_and_wait_idle(self):
+            events.append("prefetch-idle")
+            self.paused = True
+
+    class _StagedDrafter(_ExternalARDrafter):
+        staged_load = True
+
+        def __init__(self):
+            super().__init__()
+            self.loaded = False
+            self.suspends = 0
+
+        def ensure_loaded(self):
+            events.append("draft-load")
+            self.loaded = True
+
+        def begin_request(self, ids):
+            assert self.loaded
+            super().begin_request(ids)
+
+        def draft_step(self, *args, **kwargs):
+            assert self.loaded
+            return super().draft_step(*args, **kwargs)
+
+        def suspend_for_target_verification(self):
+            assert self.loaded
+            events.append("draft-suspend")
+            self.loaded = False
+            self.suspends += 1
+            return {"suspended": 1}
+
+        def telemetry_snapshot(self):
+            result = super().telemetry_snapshot()
+            result.update({
+                "verification_suspends": self.suspends,
+                "verification_suspend_s": 0.25,
+                "verification_released_active_bytes": 123,
+            })
+            return result
+
+    class _TargetWithSuspensionOracle(_WideTarget):
+        def forward_tokens_serial_positions(self, *args, **kwargs):
+            assert not drafter.loaded
+            events.append("target-verify")
+            return super().forward_tokens_serial_positions(*args, **kwargs)
+
+    drafter = _StagedDrafter()
+    target = _TargetWithSuspensionOracle(1)
+    target.cache = _Cache()
+    target.prefetcher = _Prefetcher()
+    engine = QwenMTPSpeculativeEngine(
+        target,
+        max_prompt_tokens=8,
+        min_output_tokens=2,
+        plain_warmup_tokens=0,
+        adaptive_stop=False,
+        depth=4,
+        drafter=drafter,
+    )
+
+    result = engine.generate("x", 3)
+
+    assert result["tokens"] == [4, 10, 6]
+    assert events.index("draft-suspend") < events.index("target-verify")
+    # Terminal completion intentionally avoids reloading proposal weights just
+    # to construct state that end_request immediately discards.
+    assert events.count("draft-load") == 2
+    assert drafter.commits == []
+    stats = result["path_stats"]
+    assert stats["qwen_mtp_ar_draft_verification_suspends"] == 1
+    assert stats["qwen_mtp_ar_draft_verification_suspend_s"] == 0.25
+    assert (
+        stats["qwen_mtp_ar_draft_verification_released_active_bytes"] == 123
+    )
+
+
 def test_k2_grammar_fork_masks_both_provisional_steps_without_mutating_target():
     class _Constraint:
         def __init__(self, accepted=()):
@@ -494,6 +851,74 @@ def test_k2_grammar_fork_masks_both_provisional_steps_without_mutating_target():
     assert stats["qwen_mtp_accepted_by_step"] == [1, 1]
     assert stats["qwen_mtp_grammar_masked_draft_tokens"] == 2
     assert stats["qwen_mtp_grammar_masked_draft_rounds"] == 1
+
+
+def test_k2_grammar_fork_termination_shortens_target_verification():
+    class _TerminalConstraint:
+        def __init__(self, accepted=()):
+            self.accepted = list(accepted)
+            self.completed = False
+            self.forks = []
+
+        def fork(self):
+            forked = _TerminalConstraint(self.accepted)
+            self.forks.append(forked)
+            return forked
+
+        def mask_logits(self, logits):
+            if self.completed:
+                raise RuntimeError("mask requested after terminal token")
+            legal = 10 if self.accepted == [4] else 8
+            masked = mx.full(logits.shape, -1000.0)
+            return masked.at[..., legal].add(2000.0)
+
+        def accept_token(self, token):
+            self.accepted.append(int(token))
+            if int(token) == 10:
+                self.completed = True
+
+    class _ShortTarget(_Target):
+        def forward_tokens_serial_positions(
+            self, tokens, kv, *, capture_kda_endpoints=False,
+        ):
+            assert tokens == [4, 10]
+            assert capture_kda_endpoints
+            self.serial_calls.append(list(tokens))
+            kv.offset += 2
+            kv.lengths[0] += 2
+            kv.kda_cache = self.endpoints[2]
+            self._h_window = mx.array([[[40.0], [100.0]]])
+            self._h_last = self._h_window[:, -1:, :]
+            logits = mx.full((2, 16), -100.0)
+            logits = logits.at[0, 10].add(200.0)
+            logits = logits.at[1, 8].add(200.0)
+            return logits
+
+    target = _ShortTarget(1)
+    engine = QwenMTPSpeculativeEngine(
+        target,
+        max_prompt_tokens=8,
+        min_output_tokens=2,
+        plain_warmup_tokens=0,
+        adaptive_stop=False,
+        depth=2,
+        grammar_aware_draft=True,
+    )
+    drafter = _RecurrentDrafter()
+    engine.drafter = drafter
+    constraint = _TerminalConstraint()
+
+    result = engine.generate("x", 4, constraint=constraint)
+
+    assert result["tokens"] == [4, 10]
+    assert result["termination_reason"] == "grammar"
+    assert target.serial_calls == [[4, 10]]
+    assert len(drafter.calls) == 1
+    assert constraint.forks[0].accepted == [4, 10]
+    stats = result["path_stats"]
+    assert stats["qwen_mtp_verify_width"] == 3
+    assert stats["qwen_mtp_max_verify_width_observed"] == 2
+    assert stats["qwen_mtp_grammar_masked_draft_tokens"] == 1
 
 
 def test_k4_grammar_fork_conditions_every_provisional_step():

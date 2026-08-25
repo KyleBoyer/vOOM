@@ -26,13 +26,16 @@ from runtime.resident_mlx_lm import (
 )
 
 
-def _checkpoint(tmp_path: Path, payload: int = 3_400_000_000) -> Path:
+def _checkpoint(
+    tmp_path: Path, payload: int = 3_400_000_000, *,
+    bits: int = 4, group_size: int = 32, mode: str = "mxfp4",
+) -> Path:
     model_dir = tmp_path / "Qwen3.5-4B-mlx-all-mxfp4"
     model_dir.mkdir()
     (model_dir / "config.json").write_text(json.dumps({
         "model_type": "qwen3_5",
         "quantization_config": {
-            "bits": 4, "group_size": 32, "mode": "mxfp4",
+            "bits": bits, "group_size": group_size, "mode": mode,
         },
         "voom_quantization": {"profile": "all", "source": "fixture"},
     }))
@@ -41,6 +44,13 @@ def _checkpoint(tmp_path: Path, payload: int = 3_400_000_000) -> Path:
         "weight_map": {},
     }))
     return model_dir
+
+
+def _set_profile(model_dir: Path, profile: str) -> None:
+    path = model_dir / "config.json"
+    config = json.loads(path.read_text())
+    config["voom_quantization"]["profile"] = profile
+    path.write_text(json.dumps(config))
 
 
 def _cfg(**overrides):
@@ -63,6 +73,61 @@ def test_auto_admits_only_measured_qwen_profile_with_bounded_headroom(tmp_path):
     assert decision.payload_bytes == 3_400_000_000
     assert decision.estimated_metal_bytes == 4_600_000_000
     assert decision.reason == "measured_resident_qwen_profile_admitted"
+
+
+def test_all_draft_profile_is_auxiliary_only(tmp_path):
+    model_dir = _checkpoint(tmp_path, payload=2_450_000_000)
+    _set_profile(model_dir, "all-draft")
+
+    served = choose_resident_backend(
+        model_dir, _cfg(), "fast",
+        available_bytes=10_000_000_000, env={})
+    draft = choose_resident_backend(
+        model_dir, _cfg(), "fast", allow_lossy_draft=True,
+        available_bytes=10_000_000_000, env={})
+
+    assert not served.admitted
+    assert served.reason == "checkpoint_not_measured_all_mxfp4_profile"
+    assert draft.admitted
+    assert draft.payload_bytes == 2_450_000_000
+    assert draft.reason == "measured_resident_qwen_draft_profile_admitted"
+
+
+@pytest.mark.parametrize("bits", [2, 3, 4])
+def test_affine_all_draft_profiles_are_auxiliary_only(tmp_path, bits):
+    model_dir = _checkpoint(
+        tmp_path, payload=1_900_000_000,
+        bits=bits, group_size=64, mode="affine")
+    _set_profile(model_dir, "all-draft")
+
+    served = choose_resident_backend(
+        model_dir, _cfg(), "fast",
+        available_bytes=10_000_000_000, env={})
+    draft = choose_resident_backend(
+        model_dir, _cfg(), "fast", allow_lossy_draft=True,
+        available_bytes=10_000_000_000, env={})
+
+    assert not served.admitted
+    assert draft.admitted
+    assert draft.reason == "measured_resident_qwen_draft_profile_admitted"
+
+
+@pytest.mark.parametrize(
+    ("bits", "group_size", "mode"),
+    [(3, 32, "affine"), (3, 128, "affine"), (3, 64, "mxfp4")],
+)
+def test_unmeasured_all_draft_quantization_tuples_fail_closed(
+    tmp_path, bits, group_size, mode,
+):
+    model_dir = _checkpoint(
+        tmp_path, bits=bits, group_size=group_size, mode=mode)
+    _set_profile(model_dir, "all-draft")
+
+    decision = choose_resident_backend(
+        model_dir, _cfg(), "fast", allow_lossy_draft=True,
+        available_bytes=10_000_000_000, env={})
+    assert not decision.admitted
+    assert decision.reason == "checkpoint_not_measured_all_mxfp4_profile"
 
 
 def test_auto_rejects_9b_when_current_system_headroom_is_too_small(tmp_path):

@@ -380,7 +380,14 @@ class GrammarConstraint:
 
     def mask_logits(self, logits: mx.array) -> mx.array:
         xgr = _xgrammar()
-        if self.completed:
+        # xgrammar raises if a caller asks for another mask after accepting a
+        # stop token.  Auto-tool grammars deliberately use
+        # ``stop_on_complete=False`` (ordinary text is legal), so termination
+        # is the stronger signal here: once the matcher consumed the stop
+        # token there is no next grammar position to mask.  Mark the request
+        # complete and let speculative callers stop at this exact boundary.
+        if self.completed or self.is_terminated():
+            self.completed = True
             return logits
         need_apply = self.matcher.fill_next_token_bitmask(self._bitmask)
         if not need_apply:
@@ -405,6 +412,9 @@ class GrammarConstraint:
         return mx.where(allowed, logits.reshape(-1), float("-inf"))
 
     def accept_token(self, token: int) -> None:
+        if self.completed or self.is_terminated():
+            self.completed = True
+            return
         if not self.matcher.accept_token(int(token)):
             # _compiler() (above) builds xgrammar's own tokenizer/vocabulary
             # view via `transformers.AutoTokenizer`, separate from the raw
@@ -431,7 +441,18 @@ class GrammarConstraint:
             self.completed = True
             return
         self.completed = bool(
-            self.stop_on_complete and self.matcher.is_completed())
+            self.is_terminated()
+            or (self.stop_on_complete and self.matcher.is_completed()))
+
+    def is_terminated(self) -> bool:
+        """Whether xgrammar has consumed a terminal token.
+
+        Kept as a small public query so speculative decoders can stop their
+        provisional chain without touching matcher internals.  Test doubles
+        from older callers need not implement xgrammar's optional method.
+        """
+        predicate = getattr(self.matcher, "is_terminated", None)
+        return bool(predicate()) if callable(predicate) else False
 
     def fork(self) -> "GrammarConstraint":
         """Return an independent matcher at the identical token boundary.
@@ -494,7 +515,7 @@ class GrammarConstraint:
         # matcher (live-crashed 2026-07-23 on the real Plex capture; the
         # required-tool synthetic test never hit it because that profile
         # terminates without a stop token and sets completed instead).
-        if self.completed or self.matcher.is_terminated():
+        if self.completed or self.is_terminated():
             return []
         if encode is not None:
             jump = self.matcher.find_jump_forward_string()
@@ -507,7 +528,7 @@ class GrammarConstraint:
                         # per-token path on any disagreement.
                         break
                     forced.append(int(token))
-                    if self.matcher.is_terminated() or self.matcher.is_completed():
+                    if self.is_terminated() or self.matcher.is_completed():
                         if self.stop_on_complete and self.matcher.is_completed():
                             self.completed = True
                         break
@@ -530,7 +551,7 @@ class GrammarConstraint:
                 # per-token path rather than trusting a contradicted state.
                 break
             forced.append(token)
-            if self.matcher.is_terminated() or self.matcher.is_completed():
+            if self.is_terminated() or self.matcher.is_completed():
                 if self.stop_on_complete and self.matcher.is_completed():
                     self.completed = True
                 break

@@ -112,3 +112,61 @@ def test_tiny_mixed_plan_build_emits_per_tensor_descriptors(tmp_path):
     assert isinstance(values["model.layers.0.mlp.up_proj.weight"], QTensor)
     assert not isinstance(values["model.layers.3.mlp.up_proj.weight"], QTensor)
     assert not isinstance(values["mtp.fc.weight"], QTensor)
+
+
+def test_affine3_body_keeps_attention_head_and_mtp_at_safer_precisions(
+    tmp_path,
+):
+    source, output = tmp_path / "source", tmp_path / "output"
+    source.mkdir()
+    tensors = {
+        "model.embed_tokens.weight": mx.ones((64, 64)),
+        "model.norm.weight": mx.ones((64,)),
+        "lm_head.weight": mx.ones((64, 64)),
+        "mtp.fc.weight": mx.ones((64, 64)),
+        "mtp.norm.weight": mx.ones((64,)),
+        "model.layers.0.self_attn.q_proj.weight": mx.ones((64, 64)),
+        "model.layers.0.mlp.up_proj.weight": mx.ones((64, 64)),
+        "model.layers.0.input_layernorm.weight": mx.ones((64,)),
+    }
+    mx.save_safetensors(str(source / "model.safetensors"), tensors)
+    (source / "config.json").write_text(json.dumps({
+        "model_type": "qwen3_5",
+        "hidden_size": 64,
+        "intermediate_size": 64,
+        "num_hidden_layers": 1,
+        "num_attention_heads": 1,
+        "num_key_value_heads": 1,
+        "vocab_size": 64,
+        "tie_word_embeddings": False,
+        "layer_types": ["full_attention"],
+    }))
+    plan = create_plan(source, MixedPrecisionSpec(
+        attention="mxfp4", body="affine3", mtp="bf16"))
+
+    assert plan["tensors"][
+        "model.layers.0.mlp.up_proj.weight"]["storage"] == "affine3"
+    assert plan["tensors"][
+        "model.layers.0.self_attn.q_proj.weight"]["storage"] == "mxfp4"
+    assert plan["tensors"]["lm_head.weight"]["storage"] == "mxfp4"
+    assert plan["tensors"]["mtp.fc.weight"]["storage"] == "bf16"
+    assert validate_plan(plan, source) == plan
+
+    convert_model(source, output, precision_plan=plan)
+    config = json.loads((output / "config.json").read_text())
+    assert config["quantization"]["model.layers.0.mlp.up_proj"] == {
+        "bits": 3, "group_size": 64, "mode": "affine"}
+    store = WeightStore(output)
+    values, _seconds, _bytes = store.fetch([
+        "model.layers.0.mlp.up_proj.weight",
+        "model.layers.0.self_attn.q_proj.weight",
+        "lm_head.weight",
+        "mtp.fc.weight",
+    ])
+    assert isinstance(values["model.layers.0.mlp.up_proj.weight"], QTensor)
+    assert values["model.layers.0.mlp.up_proj.weight"].bits == 3
+    assert values["model.layers.0.mlp.up_proj.weight"].group_size == 64
+    assert isinstance(values[
+        "model.layers.0.self_attn.q_proj.weight"], QTensor)
+    assert isinstance(values["lm_head.weight"], QTensor)
+    assert not isinstance(values["mtp.fc.weight"], QTensor)

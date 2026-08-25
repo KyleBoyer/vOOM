@@ -145,6 +145,22 @@ def test_explicit_ceiling_also_clamps_fixed_durable_execution():
         engine.rc.prefill_chunk_size) == 32
 
 
+def test_hot_kv_admission_uses_effective_qwen_ceiling_before_execution():
+    engine = _bare_engine(
+        "qwen3_5", hot_kv_persist=object(),
+        hot_prompt_kv_chunk_size=512,
+        qwen35_prefill_chunk_ceiling=32)
+
+    assert engine._prefill_admission_positions(16_000) == 32
+    assert engine._prefill_admission_positions(7) == 7
+
+    non_qwen = _bare_engine(
+        "glm_moe_dsa", hot_kv_persist=None,
+        hot_prompt_kv_chunk_size=512,
+        qwen35_prefill_chunk_ceiling=32)
+    assert non_qwen._prefill_admission_positions(16_000) == 512
+
+
 def test_two_conversations_can_use_different_chunk_sizes_independently():
     """The actual point of this feature: slot A (built under tight memory)
     and slot B (built under healthy memory) coexist with DIFFERENT

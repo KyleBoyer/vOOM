@@ -204,6 +204,8 @@ def test_vision_protocol_timing_exposes_qwen_mtp_round_trace():
             "qwen_mtp_plain_equivalent_target_sweeps": 8,
             "qwen_mtp_target_sweeps_avoided": 3,
             "qwen_mtp_target_tokens_per_sweep": 1.6,
+            "qwen_mtp_target_cache_prepare_s": 0.125,
+            "qwen_mtp_target_page_reserve_s": 0.375,
             "qwen_mtp_verifier_input_positions": 10,
             "qwen_mtp_verifier_committed_positions": 8,
             "qwen_mtp_verifier_rolled_back_positions": 2,
@@ -230,6 +232,22 @@ def test_vision_protocol_timing_exposes_qwen_mtp_round_trace():
             "qwen_mtp_native_draft_proposed": 3,
             "qwen_mtp_native_draft_accepted": 2,
             "qwen_mtp_native_draft_rejected": 1,
+            "qwen_mtp_ar_draft_proposed": 8,
+            "qwen_mtp_ar_draft_accepted": 6,
+            "qwen_mtp_ar_draft_rejected": 2,
+            "qwen_mtp_ar_draft_request_prefill_s": 0.75,
+            "qwen_mtp_ar_draft_cleanup_s": 0.01,
+            "qwen_mtp_ar_draft_round_sync_s": 0.02,
+            "qwen_mtp_ar_draft_round_sync_steps": 2,
+            "qwen_mtp_ar_draft_proposal_s": 0.4,
+            "qwen_mtp_ar_draft_proposal_steps": 8,
+            "qwen_mtp_ar_draft_commit_replay_s": 0.3,
+            "qwen_mtp_ar_draft_commit_replay_steps": 7,
+            "qwen_mtp_ar_draft_peak_cache_bytes": 654321,
+            "qwen_mtp_ar_draft_verification_retain_enabled": 1,
+            "qwen_mtp_ar_draft_verification_retained_rounds": 4,
+            "qwen_mtp_ar_draft_verification_retained_active_bytes_peak": 7654321,
+            "qwen_mtp_ar_draft_identity": "qwen-ar-test",
             "qwen_mtp_proposal_sources": "NMNMN",
             "qwen_mtp_accepted_by_step": [2, 1],
             "qwen_mtp_ngram_first_accepted_by_step": [1, 0, 0, 0],
@@ -256,6 +274,8 @@ def test_vision_protocol_timing_exposes_qwen_mtp_round_trace():
     assert timing["qwen_mtp_plain_equivalent_target_sweeps"] == 8
     assert timing["qwen_mtp_target_sweeps_avoided"] == 3
     assert timing["qwen_mtp_target_tokens_per_sweep"] == 1.6
+    assert timing["qwen_mtp_target_cache_prepare_s"] == 0.125
+    assert timing["qwen_mtp_target_page_reserve_s"] == 0.375
     assert timing["qwen_mtp_verifier_input_positions"] == 10
     assert timing["qwen_mtp_verifier_committed_positions"] == 8
     assert timing["qwen_mtp_verifier_rolled_back_positions"] == 2
@@ -282,6 +302,25 @@ def test_vision_protocol_timing_exposes_qwen_mtp_round_trace():
     assert timing["qwen_mtp_native_draft_proposed"] == 3
     assert timing["qwen_mtp_native_draft_accepted"] == 2
     assert timing["qwen_mtp_native_draft_rejected"] == 1
+    assert timing["qwen_mtp_ar_draft_proposed"] == 8
+    assert timing["qwen_mtp_ar_draft_accepted"] == 6
+    assert timing["qwen_mtp_ar_draft_rejected"] == 2
+    assert timing["qwen_mtp_ar_draft_request_prefill_s"] == 0.75
+    assert timing["qwen_mtp_ar_draft_cleanup_s"] == 0.01
+    assert timing["qwen_mtp_ar_draft_round_sync_s"] == 0.02
+    assert timing["qwen_mtp_ar_draft_round_sync_steps"] == 2
+    assert timing["qwen_mtp_ar_draft_proposal_s"] == 0.4
+    assert timing["qwen_mtp_ar_draft_proposal_steps"] == 8
+    assert timing["qwen_mtp_ar_draft_commit_replay_s"] == 0.3
+    assert timing["qwen_mtp_ar_draft_commit_replay_steps"] == 7
+    assert timing["qwen_mtp_ar_draft_peak_cache_bytes"] == 654321
+    assert timing[
+        "qwen_mtp_ar_draft_verification_retain_enabled"] == 1
+    assert timing[
+        "qwen_mtp_ar_draft_verification_retained_rounds"] == 4
+    assert timing[
+        "qwen_mtp_ar_draft_verification_retained_active_bytes_peak"] == 7654321
+    assert timing["qwen_mtp_ar_draft_identity"] == "qwen-ar-test"
     assert timing["qwen_mtp_proposal_sources"] == "NMNMN"
     assert timing["qwen_mtp_accepted_by_step"] == [2, 1]
     assert timing["qwen_mtp_ngram_first_accepted_by_step"] == [1, 0, 0, 0]
@@ -327,6 +366,11 @@ def test_protocol_timing_exposes_qwen35_prefill_ceiling_and_selection():
             "qwen35_prefill_chunk_ceiling": 128,
             "qwen35_prefill_chunk_selected": 128,
             "qwen35_serial_verify_exact_page_admission": 1,
+            "qwen_mtp_paged_bootstrap_endpoint_retained": 1,
+            "qwen_mtp_paged_bootstrap_budget_restored_bytes": 2100,
+            "paged_kv_spills": 8,
+            "paged_kv_reloads": 80,
+            "paged_kv_reload_seconds": 1.25,
             "qwen_mtp_native_tree_selected_rank_counts": [1, 9, 0],
         },
     })
@@ -335,6 +379,10 @@ def test_protocol_timing_exposes_qwen35_prefill_ceiling_and_selection():
     assert timing["qwen35_prefill_chunk_ceiling"] == 128
     assert timing["qwen35_prefill_chunk_selected"] == 128
     assert timing["qwen35_serial_verify_exact_page_admission"] == 1
+    assert timing["qwen_mtp_paged_bootstrap_endpoint_retained"] == 1
+    assert timing["paged_kv_spills"] == 8
+    assert timing["paged_kv_reloads"] == 80
+    assert timing["paged_kv_reload_seconds"] == 1.25
     assert timing["qwen_mtp_native_tree_selected_rank_counts"] == [1, 9, 0]
 
 
@@ -1288,6 +1336,20 @@ def test_hidden_tool_gateway_starts_virtual_only_then_retrieves_real_tools():
         assert _hidden_tool_gateway_enabled("fast", len(tools), "auto")
         assert not _hidden_tool_gateway_enabled("lossless", len(tools), "auto")
         assert not _hidden_tool_gateway_enabled("fast", len(tools), "specific:browser_open")
+    with patch.dict(os.environ, {
+        "VMODEL_FAST_TOOL_GATEWAY": "1",
+        "VMODEL_FAST_TOOL_GATEWAY_MIN_TOOLS": "5",
+    }):
+        assert not _hidden_tool_gateway_enabled("fast", 4, "auto")
+        assert _hidden_tool_gateway_enabled("fast", 5, "auto")
+        assert _hidden_tool_gateway_enabled("fast", 134, "required")
+    with patch.dict(os.environ, {
+        "VMODEL_FAST_TOOL_GATEWAY": "1",
+        "VMODEL_FAST_TOOL_GATEWAY_MIN_TOOLS": "zero",
+    }):
+        with pytest.raises(
+                RequestValidationError, match="must be a positive integer"):
+            _hidden_tool_gateway_enabled("fast", 3, "auto")
 
 
 def test_hidden_gateway_abstention_defaults_safe_and_real_tool_mode_is_explicit():
@@ -4309,6 +4371,255 @@ def test_engine_manager_wraps_qwen38_with_explicit_dflash2_and_keys_policy(tmp_p
     assert first.closes == 1
     assert first.target.closes == 1
     assert second.kwargs["proposal_policy"] == "selector"
+
+
+def test_qwen_ar_draft_controls_fail_closed_before_model_load(tmp_path):
+    from unittest.mock import patch
+
+    from runtime.server import EngineManager, RequestValidationError
+
+    draft = str(tmp_path / "draft")
+    cases = [
+        ({
+            "VMODEL_QWEN_AR_DRAFT": draft,
+            "VMODEL_QWEN_MTP_SPECULATIVE": "0",
+        }, "requires Qwen target verification"),
+        ({
+            "VMODEL_QWEN_AR_DRAFT": draft,
+            "VMODEL_QWEN_MTP_TREE_WIDTH": "2",
+        }, "cannot be combined"),
+        ({
+            "VMODEL_QWEN_AR_DRAFT": draft,
+            "VMODEL_QWEN_DFLASH2_DRAFT": str(tmp_path / "dflash"),
+        }, "mutually exclusive"),
+        ({
+            "VMODEL_QWEN_AR_DRAFT": draft,
+            "VMODEL_QWEN_AR_DRAFT_PREFILL_STEP_SIZE": "0",
+        }, "must be in"),
+        ({
+            "VMODEL_QWEN_AR_DRAFT_RETAIN_WEIGHTS": "1",
+        }, "requires VMODEL_QWEN_AR_DRAFT"),
+        ({
+            "VMODEL_QWEN_AR_DRAFT": draft,
+            "VMODEL_QWEN_AR_DRAFT_RETAIN_WEIGHTS": "true",
+        }, "must be 0 or 1"),
+    ]
+    for env, message in cases:
+        with patch.dict(os.environ, env):
+            with pytest.raises(RequestValidationError, match=message):
+                EngineManager().get(Path("/tmp/not-opened-qwen-ar"), "fast")
+
+
+def test_native_qwen_mtp_ablation_controls_fail_closed_before_model_load(
+    tmp_path,
+):
+    from unittest.mock import patch
+
+    from runtime.server import EngineManager, RequestValidationError
+
+    direction = str(tmp_path / "direction")
+    cases = [
+        ({
+            "VMODEL_QWEN_MTP_ABLATION_DIRECTION": direction,
+            "VMODEL_QWEN_MTP_ABLATION_STRENGTH": "0",
+        }, "must be in"),
+        ({
+            "VMODEL_QWEN_MTP_ABLATION_DIRECTION": direction,
+            "VMODEL_QWEN_MTP_ABLATION_STRENGTH": "nan",
+        }, "must be in"),
+        ({
+            "VMODEL_QWEN_MTP_ABLATION_DIRECTION": direction,
+            "VMODEL_QWEN_AR_DRAFT": str(tmp_path / "ar"),
+        }, "requires the native MTP drafter"),
+        ({
+            "VMODEL_QWEN_MTP_ABLATION_DIRECTION": direction,
+            "VMODEL_QWEN_DFLASH2_DRAFT": str(tmp_path / "dflash"),
+        }, "cannot be combined"),
+    ]
+    for env, message in cases:
+        with patch.dict(os.environ, env):
+            with pytest.raises(RequestValidationError, match=message):
+                EngineManager().get(Path("/tmp/not-opened-mtp-ablation"), "fast")
+
+
+def test_engine_manager_loads_native_qwen_mtp_ablation_and_keys_strength(
+    tmp_path,
+):
+    from unittest.mock import patch
+
+    from runtime.server import EngineManager
+
+    target_path = tmp_path / "Huihui-Qwen3.8-27B"
+    direction_path = tmp_path / "huihui-direction"
+    target_path.mkdir()
+    direction_path.mkdir()
+    cfg = SimpleNamespace(
+        model_type="qwen3_5", tie_word_embeddings=False,
+        index_topk=0, vision_config=None, num_experts=0,
+        hidden_size=5120, intermediate_size=17408,
+        num_hidden_layers=64, num_attention_heads=24,
+        num_key_value_heads=4, head_dim=256, vocab_size=248320,
+        attention_bias=False, layer_types=(
+            "linear_attention", "linear_attention", "linear_attention",
+            "full_attention") * 16,
+    )
+    direction = object()
+    made = []
+
+    class FakeStore:
+        def names_with_prefix(self, prefix):
+            return ["mtp.fc.weight"] if prefix == "mtp." else []
+
+    class FakeTarget:
+        def __init__(self, path, rc):
+            self.path, self.rc, self.closes = Path(path), rc, 0
+            self.store = FakeStore()
+
+        def close(self):
+            self.closes += 1
+
+    class FakeMTP:
+        def __init__(self, target, **kwargs):
+            self.target = target
+            self.kwargs = kwargs
+            self.closes = 0
+            made.append(self)
+
+        def close(self):
+            self.closes += 1
+            self.target.close()
+
+    def load_artifact(path, **kwargs):
+        assert path == direction_path
+        assert kwargs["target_config"] == target_path / "config.json"
+        assert kwargs["hidden_size"] == 5120
+        assert len(kwargs["draft_revision"]) == 40
+        return SimpleNamespace(direction=direction, fingerprint="a" * 64)
+
+    manager = EngineManager()
+    env = {
+        "VMODEL_QWEN_MTP_ABLATION_DIRECTION": str(direction_path),
+        "VMODEL_QWEN_MTP_ABLATION_STRENGTH": "0.75",
+        "VMODEL_QWEN_MTP_SPECULATIVE": "1",
+        "VMODEL_DSPARK_DRAFT": "0",
+    }
+    with patch("runtime.config.ModelConfig.from_dir", return_value=cfg), \
+         patch("runtime.path_resolver.resolve_model_dir",
+               side_effect=lambda path: path), \
+         patch("runtime.engine.StreamingEngine", FakeTarget), \
+         patch("runtime.dflash2_ablation.load_artifact",
+               side_effect=load_artifact), \
+         patch("runtime.qwen35_mtp.QwenMTPSpeculativeEngine", FakeMTP), \
+         patch.dict(os.environ, env), \
+         patch("runtime.server.psutil.virtual_memory",
+               return_value=SimpleNamespace(available=8_000_000_000)):
+        first = manager.get(target_path, "fast")
+        assert first.kwargs["mtp_ablation_direction"] is direction
+        assert first.kwargs["mtp_ablation_strength"] == 0.75
+        assert first.kwargs["mtp_ablation_fingerprint"] == "a" * 64
+        os.environ["VMODEL_QWEN_MTP_ABLATION_STRENGTH"] = "1.25"
+        second = manager.get(target_path, "fast")
+
+    assert len(made) == 2
+    assert first.closes == 1
+    assert first.target.closes == 1
+    assert second.kwargs["mtp_ablation_strength"] == 1.25
+
+
+def test_engine_manager_wraps_qwen38_with_resident_ar_draft_and_keys_it(
+    tmp_path,
+):
+    from unittest.mock import patch
+
+    from runtime.server import EngineManager
+
+    target_path = tmp_path / "Huihui-Qwen3.8-27B"
+    draft_path = tmp_path / "Qwen3.5-4B-mlx-all-mxfp4"
+    target_path.mkdir()
+    draft_path.mkdir()
+    cfg = SimpleNamespace(
+        model_type="qwen3_5", tie_word_embeddings=False,
+        index_topk=0, vision_config=None, num_experts=0,
+        hidden_size=5120, intermediate_size=17408,
+        num_hidden_layers=64, num_attention_heads=24,
+        num_key_value_heads=4, head_dim=256, vocab_size=248320,
+        attention_bias=False, layer_types=(
+            "linear_attention", "linear_attention", "linear_attention",
+            "full_attention") * 16,
+    )
+    made = []
+
+    class FakeStore:
+        def names_with_prefix(self, prefix):
+            return ["mtp.fc.weight"] if prefix == "mtp." else []
+
+    class FakeTarget:
+        def __init__(self, path, rc):
+            self.path, self.rc, self.closes = Path(path), rc, 0
+            self.store = FakeStore()
+
+        def close(self):
+            self.closes += 1
+
+    class FakeDrafter:
+        request_weight_representation = "resident-ar-mxfp4"
+        proposal_source = "A"
+        identity = "fake-ar"
+
+        def __init__(self, step):
+            self.step = step
+            self.closes = 0
+
+        def close(self):
+            self.closes += 1
+
+    class FakeMTP:
+        def __init__(self, target, **kwargs):
+            self.target = target
+            self.kwargs = kwargs
+            self.closes = 0
+            made.append(self)
+
+        def close(self):
+            self.closes += 1
+            self.kwargs["drafter"].close()
+            self.target.close()
+
+    def make_drafter(_draft, **kwargs):
+        assert kwargs["target_dir"] == target_path
+        assert kwargs["target_cfg"] is cfg
+        assert kwargs["retain_for_target_verification"]
+        return FakeDrafter(kwargs["prefill_step_size"])
+
+    manager = EngineManager()
+    env = {
+        "VMODEL_QWEN_AR_DRAFT": str(draft_path),
+        "VMODEL_QWEN_AR_DRAFT_PREFILL_STEP_SIZE": "256",
+        "VMODEL_QWEN_AR_DRAFT_RETAIN_WEIGHTS": "1",
+        "VMODEL_QWEN_MTP_SPECULATIVE": "1",
+        "VMODEL_QWEN_MTP_DEPTH": "4",
+        "VMODEL_RESIDENT_BACKEND": "voom",
+        "VMODEL_DSPARK_DRAFT": "0",
+    }
+    with patch("runtime.config.ModelConfig.from_dir", return_value=cfg), \
+         patch("runtime.path_resolver.resolve_model_dir",
+               side_effect=lambda path: path), \
+         patch("runtime.engine.StreamingEngine", FakeTarget), \
+         patch("runtime.qwen35_ar_draft.ResidentQwenARDrafter.from_model_dir",
+               side_effect=make_drafter), \
+         patch("runtime.qwen35_mtp.QwenMTPSpeculativeEngine", FakeMTP), \
+         patch.dict(os.environ, env), \
+         patch("runtime.server.psutil.virtual_memory",
+               return_value=SimpleNamespace(available=8_000_000_000)):
+        first = manager.get(target_path, "fast")
+        assert first.kwargs["drafter"].step == 256
+        assert first.kwargs["depth"] == 4
+        os.environ["VMODEL_QWEN_AR_DRAFT_PREFILL_STEP_SIZE"] = "512"
+        second = manager.get(target_path, "fast")
+
+    assert len(made) == 2
+    assert first.closes == 1
+    assert second.kwargs["drafter"].step == 512
 
 
 def test_engine_manager_prefers_full_resident_qwen3_when_governor_admits_it(tmp_path):

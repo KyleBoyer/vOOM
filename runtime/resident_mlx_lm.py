@@ -119,6 +119,7 @@ def choose_resident_backend(
     *,
     requires_vision: bool = False,
     execution_profile: str = "",
+    allow_lossy_draft: bool = False,
     available_bytes: int | None = None,
     env: Mapping[str, str] | None = None,
 ) -> ResidentBackendDecision:
@@ -163,12 +164,38 @@ def choose_resident_backend(
         raw_config.get("quantization_config")
         or raw_config.get("quantization")
         or {})
+    profile = provenance.get("profile") if isinstance(provenance, dict) else None
+    bits = int(quantization.get("bits", 0) or 0) if isinstance(
+        quantization, dict) else 0
+    group_size = int(quantization.get("group_size", 0) or 0) if isinstance(
+        quantization, dict) else 0
+    quant_mode = str(quantization.get("mode", "")).lower() if isinstance(
+        quantization, dict) else ""
+    served_quantization = (
+        profile == "all"
+        and bits == 4
+        and group_size == 32
+        and quant_mode == "mxfp4"
+    )
+    # Auxiliary proposals are always checked by the authoritative target.
+    # Admit only converter-emitted all-draft tuples we exercise locally; never
+    # broaden the ordinary served-model profile from released all-MXFP4.
+    draft_quantization = (
+        allow_lossy_draft
+        and profile == "all-draft"
+        and (
+            (quant_mode, bits, group_size) == ("mxfp4", 4, 32)
+            or (quant_mode, bits, group_size) in {
+                ("affine", 2, 64),
+                ("affine", 3, 64),
+                ("affine", 4, 64),
+            }
+        )
+    )
     if not (
         isinstance(provenance, dict)
-        and provenance.get("profile") == "all"
         and isinstance(quantization, dict)
-        and int(quantization.get("bits", 0) or 0) == 4
-        and str(quantization.get("mode", "")).lower() == "mxfp4"
+        and (served_quantization or draft_quantization)
     ):
         return ResidentBackendDecision(
             "voom", requested, "checkpoint_not_measured_all_mxfp4_profile")
@@ -209,8 +236,12 @@ def choose_resident_backend(
     if payload_bytes + system_reserve_mb * 1_000_000 > available_bytes:
         return ResidentBackendDecision(
             "voom", requested, "insufficient_current_system_headroom", **base)
-    return ResidentBackendDecision(
-        "mlx-lm", requested, "measured_resident_qwen_profile_admitted", **base)
+    reason = (
+        "measured_resident_qwen_draft_profile_admitted"
+        if profile == "all-draft"
+        else "measured_resident_qwen_profile_admitted"
+    )
+    return ResidentBackendDecision("mlx-lm", requested, reason, **base)
 
 
 def _apply_transformers_compat() -> None:
@@ -399,6 +430,7 @@ class ResidentMLXLMEngine:
     def __init__(
         self, model_dir: str | Path, cfg, rc,
         decision: ResidentBackendDecision,
+        *, auxiliary: bool = False,
     ):
         if not decision.admitted:
             raise ValueError("ResidentMLXLMEngine requires an admitted decision")
@@ -409,6 +441,7 @@ class ResidentMLXLMEngine:
             getattr(cfg, "max_position_embeddings", 0) or 0)
         self.rope_profile = "released"
         self._resident_backend_decision = decision
+        self._auxiliary = bool(auxiliary)
         self._xgrammar_compiler = None
         self._prepared_prompt_token_cache = None
         self.last_kv = None
@@ -422,8 +455,9 @@ class ResidentMLXLMEngine:
         self._generation_sampled_tokens = 0
         self._native_mtp = None
         self._persistent_prompt_store = None
-        self._lossy_suffix_prefill = _parse_lossy_suffix_prefill(
-            os.environ.get("VMODEL_MLX_LM_LOSSY_SUFFIX_PREFILL"))
+        self._lossy_suffix_prefill = (
+            None if self._auxiliary else _parse_lossy_suffix_prefill(
+                os.environ.get("VMODEL_MLX_LM_LOSSY_SUFFIX_PREFILL")))
 
         tokenizer_path = self._model_dir / "tokenizer.json"
         if not tokenizer_path.is_file():
@@ -461,8 +495,9 @@ class ResidentMLXLMEngine:
                 raise ValueError(
                     "VMODEL_MLX_LM_LOSSY_SUFFIX_PREFILL EARLY_LAYERS must "
                     f"be less than the model depth ({len(layers)})")
-        native_mtp_setting = os.environ.get(
-            "VMODEL_MLX_LM_NATIVE_MTP", "0")
+        native_mtp_setting = (
+            "0" if self._auxiliary else os.environ.get(
+                "VMODEL_MLX_LM_NATIVE_MTP", "0"))
         if native_mtp_setting not in ("0", "1"):
             raise ValueError(
                 "VMODEL_MLX_LM_NATIVE_MTP must be 0 or 1")
@@ -471,8 +506,9 @@ class ResidentMLXLMEngine:
 
             self._native_mtp = ResidentQwenMTP(
                 self.model, self._model_dir, quantization)
-        persistent_prompt_dir = os.environ.get(
-            "VMODEL_MLX_LM_PERSISTENT_PROMPT_CACHE_DIR", "").strip()
+        persistent_prompt_dir = (
+            "" if self._auxiliary else os.environ.get(
+                "VMODEL_MLX_LM_PERSISTENT_PROMPT_CACHE_DIR", "").strip())
         if persistent_prompt_dir:
             from .kv_store import model_fingerprint
             from .resident_prompt_store import ResidentPromptStore

@@ -194,6 +194,14 @@ def _convert_shard(source_shard: Path, output_shard: Path, *, profile: str,
                     selected_bits=4 if storage == "mxfp4" else 8,
                     selected_group_size=32)
                 continue
+            if storage == "affine3":
+                if value.shape[-1] % 64:
+                    raise ValueError(
+                        f"affine3 tensor {name} is not group-64 aligned")
+                add_quantized(
+                    name, value, selected_mode="affine",
+                    selected_bits=3, selected_group_size=64)
+                continue
             raise ValueError(
                 f"precision plan has unsupported storage {storage!r} for {name}")
         fused = _FUSED_QWEN_EXPERT.match(name)
