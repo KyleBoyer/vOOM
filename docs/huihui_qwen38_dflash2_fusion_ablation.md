@@ -54,13 +54,44 @@ projection to both residual-writing branch outputs in every DFlash layer,
 before residual addition; it never repeatedly erases the accumulated residual
 stream.
 
-The locally tested direction came from an Ektome-vs-base rank-one weight-delta
+The first tested direction came from an Ektome-vs-base rank-one weight-delta
 artifact, not from Huihui or from DFlash2-specific contrastive activations.
-Consequently it is not advertised as a Huihui sidecar ablation.  The first
-real gate preserved exact target tokens/state but did not increase acceptance
-and regressed wall time.  A genuinely useful follow-up requires either the
-original Huihui direction or DFlash2-specific harmful/harmless activation
-captures plus a heterogeneous held-out acceptance/quality corpus.
+It preserved exact target tokens/state but did not increase acceptance and
+regressed wall time.
+
+The bounded extractor can now recover Huihui's own direction without
+downloading another complete checkpoint.  It range-reads only named BF16
+residual-writer tensors from a pinned official Qwen revision, compares them to
+the local Huihui BF16 checkpoint, hashes every tensor, verifies a retained
+pre-ablation layer is byte-identical, and refuses output unless the edited
+directions are subtractive, projection-shaped, rank-one, and coherent:
+
+```bash
+.venv/bin/python -m runtime.qwen38_rank1_probe \
+  --base-revision 1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0 \
+  --ablated models/Huihui-Qwen3.8-27B-abliterated \
+  --ablated-revision d42ca8978c5a66e92c3446d46e8adfe03ef692ff \
+  --target-config models/Huihui-Qwen3.8-27B-abliterated-mlx-all-mxfp4/config.json \
+  --draft-revision dedf8df68adfb1afeaf7b7480c0a0243108177b4 \
+  --output models/Qwen3.8-27B-DFlash2-ablation-huihui-direction \
+  --report logs/qwen38_huihui_rank1_probe_20260824.json
+```
+
+The measured layer-16/19/20/63 deltas have 0.9925–0.9944 rank-one energy,
+at least 0.99993 projection-form cosine, 0.999996 cross-layer direction
+coherence, and mean effective strength 1.29963.  Layer 14 is byte-identical to
+official Qwen, matching Huihui's stated first-15-layer retention.  Extraction
+took 12.36s and wrote direction fingerprint
+`0db65187...39681fe`.
+
+This proves that the actual Huihui edit direction is recoverable; it does not
+prove that applying the target's coefficient to a differently trained DFlash
+architecture improves proposals.  Two cap-4, eight-token admission attempts
+with the Huihui direction were refused by the unchanged governor at the
+serial verifier, about 10MB over the safety ceiling.  They are recorded as a
+memory stop, not worked around.  Promotion still requires a successfully
+admitted heterogeneous acceptance/quality corpus, or DFlash2-specific
+harmful/harmless activation captures.
 
 ## Promotion gates
 
