@@ -9,7 +9,7 @@ import numpy as np
 import torch
 
 from runtime.config import ModelConfig
-from runtime.kda_state import KDAStateCache
+from runtime.kda_state import KDAFactorWindow, KDAStateCache
 from runtime.kv_cache import Fp8KVCache, KVCache
 from runtime.qwen35 import (
     _full_attention,
@@ -17,6 +17,8 @@ from runtime.qwen35 import (
     _moe,
     qwen35_rms_norm,
 )
+from runtime.qwen35_tree_verify import QwenTreeKVProxy
+from runtime.speculative_tree import SpeculativeTree
 
 from transformers.models.qwen3_5_moe.configuration_qwen3_5_moe import (
     Qwen3_5MoeTextConfig,
@@ -212,6 +214,116 @@ def test_gated_delta_net_exact_endpoint_continuation_matches_one_shot():
     assert bool(mx.array_equal(compiled_cache.state(0), full_cache.state(0)))
     assert bool(mx.array_equal(retained.state(0), full_cache.state(0)))
     assert retained.nbytes() > 0
+
+
+def test_qwen_scalar_delta_factors_commit_tree_path_array_equal():
+    config = _hf_config()
+    real = Qwen3_5MoeGatedDeltaNet(config, layer_idx=0)
+    _randomize(real, 33)
+    with torch.no_grad():
+        real.A_log.copy_(torch.log(
+            torch.empty_like(real.A_log).uniform_(1.0, 8.0)))
+    torch.manual_seed(34)
+    hidden = torch.randn(1, 4, HIDDEN)
+    prefix = "model.layers.0"
+    weights = _mx_state(real, f"{prefix}.linear_attn")
+    runtime = _runtime_config()
+
+    # Capture the selected path exactly, then insert an unrelated sibling
+    # factor between its final two nodes. Tree factors include causal-conv
+    # history, so the final selected factor must itself have been evaluated
+    # from the selected parent rather than from the sibling.
+    selected_capture = KDAStateCache(2)
+    selected_capture.begin_factor_capture()
+    for position in (0, 1, 3):
+        _gated_delta_net(
+            mx.array(hidden[:, position:position + 1].numpy()),
+            weights, prefix, runtime, selected_capture, 0)
+    selected = selected_capture.finish_factor_capture(3)
+    assert selected is not None
+
+    sibling_capture = KDAStateCache(2)
+    sibling_capture.begin_factor_capture()
+    _gated_delta_net(
+        mx.array(hidden[:, 2:3].numpy()),
+        weights, prefix, runtime, sibling_capture, 0)
+    sibling = sibling_capture.finish_factor_capture(1)
+    assert sibling is not None
+    factors = KDAFactorWindow([
+        [selected.steps[0][0], selected.steps[0][1],
+         sibling.steps[0][0], selected.steps[0][2]],
+        [],
+    ], positions=4)
+    committed = factors.commit_indices(KDAStateCache(2), (0, 1, 3))
+
+    assert bool(mx.array_equal(
+        committed.state(0), selected_capture.state(0)))
+    actual_history = committed.conv_history(0)[0]
+    expected_history = selected_capture.conv_history(0)[0]
+    assert bool(mx.array_equal(actual_history, expected_history))
+
+
+def test_qwen_tree_attention_nodes_and_commit_match_sequential_paths():
+    config = _hf_config()
+    real = Qwen3_5MoeAttention(config, layer_idx=1)
+    _randomize(real, 35)
+    torch.manual_seed(36)
+    hidden = torch.randn(1, 6, HIDDEN)
+    prefix = "model.layers.1"
+    weights = _mx_state(real, f"{prefix}.self_attn")
+    runtime = _runtime_config()
+
+    base = KVCache(2)
+    _full_attention(
+        mx.array(hidden[:, :2].numpy()), weights, prefix, runtime,
+        base, 1, 0)
+    tree = SpeculativeTree(
+        token_ids=(1, 2, 3, 4),
+        depths=(0, 1, 1, 2),
+        parents=(-1, 0, 0, 1),
+        children=({2: 1, 3: 2}, {4: 3}, {}, {}),
+    )
+    proxy = QwenTreeKVProxy(base, tree, 2)
+    tree_outputs = []
+    for node in range(4):
+        proxy.current_node = node
+        tree_outputs.append(_full_attention(
+            mx.array(hidden[:, 2 + node:3 + node].numpy()),
+            weights, prefix, runtime, proxy, 1,
+            base.offset + tree.depths[node],
+        ))
+
+    for node, actual in enumerate(tree_outputs):
+        reference = KVCache(2)
+        reference.keys = list(base.keys)
+        reference.values = list(base.values)
+        expected = None
+        for relative, index in enumerate(tree.path(node)):
+            expected = _full_attention(
+                mx.array(hidden[:, 2 + index:3 + index].numpy()),
+                weights, prefix, runtime, reference, 1,
+                base.offset + relative,
+            )
+        mx.eval(actual, expected)
+        assert bool(mx.array_equal(actual, expected))
+
+    committed = KVCache(2)
+    committed.keys = list(base.keys)
+    committed.values = list(base.values)
+    proxy.commit_attention_path((0, 1, 3), committed)
+    sequential = KVCache(2)
+    sequential.keys = list(base.keys)
+    sequential.values = list(base.values)
+    for relative, index in enumerate((0, 1, 3)):
+        _full_attention(
+            mx.array(hidden[:, 2 + index:3 + index].numpy()),
+            weights, prefix, runtime, sequential, 1,
+            base.offset + relative,
+        )
+    mx.eval(committed.keys[1], committed.values[1],
+            sequential.keys[1], sequential.values[1])
+    assert bool(mx.array_equal(committed.keys[1], sequential.keys[1]))
+    assert bool(mx.array_equal(committed.values[1], sequential.values[1]))
 
 
 def test_gated_full_attention_matches_reference():

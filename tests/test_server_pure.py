@@ -4238,6 +4238,7 @@ def test_engine_manager_wraps_qwen38_with_explicit_dflash2_and_keys_policy(tmp_p
         "VMODEL_QWEN_DFLASH2_NATIVE_MTP_FALLBACK": "1",
         "VMODEL_QWEN_DFLASH2_FALLBACK_MIN_ROUNDS": "5",
         "VMODEL_QWEN_DFLASH2_FALLBACK_MIN_ACCEPTED_PER_ROUND": "1.25",
+        "VMODEL_QWEN_DFLASH2_TREE_BUDGET": "8",
         "VMODEL_QWEN_MTP_SPECULATIVE": "1",
     }
     with patch("runtime.config.ModelConfig.from_dir", return_value=cfg), \
@@ -4265,6 +4266,7 @@ def test_engine_manager_wraps_qwen38_with_explicit_dflash2_and_keys_policy(tmp_p
             "native_mtp_fallback": True,
             "fallback_min_dflash_rounds": 5,
             "fallback_min_accepted_per_round": 1.25,
+            "tree_budget": 8,
         }
         os.environ["VMODEL_QWEN_DFLASH2_PROPOSAL_POLICY"] = "selector"
         second = manager.get(target_path, "fast")

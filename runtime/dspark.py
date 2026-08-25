@@ -1056,6 +1056,11 @@ class DSparkStats:
     kda_factor_restore_s: float = 0.0
     kda_refeed_sweeps: int = 0
     qwen_kda_endpoint_restores: int = 0
+    tree_nodes_verified: int = 0
+    tree_paths_committed: int = 0
+    tree_factor_bytes_peak: int = 0
+    tree_factor_commit_s: float = 0.0
+    tree_rounds: list[tuple[int, int]] = field(default_factory=list)
     expert_prefetch_router_bytes: int = 0
     expert_prefetch_planned_bytes: int = 0
     expert_prefetch_pages: int = 0
@@ -1581,6 +1586,7 @@ class DSparkSpeculativeDecoder:
                     f"{[cache.position_end for cache in ctx_caches]}")
 
             round_draft_s = 0.0
+            tree_draft = None
             if cap > 0:
                 draft_t0 = time.perf_counter()
                 proposed = self._propose(
@@ -1589,7 +1595,19 @@ class DSparkSpeculativeDecoder:
                 )
                 # Preserve the tiny forced-outcome test/probe API used before
                 # stochastic verification existed.
-                if isinstance(proposed, tuple):
+                from .speculative_tree import TreeDraft
+
+                if isinstance(proposed, TreeDraft):
+                    if constraint is not None:
+                        raise ValueError(
+                            "proposal-tree verification does not yet support "
+                            "grammar constraints")
+                    if not sampling.is_greedy:
+                        raise ValueError(
+                            "proposal-tree verification is greedy-only")
+                    tree_draft = proposed
+                    proposals, draft_probabilities = [], None
+                elif isinstance(proposed, tuple):
                     proposals, draft_probabilities = proposed
                 else:
                     proposals, draft_probabilities = proposed, None
@@ -1614,6 +1632,7 @@ class DSparkSpeculativeDecoder:
 
             verify_t0 = time.perf_counter()
             verify_ids = [pending] + proposals
+            tree_verification = None
             round_layer_lengths = (
                 target_kv.layer_lengths()
                 if callable(getattr(target_kv, "layer_lengths", None))
@@ -1626,7 +1645,8 @@ class DSparkSpeculativeDecoder:
             )
             qwen_kda_checkpoint = (
                 target_kv.kda_cache.fork()
-                if (target.cfg.model_type in ("qwen3_5", "qwen3_5_moe")
+                if (tree_draft is None
+                    and target.cfg.model_type in ("qwen3_5", "qwen3_5_moe")
                     and getattr(target_kv, "kda_cache", None) is not None)
                 else None
             )
@@ -1639,7 +1659,18 @@ class DSparkSpeculativeDecoder:
             capture_qwen_endpoints = bool(
                 qwen_kda_checkpoint is not None and len(verify_ids) > 1)
             try:
-                if capture_kda_factors:
+                if tree_draft is not None:
+                    from .qwen35_tree_verify import verify_qwen35_tree
+
+                    tree_verification = verify_qwen35_tree(
+                        target,
+                        tree_draft.tree,
+                        target_kv,
+                        tap_layers=(
+                            taps if round_uses_draft_context else ()),
+                    )
+                    verified = tree_verification.logits
+                elif capture_kda_factors:
                     verified = target.forward_tokens_serial_positions(
                         verify_ids,
                         target_kv,
@@ -1696,7 +1727,20 @@ class DSparkSpeculativeDecoder:
             stats.verify_s += round_verify_s
             stats.target_sweeps += 1
 
-            if constraint is not None:
+            selected_tree_path = None
+            if tree_verification is not None:
+                from .speculative_tree import greedy_tree_walk
+
+                predictions = [int(token) for token in mx.argmax(
+                    verified, axis=-1).reshape(-1).tolist()]
+                selected_tree_path, bonus = greedy_tree_walk(
+                    tree_verification.tree, predictions)
+                accepted = len(selected_tree_path) - 1
+                committed = [
+                    tree_verification.tree.token_ids[index]
+                    for index in selected_tree_path[1:]
+                ] + [bonus]
+            elif constraint is not None:
                 from .qwen35_mtp import _authoritative_target_logits
 
                 accepted = 0
@@ -1777,12 +1821,22 @@ class DSparkSpeculativeDecoder:
                     sampling,
                     ids + emitted,
                 )
-            stats.proposed += len(proposals)
+            round_proposed = (
+                tree_verification.tree.node_count
+                if tree_verification is not None else len(proposals))
+            stats.proposed += round_proposed
             stats.accepted += accepted
-            stats.rounds.append((len(proposals), accepted))
+            stats.rounds.append((round_proposed, accepted))
+            if tree_verification is not None:
+                stats.tree_rounds.append((
+                    max(tree_verification.tree.depths), accepted))
             stats.round_draft_s.append(round_draft_s)
             stats.round_verify_s.append(round_verify_s)
-            self._note_verified_round(len(proposals), accepted)
+            self._note_verified_round(
+                max(tree_verification.tree.depths)
+                if tree_verification is not None else len(proposals),
+                accepted,
+            )
 
             # Only the anchor and accepted proposal prefix are committed input
             # positions.  The target token is the next pending output and has
@@ -1798,15 +1852,33 @@ class DSparkSpeculativeDecoder:
                     planned_emit = index + 1
                     break
             committed_inputs = min(
-                len(verify_ids), 1 + max(0, planned_emit - 1))
+                (len(selected_tree_path)
+                 if selected_tree_path is not None else len(verify_ids)),
+                1 + max(0, planned_emit - 1))
             retain_draft_context = (
                 round_uses_draft_context and self._draft_context_required()
             )
             tapped = (
                 self._tapped_context()[:, :committed_inputs, :]
-                if retain_draft_context else None
+                if retain_draft_context and tree_verification is None else None
             )
-            if qwen_kda_checkpoint is not None:
+            if tree_verification is not None:
+                commit_path = selected_tree_path[:committed_inputs]
+                restore_t0 = time.perf_counter()
+                tree_verification.commit(
+                    commit_path, target=target, kv=target_kv)
+                stats.tree_factor_commit_s += (
+                    time.perf_counter() - restore_t0)
+                stats.tree_nodes_verified += len(
+                    tree_verification.tree.token_ids)
+                stats.tree_paths_committed += 1
+                stats.tree_factor_bytes_peak = max(
+                    stats.tree_factor_bytes_peak,
+                    tree_verification.factors.nbytes(),
+                )
+                if retain_draft_context:
+                    tapped = self._tapped_context()
+            elif qwen_kda_checkpoint is not None:
                 end_lengths = target_kv.layer_lengths()
                 growth = tuple(
                     end - start for start, end in zip(
@@ -1874,6 +1946,16 @@ class DSparkSpeculativeDecoder:
                             replay, target_kv)
                         mx.eval(replay_logits)
                         stats.kda_refeed_sweeps += 1
+            if tree_verification is not None:
+                # The accepted factors have already been replayed into the
+                # target endpoint and the selected tap rows live in `tapped`.
+                # Drop sibling K/V, node hidden rows, logits, and compact
+                # factors before reloading a large draft sidecar for context
+                # maintenance.  Retaining this dead verification graph made
+                # the next 1.08 GB DFlash load miss admission by ~10 MB on a
+                # 16 GB machine.
+                del tree_verification, verified
+                mx.clear_cache()
             ctx_t0 = time.perf_counter()
             if retain_draft_context:
                 self._restore_draft_context(
@@ -2033,6 +2115,15 @@ class DSparkSpeculativeDecoder:
                 "dspark_kda_refeed_sweeps": stats.kda_refeed_sweeps,
                 "dspark_qwen_kda_endpoint_restores": (
                     stats.qwen_kda_endpoint_restores),
+                "dspark_tree_nodes_verified": stats.tree_nodes_verified,
+                "dspark_tree_paths_committed": stats.tree_paths_committed,
+                "dspark_tree_factor_bytes_peak": (
+                    stats.tree_factor_bytes_peak),
+                "dspark_tree_factor_commit_s": stats.tree_factor_commit_s,
+                "dspark_tree_round_depth": [
+                    depth for depth, _accepted in stats.tree_rounds],
+                "dspark_tree_round_accepted": [
+                    accepted for _depth, accepted in stats.tree_rounds],
                 "dspark_target_model_type": (
                     getattr(
                         self._cfg, "target_model_type", "qwen3")),

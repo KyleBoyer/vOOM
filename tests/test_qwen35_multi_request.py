@@ -15,6 +15,7 @@ from runtime.kda_state import KDAStateCache
 from runtime.kv_cache import KVCache, fork_hybrid_kv_endpoint
 from runtime.lm_head_stream import StreamedLMHead
 from runtime.qwen35 import final_logits, run_qwen35_block
+from runtime.qwen35_tree_verify import verify_qwen35_tree
 from runtime.qwen35_multi_request import (
     QwenLayerStationaryRequest,
     QwenLayerStationaryScheduler,
@@ -24,6 +25,7 @@ from runtime.qwen35_multi_request_server import (
     run_qwen_multi_request_batch,
 )
 from runtime.sampler import SamplingParams, sample
+from runtime.speculative_tree import SpeculativeTree
 
 
 HIDDEN = 16
@@ -201,7 +203,8 @@ class _Engine:
         self.head = _array(rng, (VOCAB, HIDDEN), scale=0.1)
         self._iter_expert_batches = None
         self.governor = None
-        self.timer = None
+        self.timer = SimpleNamespace(add=lambda *_args: None)
+        self.prefetcher = None
         self._layer_transient = 0
         self._layer_transient_margin = 0
         self.rc = SimpleNamespace(
@@ -239,6 +242,9 @@ class _Engine:
         return selected
 
     def _select_serial_verify_layer_transient(self, _count, _layer):
+        return 0
+
+    def _prepare_serial_verify_layer_page(self, _layer):
         return 0
 
     def _record_serial_verify_layer_transient(
@@ -310,6 +316,42 @@ def _assert_snapshot_equal(left, right):
                 assert np.array_equal(avalue, evalue)
         else:
             assert np.array_equal(actual, expected)
+
+
+def test_tree_verifier_matches_every_branch_and_commits_selected_path_exactly():
+    engine = _Engine(moe=False)
+    base = engine.new_kv()
+    _serial_advance(engine, 2, base)
+    base_snapshot = _snapshot(base)
+    tree = SpeculativeTree(
+        token_ids=(11, 13, 17, 19),
+        depths=(0, 1, 1, 2),
+        parents=(-1, 0, 0, 1),
+        children=({13: 1, 17: 2}, {19: 3}, {}, {}),
+    )
+
+    engine.cache.reset()
+    verified = verify_qwen35_tree(engine, tree, base)
+    assert engine.cache.get_counts == {"layer.0": 1, "layer.1": 1}
+    _assert_snapshot_equal(_snapshot(base), base_snapshot)
+
+    actual_rows = np.array(verified.logits)
+    assert actual_rows.shape == (4, VOCAB)
+    for node in range(4):
+        reference = fork_hybrid_kv_endpoint(base)
+        expected = None
+        for index in tree.path(node):
+            expected = _serial_advance(
+                engine, tree.token_ids[index], reference)
+        assert np.array_equal(actual_rows[node], np.array(expected))
+
+    selected = (0, 1, 3)
+    reference = fork_hybrid_kv_endpoint(base)
+    for index in selected:
+        _serial_advance(engine, tree.token_ids[index], reference)
+    verified.commit(selected, target=engine, kv=base)
+    _assert_snapshot_equal(_snapshot(base), _snapshot(reference))
+    assert engine._h_window.shape == (1, len(selected), HIDDEN)
 
 
 @pytest.mark.parametrize("moe", [False, True])

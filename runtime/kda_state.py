@@ -191,6 +191,83 @@ class KDAFactorWindow:
                 layer, tuple(steps[count - 1].conv_history))
         return result
 
+    def commit_indices(
+        self,
+        base: "KDAStateCache",
+        indices,
+        *,
+        native_fused: bool = False,
+    ) -> "KDAStateCache":
+        """Commit an arbitrary topological tree path from captured factors.
+
+        A tree verifier captures one state-independent low-rank update per
+        node while using parent-specific recurrent states for logits.  Once
+        the target selects a path, only those node factors are replayed over
+        the immutable prompt endpoint.  This is the compact-state idea used
+        by SpecLA/Bole: storage scales with token factors, not one full state
+        matrix per speculative node and layer.
+        """
+        selected = tuple(int(index) for index in indices)
+        if any(index < 0 or index >= self.positions for index in selected):
+            raise ValueError(
+                f"KDA factor indices {selected} are outside "
+                f"[0, {self.positions})")
+        if any(right <= left for left, right in zip(selected, selected[1:])):
+            raise ValueError("KDA factor indices must be strictly increasing")
+        result = base.fork()
+        for layer, steps in enumerate(self.steps):
+            if not steps or not selected:
+                continue
+            if len(steps) < self.positions:
+                raise ValueError(
+                    f"KDA layer {layer} captured {len(steps)} factors, "
+                    f"needs {self.positions}")
+            state = result.state(layer)
+            if state is None:
+                first = steps[selected[0]]
+                state = mx.zeros((
+                    first.key.shape[0],
+                    first.key.shape[1],
+                    first.key.shape[2],
+                    first.value.shape[2],
+                ), dtype=mx.float32)
+            for index in selected:
+                step = steps[index]
+                if native_fused:
+                    if step.gate.ndim != step.key.ndim:
+                        raise ValueError(
+                            "native KDA factor commit requires a per-key gate")
+                    state = _native_fused_kda_factor_step(
+                        step.gate, step.key, step.value, step.beta, state)
+                elif step.gate.ndim == step.key.ndim:
+                    # Kimi KDA: independent decay for every key channel.
+                    state = state * mx.exp(step.gate)[..., None]
+                    pred_v = mx.sum(
+                        step.key[..., None] * state, axis=-2)
+                    residual = step.value - pred_v
+                    state = state + (
+                        step.beta[..., None] * step.key
+                    )[..., None] * residual[..., None, :]
+                elif step.gate.ndim == step.key.ndim - 1:
+                    # Qwen DeltaNet: one scalar decay per value head. Keep the
+                    # exact released recurrence expression and one-position
+                    # eval boundary used during ordinary decode.
+                    state = state * mx.exp(step.gate)[..., None, None]
+                    predicted = mx.sum(
+                        step.key[..., None] * state, axis=-2)
+                    delta = (
+                        step.value - predicted
+                    ) * step.beta[..., None]
+                    state = state + (
+                        step.key[..., None] * delta[..., None, :])
+                else:
+                    raise ValueError("unsupported KDA factor gate geometry")
+                mx.eval(state)
+            result.set_state(layer, state)
+            result.set_conv_history(
+                layer, tuple(steps[selected[-1]].conv_history))
+        return result
+
 
 class KDAStateCache:
     """Holds one recurrent state + conv history per KDA layer."""
@@ -325,7 +402,7 @@ class KDAStateCache:
             self._reload_layer(layer)
         return self._state[layer]
 
-    def set_state(self, layer: int, state: mx.array) -> None:
+    def set_state(self, layer: int, state: mx.array | None) -> None:
         self._state[layer] = state
 
     def conv_history(self, layer: int) -> tuple | None:
@@ -333,7 +410,7 @@ class KDAStateCache:
             self._reload_layer(layer)
         return self._conv[layer]
 
-    def set_conv_history(self, layer: int, history: tuple) -> None:
+    def set_conv_history(self, layer: int, history: tuple | None) -> None:
         self._conv[layer] = history
 
     def reset(self) -> None:

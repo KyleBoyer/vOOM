@@ -700,6 +700,19 @@ def _gated_delta_net(
     else:
         output, state = _sequential_gated_delta_rule(q, k, v, beta, decay, state)
     if state_cache is not None:
+        if state_cache.factor_capture_active:
+            if length != 1:
+                raise ValueError(
+                    "compact Qwen DeltaNet factor capture requires serial "
+                    "positions")
+            state_cache.capture_factor_step(
+                layer,
+                gate=decay[:, 0],
+                key=k[:, 0],
+                value=v[:, 0],
+                beta=beta[:, 0],
+                conv_history=(new_history,),
+            )
         # Per-layer state eval is a bounded-lazy-graph checkpoint for long
         # prefill sweeps, but at decode (L=1) it is one of ~24 pure GPU sync
         # points per token. The resident hybrid fast path (engine._sweep)

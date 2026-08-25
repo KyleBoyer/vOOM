@@ -142,6 +142,8 @@ def _run_arm(
     native_mtp_fallback: bool,
     fallback_min_rounds: int,
     fallback_min_accepted_per_round: float,
+    tree_budget: int,
+    load_margin_mb: int,
 ) -> dict[str, object]:
     manager = EngineManager()
     wrapper = None
@@ -158,6 +160,7 @@ def _run_arm(
                 max_prompt_tokens=262_144,
                 prompt_cache_min_tokens=0,
                 release_between_sweeps=True,
+                drafter_load_margin_bytes=load_margin_mb * 1_000_000,
                 proposal_policy=proposal_policy,
                 fused_dynamic_conv=fused_dynamic_conv,
                 ablation_direction_dir=ablation_direction,
@@ -166,6 +169,7 @@ def _run_arm(
                 fallback_min_dflash_rounds=fallback_min_rounds,
                 fallback_min_accepted_per_round=(
                     fallback_min_accepted_per_round),
+                tree_budget=tree_budget,
             )
             if force_reject:
                 mask_token = int(wrapper.decoder._cfg.mask_token_id)
@@ -205,6 +209,8 @@ def _run_arm(
                 fallback_min_rounds if mode == "spec" else None),
             "fallback_min_accepted_per_round": (
                 fallback_min_accepted_per_round if mode == "spec" else None),
+            "tree_budget": tree_budget if mode == "spec" else 0,
+            "load_margin_mb": load_margin_mb if mode == "spec" else None,
             "prompt_sha256": hashlib.sha256(prompt.encode()).hexdigest(),
             "max_tokens": max_tokens,
             "cap": cap if mode == "spec" else 0,
@@ -249,6 +255,9 @@ def main() -> int:
     parser.add_argument("--fallback-min-rounds", type=int, default=4)
     parser.add_argument(
         "--fallback-min-accepted-per-round", type=float, default=1.0)
+    parser.add_argument("--tree-budget", type=int, choices=range(0, 9),
+                        default=0)
+    parser.add_argument("--load-margin-mb", type=int, default=400)
     parser.add_argument("--result", type=Path)
     args = parser.parse_args()
     if args.max_tokens < 2:
@@ -257,6 +266,10 @@ def main() -> int:
         parser.error("fallback-min-rounds must be positive")
     if not 0 <= args.fallback_min_accepted_per_round <= 4:
         parser.error("fallback-min-accepted-per-round must be in [0, 4]")
+    if args.force_reject and args.tree_budget:
+        parser.error("force-reject and tree-budget are mutually exclusive")
+    if args.load_margin_mb < 0:
+        parser.error("load-margin-mb must be non-negative")
     target = args.target.expanduser().resolve()
     draft = args.draft.expanduser().resolve()
     if not (target / "config.json").is_file():
@@ -275,7 +288,9 @@ def main() -> int:
             ablation_strength=1.0, native_mtp_fallback=False,
             fallback_min_rounds=args.fallback_min_rounds,
             fallback_min_accepted_per_round=(
-                args.fallback_min_accepted_per_round)))
+                args.fallback_min_accepted_per_round),
+            tree_budget=0,
+            load_margin_mb=args.load_margin_mb))
     if args.mode in ("spec", "compare"):
         arms.append(_run_arm(
             mode="spec", target_path=target, draft_path=draft,
@@ -290,7 +305,9 @@ def main() -> int:
             native_mtp_fallback=args.native_mtp_fallback,
             fallback_min_rounds=args.fallback_min_rounds,
             fallback_min_accepted_per_round=(
-                args.fallback_min_accepted_per_round)))
+                args.fallback_min_accepted_per_round),
+            tree_budget=args.tree_budget,
+            load_margin_mb=args.load_margin_mb))
 
     report: dict[str, object] = {
         "schema": "voom.qwen38-dflash2-gate.v1",

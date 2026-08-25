@@ -16,6 +16,7 @@ from runtime.dspark import (
     DSparkSpeculativeDecoder,
     DSparkTapCollector,
 )
+from runtime.speculative_tree import SpeculativeTree, TreeDraft
 from runtime.dspark_sidecar import build_sidecar
 
 
@@ -373,6 +374,59 @@ def test_qwen_hybrid_dspark_accept_prefix_restores_exact_recurrent_endpoint(
     assert target.endpoint_requests == [endpoint_request]
     assert result["path_stats"]["dspark_qwen_kda_endpoint_restores"] == int(
         fed < width)
+
+
+def test_qwen_tree_round_commits_only_authoritative_branch(monkeypatch):
+    target = _HybridTarget(accepted=0)
+    decoder = DSparkSpeculativeDecoder(
+        target, _HybridDrafter(), max_draft_tokens=2,
+        prompt_cache_min_tokens=0)
+    tree = SpeculativeTree(
+        token_ids=(4, 10, 12, 11),
+        depths=(0, 1, 1, 2),
+        parents=(-1, 0, 0, 1),
+        children=({10: 1, 12: 2}, {11: 3}, {}, {}),
+    )
+    decoder._propose = lambda *_args: TreeDraft(tree)
+
+    class Factors:
+        @staticmethod
+        def nbytes():
+            return 123
+
+    class Verification:
+        def __init__(self):
+            self.tree = tree
+            self.factors = Factors()
+            self.logits = mx.full((4, 16), -100.0)
+            for row, token in enumerate((10, 11, 7, 8)):
+                self.logits[row, token] = 100.0
+
+        def commit(self, path, *, target, kv):
+            assert tuple(path) == (0, 1, 3)
+            kv.offset += len(path)
+            kv.lengths[0] += len(path)
+            kv.kda_cache = target.endpoints[len(path)]
+            target._h_window = mx.zeros((1, len(path), 2))
+            target._h_last = target._h_window[:, -1:, :]
+            target._tap_hidden = {
+                layer: mx.full((1, len(path), 2), layer + 10)
+                for layer in (0, 1)}
+
+    monkeypatch.setattr(
+        "runtime.qwen35_tree_verify.verify_qwen35_tree",
+        lambda *_args, **_kwargs: Verification(),
+    )
+    result = decoder.generate("x", max_tokens=4)
+
+    assert result["tokens"] == [4, 10, 11, 8]
+    assert target.last_kv.offset == 6
+    assert target.endpoint_requests == []
+    assert result["path_stats"]["speculative_proposed"] == 3
+    assert result["path_stats"]["speculative_accepted"] == 2
+    assert result["path_stats"]["dspark_tree_nodes_verified"] == 4
+    assert result["path_stats"]["dspark_tree_paths_committed"] == 1
+    assert result["path_stats"]["dspark_tree_factor_bytes_peak"] == 123
 
 
 def test_qwen_sidecar_is_released_during_target_sweep_then_reloaded():

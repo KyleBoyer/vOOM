@@ -1252,6 +1252,8 @@ class EngineManager:
                 "VMODEL_QWEN_DFLASH2_FALLBACK_MIN_ROUNDS", "4"))
             dflash2_fallback_min_accepted_per_round = float(os.environ.get(
                 "VMODEL_QWEN_DFLASH2_FALLBACK_MIN_ACCEPTED_PER_ROUND", "1"))
+            dflash2_tree_budget = int(os.environ.get(
+                "VMODEL_QWEN_DFLASH2_TREE_BUDGET", "0"))
         except ValueError as error:
             raise RequestValidationError(
                 "VMODEL Qwen MTP/DFlash2 settings must be numeric"
@@ -1322,6 +1324,9 @@ class EngineManager:
         if not 1 <= dflash2_max_draft_tokens <= 4:
             raise RequestValidationError(
                 "VMODEL_QWEN_DFLASH2_MAX_DRAFT_TOKENS must be in [1, 4]")
+        if not 0 <= dflash2_tree_budget <= 8:
+            raise RequestValidationError(
+                "VMODEL_QWEN_DFLASH2_TREE_BUDGET must be in [0, 8]")
         if dflash2_max_prompt_tokens <= 0:
             raise RequestValidationError(
                 "VMODEL_QWEN_DFLASH2_MAX_PROMPT_TOKENS must be positive")
@@ -1727,6 +1732,7 @@ class EngineManager:
             dflash2_native_mtp_fallback_request,
             dflash2_fallback_min_rounds,
             dflash2_fallback_min_accepted_per_round.hex(),
+            dflash2_tree_budget,
             qwen_mtp_request,
             qwen_mtp_ngram_first_request,
             qwen_mtp_max_prompt_tokens,
@@ -1815,6 +1821,7 @@ class EngineManager:
             dflash2_native_mtp_fallback_request,
             dflash2_fallback_min_rounds,
             dflash2_fallback_min_accepted_per_round.hex(),
+            dflash2_tree_budget,
             qwen_mtp_request,
             qwen_mtp_ngram_first_request,
             qwen_mtp_max_prompt_tokens,
@@ -4350,6 +4357,7 @@ class EngineManager:
                             dflash2_fallback_min_rounds),
                         fallback_min_accepted_per_round=(
                             dflash2_fallback_min_accepted_per_round),
+                        tree_budget=dflash2_tree_budget,
                     )
                     print(
                         f"[server] target-verified DFlash2 speculation: "
@@ -4369,6 +4377,7 @@ class EngineManager:
                         f"{dflash2_fallback_min_rounds} "
                         f"fallback_min_accepts="
                         f"{dflash2_fallback_min_accepted_per_round:g} "
+                        f"tree_budget={dflash2_tree_budget} "
                         f"load_margin={dflash2_load_margin_mb}MB",
                         flush=True,
                     )

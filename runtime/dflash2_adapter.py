@@ -560,6 +560,8 @@ class DFlash2Drafter(nn.Module):
         # this adds no target sweep or additional model projection.
         self._last_candidate_ids: list[list[int]] = []
         self._last_unary_tokens: list[int] = []
+        self._last_tree_candidate_ids: list[list[int]] = []
+        self._last_tree_candidate_log_probabilities: list[list[float]] = []
         self._ablation_direction: mx.array | None = None
 
     @classmethod
@@ -710,16 +712,41 @@ class DFlash2Drafter(nn.Module):
             mx.array([pending_token]),
             0.0 if sampling.is_greedy else float(sampling.temperature),
         )
+        # A chain consumes the selector's parent-conditioned winner.  A tree
+        # instead needs a stable marginal ordering at every depth so it can
+        # spend its small target-node budget across alternatives.  Sort the
+        # already-computed top-k LM-head candidates; this adds no vocabulary
+        # projection and keeps the target authoritative.
+        candidate_logits = mx.take_along_axis(logits, candidates, axis=-1)
+        candidate_order = mx.argsort(-candidate_logits, axis=-1)
+        tree_candidates = mx.take_along_axis(
+            candidates, candidate_order, axis=-1)
+        tree_logits = mx.take_along_axis(
+            candidate_logits, candidate_order, axis=-1)
+        tree_log_probabilities = mx.log(mx.softmax(
+            tree_logits.astype(mx.float32), axis=-1, precise=True))
         if sparse_q is None:
-            mx.eval(proposals, candidates, unary_proposals)
+            mx.eval(
+                proposals, candidates, unary_proposals,
+                tree_candidates, tree_log_probabilities)
         else:
-            mx.eval(proposals, candidates, sparse_q, unary_proposals)
+            mx.eval(
+                proposals, candidates, sparse_q, unary_proposals,
+                tree_candidates, tree_log_probabilities)
         self._last_candidate_ids = [
             [int(token) for token in row]
             for row in candidates[0].tolist()
         ]
         self._last_unary_tokens = [
             int(token) for token in unary_proposals[0].tolist()
+        ]
+        self._last_tree_candidate_ids = [
+            [int(token) for token in row]
+            for row in tree_candidates[0].tolist()
+        ]
+        self._last_tree_candidate_log_probabilities = [
+            [float(value) for value in row]
+            for row in tree_log_probabilities[0].tolist()
         ]
         if proposal_policy == "unary":
             proposals = unary_proposals
@@ -751,6 +778,7 @@ class DFlash2SpeculativeDecoder(DSparkSpeculativeDecoder):
         native_mtp_fallback: bool = False,
         fallback_min_dflash_rounds: int = 4,
         fallback_min_accepted_per_round: float = 1.0,
+        tree_budget: int = 0,
     ):
         if max_draft_tokens > MAX_QUANTIZED_PROPOSALS:
             raise ValueError(
@@ -767,11 +795,15 @@ class DFlash2SpeculativeDecoder(DSparkSpeculativeDecoder):
                 or not 0.0 <= fallback_min_accepted_per_round <= 4.0):
             raise ValueError(
                 "DFlash2 fallback acceptance threshold must be in [0, 4]")
+        if (isinstance(tree_budget, bool) or not isinstance(tree_budget, int)
+                or not 0 <= tree_budget <= 8):
+            raise ValueError("DFlash2 tree budget must be in [0, 8]")
         self.proposal_policy = proposal_policy
         self.native_mtp_fallback = bool(native_mtp_fallback)
         self.fallback_min_dflash_rounds = int(fallback_min_dflash_rounds)
         self.fallback_min_accepted_per_round = float(
             fallback_min_accepted_per_round)
+        self.tree_budget = int(tree_budget)
         super().__init__(
             target,
             drafter,
@@ -1025,6 +1057,22 @@ class DFlash2SpeculativeDecoder(DSparkSpeculativeDecoder):
             self._ensure_drafter()._last_unary_tokens))
         self._round_source = "D"
         self._proposal_sources.append("D")
+        if self.tree_budget:
+            if not sampling.is_greedy:
+                raise ValueError("DFlash2 proposal trees are greedy-only")
+            from .speculative_tree import TreeDraft, build_tree_from_topk
+
+            drafter = self._ensure_drafter()
+            tree = build_tree_from_topk(
+                root_token=pending,
+                top_token_ids=np.asarray(
+                    drafter._last_tree_candidate_ids, dtype=np.int64),
+                top_log_probabilities=np.asarray(
+                    drafter._last_tree_candidate_log_probabilities,
+                    dtype=np.float32),
+                budget=self.tree_budget,
+            )
+            return TreeDraft(tree)
         return proposals, distributions
 
     def generate(self, *args, **kwargs):
@@ -1058,10 +1106,13 @@ class DFlash2SpeculativeDecoder(DSparkSpeculativeDecoder):
         stats = result.get("stats")
         rounds = list(getattr(stats, "rounds", ()))
         if kwargs.get("sampling") is None or kwargs["sampling"].is_greedy:
+            recall_rounds = (
+                list(getattr(stats, "tree_rounds", ()))
+                if self.tree_budget else rounds)
             candidate_positions, candidate_hits = greedy_candidate_recall(
-                emitted, rounds, self._candidate_rounds)
+                emitted, recall_rounds, self._candidate_rounds)
             unary_positions, unary_hits = greedy_candidate_recall(
-                emitted, rounds,
+                emitted, recall_rounds,
                 [[[token] for token in row] for row in self._unary_rounds])
         result.setdefault("path_stats", {}).update({
             "speculative_kind": "dflash2",
@@ -1071,6 +1122,8 @@ class DFlash2SpeculativeDecoder(DSparkSpeculativeDecoder):
             "dflash2_selector_top_k": self._cfg.selector_top_k,
             "dflash2_context_window_tokens": self.context_window_tokens,
             "dflash2_target_verifier": "dspark-qwen-authoritative",
+            "dflash2_tree_budget": self.tree_budget,
+            "dflash2_tree_verifier": int(self.tree_budget > 0),
             "dflash2_proposal_policy": self.proposal_policy,
             "dflash2_fused_dynamic_conv": int(
                 self._cfg.fused_dynamic_conv),
@@ -1139,6 +1192,7 @@ class DFlash2SpeculativeEngine:
         native_mtp_fallback: bool = False,
         fallback_min_dflash_rounds: int = 4,
         fallback_min_accepted_per_round: float = 1.0,
+        tree_budget: int = 0,
     ):
         if max_prompt_tokens <= 0:
             raise ValueError("DFlash2 max_prompt_tokens must be positive")
@@ -1194,7 +1248,10 @@ class DFlash2SpeculativeEngine:
 
         if target.governor is not None:
             target.governor.reserve(
-                draft_bytes, reason="dflash2-sidecar-initial-load")
+                draft_bytes,
+                margin=drafter_load_margin_bytes,
+                reason="dflash2-sidecar-initial-load",
+            )
         drafter = bind(DFlash2Drafter.load(
             draft_dir,
             verify_hash=verify_sidecar_hash,
@@ -1216,6 +1273,7 @@ class DFlash2SpeculativeEngine:
             fallback_min_dflash_rounds=fallback_min_dflash_rounds,
             fallback_min_accepted_per_round=(
                 fallback_min_accepted_per_round),
+            tree_budget=tree_budget,
         )
         self._speculative_k = self.decoder.max_draft_tokens
         self._speculative_draft_dir = draft_dir
