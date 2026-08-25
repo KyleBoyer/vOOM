@@ -688,6 +688,26 @@ def _flat_top_k_draft_probabilities(
 
 class QwenMTPDrafter:
     _RELEASED_BF16_CACHE_KEY = "qwen35_mtp:released-bf16"
+    _PACKED_MXFP4_CACHE_KEY = "qwen35_mtp:proposal-mxfp4-q4-g32"
+    _PACKED_MATRIX_NAMES = frozenset({
+        "mtp.fc.weight",
+        "mtp.layers.0.mlp.down_proj.weight",
+        "mtp.layers.0.mlp.gate_proj.weight",
+        "mtp.layers.0.mlp.up_proj.weight",
+        "mtp.layers.0.self_attn.k_proj.weight",
+        "mtp.layers.0.self_attn.o_proj.weight",
+        "mtp.layers.0.self_attn.q_proj.weight",
+        "mtp.layers.0.self_attn.v_proj.weight",
+    })
+    _PACKED_NORM_NAMES = frozenset({
+        "mtp.layers.0.input_layernorm.weight",
+        "mtp.layers.0.post_attention_layernorm.weight",
+        "mtp.layers.0.self_attn.k_norm.weight",
+        "mtp.layers.0.self_attn.q_norm.weight",
+        "mtp.norm.weight",
+        "mtp.pre_fc_norm_embedding.weight",
+        "mtp.pre_fc_norm_hidden.weight",
+    })
 
     def __init__(self, engine):
         self.engine = engine
@@ -704,21 +724,36 @@ class QwenMTPDrafter:
         self._page_names = [n for n in names if ".mlp.experts." not in n]
         self.last_cache_prepare_bytes = 0
         self.last_cache_prepare_released_bytes = 0
+        if getattr(engine.store, "mtplx_mtp_sidecar", None):
+            self.request_weight_representation = "released-bf16"
+        else:
+            self.request_weight_representation = (
+                getattr(engine.store, "mtp_proposal_representation", None)
+                or "demand-cache")
 
-    def _weights(self, *, released_bf16: bool = False) -> dict:
+    def _weights(self, *, representation: str = "demand-cache") -> dict:
         # Representation is part of the cache identity.  MTPLX replaces the
         # all-MXFP4 artifact's original draft block with an explicitly indexed
         # released-BF16 sidecar; it must neither hit an earlier transformed
         # page nor be admitted under the generic key for later transformed
         # callers.  WeightStore independently makes the sidecar authoritative
         # over stale raw-fast-tier entries with the same logical names.
-        key = (
-            self._RELEASED_BF16_CACHE_KEY
-            if released_bf16 else "qwen35_mtp")
+        if representation == "released-bf16":
+            key = self._RELEASED_BF16_CACHE_KEY
+            apply_transform = False
+        elif representation == "mxfp4-q4-g32":
+            key = self._PACKED_MXFP4_CACHE_KEY
+            apply_transform = True
+        elif representation == "demand-cache":
+            key = "qwen35_mtp"
+            apply_transform = True
+        else:
+            raise ValueError(
+                f"unsupported Qwen MTP request representation: {representation}")
         return self.engine.cache.get(
             key,
             self._page_names,
-            apply_transform=not released_bf16,
+            apply_transform=apply_transform,
         )
 
     def prepare_request_weights(self) -> dict | None:
@@ -731,15 +766,28 @@ class QwenMTPDrafter:
         to overlap the whole BF16 sidecar.  Raw BF16 checkpoints and ordinary
         all-quantized artifacts deliberately stay on the existing demand path.
         """
-        if not getattr(self.engine.store, "mtplx_mtp_sidecar", None):
+        representation = self.request_weight_representation
+        if representation == "demand-cache":
             return None
-        layout = getattr(
-            self.engine.store, "_mtplx_mtp_sidecar_layout", {})
-        expected_resident = sum(
-            int(layout[name][2])
-            for name in self._page_names
-            if name in layout
-        )
+        if representation == "released-bf16":
+            layout = getattr(
+                self.engine.store, "_mtplx_mtp_sidecar_layout", {})
+            expected_resident = sum(
+                int(layout[name][2])
+                for name in self._page_names
+                if name in layout
+            )
+        elif representation == "mxfp4-q4-g32":
+            expected_resident = int(
+                self.engine.store.mlx_quantized_resident_bytes(
+                    self._page_names))
+            if expected_resident <= 0:
+                raise ValueError(
+                    "packed Qwen MTP proposal page has incomplete physical "
+                    "weight metadata")
+        else:
+            raise ValueError(
+                f"unsupported Qwen MTP request representation: {representation}")
         self.last_cache_prepare_bytes = expected_resident
         cache_before = int(getattr(self.engine.cache, "total_bytes", 0))
         prepare_for = getattr(self.engine.cache, "prepare_for", None)
@@ -755,18 +803,44 @@ class QwenMTPDrafter:
             cache_before - int(getattr(
                 self.engine.cache, "total_bytes", cache_before)),
         )
-        weights = self._weights(released_bf16=True)
+        weights = self._weights(representation=representation)
         try:
-            non_bf16 = [
-                f"{name}:{getattr(value, 'dtype', type(value).__name__)}"
-                for name, value in weights.items()
-                if not isinstance(value, mx.array) or value.dtype != mx.bfloat16
-            ]
-            if non_bf16:
-                raise ValueError(
-                    "MTPLX request weights must be plain released BF16 arrays, "
-                    f"found {non_bf16[:3]}")
-            mx.eval(*weights.values())
+            if representation == "released-bf16":
+                invalid = [
+                    f"{name}:{getattr(value, 'dtype', type(value).__name__)}"
+                    for name, value in weights.items()
+                    if (not isinstance(value, mx.array)
+                        or value.dtype != mx.bfloat16)
+                ]
+                if invalid:
+                    raise ValueError(
+                        "MTPLX request weights must be plain released BF16 "
+                        f"arrays, found {invalid[:3]}")
+            else:
+                matrices = [weights.get(name) for name in sorted(
+                    self._PACKED_MATRIX_NAMES)]
+                norms = [weights.get(name) for name in sorted(
+                    self._PACKED_NORM_NAMES)]
+                if (
+                    len(matrices) != 8
+                    or any(not isinstance(value, quant.QTensor)
+                           for value in matrices)
+                    or len(norms) != 7
+                    or any(not isinstance(value, mx.array)
+                           or value.dtype != mx.bfloat16 for value in norms)
+                ):
+                    raise ValueError(
+                        "packed Qwen MTP proposal page must contain eight "
+                        "MXFP4 matrices and seven BF16 norms")
+            eval_values = []
+            for value in weights.values():
+                if isinstance(value, quant.QTensor):
+                    eval_values.extend((value.wq, value.scales))
+                    if value.biases is not None:
+                        eval_values.append(value.biases)
+                else:
+                    eval_values.append(value)
+            mx.eval(*eval_values)
             return weights
         except BaseException:
             # A malformed/cancelled load must not strand the large sidecar in
@@ -787,9 +861,12 @@ class QwenMTPDrafter:
             int(getattr(value, "nbytes", 0)) for value in weights.values())
         weights.clear()
         discarded = False
+        key = (
+            self._RELEASED_BF16_CACHE_KEY
+            if self.request_weight_representation == "released-bf16"
+            else self._PACKED_MXFP4_CACHE_KEY)
         try:
-            discarded = self.engine.cache.discard(
-                self._RELEASED_BF16_CACHE_KEY, self._page_names)
+            discarded = self.engine.cache.discard(key, self._page_names)
         finally:
             mx.clear_cache()
         return {
@@ -969,8 +1046,13 @@ class QwenMTPSpeculativeEngine:
         self.ngram_min_ngram = int(ngram_min_ngram)
         self.ngram_max_ngram = int(ngram_max_ngram)
         self.ngram_max_draft_tokens = int(ngram_max_draft_tokens)
+        weight_identity = self.drafter.request_weight_representation
         self.mtp_engine_identity = (
             f"qwen-mtp-depth{self.depth}-{self.proposal_q_policy.name}"
+            + (
+                f"-weights-{weight_identity}"
+                if weight_identity != "demand-cache" else ""
+            )
             + (
                 f"-ngram-first-k{self.ngram_max_draft_tokens}"
                 if self.ngram_first else ""
@@ -1073,9 +1155,15 @@ class QwenMTPSpeculativeEngine:
             bootstrap_kwargs["constraint"] = constraint
         bootstrap = bootstrap_generate(prompt, 1, **bootstrap_kwargs)
         bootstrap_stats = dict(bootstrap.get("path_stats") or {})
+        request_weight_representation = str(getattr(
+            # Legacy/custom drafters with a prepare/release API represented
+            # the released BF16 sidecar before this field existed.
+            self.drafter, "request_weight_representation", "released-bf16"))
         bootstrap_stats.update({
             "qwen_mtp_enabled": 1,
             "qwen_mtp_used": 0,
+            "qwen_mtp_proposal_weight_representation": (
+                request_weight_representation),
             "qwen_mtp_ngram_first_enabled": int(self.ngram_first),
             "qwen_mtp_ngram_first_eligible": int(
                 self.ngram_first and sampling.is_greedy),
@@ -2107,28 +2195,69 @@ class QwenMTPSpeculativeEngine:
             "qwen_mtp_grammar_forced_tokens": grammar_forced_tokens,
             "qwen_mtp_grammar_forced_sweeps": grammar_forced_sweeps,
             "qwen_mtp_round_outcomes": "".join(round_outcomes),
-            # Backward-compatible endpoint fields: the sidecar is no longer
-            # request-pinned and no round-local bytes remain at return.
+            # Representation-neutral round-page counters.  They describe the
+            # actual proposal page (released BF16 or packed MXFP4) without
+            # falsely labeling quantized proposal I/O as BF16 sidecar I/O.
+            "qwen_mtp_proposal_weight_representation": (
+                request_weight_representation),
+            "qwen_mtp_proposal_page_round_loads": sidecar_round_loads,
+            "qwen_mtp_proposal_page_round_releases": sidecar_round_releases,
+            "qwen_mtp_proposal_page_read_bytes": sidecar_read_bytes,
+            "qwen_mtp_proposal_page_loaded_resident_bytes": (
+                sidecar_loaded_resident_bytes),
+            "qwen_mtp_proposal_page_released_resident_bytes": (
+                sidecar_released_resident_bytes),
+            "qwen_mtp_proposal_page_peak_resident_bytes": (
+                sidecar_peak_resident_bytes),
+            "qwen_mtp_proposal_page_cache_discards": sidecar_cache_discards,
+            "qwen_mtp_proposal_page_cache_prepare_calls": (
+                sidecar_cache_prepare_calls),
+            "qwen_mtp_proposal_page_cache_prepare_bytes": (
+                sidecar_cache_prepare_bytes),
+            "qwen_mtp_proposal_page_cache_prepare_released_bytes": (
+                sidecar_cache_prepare_released_bytes),
+            "qwen_mtp_proposal_page_load_s": sidecar_load_s,
+            "qwen_mtp_proposal_page_release_s": sidecar_release_s,
+            # Backward-compatible BF16-only endpoint fields: the sidecar is no
+            # longer request-pinned and no round-local bytes remain at return.
             "qwen_mtp_request_local_sidecar_pin": 0,
             "qwen_mtp_request_local_sidecar_bytes": 0,
-            "qwen_mtp_bf16_sidecar_round_loads": sidecar_round_loads,
-            "qwen_mtp_bf16_sidecar_round_releases": sidecar_round_releases,
-            "qwen_mtp_bf16_sidecar_read_bytes": sidecar_read_bytes,
+            "qwen_mtp_bf16_sidecar_round_loads": (
+                sidecar_round_loads
+                if request_weight_representation == "released-bf16" else 0),
+            "qwen_mtp_bf16_sidecar_round_releases": (
+                sidecar_round_releases
+                if request_weight_representation == "released-bf16" else 0),
+            "qwen_mtp_bf16_sidecar_read_bytes": (
+                sidecar_read_bytes
+                if request_weight_representation == "released-bf16" else 0),
             "qwen_mtp_bf16_sidecar_loaded_resident_bytes": (
-                sidecar_loaded_resident_bytes),
+                sidecar_loaded_resident_bytes
+                if request_weight_representation == "released-bf16" else 0),
             "qwen_mtp_bf16_sidecar_released_resident_bytes": (
-                sidecar_released_resident_bytes),
+                sidecar_released_resident_bytes
+                if request_weight_representation == "released-bf16" else 0),
             "qwen_mtp_bf16_sidecar_peak_resident_bytes": (
-                sidecar_peak_resident_bytes),
-            "qwen_mtp_bf16_sidecar_cache_discards": sidecar_cache_discards,
+                sidecar_peak_resident_bytes
+                if request_weight_representation == "released-bf16" else 0),
+            "qwen_mtp_bf16_sidecar_cache_discards": (
+                sidecar_cache_discards
+                if request_weight_representation == "released-bf16" else 0),
             "qwen_mtp_bf16_sidecar_cache_prepare_calls": (
-                sidecar_cache_prepare_calls),
+                sidecar_cache_prepare_calls
+                if request_weight_representation == "released-bf16" else 0),
             "qwen_mtp_bf16_sidecar_cache_prepare_bytes": (
-                sidecar_cache_prepare_bytes),
+                sidecar_cache_prepare_bytes
+                if request_weight_representation == "released-bf16" else 0),
             "qwen_mtp_bf16_sidecar_cache_prepare_released_bytes": (
-                sidecar_cache_prepare_released_bytes),
-            "qwen_mtp_bf16_sidecar_load_s": sidecar_load_s,
-            "qwen_mtp_bf16_sidecar_release_s": sidecar_release_s,
+                sidecar_cache_prepare_released_bytes
+                if request_weight_representation == "released-bf16" else 0),
+            "qwen_mtp_bf16_sidecar_load_s": (
+                sidecar_load_s
+                if request_weight_representation == "released-bf16" else 0.0),
+            "qwen_mtp_bf16_sidecar_release_s": (
+                sidecar_release_s
+                if request_weight_representation == "released-bf16" else 0.0),
         })
         if self.proposal_replay_top_k:
             path_stats["qwen_mtp_proposal_q_replay"] = (

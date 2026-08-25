@@ -5,6 +5,7 @@ they never create model tensors or dispatch Metal work.
 """
 
 from types import SimpleNamespace
+import inspect
 
 import pytest
 
@@ -154,3 +155,17 @@ def test_serial_verifier_refuses_before_fetch_and_cache_hit_skips_admission():
     hit = _admission_engine(hit_events, hit=True)
     assert StreamingEngine._prepare_serial_verify_layer_page(hit, 4) == 0
     assert hit_events == [("contains", "layer.4")]
+
+
+def test_serial_verifier_schedules_future_pages_after_current_admission():
+    """Future speculative I/O must not inflate the current-page proof."""
+    from runtime.engine import StreamingEngine
+
+    source = inspect.getsource(
+        StreamingEngine.forward_tokens_serial_positions)
+    loop = source.index("for layer in range(n):")
+    current_admission = source.index(
+        "self._prepare_serial_verify_layer_page(layer)", loop)
+    current_fetch = source.index("weights = self.cache.get(", current_admission)
+    future_schedule = source.index("self.prefetcher.schedule(", current_fetch)
+    assert loop < current_admission < current_fetch < future_schedule

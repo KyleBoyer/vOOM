@@ -293,6 +293,10 @@ class WeightStore:
         self._mtplx_mtp_sidecar_sha256: str | None = None
         self._mtplx_mtp_sidecar_layout: dict[str, tuple[str, tuple[int, ...], int]] = {}
         self._mtplx_mtp_exact_fast_names: frozenset[str] = frozenset()
+        # Optional proposal-only representation marker.  It never changes the
+        # served target body; Qwen's MTP adapter uses it solely to give a
+        # validated packed draft page a round-local cache identity/lifetime.
+        self.mtp_proposal_representation: str | None = None
         self.config = ModelConfig.from_dir(self.dir)
         raw_config = json.loads(_read_text_retry(self.dir / "config.json"))
         text_config = raw_config.get("text_config", {})
@@ -369,7 +373,19 @@ class WeightStore:
                 if not isinstance(index_metadata, dict):
                     raise ValueError(
                         "model.safetensors.index.json metadata must be an object")
+                proposal_representation = index_metadata.get(
+                    "vmodel_mtp_proposal_representation")
+                if proposal_representation is not None:
+                    if proposal_representation != "mxfp4-q4-g32":
+                        raise ValueError(
+                            "unsupported Qwen MTP proposal representation: "
+                            f"{proposal_representation!r}")
+                    self.mtp_proposal_representation = proposal_representation
                 sidecar = index_metadata.get("mtplx_mtp_sidecar")
+                if sidecar is not None and proposal_representation is not None:
+                    raise ValueError(
+                        "Qwen MTP checkpoint cannot select both a released "
+                        "BF16 sidecar and a packed proposal representation")
                 if sidecar is not None:
                     if not (
                         isinstance(sidecar, str)
@@ -1418,14 +1434,42 @@ class WeightStore:
             mtp_manifest_path = candidate / "mtp-bf16-fast.manifest.json"
             if not (manifest_path.is_file() or mtp_manifest_path.is_file()):
                 continue
-            manifest = (
-                json.loads(manifest_path.read_text())
-                if manifest_path.is_file() else {})
+            manifest_bytes = (
+                manifest_path.read_bytes() if manifest_path.is_file() else b"{}")
+            manifest = json.loads(manifest_bytes)
             if not isinstance(manifest, dict):
                 raise ValueError("raw fast-tier manifest must be an object")
+            if self.mtp_proposal_representation is not None:
+                alias_path = candidate / "mtp-quant-fast-alias.manifest.json"
+                try:
+                    alias_bytes = alias_path.read_bytes()
+                    alias = json.loads(alias_bytes)
+                    target_index_bytes = (
+                        self.dir / "model.safetensors.index.json").read_bytes()
+                    clone_manifest_bytes = (
+                        self.dir / "mtp-quant-clone.manifest.json").read_bytes()
+                    clone_manifest = json.loads(clone_manifest_bytes)
+                except (OSError, ValueError) as error:
+                    raise ValueError(
+                        "packed Qwen MTP fast tier lacks a bound alias manifest"
+                    ) from error
+                if not (
+                    isinstance(alias, dict)
+                    and alias.get("schema")
+                    == "voom.qwen-mtp-quant-fast-alias.v1"
+                    and alias.get("target_model") == self.dir.name
+                    and alias.get("target_index_sha256")
+                    == hashlib.sha256(target_index_bytes).hexdigest()
+                    and alias.get("target_clone_manifest_sha256")
+                    == hashlib.sha256(clone_manifest_bytes).hexdigest()
+                    and alias.get("source_manifest_sha256")
+                    == hashlib.sha256(manifest_bytes).hexdigest()
+                    and alias.get("target_body_mapping_sha256")
+                    == clone_manifest.get("target_body_mapping_sha256")
+                ):
+                    raise ValueError(
+                        "packed Qwen MTP fast-tier alias identity mismatch")
             if mtp_manifest_path.is_file():
-                import hashlib
-
                 mtp_manifest = json.loads(mtp_manifest_path.read_text())
                 if (
                     mtp_manifest.get("schema")

@@ -191,6 +191,12 @@ def test_vision_protocol_timing_exposes_qwen_mtp_round_trace():
             "qwen_mtp_round_outcomes": "AARRA",
             "qwen_mtp_depth": 2,
             "qwen_mtp_max_verify_width_observed": 5,
+            "qwen_mtp_proposal_weight_representation": "mxfp4-q4-g32",
+            "qwen_mtp_proposal_page_round_loads": 3,
+            "qwen_mtp_proposal_page_round_releases": 3,
+            "qwen_mtp_proposal_page_read_bytes": 5678,
+            "qwen_mtp_proposal_page_load_s": 0.125,
+            "qwen_mtp_proposal_page_release_s": 0.025,
             "qwen_mtp_bf16_sidecar_round_loads": 3,
             "qwen_mtp_bf16_sidecar_round_releases": 3,
             "qwen_mtp_bf16_sidecar_read_bytes": 1234,
@@ -234,6 +240,12 @@ def test_vision_protocol_timing_exposes_qwen_mtp_round_trace():
     assert timing["qwen_mtp_round_outcomes"] == "AARRA"
     assert timing["qwen_mtp_depth"] == 2
     assert timing["qwen_mtp_max_verify_width_observed"] == 5
+    assert timing["qwen_mtp_proposal_weight_representation"] == "mxfp4-q4-g32"
+    assert timing["qwen_mtp_proposal_page_round_loads"] == 3
+    assert timing["qwen_mtp_proposal_page_round_releases"] == 3
+    assert timing["qwen_mtp_proposal_page_read_bytes"] == 5678
+    assert timing["qwen_mtp_proposal_page_load_s"] == 0.125
+    assert timing["qwen_mtp_proposal_page_release_s"] == 0.025
     assert timing["qwen_mtp_bf16_sidecar_round_loads"] == 3
     assert timing["qwen_mtp_bf16_sidecar_round_releases"] == 3
     assert timing["qwen_mtp_bf16_sidecar_read_bytes"] == 1234

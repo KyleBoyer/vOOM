@@ -7265,12 +7265,6 @@ class StreamingEngine:
                     int(getattr(
                         self, "_dspark_expert_prefetch_depth", 0)),
                 )
-            if self.prefetcher:
-                for nxt in range(
-                        layer + 1,
-                        min(layer + 1 + self.rc.prefetch_depth, n)):
-                    self.prefetcher.schedule(
-                        self._layer_key(nxt), self._layer_names(nxt))
             self._prepare_serial_verify_layer_page(layer)
             t0 = time.perf_counter()
             weights = self.cache.get(
@@ -7281,6 +7275,20 @@ class StreamingEngine:
                     self._layer_transient,
                     margin=self._layer_transient_margin,
                     reason="serial-verify-transient")
+            # Schedule future I/O only after the current demand page and its
+            # compute transient have passed live admission.  Scheduling two
+            # ~203 MB Huihui pages first made the current reservation inherit
+            # their speculative allocations under tight headroom, repeatedly
+            # collapsing the cache and pausing the prefetcher.  This ordering
+            # still overlaps next-layer reads with all current-layer compute;
+            # it merely prevents future work from invalidating the admission
+            # proof for the work that must run now.
+            if self.prefetcher:
+                for nxt in range(
+                        layer + 1,
+                        min(layer + 1 + self.rc.prefetch_depth, n)):
+                    self.prefetcher.schedule(
+                        self._layer_key(nxt), self._layer_names(nxt))
 
             active_before = mx.get_active_memory()
             mx.reset_peak_memory()

@@ -450,6 +450,21 @@ def _preferred_fast_artifact(source: Path) -> Path:
     if _is_voom_lossy_checkpoint(source):
         return source
     for candidate in _derived_artifacts_for(source):
+        proposal_manifest = candidate / "mtp-quant-clone.manifest.json"
+        if proposal_manifest.exists():
+            try:
+                proposal_record = json.loads(proposal_manifest.read_text())
+            except (OSError, ValueError):
+                # A malformed experiment marker must never become the generic
+                # `lossy-<released-name>` selection by directory sort order.
+                continue
+            if (
+                not isinstance(proposal_record, dict)
+                or proposal_record.get("schema")
+                != "voom.qwen-mtp-quant-clone.v1"
+                or proposal_record.get("enabled_by_default") is not True
+            ):
+                continue
         try:
             config = json.loads((candidate / "config.json").read_text())
         except (OSError, ValueError):
@@ -8093,6 +8108,16 @@ def _vision_protocol_timing(result: dict) -> dict:
         "qwen_mtp_native_draft_rejected",
         "qwen_mtp_request_local_sidecar_pin",
         "qwen_mtp_request_local_sidecar_bytes",
+        "qwen_mtp_proposal_page_round_loads",
+        "qwen_mtp_proposal_page_round_releases",
+        "qwen_mtp_proposal_page_read_bytes",
+        "qwen_mtp_proposal_page_loaded_resident_bytes",
+        "qwen_mtp_proposal_page_released_resident_bytes",
+        "qwen_mtp_proposal_page_peak_resident_bytes",
+        "qwen_mtp_proposal_page_cache_discards",
+        "qwen_mtp_proposal_page_cache_prepare_calls",
+        "qwen_mtp_proposal_page_cache_prepare_bytes",
+        "qwen_mtp_proposal_page_cache_prepare_released_bytes",
         "qwen_mtp_bf16_sidecar_round_loads",
         "qwen_mtp_bf16_sidecar_round_releases",
         "qwen_mtp_bf16_sidecar_read_bytes",
@@ -8160,6 +8185,8 @@ def _vision_protocol_timing(result: dict) -> dict:
         "qwen_mtp_plain_round_s",
         "qwen_mtp_estimated_net_saved_s",
         "qwen_mtp_estimated_break_even_accept_rate",
+        "qwen_mtp_proposal_page_load_s",
+        "qwen_mtp_proposal_page_release_s",
         "qwen_mtp_bf16_sidecar_load_s",
         "qwen_mtp_bf16_sidecar_release_s",
         "reranked_lm_head_candidate_recall",
@@ -8181,6 +8208,7 @@ def _vision_protocol_timing(result: dict) -> dict:
     for key in (
         "qwen_mtp_round_outcomes",
         "qwen_mtp_proposal_sources",
+        "qwen_mtp_proposal_weight_representation",
         "speculative_kind",
         "dflash2_proposal_policy",
         "dflash2_target_verifier",

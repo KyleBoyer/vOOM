@@ -4,6 +4,7 @@ import hashlib
 import json
 
 import mlx.core as mx
+import pytest
 
 from runtime import quant
 from runtime.model_loader import WeightStore
@@ -163,3 +164,82 @@ def test_drafter_release_clears_caller_mapping_and_representation_page(tmp_path)
         "cache_discarded": 1,
     }
     assert not cache.contains("qwen35_mtp:released-bf16")
+
+
+def _write_packed_mtp(tmp_path):
+    model = tmp_path / "packed-model"
+    model.mkdir()
+    matrices = (
+        "mtp.fc.weight",
+        "mtp.layers.0.mlp.down_proj.weight",
+        "mtp.layers.0.mlp.gate_proj.weight",
+        "mtp.layers.0.mlp.up_proj.weight",
+        "mtp.layers.0.self_attn.k_proj.weight",
+        "mtp.layers.0.self_attn.o_proj.weight",
+        "mtp.layers.0.self_attn.q_proj.weight",
+        "mtp.layers.0.self_attn.v_proj.weight",
+    )
+    norms = (
+        "mtp.layers.0.input_layernorm.weight",
+        "mtp.layers.0.post_attention_layernorm.weight",
+        "mtp.layers.0.self_attn.k_norm.weight",
+        "mtp.layers.0.self_attn.q_norm.weight",
+        "mtp.norm.weight",
+        "mtp.pre_fc_norm_embedding.weight",
+        "mtp.pre_fc_norm_hidden.weight",
+    )
+    values = {}
+    for name in matrices:
+        wq, scales = mx.quantize(
+            mx.ones((4, 64), dtype=mx.bfloat16),
+            group_size=32, bits=4, mode="mxfp4")
+        values[name] = wq
+        values[name.removesuffix(".weight") + ".scales"] = scales
+    for name in norms:
+        values[name] = mx.ones((64,), dtype=mx.bfloat16)
+    shard = model / "model.safetensors"
+    mx.save_safetensors(str(shard), values)
+    (model / "model.safetensors.index.json").write_text(json.dumps({
+        "metadata": {
+            "vmodel_mtp_proposal_representation": "mxfp4-q4-g32",
+        },
+        "weight_map": {name: shard.name for name in values},
+    }))
+    (model / "config.json").write_text(json.dumps(_config()))
+    return model, matrices, norms
+
+
+def test_packed_mtp_proposal_page_is_round_local_and_typed(tmp_path):
+    model, matrices, norms = _write_packed_mtp(tmp_path)
+    store = WeightStore(model)
+    cache = WeightCache(store, max_bytes=1_000_000)
+    engine = type("Engine", (), {"store": store, "cache": cache})()
+    drafter = QwenMTPDrafter(engine)
+
+    weights = drafter.prepare_request_weights()
+    expected_bytes = store.mlx_quantized_resident_bytes(drafter._page_names)
+    assert drafter.request_weight_representation == "mxfp4-q4-g32"
+    assert drafter.last_cache_prepare_bytes == expected_bytes > 0
+    assert all(isinstance(weights[name], quant.QTensor) for name in matrices)
+    assert all(
+        isinstance(weights[name], mx.array)
+        and weights[name].dtype == mx.bfloat16 for name in norms)
+    assert cache.contains("qwen35_mtp:proposal-mxfp4-q4-g32")
+    assert not cache.contains("qwen35_mtp")
+    assert not cache.contains("qwen35_mtp:released-bf16")
+
+    resident = sum(value.nbytes for value in weights.values())
+    info = drafter.release_request_weights(weights)
+    assert info == {"resident_bytes": resident, "cache_discarded": 1}
+    assert weights == {}
+    assert not cache.contains("qwen35_mtp:proposal-mxfp4-q4-g32")
+
+
+def test_unknown_packed_mtp_representation_fails_closed(tmp_path):
+    model, _matrices, _norms = _write_packed_mtp(tmp_path)
+    index_path = model / "model.safetensors.index.json"
+    index = json.loads(index_path.read_text())
+    index["metadata"]["vmodel_mtp_proposal_representation"] = "mxfp4-q2"
+    index_path.write_text(json.dumps(index))
+    with pytest.raises(ValueError, match="unsupported Qwen MTP"):
+        WeightStore(model)
