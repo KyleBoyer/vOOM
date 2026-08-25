@@ -15,6 +15,7 @@ import pytest
 
 from runtime.dflash2 import CandidateSelector
 from runtime.dflash2_adapter import (
+    DFlash2DecoderLayer,
     DFlash2Drafter,
     DFlash2RuntimeConfig,
     DFlash2SpeculativeDecoder,
@@ -35,6 +36,47 @@ TAPS = (5, 19, 33, 47, 61)
 
 def _runtime_config() -> DFlash2RuntimeConfig:
     return DFlash2RuntimeConfig(DFlash2Config.from_mapping(OFFICIAL_CONFIG))
+
+
+def test_fused_dynamic_convolution_is_an_explicit_runtime_opt_in():
+    default = _runtime_config()
+    assert default.fused_dynamic_conv is False
+    fused = DFlash2RuntimeConfig(
+        DFlash2Config.from_mapping(OFFICIAL_CONFIG),
+        fused_dynamic_conv=True,
+    )
+    assert fused.fused_dynamic_conv is True
+
+
+def test_ablation_projects_residual_writers_not_the_accumulated_stream():
+    identity_conv = SimpleNamespace(
+        prepare=lambda hidden: (hidden, None),
+        finish=lambda hidden, _kernel: hidden,
+    )
+    layer = SimpleNamespace(
+        input_layernorm=lambda hidden: hidden,
+        post_attention_layernorm=lambda hidden: hidden,
+        attention_conv=identity_conv,
+        mlp_conv=identity_conv,
+        self_attn=SimpleNamespace(
+            attend=lambda hidden, _offset, _cache: hidden * 2),
+        mlp=lambda hidden: hidden * 3,
+    )
+    calls = []
+
+    def project(branch):
+        calls.append(branch)
+        return branch * mx.array([0.0, 1.0])
+
+    output = DFlash2DecoderLayer.__call__(
+        layer, mx.array([[[1.0, 2.0]]]), 0, None,
+        project_residual=project)
+    mx.eval(output)
+    # Attention branch [2,4] -> [0,4], leaving the residual [1,2].  The MLP
+    # then sees [1,6], and its [3,18] branch becomes [0,18].  Projecting the
+    # accumulated hidden stream instead would incorrectly erase coordinate 0.
+    np.testing.assert_array_equal(np.array(output), [[[1.0, 24.0]]])
+    assert len(calls) == 2
 
 
 def _compatible_target(**changes):

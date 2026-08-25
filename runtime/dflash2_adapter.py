@@ -7,16 +7,16 @@ This module is vOOM-specific glue: exact target compatibility, target residual
 taps, bounded sliding draft context, sparse proposal-q expansion, and reuse of
 DSpark's target-authoritative Qwen KV/DeltaNet commit path.
 
-There is intentionally no server/profile registration here.  Constructing
-``DFlash2SpeculativeEngine`` is an explicit research action, and the built
-sidecar continues to declare ``enabled_by_default=false``.  Promotion still
-requires the real long forced-rejection recurrent-state oracle.
+Server selection remains an explicit environment/profile action, and the
+built sidecar continues to declare ``enabled_by_default=false``.  Promotion
+still requires the real long forced-rejection recurrent-state oracle.
 """
 
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
+import math
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -26,7 +26,9 @@ import mlx.nn as nn
 from .dflash2 import (
     CandidateSelector,
     GroupedDynamicCausalConv,
+    project_out_direction,
 )
+from .dflash2_ablation import load_artifact as load_ablation_artifact
 from .dflash2_schema import (
     DFlash2Config,
     OFFICIAL_REVISION,
@@ -56,6 +58,10 @@ class DFlash2RuntimeConfig:
     share_target_embed: bool = True
     share_target_lm_head: bool = True
     logits_start: int = 1
+    fused_dynamic_conv: bool = False
+    ablation_enabled: bool = False
+    ablation_strength: float = 0.0
+    ablation_fingerprint: str = ""
 
     @property
     def hidden_size(self):
@@ -273,25 +279,38 @@ class DFlash2DecoderLayer(nn.Module):
             config.hidden_size,
             config.conv_kernel_size,
             config.conv_group_size,
+            fused=config.fused_dynamic_conv,
         )
         self.mlp_conv = GroupedDynamicCausalConv(
             config.hidden_size,
             config.conv_kernel_size,
             config.conv_group_size,
+            fused=config.fused_dynamic_conv,
         )
 
     def __call__(
-        self, hidden: mx.array, block_offset: int, cache: CtxCache,
+        self,
+        hidden: mx.array,
+        block_offset: int,
+        cache: CtxCache,
+        *,
+        project_residual=None,
     ) -> mx.array:
         residual = hidden
         hidden, kernel = self.attention_conv.prepare(
             self.input_layernorm(hidden))
-        hidden = residual + self.attention_conv.finish(
+        branch = self.attention_conv.finish(
             self.self_attn.attend(hidden, block_offset, cache), kernel)
+        if project_residual is not None:
+            branch = project_residual(branch)
+        hidden = residual + branch
         residual = hidden
         hidden, kernel = self.mlp_conv.prepare(
             self.post_attention_layernorm(hidden))
-        return residual + self.mlp_conv.finish(self.mlp(hidden), kernel)
+        branch = self.mlp_conv.finish(self.mlp(hidden), kernel)
+        if project_residual is not None:
+            branch = project_residual(branch)
+        return residual + branch
 
 
 def expand_sparse_candidate_probabilities(
@@ -525,6 +544,7 @@ class DFlash2Drafter(nn.Module):
         # this adds no target sweep or additional model projection.
         self._last_candidate_ids: list[list[int]] = []
         self._last_unary_tokens: list[int] = []
+        self._ablation_direction: mx.array | None = None
 
     @classmethod
     def load(
@@ -533,12 +553,15 @@ class DFlash2Drafter(nn.Module):
         *,
         verify_hash: bool = True,
         require_official_geometry: bool = True,
+        fused_dynamic_conv: bool = False,
     ) -> "DFlash2Drafter":
         config, physical_names, _manifest = inspect_runtime_sidecar(
             model_dir,
             verify_hash=verify_hash,
             require_official_geometry=require_official_geometry,
         )
+        config = replace(
+            config, fused_dynamic_conv=bool(fused_dynamic_conv))
         raw = json.loads((Path(model_dir) / "config.json").read_text())
         quantization = raw["quantization"]
         model = cls(config)
@@ -553,6 +576,45 @@ class DFlash2Drafter(nn.Module):
         model.load_weights(str(Path(model_dir) / "model.safetensors"))
         mx.eval(model.parameters())
         return model
+
+    def set_ablation(
+        self,
+        direction: mx.array,
+        *,
+        strength: float,
+        fingerprint: str,
+    ) -> None:
+        if direction.ndim != 1 or direction.shape[0] != self.config.hidden_size:
+            raise ValueError("DFlash2 ablation direction width mismatch")
+        if not 0.0 < float(strength) <= 2.0:
+            raise ValueError("DFlash2 ablation strength must be in (0, 2]")
+        if len(fingerprint) != 64 or any(
+            character not in "0123456789abcdef" for character in fingerprint
+        ):
+            raise ValueError("DFlash2 ablation fingerprint must be SHA-256")
+        direction = direction.astype(mx.float32)
+        mx.eval(direction)
+        norm_squared = float(mx.sum(direction * direction).item())
+        if not math.isfinite(norm_squared) or not math.isclose(
+            norm_squared, 1.0, rel_tol=0, abs_tol=2e-5,
+        ):
+            raise ValueError("DFlash2 ablation direction must be unit-normalized")
+        self._ablation_direction = direction
+        self.config = replace(
+            self.config,
+            ablation_enabled=True,
+            ablation_strength=float(strength),
+            ablation_fingerprint=fingerprint,
+        )
+
+    def _ablate(self, hidden: mx.array) -> mx.array:
+        if self._ablation_direction is None:
+            return hidden
+        return project_out_direction(
+            hidden,
+            self._ablation_direction,
+            self.config.ablation_strength,
+        )
 
     def bind_target_embed(self, provider) -> None:
         self._target_embed_provider = provider
@@ -625,7 +687,15 @@ class DFlash2Drafter(nn.Module):
             pending_token, self.mask_token_id, self.config.block_size, cap)
         hidden = self._embed_block(block_ids)
         for layer, cache in zip(self.layers, ctx_caches, strict=True):
-            hidden = layer(hidden, block_offset, cache)
+            hidden = layer(
+                hidden,
+                block_offset,
+                cache,
+                project_residual=(
+                    self._ablate if self._ablation_direction is not None
+                    else None
+                ),
+            )
         proposal_hidden = self.norm(hidden)[:, 1:]
         logits = self._project_logits(proposal_hidden)
         unary_proposals = mx.argmax(logits, axis=-1)
@@ -752,6 +822,11 @@ class DFlash2SpeculativeDecoder(DSparkSpeculativeDecoder):
             "dflash2_context_window_tokens": self.context_window_tokens,
             "dflash2_target_verifier": "dspark-qwen-authoritative",
             "dflash2_proposal_policy": self.proposal_policy,
+            "dflash2_fused_dynamic_conv": int(
+                self._cfg.fused_dynamic_conv),
+            "dflash2_ablation_enabled": int(self._cfg.ablation_enabled),
+            "dflash2_ablation_strength": self._cfg.ablation_strength,
+            "dflash2_ablation_fingerprint": self._cfg.ablation_fingerprint,
             "dflash2_candidate_recall_positions": candidate_positions,
             "dflash2_candidate_recall_hits": candidate_hits,
             "dflash2_candidate_recall": (
@@ -780,6 +855,9 @@ class DFlash2SpeculativeEngine:
         drafter_load_margin_bytes: int = 400_000_000,
         verify_sidecar_hash: bool = True,
         proposal_policy: str = "selector",
+        fused_dynamic_conv: bool = False,
+        ablation_direction_dir: str | Path | None = None,
+        ablation_strength: float = 1.0,
     ):
         if max_prompt_tokens <= 0:
             raise ValueError("DFlash2 max_prompt_tokens must be positive")
@@ -788,11 +866,30 @@ class DFlash2SpeculativeEngine:
         self._closed = False
         draft_dir = Path(draft_dir)
         draft_bytes = (draft_dir / "model.safetensors").stat().st_size
+        ablation = None
+        if ablation_direction_dir:
+            target_dir = Path(getattr(target, "_model_dir", ""))
+            target_config = target_dir / "config.json"
+            if not target_config.is_file():
+                raise ValueError(
+                    "DFlash2 ablation requires the target checkpoint config")
+            ablation = load_ablation_artifact(
+                ablation_direction_dir,
+                target_config=target_config,
+                draft_revision=OFFICIAL_REVISION,
+                hidden_size=target.cfg.hidden_size,
+            )
 
         def bind(drafter):
             drafter.bind_target_lm_head(target._lm_head_weight)
             drafter.bind_target_embed(
                 lambda token_ids: target._embed(list(token_ids)))
+            if ablation is not None:
+                drafter.set_ablation(
+                    mx.array(ablation.direction),
+                    strength=ablation_strength,
+                    fingerprint=ablation.fingerprint,
+                )
             return drafter
 
         def load_drafter():
@@ -809,13 +906,19 @@ class DFlash2SpeculativeEngine:
             # reloads validate metadata/header identity without rereading the
             # entire 1.08 GB artifact solely to hash it again.
             return bind(DFlash2Drafter.load(
-                draft_dir, verify_hash=False))
+                draft_dir,
+                verify_hash=False,
+                fused_dynamic_conv=fused_dynamic_conv,
+            ))
 
         if target.governor is not None:
             target.governor.reserve(
                 draft_bytes, reason="dflash2-sidecar-initial-load")
         drafter = bind(DFlash2Drafter.load(
-            draft_dir, verify_hash=verify_sidecar_hash))
+            draft_dir,
+            verify_hash=verify_sidecar_hash,
+            fused_dynamic_conv=fused_dynamic_conv,
+        ))
         if target.governor is not None:
             target.governor.fit_cache_to_live_headroom()
         self.decoder = DFlash2SpeculativeDecoder(

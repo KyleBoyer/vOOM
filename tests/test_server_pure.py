@@ -4200,6 +4200,10 @@ def test_engine_manager_wraps_qwen38_with_explicit_dflash2_and_keys_policy(tmp_p
         "VMODEL_QWEN_DFLASH2_PROMPT_CACHE_MIN_TOKENS": "0",
         "VMODEL_QWEN_DFLASH2_PROPOSAL_POLICY": "unary",
         "VMODEL_QWEN_DFLASH2_RELEASE_BETWEEN_SWEEPS": "1",
+        "VMODEL_QWEN_DFLASH2_FUSED_DYNAMIC_CONV": "1",
+        "VMODEL_QWEN_DFLASH2_ABLATION_DIRECTION": str(
+            tmp_path / "direction"),
+        "VMODEL_QWEN_DFLASH2_ABLATION_STRENGTH": "0.75",
         "VMODEL_QWEN_DFLASH2_LOAD_MARGIN_MB": "400",
         "VMODEL_QWEN_MTP_SPECULATIVE": "1",
     }
@@ -4222,6 +4226,9 @@ def test_engine_manager_wraps_qwen38_with_explicit_dflash2_and_keys_policy(tmp_p
             "release_between_sweeps": True,
             "drafter_load_margin_bytes": 400_000_000,
             "proposal_policy": "unary",
+            "fused_dynamic_conv": True,
+            "ablation_direction_dir": str(tmp_path / "direction"),
+            "ablation_strength": 0.75,
         }
         os.environ["VMODEL_QWEN_DFLASH2_PROPOSAL_POLICY"] = "selector"
         second = manager.get(target_path, "fast")

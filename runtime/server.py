@@ -1219,6 +1219,10 @@ class EngineManager:
         ).strip().lower()
         dflash2_release_request = os.environ.get(
             "VMODEL_QWEN_DFLASH2_RELEASE_BETWEEN_SWEEPS", "1").strip()
+        dflash2_fused_dynamic_conv_request = os.environ.get(
+            "VMODEL_QWEN_DFLASH2_FUSED_DYNAMIC_CONV", "0").strip()
+        dflash2_ablation_direction_request = os.environ.get(
+            "VMODEL_QWEN_DFLASH2_ABLATION_DIRECTION", "").strip()
         try:
             qwen_mtp_max_prompt_tokens = int(os.environ.get(
                 "VMODEL_QWEN_MTP_MAX_PROMPT_TOKENS", "32768"))
@@ -1240,6 +1244,8 @@ class EngineManager:
                 "VMODEL_QWEN_DFLASH2_PROMPT_CACHE_MIN_TOKENS", "0"))
             dflash2_load_margin_mb = int(os.environ.get(
                 "VMODEL_QWEN_DFLASH2_LOAD_MARGIN_MB", "400"))
+            dflash2_ablation_strength = float(os.environ.get(
+                "VMODEL_QWEN_DFLASH2_ABLATION_STRENGTH", "1"))
         except ValueError as error:
             raise RequestValidationError(
                 "VMODEL Qwen MTP/DFlash2 settings must be numeric"
@@ -1286,6 +1292,14 @@ class EngineManager:
         if dflash2_release_request not in ("0", "1"):
             raise RequestValidationError(
                 "VMODEL_QWEN_DFLASH2_RELEASE_BETWEEN_SWEEPS must be 0 or 1")
+        if dflash2_fused_dynamic_conv_request not in ("0", "1"):
+            raise RequestValidationError(
+                "VMODEL_QWEN_DFLASH2_FUSED_DYNAMIC_CONV must be 0 or 1")
+        if not math.isfinite(dflash2_ablation_strength) or not (
+            0.0 < dflash2_ablation_strength <= 2.0
+        ):
+            raise RequestValidationError(
+                "VMODEL_QWEN_DFLASH2_ABLATION_STRENGTH must be in (0, 2]")
         if not 1 <= dflash2_max_draft_tokens <= 4:
             raise RequestValidationError(
                 "VMODEL_QWEN_DFLASH2_MAX_DRAFT_TOKENS must be in [1, 4]")
@@ -1687,6 +1701,9 @@ class EngineManager:
             dflash2_prompt_cache_min_tokens,
             dflash2_proposal_policy,
             dflash2_release_request,
+            dflash2_fused_dynamic_conv_request,
+            dflash2_ablation_direction_request,
+            dflash2_ablation_strength.hex(),
             dflash2_load_margin_mb,
             qwen_mtp_request,
             qwen_mtp_ngram_first_request,
@@ -1769,6 +1786,9 @@ class EngineManager:
             dflash2_prompt_cache_min_tokens,
             dflash2_proposal_policy,
             dflash2_release_request,
+            dflash2_fused_dynamic_conv_request,
+            dflash2_ablation_direction_request,
+            dflash2_ablation_strength.hex(),
             dflash2_load_margin_mb,
             qwen_mtp_request,
             qwen_mtp_ngram_first_request,
@@ -4294,6 +4314,11 @@ class EngineManager:
                         drafter_load_margin_bytes=int(
                             dflash2_load_margin_mb * 1_000_000),
                         proposal_policy=dflash2_proposal_policy,
+                        fused_dynamic_conv=(
+                            dflash2_fused_dynamic_conv_request == "1"),
+                        ablation_direction_dir=(
+                            dflash2_ablation_direction_request or None),
+                        ablation_strength=dflash2_ablation_strength,
                     )
                     print(
                         f"[server] target-verified DFlash2 speculation: "
@@ -4303,6 +4328,10 @@ class EngineManager:
                         f"proposal_policy={dflash2_proposal_policy} "
                         f"release_between_sweeps="
                         f"{dflash2_release_request} "
+                        f"fused_dynamic_conv="
+                        f"{dflash2_fused_dynamic_conv_request} "
+                        f"ablation={'on' if dflash2_ablation_direction_request else 'off'} "
+                        f"ablation_strength={dflash2_ablation_strength:g} "
                         f"load_margin={dflash2_load_margin_mb}MB",
                         flush=True,
                     )

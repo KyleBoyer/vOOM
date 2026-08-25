@@ -5,7 +5,11 @@ from __future__ import annotations
 import mlx.core as mx
 import numpy as np
 
-from runtime.dflash2 import CandidateSelector, grouped_dynamic_convolve
+from runtime.dflash2 import (
+    CandidateSelector,
+    grouped_dynamic_convolve,
+    project_out_direction,
+)
 
 
 def _reference_convolve(hidden, dynamic, base, group_size):
@@ -51,6 +55,46 @@ def test_grouped_dynamic_convolution_matches_independent_loop_and_is_causal():
     mx.eval(changed_output)
     np.testing.assert_array_equal(
         np.array(actual[:, :-1]), np.array(changed_output[:, :-1]))
+
+
+def test_fused_grouped_dynamic_convolution_matches_reference_formula():
+    hidden = (
+        mx.arange(2 * 5 * 16, dtype=mx.float32).reshape(2, 5, 16) / 97
+    ).astype(mx.bfloat16)
+    dynamic = (
+        mx.arange(2 * 5 * 2 * 4, dtype=mx.float32).reshape(2, 5, 2, 4)
+        / 211
+    ).astype(mx.bfloat16)
+    base = (
+        mx.arange(2 * 16, dtype=mx.float32).reshape(2, 16) / 53
+    ).astype(mx.bfloat16)
+
+    reference = grouped_dynamic_convolve(
+        hidden, dynamic, base, group_size=4)
+    fused = grouped_dynamic_convolve(
+        hidden, dynamic, base, group_size=4, fused=True)
+    mx.eval(reference, fused)
+    np.testing.assert_allclose(
+        np.array(fused.astype(mx.float32)),
+        np.array(reference.astype(mx.float32)),
+        rtol=0,
+        # The fused kernel accumulates in FP32 and rounds once; the reference
+        # rounds each BF16 multiply/add graph edge.  At this magnitude their
+        # measured envelope is one BF16 ULP (2^-6).
+        atol=2 ** -6,
+    )
+
+
+def test_direction_projection_removes_only_the_selected_component():
+    hidden = mx.array([[[3.0, 4.0], [1.0, -2.0]]])
+    direction = mx.array([1.0, 0.0])
+    projected = project_out_direction(hidden, direction)
+    mx.eval(projected)
+    np.testing.assert_array_equal(
+        np.array(projected),
+        np.array([[[0.0, 4.0], [0.0, -2.0]]], dtype=np.float32),
+    )
+    assert project_out_direction(hidden, direction, 0.0) is hidden
 
 
 def test_candidate_selector_walks_parent_conditioned_path_and_returns_sparse_q():

@@ -136,6 +136,9 @@ def _run_arm(
     cap: int,
     force_reject: bool,
     proposal_policy: str,
+    fused_dynamic_conv: bool,
+    ablation_direction: Path | None,
+    ablation_strength: float,
 ) -> dict[str, object]:
     manager = EngineManager()
     wrapper = None
@@ -153,6 +156,9 @@ def _run_arm(
                 prompt_cache_min_tokens=0,
                 release_between_sweeps=True,
                 proposal_policy=proposal_policy,
+                fused_dynamic_conv=fused_dynamic_conv,
+                ablation_direction_dir=ablation_direction,
+                ablation_strength=ablation_strength,
             )
             if force_reject:
                 mask_token = int(wrapper.decoder._cfg.mask_token_id)
@@ -178,6 +184,14 @@ def _run_arm(
             "mode": mode,
             "force_reject": bool(force_reject),
             "proposal_policy": proposal_policy if mode == "spec" else None,
+            "fused_dynamic_conv": (
+                bool(fused_dynamic_conv) if mode == "spec" else None),
+            "ablation_direction": (
+                str(ablation_direction) if mode == "spec" and ablation_direction
+                else None),
+            "ablation_strength": (
+                ablation_strength if mode == "spec" and ablation_direction
+                else None),
             "prompt_sha256": hashlib.sha256(prompt.encode()).hexdigest(),
             "max_tokens": max_tokens,
             "cap": cap if mode == "spec" else 0,
@@ -215,6 +229,9 @@ def main() -> int:
     parser.add_argument("--force-reject", action="store_true")
     parser.add_argument("--proposal-policy", choices=("selector", "unary"),
                         default="selector")
+    parser.add_argument("--fused-dynamic-conv", action="store_true")
+    parser.add_argument("--ablation-direction", type=Path)
+    parser.add_argument("--ablation-strength", type=float, default=1.0)
     parser.add_argument("--result", type=Path)
     args = parser.parse_args()
     if args.max_tokens < 2:
@@ -232,13 +249,20 @@ def main() -> int:
         arms.append(_run_arm(
             mode="plain", target_path=target, draft_path=draft,
             prompt=args.prompt, max_tokens=args.max_tokens, cap=args.cap,
-            force_reject=False, proposal_policy=args.proposal_policy))
+            force_reject=False, proposal_policy=args.proposal_policy,
+            fused_dynamic_conv=False, ablation_direction=None,
+            ablation_strength=1.0))
     if args.mode in ("spec", "compare"):
         arms.append(_run_arm(
             mode="spec", target_path=target, draft_path=draft,
             prompt=args.prompt, max_tokens=args.max_tokens, cap=args.cap,
             force_reject=args.force_reject,
-            proposal_policy=args.proposal_policy))
+            proposal_policy=args.proposal_policy,
+            fused_dynamic_conv=args.fused_dynamic_conv,
+            ablation_direction=(
+                args.ablation_direction.expanduser().resolve()
+                if args.ablation_direction else None),
+            ablation_strength=args.ablation_strength))
 
     report: dict[str, object] = {
         "schema": "voom.qwen38-dflash2-gate.v1",
