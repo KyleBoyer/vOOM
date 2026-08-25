@@ -10225,8 +10225,11 @@ class StreamingEngine:
         }
         if execution_profile is not None:
             result["execution_profile"] = execution_profile
-        if ((self.rc.release_paged_kv_after_generate and self.rc.max_kv_mb)
-                or force_adaptive_paged):
+        retain_internal_paged_kv = bool(
+            getattr(prompt, "retain_paged_kv_after_generate", False))
+        if (((self.rc.release_paged_kv_after_generate and self.rc.max_kv_mb)
+                or force_adaptive_paged)
+                and not retain_internal_paged_kv):
             self.last_kv = None
             self._release_kv(kv)
             mx.clear_cache()

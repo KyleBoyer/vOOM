@@ -16,12 +16,14 @@ from __future__ import annotations
 
 import json
 import math
+import time
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
 import mlx.core as mx
 import mlx.nn as nn
+import numpy as np
 
 from .dflash2 import (
     CandidateSelector,
@@ -40,9 +42,11 @@ from .dspark import (
     CtxCache,
     DSparkAttention,
     DSparkMLP,
+    DSparkStats,
     DSparkSpeculativeDecoder,
 )
-from .sampler import SamplingParams
+from .kv_cache import KVCache
+from .sampler import SamplingParams, sample_probabilities
 
 
 MAX_QUANTIZED_BLOCK_SIZE = 5
@@ -744,6 +748,9 @@ class DFlash2SpeculativeDecoder(DSparkSpeculativeDecoder):
         drafter_storage_bytes: int = 0,
         drafter_load_margin_bytes: int = 400_000_000,
         proposal_policy: str = "selector",
+        native_mtp_fallback: bool = False,
+        fallback_min_dflash_rounds: int = 4,
+        fallback_min_accepted_per_round: float = 1.0,
     ):
         if max_draft_tokens > MAX_QUANTIZED_PROPOSALS:
             raise ValueError(
@@ -752,7 +759,19 @@ class DFlash2SpeculativeDecoder(DSparkSpeculativeDecoder):
         if proposal_policy not in {"selector", "unary"}:
             raise ValueError(
                 "DFlash2 proposal_policy must be selector or unary")
+        if (isinstance(fallback_min_dflash_rounds, bool)
+                or fallback_min_dflash_rounds <= 0):
+            raise ValueError(
+                "DFlash2 fallback minimum rounds must be positive")
+        if (not math.isfinite(fallback_min_accepted_per_round)
+                or not 0.0 <= fallback_min_accepted_per_round <= 4.0):
+            raise ValueError(
+                "DFlash2 fallback acceptance threshold must be in [0, 4]")
         self.proposal_policy = proposal_policy
+        self.native_mtp_fallback = bool(native_mtp_fallback)
+        self.fallback_min_dflash_rounds = int(fallback_min_dflash_rounds)
+        self.fallback_min_accepted_per_round = float(
+            fallback_min_accepted_per_round)
         super().__init__(
             target,
             drafter,
@@ -768,11 +787,219 @@ class DFlash2SpeculativeDecoder(DSparkSpeculativeDecoder):
         self.defer_prompt_context_updates = True
         self._candidate_rounds: list[list[list[int]]] = []
         self._unary_rounds: list[list[int]] = []
+        self._native_mtp_drafter = None
+        if self.native_mtp_fallback:
+            from .qwen35_mtp import QwenMTPDrafter
+
+            self._native_mtp_drafter = QwenMTPDrafter(target)
+        self._mtp_kv = KVCache(1)
+        self._proposal_mode = "dflash2"
+        self._round_source = ""
+        self._proposal_sources: list[str] = []
+        self._dflash_rounds = 0
+        self._dflash_proposed = 0
+        self._dflash_accepted = 0
+        self._native_mtp_rounds = 0
+        self._native_mtp_proposed = 0
+        self._native_mtp_accepted = 0
+        self._fallback_switch_round = 0
+        self._native_mtp_load_s = 0.0
+        self._native_mtp_release_s = 0.0
+        self._native_mtp_read_bytes = 0
+        self._native_mtp_loaded_bytes = 0
+        self._native_mtp_released_bytes = 0
+        self._draft_context_released = False
 
     def _new_ctx_caches(self) -> list[CtxCache]:
         # Cache containers have no weights. Construct them without making the
         # 1.08 GB draft sidecar resident during target prompt streaming.
         return [CtxCache() for _ in range(self._cfg.num_hidden_layers)]
+
+    def _draft_context_required(self) -> bool:
+        return self._proposal_mode == "dflash2"
+
+    @staticmethod
+    def _context_to_host(value: mx.array) -> tuple[np.ndarray, str]:
+        mx.eval(value)
+        if value.dtype == mx.bfloat16:
+            return np.array(value.view(mx.uint16), copy=True), "bf16"
+        if value.dtype == mx.float16:
+            return np.array(value, dtype=np.float16, copy=True), "f16"
+        if value.dtype == mx.float32:
+            return np.array(value, dtype=np.float32, copy=True), "f32"
+        raise TypeError(
+            f"unsupported DFlash2 context dtype {value.dtype}")
+
+    @staticmethod
+    def _context_from_host(value: np.ndarray, dtype: str) -> mx.array:
+        if dtype == "bf16":
+            return mx.array(value).view(mx.bfloat16)
+        if dtype == "f16":
+            return mx.array(value.astype(np.float16, copy=False))
+        if dtype == "f32":
+            return mx.array(value.astype(np.float32, copy=False))
+        raise TypeError(f"unsupported DFlash2 host-context dtype {dtype}")
+
+    def _suspend_draft_context(
+        self, ctx_caches: list[CtxCache], stats: DSparkStats,
+    ):
+        """Losslessly park DFlash-only K/V on the CPU during verification."""
+        if not any(cache.k is not None for cache in ctx_caches):
+            return None
+        if any((cache.k is None) != (cache.v is None) for cache in ctx_caches):
+            raise RuntimeError("DFlash2 context has incomplete K/V")
+        active_before = int(mx.get_active_memory())
+        started = time.perf_counter()
+        snapshot = []
+        byte_count = 0
+        for cache in ctx_caches:
+            if cache.k is None:
+                snapshot.append((None, None, None, None,
+                                 cache.position_start, cache.position_end))
+                continue
+            host_k, dtype_k = self._context_to_host(cache.k)
+            host_v, dtype_v = self._context_to_host(cache.v)
+            byte_count += int(host_k.nbytes + host_v.nbytes)
+            snapshot.append((host_k, host_v, dtype_k, dtype_v,
+                             cache.position_start, cache.position_end))
+            cache.k = None
+            cache.v = None
+        mx.clear_cache()
+        stats.draft_context_suspend_rounds += 1
+        stats.draft_context_suspend_s += time.perf_counter() - started
+        stats.draft_context_suspended_bytes += byte_count
+        stats.draft_context_released_active_bytes += max(
+            0, active_before - int(mx.get_active_memory()))
+        return snapshot
+
+    def _restore_draft_context(
+        self, ctx_caches: list[CtxCache], snapshot, stats: DSparkStats,
+    ) -> None:
+        if snapshot is None:
+            return
+        if len(snapshot) != len(ctx_caches):
+            raise RuntimeError("DFlash2 suspended context layer count changed")
+        started = time.perf_counter()
+        restored = []
+        for cache, entry in zip(ctx_caches, snapshot, strict=True):
+            host_k, host_v, dtype_k, dtype_v, position_start, position_end = entry
+            if cache.k is not None or cache.v is not None:
+                raise RuntimeError(
+                    "DFlash2 context became resident while suspended")
+            cache.position_start = position_start
+            cache.position_end = int(position_end)
+            if host_k is not None:
+                cache.k = self._context_from_host(host_k, dtype_k)
+                cache.v = self._context_from_host(host_v, dtype_v)
+                restored.extend((cache.k, cache.v))
+        if restored:
+            mx.eval(*restored)
+        stats.draft_context_restore_rounds += 1
+        stats.draft_context_restore_s += time.perf_counter() - started
+
+    def _discard_suspended_draft_context(
+        self, ctx_caches: list[CtxCache], snapshot,
+    ) -> None:
+        del snapshot
+        self._release_context_caches(ctx_caches)
+        self._draft_context_released = True
+
+    def _note_verified_round(self, proposed: int, accepted: int) -> None:
+        if proposed <= 0:
+            return
+        if self._round_source == "D":
+            self._dflash_rounds += 1
+            self._dflash_proposed += int(proposed)
+            self._dflash_accepted += int(accepted)
+            if (
+                self.native_mtp_fallback
+                and self._dflash_rounds >= self.fallback_min_dflash_rounds
+                and self._dflash_accepted < (
+                    self.fallback_min_accepted_per_round
+                    * self._dflash_rounds)
+            ):
+                self._proposal_mode = "native-mtp"
+                self._fallback_switch_round = len(self._proposal_sources)
+        elif self._round_source == "M":
+            self._native_mtp_rounds += 1
+            self._native_mtp_proposed += int(proposed)
+            self._native_mtp_accepted += int(accepted)
+
+    @staticmethod
+    def _release_context_caches(ctx_caches: list[CtxCache]) -> None:
+        for cache in ctx_caches:
+            cache.k = None
+            cache.v = None
+            cache.position_start = None
+            cache.position_end = 0
+        mx.clear_cache()
+
+    def _propose_native_mtp(
+        self,
+        pending: int,
+        offset: int,
+        ctx_caches: list[CtxCache],
+        sampling: SamplingParams,
+        history: list[int],
+    ):
+        if self._native_mtp_drafter is None:
+            raise RuntimeError("DFlash2 native-MTP fallback was not initialized")
+        if not self._draft_context_released:
+            self._release_context_caches(ctx_caches)
+            self._draft_context_released = True
+
+        drafter = self._native_mtp_drafter
+        prepare = getattr(drafter, "prepare_request_weights", None)
+        release = getattr(drafter, "release_request_weights", None)
+        cache_stats = getattr(self.target.cache, "stats", None)
+        read_before = int(getattr(cache_stats, "bytes_read", 0))
+        weights = None
+        load_started = time.perf_counter()
+        try:
+            weights = prepare() if callable(prepare) else None
+            self._native_mtp_load_s += time.perf_counter() - load_started
+            if weights is not None:
+                self._native_mtp_loaded_bytes += sum(
+                    int(getattr(value, "nbytes", 0))
+                    for value in weights.values()
+                )
+            logits, _hidden = drafter.draft_step(
+                self.target._h_last,
+                pending,
+                self._mtp_kv,
+                offset - 1,
+                weights,
+            )
+            if sampling.is_greedy:
+                token = int(mx.argmax(logits).item())
+                distributions = None
+            else:
+                from .qwen35_mtp import _flat_top_k_draft_probabilities
+
+                q = _flat_top_k_draft_probabilities(
+                    logits, sampling, history, 1)
+                token = int(sample_probabilities(q))
+                distributions = [q]
+        finally:
+            if weights is not None:
+                release_started = time.perf_counter()
+                if not callable(release):
+                    weights.clear()
+                    mx.clear_cache()
+                    raise RuntimeError(
+                        "native-MTP fallback omits round weight release")
+                release_info = release(weights) or {}
+                self._native_mtp_release_s += (
+                    time.perf_counter() - release_started)
+                self._native_mtp_released_bytes += int(
+                    release_info.get("resident_bytes", 0))
+        self._native_mtp_read_bytes += max(
+            0, int(getattr(cache_stats, "bytes_read", 0)) - read_before)
+        self._round_source = "M"
+        self._proposal_sources.append("M")
+        self._candidate_rounds.append([[token]])
+        self._unary_rounds.append([token])
+        return [token], distributions
 
     def _propose(
         self,
@@ -783,6 +1010,9 @@ class DFlash2SpeculativeDecoder(DSparkSpeculativeDecoder):
         sampling: SamplingParams,
         history: list[int],
     ):
+        if self._proposal_mode == "native-mtp":
+            return self._propose_native_mtp(
+                pending, offset, ctx_caches, sampling, history)
         del history  # DFlash2 q is selector-conditional, not repetition-filtered.
         proposals, distributions, _hidden = self._ensure_drafter().propose_block(
             pending, offset, ctx_caches, cap, sampling,
@@ -793,11 +1023,30 @@ class DFlash2SpeculativeDecoder(DSparkSpeculativeDecoder):
         ])
         self._unary_rounds.append(list(
             self._ensure_drafter()._last_unary_tokens))
+        self._round_source = "D"
+        self._proposal_sources.append("D")
         return proposals, distributions
 
     def generate(self, *args, **kwargs):
         self._candidate_rounds.clear()
         self._unary_rounds.clear()
+        self._mtp_kv = KVCache(1)
+        self._proposal_mode = "dflash2"
+        self._round_source = ""
+        self._proposal_sources.clear()
+        self._dflash_rounds = 0
+        self._dflash_proposed = 0
+        self._dflash_accepted = 0
+        self._native_mtp_rounds = 0
+        self._native_mtp_proposed = 0
+        self._native_mtp_accepted = 0
+        self._fallback_switch_round = 0
+        self._native_mtp_load_s = 0.0
+        self._native_mtp_release_s = 0.0
+        self._native_mtp_read_bytes = 0
+        self._native_mtp_loaded_bytes = 0
+        self._native_mtp_released_bytes = 0
+        self._draft_context_released = False
         result = super().generate(*args, **kwargs)
         # For greedy decoding, the committed stream plus each round's accepted
         # prefix reconstructs every target decision that influenced progress.
@@ -837,6 +1086,34 @@ class DFlash2SpeculativeDecoder(DSparkSpeculativeDecoder):
             "dflash2_unary_recall_hits": unary_hits,
             "dflash2_unary_recall": (
                 unary_hits / unary_positions if unary_positions else None),
+            "dflash2_native_mtp_fallback_enabled": int(
+                self.native_mtp_fallback),
+            "dflash2_native_mtp_fallback_switched": int(
+                self._fallback_switch_round > 0),
+            "dflash2_native_mtp_fallback_switch_round": (
+                self._fallback_switch_round),
+            "dflash2_native_mtp_fallback_min_rounds": (
+                self.fallback_min_dflash_rounds),
+            "dflash2_native_mtp_fallback_min_accepted_per_round": (
+                self.fallback_min_accepted_per_round),
+            "dflash2_proposal_sources": "".join(self._proposal_sources),
+            "dflash2_rounds": self._dflash_rounds,
+            "dflash2_proposed": self._dflash_proposed,
+            "dflash2_accepted": self._dflash_accepted,
+            "dflash2_fallback_native_mtp_rounds": self._native_mtp_rounds,
+            "dflash2_fallback_native_mtp_proposed": (
+                self._native_mtp_proposed),
+            "dflash2_fallback_native_mtp_accepted": (
+                self._native_mtp_accepted),
+            "dflash2_fallback_native_mtp_load_s": self._native_mtp_load_s,
+            "dflash2_fallback_native_mtp_release_s": (
+                self._native_mtp_release_s),
+            "dflash2_fallback_native_mtp_read_bytes": (
+                self._native_mtp_read_bytes),
+            "dflash2_fallback_native_mtp_loaded_bytes": (
+                self._native_mtp_loaded_bytes),
+            "dflash2_fallback_native_mtp_released_bytes": (
+                self._native_mtp_released_bytes),
         })
         return result
 
@@ -859,6 +1136,9 @@ class DFlash2SpeculativeEngine:
         fused_dynamic_conv: bool = False,
         ablation_direction_dir: str | Path | None = None,
         ablation_strength: float = 1.0,
+        native_mtp_fallback: bool = False,
+        fallback_min_dflash_rounds: int = 4,
+        fallback_min_accepted_per_round: float = 1.0,
     ):
         if max_prompt_tokens <= 0:
             raise ValueError("DFlash2 max_prompt_tokens must be positive")
@@ -932,6 +1212,10 @@ class DFlash2SpeculativeEngine:
             drafter_storage_bytes=draft_bytes,
             drafter_load_margin_bytes=drafter_load_margin_bytes,
             proposal_policy=proposal_policy,
+            native_mtp_fallback=native_mtp_fallback,
+            fallback_min_dflash_rounds=fallback_min_dflash_rounds,
+            fallback_min_accepted_per_round=(
+                fallback_min_accepted_per_round),
         )
         self._speculative_k = self.decoder.max_draft_tokens
         self._speculative_draft_dir = draft_dir

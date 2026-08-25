@@ -365,6 +365,7 @@ def test_qwen_hybrid_dspark_accept_prefix_restores_exact_recurrent_endpoint(
 
     assert result["tokens"] == expected
     assert target.bootstrap_prompt.disable_hot_prompt_kv is True
+    assert target.bootstrap_prompt.retain_paged_kv_after_generate is True
     assert target.bootstrap_prompt.stable_boundary_tokens == 0
     assert target.last_kv.offset == 3 + fed
     assert target.last_kv.lengths == [3 + fed, 0]

@@ -284,6 +284,36 @@ def test_vision_protocol_timing_exposes_qwen_mtp_round_trace():
     assert timing["qwen_mtp_proposal_q_replay"] == replay
 
 
+def test_protocol_timing_exposes_dspark_round_and_context_suspension():
+    timing = _vision_protocol_timing({
+        "path_stats": {
+            "speculative_round_proposed": [3, 3, 1],
+            "speculative_round_accepted": [1, 0, 1],
+            "speculative_round_draft_s": [0.5, 0.4, 0.2],
+            "speculative_round_verify_s": [7.0, 7.1, 6.8],
+            "speculative_round_context_s": [0.2, 0.0, 0.1],
+            "dspark_draft_context_suspend_rounds": 3,
+            "dspark_draft_context_restore_rounds": 2,
+            "dspark_draft_context_suspend_s": 0.125,
+            "dspark_draft_context_restore_s": 0.25,
+            "dspark_draft_context_suspended_bytes": 4096,
+            "dspark_draft_context_released_active_bytes": 2048,
+        },
+    })
+
+    assert timing["speculative_round_proposed"] == [3, 3, 1]
+    assert timing["speculative_round_accepted"] == [1, 0, 1]
+    assert timing["speculative_round_draft_s"] == [0.5, 0.4, 0.2]
+    assert timing["speculative_round_verify_s"] == [7.0, 7.1, 6.8]
+    assert timing["speculative_round_context_s"] == [0.2, 0.0, 0.1]
+    assert timing["dspark_draft_context_suspend_rounds"] == 3
+    assert timing["dspark_draft_context_restore_rounds"] == 2
+    assert timing["dspark_draft_context_suspend_s"] == 0.125
+    assert timing["dspark_draft_context_restore_s"] == 0.25
+    assert timing["dspark_draft_context_suspended_bytes"] == 4096
+    assert timing["dspark_draft_context_released_active_bytes"] == 2048
+
+
 def test_protocol_timing_exposes_qwen35_prefill_ceiling_and_selection():
     timing = _vision_protocol_timing({
         "path_stats": {
@@ -3066,7 +3096,7 @@ def test_dense_qwen35_paged_durable_prefix_is_explicit_and_disk_only(tmp_path):
             "full_attention") * 16,
     )
     env = {
-        "VMODEL_QWEN35_KV_MAX_MB": "768",
+        "VMODEL_QWEN35_KV_MAX_MB": "64",
         "VMODEL_QWEN35_KV_PREFILL_CHUNK_SIZE": "32",
         "VMODEL_QWEN35_KV_SPILL_DIR": str(tmp_path / "spill"),
         "VMODEL_QWEN35_HOT_KV_PERSIST_DIR": str(tmp_path / "journal"),
@@ -3082,7 +3112,7 @@ def test_dense_qwen35_paged_durable_prefix_is_explicit_and_disk_only(tmp_path):
         EngineManager().get(Path("/tmp/fake-qwen38-paged-durable"), "lossless")
 
     rc = captured[0]
-    assert rc.max_kv_mb == 768
+    assert rc.max_kv_mb == 64
     assert rc.paged_kv_persist
     assert rc.hot_prompt_kv
     assert rc.release_paged_kv_after_generate
@@ -4205,6 +4235,9 @@ def test_engine_manager_wraps_qwen38_with_explicit_dflash2_and_keys_policy(tmp_p
             tmp_path / "direction"),
         "VMODEL_QWEN_DFLASH2_ABLATION_STRENGTH": "0.75",
         "VMODEL_QWEN_DFLASH2_LOAD_MARGIN_MB": "400",
+        "VMODEL_QWEN_DFLASH2_NATIVE_MTP_FALLBACK": "1",
+        "VMODEL_QWEN_DFLASH2_FALLBACK_MIN_ROUNDS": "5",
+        "VMODEL_QWEN_DFLASH2_FALLBACK_MIN_ACCEPTED_PER_ROUND": "1.25",
         "VMODEL_QWEN_MTP_SPECULATIVE": "1",
     }
     with patch("runtime.config.ModelConfig.from_dir", return_value=cfg), \
@@ -4229,6 +4262,9 @@ def test_engine_manager_wraps_qwen38_with_explicit_dflash2_and_keys_policy(tmp_p
             "fused_dynamic_conv": True,
             "ablation_direction_dir": str(tmp_path / "direction"),
             "ablation_strength": 0.75,
+            "native_mtp_fallback": True,
+            "fallback_min_dflash_rounds": 5,
+            "fallback_min_accepted_per_round": 1.25,
         }
         os.environ["VMODEL_QWEN_DFLASH2_PROPOSAL_POLICY"] = "selector"
         second = manager.get(target_path, "fast")

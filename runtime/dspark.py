@@ -493,6 +493,10 @@ class _DSparkBootstrapPrompt(str):
         # into the ordinary target slot/journal tiers where the absent draft
         # state could turn a future apparent hit into an invalid partial prefill.
         instance.disable_hot_prompt_kv = True
+        # The target's ordinary server-only paged profile drops its cache
+        # before returning. DSpark immediately transfers that exact endpoint
+        # into its verifier, so retain it for this internal bootstrap only.
+        instance.retain_paged_kv_after_generate = True
         instance.stable_boundary_tokens = 0
         instance.rerank_capture_shape = dict(
             getattr(prompt, "rerank_capture_shape", {}) or {})
@@ -1066,7 +1070,16 @@ class DSparkStats:
     sidecar_released_active_bytes: int = 0
     deferred_context_positions: int = 0
     deferred_context_bytes_peak: int = 0
+    draft_context_suspend_rounds: int = 0
+    draft_context_restore_rounds: int = 0
+    draft_context_suspend_s: float = 0.0
+    draft_context_restore_s: float = 0.0
+    draft_context_suspended_bytes: int = 0
+    draft_context_released_active_bytes: int = 0
     rounds: list[tuple[int, int]] = field(default_factory=list)
+    round_draft_s: list[float] = field(default_factory=list)
+    round_verify_s: list[float] = field(default_factory=list)
+    round_context_s: list[float] = field(default_factory=list)
 
 
 class DSparkSpeculativeDecoder:
@@ -1146,6 +1159,42 @@ class DSparkSpeculativeDecoder:
 
     def _new_ctx_caches(self) -> list[CtxCache]:
         return self._ensure_drafter().make_ctx_cache()
+
+    def _note_verified_round(self, proposed: int, accepted: int) -> None:
+        """Optional proposal-policy feedback after target verification.
+
+        The base decoder is intentionally inert.  Specialized draft sources
+        can use this target-owned evidence to change scheduling in a later
+        round without influencing the token distribution being served.
+        """
+        del proposed, accepted
+
+    def _draft_context_required(self) -> bool:
+        """Whether the next proposal consumes the learned draft K/V cache."""
+        return True
+
+    def _suspend_draft_context(
+        self, ctx_caches: list[CtxCache], stats: DSparkStats,
+    ):
+        """Optionally move draft-only context out of the target Metal sweep.
+
+        The base decoder keeps its historical resident-context behavior.
+        Large specialized drafters can override this hook, but the suspended
+        representation must preserve every bit because it is proposal state
+        reused by later rounds.
+        """
+        del ctx_caches, stats
+        return None
+
+    def _restore_draft_context(
+        self, ctx_caches: list[CtxCache], snapshot, stats: DSparkStats,
+    ) -> None:
+        del ctx_caches, snapshot, stats
+
+    def _discard_suspended_draft_context(
+        self, ctx_caches: list[CtxCache], snapshot,
+    ) -> None:
+        del ctx_caches, snapshot
 
     def _ensure_drafter(self, stats: DSparkStats | None = None):
         if self.drafter is not None:
@@ -1521,12 +1570,17 @@ class DSparkSpeculativeDecoder:
                 max_tokens - len(emitted) - 1,
             )
             base = target_kv.offset
-            if any(cache.position_end != base for cache in ctx_caches):
+            round_uses_draft_context = self._draft_context_required()
+            if (
+                round_uses_draft_context
+                and any(cache.position_end != base for cache in ctx_caches)
+            ):
                 raise RuntimeError(
                     "DSpark context/target KV desync before proposal: "
                     f"kv={base}, ctx_end="
                     f"{[cache.position_end for cache in ctx_caches]}")
 
+            round_draft_s = 0.0
             if cap > 0:
                 draft_t0 = time.perf_counter()
                 proposed = self._propose(
@@ -1539,7 +1593,8 @@ class DSparkSpeculativeDecoder:
                     proposals, draft_probabilities = proposed
                 else:
                     proposals, draft_probabilities = proposed, None
-                stats.draft_s += time.perf_counter() - draft_t0
+                round_draft_s = time.perf_counter() - draft_t0
+                stats.draft_s += round_draft_s
             else:
                 # One output slot remains: verify the pending token alone and
                 # emit its target successor.  Breaking here would silently
@@ -1552,6 +1607,10 @@ class DSparkSpeculativeDecoder:
             # is the verifier and never needs draft weights, so avoid making
             # every streamed target layer compete with the resident sidecar.
             self._release_drafter(stats)
+            context_snapshot = (
+                self._suspend_draft_context(ctx_caches, stats)
+                if round_uses_draft_context else None
+            )
 
             verify_t0 = time.perf_counter()
             verify_ids = [pending] + proposals
@@ -1584,19 +1643,20 @@ class DSparkSpeculativeDecoder:
                     verified = target.forward_tokens_serial_positions(
                         verify_ids,
                         target_kv,
-                        tap_layers=taps,
+                        tap_layers=(taps if round_uses_draft_context else ()),
                         capture_kda_factors=True,
                     )
                 elif capture_qwen_endpoints:
                     verified = target.forward_tokens_serial_positions(
                         verify_ids,
                         target_kv,
-                        tap_layers=taps,
+                        tap_layers=(taps if round_uses_draft_context else ()),
                         capture_kda_endpoints=True,
                     )
                 else:
                     verified = target.forward_tokens_serial_positions(
-                        verify_ids, target_kv, tap_layers=taps)
+                        verify_ids, target_kv,
+                        tap_layers=(taps if round_uses_draft_context else ()))
             except BaseException:
                 target._dspark_expert_prefetch_plan = None
                 if round_layer_lengths is not None:
@@ -1632,7 +1692,8 @@ class DSparkSpeculativeDecoder:
                 stats.expert_prefetch_authoritative += (
                     plan.authoritative_experts)
                 stats.expert_prefetch_matched += plan.matched_experts
-            stats.verify_s += time.perf_counter() - verify_t0
+            round_verify_s = time.perf_counter() - verify_t0
+            stats.verify_s += round_verify_s
             stats.target_sweeps += 1
 
             if constraint is not None:
@@ -1719,6 +1780,9 @@ class DSparkSpeculativeDecoder:
             stats.proposed += len(proposals)
             stats.accepted += accepted
             stats.rounds.append((len(proposals), accepted))
+            stats.round_draft_s.append(round_draft_s)
+            stats.round_verify_s.append(round_verify_s)
+            self._note_verified_round(len(proposals), accepted)
 
             # Only the anchor and accepted proposal prefix are committed input
             # positions.  The target token is the next pending output and has
@@ -1735,7 +1799,13 @@ class DSparkSpeculativeDecoder:
                     break
             committed_inputs = min(
                 len(verify_ids), 1 + max(0, planned_emit - 1))
-            tapped = self._tapped_context()[:, :committed_inputs, :]
+            retain_draft_context = (
+                round_uses_draft_context and self._draft_context_required()
+            )
+            tapped = (
+                self._tapped_context()[:, :committed_inputs, :]
+                if retain_draft_context else None
+            )
             if qwen_kda_checkpoint is not None:
                 end_lengths = target_kv.layer_lengths()
                 growth = tuple(
@@ -1805,10 +1875,20 @@ class DSparkSpeculativeDecoder:
                         mx.eval(replay_logits)
                         stats.kda_refeed_sweeps += 1
             ctx_t0 = time.perf_counter()
-            self._ensure_drafter(stats).update_context(
-                tapped, base, ctx_caches)
-            mx.async_eval([cache.k for cache in ctx_caches])
-            stats.context_s += time.perf_counter() - ctx_t0
+            if retain_draft_context:
+                self._restore_draft_context(
+                    ctx_caches, context_snapshot, stats)
+                context_snapshot = None
+                self._ensure_drafter(stats).update_context(
+                    tapped, base, ctx_caches)
+                mx.async_eval([cache.k for cache in ctx_caches])
+            elif context_snapshot is not None:
+                self._discard_suspended_draft_context(
+                    ctx_caches, context_snapshot)
+                context_snapshot = None
+            round_context_s = time.perf_counter() - ctx_t0
+            stats.context_s += round_context_s
+            stats.round_context_s.append(round_context_s)
             target._tap_hidden = {}
 
             for token in committed:
@@ -1914,6 +1994,15 @@ class DSparkSpeculativeDecoder:
                 "speculative_target_sweeps": max(0, stats.target_sweeps - 1),
                 "speculative_proposed": stats.proposed,
                 "speculative_accepted": stats.accepted,
+                "speculative_round_proposed": [
+                    proposed for proposed, _accepted in stats.rounds
+                ],
+                "speculative_round_accepted": [
+                    accepted for _proposed, accepted in stats.rounds
+                ],
+                "speculative_round_draft_s": list(stats.round_draft_s),
+                "speculative_round_verify_s": list(stats.round_verify_s),
+                "speculative_round_context_s": list(stats.round_context_s),
                 "speculative_draft_oov_fallbacks": 0,
                 "dspark_block_size": self._cfg.block_size,
                 "dspark_confidence_threshold": self.confidence_threshold,
@@ -1923,6 +2012,18 @@ class DSparkSpeculativeDecoder:
                     stats.deferred_context_positions),
                 "dspark_deferred_context_bytes_peak": (
                     stats.deferred_context_bytes_peak),
+                "dspark_draft_context_suspend_rounds": (
+                    stats.draft_context_suspend_rounds),
+                "dspark_draft_context_restore_rounds": (
+                    stats.draft_context_restore_rounds),
+                "dspark_draft_context_suspend_s": (
+                    stats.draft_context_suspend_s),
+                "dspark_draft_context_restore_s": (
+                    stats.draft_context_restore_s),
+                "dspark_draft_context_suspended_bytes": (
+                    stats.draft_context_suspended_bytes),
+                "dspark_draft_context_released_active_bytes": (
+                    stats.draft_context_released_active_bytes),
                 "dspark_kda_factor_bytes_peak": (
                     stats.kda_factor_bytes_peak),
                 "dspark_kda_factor_restores": stats.kda_factor_restores,

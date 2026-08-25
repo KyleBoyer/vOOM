@@ -27,7 +27,12 @@ from runtime.dflash2_adapter import (
     validate_target_compatibility,
 )
 from runtime.dflash2_schema import DFlash2Config, OFFICIAL_CONFIG
-from runtime.dspark import CtxCache, DSparkSpeculativeDecoder, DSparkTapCollector
+from runtime.dspark import (
+    CtxCache,
+    DSparkSpeculativeDecoder,
+    DSparkStats,
+    DSparkTapCollector,
+)
 from runtime.sampler import SamplingParams
 
 
@@ -442,6 +447,172 @@ def test_sparse_q_shape_mismatch_fails_closed():
 
 def test_runtime_quantized_cap_constant_is_four():
     assert MAX_QUANTIZED_PROPOSALS == 4
+
+
+def _adaptive_policy_decoder(*, minimum=4, threshold=1.0):
+    decoder = DFlash2SpeculativeDecoder.__new__(
+        DFlash2SpeculativeDecoder)
+    decoder.native_mtp_fallback = True
+    decoder.fallback_min_dflash_rounds = minimum
+    decoder.fallback_min_accepted_per_round = threshold
+    decoder._proposal_mode = "dflash2"
+    decoder._round_source = "D"
+    decoder._proposal_sources = []
+    decoder._dflash_rounds = 0
+    decoder._dflash_proposed = 0
+    decoder._dflash_accepted = 0
+    decoder._native_mtp_rounds = 0
+    decoder._native_mtp_proposed = 0
+    decoder._native_mtp_accepted = 0
+    decoder._fallback_switch_round = 0
+    return decoder
+
+
+def test_adaptive_fallback_switches_only_from_verified_productivity():
+    decoder = _adaptive_policy_decoder()
+    for accepted in (1, 1, 0):
+        decoder._proposal_sources.append("D")
+        decoder._note_verified_round(4, accepted)
+        assert decoder._proposal_mode == "dflash2"
+
+    decoder._proposal_sources.append("D")
+    decoder._note_verified_round(4, 0)
+    assert decoder._proposal_mode == "native-mtp"
+    assert decoder._fallback_switch_round == 4
+    assert decoder._dflash_proposed == 16
+    assert decoder._dflash_accepted == 2
+
+    decoder._round_source = "M"
+    decoder._proposal_sources.append("M")
+    decoder._note_verified_round(1, 1)
+    assert decoder._native_mtp_rounds == 1
+    assert decoder._native_mtp_proposed == 1
+    assert decoder._native_mtp_accepted == 1
+
+
+def test_adaptive_fallback_does_not_switch_at_threshold_or_without_opt_in():
+    decoder = _adaptive_policy_decoder()
+    for _ in range(4):
+        decoder._proposal_sources.append("D")
+        decoder._note_verified_round(4, 1)
+    assert decoder._proposal_mode == "dflash2"
+
+    decoder = _adaptive_policy_decoder(threshold=4.0)
+    decoder.native_mtp_fallback = False
+    for _ in range(8):
+        decoder._proposal_sources.append("D")
+        decoder._note_verified_round(4, 0)
+    assert decoder._proposal_mode == "dflash2"
+
+
+def test_native_mtp_fallback_releases_dflash_context_and_owns_q():
+    class FakeMTP:
+        def prepare_request_weights(self):
+            return {"plain": mx.ones((2,), dtype=mx.bfloat16)}
+
+        def draft_step(self, hidden, pending, _kv, offset, weights):
+            assert hidden.shape == (1, 1, 2)
+            assert pending == 7 and offset == 12
+            assert weights["plain"].dtype == mx.bfloat16
+            return mx.array([0.0, 1.0, 4.0, 2.0]), hidden
+
+        def release_request_weights(self, weights):
+            resident = sum(value.nbytes for value in weights.values())
+            weights.clear()
+            return {"resident_bytes": resident}
+
+    decoder = DFlash2SpeculativeDecoder.__new__(
+        DFlash2SpeculativeDecoder)
+    decoder._native_mtp_drafter = FakeMTP()
+    decoder._mtp_kv = object()
+    decoder.target = SimpleNamespace(
+        _h_last=mx.zeros((1, 1, 2)),
+        cache=SimpleNamespace(stats=SimpleNamespace(bytes_read=19)),
+    )
+    decoder._draft_context_released = False
+    decoder._native_mtp_load_s = 0.0
+    decoder._native_mtp_release_s = 0.0
+    decoder._native_mtp_read_bytes = 0
+    decoder._native_mtp_loaded_bytes = 0
+    decoder._native_mtp_released_bytes = 0
+    decoder._proposal_sources = []
+    decoder._candidate_rounds = []
+    decoder._unary_rounds = []
+    decoder._round_source = ""
+    caches = [CtxCache()]
+    values = mx.ones((1, 1, 3, 1))
+    caches[0].append(values, values, position_start=10)
+
+    proposals, distributions = decoder._propose_native_mtp(
+        7, 13, caches, SamplingParams(temperature=0.0), [1, 7])
+
+    assert proposals == [2]
+    assert distributions is None
+    assert caches[0].k is None and caches[0].v is None
+    assert decoder._proposal_sources == ["M"]
+    assert decoder._round_source == "M"
+    assert decoder._native_mtp_loaded_bytes == 4
+    assert decoder._native_mtp_released_bytes == 4
+
+
+def test_dflash_context_cpu_suspend_restore_is_bit_exact():
+    decoder = DFlash2SpeculativeDecoder.__new__(
+        DFlash2SpeculativeDecoder)
+    decoder._draft_context_released = False
+    caches = [CtxCache(), CtxCache()]
+    original = []
+    for layer, cache in enumerate(caches):
+        bits = mx.array(
+            np.arange(16, dtype=np.uint16).reshape(1, 2, 4, 2)
+            + 100 * layer,
+        )
+        k = bits.view(mx.bfloat16)
+        v = (bits + 17).view(mx.bfloat16)
+        cache.append(k, v, position_start=23)
+        original.append((
+            np.array(k.view(mx.uint16), copy=True),
+            np.array(v.view(mx.uint16), copy=True),
+        ))
+    stats = DSparkStats()
+
+    snapshot = decoder._suspend_draft_context(caches, stats)
+
+    assert all(cache.k is None and cache.v is None for cache in caches)
+    assert [cache.position_start for cache in caches] == [23, 23]
+    assert [cache.position_end for cache in caches] == [27, 27]
+    assert stats.draft_context_suspend_rounds == 1
+    assert stats.draft_context_suspended_bytes == 128
+
+    decoder._restore_draft_context(caches, snapshot, stats)
+
+    assert stats.draft_context_restore_rounds == 1
+    for cache, (expected_k, expected_v) in zip(
+        caches, original, strict=True,
+    ):
+        np.testing.assert_array_equal(
+            np.array(cache.k.view(mx.uint16)), expected_k)
+        np.testing.assert_array_equal(
+            np.array(cache.v.view(mx.uint16)), expected_v)
+        assert cache.position_start == 23
+        assert cache.position_end == 27
+
+
+def test_dflash_context_cpu_snapshot_is_discarded_after_source_switch():
+    decoder = DFlash2SpeculativeDecoder.__new__(
+        DFlash2SpeculativeDecoder)
+    decoder._draft_context_released = False
+    cache = CtxCache()
+    value = mx.ones((1, 1, 3, 2), dtype=mx.bfloat16)
+    cache.append(value, value, position_start=10)
+    stats = DSparkStats()
+
+    snapshot = decoder._suspend_draft_context([cache], stats)
+    decoder._discard_suspended_draft_context([cache], snapshot)
+
+    assert cache.k is None and cache.v is None
+    assert cache.position_start is None and cache.position_end == 0
+    assert decoder._draft_context_released is True
+    assert stats.draft_context_restore_rounds == 0
 
 
 def test_greedy_candidate_recall_counts_only_progress_decisions():

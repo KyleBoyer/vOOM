@@ -150,8 +150,11 @@ class PagedKVCache:
     def update(self, layer: int, k: mx.array, v: mx.array) -> tuple[mx.array, mx.array]:
         self._append_layer(layer, k, v)
 
-        if layer == self.num_layers - 1:
-            self._offset += k.shape[2]
+        # Match KVCache's global-position contract: mixed-depth Qwen prefill
+        # can retain the complete prefix in an early attention layer while a
+        # later layer stores only a compact suffix. The global endpoint is the
+        # longest local layer, not specifically the final model layer.
+        self._offset = max(self._offset, self.layer_positions(layer))
         # Enforce after every layer, not only the final one. Chunk-major
         # execution reaches the final layer before the next chunk, but exact
         # layer-stationary prefill completes one layer's entire context before
@@ -295,6 +298,95 @@ class PagedKVCache:
     @property
     def offset(self) -> int:
         return self._offset
+
+    def layer_lengths(self) -> tuple[int, ...]:
+        """Return each layer's exact local append length.
+
+        Hybrid Qwen speculative verification updates only full-attention
+        layers.  Exposing the same checkpoint surface as ``KVCache`` lets its
+        target-authoritative rollback keep paged K/V and recurrent KDA state
+        aligned without materializing the whole prefix.
+        """
+        return tuple(
+            self.layer_positions(layer) for layer in range(self.num_layers))
+
+    @staticmethod
+    def _unlink_pages(pages: list[_Page]) -> None:
+        for page in pages:
+            if page.path is None:
+                continue
+            try:
+                page.path.unlink()
+            except FileNotFoundError:
+                pass
+
+    def _trim_layer_to(self, layer: int, target: int) -> None:
+        current = self.layer_positions(layer)
+        if not 0 <= target <= current:
+            raise ValueError("cannot grow paged KV during rollback")
+        if target == current:
+            return
+        pages = self._pages[layer]
+        tail_k, tail_v = self._tail_k[layer], self._tail_v[layer]
+        if target == 0:
+            self._unlink_pages(pages)
+            self._pages[layer] = []
+            self._tail_k[layer] = None
+            self._tail_v[layer] = None
+            return
+
+        full_pages, partial = divmod(target, self.page_positions)
+        if full_pages > len(pages):
+            raise RuntimeError("paged KV rollback geometry is inconsistent")
+        if partial:
+            if full_pages < len(pages):
+                source = pages[full_pages]
+                if not source.resident:
+                    started = time.perf_counter()
+                    next_k, next_v = source.load()
+                    self.stats.reloads += 1
+                    self.stats.reload_s += time.perf_counter() - started
+                else:
+                    next_k, next_v = source.k, source.v
+            else:
+                if tail_k is None:
+                    raise RuntimeError("paged KV rollback omitted its tail")
+                next_k, next_v = tail_k, tail_v
+            new_tail_k = next_k[:, :, :partial, :]
+            new_tail_v = next_v[:, :, :partial, :]
+        else:
+            if tail_k is None:
+                raise RuntimeError("paged KV rollback omitted tail geometry")
+            new_tail_k = tail_k[:, :, :0, :]
+            new_tail_v = tail_v[:, :, :0, :]
+
+        removed = pages[full_pages:]
+        self._pages[layer] = pages[:full_pages]
+        self._tail_k[layer] = new_tail_k
+        self._tail_v[layer] = new_tail_v
+        mx.eval(new_tail_k, new_tail_v)
+        self._unlink_pages(removed)
+
+    def trim_layer_lengths(self, lengths) -> None:
+        """Roll every paged attention layer back to checkpoint-local lengths."""
+        targets = tuple(int(value) for value in lengths)
+        if len(targets) != self.num_layers or any(value < 0 for value in targets):
+            raise ValueError("invalid per-layer paged KV rollback lengths")
+        for layer, target in enumerate(targets):
+            self._trim_layer_to(layer, target)
+        self._offset = max(targets, default=0)
+        mx.clear_cache()
+
+    def trim(self, length: int) -> None:
+        """Roll all populated layers back to one absolute sequence length."""
+        length = int(length)
+        if length < 0 or length > self.offset:
+            raise ValueError("invalid paged KV trim length")
+        self.trim_layer_lengths(tuple(
+            min(self.layer_positions(layer), length)
+            for layer in range(self.num_layers)
+        ))
+        self._offset = length
 
     def nbytes(self) -> int:
         """Resident bytes only (spilled pages cost disk, not RAM)."""

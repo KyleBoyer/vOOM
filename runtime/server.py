@@ -1223,6 +1223,8 @@ class EngineManager:
             "VMODEL_QWEN_DFLASH2_FUSED_DYNAMIC_CONV", "0").strip()
         dflash2_ablation_direction_request = os.environ.get(
             "VMODEL_QWEN_DFLASH2_ABLATION_DIRECTION", "").strip()
+        dflash2_native_mtp_fallback_request = os.environ.get(
+            "VMODEL_QWEN_DFLASH2_NATIVE_MTP_FALLBACK", "0").strip()
         try:
             qwen_mtp_max_prompt_tokens = int(os.environ.get(
                 "VMODEL_QWEN_MTP_MAX_PROMPT_TOKENS", "32768"))
@@ -1246,6 +1248,10 @@ class EngineManager:
                 "VMODEL_QWEN_DFLASH2_LOAD_MARGIN_MB", "400"))
             dflash2_ablation_strength = float(os.environ.get(
                 "VMODEL_QWEN_DFLASH2_ABLATION_STRENGTH", "1"))
+            dflash2_fallback_min_rounds = int(os.environ.get(
+                "VMODEL_QWEN_DFLASH2_FALLBACK_MIN_ROUNDS", "4"))
+            dflash2_fallback_min_accepted_per_round = float(os.environ.get(
+                "VMODEL_QWEN_DFLASH2_FALLBACK_MIN_ACCEPTED_PER_ROUND", "1"))
         except ValueError as error:
             raise RequestValidationError(
                 "VMODEL Qwen MTP/DFlash2 settings must be numeric"
@@ -1295,6 +1301,19 @@ class EngineManager:
         if dflash2_fused_dynamic_conv_request not in ("0", "1"):
             raise RequestValidationError(
                 "VMODEL_QWEN_DFLASH2_FUSED_DYNAMIC_CONV must be 0 or 1")
+        if dflash2_native_mtp_fallback_request not in ("0", "1"):
+            raise RequestValidationError(
+                "VMODEL_QWEN_DFLASH2_NATIVE_MTP_FALLBACK must be 0 or 1")
+        if dflash2_fallback_min_rounds <= 0:
+            raise RequestValidationError(
+                "VMODEL_QWEN_DFLASH2_FALLBACK_MIN_ROUNDS must be positive")
+        if (
+            not math.isfinite(dflash2_fallback_min_accepted_per_round)
+            or not 0.0 <= dflash2_fallback_min_accepted_per_round <= 4.0
+        ):
+            raise RequestValidationError(
+                "VMODEL_QWEN_DFLASH2_FALLBACK_MIN_ACCEPTED_PER_ROUND "
+                "must be in [0, 4]")
         if not math.isfinite(dflash2_ablation_strength) or not (
             0.0 < dflash2_ablation_strength <= 2.0
         ):
@@ -1705,6 +1724,9 @@ class EngineManager:
             dflash2_ablation_direction_request,
             dflash2_ablation_strength.hex(),
             dflash2_load_margin_mb,
+            dflash2_native_mtp_fallback_request,
+            dflash2_fallback_min_rounds,
+            dflash2_fallback_min_accepted_per_round.hex(),
             qwen_mtp_request,
             qwen_mtp_ngram_first_request,
             qwen_mtp_max_prompt_tokens,
@@ -1790,6 +1812,9 @@ class EngineManager:
             dflash2_ablation_direction_request,
             dflash2_ablation_strength.hex(),
             dflash2_load_margin_mb,
+            dflash2_native_mtp_fallback_request,
+            dflash2_fallback_min_rounds,
+            dflash2_fallback_min_accepted_per_round.hex(),
             qwen_mtp_request,
             qwen_mtp_ngram_first_request,
             qwen_mtp_max_prompt_tokens,
@@ -2936,9 +2961,9 @@ class EngineManager:
                 except ValueError as error:
                     raise ValueError(
                         "VMODEL_QWEN35_KV limits must be integers") from error
-                if qwen35_kv_max_mb and not 128 <= qwen35_kv_max_mb <= 6000:
+                if qwen35_kv_max_mb and not 64 <= qwen35_kv_max_mb <= 6000:
                     raise ValueError(
-                        "VMODEL_QWEN35_KV_MAX_MB must be 0 or in [128, 6000]")
+                        "VMODEL_QWEN35_KV_MAX_MB must be 0 or in [64, 6000]")
                 if not 1 <= qwen35_kv_chunk <= 512:
                     raise ValueError(
                         "VMODEL_QWEN35_KV_PREFILL_CHUNK_SIZE must be in "
@@ -4319,6 +4344,12 @@ class EngineManager:
                         ablation_direction_dir=(
                             dflash2_ablation_direction_request or None),
                         ablation_strength=dflash2_ablation_strength,
+                        native_mtp_fallback=(
+                            dflash2_native_mtp_fallback_request == "1"),
+                        fallback_min_dflash_rounds=(
+                            dflash2_fallback_min_rounds),
+                        fallback_min_accepted_per_round=(
+                            dflash2_fallback_min_accepted_per_round),
                     )
                     print(
                         f"[server] target-verified DFlash2 speculation: "
@@ -4332,6 +4363,12 @@ class EngineManager:
                         f"{dflash2_fused_dynamic_conv_request} "
                         f"ablation={'on' if dflash2_ablation_direction_request else 'off'} "
                         f"ablation_strength={dflash2_ablation_strength:g} "
+                        f"native_mtp_fallback="
+                        f"{dflash2_native_mtp_fallback_request} "
+                        f"fallback_min_rounds="
+                        f"{dflash2_fallback_min_rounds} "
+                        f"fallback_min_accepts="
+                        f"{dflash2_fallback_min_accepted_per_round:g} "
                         f"load_margin={dflash2_load_margin_mb}MB",
                         flush=True,
                     )
@@ -8071,12 +8108,29 @@ def _vision_protocol_timing(result: dict) -> dict:
         "dflash2_candidate_recall_hits",
         "dflash2_unary_recall_positions",
         "dflash2_unary_recall_hits",
+        "dflash2_native_mtp_fallback_enabled",
+        "dflash2_native_mtp_fallback_switched",
+        "dflash2_native_mtp_fallback_switch_round",
+        "dflash2_native_mtp_fallback_min_rounds",
+        "dflash2_rounds",
+        "dflash2_proposed",
+        "dflash2_accepted",
+        "dflash2_fallback_native_mtp_rounds",
+        "dflash2_fallback_native_mtp_proposed",
+        "dflash2_fallback_native_mtp_accepted",
+        "dflash2_fallback_native_mtp_read_bytes",
+        "dflash2_fallback_native_mtp_loaded_bytes",
+        "dflash2_fallback_native_mtp_released_bytes",
         "dspark_sidecar_round_loads",
         "dspark_sidecar_round_releases",
         "dspark_sidecar_loaded_bytes",
         "dspark_sidecar_released_active_bytes",
         "dspark_deferred_context_positions",
         "dspark_deferred_context_bytes_peak",
+        "dspark_draft_context_suspend_rounds",
+        "dspark_draft_context_restore_rounds",
+        "dspark_draft_context_suspended_bytes",
+        "dspark_draft_context_released_active_bytes",
         "qwen_mtp_enabled",
         "qwen_mtp_used",
         "qwen_mtp_proposed",
@@ -8223,9 +8277,14 @@ def _vision_protocol_timing(result: dict) -> dict:
         "qwen_mtp_draft_reranked_lm_head_candidate_recall",
         "dflash2_candidate_recall",
         "dflash2_unary_recall",
+        "dflash2_native_mtp_fallback_min_accepted_per_round",
+        "dflash2_fallback_native_mtp_load_s",
+        "dflash2_fallback_native_mtp_release_s",
         "dspark_context_s",
         "dspark_sidecar_load_s",
         "dspark_sidecar_release_s",
+        "dspark_draft_context_suspend_s",
+        "dspark_draft_context_restore_s",
         "resident_persistent_prompt_cache_load_s",
         "resident_persistent_prompt_cache_save_s",
         "disk_prompt_lookup_s",
@@ -8241,6 +8300,7 @@ def _vision_protocol_timing(result: dict) -> dict:
         "speculative_kind",
         "dflash2_proposal_policy",
         "dflash2_target_verifier",
+        "dflash2_proposal_sources",
         "kimi_k3_prefill_tile_policy",
         "kimi_k3_prefill_schedule",
     ):
@@ -8259,6 +8319,11 @@ def _vision_protocol_timing(result: dict) -> dict:
         "qwen_mtp_q_policy",
         "qwen_mtp_engine_identity",
         "qwen_mtp_proposal_q_replay",
+        "speculative_round_proposed",
+        "speculative_round_accepted",
+        "speculative_round_draft_s",
+        "speculative_round_verify_s",
+        "speculative_round_context_s",
     ):
         if key in stats or key in result:
             value[key] = metric(key)

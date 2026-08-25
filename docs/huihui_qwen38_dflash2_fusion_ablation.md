@@ -120,3 +120,50 @@ performance stop.
   shapes, not one pinned capture.
 - Refuse any run that crosses the 8.5GB Metal or swap-growth gates.
 - Do not lower the 5.3GB system reserve to make a sidecar fit.
+
+## Adaptive DFlash2 to native-MTP fallback (2026-08-25)
+
+The serving adapter now has a target-verified, default-off productivity gate:
+
+```bash
+export VMODEL_QWEN_DFLASH2_NATIVE_MTP_FALLBACK=1
+export VMODEL_QWEN_DFLASH2_FALLBACK_MIN_ROUNDS=4
+export VMODEL_QWEN_DFLASH2_FALLBACK_MIN_ACCEPTED_PER_ROUND=1
+```
+
+Only acceptance measured by the authoritative target can trigger the switch.
+After a switch, the released-BF16 native MTP sidecar is loaded for one proposal
+round and released before the target verifier.  The proposal source therefore
+changes efficiency only: target verification and exact stochastic `p/q`
+correction continue to define the served distribution.  The adapter also moves
+DFlash2's BF16 context K/V to bit-preserving CPU `uint16` storage between the
+draft and target sweeps, restoring it only if the next round still uses
+DFlash2.  Per-round proposed/accepted counts, draft/verify/context time, source
+trace, switch point, sidecar bytes, and context suspend/restore bytes and time
+are emitted through the API timing object.
+
+The unmodified 134-tool, 6,339-input-token, max-64 capture completed with this
+hybrid path, but it is a performance **STOP**:
+
+| Path | Wall | Decode | Output | Target sweeps | Accepted / proposed | Decode reads | Peak Metal |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| Native BF16 MTP | 201.7076s | 141.4487s | 35 | 19 | 16 / 19 | 264.855GB | 3.906GB |
+| DFlash2 then native MTP | 272.4593s | 210.3759s | 42 | 28 | 14 / 36 | 444.630GB | 3.677GB |
+
+The hybrid switched after four DFlash2 rounds (`DDDD` then 24 native-MTP
+rounds).  DFlash2 accepted 3/12; the fallback accepted 11/24.  The successful
+admission required an unpinned 675MB LM head, which amplified verifier reads;
+the run read 460.005GB total versus 278.001GB for the native baseline.  A
+subsequent unit-gated fix corrected the fallback draft RoPE position from the
+target endpoint to the last committed token.  The table intentionally reports
+the measured pre-fix run, not an unmeasured speed claim.  Even perfecting its
+fallback acceptance cannot recover the large unpinned-head read penalty, and
+the first four DFlash2 rounds were already less productive than native MTP.
+
+Exact paged-KV admission experiments at 128MB and 64MB exposed and fixed two
+general correctness gaps: speculative rollback can now truncate individual
+spilled layer pages without materializing the whole prefix, and the global
+cache offset is the maximum populated layer length during mixed-depth Qwen
+prefill.  Those smaller caps did not clear the live DFlash2 memory gate; 64MB
+increased transient page reload/materialization pressure.  They remain
+explicit opt-ins, while the native-MTP profile stays the selected fast path.

@@ -139,6 +139,9 @@ def _run_arm(
     fused_dynamic_conv: bool,
     ablation_direction: Path | None,
     ablation_strength: float,
+    native_mtp_fallback: bool,
+    fallback_min_rounds: int,
+    fallback_min_accepted_per_round: float,
 ) -> dict[str, object]:
     manager = EngineManager()
     wrapper = None
@@ -159,6 +162,10 @@ def _run_arm(
                 fused_dynamic_conv=fused_dynamic_conv,
                 ablation_direction_dir=ablation_direction,
                 ablation_strength=ablation_strength,
+                native_mtp_fallback=native_mtp_fallback,
+                fallback_min_dflash_rounds=fallback_min_rounds,
+                fallback_min_accepted_per_round=(
+                    fallback_min_accepted_per_round),
             )
             if force_reject:
                 mask_token = int(wrapper.decoder._cfg.mask_token_id)
@@ -192,6 +199,12 @@ def _run_arm(
             "ablation_strength": (
                 ablation_strength if mode == "spec" and ablation_direction
                 else None),
+            "native_mtp_fallback": (
+                bool(native_mtp_fallback) if mode == "spec" else None),
+            "fallback_min_rounds": (
+                fallback_min_rounds if mode == "spec" else None),
+            "fallback_min_accepted_per_round": (
+                fallback_min_accepted_per_round if mode == "spec" else None),
             "prompt_sha256": hashlib.sha256(prompt.encode()).hexdigest(),
             "max_tokens": max_tokens,
             "cap": cap if mode == "spec" else 0,
@@ -232,10 +245,18 @@ def main() -> int:
     parser.add_argument("--fused-dynamic-conv", action="store_true")
     parser.add_argument("--ablation-direction", type=Path)
     parser.add_argument("--ablation-strength", type=float, default=1.0)
+    parser.add_argument("--native-mtp-fallback", action="store_true")
+    parser.add_argument("--fallback-min-rounds", type=int, default=4)
+    parser.add_argument(
+        "--fallback-min-accepted-per-round", type=float, default=1.0)
     parser.add_argument("--result", type=Path)
     args = parser.parse_args()
     if args.max_tokens < 2:
         parser.error("max-tokens must be at least 2")
+    if args.fallback_min_rounds <= 0:
+        parser.error("fallback-min-rounds must be positive")
+    if not 0 <= args.fallback_min_accepted_per_round <= 4:
+        parser.error("fallback-min-accepted-per-round must be in [0, 4]")
     target = args.target.expanduser().resolve()
     draft = args.draft.expanduser().resolve()
     if not (target / "config.json").is_file():
@@ -251,7 +272,10 @@ def main() -> int:
             prompt=args.prompt, max_tokens=args.max_tokens, cap=args.cap,
             force_reject=False, proposal_policy=args.proposal_policy,
             fused_dynamic_conv=False, ablation_direction=None,
-            ablation_strength=1.0))
+            ablation_strength=1.0, native_mtp_fallback=False,
+            fallback_min_rounds=args.fallback_min_rounds,
+            fallback_min_accepted_per_round=(
+                args.fallback_min_accepted_per_round)))
     if args.mode in ("spec", "compare"):
         arms.append(_run_arm(
             mode="spec", target_path=target, draft_path=draft,
@@ -262,7 +286,11 @@ def main() -> int:
             ablation_direction=(
                 args.ablation_direction.expanduser().resolve()
                 if args.ablation_direction else None),
-            ablation_strength=args.ablation_strength))
+            ablation_strength=args.ablation_strength,
+            native_mtp_fallback=args.native_mtp_fallback,
+            fallback_min_rounds=args.fallback_min_rounds,
+            fallback_min_accepted_per_round=(
+                args.fallback_min_accepted_per_round)))
 
     report: dict[str, object] = {
         "schema": "voom.qwen38-dflash2-gate.v1",
