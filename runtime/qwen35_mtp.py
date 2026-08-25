@@ -1364,6 +1364,11 @@ class QwenMTPSpeculativeEngine:
         native_tree_paths_committed = 0
         native_tree_factor_bytes_peak = 0
         native_tree_factor_commit_s = 0.0
+        greedy_target_rank_counts_by_step = [
+            [0] * (self.proposal_replay_top_k + 1)
+            for _ in range(self.depth)
+        ]
+        greedy_rescuable_rejections_by_step = [0] * self.depth
         proposal_replay_records: list[dict] = []
         sidecar_round_loads = 0
         sidecar_round_releases = 0
@@ -1610,6 +1615,7 @@ class QwenMTPSpeculativeEngine:
                 draft_tokens: list[int] = []
                 draft_probabilities: list[mx.array | None] = []
                 draft_rank_probabilities: list[mx.array | None] = []
+                draft_ranked_tokens: list[tuple[int, ...] | None] = []
                 draft_hidden = h_last
                 draft_input_token = catchup_tok
                 round_mtp_weights: dict | None = None
@@ -1696,6 +1702,7 @@ class QwenMTPSpeculativeEngine:
                         draft_probabilities.extend([None] * len(ngram_tokens))
                         draft_rank_probabilities.extend(
                             [None] * len(ngram_tokens))
+                        draft_ranked_tokens.extend([None] * len(ngram_tokens))
 
                     draft_constraint = None
                     if (self.grammar_aware_draft
@@ -1720,7 +1727,7 @@ class QwenMTPSpeculativeEngine:
                                 if (round_native_tree or (
                                     self.grammar_aware_draft
                                     and constraint is not None
-                                )):
+                                ) or self.proposal_replay_top_k):
                                     step_logits = self.drafter.draft_logits(
                                         draft_hidden, draft_input_token, mtp_kv,
                                         round_start_offset - 1,
@@ -1756,6 +1763,7 @@ class QwenMTPSpeculativeEngine:
 
                         step_rank_probabilities = None
                         step_probabilities = None
+                        step_ranked_tokens = None
                         if sampling.is_greedy:
                             if draft_tok is None:
                                 # The target already applies this exact grammar
@@ -1780,6 +1788,17 @@ class QwenMTPSpeculativeEngine:
                                     grammar_masked_draft_tokens += 1
                                     if step == 0:
                                         grammar_masked_draft_rounds += 1
+                                if self.proposal_replay_top_k:
+                                    rank_count = min(
+                                        self.proposal_replay_top_k,
+                                        int(step_logits.size),
+                                    )
+                                    ranked = mx.argsort(
+                                        step_logits.reshape(-1))[::-1][
+                                            :rank_count]
+                                    mx.eval(ranked)
+                                    step_ranked_tokens = tuple(
+                                        int(token) for token in ranked.tolist())
                                 draft_tok = int(mx.argmax(step_logits))
                         else:
                             if step_logits is None:
@@ -1809,6 +1828,7 @@ class QwenMTPSpeculativeEngine:
                         draft_tokens.append(int(draft_tok))
                         draft_probabilities.append(step_probabilities)
                         draft_rank_probabilities.append(step_rank_probabilities)
+                        draft_ranked_tokens.append(step_ranked_tokens)
                         draft_input_token = int(draft_tok)
                         if (sampling.is_greedy
                                 and draft_constraint is not None):
@@ -2010,12 +2030,29 @@ class QwenMTPSpeculativeEngine:
                         else:
                             verified_by_step[step] += 1
                         if sampling.is_greedy:
-                            draft_accepted = (
-                                int(mx.argmax(authoritative_logits)) == draft_tok)
+                            target_winner = int(mx.argmax(authoritative_logits))
+                            draft_accepted = target_winner == draft_tok
                             true_tok = (
                                 draft_tok if draft_accepted
-                                else int(mx.argmax(authoritative_logits))
+                                else target_winner
                             )
+                            if (self.proposal_replay_top_k
+                                    and round_proposal_source == "M"):
+                                ranked_tokens = draft_ranked_tokens[step]
+                                if ranked_tokens is None:
+                                    raise RuntimeError(
+                                        "greedy proposal-rank capture omitted "
+                                        "draft candidates")
+                                try:
+                                    target_rank = (
+                                        ranked_tokens.index(target_winner) + 1)
+                                except ValueError:
+                                    target_rank = 0
+                                greedy_target_rank_counts_by_step[
+                                    step][target_rank] += 1
+                                if not draft_accepted and target_rank > 1:
+                                    greedy_rescuable_rejections_by_step[
+                                        step] += 1
                         else:
                             step_probabilities = draft_probabilities[step]
                             if step_probabilities is None:
@@ -2600,6 +2637,10 @@ class QwenMTPSpeculativeEngine:
         if self.proposal_replay_top_k:
             path_stats["qwen_mtp_proposal_q_replay"] = (
                 proposal_replay_records)
+            path_stats["qwen_mtp_greedy_target_rank_counts_by_step"] = (
+                greedy_target_rank_counts_by_step)
+            path_stats["qwen_mtp_greedy_rescuable_rejections_by_step"] = (
+                greedy_rescuable_rejections_by_step)
         if not proposed:
             path_stats["qwen_mtp_fallback_reason"] = (
                 "terminal-during-plain-warmup")

@@ -263,6 +263,39 @@ def test_qwen_scalar_delta_factors_commit_tree_path_array_equal():
     assert bool(mx.array_equal(actual_history, expected_history))
 
 
+def test_qwen_scalar_delta_factors_commit_every_prefix_array_equal():
+    config = _hf_config()
+    real = Qwen3_5MoeGatedDeltaNet(config, layer_idx=0)
+    _randomize(real, 45)
+    with torch.no_grad():
+        real.A_log.copy_(torch.log(
+            torch.empty_like(real.A_log).uniform_(1.0, 8.0)))
+    torch.manual_seed(46)
+    hidden = torch.randn(1, 4, HIDDEN)
+    prefix = "model.layers.0"
+    weights = _mx_state(real, f"{prefix}.linear_attn")
+    runtime = _runtime_config()
+
+    base = KDAStateCache(2)
+    live = base.fork()
+    live.begin_factor_capture()
+    expected = []
+    for position in range(4):
+        _gated_delta_net(
+            mx.array(hidden[:, position:position + 1].numpy()),
+            weights, prefix, runtime, live, 0)
+        expected.append(live.fork())
+    factors = live.finish_factor_capture(4)
+    assert factors is not None
+
+    for count, endpoint in enumerate(expected, start=1):
+        committed = factors.commit_prefix(base, count)
+        mx.eval(committed.state(0), endpoint.state(0))
+        assert bool(mx.array_equal(committed.state(0), endpoint.state(0)))
+        assert bool(mx.array_equal(
+            committed.conv_history(0)[0], endpoint.conv_history(0)[0]))
+
+
 def test_qwen_tree_attention_nodes_and_commit_match_sequential_paths():
     config = _hf_config()
     real = Qwen3_5MoeAttention(config, layer_idx=1)

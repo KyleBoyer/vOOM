@@ -177,7 +177,8 @@ class KDAFactorWindow:
                         step.beta,
                         state,
                     )
-                else:
+                elif step.gate.ndim == step.key.ndim:
+                    # Kimi KDA: one decay value per key channel.
                     state = state * mx.exp(step.gate)[..., None]
                     pred_v = mx.sum(
                         step.key[..., None] * state, axis=-2)
@@ -185,6 +186,21 @@ class KDAFactorWindow:
                     state = state + (
                         step.beta[..., None] * step.key
                     )[..., None] * residual[..., None, :]
+                elif step.gate.ndim == step.key.ndim - 1:
+                    # Qwen DeltaNet: one scalar decay per value head. Match
+                    # ordinary one-token decode and commit_indices exactly,
+                    # including its per-position evaluation boundary.
+                    state = state * mx.exp(step.gate)[..., None, None]
+                    predicted = mx.sum(
+                        step.key[..., None] * state, axis=-2)
+                    delta = (
+                        step.value - predicted
+                    ) * step.beta[..., None]
+                    state = state + (
+                        step.key[..., None] * delta[..., None, :])
+                    mx.eval(state)
+                else:
+                    raise ValueError("unsupported KDA factor gate geometry")
             mx.eval(state)
             result.set_state(layer, state)
             result.set_conv_history(

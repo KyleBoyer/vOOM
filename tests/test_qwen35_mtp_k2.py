@@ -315,6 +315,48 @@ def test_k2_accept_prefixes_match_ordinary_state_oracle(
     assert stats["qwen_mtp_draft_kv_rollbacks"] == int(mtp_length < 2)
 
 
+def test_k2_greedy_rank_capture_identifies_rescuable_second_choice():
+    class _RankedDrafter(_RecurrentDrafter):
+        def draft_step(self, hidden, token, mtp_kv, offset, _weights=None):
+            step = len(self.calls)
+            self.mtp_kv = mtp_kv
+            self.calls.append({
+                "hidden": float(hidden.reshape(-1)[0].item()),
+                "token": int(token),
+                "offset": int(offset),
+            })
+            item = mx.full((1, 1, 1, 1), float(step + 1))
+            mtp_kv.update(0, item, item)
+            primary, secondary = ((10, 6), (11, 7))[step]
+            logits = mx.full((16,), -100.0)
+            logits = logits.at[primary].add(300.0)
+            logits = logits.at[secondary].add(200.0)
+            return logits, mx.array([[[1000.0 + step]]])
+
+    target = _Target(1)
+    engine = QwenMTPSpeculativeEngine(
+        target,
+        max_prompt_tokens=8,
+        min_output_tokens=2,
+        plain_warmup_tokens=0,
+        adaptive_stop=False,
+        depth=2,
+        proposal_replay_top_k=3,
+    )
+    engine.drafter = _RankedDrafter()
+
+    result = engine.generate("x", 3)
+
+    assert result["tokens"] == [4, 10, 7]
+    stats = result["path_stats"]
+    assert stats["qwen_mtp_greedy_target_rank_counts_by_step"] == [
+        [0, 1, 0, 0],
+        [0, 0, 1, 0],
+    ]
+    assert stats["qwen_mtp_greedy_rescuable_rejections_by_step"] == [0, 1]
+    assert stats["qwen_mtp_proposal_q_replay"] == []
+
+
 @pytest.mark.parametrize("accepted_prefix", range(5))
 def test_k4_every_accepted_prefix_matches_ordinary_state_oracle(
     accepted_prefix,

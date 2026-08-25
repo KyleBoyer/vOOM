@@ -144,6 +144,50 @@ sibling branch but did not reduce the six target sweeps; the in-process wall
 regressed from 51.526s to 55.983s despite identical output.  The serial
 depth-four chain therefore remains the selected speculative topology.
 
+Two further composition probes were also rejected.  A depth-four n-gram-first
+cascade preserved the output but found prompt/history matches in only 3/8
+rounds, accepted 2/12 n-gram proposals, increased target sweeps from six to
+eight, and regressed wall from 54.417s to 69.668s while target reads rose from
+83.548GB to 107.779GB.  Increasing prefetch depth from the selected two to
+three or four likewise did not reduce measured prefetch wait or parallel-tier
+service time.  Depth four then failed closed on an immediate repeat when
+available memory fell below the configured floor.  N-gram-first remains off
+for this workload and prefetch depth two remains the safe measured setting.
+
+Batching the five verifier rows on full-attention layers was also rejected.
+It preserved the complete unrelated science-answer hash and the 15/52 native
+MTP acceptance pattern, but decode was 98.232s versus 97.191s for the existing
+batched-MLP schedule.  Its 208 batched attention calls consumed only 1.391s,
+too little leverage to overcome storage/prefetch variance.  No full-attention
+batching flag remains in the runtime.
+
+Batching DeltaNet projections/convolution while retaining its per-token FP32
+recurrence was rejected as well.  A real MXFP4 oracle bounded activation,
+state, and convolution-history drift at every selectable prefix, and the live
+science answer and 15/52 MTP acceptance pattern stayed identical.  It was not
+a speed win: 624 batched DeltaNet calls consumed 8.551s and decode regressed
+from 97.191s to 104.716s.  The experimental runtime flag was removed.
+
+Compact Delta-factor rollback was rejected for the serial MTP chain.  The
+Qwen scalar-gate replay now has an array-equal oracle at every prefix, and the
+live candidate retained only 41.073MB of factors while reproducing the exact
+science-answer hash, 15/52 acceptance, and 13 target sweeps.  It nevertheless
+raised decode from 97.191s to 104.354s, spent 0.740s reconstructing 12
+prefixes, and moved peak Metal from 3.589GB to 3.640GB.  Factor capture's
+evaluation/storage interference outweighed the smaller rollback payload, so
+the serving flag was removed.  The low-level scalar-gate replay correction and
+oracle remain for future topology-aware tree work.
+
+A width-two sibling tree at every node of the depth-four native-MTP chain was
+also rejected.  It reproduced the exact science-answer hash and accepted
+16/104 proposals, one more token than the serial chain, but widened each target
+sweep from five to nine positions.  Thirteen sweeps therefore evaluated 117
+target positions instead of 65; decode rose from 97.191s to 116.164s, wall to
+131.904s, and swap-outs grew 17.203MB.  Batched MLP consumed 22.554s across the
+expanded verifier.  The multi-depth tree code was removed; the measured
+depth-one sibling tree and the serial depth-four chain remain separate,
+explicit candidates.
+
 The second adds a separately typed, checksummed prompt endpoint to the
 mixed-depth journal.  It records complete full-attention KV, every DeltaNet
 state and convolution history, the prompt logits, and the final hidden row

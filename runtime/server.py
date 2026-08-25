@@ -8415,6 +8415,8 @@ def _vision_protocol_timing(result: dict) -> dict:
         "qwen_mtp_q_policy",
         "qwen_mtp_engine_identity",
         "qwen_mtp_proposal_q_replay",
+        "qwen_mtp_greedy_target_rank_counts_by_step",
+        "qwen_mtp_greedy_rescuable_rejections_by_step",
         "speculative_round_proposed",
         "speculative_round_accepted",
         "speculative_round_draft_s",
