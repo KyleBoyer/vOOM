@@ -2450,6 +2450,12 @@ class QwenMTPSpeculativeEngine:
             "qwen_mtp_verifier_bonus_tokens": verifier_bonus_tokens,
             "qwen_mtp_draft_round_s": draft_round_s,
             "qwen_mtp_verifier_round_s": verifier_round_s,
+            "qwen_mtp_target_batched_mlp_layers": int(getattr(
+                tgt, "_qwen35_serial_verify_batched_mlp_layers", 0)),
+            "qwen_mtp_target_batched_mlp_positions": int(getattr(
+                tgt, "_qwen35_serial_verify_batched_mlp_positions", 0)),
+            "qwen_mtp_target_batched_mlp_s": float(getattr(
+                tgt, "_qwen35_serial_verify_batched_mlp_s", 0.0)),
             "qwen_mtp_plain_round_s": plain_round_s,
             "qwen_mtp_kda_endpoint_restores": kda_endpoint_restores,
             "qwen_mtp_refeed_sweeps_saved": refeed_sweeps_saved,

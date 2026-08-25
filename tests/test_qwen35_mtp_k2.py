@@ -615,6 +615,11 @@ def test_server_q_policy_is_strict_and_part_of_engine_cache_identity():
         with pytest.raises(RequestValidationError, match="must be 0 or 1"):
             EngineManager().get(Path("/tmp/not-opened"), "fast")
     with patch.dict(os.environ, {
+        "VMODEL_QWEN35_SERIAL_VERIFY_BATCHED_MLP": "yes",
+    }):
+        with pytest.raises(RequestValidationError, match="must be 0 or 1"):
+            EngineManager().get(Path("/tmp/not-opened"), "fast")
+    with patch.dict(os.environ, {
         "VMODEL_QWEN_MTP_TREE_WIDTH": "2",
         "VMODEL_QWEN_MTP_DEPTH": "2",
     }):
@@ -660,6 +665,7 @@ def test_server_q_policy_is_strict_and_part_of_engine_cache_identity():
         "VMODEL_QWEN_MTP_TREE_WIDTH": "0",
         "VMODEL_QWEN_MTP_GRAMMAR_AWARE_DRAFT": "0",
         "VMODEL_QWEN35_SERIAL_VERIFY_EXACT_PAGE_ADMISSION": "0",
+        "VMODEL_QWEN35_SERIAL_VERIFY_BATCHED_MLP": "0",
     }
     with patch.dict(os.environ, env), \
          patch("runtime.config.ModelConfig.from_dir", return_value=cfg), \
@@ -680,8 +686,10 @@ def test_server_q_policy_is_strict_and_part_of_engine_cache_identity():
             "VMODEL_QWEN35_SERIAL_VERIFY_EXACT_PAGE_ADMISSION"
         ] = "1"
         fifth = manager.get(Path("/tmp/fake-qwen-q-policy"), "fast")
-        os.environ["VMODEL_QWEN_MTP_GRAMMAR_AWARE_DRAFT"] = "1"
+        os.environ["VMODEL_QWEN35_SERIAL_VERIFY_BATCHED_MLP"] = "1"
         sixth = manager.get(Path("/tmp/fake-qwen-q-policy"), "fast")
+        os.environ["VMODEL_QWEN_MTP_GRAMMAR_AWARE_DRAFT"] = "1"
+        seventh = manager.get(Path("/tmp/fake-qwen-q-policy"), "fast")
 
     assert first is made[0]
     assert second is made[1]
@@ -689,11 +697,13 @@ def test_server_q_policy_is_strict_and_part_of_engine_cache_identity():
     assert fourth is made[3]
     assert fifth is made[4]
     assert sixth is made[5]
+    assert seventh is made[6]
     assert first.closes == 1
     assert second.closes == 1
     assert third.closes == 1
     assert fourth.closes == 1
     assert fifth.closes == 1
+    assert sixth.closes == 1
 
 
 def test_server_wires_typed_q_policy_and_explicit_deep_chain():
@@ -742,6 +752,7 @@ def test_server_wires_typed_q_policy_and_explicit_deep_chain():
         "VMODEL_QWEN_MTP_DEPTH": "4",
         "VMODEL_QWEN_MTP_TREE_WIDTH": "0",
         "VMODEL_QWEN_MTP_GRAMMAR_AWARE_DRAFT": "1",
+        "VMODEL_QWEN35_SERIAL_VERIFY_BATCHED_MLP": "1",
     }
     with patch.dict(os.environ, env), \
          patch("runtime.config.ModelConfig.from_dir", return_value=cfg), \
@@ -760,6 +771,7 @@ def test_server_wires_typed_q_policy_and_explicit_deep_chain():
     assert wrapped.kwargs["depth"] == 4
     assert wrapped.kwargs["ngram_first"] is False
     assert wrapped.kwargs["grammar_aware_draft"] is True
+    assert wrapped.target.rc.qwen35_serial_verify_batched_mlp is True
     policy = wrapped.kwargs["proposal_q_policy"]
     assert policy.name == "temperature-k8-t0.75"
 

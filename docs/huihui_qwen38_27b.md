@@ -121,6 +121,29 @@ remains opt-in for the same anti-overfit reason.  A measured depth-five probe
 was rejected: its fifth-step acceptance was 0/2, target sweeps rose to seven,
 and the cached wall regressed to 63.201s.
 
+An additional default-off verifier schedule is available with
+`VMODEL_QWEN35_SERIAL_VERIFY_BATCHED_MLP=1`.  It preserves canonical
+position order for every full-attention and DeltaNet operation, then evaluates
+only the position-independent dense SwiGLU residual for all verifier rows in
+one MXFP4 call.  A real MXFP4 operator gate is byte-identical for batched and
+row-serial evaluation.  On the depth-four developer/two-tool endpoint it kept
+the same output hash, 14/24 acceptance pattern, and six target sweeps while
+reducing a clean fresh-process replay from 57.411s wall / 53.802s decode to
+**54.417s wall / 50.781s decode** (5.2% / 5.6%).  A second cold shape with 37
+input tokens, no tools, no developer message, and a different direct science
+prompt emitted the same complete 29-token answer under both schedules; wall
+fell from 110.304s to **106.903s** and decode from 100.599s to **97.191s**.
+The latter exercised 4,160 verifier positions across 832 batched layer calls.
+The setting remains opt-in: the first fingerprint-changing cold 1,481-token
+seed completed prefill but hit the unchanged Metal admission ceiling before
+decode, whereas its clean endpoint restart passed.  It is a measured schedule
+win, not a broadly promoted default.
+
+A depth-four width-two comb-tree follow-up was also rejected.  It rescued one
+sibling branch but did not reduce the six target sweeps; the in-process wall
+regressed from 51.526s to 55.983s despite identical output.  The serial
+depth-four chain therefore remains the selected speculative topology.
+
 The second adds a separately typed, checksummed prompt endpoint to the
 mixed-depth journal.  It records complete full-attention KV, every DeltaNet
 state and convolution history, the prompt logits, and the final hidden row

@@ -1401,6 +1401,12 @@ class EngineManager:
                 "VMODEL_QWEN35_SERIAL_VERIFY_EXACT_PAGE_ADMISSION must be "
                 "0 or 1"
             )
+        qwen35_batched_mlp_request = os.environ.get(
+            "VMODEL_QWEN35_SERIAL_VERIFY_BATCHED_MLP", "0"
+        ).strip()
+        if qwen35_batched_mlp_request not in ("0", "1"):
+            raise RequestValidationError(
+                "VMODEL_QWEN35_SERIAL_VERIFY_BATCHED_MLP must be 0 or 1")
         qwen_quant_lm_head_request = os.environ.get(
             "VMODEL_QWEN35_QUANT_LM_HEAD", "0").strip()
         if qwen_quant_lm_head_request not in ("0", "1"):
@@ -1786,6 +1792,7 @@ class EngineManager:
             qwen_moe_decode_batch_request,
             qwen35_prefill_chunk_ceiling,
             qwen35_exact_page_admission_request,
+            qwen35_batched_mlp_request,
             qwen_lossy_suffix_request,
             qwen_hot_kv_request,
             qwen_hot_kv_persist_dir_request,
@@ -1879,6 +1886,7 @@ class EngineManager:
             qwen_moe_decode_batch_request,
             qwen35_prefill_chunk_ceiling,
             qwen35_exact_page_admission_request,
+            qwen35_batched_mlp_request,
             qwen_lossy_suffix_request,
             qwen_hot_kv_request,
             qwen_hot_kv_persist_dir_request,
@@ -2016,6 +2024,8 @@ class EngineManager:
                     qwen35_prefill_chunk_ceiling)
                 rc.qwen35_serial_verify_exact_page_admission = (
                     qwen35_exact_page_admission_request == "1")
+                rc.qwen35_serial_verify_batched_mlp = (
+                    qwen35_batched_mlp_request == "1")
                 rc.qwen_mixed_depth_endpoint_persist = (
                     qwen_mixed_depth_endpoint_request == "1")
             # Grammar fast-forward (token-level jump-forward decoding,
@@ -8320,6 +8330,7 @@ def _vision_protocol_timing(result: dict) -> dict:
         "qwen35_prefill_chunk_ceiling",
         "qwen35_prefill_chunk_selected",
         "qwen35_serial_verify_exact_page_admission",
+        "qwen35_serial_verify_batched_mlp",
         "kimi_k3_prefill_tile_width",
         "kimi_k3_dense_mlp_tile_size",
         "kimi_k3_prefill_long_context_tokens",
@@ -8343,6 +8354,9 @@ def _vision_protocol_timing(result: dict) -> dict:
         "qwen_mtp_verifier_tokens_per_sweep",
         "qwen_mtp_draft_round_s",
         "qwen_mtp_verifier_round_s",
+        "qwen_mtp_target_batched_mlp_layers",
+        "qwen_mtp_target_batched_mlp_positions",
+        "qwen_mtp_target_batched_mlp_s",
         "qwen_mtp_plain_round_s",
         "qwen_mtp_estimated_net_saved_s",
         "qwen_mtp_estimated_break_even_accept_rate",

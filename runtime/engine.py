@@ -949,6 +949,12 @@ class RuntimeConfig:
     # generic 400-MB unknown-allocation margin.  Default false preserves the
     # conservative historical admission policy.
     qwen35_serial_verify_exact_page_admission: bool = False
+    # Explicit fast-target experiment: keep attention/DeltaNet recurrence in
+    # canonical position order, but evaluate the dense, position-independent
+    # SwiGLU residual for the complete verifier window in one batched call.
+    # The served BF16 lossless route never enables this; MXFP4 promotion still
+    # requires identical target tokens plus the heterogeneous quality corpus.
+    qwen35_serial_verify_batched_mlp: bool = False
     # F94: layer-major (not chunk-major) dense prefill for qwen3_5 (dense
     # hybrid DeltaNet/full-attention, e.g. Qwen3.5-4B/9B, Qwen3.6-27B) --
     # fetches each layer's weights exactly once for the whole prefill instead
@@ -1247,6 +1253,8 @@ class RuntimeConfig:
                 "qwen35_prefill_chunk_ceiling", 0),
             qwen35_serial_verify_exact_page_admission=run.get(
                 "qwen35_serial_verify_exact_page_admission", False),
+            qwen35_serial_verify_batched_mlp=run.get(
+                "qwen35_serial_verify_batched_mlp", False),
             qwen_mixed_depth_endpoint_persist=run.get(
                 "qwen_mixed_depth_endpoint_persist", False),
             prefill_last_token_separate=run.get(
@@ -2005,6 +2013,9 @@ class StreamingEngine:
         self._serial_verify_layer_transient_recurring_max: dict[
             tuple[int, str], int
         ] = {}
+        self._qwen35_serial_verify_batched_mlp_layers = 0
+        self._qwen35_serial_verify_batched_mlp_positions = 0
+        self._qwen35_serial_verify_batched_mlp_s = 0.0
         self._layer_transient_margin = 400_000_000
         self._token_transient = 0  # F42: whole-token transient (greedy sync point)
         # 2026-07-13: F42's own per-layer/per-token mx.reset_peak_memory() calls
@@ -7422,6 +7433,51 @@ class StreamingEngine:
                 prefix_sum_layer = prefix_sum_layer + mlp_out_layer
                 next_positions = [
                     prefix_sum_layer[:, p:p + 1, :] for p in range(N)]
+            elif (
+                qwen_family
+                and self.rc.qwen35_serial_verify_batched_mlp
+                and not self.cfg.num_experts
+            ):
+                # Attention remains strictly sequential because DeltaNet state
+                # and full-attention KV advance position by position.  The
+                # dense MLP has no cross-position dependency: each row sees
+                # only its own post-attention residual and the same weights.
+                # Concatenate only after every canonical attention call, then
+                # split immediately after one SwiGLU projection group.
+                prefix = f"model.layers.{layer}"
+                attn_positions = []
+                for position, hidden in enumerate(positions):
+                    attn_out = _qwen35_attention_residual(
+                        hidden, weights, prefix, self.cfg, kv, layer,
+                        offset + position,
+                        chunked_delta_prefill=(
+                            self.rc.qwen_chunked_delta_prefill),
+                        compiled_delta_prefill=(
+                            self.rc.qwen_compiled_delta_prefill),
+                        native_fused_delta_prefill=(
+                            self.rc.qwen_native_fused_delta_prefill),
+                    )
+                    capture_kda_position(layer, position)
+                    attn_positions.append(attn_out)
+                batched_mlp_t0 = time.perf_counter()
+                batched_hidden = _qwen35_mlp_residual(
+                    mx.concatenate(attn_positions, axis=1),
+                    weights,
+                    prefix,
+                    self.cfg,
+                    layer,
+                    self._get_experts,
+                )
+                mx.eval(batched_hidden)
+                self._qwen35_serial_verify_batched_mlp_s += (
+                    time.perf_counter() - batched_mlp_t0)
+                self._qwen35_serial_verify_batched_mlp_layers += 1
+                self._qwen35_serial_verify_batched_mlp_positions += len(
+                    positions)
+                next_positions = [
+                    batched_hidden[:, position:position + 1, :]
+                    for position in range(len(positions))
+                ]
             else:
                 next_positions = []
                 for position, hidden in enumerate(positions):
@@ -7673,6 +7729,8 @@ class StreamingEngine:
                 f"qwencompileddelta{int(self.rc.qwen_compiled_delta_prefill)}"
                 f"qwennativeprefill{int(self.rc.qwen_native_fused_delta_prefill)}"
                 f"qwenchunkeddelta{int(self.rc.qwen_chunked_delta_prefill)}"
+                f"qwenserialbatchmlp{int(
+                    self.rc.qwen35_serial_verify_batched_mlp)}"
                 f"k3scalesidecar{scale_sidecar_identity}"
                 f"k3nf12sidecar{nf12_sidecar_identity}"
                 f"k3nf12direct{int(self.rc.bf16_nf12_direct_linear)}"
@@ -7900,6 +7958,9 @@ class StreamingEngine:
         # sampled or exposed any model output.  Once this becomes non-zero,
         # retrying would reuse a mutated grammar/RNG state and is forbidden.
         self._generation_sampled_tokens = 0
+        self._qwen35_serial_verify_batched_mlp_layers = 0
+        self._qwen35_serial_verify_batched_mlp_positions = 0
+        self._qwen35_serial_verify_batched_mlp_s = 0.0
         self._true_peak_metal_bytes = mx.get_active_memory()  # see _note_true_peak
         if self.governor is not None:
             self.governor.reset_request_peak(self._true_peak_metal_bytes)
@@ -8053,6 +8114,8 @@ class StreamingEngine:
                 self.rc.qwen35_prefill_chunk_ceiling)
             path_stats["qwen35_serial_verify_exact_page_admission"] = int(
                 self.rc.qwen35_serial_verify_exact_page_admission)
+            path_stats["qwen35_serial_verify_batched_mlp"] = int(
+                self.rc.qwen35_serial_verify_batched_mlp)
         tokenize_t0 = time.perf_counter()
         prepared_ids = getattr(prompt, "token_ids", None)
         tokens = (list(prepared_ids) if prepared_ids is not None
