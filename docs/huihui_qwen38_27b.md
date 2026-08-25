@@ -188,6 +188,27 @@ expanded verifier.  The multi-depth tree code was removed; the measured
 depth-one sibling tree and the serial depth-four chain remain separate,
 explicit candidates.
 
+Ranks-only telemetry on that same unrelated science prompt found three
+rank-two root winners in 13 rounds, two later rescuable rejections, and no
+useful rank-four candidate.  A narrower follow-up therefore branched only at
+the root and retained the ordinary primary chain: six verifier positions, not
+nine.  It preserved the exact output, rescued rank two twice, reduced target
+sweeps from 13 to 12, and cut total weight reads by 14.396GB.  It still missed
+the latency gate: decode was 98.744s versus 97.191s and wall was 111.706s versus
+106.903s.  The 72 verified target positions plus 0.817s factor commit erased
+the I/O saving, so this candidate was also removed.  Proposal-rank histograms
+remain available for future proposal-quality work without retaining prompt,
+token, or logit contents.
+
+The recovered Huihui residual direction was then applied directly to the
+released-BF16 native MTP attention and MLP residual writers at the measured
+1.3 strength.  This genuinely abliterated only the proposal sidecar; the
+unchanged target still verified every decision.  It did not improve the draft:
+the complete per-depth rank histograms, 15/52 acceptance, 13 target sweeps, and
+output hash were identical to the unprojected control.  Decode rose to 106.312s
+and wall to 118.617s.  The native-MTP ablation code was removed; the MTP block
+does not benefit from inheriting the target's refusal-direction projection.
+
 The second adds a separately typed, checksummed prompt endpoint to the
 mixed-depth journal.  It records complete full-attention KV, every DeltaNet
 state and convolution history, the prompt logits, and the final hidden row
