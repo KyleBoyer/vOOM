@@ -354,6 +354,21 @@ def test_k2_greedy_rank_capture_identifies_rescuable_second_choice():
         [0, 0, 1, 0],
     ]
     assert stats["qwen_mtp_greedy_rescuable_rejections_by_step"] == [0, 1]
+    assert stats["qwen_mtp_greedy_draft_margin_thresholds"] == [
+        0.25, 0.5, 1.0, 2.0, 4.0, 8.0, 16.0,
+    ]
+    margin_counts = stats["qwen_mtp_greedy_margin_rank_counts_by_step"]
+    assert margin_counts[0][-1] == [0, 1, 0, 0]
+    assert margin_counts[1][-1] == [0, 0, 1, 0]
+    assert sum(
+        sum(bucket) for step in margin_counts for bucket in step
+    ) == 2
+    assert stats["qwen_mtp_greedy_round_confidence_records"] == [{
+        "margin_buckets": [7, 7],
+        "target_ranks": [1, 2],
+        "accepted_prefix": 1,
+        "rejected": 1,
+    }]
     assert stats["qwen_mtp_proposal_q_replay"] == []
 
 

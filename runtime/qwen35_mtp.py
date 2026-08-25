@@ -67,7 +67,6 @@ from dataclasses import dataclass
 from typing import Iterable, Mapping, Sequence
 
 import mlx.core as mx
-
 from . import quant
 from .kv_cache import KVCache
 from .qwen35 import _full_attention, _moe, _swiglu, final_logits, qwen35_rms_norm
@@ -75,6 +74,9 @@ from .sampler import (SamplingParams, filtered_probabilities, sample,
                       sample_probabilities,
                       speculative_residual_probabilities)
 from .speculative import ngram_propose
+
+
+_GREEDY_DRAFT_MARGIN_THRESHOLDS = (0.25, 0.5, 1.0, 2.0, 4.0, 8.0, 16.0)
 
 
 def _reranked_head_telemetry_snapshot(target) -> dict[str, int]:
@@ -1369,6 +1371,14 @@ class QwenMTPSpeculativeEngine:
             for _ in range(self.depth)
         ]
         greedy_rescuable_rejections_by_step = [0] * self.depth
+        greedy_margin_rank_counts_by_step = [
+            [
+                [0] * (self.proposal_replay_top_k + 1)
+                for _ in range(len(_GREEDY_DRAFT_MARGIN_THRESHOLDS) + 1)
+            ]
+            for _ in range(self.depth)
+        ]
+        greedy_round_confidence_records: list[dict] = []
         proposal_replay_records: list[dict] = []
         sidecar_round_loads = 0
         sidecar_round_releases = 0
@@ -1616,6 +1626,7 @@ class QwenMTPSpeculativeEngine:
                 draft_probabilities: list[mx.array | None] = []
                 draft_rank_probabilities: list[mx.array | None] = []
                 draft_ranked_tokens: list[tuple[int, ...] | None] = []
+                draft_margin_buckets: list[int | None] = []
                 draft_hidden = h_last
                 draft_input_token = catchup_tok
                 round_mtp_weights: dict | None = None
@@ -1703,6 +1714,7 @@ class QwenMTPSpeculativeEngine:
                         draft_rank_probabilities.extend(
                             [None] * len(ngram_tokens))
                         draft_ranked_tokens.extend([None] * len(ngram_tokens))
+                        draft_margin_buckets.extend([None] * len(ngram_tokens))
 
                     draft_constraint = None
                     if (self.grammar_aware_draft
@@ -1764,6 +1776,7 @@ class QwenMTPSpeculativeEngine:
                         step_rank_probabilities = None
                         step_probabilities = None
                         step_ranked_tokens = None
+                        step_margin_bucket = None
                         if sampling.is_greedy:
                             if draft_tok is None:
                                 # The target already applies this exact grammar
@@ -1799,6 +1812,18 @@ class QwenMTPSpeculativeEngine:
                                     mx.eval(ranked)
                                     step_ranked_tokens = tuple(
                                         int(token) for token in ranked.tolist())
+                                    if rank_count >= 2:
+                                        ranked_scores = mx.take(
+                                            step_logits.reshape(-1), ranked[:2])
+                                        mx.eval(ranked_scores)
+                                        margin = float(
+                                            ranked_scores[0].item()
+                                            - ranked_scores[1].item())
+                                        step_margin_bucket = sum(
+                                            margin >= threshold
+                                            for threshold in
+                                            _GREEDY_DRAFT_MARGIN_THRESHOLDS
+                                        )
                                 draft_tok = int(mx.argmax(step_logits))
                         else:
                             if step_logits is None:
@@ -1829,6 +1854,7 @@ class QwenMTPSpeculativeEngine:
                         draft_probabilities.append(step_probabilities)
                         draft_rank_probabilities.append(step_rank_probabilities)
                         draft_ranked_tokens.append(step_ranked_tokens)
+                        draft_margin_buckets.append(step_margin_bucket)
                         draft_input_token = int(draft_tok)
                         if (sampling.is_greedy
                                 and draft_constraint is not None):
@@ -1952,6 +1978,7 @@ class QwenMTPSpeculativeEngine:
                 new_tokens = []
                 new_token_logits = []
                 accepted_prefix = 0
+                round_target_ranks: list[int] = []
                 if round_native_tree:
                     root_logits = _authoritative_target_logits_from_hidden(
                         tgt,
@@ -2050,6 +2077,15 @@ class QwenMTPSpeculativeEngine:
                                     target_rank = 0
                                 greedy_target_rank_counts_by_step[
                                     step][target_rank] += 1
+                                round_target_ranks.append(target_rank)
+                                if self.proposal_replay_top_k >= 2:
+                                    margin_bucket = draft_margin_buckets[step]
+                                    if margin_bucket is None:
+                                        raise RuntimeError(
+                                            "greedy proposal-rank capture "
+                                            "omitted draft margin")
+                                    greedy_margin_rank_counts_by_step[
+                                        step][margin_bucket][target_rank] += 1
                                 if not draft_accepted and target_rank > 1:
                                     greedy_rescuable_rejections_by_step[
                                         step] += 1
@@ -2151,6 +2187,27 @@ class QwenMTPSpeculativeEngine:
                             else f"A{accepted_prefix}R")
                     else:
                         round_outcomes.append(f"A{accepted_prefix}")
+
+                    if (sampling.is_greedy
+                            and self.proposal_replay_top_k >= 2
+                            and round_proposal_source == "M"):
+                        margin_buckets = draft_margin_buckets[
+                            :round_draft_width]
+                        if any(bucket is None for bucket in margin_buckets):
+                            raise RuntimeError(
+                                "greedy round-confidence capture omitted "
+                                "draft margin")
+                        greedy_round_confidence_records.append({
+                            # Bucket indices reference the fixed public
+                            # threshold vector below.  Token IDs, prompt text,
+                            # logits, and raw margins are deliberately absent.
+                            "margin_buckets": [
+                                int(bucket) for bucket in margin_buckets
+                            ],
+                            "target_ranks": list(round_target_ranks),
+                            "accepted_prefix": accepted_prefix,
+                            "rejected": int(round_rejected),
+                        })
 
                     if (all_drafts_accepted
                             and not _candidate_terminal(new_tokens)):
@@ -2641,6 +2698,12 @@ class QwenMTPSpeculativeEngine:
                 greedy_target_rank_counts_by_step)
             path_stats["qwen_mtp_greedy_rescuable_rejections_by_step"] = (
                 greedy_rescuable_rejections_by_step)
+            path_stats["qwen_mtp_greedy_draft_margin_thresholds"] = list(
+                _GREEDY_DRAFT_MARGIN_THRESHOLDS)
+            path_stats["qwen_mtp_greedy_margin_rank_counts_by_step"] = (
+                greedy_margin_rank_counts_by_step)
+            path_stats["qwen_mtp_greedy_round_confidence_records"] = (
+                greedy_round_confidence_records)
         if not proposed:
             path_stats["qwen_mtp_fallback_reason"] = (
                 "terminal-during-plain-warmup")

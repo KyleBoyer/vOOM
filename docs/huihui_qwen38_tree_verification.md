@@ -113,3 +113,44 @@ Allowed values are `0..8`; `0` is the unchanged default.  A real fixture run:
 The zero secondary sidecar-load margin is part of that measured command.  The
 memory governor's independent critical reserve, fresh preflight, ≤8.5GB Metal
 limit, and swap-growth gate remained active.
+
+## Native-MTP confidence and fixed-cost topology follow-up (2026-08-25)
+
+The native released-BF16 MTP path now has an explicit, privacy-safe diagnostic
+under the existing `VMODEL_QWEN_MTP_PROPOSAL_REPLAY_TOP_K` opt-in.  It records
+only fixed top-1/top-2 logit-margin bucket indices crossed with the
+authoritative target winner's rank, plus per-round bucket sequences and
+accepted-prefix lengths.  It never records prompt text, token IDs, logits, or
+raw margins.
+
+Four real request shapes were replayed with depth four and target-authoritative
+verification: three no-tool domains (science, factual explanation, and Python
+code) plus a developer-message/two-tool function call.  They covered 36
+speculative rounds, 97 emitted tokens, 0/2 tools, 36--1,481 input tokens, and
+16--32 output tokens.  Low confidence did not isolate failures: accepted
+rank-one proposals and rank-two/miss outcomes occupied overlapping margin
+buckets, while some high-margin roots still selected target rank two.  A
+margin-threshold router is therefore **STOP**; no content- or capture-tuned
+default was added.  The first request was cold; subsequent same-server wall
+times are retained only as acceptance evidence, not cold latency claims.
+
+The corpus suggested a stricter fixed-cost experiment: replace the fourth
+primary-chain node with the root's rank-two sibling, keeping five total target
+positions.  Tiny exact-state tests covered root miss, sibling selection, deep
+rejection, full primary acceptance, divergent MTP-KV trimming, and target
+KV/DeltaNet commit.  The cold real science gate rejected it: acceptance fell
+to 14/56, target sweeps rose from 13 to 14, decode-body reads reached
+193.28GB, wall reached 123.3404s, and swap growth failed the pressure gate.
+The response stream was then prevented from publishing its final envelope by
+a diagnostic string being placed in an integer telemetry field; that telemetry
+bug was corrected during rollback, but the candidate had already failed its
+speed and memory gates.  All fixed-cost topology code and serving support were
+removed.
+
+Evidence:
+
+- `logs/qwen38_mtp_confidence_science32_20260825.json`
+- `logs/qwen38_mtp_confidence_seasons32_20260825.json`
+- `logs/qwen38_mtp_confidence_python32_20260825.json`
+- `logs/qwen38_mtp_confidence_developer_tools32_20260825.json`
+- `logs/qwen38_mtp_fixed5_root_sibling_science32_20260825.json`
