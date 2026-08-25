@@ -108,6 +108,19 @@ the cache fingerprint and forced a 34.874s prefill; its decode was 64.619s.
 Depth two and grammar-aware drafting remain explicit opt-ins pending the full
 heterogeneous replay corpus.
 
+The same exact recurrent verifier is now bounded at depth four.  It retains a
+KDA/KV/hidden endpoint for every possible accepted prefix and commits only the
+target-verified prefix; unit oracles cover accepted lengths 0 through 4.  A
+fresh-process depth-four replay restored the exact 1,481-token endpoint,
+accepted 14/24 drafts, reduced target sweeps from eight to six, preserved the
+same response hash, and measured **57.411s wall** (0.006s prefill, 53.802s
+decode, 3.557GB peak Metal, 4.260MB swap-out growth).  An in-process repeat was
+51.526s.  The result is 26.4% faster than the 69.983s depth-two restart and
+56.1% faster than the 130.632s original cold depth-one baseline, but depth four
+remains opt-in for the same anti-overfit reason.  A measured depth-five probe
+was rejected: its fifth-step acceptance was 0/2, target sweeps rose to seven,
+and the cached wall regressed to 63.201s.
+
 The second adds a separately typed, checksummed prompt endpoint to the
 mixed-depth journal.  It records complete full-attention KV, every DeltaNet
 state and convolution history, the prompt logits, and the final hidden row

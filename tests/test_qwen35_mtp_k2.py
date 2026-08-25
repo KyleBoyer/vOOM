@@ -1,4 +1,4 @@
-"""Focused exactness gates for the explicit recurrent Qwen MTP depth-2 path."""
+"""Focused exactness gates for explicit recurrent Qwen MTP chain depths."""
 
 from __future__ import annotations
 
@@ -164,6 +164,61 @@ class _RecurrentDrafter:
         return logits, next_hidden
 
 
+class _WideTarget(_Target):
+    """Width-five serial oracle for every accepted prefix at depth four."""
+
+    draft_tokens = (10, 11, 12, 13)
+    correction_tokens = (5, 6, 7, 9)
+
+    def __init__(self, accepted_prefix, *, eos=()):
+        super().__init__(accepted_prefix, eos=eos)
+        self.endpoints = {index: _Endpoint(index) for index in range(1, 6)}
+
+    def forward_tokens_serial_positions(
+        self, tokens, kv, *, capture_kda_endpoints=False,
+    ):
+        expected = [4, *self.draft_tokens]
+        assert tokens == expected
+        assert capture_kda_endpoints
+        self.serial_calls.append(list(tokens))
+        width = len(expected)
+        kv.offset += width
+        kv.lengths[0] += width
+        kv.kda_cache = self.endpoints[width]
+        hidden_rows = (40.0, 100.0, 110.0, 120.0, 130.0)
+        self._h_window = mx.array(
+            [[[value] for value in hidden_rows]])
+        self._h_last = self._h_window[:, -1:, :]
+        target_tokens = [
+            (
+                proposal if self.accepted_prefix > index
+                else self.correction_tokens[index]
+            )
+            for index, proposal in enumerate(self.draft_tokens)
+        ]
+        target_tokens.append(8)
+        logits = mx.full((width, 16), -100.0)
+        for row, token in enumerate(target_tokens):
+            logits = logits.at[row, token].add(200.0)
+        return logits
+
+
+class _WideRecurrentDrafter(_RecurrentDrafter):
+    def draft_step(self, hidden, token, mtp_kv, offset, _weights=None):
+        step = len(self.calls)
+        self.mtp_kv = mtp_kv
+        self.calls.append({
+            "hidden": float(hidden.reshape(-1)[0].item()),
+            "token": int(token),
+            "offset": int(offset),
+        })
+        key = mx.full((1, 1, 1, 1), float(step + 1))
+        mtp_kv.update(0, key, key)
+        proposal = _WideTarget.draft_tokens[step]
+        logits = mx.full((16,), -100.0).at[proposal].add(200.0)
+        return logits, mx.array([[[1000.0 + step]]])
+
+
 def test_released_drafter_step_returns_post_block_hidden(monkeypatch):
     weights = {
         "mtp.pre_fc_norm_embedding.weight": mx.ones((1,)),
@@ -260,6 +315,62 @@ def test_k2_accept_prefixes_match_ordinary_state_oracle(
     assert stats["qwen_mtp_draft_kv_rollbacks"] == int(mtp_length < 2)
 
 
+@pytest.mark.parametrize("accepted_prefix", range(5))
+def test_k4_every_accepted_prefix_matches_ordinary_state_oracle(
+    accepted_prefix,
+):
+    target = _WideTarget(accepted_prefix)
+    engine = QwenMTPSpeculativeEngine(
+        target,
+        max_prompt_tokens=8,
+        min_output_tokens=2,
+        plain_warmup_tokens=0,
+        adaptive_stop=False,
+        depth=4,
+    )
+    drafter = _WideRecurrentDrafter()
+    engine.drafter = drafter
+
+    result = engine.generate("x", accepted_prefix + 2)
+
+    accepted_tokens = list(_WideTarget.draft_tokens[:accepted_prefix])
+    final_token = (
+        8 if accepted_prefix == 4
+        else _WideTarget.correction_tokens[accepted_prefix]
+    )
+    expected_tokens = [4, *accepted_tokens, final_token]
+    expected_fed = accepted_prefix + 1
+    expected_mtp_length = min(4, expected_fed)
+    assert result["tokens"] == expected_tokens
+    assert target.last_kv.offset == 3 + expected_fed
+    assert target.last_kv.lengths == [3 + expected_fed, 1]
+    assert target.last_kv.kda_cache is target.endpoints[expected_fed]
+    assert float(target._h_last.reshape(-1)[0].item()) == {
+        1: 40.0,
+        2: 100.0,
+        3: 110.0,
+        4: 120.0,
+        5: 130.0,
+    }[expected_fed]
+    assert target.endpoint_requests == [
+        None if expected_fed == 5 else expected_fed]
+    assert drafter.mtp_kv.layer_lengths() == (expected_mtp_length,)
+    assert [call["token"] for call in drafter.calls] == [4, 10, 11, 12]
+    assert [call["offset"] for call in drafter.calls] == [2, 3, 4, 5]
+    stats = result["path_stats"]
+    assert stats["qwen_mtp_depth"] == 4
+    assert stats["qwen_mtp_verify_width"] == 5
+    assert stats["qwen_mtp_accepted"] == accepted_prefix
+    assert stats["qwen_mtp_accepted_by_step"] == [
+        int(index < accepted_prefix) for index in range(4)]
+    assert stats["qwen_mtp_verified_by_step"] == [
+        int(index <= accepted_prefix) for index in range(4)]
+    assert stats["qwen_mtp_target_prefix_rollbacks"] == int(
+        expected_fed < 5)
+    assert stats["qwen_mtp_draft_kv_rollbacks"] == int(
+        expected_mtp_length < 4)
+
+
 def test_k2_grammar_fork_masks_both_provisional_steps_without_mutating_target():
     class _Constraint:
         def __init__(self, accepted=()):
@@ -328,6 +439,66 @@ def test_k2_grammar_fork_masks_both_provisional_steps_without_mutating_target():
     assert stats["qwen_mtp_grammar_masked_draft_rounds"] == 1
 
 
+def test_k4_grammar_fork_conditions_every_provisional_step():
+    class _Constraint:
+        def __init__(self, accepted=()):
+            self.accepted = list(accepted)
+            self.completed = False
+            self.forks = []
+
+        def fork(self):
+            forked = _Constraint(self.accepted)
+            self.forks.append(forked)
+            return forked
+
+        def mask_logits(self, logits):
+            legal = {
+                (4,): 10,
+                (4, 10): 11,
+                (4, 10, 11): 12,
+                (4, 10, 11, 12): 13,
+                (4, 10, 11, 12, 13): 8,
+            }[tuple(self.accepted)]
+            masked = mx.full(logits.shape, -1000.0)
+            return masked.at[..., legal].add(2000.0)
+
+        def accept_token(self, token):
+            self.accepted.append(int(token))
+
+    class _RawIllegalWideDrafter(_WideRecurrentDrafter):
+        def draft_step(self, hidden, token, mtp_kv, offset, _weights=None):
+            logits, next_hidden = super().draft_step(
+                hidden, token, mtp_kv, offset, _weights)
+            illegal = (15, 14, 15, 14)[len(self.calls) - 1]
+            logits = logits.at[illegal].add(300.0)
+            return logits, next_hidden
+
+    target = _WideTarget(4)
+    engine = QwenMTPSpeculativeEngine(
+        target,
+        max_prompt_tokens=8,
+        min_output_tokens=2,
+        plain_warmup_tokens=0,
+        adaptive_stop=False,
+        depth=4,
+        grammar_aware_draft=True,
+    )
+    drafter = _RawIllegalWideDrafter()
+    engine.drafter = drafter
+    constraint = _Constraint()
+
+    result = engine.generate("x", 6, constraint=constraint)
+
+    assert result["tokens"] == [4, 10, 11, 12, 13, 8]
+    assert constraint.accepted == [4, 10, 11, 12, 13, 8]
+    assert len(constraint.forks) == 1
+    assert constraint.forks[0].accepted == [4, 10, 11, 12, 13]
+    stats = result["path_stats"]
+    assert stats["qwen_mtp_accepted_by_step"] == [1, 1, 1, 1]
+    assert stats["qwen_mtp_grammar_masked_draft_tokens"] == 4
+    assert stats["qwen_mtp_grammar_masked_draft_rounds"] == 1
+
+
 @pytest.mark.parametrize(
     "eos,expected_tokens,expected_fed,verified",
     [
@@ -388,8 +559,9 @@ def test_k2_stochastic_uses_separate_sequential_q_and_rejection_correction():
 def test_k2_constructor_is_strict_and_opt_in():
     target = _Target(2)
     assert QwenMTPSpeculativeEngine(target).depth == 1
-    for invalid in (0, 3, True, "2"):
-        with pytest.raises(ValueError, match="depth must be 1 or 2"):
+    assert QwenMTPSpeculativeEngine(target, depth=4).depth == 4
+    for invalid in (0, 5, True, "2"):
+        with pytest.raises(ValueError, match=r"depth must be in \[1, 4\]"):
             QwenMTPSpeculativeEngine(target, depth=invalid)
     with pytest.raises(ValueError, match="requires depth 1"):
         QwenMTPSpeculativeEngine(target, depth=2, ngram_first=True)
@@ -416,6 +588,9 @@ def test_server_q_policy_is_strict_and_part_of_engine_cache_identity():
 
     with patch.dict(os.environ, {"VMODEL_QWEN_MTP_Q_POLICY": "mystery"}):
         with pytest.raises(RequestValidationError, match="flat, temperature"):
+            EngineManager().get(Path("/tmp/not-opened"), "fast")
+    with patch.dict(os.environ, {"VMODEL_QWEN_MTP_DEPTH": "5"}):
+        with pytest.raises(RequestValidationError, match=r"in \[1, 4\]"):
             EngineManager().get(Path("/tmp/not-opened"), "fast")
     with patch.dict(os.environ, {"VMODEL_QWEN_MTP_NGRAM_FIRST": "auto"}):
         with pytest.raises(RequestValidationError, match="must be 0 or 1"):
@@ -521,7 +696,7 @@ def test_server_q_policy_is_strict_and_part_of_engine_cache_identity():
     assert fifth.closes == 1
 
 
-def test_server_wires_typed_q_policy_and_explicit_depth_two():
+def test_server_wires_typed_q_policy_and_explicit_deep_chain():
     from runtime.server import EngineManager
 
     captured = []
@@ -564,7 +739,7 @@ def test_server_wires_typed_q_policy_and_explicit_depth_two():
         "VMODEL_QWEN_MTP_Q_POLICY": "temperature",
         "VMODEL_QWEN_MTP_Q_PARAMETER": "0.75",
         "VMODEL_QWEN_MTP_STOCHASTIC_DRAFT_TOP_K": "8",
-        "VMODEL_QWEN_MTP_DEPTH": "2",
+        "VMODEL_QWEN_MTP_DEPTH": "4",
         "VMODEL_QWEN_MTP_TREE_WIDTH": "0",
         "VMODEL_QWEN_MTP_GRAMMAR_AWARE_DRAFT": "1",
     }
@@ -582,7 +757,7 @@ def test_server_wires_typed_q_policy_and_explicit_depth_two():
             Path("/tmp/fake-qwen-q-policy-wiring"), "fast")
 
     assert wrapped is captured[0]
-    assert wrapped.kwargs["depth"] == 2
+    assert wrapped.kwargs["depth"] == 4
     assert wrapped.kwargs["ngram_first"] is False
     assert wrapped.kwargs["grammar_aware_draft"] is True
     policy = wrapped.kwargs["proposal_q_policy"]

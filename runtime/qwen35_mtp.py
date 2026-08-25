@@ -3,9 +3,9 @@ source for speculative decoding.
 
 Checkpoint block under the top-level ``mtp.`` prefix (DeepSeek-V3 style,
 ``mtp_num_hidden_layers=1``).  Depth 1 remains the safe default.  Explicit
-depth 2 recurrently reuses the released single physical layer, feeding its
-post-block hidden state and first proposal into the second step before one
-width-3 exact target verification:
+depths 2--4 recurrently reuse the released single physical layer, feeding its
+post-block hidden state and preceding proposal into the next step before one
+width-(depth+1) exact target verification:
 
     e   = pre_fc_norm_embedding( embed(token_t) )
     hn  = pre_fc_norm_hidden( h )                  # h = trunk hidden at t-1
@@ -40,8 +40,8 @@ terminal token therefore installs the exact accepted KDA endpoint and trims
 ordinary target KV plus the MTP layer's own attention KV to the same prefix.
 
 Round structure (matching speculative.py's own "1 + k" verify convention):
-depth 1 feeds ``[catchup_token, draft_token]`` and depth 2 feeds
-``[catchup_token, draft1, draft2]`` through one
+depth 1 feeds ``[catchup_token, draft_token]`` and deeper chains feed
+``[catchup_token, draft1, ..., draftN]`` through one
 layer-major sweep. Every position retains the ordinary one-token arithmetic
 shape inside that sweep, so MoE routing never widens into a two-position union
 and MXFP4 reductions remain identical to sequential decode. The verifier also
@@ -55,7 +55,7 @@ whose misses merely fail to save one.
 This module mirrors runtime/glm_mtp.py's structure and safety framing:
 greedy drafts require target argmax equality, while stochastic drafts use the
 standard exact p/q acceptance ratio and normalized positive-part (p-q)
-rejection residual, applied sequentially to q1 then q2.  This remains a small
+rejection residual, applied sequentially to every proposal.  This remains a small
 dedicated adapter rather than changing the provisional GLM path.
 """
 
@@ -951,7 +951,7 @@ class QwenMTPDrafter:
         """h_last: (1, 1, hidden) trunk hidden (pre final-norm) at position
         offset-1 (i.e. the state that produced last_token). Returns the full
         draft-logit vector and the post-MTP hidden state.  The latter is the
-        released recurrent input to the same physical layer at draft depth 2.
+        released recurrent input to the same physical layer at later draft depths.
         `offset` is the ABSOLUTE
         sequence position of last_token (matching the trunk's own kv.offset
         convention, not a decode-session-local counter) -- RoPE inside this
@@ -960,7 +960,7 @@ class QwenMTPDrafter:
         against the trunk regardless of how it was positioned). mtp_kv
         accumulates the MTP block's own ordinary attention KV.  The serving
         adapter trims this cache to the accepted input prefix after every
-        recurrent proposal chain; keeping a rejected depth-2 input would not
+        recurrent proposal chain; keeping a rejected deeper input would not
         change target correctness, but would silently degrade later q."""
         eng = self.engine
         cfg = eng.cfg
@@ -998,8 +998,8 @@ class QwenMTPDrafter:
         # qwen35.final_logits already removes batch/sequence axes and returns
         # one rank-1 vocabulary row. Indexing it again selected only the final
         # vocabulary scalar, degenerating q to a one-token distribution (and
-        # making depth-2 fail its exact vocabulary-shape check). Preserve the
-        # complete released MTP head row for both draft depths.
+        # making a recurrent chain fail its exact vocabulary-shape check).
+        # Preserve the complete released MTP head row for every draft depth.
         if logits.ndim != 1 or int(logits.shape[0]) != int(cfg.vocab_size):
             raise ValueError(
                 "Qwen MTP head must return one complete vocabulary row, "
@@ -1059,8 +1059,9 @@ class QwenMTPSpeculativeEngine:
             raise ValueError("stochastic_draft_top_k must be positive")
         if isinstance(proposal_replay_top_k, bool) or proposal_replay_top_k < 0:
             raise ValueError("proposal_replay_top_k must be non-negative")
-        if isinstance(depth, bool) or depth not in (1, 2):
-            raise ValueError("Qwen MTP depth must be 1 or 2")
+        if (isinstance(depth, bool) or not isinstance(depth, int)
+                or not 1 <= depth <= 4):
+            raise ValueError("Qwen MTP depth must be in [1, 4]")
         if not isinstance(ngram_first, bool):
             raise TypeError("Qwen MTP ngram_first must be bool")
         if (isinstance(ngram_min_ngram, bool)
@@ -1141,11 +1142,11 @@ class QwenMTPSpeculativeEngine:
             )
             + ("-grammar-aware-draft" if self.grammar_aware_draft else "")
         )
-        if self.depth == 2 and not callable(getattr(
+        if self.depth > 1 and not callable(getattr(
             target, "forward_tokens_serial_positions", None
         )):
             raise ValueError(
-                "Qwen MTP depth 2 requires serial-position target verification")
+                "Qwen MTP depth >1 requires serial-position target verification")
         if (
             getattr(target.cfg, "num_experts", 0)
             and not callable(getattr(
@@ -1743,7 +1744,7 @@ class QwenMTPSpeculativeEngine:
                             draft_step = getattr(self.drafter, "draft_step", None)
                             if not callable(draft_step):
                                 raise RuntimeError(
-                                    "Qwen MTP depth 2 drafter omits draft_step")
+                                    "Qwen MTP depth >1 drafter omits draft_step")
                             step_logits, draft_hidden = draft_step(
                                 draft_hidden,
                                 draft_input_token,
@@ -1784,11 +1785,12 @@ class QwenMTPSpeculativeEngine:
                             if step_logits is None:
                                 raise RuntimeError(
                                     "stochastic Qwen MTP draft omitted logits")
-                            # q at depth 2 is generated before the target has
-                            # accepted d1 into a mutable grammar. Conditioning
-                            # q2 on the old grammar state would be wrong; leaving
-                            # q2 unconstrained is still distribution-exact because
-                            # the sequential target p2 below is authoritative.
+                            # Later q rows are generated before the target has
+                            # accepted the preceding drafts into a mutable
+                            # grammar. Conditioning them on the old grammar
+                            # state would be wrong; leaving them unconstrained
+                            # is still distribution-exact because each
+                            # sequential target p row below is authoritative.
                             step_constraint = constraint if step == 0 else None
                             step_rank_probabilities = (
                                 _filtered_draft_probabilities(
