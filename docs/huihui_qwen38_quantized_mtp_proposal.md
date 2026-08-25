@@ -65,3 +65,26 @@ The useful follow-up is deeper/multi-token native MTP or a higher-acceptance
 sidecar that reduces full target sweeps. Further proposal-only I/O compression
 is low priority unless it also preserves acceptance on a heterogeneous replay
 corpus.
+
+## Follow-up: native depth two and `q` calibration
+
+Native released-BF16 MTP depth two was tested on the same unmodified max-16
+capture with 8.45 GB initially available. It preserved the output hash and all
+target/KV/KDA accounting, but accepted only 1/6 second-step proposals. The
+request still needed eight target sweeps and finished in 128.47 seconds
+(57.38 seconds prefill, 67.53 seconds decode). Depth two is therefore also a
+STOP and depth one remains the default.
+
+Existing sparse proposal replays were then evaluated offline across disjoint
+request shapes rather than tuning on the live benchmark:
+
+- developer-action calibration -> short-direct validation selected flat top-1;
+- short-direct calibration -> 134-tool validation selected temperature/top-16
+  in calibration but lost 3.89 acceptance points versus flat top-1 on the
+  held-out capture;
+- 134-tool calibration -> developer-action validation selected flat top-1.
+
+No alternate `q` policy generalized across these shapes, so the runtime keeps
+flat top-1. The failed held-out result is evidence against enabling a
+capture-tuned sampling policy, not a reason to expand the tuning corpus until a
+preferred answer appears.
