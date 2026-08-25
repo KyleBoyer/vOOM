@@ -177,6 +177,10 @@ class _FakeMatcher:
     def is_completed(self) -> bool:
         return False
 
+    def fork(self):
+        return _FakeMatcher(
+            allow_all=self._allow_all, accept=self._accept)
+
 
 def test_dead_grammar_state_stops_generation_instead_of_crashing():
     """An under-tuned/untrained model (no native tool-call special tokens,
@@ -225,3 +229,16 @@ def test_accepted_token_completes_normally():
     constraint.mask_logits(mx.zeros((8,)))
     constraint.accept_token(3)
     assert not constraint.completed
+
+
+def test_grammar_constraint_fork_is_independent():
+    constraint = GrammarConstraint(
+        matcher=_FakeMatcher(allow_all=True, accept=True),
+        vocab_size=8, profile="test", stop_on_complete=False)
+    forked = constraint.fork()
+
+    assert forked is not constraint
+    assert forked.matcher is not constraint.matcher
+    forked.accept_token(3)
+    assert not constraint.completed
+    assert not forked.completed

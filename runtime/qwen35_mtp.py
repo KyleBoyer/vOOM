@@ -1696,6 +1696,22 @@ class QwenMTPSpeculativeEngine:
                         draft_rank_probabilities.extend(
                             [None] * len(ngram_tokens))
 
+                    draft_constraint = None
+                    if (self.grammar_aware_draft
+                            and constraint is not None
+                            and sampling.is_greedy
+                            and self.depth > 1):
+                        fork_constraint = getattr(constraint, "fork", None)
+                        if callable(fork_constraint):
+                            try:
+                                draft_constraint = fork_constraint()
+                            except (RuntimeError, TypeError, ValueError):
+                                # A custom constraint may expose a partial fork
+                                # surface. Step zero remains safe with the
+                                # authoritative read-only mask; later steps
+                                # simply retain the established unmasked path.
+                                draft_constraint = None
+
                     for step in range(0 if ngram_tokens else self.depth):
                         if self.depth == 1:
                             # Keep the established k=1 mock/API path unchanged.
@@ -1746,17 +1762,23 @@ class QwenMTPSpeculativeEngine:
                                 # the same current-state mask for the first MTP
                                 # proposal so an obviously illegal raw argmax
                                 # does not force a full target-sweep rejection.
-                                # At depth two the grammar has not yet accepted
-                                # d1 while d2 is drafted, so only step zero is
-                                # eligible.  Target verification remains fully
-                                # authoritative either way.
+                                # A forked grammar may advance through earlier
+                                # provisional tokens and mask every later draft
+                                # step without mutating the authoritative
+                                # request grammar. Constraints without a fork
+                                # retain the established step-zero-only mask.
+                                step_constraint = (
+                                    draft_constraint
+                                    if draft_constraint is not None else
+                                    constraint if step == 0 else None
+                                )
                                 if (self.grammar_aware_draft
-                                        and constraint is not None
-                                        and step == 0):
-                                    step_logits = constraint.mask_logits(
+                                        and step_constraint is not None):
+                                    step_logits = step_constraint.mask_logits(
                                         step_logits)
                                     grammar_masked_draft_tokens += 1
-                                    grammar_masked_draft_rounds += 1
+                                    if step == 0:
+                                        grammar_masked_draft_rounds += 1
                                 draft_tok = int(mx.argmax(step_logits))
                         else:
                             if step_logits is None:
@@ -1786,6 +1808,9 @@ class QwenMTPSpeculativeEngine:
                         draft_probabilities.append(step_probabilities)
                         draft_rank_probabilities.append(step_rank_probabilities)
                         draft_input_token = int(draft_tok)
+                        if (sampling.is_greedy
+                                and draft_constraint is not None):
+                            draft_constraint.accept_token(draft_tok)
 
                     if round_native_tree:
                         if step_logits is None:

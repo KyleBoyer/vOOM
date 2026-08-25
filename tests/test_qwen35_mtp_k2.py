@@ -260,6 +260,74 @@ def test_k2_accept_prefixes_match_ordinary_state_oracle(
     assert stats["qwen_mtp_draft_kv_rollbacks"] == int(mtp_length < 2)
 
 
+def test_k2_grammar_fork_masks_both_provisional_steps_without_mutating_target():
+    class _Constraint:
+        def __init__(self, accepted=()):
+            self.accepted = list(accepted)
+            self.completed = False
+            self.forks = []
+
+        def fork(self):
+            forked = _Constraint(self.accepted)
+            self.forks.append(forked)
+            return forked
+
+        def mask_logits(self, logits):
+            legal = {
+                (4,): 10,
+                (4, 10): 11,
+                (4, 10, 11): 8,
+            }[tuple(self.accepted)]
+            masked = mx.full(logits.shape, -1000.0)
+            return masked.at[..., legal].add(2000.0)
+
+        def accept_token(self, token):
+            self.accepted.append(int(token))
+
+    class _RawIllegalDrafter(_RecurrentDrafter):
+        def draft_step(self, hidden, token, mtp_kv, offset, _weights=None):
+            step = len(self.calls)
+            self.mtp_kv = mtp_kv
+            self.calls.append({
+                "hidden": float(hidden.reshape(-1)[0].item()),
+                "token": int(token),
+                "offset": int(offset),
+            })
+            key = mx.full((1, 1, 1, 1), float(step + 1))
+            mtp_kv.update(0, key, key)
+            raw_illegal, legal = ((12, 10), (13, 11))[step]
+            logits = mx.full((16,), -100.0)
+            logits = logits.at[legal].add(200.0)
+            logits = logits.at[raw_illegal].add(300.0)
+            return logits, mx.array([[[1000.0 + step]]])
+
+    target = _Target(2)
+    engine = QwenMTPSpeculativeEngine(
+        target,
+        max_prompt_tokens=8,
+        min_output_tokens=2,
+        plain_warmup_tokens=0,
+        adaptive_stop=False,
+        depth=2,
+        grammar_aware_draft=True,
+    )
+    drafter = _RawIllegalDrafter()
+    engine.drafter = drafter
+    constraint = _Constraint()
+
+    result = engine.generate("x", 4, constraint=constraint)
+
+    assert result["tokens"] == [4, 10, 11, 8]
+    assert constraint.accepted == [4, 10, 11, 8]
+    assert len(constraint.forks) == 1
+    assert constraint.forks[0].accepted == [4, 10, 11]
+    assert drafter.calls[1]["token"] == 10
+    stats = result["path_stats"]
+    assert stats["qwen_mtp_accepted_by_step"] == [1, 1]
+    assert stats["qwen_mtp_grammar_masked_draft_tokens"] == 2
+    assert stats["qwen_mtp_grammar_masked_draft_rounds"] == 1
+
+
 @pytest.mark.parametrize(
     "eos,expected_tokens,expected_fed,verified",
     [

@@ -433,6 +433,26 @@ class GrammarConstraint:
         self.completed = bool(
             self.stop_on_complete and self.matcher.is_completed())
 
+    def fork(self) -> "GrammarConstraint":
+        """Return an independent matcher at the identical token boundary.
+
+        Speculative drafters may use this copy to condition later proposals on
+        earlier provisional tokens without mutating the authoritative request
+        grammar.  Only target-verified tokens are ever accepted by ``self``.
+        """
+        matcher_fork = getattr(self.matcher, "fork", None)
+        if not callable(matcher_fork):
+            raise TypeError("grammar matcher does not support fork")
+        forked = GrammarConstraint(
+            matcher_fork(),
+            self.vocab_size,
+            self.profile,
+            stop_on_complete=self.stop_on_complete,
+        )
+        forked.completed = bool(self.completed)
+        forked._dead_end = bool(self._dead_end)
+        return forked
+
     def forced_run(self, limit: int, encode=None) -> list[int]:
         """Grammar fast-forward (jump-forward decoding, token-level exact
         variant): return the run of tokens the grammar FORCES next.

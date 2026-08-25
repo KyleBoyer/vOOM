@@ -84,6 +84,7 @@ heterogeneous replay matrix is accumulated:
 
 ```bash
 VMODEL_QWEN_MTP_GRAMMAR_AWARE_DRAFT=1 \
+VMODEL_QWEN_MTP_DEPTH=2 \
 VMODEL_QWEN35_MIXED_DEPTH_ENDPOINT_PERSIST=1 \
 .venv/bin/python -u -m runtime.server \
   --profile huihui-qwen38-27b-fast-agent --port 8077
@@ -95,6 +96,17 @@ developer-message/two-tool/max-32 shape this preserved the response hash,
 raised native-MTP acceptance from 6/13 to 9/10, and reduced decode from
 101.719s to 78.840s.  It remains default-off because this is one constrained
 request family; stochastic sampling retains the established unmodified path.
+For depth two, the drafter now advances an independent fork of the grammar
+through provisional tokens, so the second proposal is conditioned without
+mutating the authoritative verifier state.  Against that same declared
+developer/two-tool/max-32 shape, a fresh-process endpoint replay accepted
+12/16 drafts over eight target sweeps, preserved the response hash, and
+completed in **69.983s wall** (0.006s prefill, 66.407s decode, 2.486GB peak
+Metal).  That is 10.3% faster than the 77.977s depth-one endpoint replay.  The
+cold depth-two seed took 102.901s because changing MTP depth correctly changed
+the cache fingerprint and forced a 34.874s prefill; its decode was 64.619s.
+Depth two and grammar-aware drafting remain explicit opt-ins pending the full
+heterogeneous replay corpus.
 
 The second adds a separately typed, checksummed prompt endpoint to the
 mixed-depth journal.  It records complete full-attention KV, every DeltaNet
