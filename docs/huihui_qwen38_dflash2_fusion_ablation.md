@@ -14,8 +14,11 @@ export VMODEL_QWEN_DFLASH2_FUSED_DYNAMIC_CONV=1
 ```
 
 The kernel implements DFlash2's two-tap group-dynamic causal convolution in
-one dispatch and serial FP32 accumulation.  It is formula-equivalent but not
-BF16 byte-identical to the MLX graph, so it is deliberately confined to the
+one dispatch and serial FP32 accumulation.  When residual projection is
+enabled, a second threadgroup form fuses the 5,120-wide direction reduction
+and subtraction into the convolution instead of materializing the branch and
+launching a separate projection.  Both forms are formula-equivalent but not
+BF16 byte-identical to the MLX graph, so they are deliberately confined to the
 draft.  The real-geometry microbenchmark is reproducible after a passing
 memory preflight:
 
@@ -24,6 +27,11 @@ memory preflight:
   --warmup 30 --repetitions 400 \
   --result logs/dflash2_dynamic_conv_bench_20260824.json
 ```
+
+The plain convolution improved 0.27096ms to 0.19483ms (1.391x).  With
+projection, the already-fused convolution plus a separate projection measured
+0.24635ms, while the combined kernel measured 0.23508ms (1.048x), saving only
+0.225ms over all 20 calls in a five-layer proposal block.
 
 ## Rank-one sidecar projection
 
@@ -88,10 +96,20 @@ This proves that the actual Huihui edit direction is recoverable; it does not
 prove that applying the target's coefficient to a differently trained DFlash
 architecture improves proposals.  Two cap-4, eight-token admission attempts
 with the Huihui direction were refused by the unchanged governor at the
-serial verifier, about 10MB over the safety ceiling.  They are recorded as a
-memory stop, not worked around.  Promotion still requires a successfully
-admitted heterogeneous acceptance/quality corpus, or DFlash2-specific
-harmful/harmless activation captures.
+serial verifier, about 10MB over the safety ceiling.  A third attempt after
+fusing projection into the convolution was also refused at essentially the
+same active footprint, proving the projection temporary was not the limiting
+allocation.  They are recorded as a memory stop, not worked around.  Promotion
+still requires a successfully admitted heterogeneous acceptance/quality
+corpus, or DFlash2-specific harmful/harmless activation captures.
+
+A bounded three-token oracle did admit.  At measured Huihui strength 1.29963,
+the combined kernel emitted `[271, 12, 2972]` and reproduced both visible
+output SHA-256 `c9165f...392c` and the complete 129-tensor target endpoint
+SHA-256 `979303ca...b4c85` from the unprojected/unfused reference.  Both arms
+accepted 1/1 proposal.  Candidate wall was 18.539s versus 17.320s, with 2.656s
+versus 0.909s sidecar load time, so it is a correctness witness and a
+performance stop.
 
 ## Promotion gates
 

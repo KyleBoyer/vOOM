@@ -26,7 +26,6 @@ import mlx.nn as nn
 from .dflash2 import (
     CandidateSelector,
     GroupedDynamicCausalConv,
-    project_out_direction,
 )
 from .dflash2_ablation import load_artifact as load_ablation_artifact
 from .dflash2_schema import (
@@ -294,20 +293,33 @@ class DFlash2DecoderLayer(nn.Module):
         block_offset: int,
         cache: CtxCache,
         *,
+        residual_direction: mx.array | None = None,
+        residual_strength: float = 1.0,
         project_residual=None,
     ) -> mx.array:
+        if residual_direction is not None and project_residual is not None:
+            raise ValueError("DFlash2 residual projection was specified twice")
         residual = hidden
         hidden, kernel = self.attention_conv.prepare(
             self.input_layernorm(hidden))
         branch = self.attention_conv.finish(
-            self.self_attn.attend(hidden, block_offset, cache), kernel)
+            self.self_attn.attend(hidden, block_offset, cache),
+            kernel,
+            projection_direction=residual_direction,
+            projection_strength=residual_strength,
+        )
         if project_residual is not None:
             branch = project_residual(branch)
         hidden = residual + branch
         residual = hidden
         hidden, kernel = self.mlp_conv.prepare(
             self.post_attention_layernorm(hidden))
-        branch = self.mlp_conv.finish(self.mlp(hidden), kernel)
+        branch = self.mlp_conv.finish(
+            self.mlp(hidden),
+            kernel,
+            projection_direction=residual_direction,
+            projection_strength=residual_strength,
+        )
         if project_residual is not None:
             branch = project_residual(branch)
         return residual + branch
@@ -607,15 +619,6 @@ class DFlash2Drafter(nn.Module):
             ablation_fingerprint=fingerprint,
         )
 
-    def _ablate(self, hidden: mx.array) -> mx.array:
-        if self._ablation_direction is None:
-            return hidden
-        return project_out_direction(
-            hidden,
-            self._ablation_direction,
-            self.config.ablation_strength,
-        )
-
     def bind_target_embed(self, provider) -> None:
         self._target_embed_provider = provider
 
@@ -691,10 +694,8 @@ class DFlash2Drafter(nn.Module):
                 hidden,
                 block_offset,
                 cache,
-                project_residual=(
-                    self._ablate if self._ablation_direction is not None
-                    else None
-                ),
+                residual_direction=self._ablation_direction,
+                residual_strength=self.config.ablation_strength,
             )
         proposal_hidden = self.norm(hidden)[:, 1:]
         logits = self._project_logits(proposal_hidden)

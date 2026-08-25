@@ -60,11 +60,78 @@ _FUSED_GROUPED_DYNAMIC_CONV_SOURCE = r"""
 """
 
 
+_FUSED_GROUPED_DYNAMIC_CONV_PROJECTED_SOURCE = r"""
+    uint tid = thread_index_in_threadgroup;
+    uint t = threadgroup_position_in_grid.y;
+    uint b = threadgroup_position_in_grid.z;
+    uint H = hidden_shape[2];
+    uint L = hidden_shape[1];
+    uint K = base_shape[0];
+    uint G = dynamic_shape[3];
+    uint simd_group = tid / 32;
+    uint lane = tid % 32;
+    threadgroup float partials[8];
+    threadgroup float projection[1];
+
+    float local_dot = 0.0f;
+    for (uint h = tid; h < H; h += 256) {
+        uint group = h / (H / G);
+        float value = 0.0f;
+        for (uint offset = 0; offset < K; ++offset) {
+            if (offset > t) break;
+            size_t source_index = ((size_t)b * L + (t - offset)) * H + h;
+            size_t base_index = (size_t)offset * H + h;
+            size_t dynamic_index =
+                (((size_t)b * L + t) * K + offset) * G + group;
+            value += static_cast<float>(hidden[source_index])
+                * (static_cast<float>(base[base_index])
+                   + static_cast<float>(dynamic[dynamic_index]));
+        }
+        local_dot += value * static_cast<float>(direction[h]);
+    }
+    float simd_partial = simd_sum(local_dot);
+    if (lane == 0) partials[simd_group] = simd_partial;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (simd_group == 0) {
+        float value = lane < 8 ? partials[lane] : 0.0f;
+        value = simd_sum(value);
+        if (lane == 0) projection[0] = value;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float coefficient = static_cast<float>(strength[0]) * projection[0];
+    for (uint h = tid; h < H; h += 256) {
+        uint group = h / (H / G);
+        float value = 0.0f;
+        for (uint offset = 0; offset < K; ++offset) {
+            if (offset > t) break;
+            size_t source_index = ((size_t)b * L + (t - offset)) * H + h;
+            size_t base_index = (size_t)offset * H + h;
+            size_t dynamic_index =
+                (((size_t)b * L + t) * K + offset) * G + group;
+            value += static_cast<float>(hidden[source_index])
+                * (static_cast<float>(base[base_index])
+                   + static_cast<float>(dynamic[dynamic_index]));
+        }
+        value -= coefficient * static_cast<float>(direction[h]);
+        output[((size_t)b * L + t) * H + h] = static_cast<T>(value);
+    }
+"""
+
+
 _fused_grouped_dynamic_conv_kernel = mx.fast.metal_kernel(
     name="voom_dflash2_grouped_dynamic_conv",
     input_names=["hidden", "dynamic", "base"],
     output_names=["output"],
     source=_FUSED_GROUPED_DYNAMIC_CONV_SOURCE,
+)
+
+
+_fused_grouped_dynamic_conv_projected_kernel = mx.fast.metal_kernel(
+    name="voom_dflash2_grouped_dynamic_conv_projected",
+    input_names=["hidden", "dynamic", "base", "direction", "strength"],
+    output_names=["output"],
+    source=_FUSED_GROUPED_DYNAMIC_CONV_PROJECTED_SOURCE,
 )
 
 
@@ -117,6 +184,41 @@ def fused_grouped_dynamic_convolve(
         template=[("T", hidden.dtype)],
         grid=(hidden_size, length, batch),
         threadgroup=(min(hidden_size, 256), 1, 1),
+        output_shapes=[hidden.shape],
+        output_dtypes=[hidden.dtype],
+    )[0]
+
+
+def fused_grouped_dynamic_convolve_projected(
+    hidden: mx.array,
+    dynamic: mx.array,
+    base: mx.array,
+    direction: mx.array,
+    group_size: int,
+    strength: float = 1.0,
+) -> mx.array:
+    """Fuse causal convolution and one residual-direction projection."""
+    batch, length, hidden_size, _kernel_size = (
+        _validate_grouped_dynamic_convolution(
+            hidden, dynamic, base, group_size))
+    if direction.ndim != 1 or tuple(direction.shape) != (hidden_size,):
+        raise ValueError("DFlash2 fused projection direction width mismatch")
+    if not isinstance(strength, (int, float)) or isinstance(strength, bool) \
+            or not 0.0 < float(strength) <= 2.0:
+        raise ValueError("DFlash2 fused projection strength must be in (0, 2]")
+    if not mx.metal.is_available():
+        raise RuntimeError("DFlash2 fused convolution requires Metal")
+    return _fused_grouped_dynamic_conv_projected_kernel(
+        inputs=[
+            hidden,
+            dynamic,
+            base,
+            direction.astype(mx.float32),
+            mx.array([float(strength)], dtype=mx.float32),
+        ],
+        template=[("T", hidden.dtype)],
+        grid=(256, length, batch),
+        threadgroup=(256, 1, 1),
         output_shapes=[hidden.shape],
         output_dtypes=[hidden.dtype],
     )[0]
@@ -220,14 +322,30 @@ class GroupedDynamicCausalConv(nn.Module):
         )
         return prepared, dynamic[..., 1, :, :]
 
-    def finish(self, hidden: mx.array, dynamic: mx.array) -> mx.array:
-        return grouped_dynamic_convolve(
-            hidden,
-            dynamic,
-            self.base_kernel[1],
-            self.group_size,
-            fused=self.fused,
-        )
+    def finish(
+        self,
+        hidden: mx.array,
+        dynamic: mx.array,
+        *,
+        projection_direction: mx.array | None = None,
+        projection_strength: float = 1.0,
+    ) -> mx.array:
+        if projection_direction is not None and self.fused:
+            return fused_grouped_dynamic_convolve_projected(
+                hidden,
+                dynamic,
+                self.base_kernel[1],
+                projection_direction,
+                self.group_size,
+                projection_strength,
+            )
+        output = grouped_dynamic_convolve(
+            hidden, dynamic, self.base_kernel[1], self.group_size,
+            fused=self.fused)
+        if projection_direction is not None:
+            output = project_out_direction(
+                output, projection_direction, projection_strength)
+        return output
 
 
 def _sampling_probabilities(scores: mx.array, temperature: float) -> mx.array:

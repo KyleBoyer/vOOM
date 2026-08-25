@@ -51,7 +51,7 @@ def test_fused_dynamic_convolution_is_an_explicit_runtime_opt_in():
 def test_ablation_projects_residual_writers_not_the_accumulated_stream():
     identity_conv = SimpleNamespace(
         prepare=lambda hidden: (hidden, None),
-        finish=lambda hidden, _kernel: hidden,
+        finish=lambda hidden, _kernel, **_kwargs: hidden,
     )
     layer = SimpleNamespace(
         input_layernorm=lambda hidden: hidden,

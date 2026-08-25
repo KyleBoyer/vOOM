@@ -7,6 +7,7 @@ import numpy as np
 
 from runtime.dflash2 import (
     CandidateSelector,
+    fused_grouped_dynamic_convolve_projected,
     grouped_dynamic_convolve,
     project_out_direction,
 )
@@ -95,6 +96,34 @@ def test_direction_projection_removes_only_the_selected_component():
         np.array([[[0.0, 4.0], [0.0, -2.0]]], dtype=np.float32),
     )
     assert project_out_direction(hidden, direction, 0.0) is hidden
+
+
+def test_fused_convolution_projection_matches_composed_reference():
+    hidden = (
+        mx.arange(5 * 16, dtype=mx.float32).reshape(1, 5, 16) / 31
+    ).astype(mx.bfloat16)
+    dynamic = (
+        mx.arange(5 * 2 * 4, dtype=mx.float32).reshape(1, 5, 2, 4) / 47
+    ).astype(mx.bfloat16)
+    base = (
+        mx.arange(2 * 16, dtype=mx.float32).reshape(2, 16) / 29
+    ).astype(mx.bfloat16)
+    direction = mx.arange(1, 17, dtype=mx.float32)
+    direction = direction / mx.sqrt(mx.sum(direction * direction))
+    reference = project_out_direction(
+        grouped_dynamic_convolve(hidden, dynamic, base, 4),
+        direction,
+        1.3,
+    )
+    fused = fused_grouped_dynamic_convolve_projected(
+        hidden, dynamic, base, direction, 4, 1.3)
+    mx.eval(reference, fused)
+    np.testing.assert_allclose(
+        np.array(fused.astype(mx.float32)),
+        np.array(reference.astype(mx.float32)),
+        rtol=0,
+        atol=2 ** -4,
+    )
 
 
 def test_candidate_selector_walks_parent_conditioned_path_and_returns_sparse_q():
