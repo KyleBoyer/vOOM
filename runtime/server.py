@@ -1299,10 +1299,6 @@ class EngineManager:
                 "VMODEL_QWEN_MTP_GRAMMAR_AWARE_DRAFT must be 0 or 1")
         qwen_mtp_grammar_aware_draft = (
             qwen_mtp_grammar_aware_draft_request == "1")
-        if qwen_mtp_ngram_first and qwen_mtp_depth != 1:
-            raise RequestValidationError(
-                "VMODEL_QWEN_MTP_NGRAM_FIRST=1 requires "
-                "VMODEL_QWEN_MTP_DEPTH=1")
         if qwen_mtp_tree_width and qwen_mtp_ngram_first:
             raise RequestValidationError(
                 "VMODEL_QWEN_MTP_TREE_WIDTH cannot be combined with "

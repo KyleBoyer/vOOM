@@ -486,6 +486,54 @@ attempt also remains a STOP: prefill completed, but decode hit the memory floor
 and swap growth reached 706MB. The released model advertises 262,144 context;
 this work validates 30K on this machine, not the advertised maximum.
 
+## Depth-4 n-gram/MTP cascade and pressure follow-up (2026-08-26)
+
+`VMODEL_QWEN_MTP_NGRAM_FIRST=1` now composes with the existing native-MTP
+depth-four chain. A prompt/history suffix match proposes up to four tokens
+without loading the 849.399MB BF16 MTP sidecar; a miss falls back to the
+ordinary depth-four drafter. Both sources use the same authoritative target
+verifier and recurrent/KV rollback. The setting remains explicit and defaults
+off.
+
+On a tracked but intentionally modified non-streaming/no-tool repetitive
+scenario (84 rendered input tokens, 10 output tokens, temperature zero), the
+cascade preserved output SHA-256
+`c886b3783fc717ff9f3e021e40cb1c2699068f51512d601f0641ebb97d8a4d05`.
+Two n-gram matches accepted five tokens, cut target sweeps 5 -> 4, BF16 sidecar
+round loads 5 -> 2, and total streamed weight bytes 82.094 -> 67.215GB. Wall
+fell 50.7372 -> 39.4793s (22.2%). This number depends on the stated prompt and
+tool-shape mutation; it is not the unmodified 134-tool result.
+
+The unmodified captured 134-tool request also preserved its known response
+hash and found two n-gram matches, but a host-pressure prefill retry selected
+32-token chunks and made that cold sample 175.0009s versus the same-day
+106.1934s control. Because n-gram lookup begins only after prefill, this is
+evidence of cold scheduling variance rather than prompt-dependent prefill
+work, but it is still a promotion failure. The named fast profile therefore
+does not enable the cascade.
+
+The fixed 16,029-input / 64-output fixture gave the strongest sustained-decode
+result when the 675.441MB MXFP4 LM head was left demand-cached instead of
+pinned. It reproduced the known output SHA-256
+`bdff23c8cc7742c78896798a571c59112be9b39559ca20b16e577b3550b44fca`,
+both distant canaries, the exact required prefix, and nine validation integers.
+N-gram-first accepted 20/24 proposals across six matches; combined acceptance
+was 45/72, target sweeps fell 27 -> 18, sidecar loads fell 27 -> 12, and wall
+fell 335.2813 -> 287.2454s (14.3%). It is not promoted: swap-out growth was
+19.841MB, above the 16MB gate. A stricter 5.35GB floor still emitted identical
+bytes in 307.5602s but used 18.432MB swap; 5.4GB failed closed by 10MB during a
+later verifier reservation. These are explicit long-context experiments, not
+production defaults.
+
+A proposal-only affine4 -> affine2 requantizer was added for dense Qwen3.5
+draft artifacts. The real 0.8B derivative shrank 493.916 -> 276.009MB (44.1%),
+but both the affine4 release-before-target path and affine2 retained path were
+refused by the unchanged verifier memory ceiling. Affine2 also increased live
+allocator pressure despite its smaller file. It is a reproducible storage tool,
+not an accepted serving sidecar. Prefetch depth four and a proposed 64-token
+prefill retry rung were likewise rejected by live gates; the production
+prefetch depth remains two and the conservative 128 -> 32 retry is unchanged.
+
 ## Evidence
 
 - FreeToken audit, exact MTP two-SSD split, verifier/prefetch instrumentation,
@@ -520,6 +568,13 @@ this work validates 30K on this machine, not the advertised maximum.
   `logs/qwen38_large_context_16k_out64_nohot.json`
 - Passing 16K/64 adaptive-MTP/cache-overlap gate:
   `logs/qwen38_large_context_16k_out64_mtp_recovery_cache_prepare.json`
+- N-gram repetitive A/B:
+  `logs/qwen38_ngram4_repetition_baseline32_20260826.json` and
+  `logs/qwen38_ngram4_repetition_candidate32_20260826.json`
+- N-gram unmodified capture correctness/pressure sample:
+  `logs/qwen38_ngram4_unmodified_capture16_20260826.json`
+- N-gram 16K/64 unpinned-head near-pass:
+  `logs/qwen38_ngram4_unpinned_head_large16k_out64_20260826.json`
 - 30K/32 retrieval result (composite red only for second integer):
   `logs/qwen38_large_context_30k_out32_nohot.json`
 - 30K/128 pressure STOP:

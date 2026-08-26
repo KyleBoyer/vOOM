@@ -622,7 +622,8 @@ def test_qwen_mtp_ngram_first_keeps_exact_target_state_and_acceptance_telemetry(
     target = _Target()
     engine = QwenMTPSpeculativeEngine(
         target, max_prompt_tokens=8, min_output_tokens=2,
-        plain_warmup_tokens=0, adaptive_stop=False, ngram_first=True)
+        plain_warmup_tokens=0, adaptive_stop=False, depth=4,
+        ngram_first=True)
     engine.drafter = _ForbiddenSidecar()
 
     result = engine.generate("x", 6)
@@ -643,6 +644,7 @@ def test_qwen_mtp_ngram_first_keeps_exact_target_state_and_acceptance_telemetry(
         "R" if accepted_prefix == 0 else
         f"A{accepted_prefix}R" if rejected else "A4")
     assert stats["qwen_mtp_proposal_sources"] == "N"
+    assert stats["qwen_mtp_depth"] == 4
     assert stats["qwen_mtp_ngram_first_attempts"] == 1
     assert stats["qwen_mtp_ngram_first_matches"] == 1
     assert stats["qwen_mtp_ngram_first_max_draft_tokens"] == 4

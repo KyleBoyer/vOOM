@@ -1229,9 +1229,6 @@ class QwenMTPSpeculativeEngine:
                 or not 1 <= ngram_max_draft_tokens <= 4):
             raise ValueError(
                 "Qwen MTP n-gram draft width must be in [1, 4]")
-        if ngram_first and depth != 1:
-            raise ValueError(
-                "Qwen MTP n-gram-first cascade currently requires depth 1")
         if (isinstance(native_tree_width, bool)
                 or not isinstance(native_tree_width, int)
                 or native_tree_width not in (0, 2, 3, 4)):

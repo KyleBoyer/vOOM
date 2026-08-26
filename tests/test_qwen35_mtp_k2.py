@@ -599,6 +599,7 @@ def test_k4_every_accepted_prefix_matches_ordinary_state_oracle(
         plain_warmup_tokens=0,
         adaptive_stop=False,
         depth=4,
+        ngram_first=True,
     )
     drafter = _WideRecurrentDrafter()
     engine.drafter = drafter
@@ -631,6 +632,9 @@ def test_k4_every_accepted_prefix_matches_ordinary_state_oracle(
     assert [call["offset"] for call in drafter.calls] == [2, 3, 4, 5]
     stats = result["path_stats"]
     assert stats["qwen_mtp_depth"] == 4
+    assert stats["qwen_mtp_ngram_first_attempts"] == 1
+    assert stats["qwen_mtp_ngram_first_matches"] == 0
+    assert stats["qwen_mtp_proposal_sources"] == "M"
     assert stats["qwen_mtp_verify_width"] == 5
     assert stats["qwen_mtp_accepted"] == accepted_prefix
     assert stats["qwen_mtp_accepted_by_step"] == [
@@ -1045,8 +1049,10 @@ def test_k2_constructor_is_strict_and_opt_in():
     for invalid in (0, 5, True, "2"):
         with pytest.raises(ValueError, match=r"depth must be in \[1, 4\]"):
             QwenMTPSpeculativeEngine(target, depth=invalid)
-    with pytest.raises(ValueError, match="requires depth 1"):
-        QwenMTPSpeculativeEngine(target, depth=2, ngram_first=True)
+    cascade = QwenMTPSpeculativeEngine(
+        target, depth=4, ngram_first=True)
+    assert cascade.depth == 4
+    assert cascade.ngram_first is True
     for invalid in (1, 5, True, "4"):
         with pytest.raises(ValueError, match="tree width must be 0 or"):
             QwenMTPSpeculativeEngine(target, native_tree_width=invalid)
@@ -1081,12 +1087,6 @@ def test_server_q_policy_is_strict_and_part_of_engine_cache_identity():
         "VMODEL_QWEN_MTP_GRAMMAR_AWARE_DRAFT": "auto",
     }):
         with pytest.raises(RequestValidationError, match="must be 0 or 1"):
-            EngineManager().get(Path("/tmp/not-opened"), "fast")
-    with patch.dict(os.environ, {
-        "VMODEL_QWEN_MTP_NGRAM_FIRST": "1",
-        "VMODEL_QWEN_MTP_DEPTH": "2",
-    }):
-        with pytest.raises(RequestValidationError, match="requires.*DEPTH=1"):
             EngineManager().get(Path("/tmp/not-opened"), "fast")
     with patch.dict(os.environ, {"VMODEL_QWEN_MTP_TREE_WIDTH": "1"}):
         with pytest.raises(RequestValidationError, match="must be 0 or"):
@@ -1252,7 +1252,7 @@ def test_server_wires_typed_q_policy_and_explicit_deep_chain():
     assert policy.name == "temperature-k8-t0.75"
 
     env.update({
-        "VMODEL_QWEN_MTP_DEPTH": "1",
+        "VMODEL_QWEN_MTP_DEPTH": "4",
         "VMODEL_QWEN_MTP_NGRAM_FIRST": "1",
     })
     with patch.dict(os.environ, env), \
@@ -1269,7 +1269,7 @@ def test_server_wires_typed_q_policy_and_explicit_deep_chain():
             Path("/tmp/fake-qwen-ngram-mtp-wiring"), "fast")
 
     assert cascaded is captured[1]
-    assert cascaded.kwargs["depth"] == 1
+    assert cascaded.kwargs["depth"] == 4
     assert cascaded.kwargs["ngram_first"] is True
     assert cascaded.kwargs["grammar_aware_draft"] is True
 
