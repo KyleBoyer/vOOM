@@ -26,6 +26,15 @@ class QwenTreeKVProxy:
         self.tree = tree
         self.num_layers = int(num_layers)
         self.current_node = 0
+        # Preserve the established exact materialize+SDPA behavior unless the
+        # caller already selected Qwen's explicit lossy paged-online path.
+        # In that mode the proxy exposes the prompt pages followed by only the
+        # current node's ancestor chain, avoiding one full-prefix
+        # materialization for every tree node.
+        self.online_attention = bool(
+            getattr(base, "online_attention", False))
+        self.online_attention_tile_positions = int(getattr(
+            base, "online_attention_tile_positions", 2048))
         self.kda_cache = KDAStateCache(self.num_layers)
         size = len(tree.token_ids)
         self.node_keys: list[list[mx.array | None]] = [
@@ -74,6 +83,58 @@ class QwenTreeKVProxy:
             keys[0] if len(keys) == 1 else mx.concatenate(keys, axis=2),
             values[0] if len(values) == 1 else mx.concatenate(values, axis=2),
         )
+
+    def append_for_online_attention(
+        self, layer: int, key: mx.array, value: mx.array,
+    ) -> None:
+        """Retain one speculative node without mutating the prompt cache."""
+        node = int(self.current_node)
+        if not self.online_attention:
+            raise RuntimeError("tree proxy online attention is disabled")
+        if not 0 <= node < len(self.tree.token_ids):
+            raise ValueError("current Qwen tree node is invalid")
+        if int(key.shape[2]) != 1 or key.shape != value.shape:
+            raise ValueError("Qwen tree attention updates must be one position")
+        self.node_keys[layer][node] = key
+        self.node_values[layer][node] = value
+
+    def iter_materialized_layer_chunks(
+        self, layer: int, *, max_positions: int,
+    ):
+        """Yield bounded prompt tiles followed by the current ancestor path."""
+        if not self.online_attention:
+            raise RuntimeError("tree proxy online attention is disabled")
+        iterator = getattr(self.base, "iter_materialized_layer_chunks", None)
+        if not callable(iterator):
+            raise TypeError(
+                "Qwen tree online attention requires paged prompt K/V")
+        yield from iterator(layer, max_positions=max_positions)
+
+        path = self.tree.path(int(self.current_node))
+        keys = [self.node_keys[layer][index] for index in path]
+        values = [self.node_values[layer][index] for index in path]
+        if any(item is None for item in (*keys, *values)):
+            raise RuntimeError("Qwen tree attention parent K/V is incomplete")
+        # Tree depths are tiny (currently <= 4), but retain the iterator's
+        # contract if a larger experimental topology is supplied later.
+        for start in range(0, len(path), int(max_positions)):
+            part_k = keys[start:start + int(max_positions)]
+            part_v = values[start:start + int(max_positions)]
+            yield (
+                part_k[0] if len(part_k) == 1
+                else mx.concatenate(part_k, axis=2),
+                part_v[0] if len(part_v) == 1
+                else mx.concatenate(part_v, axis=2),
+            )
+
+    def layer_positions(self, layer: int) -> int:
+        base_positions = getattr(self.base, "layer_positions", None)
+        if not callable(base_positions):
+            keys, _values = self._base_layer(layer)
+            count = 0 if keys is None else int(keys.shape[2])
+        else:
+            count = int(base_positions(layer))
+        return count + len(self.tree.path(int(self.current_node)))
 
     def commit_attention_path(self, path, destination) -> None:
         selected = tuple(int(index) for index in path)

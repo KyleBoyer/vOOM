@@ -646,6 +646,13 @@ not allowed.
   `logs/qwen38_paged300_page2048_online2048_large16k_out64_20260826.json`
 - Exact untouched captured-shape tiled-paged gate:
   `logs/qwen38_paged64_online2048_exact_greedy_capture16_20260826.json`
+- Winning depth-12 plus tiled-paged 16K/64 gate:
+  `logs/qwen38_suffix12_anchor128_paged_large16k_out64_20260826.json`
+- Untouched captured-shape depth-12 quality sample:
+  `logs/qwen38_suffix12_unmodified_capture16_20260826.json`
+- Rejected heterogeneous developer/tool depth-12 and depth-14 gates:
+  `logs/qwen38_suffix12_developer2tools_noonline_capture16_20260826.json` and
+  `logs/qwen38_suffix14_developer2tools_noonline_capture16_20260826.json`
 - 30K/32 retrieval result (composite red only for second integer):
   `logs/qwen38_large_context_30k_out32_nohot.json`
 - 30K/128 pressure STOP:
@@ -653,5 +660,6 @@ not allowed.
 - Historical invalid-KDA full-schema artifact:
   `logs/huihui_qwen38_lossless_capture1_paged_v4.json`
 - Profiles: `profiles/huihui-qwen38-27b-fast-agent.yaml`,
+  `profiles/huihui-qwen38-27b-fast-long-context.yaml`,
   `profiles/huihui-qwen38-27b-lossless.yaml`, and
   `profiles/huihui-qwen38-27b-lossless-paged-persist.yaml`

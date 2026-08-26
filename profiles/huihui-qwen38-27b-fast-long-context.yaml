@@ -1,0 +1,23 @@
+schema: voom.runtime-profile.v1
+name: huihui-qwen38-27b-fast-long-context
+description: Explicit Huihui Qwen3.8 27B long-context throughput candidate for this 16 GB Mac.
+notes:
+  - "This profile is lossy: it combines all-weight MXFP4, a mixed-depth 12:128:1024 prefill schedule, reassociated DeltaNet prefill, and reassociated tiled online attention. It is never a released-model-correct route."
+  - "It is an operator-selected long-context profile, not an automatic prompt-length route. The ordinary fast-agent profile retains its quality-gated 16:1024 schedule."
+  - "On the fixed 16,029-input / 64-output gate, it preserved the established output SHA, both distant canaries, all 64 tokens, and nine validation integers while reducing wall 260.0515s -> 236.8557s and prefill 130.9405s -> 109.9479s. Peak Metal was 3.565GB and swap-out growth was 12.845MB."
+  - "The untouched 134-tool / max-16 capture also preserved its known output SHA at 93.3092s wall, but exceeded the strict swap-growth gate. A 1,371-input developer/two-tool/temperature-0.7 shape chose the wrong response class under depth 12, so this profile must not become the general agent default."
+  - "The 64MB exact-BF16 KV resident budget, 1,024-position spill pages, and 2,048-position online-softmax tiles are the measured long-context composition. The generic tree proxy can stream speculative ancestor K/V through this path, but no tree topology is enabled because the tested extra leaf increased wall without reducing target sweeps."
+extends:
+  - huihui-qwen38-27b-fast-agent
+settings:
+  VMODEL_QWEN35_LOSSY_SUFFIX_PREFILL: "12:128:1024"
+  # A depth-16 durable snapshot is not valid for this depth-12 execution
+  # identity, and the long-context gates were intentionally cold.
+  VMODEL_QWEN35_MIXED_DEPTH_HOT_KV_PERSIST: false
+  VMODEL_QWEN35_KV_MAX_MB: 64
+  VMODEL_QWEN35_KV_PAGE_POSITIONS: 1024
+  VMODEL_QWEN35_PAGED_ONLINE_ATTENTION: true
+  VMODEL_QWEN35_PAGED_ONLINE_TILE_POSITIONS: 2048
+  # The fixed rank-two continuation leaf rescued one proposal but did not
+  # remove a target sweep and regressed the 16K/64 wall to 275.6631 seconds.
+  VMODEL_QWEN_MTP_SELECTIVE_TREE_MARGIN: 0

@@ -12,10 +12,12 @@ import numpy as np
 import pytest
 
 from runtime.kv_paged import PagedKVCache
+from runtime.qwen35_tree_verify import QwenTreeKVProxy
 from runtime.qwen35_paged_attention import (
     theoretical_tile_count,
     tiled_paged_attention,
 )
+from runtime.speculative_tree import SpeculativeTree
 
 
 def test_paged_chunk_iterator_reconstructs_spilled_bits_exactly(tmp_path):
@@ -37,6 +39,97 @@ def test_paged_chunk_iterator_reconstructs_spilled_bits_exactly(tmp_path):
         np.asarray(reconstructed_values), np.asarray(values))
     assert kv.offset == 14
     assert theoretical_tile_count(14, 5) == 3
+
+
+def test_tree_proxy_streams_prompt_then_only_current_ancestor_path(tmp_path):
+    kv = PagedKVCache(
+        1, max_bytes=1, spill_dir=tmp_path,
+        page_positions=4, resident_pages=0)
+    kv.online_attention = True
+    kv.online_attention_tile_positions = 5
+    base_keys = mx.arange(12 * 8, dtype=mx.float32).reshape(1, 2, 12, 4)
+    base_values = base_keys + 1000
+    kv.append_for_online_attention(0, base_keys, base_values)
+    tree = SpeculativeTree(
+        token_ids=(1, 2, 3, 4),
+        depths=(0, 1, 1, 2),
+        parents=(-1, 0, 0, 1),
+        children=({2: 1, 3: 2}, {4: 3}, {}, {}),
+    )
+    proxy = QwenTreeKVProxy(kv, tree, 1)
+    node_keys = []
+    node_values = []
+    for node in range(4):
+        proxy.current_node = node
+        key = mx.full((1, 2, 1, 4), 100 + node, dtype=mx.float32)
+        value = mx.full((1, 2, 1, 4), 200 + node, dtype=mx.float32)
+        proxy.append_for_online_attention(0, key, value)
+        node_keys.append(key)
+        node_values.append(value)
+
+    proxy.current_node = 3
+    chunks = list(proxy.iter_materialized_layer_chunks(
+        0, max_positions=5))
+    actual_keys = mx.concatenate([item[0] for item in chunks], axis=2)
+    actual_values = mx.concatenate([item[1] for item in chunks], axis=2)
+    expected_keys = mx.concatenate(
+        [base_keys, node_keys[0], node_keys[1], node_keys[3]], axis=2)
+    expected_values = mx.concatenate(
+        [base_values, node_values[0], node_values[1], node_values[3]], axis=2)
+    mx.eval(actual_keys, actual_values, expected_keys, expected_values)
+
+    assert proxy.online_attention
+    assert proxy.online_attention_tile_positions == 5
+    assert proxy.layer_positions(0) == 15
+    assert [int(item[0].shape[2]) for item in chunks] == [5, 5, 2, 3]
+    np.testing.assert_array_equal(
+        np.asarray(actual_keys), np.asarray(expected_keys))
+    np.testing.assert_array_equal(
+        np.asarray(actual_values), np.asarray(expected_values))
+    # The immutable base prompt is never extended by speculative nodes.
+    assert kv.layer_positions(0) == 12
+
+
+def test_tree_proxy_online_commit_appends_only_selected_path(tmp_path):
+    kv = PagedKVCache(
+        1, max_bytes=1, spill_dir=tmp_path / "source",
+        page_positions=4, resident_pages=0)
+    kv.online_attention = True
+    base_keys = mx.zeros((1, 2, 8, 4), dtype=mx.float32)
+    base_values = base_keys + 1
+    kv.append_for_online_attention(0, base_keys, base_values)
+    tree = SpeculativeTree(
+        token_ids=(1, 2, 3, 4),
+        depths=(0, 1, 1, 2),
+        parents=(-1, 0, 0, 1),
+        children=({2: 1, 3: 2}, {4: 3}, {}, {}),
+    )
+    proxy = QwenTreeKVProxy(kv, tree, 1)
+    expected_keys = [base_keys]
+    expected_values = [base_values]
+    for node in range(4):
+        proxy.current_node = node
+        key = mx.full((1, 2, 1, 4), 10 + node, dtype=mx.float32)
+        value = mx.full((1, 2, 1, 4), 20 + node, dtype=mx.float32)
+        proxy.append_for_online_attention(0, key, value)
+        if node in (0, 1, 3):
+            expected_keys.append(key)
+            expected_values.append(value)
+
+    destination = PagedKVCache(
+        1, max_bytes=1, spill_dir=tmp_path / "destination",
+        page_positions=4, resident_pages=0)
+    destination.append_for_online_attention(0, base_keys, base_values)
+    proxy.commit_attention_path((0, 1, 3), destination)
+    actual_keys, actual_values = destination.materialize_layer(0)
+    expected_keys_array = mx.concatenate(expected_keys, axis=2)
+    expected_values_array = mx.concatenate(expected_values, axis=2)
+    mx.eval(actual_keys, actual_values)
+    np.testing.assert_array_equal(
+        np.asarray(actual_keys), np.asarray(expected_keys_array))
+    np.testing.assert_array_equal(
+        np.asarray(actual_values), np.asarray(expected_values_array))
+    assert destination.layer_positions(0) == 11
 
 
 @pytest.mark.skipif(not mx.metal.is_available(), reason="requires Metal")
