@@ -96,6 +96,27 @@ class KVCache:
     def allocated_nbytes(self) -> int:
         return self.nbytes()
 
+    def fork(self) -> "KVCache":
+        """Create a copy-on-write cache branch without copying tensor bytes.
+
+        ``update`` replaces each list entry with a newly concatenated array,
+        so sharing the already-evaluated prefix arrays is safe.  The method is
+        intentionally limited to the plain in-memory cache: paged/spilled
+        caches own external resources and expose their own lifetime rules.
+        """
+        branch = KVCache(len(self.keys))
+        branch.keys = list(self.keys)
+        branch.values = list(self.values)
+        branch._windows = list(self._windows)
+        branch._starts = list(self._starts)
+        recurrent = getattr(self, "kda_cache", None)
+        if recurrent is not None:
+            fork_recurrent = getattr(recurrent, "fork", None)
+            if not callable(fork_recurrent):
+                raise TypeError("recurrent KV companion cannot be forked")
+            branch.kda_cache = fork_recurrent()
+        return branch
+
     def update_latent(self, layer: int, lat):
         """Append compressed MLA state on its architecture-specific axis."""
         if self.keys[layer] is None:
@@ -1034,7 +1055,14 @@ class SteppedKVCache(KVCache):
 
     @property
     def offset(self) -> int:
-        return next((length for length in self._lengths if length), 0)
+        # A cache restored by assigning exact arrays predates the private
+        # capacity-length side table.  Adopt the first materialized layer on
+        # demand, as ``update`` already does through ``_layer_length``.
+        return next(
+            (length for layer in range(len(self.keys))
+             if (length := self._layer_length(layer))),
+            0,
+        )
 
     def nbytes(self) -> int:
         total = 0

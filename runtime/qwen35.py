@@ -258,10 +258,24 @@ def _full_attention(
     k = k.transpose(0, 2, 1, 3)
     v = v.transpose(0, 2, 1, 3)
     q, k = _apply_partial_rope(q, k, offset, cfg, positions3)
-    keys, values = kv.update(layer, k, v)
+    online_paged = bool(
+        length == 1 and getattr(kv, "online_attention", False))
+    if online_paged:
+        kv.append_for_online_attention(layer, k, v)
+        from .qwen35_paged_attention import tiled_paged_attention
+
+        attended = tiled_paged_attention(
+            q,
+            kv,
+            layer,
+            tile_positions=int(getattr(
+                kv, "online_attention_tile_positions", 2048)),
+        )
+    else:
+        keys, values = kv.update(layer, k, v)
 
     mask = None
-    if length > 1:
+    if not online_paged and length > 1:
         # The cache normally begins at global position zero, making its local
         # length and the RoPE offset identical. Mixed-depth lossy prefill can
         # intentionally begin an upper layer at a later global position:
@@ -271,8 +285,9 @@ def _full_attention(
         # suffix caches (including subsequent multi-token extensions).
         mask = _cache_local_causal_mask(
             length, int(keys.shape[2]), q.dtype)
-    attended = mx.fast.scaled_dot_product_attention(
-        q, keys, values, scale=head_dim ** -0.5, mask=mask)
+    if not online_paged:
+        attended = mx.fast.scaled_dot_product_attention(
+            q, keys, values, scale=head_dim ** -0.5, mask=mask)
     attended = attended.transpose(0, 2, 1, 3).reshape(
         batch, length, heads * head_dim)
     attended = attended * mx.sigmoid(output_gate)

@@ -998,6 +998,41 @@ def test_qwen_mtp_depth4_rescue_tree_extends_only_primary_chain():
     )
 
 
+def test_qwen_mtp_selective_tree_extends_only_low_margin_sibling():
+    from runtime.qwen35_mtp import _native_mtp_selective_continuation_tree
+
+    tree = _native_mtp_selective_continuation_tree(
+        4,
+        [10, 11, 12, 13],
+        branch_step=1,
+        branch_tokens=[21, 22, 23],
+    )
+
+    assert tree.token_ids == (4, 10, 11, 21, 12, 13, 22, 23)
+    assert tree.depths == (0, 1, 2, 2, 3, 4, 3, 4)
+    assert tree.parents == (-1, 0, 1, 1, 2, 4, 3, 6)
+    assert tree.children == (
+        {10: 1},
+        {11: 2, 21: 3},
+        {12: 4},
+        {22: 6},
+        {13: 5},
+        {},
+        {23: 7},
+        {},
+    )
+
+    with pytest.raises(ValueError, match="outside the primary"):
+        _native_mtp_selective_continuation_tree(
+            4, [10], branch_step=1, branch_tokens=[21])
+    with pytest.raises(ValueError, match="begin with a sibling"):
+        _native_mtp_selective_continuation_tree(
+            4, [10, 11], branch_step=1, branch_tokens=[11])
+    with pytest.raises(ValueError, match="exceeds the primary depth"):
+        _native_mtp_selective_continuation_tree(
+            4, [10, 11], branch_step=1, branch_tokens=[21, 22])
+
+
 def test_qwen_mtp_depth4_rescue_commits_sibling_and_trims_primary_mtp(
     monkeypatch,
 ):

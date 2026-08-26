@@ -1250,6 +1250,8 @@ class EngineManager:
                 "VMODEL_QWEN_MTP_PROMPT_HISTORY_TOKENS", "0"))
             qwen_mtp_prompt_history_min_prompt_tokens = int(os.environ.get(
                 "VMODEL_QWEN_MTP_PROMPT_HISTORY_MIN_PROMPT_TOKENS", "0"))
+            qwen_mtp_selective_tree_margin = float(os.environ.get(
+                "VMODEL_QWEN_MTP_SELECTIVE_TREE_MARGIN", "0"))
             qwen_mtp_q_parameter = float(os.environ.get(
                 "VMODEL_QWEN_MTP_Q_PARAMETER", "1"))
             qwen_mtp_ablation_strength = float(os.environ.get(
@@ -1301,6 +1303,10 @@ class EngineManager:
             raise RequestValidationError(
                 "VMODEL_QWEN_MTP_PROMPT_HISTORY_MIN_PROMPT_TOKENS must be "
                 "in [0, 1048576]")
+        if (not math.isfinite(qwen_mtp_selective_tree_margin)
+                or not 0.0 <= qwen_mtp_selective_tree_margin <= 16.0):
+            raise RequestValidationError(
+                "VMODEL_QWEN_MTP_SELECTIVE_TREE_MARGIN must be in [0, 16]")
         if qwen_mtp_ngram_first_request not in ("0", "1"):
             raise RequestValidationError(
                 "VMODEL_QWEN_MTP_NGRAM_FIRST must be 0 or 1")
@@ -1318,6 +1324,20 @@ class EngineManager:
             raise RequestValidationError(
                 "VMODEL_QWEN_MTP_PROMPT_HISTORY_TOKENS cannot be combined "
                 "with VMODEL_QWEN_MTP_TREE_WIDTH")
+        if (qwen_mtp_selective_tree_margin
+                and not qwen_mtp_prompt_history_tokens):
+            raise RequestValidationError(
+                "VMODEL_QWEN_MTP_SELECTIVE_TREE_MARGIN requires committed "
+                "prompt history")
+        if qwen_mtp_selective_tree_margin and qwen_mtp_depth <= 1:
+            raise RequestValidationError(
+                "VMODEL_QWEN_MTP_SELECTIVE_TREE_MARGIN requires MTP depth >1")
+        if qwen_mtp_selective_tree_margin and (
+            qwen_mtp_tree_width or qwen_mtp_ngram_first
+        ):
+            raise RequestValidationError(
+                "VMODEL_QWEN_MTP_SELECTIVE_TREE_MARGIN cannot be combined "
+                "with a native tree or n-gram-first")
         if not 1 <= qwen_ar_draft_prefill_step_size <= 4096:
             raise RequestValidationError(
                 "VMODEL_QWEN_AR_DRAFT_PREFILL_STEP_SIZE must be in [1, 4096]")
@@ -1340,11 +1360,17 @@ class EngineManager:
             raise RequestValidationError(
                 "VMODEL_QWEN_MTP_PROMPT_HISTORY_TOKENS requires the native "
                 "MTP drafter and cannot be combined with VMODEL_QWEN_AR_DRAFT")
+        if qwen_ar_draft_request and qwen_mtp_selective_tree_margin:
+            raise RequestValidationError(
+                "VMODEL_QWEN_MTP_SELECTIVE_TREE_MARGIN requires native MTP")
         if dflash2_draft_request and qwen_mtp_prompt_history_tokens:
             raise RequestValidationError(
                 "VMODEL_QWEN_MTP_PROMPT_HISTORY_TOKENS requires the native "
                 "MTP drafter and cannot be combined with "
                 "VMODEL_QWEN_DFLASH2_DRAFT")
+        if dflash2_draft_request and qwen_mtp_selective_tree_margin:
+            raise RequestValidationError(
+                "VMODEL_QWEN_MTP_SELECTIVE_TREE_MARGIN requires native MTP")
         if qwen_ar_draft_request and qwen_mtp_ablation_direction_request:
             raise RequestValidationError(
                 "VMODEL_QWEN_MTP_ABLATION_DIRECTION requires the native MTP "
@@ -1468,6 +1494,34 @@ class EngineManager:
                 "VMODEL_QWEN35_SERIAL_VERIFY_EXACT_PAGE_ADMISSION must be "
                 "0 or 1"
             )
+        qwen35_paged_online_request = os.environ.get(
+            "VMODEL_QWEN35_PAGED_ONLINE_ATTENTION", "0"
+        ).strip()
+        if qwen35_paged_online_request not in ("0", "1"):
+            raise RequestValidationError(
+                "VMODEL_QWEN35_PAGED_ONLINE_ATTENTION must be 0 or 1")
+        try:
+            qwen35_paged_online_tile_positions = int(os.environ.get(
+                "VMODEL_QWEN35_PAGED_ONLINE_TILE_POSITIONS", "2048"))
+        except ValueError as error:
+            raise RequestValidationError(
+                "VMODEL_QWEN35_PAGED_ONLINE_TILE_POSITIONS must be an integer"
+            ) from error
+        if qwen35_paged_online_tile_positions not in (256, 512, 1024, 2048):
+            raise RequestValidationError(
+                "VMODEL_QWEN35_PAGED_ONLINE_TILE_POSITIONS must be one of "
+                "256, 512, 1024, or 2048")
+        try:
+            qwen35_kv_page_positions = int(os.environ.get(
+                "VMODEL_QWEN35_KV_PAGE_POSITIONS", "256"))
+        except ValueError as error:
+            raise RequestValidationError(
+                "VMODEL_QWEN35_KV_PAGE_POSITIONS must be an integer"
+            ) from error
+        if qwen35_kv_page_positions not in (256, 512, 1024, 2048):
+            raise RequestValidationError(
+                "VMODEL_QWEN35_KV_PAGE_POSITIONS must be one of "
+                "256, 512, 1024, or 2048")
         qwen35_batched_mlp_request = os.environ.get(
             "VMODEL_QWEN35_SERIAL_VERIFY_BATCHED_MLP", "0"
         ).strip()
@@ -1876,6 +1930,7 @@ class EngineManager:
             qwen_mtp_tree_width,
             qwen_mtp_prompt_history_tokens,
             qwen_mtp_prompt_history_min_prompt_tokens,
+            qwen_mtp_selective_tree_margin.hex(),
             qwen_mtp_q_policy_kind,
             qwen_mtp_q_parameter.hex(),
             qwen_ar_draft_request,
@@ -1885,6 +1940,9 @@ class EngineManager:
             qwen_moe_decode_batch_request,
             qwen35_prefill_chunk_ceiling,
             qwen35_exact_page_admission_request,
+            qwen35_paged_online_request,
+            qwen35_paged_online_tile_positions,
+            qwen35_kv_page_positions,
             qwen35_batched_mlp_request,
             qwen35_suspend_lm_head_request,
             qwen35_suspend_lm_head_min_prompt_tokens,
@@ -1979,6 +2037,7 @@ class EngineManager:
             qwen_mtp_tree_width,
             qwen_mtp_prompt_history_tokens,
             qwen_mtp_prompt_history_min_prompt_tokens,
+            qwen_mtp_selective_tree_margin.hex(),
             qwen_mtp_q_policy_kind,
             qwen_mtp_q_parameter.hex(),
             qwen_ar_draft_request,
@@ -1988,6 +2047,9 @@ class EngineManager:
             qwen_moe_decode_batch_request,
             qwen35_prefill_chunk_ceiling,
             qwen35_exact_page_admission_request,
+            qwen35_paged_online_request,
+            qwen35_paged_online_tile_positions,
+            qwen35_kv_page_positions,
             qwen35_batched_mlp_request,
             qwen35_suspend_lm_head_request,
             qwen35_suspend_lm_head_min_prompt_tokens,
@@ -2128,6 +2190,10 @@ class EngineManager:
                     qwen35_prefill_chunk_ceiling)
                 rc.qwen35_serial_verify_exact_page_admission = (
                     qwen35_exact_page_admission_request == "1")
+                rc.qwen35_paged_online_attention = (
+                    qwen35_paged_online_request == "1")
+                rc.qwen35_paged_online_tile_positions = (
+                    qwen35_paged_online_tile_positions)
                 rc.qwen35_serial_verify_batched_mlp = (
                     qwen35_batched_mlp_request == "1")
                 rc.qwen35_serial_verify_suspend_lm_head = (
@@ -3159,7 +3225,10 @@ class EngineManager:
                     # only the conventional full-attention K/V history pages.
                     rc.max_kv_mb = qwen35_kv_max_mb
                     rc.release_paged_kv_after_generate = True
-                    rc.kv_page_positions = 256
+                    # Larger exact BF16 spill pages amortize safetensors open
+                    # and evaluation overhead in the opt-in tiled decoder.
+                    # The established default stays at 256 positions.
+                    rc.kv_page_positions = qwen35_kv_page_positions
                     rc.kv_spill_dir = os.environ.get(
                         "VMODEL_QWEN35_KV_SPILL_DIR",
                         str(ROOT / ".kv_spill" / model_dir.name),
@@ -3183,6 +3252,10 @@ class EngineManager:
                         # state and no in-memory hot cache.
                         rc.hot_prompt_kv = False
                         rc.hot_prompt_kv_persist_dir = ""
+                elif qwen35_paged_online_request == "1":
+                    raise ValueError(
+                        "VMODEL_QWEN35_PAGED_ONLINE_ATTENTION=1 requires "
+                        "VMODEL_QWEN35_KV_MAX_MB")
                 if mode in ("fast", "fast-long"):
                     # No expert-only profile exists for a dense checkpoint --
                     # full MXFP4 (attention + MLP + lm_head all quantized),
@@ -4726,6 +4799,8 @@ class EngineManager:
                             qwen_mtp_prompt_history_tokens),
                         prompt_history_min_prompt_tokens=(
                             qwen_mtp_prompt_history_min_prompt_tokens),
+                        selective_tree_margin=(
+                            qwen_mtp_selective_tree_margin),
                         grammar_aware_draft=(
                             qwen_mtp_grammar_aware_draft),
                         ngram_first=qwen_mtp_ngram_first,
@@ -4755,6 +4830,8 @@ class EngineManager:
                         f"{qwen_mtp_prompt_history_tokens} "
                         f"prompt_history_min_prompt="
                         f"{qwen_mtp_prompt_history_min_prompt_tokens} "
+                        f"selective_tree_margin="
+                        f"{qwen_mtp_selective_tree_margin:g} "
                         f"grammar_aware_draft="
                         f"{int(qwen_mtp_grammar_aware_draft)} "
                         f"ngram_first={int(qwen_mtp_ngram_first)} "
@@ -8213,6 +8290,12 @@ def _vision_protocol_timing(result: dict) -> dict:
             "prompt_kv_projected_bytes", default=0) or 0),
         "prompt_kv_projection": str(metric(
             "prompt_kv_projection", default="") or ""),
+        "qwen35_paged_online_attention": int(metric(
+            "qwen35_paged_online_attention", default=0) or 0),
+        "qwen35_paged_online_tile_positions": int(metric(
+            "qwen35_paged_online_tile_positions", default=0) or 0),
+        "qwen35_kv_page_positions": int(metric(
+            "qwen35_kv_page_positions", default=0) or 0),
         "vision_cache_hits": int(metric("vision_cache_hits") or 0),
         "vision_cache_misses": int(metric("vision_cache_misses") or 0),
         "vision_prompt_cache_tower_skipped": int(metric(
@@ -8472,6 +8555,12 @@ def _vision_protocol_timing(result: dict) -> dict:
         "qwen_mtp_native_tree_nodes_verified",
         "qwen_mtp_native_tree_paths_committed",
         "qwen_mtp_native_tree_factor_bytes_peak",
+        "qwen_mtp_selective_tree_eligible",
+        "qwen_mtp_selective_tree_rounds",
+        "qwen_mtp_selective_tree_triggered_rounds",
+        "qwen_mtp_selective_tree_branch_draft_steps",
+        "qwen_mtp_selective_tree_extra_verified_nodes",
+        "qwen_mtp_selective_tree_rescued_branches",
         "qwen_mtp_grammar_forced_tokens",
         "qwen_mtp_grammar_forced_sweeps",
         "qwen_mtp_grammar_aware_draft_enabled",
@@ -8638,6 +8727,7 @@ def _vision_protocol_timing(result: dict) -> dict:
         "qwen_mtp_estimated_break_even_accept_rate",
         "qwen_mtp_native_tree_hit_rate",
         "qwen_mtp_native_tree_factor_commit_s",
+        "qwen_mtp_selective_tree_margin",
         "qwen_mtp_proposal_page_load_s",
         "qwen_mtp_proposal_page_release_s",
         "qwen_mtp_bf16_sidecar_load_s",
@@ -8701,6 +8791,7 @@ def _vision_protocol_timing(result: dict) -> dict:
         "qwen_mtp_verified_by_step",
         "qwen_mtp_native_tree_selected_rank_counts",
         "qwen_mtp_native_tree_selected_rank_counts_by_step",
+        "qwen_mtp_selective_tree_branch_steps",
         "qwen_mtp_ngram_first_accepted_by_step",
         "qwen_mtp_ngram_first_verified_by_step",
         "qwen_mtp_stochastic_expected_acceptance_by_step",

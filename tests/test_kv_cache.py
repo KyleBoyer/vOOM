@@ -39,6 +39,26 @@ def test_short_decode_uses_exact_length_concatenation():
     assert values.flatten().tolist() == [1001, 1002, 1003, 1004]
 
 
+def test_plain_cache_fork_is_copy_on_write_and_preserves_prefix():
+    source = KVCache(1)
+    source_keys, source_values = source.update(0, *_kv([1, 2]))
+    mx.eval(source_keys, source_values)
+
+    branch = source.fork()
+    assert branch.keys[0] is source.keys[0]
+    assert branch.values[0] is source.values[0]
+
+    branch_keys, branch_values = branch.update(0, *_kv([3]))
+    mx.eval(branch_keys, branch_values, source.keys[0], source.values[0])
+
+    assert source.offset == 2
+    assert branch.offset == 3
+    assert source.keys[0].flatten().tolist() == [1, 2]
+    assert source.values[0].flatten().tolist() == [1001, 1002]
+    assert branch_keys.flatten().tolist() == [1, 2, 3]
+    assert branch_values.flatten().tolist() == [1001, 1002, 1003]
+
+
 def test_per_layer_lengths_restore_mixed_depth_speculative_tail():
     cache = KVCache(3)
     cache.update(0, *_kv(range(10)))

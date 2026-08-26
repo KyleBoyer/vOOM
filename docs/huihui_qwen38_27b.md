@@ -558,6 +558,47 @@ not an accepted serving sidecar. Prefetch depth four and a proposed 64-token
 prefill retry rung were likewise rejected by live gates; the production
 prefetch depth remains two and the conservative 128 -> 32 retry is unchanged.
 
+## Tiled paged decode and selective low-margin continuation (2026-08-26)
+
+Two additional paths are implemented as explicit experiments.  Neither is a
+named-profile default.
+
+`VMODEL_QWEN_MTP_SELECTIVE_TREE_MARGIN=2` forks the native MTP recurrence only
+at a low-margin non-root proposal, generates one rank-two continuation, and
+passes both chains through the target-authoritative verifier.  On the untouched
+134-tool/max-16 capture it preserved SHA `9b170095...b87b81`, reduced target
+sweeps 4 -> 3 and decode 32.4705s -> 29.7882s in a same-session comparison.
+Total wall regressed 99.3253s -> 101.8428s because prefill varied upward.  At
+16K it required a 2.03GB tree-verifier transient and failed closed, so it is a
+short-context research lever only.
+
+`VMODEL_QWEN35_PAGED_ONLINE_ATTENTION=1` is the larger long-context win.  For
+one-token decode it consumes exact BF16 spill pages in bounded tiles and uses a
+fused Metal online-softmax kernel; multi-token prefill and the lossless path
+still use the established MLX SDPA.  The changed reduction order makes this a
+lossy path even when a tested output happens to be byte-identical.  The winning
+measured settings are:
+
+```
+VMODEL_QWEN35_KV_MAX_MB=64
+VMODEL_QWEN35_KV_PAGE_POSITIONS=1024
+VMODEL_QWEN35_PAGED_ONLINE_ATTENTION=1
+VMODEL_QWEN35_PAGED_ONLINE_TILE_POSITIONS=2048
+VMODEL_QWEN_MTP_SELECTIVE_TREE_MARGIN=0
+```
+
+On the fixed 16,029-input / 64-output gate these settings reproduced SHA
+`bdff23c8...44fca`, both canaries, the exact prefix, and nine validation
+integers.  Wall was 260.0515s, decode 128.5402s, peak Metal 2.650GB, and
+swap-out growth 13.058MB.  Relative to the earlier successful committed-history
+run, wall improved 297.6953s -> 260.0515s (12.6%) and decode 168.0094s ->
+128.5402s (23.5%).  Coarsening spill pages from 256 to 1,024 reduced reloads
+24,023 -> 5,964 and reload time 17.8079s -> 9.6559s.  A 2,048-page/300MB arm
+was rejected despite fewer reloads: it regressed wall to 268.5371s and exceeded
+the swap gate.  The untouched 134-tool/max-16 replay preserved its known SHA
+but regressed 98.7772s -> 102.5523s, which is why automatic short-context use is
+not allowed.
+
 ## Evidence
 
 - FreeToken audit, exact MTP two-SSD split, verifier/prefetch instrumentation,
@@ -599,6 +640,12 @@ prefetch depth remains two and the conservative 128 -> 32 retry is unchanged.
   `logs/qwen38_ngram4_unmodified_capture16_20260826.json`
 - N-gram 16K/64 unpinned-head near-pass:
   `logs/qwen38_ngram4_unpinned_head_large16k_out64_20260826.json`
+- Winning tiled-paged 16K/64 gate:
+  `logs/qwen38_paged64_page1024_online2048_large16k_out64_20260826.json`
+- Rejected 2,048-position page arm:
+  `logs/qwen38_paged300_page2048_online2048_large16k_out64_20260826.json`
+- Exact untouched captured-shape tiled-paged gate:
+  `logs/qwen38_paged64_online2048_exact_greedy_capture16_20260826.json`
 - 30K/32 retrieval result (composite red only for second integer):
   `logs/qwen38_large_context_30k_out32_nohot.json`
 - 30K/128 pressure STOP:

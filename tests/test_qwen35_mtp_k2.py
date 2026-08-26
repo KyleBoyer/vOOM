@@ -533,6 +533,143 @@ def test_prompt_history_flushes_authoritative_target_rows_on_next_round():
     assert stats["qwen_mtp_draft_kv_rollbacks"] == 2
 
 
+def test_selective_tree_commits_rank2_continuation_and_rolls_back_draft_kv(
+    monkeypatch,
+):
+    committed_paths = []
+
+    class SelectiveTarget(_Target):
+        def __init__(self):
+            super().__init__(accepted_prefix=0)
+            self.cfg.model_type = "qwen3_5"
+
+        def generate(self, prompt, max_tokens, **kwargs):
+            result = super().generate(prompt, max_tokens, **kwargs)
+            self._h_window = mx.array([[[10.0], [20.0], [30.0]]])
+            self._h_last = self._h_window[:, -1:, :]
+            return result
+
+        def forward_tokens_serial_positions(self, *_args, **_kwargs):
+            raise AssertionError("selective tree must use tree verification")
+
+    class SelectiveDrafter:
+        proposal_source = "M"
+        request_weight_representation = "demand-cache"
+
+        def __init__(self):
+            self.calls = []
+            self.mtp_kv = None
+
+        def append_committed_history(
+            self, hidden, tokens, mtp_kv, offset, _weights=None,
+            *, tile_size=128,
+        ):
+            assert hidden.tolist() == [[[10.0], [20.0]]]
+            assert list(tokens) == [2, 3]
+            assert offset == 0
+            key = mx.zeros((1, 1, 2, 1))
+            mtp_kv.update(0, key, key)
+            self.mtp_kv = mtp_kv
+            return {
+                "rows": 2, "tiles": 1, "seconds": 0.0,
+                "kv_bytes": mtp_kv.nbytes(),
+            }
+
+        def draft_step(self, hidden, token, mtp_kv, offset, _weights=None):
+            self.mtp_kv = mtp_kv
+            self.calls.append(
+                (int(token), int(offset), mtp_kv.layer_lengths()))
+            item = mx.ones((1, 1, 1, 1))
+            mtp_kv.update(0, item, item)
+            # Main chain: 4 -> 10 -> 11 -> 12 -> 13.  The sole low-margin
+            # row is after token 10, where rank two is 21.  The branch fork
+            # must then condition 21 -> 22 -> 23 independently of the main.
+            rows = {
+                (4, 2): (10, 5.0),
+                (10, 3): (11, 1.0),
+                (21, 4): (22, 5.0),
+                (22, 5): (23, 5.0),
+                (11, 4): (12, 5.0),
+                (12, 5): (13, 5.0),
+            }
+            primary, margin = rows[(int(token), int(offset))]
+            sibling = 21 if (int(token), int(offset)) == (10, 3) else 19
+            logits = mx.full((32,), -100.0)
+            logits = logits.at[primary].add(200.0)
+            logits = logits.at[sibling].add(200.0 - margin)
+            return logits, hidden + 1
+
+    class Factors:
+        @staticmethod
+        def nbytes():
+            return 777
+
+    class Verification:
+        def __init__(self, tree):
+            self.factors = Factors()
+            self.hidden_nodes = tuple(
+                mx.array([[[40.0 + node]]])
+                for node in range(len(tree.token_ids)))
+            self.logits = mx.full((len(tree.token_ids), 32), -100.0)
+            # Authoritative target selects the primary first token, then the
+            # low-margin rank-two branch and its two conditioned successors.
+            for node, token in ((0, 10), (1, 21), (3, 22), (6, 23), (7, 7)):
+                self.logits = self.logits.at[node, token].add(200.0)
+
+        def commit(self, path, *, target, kv):
+            selected = tuple(path)
+            committed_paths.append(selected)
+            kv.offset += len(selected)
+            kv.lengths = [value + len(selected) for value in kv.lengths]
+            kv.kda_cache = _Endpoint(len(selected))
+            target._h_window = mx.concatenate(
+                tuple(self.hidden_nodes[node] for node in selected), axis=1)
+            target._h_last = target._h_window[:, -1:, :]
+
+    def verify(_target, tree, kv):
+        assert tree.token_ids == (4, 10, 11, 21, 12, 13, 22, 23)
+        assert tree.depths == (0, 1, 2, 2, 3, 4, 3, 4)
+        assert kv.layer_lengths() == (3, 1)
+        return Verification(tree)
+
+    monkeypatch.setattr(
+        "runtime.qwen35_tree_verify.verify_qwen35_tree", verify)
+    target = SelectiveTarget()
+    drafter = SelectiveDrafter()
+    engine = QwenMTPSpeculativeEngine(
+        target,
+        max_prompt_tokens=8,
+        min_output_tokens=2,
+        adaptive_stop=False,
+        plain_warmup_tokens=0,
+        depth=4,
+        prompt_history_tokens=2,
+        selective_tree_margin=2,
+        drafter=drafter,
+    )
+
+    result = engine.generate("x", 6)
+    stats = result["path_stats"]
+
+    assert result["tokens"] == [4, 10, 21, 22, 23, 7]
+    assert committed_paths == [(0, 1, 3, 6, 7)]
+    assert [call[:2] for call in drafter.calls] == [
+        (4, 2), (10, 3), (21, 4), (22, 5), (11, 4), (12, 5)]
+    assert drafter.mtp_kv.layer_lengths() == (2,)
+    assert target.last_kv.layer_lengths() == (8, 6)
+    assert stats["qwen_mtp_draft_kv_rollbacks"] == 1
+    assert stats["qwen_mtp_selective_tree_rounds"] == 1
+    assert stats["qwen_mtp_selective_tree_triggered_rounds"] == 1
+    assert stats["qwen_mtp_selective_tree_branch_steps"] == [0, 1, 0, 0]
+    assert stats["qwen_mtp_selective_tree_branch_draft_steps"] == 2
+    assert stats["qwen_mtp_selective_tree_extra_verified_nodes"] == 3
+    assert stats["qwen_mtp_selective_tree_rescued_branches"] == 1
+    assert stats["qwen_mtp_verified_by_step"] == [1, 2, 2, 2]
+    assert stats["qwen_mtp_accepted_by_step"] == [1, 1, 1, 1]
+    assert stats["qwen_mtp_verify_width"] == 8
+    assert stats["qwen_mtp_round_outcomes"] == "A4"
+
+
 def test_native_mtp_phase_head_detaches_only_vocab_row_through_host():
     engine = SimpleNamespace(
         store=SimpleNamespace(
@@ -1313,6 +1450,25 @@ def test_k2_constructor_is_strict_and_opt_in():
     with pytest.raises(ValueError, match="not yet supported with native trees"):
         QwenMTPSpeculativeEngine(
             target, prompt_history_tokens=128, native_tree_width=2)
+    for invalid in (-1, 17, float("nan"), float("inf"), True, "2"):
+        with pytest.raises(ValueError, match="selective-tree margin"):
+            QwenMTPSpeculativeEngine(
+                target, selective_tree_margin=invalid)
+    with pytest.raises(ValueError, match="require committed prompt history"):
+        QwenMTPSpeculativeEngine(
+            target, depth=4, selective_tree_margin=2)
+    selective = QwenMTPSpeculativeEngine(
+        target, depth=4, prompt_history_tokens=128,
+        selective_tree_margin=2)
+    assert selective.selective_tree_margin == 2.0
+    with pytest.raises(ValueError, match="native trees"):
+        QwenMTPSpeculativeEngine(
+            target, depth=4, prompt_history_tokens=128,
+            native_tree_width=2, selective_tree_margin=2)
+    with pytest.raises(ValueError, match="cannot be combined with n-gram-first"):
+        QwenMTPSpeculativeEngine(
+            target, depth=4, prompt_history_tokens=128,
+            ngram_first=True, selective_tree_margin=2)
 
 
 def test_server_q_policy_is_strict_and_part_of_engine_cache_identity():
@@ -1366,6 +1522,16 @@ def test_server_q_policy_is_strict_and_part_of_engine_cache_identity():
     }):
         with pytest.raises(RequestValidationError, match="cannot be combined"):
             EngineManager().get(Path("/tmp/not-opened"), "fast")
+    with patch.dict(os.environ, {
+        "VMODEL_QWEN_MTP_SELECTIVE_TREE_MARGIN": "17",
+    }):
+        with pytest.raises(RequestValidationError, match=r"in \[0, 16\]"):
+            EngineManager().get(Path("/tmp/not-opened"), "fast")
+    with patch.dict(os.environ, {
+        "VMODEL_QWEN_MTP_SELECTIVE_TREE_MARGIN": "2",
+    }):
+        with pytest.raises(RequestValidationError, match="requires committed"):
+            EngineManager().get(Path("/tmp/not-opened"), "fast")
 
     made = []
 
@@ -1400,6 +1566,7 @@ def test_server_q_policy_is_strict_and_part_of_engine_cache_identity():
         "VMODEL_QWEN_MTP_TREE_WIDTH": "0",
         "VMODEL_QWEN_MTP_PROMPT_HISTORY_TOKENS": "0",
         "VMODEL_QWEN_MTP_PROMPT_HISTORY_MIN_PROMPT_TOKENS": "0",
+        "VMODEL_QWEN_MTP_SELECTIVE_TREE_MARGIN": "0",
         "VMODEL_QWEN_MTP_GRAMMAR_AWARE_DRAFT": "0",
         "VMODEL_QWEN35_SERIAL_VERIFY_EXACT_PAGE_ADMISSION": "0",
         "VMODEL_QWEN35_SERIAL_VERIFY_BATCHED_MLP": "0",
@@ -1439,6 +1606,9 @@ def test_server_q_policy_is_strict_and_part_of_engine_cache_identity():
             "VMODEL_QWEN_MTP_PROMPT_HISTORY_MIN_PROMPT_TOKENS"
         ] = "4096"
         tenth = manager.get(Path("/tmp/fake-qwen-q-policy"), "fast")
+        os.environ["VMODEL_QWEN_MTP_DEPTH"] = "4"
+        os.environ["VMODEL_QWEN_MTP_SELECTIVE_TREE_MARGIN"] = "2"
+        eleventh = manager.get(Path("/tmp/fake-qwen-q-policy"), "fast")
 
     assert first is made[0]
     assert second is made[1]
@@ -1450,6 +1620,7 @@ def test_server_q_policy_is_strict_and_part_of_engine_cache_identity():
     assert eighth is made[7]
     assert ninth is made[8]
     assert tenth is made[9]
+    assert eleventh is made[10]
     assert first.closes == 1
     assert second.closes == 1
     assert third.closes == 1
@@ -1459,6 +1630,7 @@ def test_server_q_policy_is_strict_and_part_of_engine_cache_identity():
     assert seventh.closes == 1
     assert eighth.closes == 1
     assert ninth.closes == 1
+    assert tenth.closes == 1
 
 
 def test_server_wires_typed_q_policy_and_explicit_deep_chain():
@@ -1508,6 +1680,7 @@ def test_server_wires_typed_q_policy_and_explicit_deep_chain():
         "VMODEL_QWEN_MTP_TREE_WIDTH": "0",
         "VMODEL_QWEN_MTP_PROMPT_HISTORY_TOKENS": "128",
         "VMODEL_QWEN_MTP_PROMPT_HISTORY_MIN_PROMPT_TOKENS": "4096",
+        "VMODEL_QWEN_MTP_SELECTIVE_TREE_MARGIN": "2",
         "VMODEL_QWEN_MTP_GRAMMAR_AWARE_DRAFT": "1",
         "VMODEL_QWEN35_SERIAL_VERIFY_BATCHED_MLP": "1",
         "VMODEL_QWEN35_SERIAL_VERIFY_SUSPEND_LM_HEAD": "1",
@@ -1531,6 +1704,7 @@ def test_server_wires_typed_q_policy_and_explicit_deep_chain():
     assert wrapped.kwargs["grammar_aware_draft"] is True
     assert wrapped.kwargs["prompt_history_tokens"] == 128
     assert wrapped.kwargs["prompt_history_min_prompt_tokens"] == 4096
+    assert wrapped.kwargs["selective_tree_margin"] == 2.0
     assert wrapped.target.rc.qwen35_serial_verify_batched_mlp is True
     assert wrapped.target.rc.qwen35_serial_verify_suspend_lm_head is True
     policy = wrapped.kwargs["proposal_q_policy"]
@@ -1539,6 +1713,7 @@ def test_server_wires_typed_q_policy_and_explicit_deep_chain():
     env.update({
         "VMODEL_QWEN_MTP_DEPTH": "4",
         "VMODEL_QWEN_MTP_NGRAM_FIRST": "1",
+        "VMODEL_QWEN_MTP_SELECTIVE_TREE_MARGIN": "0",
     })
     with patch.dict(os.environ, env), \
          patch("runtime.config.ModelConfig.from_dir", return_value=cfg), \
@@ -1563,6 +1738,7 @@ def test_server_wires_typed_q_policy_and_explicit_deep_chain():
         "VMODEL_QWEN_MTP_NGRAM_FIRST": "0",
         "VMODEL_QWEN_MTP_TREE_WIDTH": "4",
         "VMODEL_QWEN_MTP_PROMPT_HISTORY_TOKENS": "0",
+        "VMODEL_QWEN_MTP_SELECTIVE_TREE_MARGIN": "0",
     })
     with patch.dict(os.environ, env), \
          patch("runtime.config.ModelConfig.from_dir", return_value=cfg), \

@@ -144,6 +144,11 @@ class PagedKVCache:
         self._persisted_layers: frozenset[int] | None = None
         self.compressed_mla = False
         self.stats = KVStats()
+        # Explicit fast-profile-only mode. Qwen sets this after construction;
+        # the generic/lossless default remains the established full-history
+        # materialization plus MLX SDPA.
+        self.online_attention = False
+        self.online_attention_tile_positions = 2048
 
     # ---- KVCache API ------------------------------------------------------
 
@@ -162,6 +167,75 @@ class PagedKVCache:
         # layer resident and defeats the configured paging budget.
         self._enforce_budget(protected_layer=layer)
         return self.materialize_layer(layer)
+
+    def append_for_online_attention(
+        self, layer: int, k: mx.array, v: mx.array,
+    ) -> None:
+        """Append without constructing a second full-history K/V tensor."""
+        self._append_layer(layer, k, v)
+        self._offset = max(self._offset, self.layer_positions(layer))
+        self._enforce_budget(protected_layer=layer)
+
+    def iter_materialized_layer_chunks(
+        self, layer: int, *, max_positions: int,
+    ):
+        """Yield complete K/V history in bounded contiguous page tiles.
+
+        Spilled BF16 pages are reconstructed exactly. Only the online-softmax
+        reduction consuming these tiles is approximate; storage and paging
+        remain byte-preserving.
+        """
+        max_positions = int(max_positions)
+        if max_positions <= 0:
+            raise ValueError("paged KV chunk width must be positive")
+        pending_k, pending_v = [], []
+        pending_positions = 0
+
+        def materialize_pending():
+            if not pending_k:
+                return None
+            keys = (pending_k[0] if len(pending_k) == 1
+                    else mx.concatenate(pending_k, axis=2))
+            values = (pending_v[0] if len(pending_v) == 1
+                      else mx.concatenate(pending_v, axis=2))
+            return keys, values
+
+        def sources():
+            # Load one page at a time. Keeping a Python list of every loaded
+            # spill page would recreate the full resident history before the
+            # fused tile kernel had a chance to bound it.
+            for page in self._pages[layer]:
+                if not page.resident:
+                    t0 = time.perf_counter()
+                    keys, values = page.load()
+                    self.stats.reloads += 1
+                    self.stats.reload_s += time.perf_counter() - t0
+                else:
+                    keys, values = page.k, page.v
+                yield keys, values
+            tail_k, tail_v = self._tail_k[layer], self._tail_v[layer]
+            if tail_k is not None and int(tail_k.shape[2]) > 0:
+                yield tail_k, tail_v
+
+        for keys, values in sources():
+            cursor = 0
+            width = int(keys.shape[2])
+            while cursor < width:
+                take = min(
+                    width - cursor, max_positions - pending_positions)
+                pending_k.append(keys[:, :, cursor:cursor + take, :])
+                pending_v.append(values[:, :, cursor:cursor + take, :])
+                pending_positions += take
+                cursor += take
+                if pending_positions == max_positions:
+                    result = materialize_pending()
+                    if result is not None:
+                        yield result
+                    pending_k, pending_v = [], []
+                    pending_positions = 0
+        result = materialize_pending()
+        if result is not None:
+            yield result
 
     def _append_layer(self, layer: int, k: mx.array, v: mx.array) -> None:
         if self._tail_k[layer] is None:

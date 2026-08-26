@@ -722,6 +722,11 @@ class RuntimeConfig:
     prefetch_depth: int = 0  # 0 disables prefetch
     prefetch_workers: int = 0  # 0 = store default (raw: 1, packed: 2)
     max_kv_mb: int = 0  # 0 = unpaged KV (all resident); >0 enables disk spilling
+    # Explicit lossy-Qwen sidequest: one-token paged attention uses a fused
+    # tile-wise online softmax instead of materializing the complete history.
+    # The changed reduction order is never enabled on released/lossless paths.
+    qwen35_paged_online_attention: bool = False
+    qwen35_paged_online_tile_positions: int = 2048
     # Explicit Qwen hybrid mode: durable journal tensors restore directly into
     # bounded PagedKVCache pages and are never preloaded into the resident LRU.
     # Default-off until the real 49K replay passes the cold/restart proof gate.
@@ -2548,13 +2553,20 @@ class StreamingEngine:
             if self.rc.paged_kv_persist:
                 from .kv_paged import PagedKVCache
 
-                paged_cache_factory = lambda num_layers: PagedKVCache(
-                    num_layers,
-                    max_bytes=self.rc.max_kv_mb * 1_000_000,
-                    spill_dir=self.rc.kv_spill_dir,
-                    page_positions=self.rc.kv_page_positions,
-                    compress_spill=self.rc.kv_spill_compress,
-                )
+                def paged_cache_factory(num_layers):
+                    cache = PagedKVCache(
+                        num_layers,
+                        max_bytes=self.rc.max_kv_mb * 1_000_000,
+                        spill_dir=self.rc.kv_spill_dir,
+                        page_positions=self.rc.kv_page_positions,
+                        compress_spill=self.rc.kv_spill_compress,
+                    )
+                    cache.online_attention = bool(
+                        self.cfg.model_type in ("qwen3_5", "qwen3_5_moe")
+                        and self.rc.qwen35_paged_online_attention)
+                    cache.online_attention_tile_positions = int(
+                        self.rc.qwen35_paged_online_tile_positions)
+                    return cache
 
             if mixed_depth_persistence:
                 if paged_cache_factory is not None:
@@ -8329,6 +8341,12 @@ class StreamingEngine:
                 self.rc.qwen35_prefill_chunk_ceiling)
             path_stats["qwen35_serial_verify_exact_page_admission"] = int(
                 self.rc.qwen35_serial_verify_exact_page_admission)
+            path_stats["qwen35_paged_online_attention"] = int(
+                self.rc.qwen35_paged_online_attention)
+            path_stats["qwen35_paged_online_tile_positions"] = int(
+                self.rc.qwen35_paged_online_tile_positions)
+            path_stats["qwen35_kv_page_positions"] = int(
+                self.rc.kv_page_positions)
             path_stats["qwen35_serial_verify_batched_mlp"] = int(
                 self.rc.qwen35_serial_verify_batched_mlp)
             path_stats["qwen35_serial_verify_suspend_lm_head"] = int(
@@ -9129,6 +9147,11 @@ class StreamingEngine:
                     page_positions=self.rc.kv_page_positions,
                     compress_spill=self.rc.kv_spill_compress,
                 )
+                kv.online_attention = bool(
+                    self.cfg.model_type in ("qwen3_5", "qwen3_5_moe")
+                    and self.rc.qwen35_paged_online_attention)
+                kv.online_attention_tile_positions = int(
+                    self.rc.qwen35_paged_online_tile_positions)
                 attach_hybrid_recurrent_cache(
                     kv,
                     model_type=self.cfg.model_type,
