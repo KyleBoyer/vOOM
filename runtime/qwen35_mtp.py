@@ -1337,7 +1337,6 @@ class QwenMTPSpeculativeEngine:
         ngram_max_draft_tokens: int = 4,
         native_tree_width: int = 0,
         grammar_aware_draft: bool = False,
-        compact_kda_factors: bool = False,
         prompt_history_tokens: int = 0,
         prompt_history_min_prompt_tokens: int = 0,
         drafter=None,
@@ -1395,8 +1394,6 @@ class QwenMTPSpeculativeEngine:
                 "Qwen MTP native proposal trees require dense qwen3_5")
         if not isinstance(grammar_aware_draft, bool):
             raise TypeError("Qwen MTP grammar_aware_draft must be bool")
-        if not isinstance(compact_kda_factors, bool):
-            raise TypeError("Qwen MTP compact_kda_factors must be bool")
         if (isinstance(prompt_history_tokens, bool)
                 or not isinstance(prompt_history_tokens, int)
                 or not 0 <= prompt_history_tokens <= 4096):
@@ -1455,7 +1452,6 @@ class QwenMTPSpeculativeEngine:
         self.ngram_max_draft_tokens = int(ngram_max_draft_tokens)
         self.native_tree_width = int(native_tree_width)
         self.grammar_aware_draft = grammar_aware_draft
-        self.compact_kda_factors = compact_kda_factors
         self.prompt_history_tokens = int(prompt_history_tokens)
         self.prompt_history_min_prompt_tokens = int(
             prompt_history_min_prompt_tokens)
@@ -1480,7 +1476,6 @@ class QwenMTPSpeculativeEngine:
                 f"-min{self.prompt_history_min_prompt_tokens}"
                 if self.prompt_history_tokens else ""
             )
-            + ("-compact-kda-factors" if self.compact_kda_factors else "")
             + (
                 f"-mtp-ablation-{mtp_ablation_fingerprint[:12]}-"
                 f"s{float(mtp_ablation_strength):g}"
@@ -1991,10 +1986,6 @@ class QwenMTPSpeculativeEngine:
         adaptive_reactivations = 0
         serial_verify_rounds = 0
         kda_endpoint_restores = 0
-        kda_factor_windows = 0
-        kda_factor_commits = 0
-        kda_factor_bytes_peak = 0
-        kda_factor_commit_s = 0.0
         refeed_sweeps_saved = 0
         grammar_forced_tokens = 0
         grammar_forced_sweeps = 0
@@ -2163,9 +2154,6 @@ class QwenMTPSpeculativeEngine:
             round_start_layer_lengths = None
             round_layer_growth = None
             round_capture_endpoint = False
-            round_capture_factors = False
-            round_kda_base = None
-            round_kda_factors = None
             round_serial_verify = False
             round_mtp_start_lengths = None
             round_bonus_candidate = False
@@ -2673,40 +2661,12 @@ class QwenMTPSpeculativeEngine:
                             round_serial_verify
                             and getattr(kv, "kda_cache", None) is not None
                         )
-                        recurrent = getattr(kv, "kda_cache", None)
-                        round_capture_factors = bool(
-                            round_capture_endpoint
-                            and self.compact_kda_factors
-                            and callable(getattr(recurrent, "fork", None))
-                            and callable(getattr(
-                                tgt, "consume_serial_kda_factors", None))
-                        )
-                        if round_capture_factors:
-                            round_kda_base = recurrent.fork()
-                            round_capture_endpoint = False
                         if round_serial_verify:
-                            serial_kwargs = {
-                                "capture_kda_endpoints": round_capture_endpoint,
-                            }
-                            if round_capture_factors:
-                                serial_kwargs["capture_kda_factors"] = True
                             spec_logits = tgt.forward_tokens_serial_positions(
                                 verify_tokens,
                                 kv,
-                                **serial_kwargs,
+                                capture_kda_endpoints=round_capture_endpoint,
                             )
-                            if round_capture_factors:
-                                round_kda_factors = (
-                                    tgt.consume_serial_kda_factors())
-                                if round_kda_factors is None:
-                                    raise RuntimeError(
-                                        "serial Qwen verifier omitted compact "
-                                        "KDA factors")
-                                kda_factor_windows += 1
-                                kda_factor_bytes_peak = max(
-                                    kda_factor_bytes_peak,
-                                    int(round_kda_factors.nbytes()),
-                                )
                             serial_verify_rounds += 1
                         else:
                             # Compatibility fallback for old dense adapters. MoE
@@ -2714,18 +2674,6 @@ class QwenMTPSpeculativeEngine:
                             # is unavailable.
                             spec_logits = tgt.forward_tokens(verify_tokens, kv)
                 except BaseException as error:
-                    if round_capture_factors:
-                        cancel_factors = getattr(
-                            getattr(kv, "kda_cache", None),
-                            "cancel_factor_capture",
-                            None,
-                        )
-                        if callable(cancel_factors):
-                            cancel_factors()
-                        consume_factors = getattr(
-                            tgt, "consume_serial_kda_factors", None)
-                        if callable(consume_factors):
-                            consume_factors()
                     if (isinstance(error, MemoryError)
                             and prompt_history_active):
                         raise MemoryError(
@@ -3137,17 +3085,6 @@ class QwenMTPSpeculativeEngine:
                         tgt.consume_serial_kda_endpoint(target_fed_positions)
                         if round_capture_endpoint else None
                     )
-                    if round_capture_factors:
-                        if (round_kda_base is None
-                                or round_kda_factors is None):
-                            raise RuntimeError(
-                                "serial Qwen verifier lost compact KDA rollback")
-                        factor_commit_started = time.perf_counter()
-                        retained_prefix = round_kda_factors.commit_prefix(
-                            round_kda_base, target_fed_positions)
-                        kda_factor_commit_s += (
-                            time.perf_counter() - factor_commit_started)
-                        kda_factor_commits += 1
                     if round_capture_endpoint and retained_prefix is None:
                         raise RuntimeError(
                             "serial Qwen verifier did not retain KDA prefix "
@@ -3168,7 +3105,7 @@ class QwenMTPSpeculativeEngine:
                         kv.trim_layer_lengths(retained_lengths)
                     else:
                         kv.trim(round_start_offset + target_fed_positions)
-                    if round_capture_endpoint or round_capture_factors:
+                    if round_capture_endpoint:
                         kv.kda_cache = retained_prefix
                     if round_capture_endpoint:
                         kda_endpoint_restores += 1
@@ -3593,12 +3530,6 @@ class QwenMTPSpeculativeEngine:
                 - draft_head_detach_before[2]),
             "qwen_mtp_plain_round_s": plain_round_s,
             "qwen_mtp_kda_endpoint_restores": kda_endpoint_restores,
-            "qwen_mtp_kda_factor_windows": kda_factor_windows,
-            "qwen_mtp_kda_factor_commits": kda_factor_commits,
-            "qwen_mtp_kda_factor_bytes_peak": kda_factor_bytes_peak,
-            "qwen_mtp_kda_factor_commit_s": kda_factor_commit_s,
-            "qwen_mtp_compact_kda_factors_enabled": int(
-                self.compact_kda_factors),
             "qwen_mtp_refeed_sweeps_saved": refeed_sweeps_saved,
             "qwen_mtp_target_prefix_rollbacks": target_prefix_rollbacks,
             "qwen_mtp_draft_kv_rollbacks": mtp_kv_rollbacks,

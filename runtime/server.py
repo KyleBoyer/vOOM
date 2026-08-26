@@ -1212,8 +1212,6 @@ class EngineManager:
             "VMODEL_QWEN_MTP_NGRAM_FIRST", "0").strip()
         qwen_mtp_grammar_aware_draft_request = os.environ.get(
             "VMODEL_QWEN_MTP_GRAMMAR_AWARE_DRAFT", "0").strip()
-        qwen_mtp_compact_kda_factors_request = os.environ.get(
-            "VMODEL_QWEN_MTP_COMPACT_KDA_FACTORS", "0").strip()
         qwen_mtp_ablation_direction_request = os.environ.get(
             "VMODEL_QWEN_MTP_ABLATION_DIRECTION", "").strip()
         qwen_mtp_q_policy_kind = os.environ.get(
@@ -1312,11 +1310,6 @@ class EngineManager:
                 "VMODEL_QWEN_MTP_GRAMMAR_AWARE_DRAFT must be 0 or 1")
         qwen_mtp_grammar_aware_draft = (
             qwen_mtp_grammar_aware_draft_request == "1")
-        if qwen_mtp_compact_kda_factors_request not in ("0", "1"):
-            raise RequestValidationError(
-                "VMODEL_QWEN_MTP_COMPACT_KDA_FACTORS must be 0 or 1")
-        qwen_mtp_compact_kda_factors = (
-            qwen_mtp_compact_kda_factors_request == "1")
         if qwen_mtp_tree_width and qwen_mtp_ngram_first:
             raise RequestValidationError(
                 "VMODEL_QWEN_MTP_TREE_WIDTH cannot be combined with "
@@ -1873,7 +1866,6 @@ class EngineManager:
             qwen_mtp_request,
             qwen_mtp_ngram_first_request,
             qwen_mtp_grammar_aware_draft_request,
-            qwen_mtp_compact_kda_factors_request,
             qwen_mtp_ablation_direction_request,
             qwen_mtp_ablation_strength.hex(),
             qwen_mtp_max_prompt_tokens,
@@ -1977,7 +1969,6 @@ class EngineManager:
             qwen_mtp_request,
             qwen_mtp_ngram_first_request,
             qwen_mtp_grammar_aware_draft_request,
-            qwen_mtp_compact_kda_factors_request,
             qwen_mtp_ablation_direction_request,
             qwen_mtp_ablation_strength.hex(),
             qwen_mtp_max_prompt_tokens,
@@ -4737,8 +4728,6 @@ class EngineManager:
                             qwen_mtp_prompt_history_min_prompt_tokens),
                         grammar_aware_draft=(
                             qwen_mtp_grammar_aware_draft),
-                        compact_kda_factors=(
-                            qwen_mtp_compact_kda_factors),
                         ngram_first=qwen_mtp_ngram_first,
                         proposal_q_policy=proposal_q_policy,
                         drafter=ar_drafter,
@@ -4768,8 +4757,6 @@ class EngineManager:
                         f"{qwen_mtp_prompt_history_min_prompt_tokens} "
                         f"grammar_aware_draft="
                         f"{int(qwen_mtp_grammar_aware_draft)} "
-                        f"compact_kda_factors="
-                        f"{int(qwen_mtp_compact_kda_factors)} "
                         f"ngram_first={int(qwen_mtp_ngram_first)} "
                         f"draft_source="
                         f"{'resident-ar' if ar_drafter is not None else 'native-mtp'} "
@@ -8437,10 +8424,6 @@ def _vision_protocol_timing(result: dict) -> dict:
         "qwen_mtp_committed_history_active_before_flush_bytes",
         "qwen_mtp_committed_history_active_after_flush_bytes",
         "qwen_mtp_committed_history_active_after_sidecar_release_bytes",
-        "qwen_mtp_kda_factor_windows",
-        "qwen_mtp_kda_factor_commits",
-        "qwen_mtp_kda_factor_bytes_peak",
-        "qwen_mtp_compact_kda_factors_enabled",
         "qwen_mtp_verify_width",
         "qwen_mtp_max_verify_width_observed",
         "qwen_mtp_speculative_rounds",
@@ -8634,7 +8617,6 @@ def _vision_protocol_timing(result: dict) -> dict:
         "qwen_mtp_target_batched_mlp_layers",
         "qwen_mtp_target_batched_mlp_positions",
         "qwen_mtp_target_batched_mlp_s",
-        "qwen_mtp_kda_factor_commit_s",
         "qwen_mtp_target_page_prepare_s",
         "qwen_mtp_target_cache_prepare_s",
         "qwen_mtp_target_page_reserve_s",

@@ -1302,8 +1302,6 @@ def test_k2_constructor_is_strict_and_opt_in():
                 ngram_max_draft_tokens=invalid)
     with pytest.raises(TypeError, match="grammar_aware_draft must be bool"):
         QwenMTPSpeculativeEngine(target, grammar_aware_draft=1)
-    with pytest.raises(TypeError, match="compact_kda_factors must be bool"):
-        QwenMTPSpeculativeEngine(target, compact_kda_factors=1)
     for invalid in (-1, 4097, True, "128"):
         with pytest.raises(ValueError, match="history tokens must be in"):
             QwenMTPSpeculativeEngine(
@@ -1331,11 +1329,6 @@ def test_server_q_policy_is_strict_and_part_of_engine_cache_identity():
             EngineManager().get(Path("/tmp/not-opened"), "fast")
     with patch.dict(os.environ, {
         "VMODEL_QWEN_MTP_GRAMMAR_AWARE_DRAFT": "auto",
-    }):
-        with pytest.raises(RequestValidationError, match="must be 0 or 1"):
-            EngineManager().get(Path("/tmp/not-opened"), "fast")
-    with patch.dict(os.environ, {
-        "VMODEL_QWEN_MTP_COMPACT_KDA_FACTORS": "auto",
     }):
         with pytest.raises(RequestValidationError, match="must be 0 or 1"):
             EngineManager().get(Path("/tmp/not-opened"), "fast")
@@ -1516,7 +1509,6 @@ def test_server_wires_typed_q_policy_and_explicit_deep_chain():
         "VMODEL_QWEN_MTP_PROMPT_HISTORY_TOKENS": "128",
         "VMODEL_QWEN_MTP_PROMPT_HISTORY_MIN_PROMPT_TOKENS": "4096",
         "VMODEL_QWEN_MTP_GRAMMAR_AWARE_DRAFT": "1",
-        "VMODEL_QWEN_MTP_COMPACT_KDA_FACTORS": "1",
         "VMODEL_QWEN35_SERIAL_VERIFY_BATCHED_MLP": "1",
         "VMODEL_QWEN35_SERIAL_VERIFY_SUSPEND_LM_HEAD": "1",
     }
@@ -1537,7 +1529,6 @@ def test_server_wires_typed_q_policy_and_explicit_deep_chain():
     assert wrapped.kwargs["depth"] == 4
     assert wrapped.kwargs["ngram_first"] is False
     assert wrapped.kwargs["grammar_aware_draft"] is True
-    assert wrapped.kwargs["compact_kda_factors"] is True
     assert wrapped.kwargs["prompt_history_tokens"] == 128
     assert wrapped.kwargs["prompt_history_min_prompt_tokens"] == 4096
     assert wrapped.target.rc.qwen35_serial_verify_batched_mlp is True
