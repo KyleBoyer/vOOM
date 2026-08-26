@@ -650,6 +650,8 @@ not allowed.
   `logs/qwen38_suffix12_anchor128_paged_large16k_out64_20260826.json`
 - Winning 4,096-position attention-tile composition:
   `logs/qwen38_suffix12_tile4096_large16k_out64_20260826.json`
+- Rejected 8,192-position attention-tile arm:
+  `logs/qwen38_suffix12_tile8192_large16k_out64_20260826.json`
 - Untouched captured-shape depth-12 quality sample:
   `logs/qwen38_suffix12_unmodified_capture16_20260826.json`
 - Rejected heterogeneous developer/tool depth-12 and depth-14 gates:
