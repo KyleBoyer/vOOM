@@ -52,11 +52,15 @@ QWEN35_PREFILL_CHUNK_CEILINGS = frozenset((0, 1, 8, 32, 128, 512))
 QWEN35_PHASE_HEAD_MIN_PROMPT_TOKENS = 8192
 
 
-def qwen35_phase_head_request_active(enabled: bool, prompt_tokens: int) -> bool:
+def qwen35_phase_head_request_active(
+    enabled: bool,
+    prompt_tokens: int,
+    min_prompt_tokens: int = QWEN35_PHASE_HEAD_MIN_PROMPT_TOKENS,
+) -> bool:
     """Content-blind admission for the measured long-context head lifecycle."""
     return bool(
         enabled
-        and int(prompt_tokens) >= QWEN35_PHASE_HEAD_MIN_PROMPT_TOKENS)
+        and int(prompt_tokens) >= int(min_prompt_tokens))
 
 
 def attach_hybrid_recurrent_cache(
@@ -973,6 +977,12 @@ class RuntimeConfig:
     # projection, released before each multi-position target-trunk sweep, then
     # the verifier's demand-loaded head is re-pinned without a second read.
     qwen35_serial_verify_suspend_lm_head: bool = False
+    # Content-blind activation boundary for the explicit head lifecycle.
+    # 8192 is the measured production candidate. Lower values are useful only
+    # for composed experiments (for example a wider exact verifier that needs
+    # the physical head release to fit) and must retain their own live gate.
+    qwen35_serial_verify_suspend_lm_head_min_prompt_tokens: int = (
+        QWEN35_PHASE_HEAD_MIN_PROMPT_TOKENS)
     # F94: layer-major (not chunk-major) dense prefill for qwen3_5 (dense
     # hybrid DeltaNet/full-attention, e.g. Qwen3.5-4B/9B, Qwen3.6-27B) --
     # fetches each layer's weights exactly once for the whole prefill instead
@@ -1275,6 +1285,9 @@ class RuntimeConfig:
                 "qwen35_serial_verify_batched_mlp", False),
             qwen35_serial_verify_suspend_lm_head=run.get(
                 "qwen35_serial_verify_suspend_lm_head", False),
+            qwen35_serial_verify_suspend_lm_head_min_prompt_tokens=run.get(
+                "qwen35_serial_verify_suspend_lm_head_min_prompt_tokens",
+                QWEN35_PHASE_HEAD_MIN_PROMPT_TOKENS),
             qwen_mixed_depth_endpoint_persist=run.get(
                 "qwen_mixed_depth_endpoint_persist", False),
             prefill_last_token_separate=run.get(
@@ -8322,7 +8335,8 @@ class StreamingEngine:
                 self.rc.qwen35_serial_verify_suspend_lm_head)
             path_stats[
                 "qwen35_serial_verify_suspend_lm_head_min_prompt_tokens"
-            ] = QWEN35_PHASE_HEAD_MIN_PROMPT_TOKENS
+            ] = int(
+                self.rc.qwen35_serial_verify_suspend_lm_head_min_prompt_tokens)
             path_stats["qwen35_serial_verify_head_suspend_calls"] = int(
                 self._qwen35_serial_verify_head_suspend_calls)
             path_stats["qwen35_serial_verify_head_suspend_bytes"] = int(
@@ -8352,7 +8366,10 @@ class StreamingEngine:
         path_stats["prompt_tokenize_s"] = time.perf_counter() - tokenize_t0
         self._qwen35_lm_head_suspend_request_active = (
             qwen35_phase_head_request_active(
-                self.rc.qwen35_serial_verify_suspend_lm_head, len(tokens)))
+                self.rc.qwen35_serial_verify_suspend_lm_head,
+                len(tokens),
+                self.rc.qwen35_serial_verify_suspend_lm_head_min_prompt_tokens,
+            ))
         path_stats[
             "qwen35_serial_verify_suspend_lm_head_request_active"
         ] = int(self._qwen35_lm_head_suspend_request_active)

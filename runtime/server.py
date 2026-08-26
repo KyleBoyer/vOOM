@@ -1212,6 +1212,8 @@ class EngineManager:
             "VMODEL_QWEN_MTP_NGRAM_FIRST", "0").strip()
         qwen_mtp_grammar_aware_draft_request = os.environ.get(
             "VMODEL_QWEN_MTP_GRAMMAR_AWARE_DRAFT", "0").strip()
+        qwen_mtp_compact_kda_factors_request = os.environ.get(
+            "VMODEL_QWEN_MTP_COMPACT_KDA_FACTORS", "0").strip()
         qwen_mtp_ablation_direction_request = os.environ.get(
             "VMODEL_QWEN_MTP_ABLATION_DIRECTION", "").strip()
         qwen_mtp_q_policy_kind = os.environ.get(
@@ -1246,6 +1248,10 @@ class EngineManager:
                 "VMODEL_QWEN_MTP_DEPTH", "1"))
             qwen_mtp_tree_width = int(os.environ.get(
                 "VMODEL_QWEN_MTP_TREE_WIDTH", "0"))
+            qwen_mtp_prompt_history_tokens = int(os.environ.get(
+                "VMODEL_QWEN_MTP_PROMPT_HISTORY_TOKENS", "0"))
+            qwen_mtp_prompt_history_min_prompt_tokens = int(os.environ.get(
+                "VMODEL_QWEN_MTP_PROMPT_HISTORY_MIN_PROMPT_TOKENS", "0"))
             qwen_mtp_q_parameter = float(os.environ.get(
                 "VMODEL_QWEN_MTP_Q_PARAMETER", "1"))
             qwen_mtp_ablation_strength = float(os.environ.get(
@@ -1284,12 +1290,19 @@ class EngineManager:
         if qwen_mtp_proposal_replay_top_k < 0:
             raise RequestValidationError(
                 "VMODEL_QWEN_MTP_PROPOSAL_REPLAY_TOP_K must be non-negative")
-        if qwen_mtp_depth not in (1, 2, 3, 4):
+        if not 1 <= qwen_mtp_depth <= 4:
             raise RequestValidationError(
                 "VMODEL_QWEN_MTP_DEPTH must be in [1, 4]")
         if qwen_mtp_tree_width not in (0, 2, 3, 4):
             raise RequestValidationError(
                 "VMODEL_QWEN_MTP_TREE_WIDTH must be 0 or in [2, 4]")
+        if not 0 <= qwen_mtp_prompt_history_tokens <= 4096:
+            raise RequestValidationError(
+                "VMODEL_QWEN_MTP_PROMPT_HISTORY_TOKENS must be in [0, 4096]")
+        if not 0 <= qwen_mtp_prompt_history_min_prompt_tokens <= 1_048_576:
+            raise RequestValidationError(
+                "VMODEL_QWEN_MTP_PROMPT_HISTORY_MIN_PROMPT_TOKENS must be "
+                "in [0, 1048576]")
         if qwen_mtp_ngram_first_request not in ("0", "1"):
             raise RequestValidationError(
                 "VMODEL_QWEN_MTP_NGRAM_FIRST must be 0 or 1")
@@ -1299,10 +1312,19 @@ class EngineManager:
                 "VMODEL_QWEN_MTP_GRAMMAR_AWARE_DRAFT must be 0 or 1")
         qwen_mtp_grammar_aware_draft = (
             qwen_mtp_grammar_aware_draft_request == "1")
+        if qwen_mtp_compact_kda_factors_request not in ("0", "1"):
+            raise RequestValidationError(
+                "VMODEL_QWEN_MTP_COMPACT_KDA_FACTORS must be 0 or 1")
+        qwen_mtp_compact_kda_factors = (
+            qwen_mtp_compact_kda_factors_request == "1")
         if qwen_mtp_tree_width and qwen_mtp_ngram_first:
             raise RequestValidationError(
                 "VMODEL_QWEN_MTP_TREE_WIDTH cannot be combined with "
                 "VMODEL_QWEN_MTP_NGRAM_FIRST=1")
+        if qwen_mtp_prompt_history_tokens and qwen_mtp_tree_width:
+            raise RequestValidationError(
+                "VMODEL_QWEN_MTP_PROMPT_HISTORY_TOKENS cannot be combined "
+                "with VMODEL_QWEN_MTP_TREE_WIDTH")
         if not 1 <= qwen_ar_draft_prefill_step_size <= 4096:
             raise RequestValidationError(
                 "VMODEL_QWEN_AR_DRAFT_PREFILL_STEP_SIZE must be in [1, 4096]")
@@ -1321,6 +1343,15 @@ class EngineManager:
         if qwen_ar_draft_request and qwen_mtp_tree_width:
             raise RequestValidationError(
                 "VMODEL_QWEN_AR_DRAFT cannot be combined with a native MTP tree")
+        if qwen_ar_draft_request and qwen_mtp_prompt_history_tokens:
+            raise RequestValidationError(
+                "VMODEL_QWEN_MTP_PROMPT_HISTORY_TOKENS requires the native "
+                "MTP drafter and cannot be combined with VMODEL_QWEN_AR_DRAFT")
+        if dflash2_draft_request and qwen_mtp_prompt_history_tokens:
+            raise RequestValidationError(
+                "VMODEL_QWEN_MTP_PROMPT_HISTORY_TOKENS requires the native "
+                "MTP drafter and cannot be combined with "
+                "VMODEL_QWEN_DFLASH2_DRAFT")
         if qwen_ar_draft_request and qwen_mtp_ablation_direction_request:
             raise RequestValidationError(
                 "VMODEL_QWEN_MTP_ABLATION_DIRECTION requires the native MTP "
@@ -1456,6 +1487,19 @@ class EngineManager:
         if qwen35_suspend_lm_head_request not in ("0", "1"):
             raise RequestValidationError(
                 "VMODEL_QWEN35_SERIAL_VERIFY_SUSPEND_LM_HEAD must be 0 or 1")
+        try:
+            qwen35_suspend_lm_head_min_prompt_tokens = int(os.environ.get(
+                "VMODEL_QWEN35_SERIAL_VERIFY_SUSPEND_LM_HEAD_MIN_PROMPT_TOKENS",
+                "8192",
+            ))
+        except ValueError as error:
+            raise RequestValidationError(
+                "VMODEL_QWEN35_SERIAL_VERIFY_SUSPEND_LM_HEAD_MIN_PROMPT_TOKENS "
+                "must be an integer") from error
+        if not 0 <= qwen35_suspend_lm_head_min_prompt_tokens <= 1_048_576:
+            raise RequestValidationError(
+                "VMODEL_QWEN35_SERIAL_VERIFY_SUSPEND_LM_HEAD_MIN_PROMPT_TOKENS "
+                "must be in [0, 1048576]")
         qwen_quant_lm_head_request = os.environ.get(
             "VMODEL_QWEN35_QUANT_LM_HEAD", "0").strip()
         if qwen_quant_lm_head_request not in ("0", "1"):
@@ -1829,6 +1873,7 @@ class EngineManager:
             qwen_mtp_request,
             qwen_mtp_ngram_first_request,
             qwen_mtp_grammar_aware_draft_request,
+            qwen_mtp_compact_kda_factors_request,
             qwen_mtp_ablation_direction_request,
             qwen_mtp_ablation_strength.hex(),
             qwen_mtp_max_prompt_tokens,
@@ -1837,6 +1882,8 @@ class EngineManager:
             qwen_mtp_proposal_replay_top_k,
             qwen_mtp_depth,
             qwen_mtp_tree_width,
+            qwen_mtp_prompt_history_tokens,
+            qwen_mtp_prompt_history_min_prompt_tokens,
             qwen_mtp_q_policy_kind,
             qwen_mtp_q_parameter.hex(),
             qwen_ar_draft_request,
@@ -1848,6 +1895,7 @@ class EngineManager:
             qwen35_exact_page_admission_request,
             qwen35_batched_mlp_request,
             qwen35_suspend_lm_head_request,
+            qwen35_suspend_lm_head_min_prompt_tokens,
             qwen_lossy_suffix_request,
             qwen_hot_kv_request,
             qwen_hot_kv_persist_dir_request,
@@ -1929,6 +1977,7 @@ class EngineManager:
             qwen_mtp_request,
             qwen_mtp_ngram_first_request,
             qwen_mtp_grammar_aware_draft_request,
+            qwen_mtp_compact_kda_factors_request,
             qwen_mtp_ablation_direction_request,
             qwen_mtp_ablation_strength.hex(),
             qwen_mtp_max_prompt_tokens,
@@ -1937,6 +1986,8 @@ class EngineManager:
             qwen_mtp_proposal_replay_top_k,
             qwen_mtp_depth,
             qwen_mtp_tree_width,
+            qwen_mtp_prompt_history_tokens,
+            qwen_mtp_prompt_history_min_prompt_tokens,
             qwen_mtp_q_policy_kind,
             qwen_mtp_q_parameter.hex(),
             qwen_ar_draft_request,
@@ -1948,6 +1999,7 @@ class EngineManager:
             qwen35_exact_page_admission_request,
             qwen35_batched_mlp_request,
             qwen35_suspend_lm_head_request,
+            qwen35_suspend_lm_head_min_prompt_tokens,
             qwen_lossy_suffix_request,
             qwen_hot_kv_request,
             qwen_hot_kv_persist_dir_request,
@@ -2089,6 +2141,8 @@ class EngineManager:
                     qwen35_batched_mlp_request == "1")
                 rc.qwen35_serial_verify_suspend_lm_head = (
                     qwen35_suspend_lm_head_request == "1")
+                rc.qwen35_serial_verify_suspend_lm_head_min_prompt_tokens = (
+                    qwen35_suspend_lm_head_min_prompt_tokens)
                 rc.qwen_mixed_depth_endpoint_persist = (
                     qwen_mixed_depth_endpoint_request == "1")
             # Grammar fast-forward (token-level jump-forward decoding,
@@ -4677,8 +4731,14 @@ class EngineManager:
                             qwen_mtp_proposal_replay_top_k),
                         depth=qwen_mtp_depth,
                         native_tree_width=qwen_mtp_tree_width,
+                        prompt_history_tokens=(
+                            qwen_mtp_prompt_history_tokens),
+                        prompt_history_min_prompt_tokens=(
+                            qwen_mtp_prompt_history_min_prompt_tokens),
                         grammar_aware_draft=(
                             qwen_mtp_grammar_aware_draft),
+                        compact_kda_factors=(
+                            qwen_mtp_compact_kda_factors),
                         ngram_first=qwen_mtp_ngram_first,
                         proposal_q_policy=proposal_q_policy,
                         drafter=ar_drafter,
@@ -4702,8 +4762,14 @@ class EngineManager:
                         f"{qwen_mtp_proposal_replay_top_k} "
                         f"depth={qwen_mtp_depth} "
                         f"tree_width={qwen_mtp_tree_width} "
+                        f"prompt_history_tokens="
+                        f"{qwen_mtp_prompt_history_tokens} "
+                        f"prompt_history_min_prompt="
+                        f"{qwen_mtp_prompt_history_min_prompt_tokens} "
                         f"grammar_aware_draft="
                         f"{int(qwen_mtp_grammar_aware_draft)} "
+                        f"compact_kda_factors="
+                        f"{int(qwen_mtp_compact_kda_factors)} "
                         f"ngram_first={int(qwen_mtp_ngram_first)} "
                         f"draft_source="
                         f"{'resident-ar' if ar_drafter is not None else 'native-mtp'} "
@@ -8349,6 +8415,32 @@ def _vision_protocol_timing(result: dict) -> dict:
         "qwen_mtp_used",
         "qwen_mtp_proposed",
         "qwen_mtp_depth",
+        "qwen_mtp_prompt_history_enabled",
+        "qwen_mtp_prompt_history_request_active",
+        "qwen_mtp_prompt_history_requested_tokens",
+        "qwen_mtp_prompt_history_min_prompt_tokens",
+        "qwen_mtp_prompt_history_available_rows",
+        "qwen_mtp_prompt_history_captured_rows",
+        "qwen_mtp_prompt_history_captured_host_bytes",
+        "qwen_mtp_prompt_endpoint_detach_calls",
+        "qwen_mtp_prompt_endpoint_source_rows",
+        "qwen_mtp_prompt_endpoint_source_bytes",
+        "qwen_mtp_prompt_endpoint_retained_bytes",
+        "qwen_mtp_prompt_endpoint_released_active_bytes",
+        "qwen_mtp_committed_history_rows_queued",
+        "qwen_mtp_committed_history_pending_rows",
+        "qwen_mtp_committed_history_flush_calls",
+        "qwen_mtp_committed_history_flush_blocks",
+        "qwen_mtp_committed_history_flushed_rows",
+        "qwen_mtp_committed_history_flush_tiles",
+        "qwen_mtp_committed_history_peak_kv_bytes",
+        "qwen_mtp_committed_history_active_before_flush_bytes",
+        "qwen_mtp_committed_history_active_after_flush_bytes",
+        "qwen_mtp_committed_history_active_after_sidecar_release_bytes",
+        "qwen_mtp_kda_factor_windows",
+        "qwen_mtp_kda_factor_commits",
+        "qwen_mtp_kda_factor_bytes_peak",
+        "qwen_mtp_compact_kda_factors_enabled",
         "qwen_mtp_verify_width",
         "qwen_mtp_max_verify_width_observed",
         "qwen_mtp_speculative_rounds",
@@ -8542,6 +8634,7 @@ def _vision_protocol_timing(result: dict) -> dict:
         "qwen_mtp_target_batched_mlp_layers",
         "qwen_mtp_target_batched_mlp_positions",
         "qwen_mtp_target_batched_mlp_s",
+        "qwen_mtp_kda_factor_commit_s",
         "qwen_mtp_target_page_prepare_s",
         "qwen_mtp_target_cache_prepare_s",
         "qwen_mtp_target_page_reserve_s",
@@ -8555,6 +8648,9 @@ def _vision_protocol_timing(result: dict) -> dict:
         "qwen_mtp_target_head_suspend_s",
         "qwen_mtp_target_head_restore_s",
         "qwen_mtp_draft_head_host_detach_s",
+        "qwen_mtp_prompt_history_capture_s",
+        "qwen_mtp_prompt_endpoint_detach_s",
+        "qwen_mtp_committed_history_flush_s",
         "qwen_mtp_plain_round_s",
         "qwen_mtp_estimated_net_saved_s",
         "qwen_mtp_estimated_break_even_accept_rate",
@@ -8604,6 +8700,7 @@ def _vision_protocol_timing(result: dict) -> dict:
         "qwen_mtp_proposal_weight_representation",
         "qwen_mtp_ar_draft_identity",
         "qwen_mtp_ablation_fingerprint",
+        "qwen_mtp_prompt_history_skip_reason",
         "speculative_kind",
         "dflash2_proposal_policy",
         "dflash2_target_verifier",
@@ -8719,6 +8816,13 @@ def _execution_profile_fields(engine) -> dict[str, object]:
     if rc is not None and getattr(
             rc, "qwen35_serial_verify_suspend_lm_head", False):
         fields["vmodel_qwen35_serial_verify_suspend_lm_head"] = 1
+        fields[
+            "vmodel_qwen35_serial_verify_suspend_lm_head_min_prompt_tokens"
+        ] = int(getattr(
+            rc,
+            "qwen35_serial_verify_suspend_lm_head_min_prompt_tokens",
+            8192,
+        ))
     if rc is not None and getattr(
             rc, "rerank_lm_head_source_fingerprint", ""):
         fields.update({

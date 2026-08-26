@@ -69,7 +69,8 @@ from typing import Iterable, Mapping, Sequence
 import mlx.core as mx
 from . import quant
 from .kv_cache import KVCache
-from .qwen35 import _full_attention, _moe, _swiglu, final_logits, qwen35_rms_norm
+from .qwen35 import (_apply_partial_rope, _full_attention, _linear, _moe,
+                     _swiglu, final_logits, qwen35_rms_norm)
 from .sampler import (SamplingParams, filtered_probabilities, sample,
                       sample_probabilities,
                       speculative_residual_probabilities)
@@ -1191,6 +1192,113 @@ class QwenMTPDrafter:
                 f"got shape {tuple(logits.shape)} for vocab {cfg.vocab_size}")
         return logits, x
 
+    def append_committed_history(
+        self,
+        hidden: mx.array,
+        next_tokens: Sequence[int],
+        mtp_kv,
+        start_offset: int,
+        weights: dict | None = None,
+        *,
+        tile_size: int = 128,
+    ) -> dict[str, int | float]:
+        """Append target-committed rows to the MTP layer's attention cache.
+
+        Qwen's released MTP input at position ``t`` is
+        ``fuse(target_hidden[t], token[t + 1])``.  The previous implementation
+        started every request with an empty MTP cache and retained speculative
+        draft hidden rows after a round.  That is target-safe—the trunk still
+        verifies every proposal—but gives the draft layer almost no committed
+        context.  This helper computes only the released fusion, input norm,
+        and K/V projections for already-committed target rows.  It deliberately
+        skips Q, attention, the MLP, and the shared LM head because none of
+        their outputs are part of the persistent history.
+
+        The exact same released operators used by :meth:`draft_step` produce
+        K/V.  A caller may bound prompt history, but may never append an
+        unverified row.  Absolute RoPE positions are supplied explicitly, so a
+        retained suffix remains position-correct even though its physical
+        cache begins after position zero.
+        """
+        if isinstance(start_offset, bool) or int(start_offset) < 0:
+            raise ValueError("Qwen MTP history start_offset must be non-negative")
+        if isinstance(tile_size, bool) or int(tile_size) <= 0:
+            raise ValueError("Qwen MTP history tile_size must be positive")
+        if hidden.ndim != 3 or int(hidden.shape[0]) != 1:
+            raise ValueError(
+                "Qwen MTP committed hidden rows must have shape (1, T, H)")
+        tokens = [int(token) for token in next_tokens]
+        rows = int(hidden.shape[1])
+        if rows != len(tokens):
+            raise ValueError(
+                "Qwen MTP committed hidden/token row count mismatch: "
+                f"{rows} != {len(tokens)}")
+        if rows == 0:
+            return {"rows": 0, "tiles": 0, "seconds": 0.0, "kv_bytes": 0}
+        if int(hidden.shape[2]) != int(self.engine.cfg.hidden_size):
+            raise ValueError("Qwen MTP committed hidden width mismatch")
+
+        started = time.perf_counter()
+        eng = self.engine
+        cfg = eng.cfg
+        w = weights if weights is not None else self._weights()
+        prefix = "mtp.layers.0"
+        kv_heads = int(cfg.num_key_value_heads)
+        head_dim = int(cfg.head_dim)
+        tiles = 0
+        for begin in range(0, rows, int(tile_size)):
+            end = min(rows, begin + int(tile_size))
+            hidden_tile = hidden[:, begin:end, :]
+            embedding = eng._embed(tokens[begin:end])
+            embedding = qwen35_rms_norm(
+                embedding,
+                w["mtp.pre_fc_norm_embedding.weight"],
+                cfg.rms_norm_eps,
+            )
+            hidden_norm = qwen35_rms_norm(
+                hidden_tile,
+                w["mtp.pre_fc_norm_hidden.weight"],
+                cfg.rms_norm_eps,
+            )
+            fused = quant.matmul(
+                mx.concatenate([embedding, hidden_norm], axis=-1),
+                w["mtp.fc.weight"],
+            )
+            attn_input = qwen35_rms_norm(
+                fused,
+                w[f"{prefix}.input_layernorm.weight"],
+                cfg.rms_norm_eps,
+            )
+            length = end - begin
+            key = _linear(attn_input, w, f"{prefix}.self_attn.k_proj").reshape(
+                1, length, kv_heads, head_dim)
+            value = _linear(
+                attn_input, w, f"{prefix}.self_attn.v_proj").reshape(
+                    1, length, kv_heads, head_dim)
+            key = qwen35_rms_norm(
+                key,
+                w[f"{prefix}.self_attn.k_norm.weight"],
+                cfg.rms_norm_eps,
+            )
+            key = key.transpose(0, 2, 1, 3)
+            value = value.transpose(0, 2, 1, 3)
+            # The helper applies exactly the same partial-RoPE operation as
+            # _full_attention.  Passing K through both tuple positions avoids
+            # introducing a second rotation implementation; the unused first
+            # result is dead and MLX may eliminate it from the lazy graph.
+            _unused, key = _apply_partial_rope(
+                key, key, int(start_offset) + begin, cfg)
+            cached_key, cached_value = mtp_kv.update(0, key, value)
+            mx.eval(cached_key, cached_value)
+            tiles += 1
+
+        return {
+            "rows": rows,
+            "tiles": tiles,
+            "seconds": time.perf_counter() - started,
+            "kv_bytes": int(mtp_kv.nbytes()),
+        }
+
     def draft_logits(
         self, h_last: mx.array, last_token: int, mtp_kv, offset: int,
         weights: dict | None = None,
@@ -1229,6 +1337,9 @@ class QwenMTPSpeculativeEngine:
         ngram_max_draft_tokens: int = 4,
         native_tree_width: int = 0,
         grammar_aware_draft: bool = False,
+        compact_kda_factors: bool = False,
+        prompt_history_tokens: int = 0,
+        prompt_history_min_prompt_tokens: int = 0,
         drafter=None,
         mtp_ablation_direction=None,
         mtp_ablation_strength: float = 1.0,
@@ -1284,6 +1395,19 @@ class QwenMTPSpeculativeEngine:
                 "Qwen MTP native proposal trees require dense qwen3_5")
         if not isinstance(grammar_aware_draft, bool):
             raise TypeError("Qwen MTP grammar_aware_draft must be bool")
+        if not isinstance(compact_kda_factors, bool):
+            raise TypeError("Qwen MTP compact_kda_factors must be bool")
+        if (isinstance(prompt_history_tokens, bool)
+                or not isinstance(prompt_history_tokens, int)
+                or not 0 <= prompt_history_tokens <= 4096):
+            raise ValueError(
+                "Qwen MTP prompt history tokens must be in [0, 4096]")
+        if (isinstance(prompt_history_min_prompt_tokens, bool)
+                or not isinstance(prompt_history_min_prompt_tokens, int)
+                or not 0 <= prompt_history_min_prompt_tokens <= 1_048_576):
+            raise ValueError(
+                "Qwen MTP prompt-history minimum prompt tokens must be in "
+                "[0, 1048576]")
         self.target = target
         self.drafter = drafter if drafter is not None else QwenMTPDrafter(target)
         self.proposal_source = str(getattr(
@@ -1291,6 +1415,12 @@ class QwenMTPSpeculativeEngine:
         if len(self.proposal_source) != 1 or self.proposal_source not in {"M", "A"}:
             raise ValueError(
                 "Qwen speculative drafter proposal_source must be M or A")
+        if prompt_history_tokens and self.proposal_source != "M":
+            raise ValueError(
+                "Qwen MTP prompt history requires the native MTP drafter")
+        if prompt_history_tokens and native_tree_width:
+            raise ValueError(
+                "Qwen MTP prompt history is not yet supported with native trees")
         if mtp_ablation_direction is not None:
             if self.proposal_source != "M":
                 raise ValueError(
@@ -1325,6 +1455,10 @@ class QwenMTPSpeculativeEngine:
         self.ngram_max_draft_tokens = int(ngram_max_draft_tokens)
         self.native_tree_width = int(native_tree_width)
         self.grammar_aware_draft = grammar_aware_draft
+        self.compact_kda_factors = compact_kda_factors
+        self.prompt_history_tokens = int(prompt_history_tokens)
+        self.prompt_history_min_prompt_tokens = int(
+            prompt_history_min_prompt_tokens)
         weight_identity = self.drafter.request_weight_representation
         self.mtp_engine_identity = (
             f"qwen-mtp-depth{self.depth}-{self.proposal_q_policy.name}"
@@ -1341,6 +1475,12 @@ class QwenMTPSpeculativeEngine:
                 if self.native_tree_width else ""
             )
             + ("-grammar-aware-draft" if self.grammar_aware_draft else "")
+            + (
+                f"-committed-history-k{self.prompt_history_tokens}"
+                f"-min{self.prompt_history_min_prompt_tokens}"
+                if self.prompt_history_tokens else ""
+            )
+            + ("-compact-kda-factors" if self.compact_kda_factors else "")
             + (
                 f"-mtp-ablation-{mtp_ablation_fingerprint[:12]}-"
                 f"s{float(mtp_ablation_strength):g}"
@@ -1606,6 +1746,222 @@ class QwenMTPSpeculativeEngine:
             drafter_request_prefill_s = (
                 time.perf_counter() - drafter_prefill_started)
         mtp_kv = KVCache(1)
+        prompt_history_active = bool(
+            self.prompt_history_tokens
+            and len(ids) >= self.prompt_history_min_prompt_tokens)
+        mtp_history_pending: list[dict] = []
+        mtp_history_last_queued_position: int | None = None
+        mtp_history_prompt_available_rows = 0
+        mtp_history_prompt_captured_rows = 0
+        mtp_history_prompt_captured_bytes = 0
+        mtp_history_prompt_capture_s = 0.0
+        mtp_history_prompt_endpoint_detach_calls = 0
+        mtp_history_prompt_endpoint_source_rows = 0
+        mtp_history_prompt_endpoint_source_bytes = 0
+        mtp_history_prompt_endpoint_retained_bytes = 0
+        mtp_history_prompt_endpoint_released_active_bytes = 0
+        mtp_history_prompt_endpoint_detach_s = 0.0
+        mtp_history_prompt_skip_reason = (
+            "disabled" if not self.prompt_history_tokens
+            else (
+                "below-min-prompt"
+                if not prompt_history_active else "not-captured"
+            ))
+        mtp_history_committed_rows_queued = 0
+        mtp_history_flush_calls = 0
+        mtp_history_flush_blocks = 0
+        mtp_history_flushed_rows = 0
+        mtp_history_flush_tiles = 0
+        mtp_history_flush_s = 0.0
+        mtp_history_peak_kv_bytes = 0
+        mtp_history_active_before_flush_bytes = 0
+        mtp_history_active_after_flush_bytes = 0
+        mtp_history_active_after_sidecar_release_bytes = 0
+
+        def _queue_mtp_history(
+            hidden_rows: mx.array,
+            token_rows: Sequence[int],
+            start_offset: int,
+            *,
+            prompt_rows: bool = False,
+        ) -> None:
+            """Detach a small committed target block from its weight graph."""
+            nonlocal mtp_history_last_queued_position
+            nonlocal mtp_history_prompt_captured_rows
+            nonlocal mtp_history_prompt_captured_bytes
+            nonlocal mtp_history_prompt_capture_s
+            nonlocal mtp_history_committed_rows_queued
+
+            tokens_here = tuple(int(token) for token in token_rows)
+            if not tokens_here:
+                return
+            if hidden_rows.ndim != 3 or int(hidden_rows.shape[0]) != 1:
+                raise RuntimeError(
+                    "Qwen MTP committed-history source must be rank-three")
+            if int(hidden_rows.shape[1]) != len(tokens_here):
+                raise RuntimeError(
+                    "Qwen MTP committed-history source/token mismatch")
+            start = int(start_offset)
+            if start < 0:
+                raise RuntimeError(
+                    "Qwen MTP committed-history source offset is negative")
+            if (mtp_history_last_queued_position is not None
+                    and start != mtp_history_last_queued_position + 1):
+                raise RuntimeError(
+                    "Qwen MTP committed-history rows are not contiguous: "
+                    f"{start} after {mtp_history_last_queued_position}")
+
+            detached_started = time.perf_counter()
+            import numpy as np
+
+            source_dtype = hidden_rows.dtype
+            fp32 = hidden_rows.astype(mx.float32)
+            mx.eval(fp32)
+            host = np.array(fp32, dtype=np.float32, copy=True)
+            del fp32
+            mtp_history_pending.append({
+                "hidden": host,
+                "dtype": source_dtype,
+                "tokens": tokens_here,
+                "start_offset": start,
+            })
+            mtp_history_last_queued_position = start + len(tokens_here) - 1
+            if prompt_rows:
+                mtp_history_prompt_captured_rows += len(tokens_here)
+                mtp_history_prompt_captured_bytes += int(host.nbytes)
+                mtp_history_prompt_capture_s += (
+                    time.perf_counter() - detached_started)
+            else:
+                mtp_history_committed_rows_queued += len(tokens_here)
+
+        def _flush_mtp_history(weights: dict | None) -> None:
+            nonlocal mtp_history_flush_calls
+            nonlocal mtp_history_flush_blocks
+            nonlocal mtp_history_flushed_rows
+            nonlocal mtp_history_flush_tiles
+            nonlocal mtp_history_flush_s
+            nonlocal mtp_history_peak_kv_bytes
+            nonlocal mtp_history_active_before_flush_bytes
+            nonlocal mtp_history_active_after_flush_bytes
+
+            if not mtp_history_pending:
+                return
+            append_history = getattr(
+                self.drafter, "append_committed_history", None)
+            if not callable(append_history):
+                raise RuntimeError(
+                    "native Qwen MTP drafter omits committed-history append")
+            mtp_history_active_before_flush_bytes = int(mx.get_active_memory())
+            mtp_history_flush_calls += 1
+            for block in mtp_history_pending:
+                hidden_mx = mx.array(block["hidden"]).astype(block["dtype"])
+                info = append_history(
+                    hidden_mx,
+                    block["tokens"],
+                    mtp_kv,
+                    block["start_offset"],
+                    weights,
+                ) or {}
+                rows_here = int(info.get("rows", len(block["tokens"])))
+                if rows_here != len(block["tokens"]):
+                    raise RuntimeError(
+                        "Qwen MTP committed-history append changed row count")
+                mtp_history_flush_blocks += 1
+                mtp_history_flushed_rows += rows_here
+                mtp_history_flush_tiles += int(info.get("tiles", 0))
+                mtp_history_flush_s += float(info.get("seconds", 0.0))
+                mtp_history_peak_kv_bytes = max(
+                    mtp_history_peak_kv_bytes,
+                    int(info.get("kv_bytes", mtp_kv.nbytes())),
+                )
+                del hidden_mx
+            mtp_history_pending.clear()
+            # Discard reusable fusion scratch while the round-local sidecar is
+            # still live. Active weights and committed K/V remain resident.
+            mx.clear_cache()
+            mtp_history_active_after_flush_bytes = int(mx.get_active_memory())
+
+        if prompt_history_active:
+            prompt_hidden = getattr(tgt, "_h_window", None)
+            if prompt_hidden is None:
+                mtp_history_prompt_skip_reason = "hidden-window-missing"
+            elif (prompt_hidden.ndim != 3
+                    or int(prompt_hidden.shape[0]) != 1):
+                mtp_history_prompt_skip_reason = "hidden-window-shape"
+            else:
+                hidden_rows = int(prompt_hidden.shape[1])
+                mapped_rows = hidden_rows
+                if bool(bootstrap_stats.get(
+                    "qwen_lossy_suffix_prefill_used", 0
+                )):
+                    # Endpoint-packed mode prepends a disjoint semantic anchor.
+                    # Its final suffix+scaffold remains contiguous; only that
+                    # tail is eligible for adjacent (hidden[t], token[t+1])
+                    # pairing.
+                    mapped_rows = max(
+                        0,
+                        hidden_rows - int(getattr(
+                            rc,
+                            "qwen_lossy_suffix_prefill_prefix_tokens",
+                            0,
+                        ) or 0),
+                    )
+                mtp_history_prompt_available_rows = max(0, mapped_rows - 1)
+                capture_rows = min(
+                    self.prompt_history_tokens,
+                    len(ids) - 1,
+                    mtp_history_prompt_available_rows,
+                )
+                if capture_rows > 0:
+                    _queue_mtp_history(
+                        prompt_hidden[
+                            :,
+                            hidden_rows - capture_rows - 1:hidden_rows - 1,
+                            :,
+                        ],
+                        ids[-capture_rows:],
+                        len(ids) - capture_rows - 1,
+                        prompt_rows=True,
+                    )
+                    mtp_history_prompt_skip_reason = ""
+
+                    # The target verifier does not consume the prefill hidden
+                    # window again: its first serial sweep replaces it with
+                    # authoritative decode rows.  Native MTP only needs the
+                    # final prompt row to form its first proposal.  Detach that
+                    # single row through FP32 host memory (an exact round-trip
+                    # for BF16) and release the much larger lazy prompt graph
+                    # before the sidecar is admitted.  Target KV/KDA and logits
+                    # remain untouched.
+                    detached_started = time.perf_counter()
+                    import numpy as np
+
+                    active_before = int(mx.get_active_memory())
+                    source_dtype = prompt_hidden.dtype
+                    endpoint_fp32 = prompt_hidden[:, -1:, :].astype(mx.float32)
+                    mx.eval(endpoint_fp32)
+                    endpoint_host = np.array(
+                        endpoint_fp32, dtype=np.float32, copy=True)
+                    del endpoint_fp32
+                    endpoint_hidden = mx.array(endpoint_host).astype(source_dtype)
+                    mx.eval(endpoint_hidden)
+                    tgt._h_last = endpoint_hidden
+                    tgt._h_window = endpoint_hidden
+                    mtp_history_prompt_endpoint_detach_calls = 1
+                    mtp_history_prompt_endpoint_source_rows = hidden_rows
+                    mtp_history_prompt_endpoint_source_bytes = int(
+                        prompt_hidden.nbytes)
+                    mtp_history_prompt_endpoint_retained_bytes = int(
+                        endpoint_hidden.nbytes)
+                    del endpoint_host
+                    del prompt_hidden
+                    mx.clear_cache()
+                    mtp_history_prompt_endpoint_released_active_bytes = max(
+                        0, active_before - int(mx.get_active_memory()))
+                    mtp_history_prompt_endpoint_detach_s = (
+                        time.perf_counter() - detached_started)
+                else:
+                    mtp_history_prompt_skip_reason = "hidden-window-too-short"
         proposed = 0
         verified_proposals = 0
         accepted = 0
@@ -1635,6 +1991,10 @@ class QwenMTPSpeculativeEngine:
         adaptive_reactivations = 0
         serial_verify_rounds = 0
         kda_endpoint_restores = 0
+        kda_factor_windows = 0
+        kda_factor_commits = 0
+        kda_factor_bytes_peak = 0
+        kda_factor_commit_s = 0.0
         refeed_sweeps_saved = 0
         grammar_forced_tokens = 0
         grammar_forced_sweeps = 0
@@ -1803,12 +2163,19 @@ class QwenMTPSpeculativeEngine:
             round_start_layer_lengths = None
             round_layer_growth = None
             round_capture_endpoint = False
+            round_capture_factors = False
+            round_kda_base = None
+            round_kda_factors = None
             round_serial_verify = False
             round_mtp_start_lengths = None
             round_bonus_candidate = False
             round_tree_verification = None
             round_tree_selected_path = None
             round_native_tree = False
+            round_history_entry_hidden = h_last
+            round_history_start_offset = int(kv.offset) - 1
+            round_history_input_tokens: list[int] = []
+            round_history_hidden_window = None
             # Grammar-deterministic spans need target state updates, but no
             # target decisions.  Preserve StreamingEngine's jump-forward win
             # inside MTP by folding catchup + the whole forced run into one
@@ -1862,6 +2229,8 @@ class QwenMTPSpeculativeEngine:
                         verify_tokens, kv, capture_kda_endpoints=False)
                 else:
                     forced_logits = tgt.forward_tokens(verify_tokens, kv)
+                round_history_input_tokens = list(verify_tokens)
+                round_history_hidden_window = getattr(tgt, "_h_window", None)
                 target_decode_sweeps += 1
                 plain_decode_sweeps += 1
                 grammar_forced_sweeps += 1
@@ -1899,6 +2268,8 @@ class QwenMTPSpeculativeEngine:
                 plain_started = time.perf_counter()
                 self._suspend_drafter_for_target_verification()
                 plain_logits = tgt.forward_tokens([catchup_tok], kv)
+                round_history_input_tokens = [int(catchup_tok)]
+                round_history_hidden_window = getattr(tgt, "_h_window", None)
                 target_decode_sweeps += 1
                 plain_decode_sweeps += 1
                 if warmup_remaining:
@@ -2036,6 +2407,15 @@ class QwenMTPSpeculativeEngine:
                             getattr(tgt.cache, "stats", None),
                             "bytes_read", read_before))
                         sidecar_read_bytes += max(0, read_after - read_before)
+
+                    if (prompt_history_active
+                            and not ngram_tokens
+                            and round_proposal_source == "M"):
+                        _flush_mtp_history(round_mtp_weights)
+                    # History flushing appends only already-committed rows.
+                    # The speculative-growth checkpoint must begin after that
+                    # append so rollback never discards prompt/committed K/V.
+                    round_mtp_start_lengths = mtp_kv.layer_lengths()
 
                     if ngram_tokens:
                         draft_tokens.extend(ngram_tokens)
@@ -2242,6 +2622,9 @@ class QwenMTPSpeculativeEngine:
                             release_info.get("resident_bytes", 0))
                         sidecar_cache_discards += int(
                             release_info.get("cache_discarded", 0))
+                        if prompt_history_active:
+                            mtp_history_active_after_sidecar_release_bytes = int(
+                                mx.get_active_memory())
                     self._suspend_drafter_for_target_verification()
                     draft_round_s += time.perf_counter() - draft_started
                 _accumulate_reranked_head_telemetry(
@@ -2267,40 +2650,93 @@ class QwenMTPSpeculativeEngine:
                 max_verify_width_observed = max(
                     max_verify_width_observed, round_verify_width)
                 verifier_started = time.perf_counter()
-                if round_native_tree:
-                    if native_tree is None:
-                        raise RuntimeError(
-                            "native MTP sibling verifier omitted its tree")
-                    from .qwen35_tree_verify import verify_qwen35_tree
+                try:
+                    if round_native_tree:
+                        if native_tree is None:
+                            raise RuntimeError(
+                                "native MTP sibling verifier omitted its tree")
+                        from .qwen35_tree_verify import verify_qwen35_tree
 
-                    round_tree_verification = verify_qwen35_tree(
-                        tgt, native_tree, kv)
-                    spec_logits = round_tree_verification.logits
-                    native_tree_rounds += 1
-                    native_tree_nodes_verified += len(native_tree.token_ids)
-                    native_tree_factor_bytes_peak = max(
-                        native_tree_factor_bytes_peak,
-                        round_tree_verification.factors.nbytes(),
-                    )
-                else:
-                    round_serial_verify = callable(getattr(
-                        tgt, "forward_tokens_serial_positions", None))
-                    round_capture_endpoint = bool(
-                        round_serial_verify
-                        and getattr(kv, "kda_cache", None) is not None
-                    )
-                    if round_serial_verify:
-                        spec_logits = tgt.forward_tokens_serial_positions(
-                            verify_tokens,
-                            kv,
-                            capture_kda_endpoints=round_capture_endpoint,
+                        round_tree_verification = verify_qwen35_tree(
+                            tgt, native_tree, kv)
+                        spec_logits = round_tree_verification.logits
+                        native_tree_rounds += 1
+                        native_tree_nodes_verified += len(native_tree.token_ids)
+                        native_tree_factor_bytes_peak = max(
+                            native_tree_factor_bytes_peak,
+                            round_tree_verification.factors.nbytes(),
                         )
-                        serial_verify_rounds += 1
                     else:
-                        # Compatibility fallback for old dense adapters. MoE
-                        # construction fails closed above when the exact verifier
-                        # is unavailable.
-                        spec_logits = tgt.forward_tokens(verify_tokens, kv)
+                        round_serial_verify = callable(getattr(
+                            tgt, "forward_tokens_serial_positions", None))
+                        round_capture_endpoint = bool(
+                            round_serial_verify
+                            and getattr(kv, "kda_cache", None) is not None
+                        )
+                        recurrent = getattr(kv, "kda_cache", None)
+                        round_capture_factors = bool(
+                            round_capture_endpoint
+                            and self.compact_kda_factors
+                            and callable(getattr(recurrent, "fork", None))
+                            and callable(getattr(
+                                tgt, "consume_serial_kda_factors", None))
+                        )
+                        if round_capture_factors:
+                            round_kda_base = recurrent.fork()
+                            round_capture_endpoint = False
+                        if round_serial_verify:
+                            serial_kwargs = {
+                                "capture_kda_endpoints": round_capture_endpoint,
+                            }
+                            if round_capture_factors:
+                                serial_kwargs["capture_kda_factors"] = True
+                            spec_logits = tgt.forward_tokens_serial_positions(
+                                verify_tokens,
+                                kv,
+                                **serial_kwargs,
+                            )
+                            if round_capture_factors:
+                                round_kda_factors = (
+                                    tgt.consume_serial_kda_factors())
+                                if round_kda_factors is None:
+                                    raise RuntimeError(
+                                        "serial Qwen verifier omitted compact "
+                                        "KDA factors")
+                                kda_factor_windows += 1
+                                kda_factor_bytes_peak = max(
+                                    kda_factor_bytes_peak,
+                                    int(round_kda_factors.nbytes()),
+                                )
+                            serial_verify_rounds += 1
+                        else:
+                            # Compatibility fallback for old dense adapters. MoE
+                            # construction fails closed above when the exact verifier
+                            # is unavailable.
+                            spec_logits = tgt.forward_tokens(verify_tokens, kv)
+                except BaseException as error:
+                    if round_capture_factors:
+                        cancel_factors = getattr(
+                            getattr(kv, "kda_cache", None),
+                            "cancel_factor_capture",
+                            None,
+                        )
+                        if callable(cancel_factors):
+                            cancel_factors()
+                        consume_factors = getattr(
+                            tgt, "consume_serial_kda_factors", None)
+                        if callable(consume_factors):
+                            consume_factors()
+                    if (isinstance(error, MemoryError)
+                            and prompt_history_active):
+                        raise MemoryError(
+                            f"{error}; qwen_mtp_history_active_before_flush="
+                            f"{mtp_history_active_before_flush_bytes} "
+                            f"after_flush={mtp_history_active_after_flush_bytes} "
+                            "after_sidecar_release="
+                            f"{mtp_history_active_after_sidecar_release_bytes} "
+                            f"kv={int(mtp_kv.nbytes())}"
+                        ) from error
+                    raise
                 target_decode_sweeps += 1
                 if (not round_native_tree
                         and round_start_layer_lengths is not None):
@@ -2668,6 +3104,13 @@ class QwenMTPSpeculativeEngine:
                     round_verify_width,
                     1 + max(0, emitted_this_round - 1),
                 )
+                if prompt_history_active:
+                    round_history_input_tokens = [
+                        int(token)
+                        for token in verify_tokens[:target_fed_positions]
+                    ]
+                    round_history_hidden_window = getattr(
+                        tgt, "_h_window", None)
                 verifier_committed_positions += target_fed_positions
                 verifier_rolled_back_positions += max(
                     0, round_verify_width - target_fed_positions)
@@ -2694,6 +3137,17 @@ class QwenMTPSpeculativeEngine:
                         tgt.consume_serial_kda_endpoint(target_fed_positions)
                         if round_capture_endpoint else None
                     )
+                    if round_capture_factors:
+                        if (round_kda_base is None
+                                or round_kda_factors is None):
+                            raise RuntimeError(
+                                "serial Qwen verifier lost compact KDA rollback")
+                        factor_commit_started = time.perf_counter()
+                        retained_prefix = round_kda_factors.commit_prefix(
+                            round_kda_base, target_fed_positions)
+                        kda_factor_commit_s += (
+                            time.perf_counter() - factor_commit_started)
+                        kda_factor_commits += 1
                     if round_capture_endpoint and retained_prefix is None:
                         raise RuntimeError(
                             "serial Qwen verifier did not retain KDA prefix "
@@ -2714,8 +3168,9 @@ class QwenMTPSpeculativeEngine:
                         kv.trim_layer_lengths(retained_lengths)
                     else:
                         kv.trim(round_start_offset + target_fed_positions)
-                    if round_capture_endpoint:
+                    if round_capture_endpoint or round_capture_factors:
                         kv.kda_cache = retained_prefix
+                    if round_capture_endpoint:
                         kda_endpoint_restores += 1
                     hidden_window = getattr(tgt, "_h_window", None)
                     if hidden_window is not None:
@@ -2747,19 +3202,28 @@ class QwenMTPSpeculativeEngine:
                     raise RuntimeError(
                         "recurrent Qwen MTP chain changed its KV by an "
                         f"unexpected count: {mtp_growth}")
-                # A rescue sibling is not an input to the primary MTP chain.
-                # Retain only steps whose consumed inputs are shared with the
-                # target-selected branch. On a correction, the extra proposal
-                # step consumed the last accepted primary token and remains
-                # valid; on an accepted sibling/bonus it does not.
-                if round_native_tree:
-                    committed_mtp_steps = min(
-                        round_draft_steps_run,
-                        accepted_prefix + int(round_rejected),
-                    )
+                if prompt_history_active:
+                    # Every proposal-chain row—including step zero—is a draft
+                    # computation.  Committed-history mode keeps only target
+                    # hidden rows, queued below after the authoritative prefix
+                    # has been selected.  Roll the complete provisional chain
+                    # back to the already-flushed committed checkpoint.
+                    committed_mtp_steps = 0
                 else:
-                    committed_mtp_steps = min(
-                        round_draft_steps_run, target_fed_positions)
+                    # A rescue sibling is not an input to the primary MTP
+                    # chain. Retain only steps whose consumed inputs are shared
+                    # with the target-selected branch. On a correction, the
+                    # extra proposal step consumed the last accepted primary
+                    # token and remains valid; on an accepted sibling/bonus it
+                    # does not.
+                    if round_native_tree:
+                        committed_mtp_steps = min(
+                            round_draft_steps_run,
+                            accepted_prefix + int(round_rejected),
+                        )
+                    else:
+                        committed_mtp_steps = min(
+                            round_draft_steps_run, target_fed_positions)
                 if committed_mtp_steps < round_draft_steps_run:
                     mtp_lengths = tuple(
                         start + (committed_mtp_steps if growth else 0)
@@ -2800,6 +3264,33 @@ class QwenMTPSpeculativeEngine:
                     ):
                         self._stage_drafter_after_target_prefill()
                         commit_draft_inputs(committed_inputs)
+            if (prompt_history_active
+                    and not terminal_round
+                    and round_history_input_tokens):
+                history_count = len(round_history_input_tokens)
+                if history_count == 1:
+                    committed_hidden = round_history_entry_hidden
+                else:
+                    if (round_history_hidden_window is None
+                            or round_history_hidden_window.ndim != 3
+                            or int(round_history_hidden_window.shape[1])
+                            < history_count - 1):
+                        raise RuntimeError(
+                            "Qwen MTP committed-history target window is "
+                            "missing verified prefix rows")
+                    committed_hidden = mx.concatenate(
+                        [
+                            round_history_entry_hidden,
+                            round_history_hidden_window[
+                                :, :history_count - 1, :],
+                        ],
+                        axis=1,
+                    )
+                _queue_mtp_history(
+                    committed_hidden,
+                    round_history_input_tokens,
+                    round_history_start_offset,
+                )
             # An accepted pair may encounter EOS/stop on its first token, in
             # which case ``next_catchup_tok`` is the unused bonus token. Never
             # continue from that uncommitted value (the old behavior leaked
@@ -2945,6 +3436,58 @@ class QwenMTPSpeculativeEngine:
                 plain_equivalent_sweeps / target_decode_sweeps
                 if target_decode_sweeps else 0.0),
             "qwen_mtp_depth": self.depth,
+            "qwen_mtp_prompt_history_enabled": int(
+                self.prompt_history_tokens > 0),
+            "qwen_mtp_prompt_history_request_active": int(
+                prompt_history_active),
+            "qwen_mtp_prompt_history_requested_tokens": (
+                self.prompt_history_tokens),
+            "qwen_mtp_prompt_history_min_prompt_tokens": (
+                self.prompt_history_min_prompt_tokens),
+            "qwen_mtp_prompt_history_available_rows": (
+                mtp_history_prompt_available_rows),
+            "qwen_mtp_prompt_history_captured_rows": (
+                mtp_history_prompt_captured_rows),
+            "qwen_mtp_prompt_history_captured_host_bytes": (
+                mtp_history_prompt_captured_bytes),
+            "qwen_mtp_prompt_history_capture_s": (
+                mtp_history_prompt_capture_s),
+            "qwen_mtp_prompt_endpoint_detach_calls": (
+                mtp_history_prompt_endpoint_detach_calls),
+            "qwen_mtp_prompt_endpoint_source_rows": (
+                mtp_history_prompt_endpoint_source_rows),
+            "qwen_mtp_prompt_endpoint_source_bytes": (
+                mtp_history_prompt_endpoint_source_bytes),
+            "qwen_mtp_prompt_endpoint_retained_bytes": (
+                mtp_history_prompt_endpoint_retained_bytes),
+            "qwen_mtp_prompt_endpoint_released_active_bytes": (
+                mtp_history_prompt_endpoint_released_active_bytes),
+            "qwen_mtp_prompt_endpoint_detach_s": (
+                mtp_history_prompt_endpoint_detach_s),
+            "qwen_mtp_prompt_history_skip_reason": (
+                mtp_history_prompt_skip_reason),
+            "qwen_mtp_committed_history_rows_queued": (
+                mtp_history_committed_rows_queued),
+            "qwen_mtp_committed_history_pending_rows": sum(
+                len(block["tokens"]) for block in mtp_history_pending),
+            "qwen_mtp_committed_history_flush_calls": (
+                mtp_history_flush_calls),
+            "qwen_mtp_committed_history_flush_blocks": (
+                mtp_history_flush_blocks),
+            "qwen_mtp_committed_history_flushed_rows": (
+                mtp_history_flushed_rows),
+            "qwen_mtp_committed_history_flush_tiles": (
+                mtp_history_flush_tiles),
+            "qwen_mtp_committed_history_flush_s": (
+                mtp_history_flush_s),
+            "qwen_mtp_committed_history_peak_kv_bytes": max(
+                mtp_history_peak_kv_bytes, int(mtp_kv.nbytes())),
+            "qwen_mtp_committed_history_active_before_flush_bytes": (
+                mtp_history_active_before_flush_bytes),
+            "qwen_mtp_committed_history_active_after_flush_bytes": (
+                mtp_history_active_after_flush_bytes),
+            "qwen_mtp_committed_history_active_after_sidecar_release_bytes": (
+                mtp_history_active_after_sidecar_release_bytes),
             "qwen_mtp_verify_width": max(
                 self.depth + 1, max_verify_width_observed),
             "qwen_mtp_max_verify_width_observed": max_verify_width_observed,
@@ -3050,6 +3593,12 @@ class QwenMTPSpeculativeEngine:
                 - draft_head_detach_before[2]),
             "qwen_mtp_plain_round_s": plain_round_s,
             "qwen_mtp_kda_endpoint_restores": kda_endpoint_restores,
+            "qwen_mtp_kda_factor_windows": kda_factor_windows,
+            "qwen_mtp_kda_factor_commits": kda_factor_commits,
+            "qwen_mtp_kda_factor_bytes_peak": kda_factor_bytes_peak,
+            "qwen_mtp_kda_factor_commit_s": kda_factor_commit_s,
+            "qwen_mtp_compact_kda_factors_enabled": int(
+                self.compact_kda_factors),
             "qwen_mtp_refeed_sweeps_saved": refeed_sweeps_saved,
             "qwen_mtp_target_prefix_rollbacks": target_prefix_rollbacks,
             "qwen_mtp_draft_kv_rollbacks": mtp_kv_rollbacks,

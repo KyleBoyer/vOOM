@@ -49,6 +49,15 @@ settings:
   # row-serial, so unrelated models/profiles do not inherit these lossy-Qwen
   # throughput choices.
   VMODEL_QWEN_MTP_DEPTH: 4
+  # The released MTP layer benefits from real committed context on both the
+  # 6.3K agent capture and 16K/64 sustained gate. The 1.37K developer/tool
+  # shape regressed, so admission is content-blind and long-prompt-only.
+  VMODEL_QWEN_MTP_PROMPT_HISTORY_TOKENS: 128
+  VMODEL_QWEN_MTP_PROMPT_HISTORY_MIN_PROMPT_TOKENS: 4096
+  # The same long-prompt gate scopes physical target-head release between the
+  # draft and verifier phases. It is restored without a second physical read.
+  VMODEL_QWEN35_SERIAL_VERIFY_SUSPEND_LM_HEAD: true
+  VMODEL_QWEN35_SERIAL_VERIFY_SUSPEND_LM_HEAD_MIN_PROMPT_TOKENS: 4096
   VMODEL_QWEN_MTP_GRAMMAR_AWARE_DRAFT: true
   VMODEL_QWEN35_SERIAL_VERIFY_BATCHED_MLP: true
   VMODEL_QWEN_MTP_STOCHASTIC_DRAFT_TOP_K: 1

@@ -54,7 +54,11 @@ target-verified native MTP. The MTP module is the released BF16 tensor set,
 loaded only for one speculative round and released before the target sweep.
 The named profile uses a top-1 proposal distribution at depth four, masks
 greedy proposals with the active grammar, and batches only the
-position-independent verifier MLP. The compact MXFP4 language-model head is
+position-independent verifier MLP. For prompts of at least 4,096 tokens it
+also primes the released MTP attention cache with 128 target-committed rows
+and releases the target head between proposal and verification phases.
+Shorter prompts keep the established empty-history/pinned-head path. The
+compact MXFP4 language-model head is
 pinned and two-layer prefetch is enabled; a trunk pin is not. MTP measures its
 draft/target break-even window, temporarily
 disengages after a complete unhelpful window, and periodically re-probes so a
@@ -62,16 +66,25 @@ poor opening region cannot hide a later predictable span.
 Grammar jump-forward and experimental fused DeltaNet kernels stay off because
 they do not have an accepted quality case here.
 
-An additional long-context-only head lifecycle is available with
-`VMODEL_QWEN35_SERIAL_VERIFY_SUSPEND_LM_HEAD=1`.  It is default-off and
-content-blind gated at 8,192 prompt tokens.  Startup defers the 675.4MB MXFP4
+The profile's long-context-only head lifecycle is controlled by
+`VMODEL_QWEN35_SERIAL_VERIFY_SUSPEND_LM_HEAD=1`. It remains default-off
+outside the named profile. Startup defers the 675.4MB MXFP4
 head until first projection; native-MTP copies only its evaluated vocabulary
 row through host float32, then the target drops the physical head during each
 streamed trunk sweep and zero-copy re-pins it for projection.  On the 16K/64
 gate this reduced wall 287.2454s -> 271.0189s and reads 314.125GB -> 275.822GB
 with the identical output SHA and a passing pressure gate.  Forcing it on the
-6,339-token capture regressed 106.1934s -> 107.2490s, which is why it is not in
-the recommended profile.
+6,339-token capture alone regressed 106.1934s -> 107.2490s. Composed with 128
+committed MTP rows, however, the capture improved to 98.3885s and a paired
+16K/64 run improved 320.5869s -> 297.6953s. The shared 4,096-token boundary
+also excludes the measured 1,371-token regression.
+
+A final cold replay through the named production profile (without the
+synchronization-heavy `ops` profiler) completed in 98.7772s: 61.0816s
+prefill, 34.6881s decode, four target sweeps, 11/16 accepted proposals,
+72.297GB of store-accounted reads, 2.916GB peak Metal, and 7.569MB swap-out
+growth. It retained output SHA-256 `9b170095...b87b81`. The `ops` profiler is
+diagnostic only and must not be used for production wall-time claims.
 
 The captured request is 178,616 bytes with 134 tools, 3 input items, 15,630
 message characters, and 162,441 raw tool-schema characters. The fast gateway

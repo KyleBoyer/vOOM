@@ -62,6 +62,9 @@ class _Endpoint:
     def synchronize(self):
         return None
 
+    def fork(self):
+        return self
+
 
 class _TargetKV:
     def __init__(self):
@@ -337,6 +340,197 @@ def test_released_drafter_step_returns_post_block_hidden(monkeypatch):
     assert logits.shape == (1,)
     assert logits.tolist() == [17.0]
     assert mtp_kv.layer_lengths() == (1,)
+
+
+def test_prompt_history_is_primed_once_and_provisional_rows_are_rolled_back():
+    class HistoryTarget(_Target):
+        def generate(self, prompt, max_tokens, **kwargs):
+            result = super().generate(prompt, max_tokens, **kwargs)
+            self._h_window = mx.array([[[10.0], [20.0], [30.0]]])
+            self._h_last = self._h_window[:, -1:, :]
+            return result
+
+    class HistoryDrafter(_RecurrentDrafter):
+        proposal_source = "M"
+        request_weight_representation = "demand-cache"
+
+        def __init__(self):
+            super().__init__()
+            self.history_appends = []
+
+        def append_committed_history(
+            self, hidden, tokens, mtp_kv, offset, _weights=None,
+            *, tile_size=128,
+        ):
+            self.history_appends.append({
+                "hidden": hidden.tolist(),
+                "tokens": list(tokens),
+                "offset": int(offset),
+            })
+            rows = len(tokens)
+            key = mx.arange(rows, dtype=mx.float32).reshape(1, 1, rows, 1)
+            mtp_kv.update(0, key, key)
+            return {
+                "rows": rows,
+                "tiles": 1,
+                "seconds": 0.001,
+                "kv_bytes": mtp_kv.nbytes(),
+            }
+
+    target = HistoryTarget(accepted_prefix=2)
+    drafter = HistoryDrafter()
+    engine = QwenMTPSpeculativeEngine(
+        target,
+        max_prompt_tokens=8,
+        min_output_tokens=2,
+        adaptive_stop=False,
+        plain_warmup_tokens=0,
+        depth=2,
+        prompt_history_tokens=2,
+        drafter=drafter,
+    )
+
+    result = engine.generate("x", 4)
+    stats = result["path_stats"]
+
+    assert result["tokens"] == [4, 10, 11, 8]
+    assert drafter.history_appends == [{
+        "hidden": [[[10.0], [20.0]]],
+        "tokens": [2, 3],
+        "offset": 0,
+    }]
+    # The two prompt rows remain. Both provisional draft rows were trimmed;
+    # no target row is queued because this request ended in the same round.
+    assert drafter.mtp_kv.layer_lengths() == (2,)
+    assert stats["qwen_mtp_prompt_history_captured_rows"] == 2
+    assert stats["qwen_mtp_prompt_endpoint_detach_calls"] == 1
+    assert stats["qwen_mtp_prompt_endpoint_source_rows"] == 3
+    assert stats["qwen_mtp_prompt_endpoint_source_bytes"] == 12
+    assert stats["qwen_mtp_prompt_endpoint_retained_bytes"] == 4
+    assert stats["qwen_mtp_committed_history_flushed_rows"] == 2
+    assert stats["qwen_mtp_committed_history_pending_rows"] == 0
+    assert stats["qwen_mtp_draft_kv_rollbacks"] == 1
+    assert "committed-history-k2" in stats["qwen_mtp_engine_identity"]
+
+    short_target = HistoryTarget(accepted_prefix=2)
+    short_drafter = HistoryDrafter()
+    short_engine = QwenMTPSpeculativeEngine(
+        short_target,
+        max_prompt_tokens=8,
+        min_output_tokens=2,
+        adaptive_stop=False,
+        plain_warmup_tokens=0,
+        depth=2,
+        prompt_history_tokens=2,
+        prompt_history_min_prompt_tokens=4,
+        drafter=short_drafter,
+    )
+    short_stats = short_engine.generate("x", 4)["path_stats"]
+    assert short_drafter.history_appends == []
+    assert short_stats["qwen_mtp_prompt_history_enabled"] == 1
+    assert short_stats["qwen_mtp_prompt_history_request_active"] == 0
+    assert short_stats["qwen_mtp_prompt_history_min_prompt_tokens"] == 4
+    assert short_stats["qwen_mtp_prompt_history_skip_reason"] == (
+        "below-min-prompt")
+    assert short_stats["qwen_mtp_prompt_endpoint_detach_calls"] == 0
+
+
+def test_prompt_history_flushes_authoritative_target_rows_on_next_round():
+    class TwoRoundTarget(_WideTarget):
+        def __init__(self):
+            super().__init__(accepted_prefix=2)
+            self.round = 0
+
+        def generate(self, prompt, max_tokens, **kwargs):
+            result = super().generate(prompt, max_tokens, **kwargs)
+            self._h_window = mx.array([[[10.0], [20.0], [30.0]]])
+            self._h_last = self._h_window[:, -1:, :]
+            return result
+
+        def forward_tokens_serial_positions(
+            self, tokens, kv, *, capture_kda_endpoints=False,
+        ):
+            assert capture_kda_endpoints
+            expected = ([4, 10, 11], [8, 10, 11])[self.round]
+            assert tokens == expected
+            hidden = (
+                (40.0, 100.0, 110.0),
+                (80.0, 200.0, 210.0),
+            )[self.round]
+            winners = ((10, 11, 8), (6, 7, 8))[self.round]
+            self.round += 1
+            kv.offset += 3
+            kv.lengths[0] += 3
+            kv.kda_cache = self.endpoints[3]
+            self._h_window = mx.array([[[value] for value in hidden]])
+            self._h_last = self._h_window[:, -1:, :]
+            logits = mx.full((3, 16), -100.0)
+            for row, token in enumerate(winners):
+                logits = logits.at[row, token].add(200.0)
+            return logits
+
+    class HistoryDrafter(_WideRecurrentDrafter):
+        proposal_source = "M"
+        request_weight_representation = "demand-cache"
+
+        def __init__(self):
+            super().__init__()
+            self.history_appends = []
+
+        def append_committed_history(
+            self, hidden, tokens, mtp_kv, offset, _weights=None,
+            *, tile_size=128,
+        ):
+            self.history_appends.append(
+                (hidden.tolist(), list(tokens), int(offset)))
+            rows = len(tokens)
+            key = mx.zeros((1, 1, rows, 1))
+            mtp_kv.update(0, key, key)
+            return {
+                "rows": rows, "tiles": 1, "seconds": 0.001,
+                "kv_bytes": mtp_kv.nbytes(),
+            }
+
+        def draft_step(self, hidden, token, mtp_kv, offset, _weights=None):
+            step = len(self.calls) % 2
+            self.mtp_kv = mtp_kv
+            self.calls.append({
+                "hidden": float(hidden.reshape(-1)[0].item()),
+                "token": int(token),
+                "offset": int(offset),
+            })
+            key = mx.ones((1, 1, 1, 1))
+            mtp_kv.update(0, key, key)
+            proposal = (10, 11)[step]
+            logits = mx.full((16,), -100.0).at[proposal].add(200.0)
+            return logits, mx.array([[[1000.0 + step]]])
+
+    target = TwoRoundTarget()
+    drafter = HistoryDrafter()
+    engine = QwenMTPSpeculativeEngine(
+        target,
+        max_prompt_tokens=8,
+        min_output_tokens=2,
+        adaptive_stop=False,
+        plain_warmup_tokens=0,
+        depth=2,
+        prompt_history_tokens=2,
+        drafter=drafter,
+    )
+
+    result = engine.generate("x", 5)
+    stats = result["path_stats"]
+
+    assert result["tokens"] == [4, 10, 11, 8, 6]
+    assert drafter.history_appends == [
+        ([[[10.0], [20.0]]], [2, 3], 0),
+        ([[[30.0], [40.0], [100.0]]], [4, 10, 11], 2),
+    ]
+    assert drafter.mtp_kv.layer_lengths() == (5,)
+    assert stats["qwen_mtp_committed_history_rows_queued"] == 3
+    assert stats["qwen_mtp_committed_history_flushed_rows"] == 5
+    assert stats["qwen_mtp_committed_history_flush_calls"] == 2
+    assert stats["qwen_mtp_draft_kv_rollbacks"] == 2
 
 
 def test_native_mtp_phase_head_detaches_only_vocab_row_through_host():
@@ -1108,6 +1302,19 @@ def test_k2_constructor_is_strict_and_opt_in():
                 ngram_max_draft_tokens=invalid)
     with pytest.raises(TypeError, match="grammar_aware_draft must be bool"):
         QwenMTPSpeculativeEngine(target, grammar_aware_draft=1)
+    with pytest.raises(TypeError, match="compact_kda_factors must be bool"):
+        QwenMTPSpeculativeEngine(target, compact_kda_factors=1)
+    for invalid in (-1, 4097, True, "128"):
+        with pytest.raises(ValueError, match="history tokens must be in"):
+            QwenMTPSpeculativeEngine(
+                target, prompt_history_tokens=invalid)
+    for invalid in (-1, 1_048_577, True, "4096"):
+        with pytest.raises(ValueError, match="minimum prompt tokens"):
+            QwenMTPSpeculativeEngine(
+                target, prompt_history_min_prompt_tokens=invalid)
+    with pytest.raises(ValueError, match="not yet supported with native trees"):
+        QwenMTPSpeculativeEngine(
+            target, prompt_history_tokens=128, native_tree_width=2)
 
 
 def test_server_q_policy_is_strict_and_part_of_engine_cache_identity():
@@ -1127,8 +1334,23 @@ def test_server_q_policy_is_strict_and_part_of_engine_cache_identity():
     }):
         with pytest.raises(RequestValidationError, match="must be 0 or 1"):
             EngineManager().get(Path("/tmp/not-opened"), "fast")
+    with patch.dict(os.environ, {
+        "VMODEL_QWEN_MTP_COMPACT_KDA_FACTORS": "auto",
+    }):
+        with pytest.raises(RequestValidationError, match="must be 0 or 1"):
+            EngineManager().get(Path("/tmp/not-opened"), "fast")
     with patch.dict(os.environ, {"VMODEL_QWEN_MTP_TREE_WIDTH": "1"}):
         with pytest.raises(RequestValidationError, match="must be 0 or"):
+            EngineManager().get(Path("/tmp/not-opened"), "fast")
+    with patch.dict(os.environ, {
+        "VMODEL_QWEN_MTP_PROMPT_HISTORY_TOKENS": "4097",
+    }):
+        with pytest.raises(RequestValidationError, match=r"in \[0, 4096\]"):
+            EngineManager().get(Path("/tmp/not-opened"), "fast")
+    with patch.dict(os.environ, {
+        "VMODEL_QWEN_MTP_PROMPT_HISTORY_MIN_PROMPT_TOKENS": "1048577",
+    }):
+        with pytest.raises(RequestValidationError, match=r"in \[0, 1048576\]"):
             EngineManager().get(Path("/tmp/not-opened"), "fast")
     with patch.dict(os.environ, {
         "VMODEL_QWEN35_SERIAL_VERIFY_EXACT_PAGE_ADMISSION": "yes",
@@ -1183,6 +1405,8 @@ def test_server_q_policy_is_strict_and_part_of_engine_cache_identity():
         "VMODEL_QWEN_MTP_DEPTH": "1",
         "VMODEL_QWEN_MTP_NGRAM_FIRST": "0",
         "VMODEL_QWEN_MTP_TREE_WIDTH": "0",
+        "VMODEL_QWEN_MTP_PROMPT_HISTORY_TOKENS": "0",
+        "VMODEL_QWEN_MTP_PROMPT_HISTORY_MIN_PROMPT_TOKENS": "0",
         "VMODEL_QWEN_MTP_GRAMMAR_AWARE_DRAFT": "0",
         "VMODEL_QWEN35_SERIAL_VERIFY_EXACT_PAGE_ADMISSION": "0",
         "VMODEL_QWEN35_SERIAL_VERIFY_BATCHED_MLP": "0",
@@ -1215,6 +1439,13 @@ def test_server_q_policy_is_strict_and_part_of_engine_cache_identity():
             "VMODEL_QWEN35_SERIAL_VERIFY_SUSPEND_LM_HEAD"
         ] = "1"
         eighth = manager.get(Path("/tmp/fake-qwen-q-policy"), "fast")
+        os.environ["VMODEL_QWEN_MTP_TREE_WIDTH"] = "0"
+        os.environ["VMODEL_QWEN_MTP_PROMPT_HISTORY_TOKENS"] = "128"
+        ninth = manager.get(Path("/tmp/fake-qwen-q-policy"), "fast")
+        os.environ[
+            "VMODEL_QWEN_MTP_PROMPT_HISTORY_MIN_PROMPT_TOKENS"
+        ] = "4096"
+        tenth = manager.get(Path("/tmp/fake-qwen-q-policy"), "fast")
 
     assert first is made[0]
     assert second is made[1]
@@ -1224,6 +1455,8 @@ def test_server_q_policy_is_strict_and_part_of_engine_cache_identity():
     assert sixth is made[5]
     assert seventh is made[6]
     assert eighth is made[7]
+    assert ninth is made[8]
+    assert tenth is made[9]
     assert first.closes == 1
     assert second.closes == 1
     assert third.closes == 1
@@ -1231,6 +1464,8 @@ def test_server_q_policy_is_strict_and_part_of_engine_cache_identity():
     assert fifth.closes == 1
     assert sixth.closes == 1
     assert seventh.closes == 1
+    assert eighth.closes == 1
+    assert ninth.closes == 1
 
 
 def test_server_wires_typed_q_policy_and_explicit_deep_chain():
@@ -1278,7 +1513,10 @@ def test_server_wires_typed_q_policy_and_explicit_deep_chain():
         "VMODEL_QWEN_MTP_STOCHASTIC_DRAFT_TOP_K": "8",
         "VMODEL_QWEN_MTP_DEPTH": "4",
         "VMODEL_QWEN_MTP_TREE_WIDTH": "0",
+        "VMODEL_QWEN_MTP_PROMPT_HISTORY_TOKENS": "128",
+        "VMODEL_QWEN_MTP_PROMPT_HISTORY_MIN_PROMPT_TOKENS": "4096",
         "VMODEL_QWEN_MTP_GRAMMAR_AWARE_DRAFT": "1",
+        "VMODEL_QWEN_MTP_COMPACT_KDA_FACTORS": "1",
         "VMODEL_QWEN35_SERIAL_VERIFY_BATCHED_MLP": "1",
         "VMODEL_QWEN35_SERIAL_VERIFY_SUSPEND_LM_HEAD": "1",
     }
@@ -1299,6 +1537,9 @@ def test_server_wires_typed_q_policy_and_explicit_deep_chain():
     assert wrapped.kwargs["depth"] == 4
     assert wrapped.kwargs["ngram_first"] is False
     assert wrapped.kwargs["grammar_aware_draft"] is True
+    assert wrapped.kwargs["compact_kda_factors"] is True
+    assert wrapped.kwargs["prompt_history_tokens"] == 128
+    assert wrapped.kwargs["prompt_history_min_prompt_tokens"] == 4096
     assert wrapped.target.rc.qwen35_serial_verify_batched_mlp is True
     assert wrapped.target.rc.qwen35_serial_verify_suspend_lm_head is True
     policy = wrapped.kwargs["proposal_q_policy"]
@@ -1330,6 +1571,7 @@ def test_server_wires_typed_q_policy_and_explicit_deep_chain():
         "VMODEL_QWEN_MTP_DEPTH": "4",
         "VMODEL_QWEN_MTP_NGRAM_FIRST": "0",
         "VMODEL_QWEN_MTP_TREE_WIDTH": "4",
+        "VMODEL_QWEN_MTP_PROMPT_HISTORY_TOKENS": "0",
     })
     with patch.dict(os.environ, env), \
          patch("runtime.config.ModelConfig.from_dir", return_value=cfg), \

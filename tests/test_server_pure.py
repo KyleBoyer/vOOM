@@ -3145,6 +3145,9 @@ def test_dense_qwen35_honors_postgen_cleanup_floor():
         "VMODEL_QWEN35_WEIGHT_CACHE_MB": "2200",
         "VMODEL_QWEN35_PREFILL_CHUNK_CEILING": "128",
         "VMODEL_QWEN35_HOT_KV": "1",
+        "VMODEL_QWEN35_SERIAL_VERIFY_SUSPEND_LM_HEAD": "1",
+        "VMODEL_QWEN35_SERIAL_VERIFY_SUSPEND_LM_HEAD_MIN_PROMPT_TOKENS":
+            "6339",
     }
     manager = EngineManager()
     with patch.dict(os.environ, env), \
@@ -3159,14 +3162,41 @@ def test_dense_qwen35_honors_postgen_cleanup_floor():
         manager.get(Path("/tmp/fake-qwen38-dense"), "lossless")
         os.environ["VMODEL_QWEN35_HOT_KV"] = "0"
         manager.get(Path("/tmp/fake-qwen38-dense"), "lossless")
+        os.environ[
+            "VMODEL_QWEN35_SERIAL_VERIFY_SUSPEND_LM_HEAD_MIN_PROMPT_TOKENS"
+        ] = "4096"
+        manager.get(Path("/tmp/fake-qwen38-dense"), "lossless")
 
-    assert len(captured) == 3  # ceiling and hot-state policy are identities
+    assert len(captured) == 4  # all explicit policies are cache identities
     assert captured[0].qwen_postgen_min_available_mb == 6000
     assert captured[0].max_weight_cache_mb == 2200
     assert captured[0].qwen35_prefill_chunk_ceiling == 128
     assert captured[1].qwen35_prefill_chunk_ceiling == 32
     assert captured[1].hot_prompt_kv
     assert not captured[2].hot_prompt_kv
+    assert captured[0].qwen35_serial_verify_suspend_lm_head
+    assert (
+        captured[0].qwen35_serial_verify_suspend_lm_head_min_prompt_tokens
+        == 6339)
+    assert (
+        captured[3].qwen35_serial_verify_suspend_lm_head_min_prompt_tokens
+        == 4096)
+
+
+@pytest.mark.parametrize("value", ["-1", "1048577", "auto", "bad"])
+def test_qwen35_phase_head_min_prompt_rejects_invalid_values(value):
+    from unittest.mock import patch
+
+    from runtime.server import EngineManager
+
+    with patch.dict(os.environ, {
+        "VMODEL_QWEN35_SERIAL_VERIFY_SUSPEND_LM_HEAD_MIN_PROMPT_TOKENS": value,
+    }):
+        with pytest.raises(
+                RequestValidationError,
+                match="SUSPEND_LM_HEAD_MIN_PROMPT_TOKENS"):
+            EngineManager().get(Path("/tmp/not-opened-invalid-head-boundary"),
+                                "fast")
 
 
 @pytest.mark.parametrize("value", ["", "2", "true", "bad"])

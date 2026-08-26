@@ -101,6 +101,15 @@ def test_builtin_profiles_resolve_complete_agent_group():
         "VMODEL_QWEN35_POSTGEN_MIN_AVAILABLE_MB"] == "5300"
     assert huihui_settings["VMODEL_QWEN_MTP_DEPTH"] == "4"
     assert huihui_settings[
+        "VMODEL_QWEN_MTP_PROMPT_HISTORY_TOKENS"] == "128"
+    assert huihui_settings[
+        "VMODEL_QWEN_MTP_PROMPT_HISTORY_MIN_PROMPT_TOKENS"] == "4096"
+    assert huihui_settings[
+        "VMODEL_QWEN35_SERIAL_VERIFY_SUSPEND_LM_HEAD"] == "1"
+    assert huihui_settings[
+        "VMODEL_QWEN35_SERIAL_VERIFY_SUSPEND_LM_HEAD_MIN_PROMPT_TOKENS"] == (
+            "4096")
+    assert huihui_settings[
         "VMODEL_QWEN_MTP_GRAMMAR_AWARE_DRAFT"] == "1"
     assert huihui_settings[
         "VMODEL_QWEN35_SERIAL_VERIFY_BATCHED_MLP"] == "1"

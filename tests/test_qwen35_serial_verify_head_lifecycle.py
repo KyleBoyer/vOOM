@@ -120,3 +120,8 @@ def test_phase_head_request_gate_is_content_blind_and_long_context_only():
     assert not qwen35_phase_head_request_active(True, boundary - 1)
     assert qwen35_phase_head_request_active(True, boundary)
     assert qwen35_phase_head_request_active(True, boundary + 1)
+
+
+def test_phase_head_request_gate_accepts_explicit_content_blind_boundary():
+    assert not qwen35_phase_head_request_active(True, 6_338, 6_339)
+    assert qwen35_phase_head_request_active(True, 6_339, 6_339)
