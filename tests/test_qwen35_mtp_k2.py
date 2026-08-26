@@ -1050,9 +1050,9 @@ def test_k2_constructor_is_strict_and_opt_in():
     for invalid in (1, 5, True, "4"):
         with pytest.raises(ValueError, match="tree width must be 0 or"):
             QwenMTPSpeculativeEngine(target, native_tree_width=invalid)
-    with pytest.raises(ValueError, match="trees currently require depth 1"):
-        QwenMTPSpeculativeEngine(
-            target, depth=2, native_tree_width=2)
+    target.cfg.model_type = "qwen3_5"
+    assert QwenMTPSpeculativeEngine(
+        target, depth=4, native_tree_width=2).native_tree_width == 2
     with pytest.raises(ValueError, match="cannot be combined"):
         QwenMTPSpeculativeEngine(
             target, ngram_first=True, native_tree_width=2)
@@ -1100,12 +1100,6 @@ def test_server_q_policy_is_strict_and_part_of_engine_cache_identity():
         "VMODEL_QWEN35_SERIAL_VERIFY_BATCHED_MLP": "yes",
     }):
         with pytest.raises(RequestValidationError, match="must be 0 or 1"):
-            EngineManager().get(Path("/tmp/not-opened"), "fast")
-    with patch.dict(os.environ, {
-        "VMODEL_QWEN_MTP_TREE_WIDTH": "2",
-        "VMODEL_QWEN_MTP_DEPTH": "2",
-    }):
-        with pytest.raises(RequestValidationError, match="requires.*DEPTH=1"):
             EngineManager().get(Path("/tmp/not-opened"), "fast")
     with patch.dict(os.environ, {
         "VMODEL_QWEN_MTP_TREE_WIDTH": "2",
@@ -1280,6 +1274,7 @@ def test_server_wires_typed_q_policy_and_explicit_deep_chain():
     assert cascaded.kwargs["grammar_aware_draft"] is True
 
     env.update({
+        "VMODEL_QWEN_MTP_DEPTH": "4",
         "VMODEL_QWEN_MTP_NGRAM_FIRST": "0",
         "VMODEL_QWEN_MTP_TREE_WIDTH": "4",
     })
@@ -1297,7 +1292,7 @@ def test_server_wires_typed_q_policy_and_explicit_deep_chain():
             Path("/tmp/fake-qwen-native-mtp-tree-wiring"), "fast")
 
     assert tree is captured[2]
-    assert tree.kwargs["depth"] == 1
+    assert tree.kwargs["depth"] == 4
     assert tree.kwargs["ngram_first"] is False
     assert tree.kwargs["native_tree_width"] == 4
     assert tree.kwargs["grammar_aware_draft"] is True

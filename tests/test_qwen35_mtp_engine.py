@@ -970,6 +970,173 @@ def test_qwen_mtp_native_sibling_tree_commits_only_target_selected_path(
         assert target.constraint_hidden == [40.0, 40.0 + selected]
 
 
+def test_qwen_mtp_depth4_rescue_tree_extends_only_primary_chain():
+    from runtime.qwen35_mtp import _native_mtp_chain_sibling_tree
+
+    rows = []
+    for primary, rescue in ((9, 10), (11, 12), (13, 14), (15, 16)):
+        row = mx.full((20,), -100.0)
+        row = row.at[primary].add(200.0)
+        rows.append(row.at[rescue].add(199.0))
+    tree = _native_mtp_chain_sibling_tree(4, rows, 2)
+
+    assert tree.token_ids == (4, 9, 10, 11, 12, 13, 14, 15, 16)
+    assert tree.depths == (0, 1, 1, 2, 2, 3, 3, 4, 4)
+    assert tree.parents == (-1, 0, 0, 1, 1, 3, 3, 5, 5)
+    assert tree.children == (
+        {9: 1, 10: 2},
+        {11: 3, 12: 4},
+        {},
+        {13: 5, 14: 6},
+        {},
+        {15: 7, 16: 8},
+        {},
+        {},
+        {},
+    )
+
+
+def test_qwen_mtp_depth4_rescue_commits_sibling_and_trims_primary_mtp(
+    monkeypatch,
+):
+    """A depth-two rescue must discard later primary-chain MTP state."""
+    from runtime.qwen35_mtp import QwenMTPSpeculativeEngine
+
+    committed_paths = []
+
+    class _KV:
+        def __init__(self):
+            self.offset = 3
+            self.lengths = [3, 1]
+            self.kda_cache = SimpleNamespace(synchronize=lambda: None)
+
+        def layer_lengths(self):
+            return tuple(self.lengths)
+
+        def trim(self, offset):
+            self.offset = int(offset)
+
+        def nbytes(self):
+            return 0
+
+    class _Target(_Engine):
+        def __init__(self):
+            super().__init__("/models/target")
+            self.cfg = SimpleNamespace(
+                model_type="qwen3_5", num_experts=0, eos_token_ids=())
+            self.cache = SimpleNamespace(
+                stats=SimpleNamespace(
+                    hits=0, misses=0, evictions=0, bytes_read=0),
+                total_bytes=0, max_bytes=1)
+            self.expert_hits = self.expert_misses = 0
+            for name in (
+                    "fast_tier_bytes", "archive_bytes",
+                    "parallel_tier_fetches", "parallel_tier_fast_bytes",
+                    "parallel_tier_archive_bytes"):
+                setattr(self.store, name, 0)
+            self.governor = None
+            self._layer_transient = self._prefill_layer_transient = 0
+            self._decode_layer_transient = self._layer_transient_margin = 0
+            self._token_transient = self._true_peak_metal_bytes = 0
+            self._request_profiler = None
+            self._hot_prompt_slots = []
+            self._h_last = mx.array([[[30.0]]])
+            self._h_window = self._h_last
+            self.last_kv = None
+
+        def generate(self, _prompt, max_tokens, **_kwargs):
+            assert max_tokens == 1
+            self.last_kv = _KV()
+            return {
+                "text": "4", "tokens": [4], "prefill_s": 0.0,
+                "first_token_s": 0.0, "decode_s": 0.0, "total_s": 0.0,
+                "termination_reason": "length", "stop_sequence": None,
+                "path_stats": {}, "prompt_tokens": 3,
+            }
+
+        def forward_tokens_serial_positions(self, *_args, **_kwargs):
+            raise AssertionError("rescue tree must use tree verification")
+
+    class _Drafter:
+        def __init__(self):
+            self.step = 0
+            self.mtp_kv = None
+
+        def draft_step(self, hidden, _token, mtp_kv, _offset, _weights=None):
+            self.mtp_kv = mtp_kv
+            item = mx.ones((1, 1, 1, 1))
+            mtp_kv.update(0, item, item)
+            candidates = ((9, 10), (11, 12), (13, 14), (15, 16))
+            primary, rescue = candidates[self.step]
+            self.step += 1
+            logits = mx.full((20,), -100.0)
+            logits = logits.at[primary].add(200.0)
+            logits = logits.at[rescue].add(199.0)
+            return logits, hidden
+
+    class _Factors:
+        @staticmethod
+        def nbytes():
+            return 654
+
+    class _Verification:
+        def __init__(self, tree):
+            self.factors = _Factors()
+            self.hidden_nodes = tuple(
+                mx.array([[[40.0 + node]]])
+                for node in range(len(tree.token_ids)))
+            self.logits = mx.full((len(tree.token_ids), 20), -100.0)
+            # Target accepts primary token 9, then rescues rank-two token 12.
+            self.logits = self.logits.at[0, 9].add(200.0)
+            self.logits = self.logits.at[1, 12].add(200.0)
+            self.logits = self.logits.at[4, 7].add(200.0)
+
+        def commit(self, path, *, target, kv):
+            selected = tuple(path)
+            committed_paths.append(selected)
+            kv.offset += len(selected)
+            kv.lengths = [value + len(selected) for value in kv.lengths]
+            kv.kda_cache = SimpleNamespace(
+                selected=selected, synchronize=lambda: None)
+            target._h_window = mx.array([[
+                [40.0 + node] for node in selected]])
+            target._h_last = target._h_window[:, -1:, :]
+
+    def fake_verify(_target, tree, kv):
+        assert tree.token_ids == (4, 9, 10, 11, 12, 13, 14, 15, 16)
+        assert kv.layer_lengths() == (3, 1)
+        return _Verification(tree)
+
+    monkeypatch.setattr(
+        "runtime.qwen35_tree_verify.verify_qwen35_tree", fake_verify)
+    target = _Target()
+    engine = QwenMTPSpeculativeEngine(
+        target, max_prompt_tokens=8, min_output_tokens=2, depth=4,
+        plain_warmup_tokens=0, adaptive_stop=False, native_tree_width=2)
+    drafter = _Drafter()
+    engine.drafter = drafter
+
+    result = engine.generate("x", 4)
+    stats = result["path_stats"]
+
+    assert result["tokens"] == [4, 9, 12, 7]
+    assert committed_paths == [(0, 1, 4)]
+    assert target.last_kv.layer_lengths() == (6, 4)
+    # Four draft steps ran, but only catchup + primary-9 are shared inputs
+    # with the target-selected sibling branch.
+    assert drafter.mtp_kv.layer_lengths() == (2,)
+    assert stats["qwen_mtp_draft_kv_rollbacks"] == 1
+    assert stats["qwen_mtp_native_tree_rescued_branches"] == 1
+    assert stats["qwen_mtp_native_tree_selected_rank_counts"] == [0, 1, 1]
+    assert stats["qwen_mtp_native_tree_selected_rank_counts_by_step"] == [
+        [0, 1, 0], [0, 0, 1], [0, 0, 0], [0, 0, 0]]
+    assert stats["qwen_mtp_native_tree_nodes_verified"] == 9
+    assert stats["qwen_mtp_verify_width"] == 9
+    assert stats["qwen_mtp_verified_by_step"] == [2, 2, 2, 2]
+    assert stats["qwen_mtp_accepted_by_step"] == [1, 1, 0, 0]
+    assert stats["qwen_mtp_round_outcomes"] == "A2"
+
+
 def test_qwen_mtp_batches_grammar_forced_span_before_next_decision():
     """Jump-forward and MTP compose: deterministic grammar tokens share one
     target sweep and the draft head is reserved for genuinely free choices."""

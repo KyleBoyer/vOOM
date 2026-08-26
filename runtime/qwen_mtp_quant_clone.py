@@ -24,6 +24,7 @@ from pathlib import Path
 INDEX_NAME = "model.safetensors.index.json"
 MANIFEST_NAME = "mtp-quant-clone.manifest.json"
 MANIFEST_SCHEMA = "voom.qwen-mtp-quant-clone.v1"
+HYBRID_MANIFEST_SCHEMA = "voom.qwen-mtp-hybrid-clone.v1"
 FAST_MANIFEST_NAME = "fast_tier_manifest.json"
 FAST_ALIAS_MANIFEST_NAME = "mtp-quant-fast-alias.manifest.json"
 FAST_ALIAS_SCHEMA = "voom.qwen-mtp-quant-fast-alias.v1"
@@ -267,7 +268,8 @@ def plan_fast_alias(
     clone_manifest = json.loads(clone_manifest_bytes)
     if not (
         isinstance(clone_manifest, dict)
-        and clone_manifest.get("schema") == MANIFEST_SCHEMA
+        and clone_manifest.get("schema") in {
+            MANIFEST_SCHEMA, HYBRID_MANIFEST_SCHEMA}
         and Path(clone_manifest.get("output", "")).expanduser().resolve()
         == target
         and Path(clone_manifest.get("source", "")).name == source.name

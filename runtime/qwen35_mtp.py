@@ -742,30 +742,62 @@ def _native_mtp_sibling_tree(
     tree changes proposal scheduling only: the target evaluates every sibling
     and its argmax chooses the sole committed branch.
     """
+    return _native_mtp_chain_sibling_tree(root_token, [logits], width)
+
+
+def _native_mtp_chain_sibling_tree(
+    root_token: int,
+    logits_rows: list[mx.array] | tuple[mx.array, ...],
+    width: int,
+):
+    """Build a primary MTP chain with target-verified rescue siblings.
+
+    Each row was produced after consuming the preceding rank-one proposal.
+    Consequently only the rank-one child is extended; every other candidate
+    is a leaf.  The released target still evaluates every node and owns the
+    branch choice, correction token, bonus token, and committed state.
+    """
     from .speculative_tree import SpeculativeTree, validate_tree
 
     width = int(width)
     if width < 2:
         raise ValueError("native MTP sibling width must be at least two")
-    row = logits.reshape(-1)
-    vocab = int(row.shape[0])
-    if width > vocab:
-        raise ValueError(
-            f"native MTP sibling width {width} exceeds vocabulary {vocab}")
-    candidates = mx.argpartition(-row, kth=width - 1)[:width]
-    scores = mx.take(row, candidates)
-    candidates = mx.take(candidates, mx.argsort(-scores))
-    mx.eval(candidates)
-    token_ids = [int(root_token), *(
-        int(token) for token in candidates.tolist())]
-    children = [{
-        token: index for index, token in enumerate(token_ids[1:], start=1)
-    }]
-    children.extend({} for _ in range(width))
+    if not logits_rows:
+        raise ValueError("native MTP sibling chain requires a logits row")
+    token_ids = [int(root_token)]
+    depths = [0]
+    parents = [-1]
+    children: list[dict[int, int]] = [{}]
+    primary_parent = 0
+    for depth, logits in enumerate(logits_rows, start=1):
+        row = logits.reshape(-1)
+        vocab = int(row.shape[0])
+        if width > vocab:
+            raise ValueError(
+                f"native MTP sibling width {width} exceeds vocabulary "
+                f"{vocab}")
+        candidates = mx.argpartition(-row, kth=width - 1)[:width]
+        scores = mx.take(row, candidates)
+        candidates = mx.take(candidates, mx.argsort(-scores))
+        mx.eval(candidates)
+        next_primary = None
+        for rank, candidate in enumerate(candidates.tolist()):
+            token = int(candidate)
+            node = len(token_ids)
+            token_ids.append(token)
+            depths.append(depth)
+            parents.append(primary_parent)
+            children.append({})
+            children[primary_parent][token] = node
+            if rank == 0:
+                next_primary = node
+        if next_primary is None:
+            raise RuntimeError("native MTP sibling chain omitted its primary")
+        primary_parent = next_primary
     tree = SpeculativeTree(
         token_ids=tuple(token_ids),
-        depths=(0, *(1 for _ in range(width))),
-        parents=(-1, *(0 for _ in range(width))),
+        depths=tuple(depths),
+        parents=tuple(parents),
         children=tuple(children),
     )
     validate_tree(tree)
@@ -775,6 +807,8 @@ def _native_mtp_sibling_tree(
 class QwenMTPDrafter:
     _RELEASED_BF16_CACHE_KEY = "qwen35_mtp:released-bf16"
     _PACKED_MXFP4_CACHE_KEY = "qwen35_mtp:proposal-mxfp4-q4-g32"
+    _HYBRID_MLP_MXFP4_CACHE_KEY = (
+        "qwen35_mtp:proposal-hybrid-bf16-attn-mxfp4-mlp")
     _PACKED_MATRIX_NAMES = frozenset({
         "mtp.fc.weight",
         "mtp.layers.0.mlp.down_proj.weight",
@@ -794,6 +828,12 @@ class QwenMTPDrafter:
         "mtp.pre_fc_norm_embedding.weight",
         "mtp.pre_fc_norm_hidden.weight",
     })
+    _HYBRID_PACKED_MATRIX_NAMES = frozenset({
+        "mtp.layers.0.mlp.down_proj.weight",
+        "mtp.layers.0.mlp.gate_proj.weight",
+        "mtp.layers.0.mlp.up_proj.weight",
+    })
+    _HYBRID_PLAIN_MATRIX_NAMES = _PACKED_MATRIX_NAMES - _HYBRID_PACKED_MATRIX_NAMES
 
     def __init__(self, engine):
         self.engine = engine
@@ -874,6 +914,13 @@ class QwenMTPDrafter:
         elif representation == "mxfp4-q4-g32":
             key = self._PACKED_MXFP4_CACHE_KEY
             apply_transform = True
+        elif representation == "hybrid-bf16-attn-mxfp4-mlp":
+            key = self._HYBRID_MLP_MXFP4_CACHE_KEY
+            # WeightStore already reconstructs the three indexed on-disk
+            # MXFP4 triplets as QTensor values.  The remaining matrices are
+            # intentionally released BF16; applying the target artifact's
+            # generic cache transform here would silently quantize them too.
+            apply_transform = False
         elif representation == "demand-cache":
             key = "qwen35_mtp"
             apply_transform = True
@@ -907,7 +954,10 @@ class QwenMTPDrafter:
                 for name in self._page_names
                 if name in layout
             )
-        elif representation == "mxfp4-q4-g32":
+        elif representation in {
+            "mxfp4-q4-g32",
+            "hybrid-bf16-attn-mxfp4-mlp",
+        }:
             expected_resident = int(
                 self.engine.store.mlx_quantized_resident_bytes(
                     self._page_names))
@@ -946,7 +996,7 @@ class QwenMTPDrafter:
                     raise ValueError(
                         "MTPLX request weights must be plain released BF16 "
                         f"arrays, found {invalid[:3]}")
-            else:
+            elif representation == "mxfp4-q4-g32":
                 matrices = [weights.get(name) for name in sorted(
                     self._PACKED_MATRIX_NAMES)]
                 norms = [weights.get(name) for name in sorted(
@@ -962,6 +1012,24 @@ class QwenMTPDrafter:
                     raise ValueError(
                         "packed Qwen MTP proposal page must contain eight "
                         "MXFP4 matrices and seven BF16 norms")
+            else:
+                packed = [weights.get(name) for name in sorted(
+                    self._HYBRID_PACKED_MATRIX_NAMES)]
+                plain = [weights.get(name) for name in sorted(
+                    self._HYBRID_PLAIN_MATRIX_NAMES | self._PACKED_NORM_NAMES)]
+                if (
+                    len(packed) != 3
+                    or any(not isinstance(value, quant.QTensor)
+                           or value.mode != "mxfp4"
+                           or value.bits != 4
+                           or value.group_size != 32 for value in packed)
+                    or len(plain) != 12
+                    or any(not isinstance(value, mx.array)
+                           or value.dtype != mx.bfloat16 for value in plain)
+                ):
+                    raise ValueError(
+                        "hybrid Qwen MTP proposal page must contain three "
+                        "MXFP4 MLP matrices and twelve released-BF16 tensors")
             eval_values = []
             for value in weights.values():
                 if isinstance(value, quant.QTensor):
@@ -991,10 +1059,11 @@ class QwenMTPDrafter:
             int(getattr(value, "nbytes", 0)) for value in weights.values())
         weights.clear()
         discarded = False
-        key = (
-            self._RELEASED_BF16_CACHE_KEY
-            if self.request_weight_representation == "released-bf16"
-            else self._PACKED_MXFP4_CACHE_KEY)
+        key = {
+            "released-bf16": self._RELEASED_BF16_CACHE_KEY,
+            "mxfp4-q4-g32": self._PACKED_MXFP4_CACHE_KEY,
+            "hybrid-bf16-attn-mxfp4-mlp": self._HYBRID_MLP_MXFP4_CACHE_KEY,
+        }[self.request_weight_representation]
         try:
             discarded = self.engine.cache.discard(key, self._page_names)
         finally:
@@ -1168,9 +1237,6 @@ class QwenMTPSpeculativeEngine:
                 or native_tree_width not in (0, 2, 3, 4)):
             raise ValueError(
                 "Qwen MTP native tree width must be 0 or in [2, 4]")
-        if native_tree_width and depth != 1:
-            raise ValueError(
-                "Qwen MTP native proposal trees currently require depth 1")
         if native_tree_width and ngram_first:
             raise ValueError(
                 "Qwen MTP native proposal trees cannot be combined with "
@@ -1559,6 +1625,7 @@ class QwenMTPSpeculativeEngine:
         native_tree_rounds = 0
         native_tree_hits = 0
         native_tree_misses = 0
+        native_tree_rescued_branches = 0
         # Index zero is a complete sibling miss; indices 1..width are the
         # MTP-logit ranks selected by the authoritative target root.  This is
         # the offline decision statistic for choosing width 2/3/4 without
@@ -1566,6 +1633,10 @@ class QwenMTPSpeculativeEngine:
         # never useful.
         native_tree_selected_rank_counts = [
             0 for _ in range(self.native_tree_width + 1)
+        ]
+        native_tree_selected_rank_counts_by_step = [
+            [0 for _ in range(self.native_tree_width + 1)]
+            for _ in range(self.depth)
         ]
         native_tree_nodes_verified = 0
         native_tree_paths_committed = 0
@@ -1843,6 +1914,7 @@ class QwenMTPSpeculativeEngine:
                 round_native_tree = self._native_tree_request_eligible(
                     sampling, constraint)
                 native_tree = None
+                native_tree_logits_rows: list[mx.array] = []
                 draft_rerank_before = _reranked_head_telemetry_snapshot(tgt)
                 draft_started = time.perf_counter()
                 try:
@@ -1934,7 +2006,7 @@ class QwenMTPSpeculativeEngine:
                         draft_margin_buckets.extend([None] * len(ngram_tokens))
 
                     draft_constraint = None
-                    if (self.grammar_aware_draft
+                    if ((self.grammar_aware_draft or round_native_tree)
                             and constraint is not None
                             and sampling.is_greedy
                             and self.depth > 1):
@@ -2022,7 +2094,8 @@ class QwenMTPSpeculativeEngine:
                                     if draft_constraint is not None else
                                     constraint if step == 0 else None
                                 )
-                                if (self.grammar_aware_draft
+                                if ((self.grammar_aware_draft
+                                        or round_native_tree)
                                         and step_constraint is not None):
                                     step_logits = step_constraint.mask_logits(
                                         step_logits)
@@ -2053,6 +2126,8 @@ class QwenMTPSpeculativeEngine:
                                             _GREEDY_DRAFT_MARGIN_THRESHOLDS
                                         )
                                 draft_tok = int(mx.argmax(step_logits))
+                                if round_native_tree:
+                                    native_tree_logits_rows.append(step_logits)
                         else:
                             if step_logits is None:
                                 raise RuntimeError(
@@ -2092,15 +2167,12 @@ class QwenMTPSpeculativeEngine:
                                 break
 
                     if round_native_tree:
-                        if step_logits is None:
+                        if not native_tree_logits_rows:
                             raise RuntimeError(
                                 "native MTP proposal tree omitted draft logits")
-                        native_tree = _native_mtp_sibling_tree(
+                        native_tree = _native_mtp_chain_sibling_tree(
                             catchup_tok,
-                            (
-                                constraint.mask_logits(step_logits)
-                                if constraint is not None else step_logits
-                            ),
+                            native_tree_logits_rows,
                             self.native_tree_width,
                         )
                         draft_tokens = list(native_tree.token_ids[1:])
@@ -2214,70 +2286,113 @@ class QwenMTPSpeculativeEngine:
                 accepted_prefix = 0
                 round_target_ranks: list[int] = []
                 if round_native_tree:
-                    root_logits = _authoritative_target_logits_from_hidden(
-                        tgt,
-                        spec_logits[0],
-                        constraint,
-                        round_tree_verification.hidden_nodes[0],
-                    )
-                    target_root = sample(
-                        root_logits, sampling, history=all_tokens)
-                    selected_node = native_tree.children[0].get(target_root)
-                    selected_rank = (
-                        int(selected_node) if selected_node is not None else 0
-                    )
-                    native_tree_selected_rank_counts[selected_rank] += 1
-                    accepted_prefix = int(selected_node is not None)
-                    round_tree_selected_path = (
-                        (0, int(selected_node))
-                        if selected_node is not None else (0,)
-                    )
+                    round_tree_selected_path_list = [0]
                     verified_proposals += len(draft_tokens)
-                    verified_by_step[0] += len(draft_tokens)
-                    round_rejected = accepted_prefix == 0
-                    if accepted_prefix:
-                        accepted += 1
-                        accepted_by_step[0] += 1
-                        native_mtp_accepted += 1
-                        native_tree_hits += 1
-                        if constraint is not None:
-                            constraint.accept_token(target_root)
-                            grammar_completed = bool(constraint.completed)
-                        new_tokens = [int(target_root)]
-                        new_token_logits = [root_logits]
-                        if not _candidate_terminal(new_tokens):
-                            bonus_logits = (
-                                _authoritative_target_logits_from_hidden(
-                                    tgt,
-                                    spec_logits[selected_node],
-                                    constraint,
-                                    round_tree_verification.hidden_nodes[
-                                        selected_node],
-                                )
+                    for step in range(len(native_tree_logits_rows)):
+                        verified_by_step[step] += self.native_tree_width
+
+                    current_node = 0
+                    while True:
+                        authoritative_logits = (
+                            _authoritative_target_logits_from_hidden(
+                                tgt,
+                                spec_logits[current_node],
+                                constraint,
+                                round_tree_verification.hidden_nodes[
+                                    current_node],
                             )
-                            bonus_tok = sample(
-                                bonus_logits,
-                                sampling,
-                                history=all_tokens + new_tokens,
+                        )
+                        target_token = sample(
+                            authoritative_logits,
+                            sampling,
+                            history=all_tokens + new_tokens,
+                        )
+                        child_items = tuple(
+                            native_tree.children[current_node].items())
+                        selected_node = native_tree.children[current_node].get(
+                            target_token)
+                        selected_rank = 0
+                        if selected_node is not None:
+                            selected_rank = 1 + next(
+                                rank for rank, (token, _node) in enumerate(
+                                    child_items)
+                                if token == target_token
                             )
+                        step = accepted_prefix
+                        native_tree_selected_rank_counts[selected_rank] += 1
+                        native_tree_selected_rank_counts_by_step[
+                            step][selected_rank] += 1
+
+                        if selected_node is None:
+                            round_rejected = True
+                            rejected_rounds += 1
+                            native_mtp_rejected += 1
+                            if accepted_prefix:
+                                partial_accept_rounds += 1
+                            else:
+                                native_tree_misses += 1
                             if constraint is not None:
-                                constraint.accept_token(bonus_tok)
+                                constraint.accept_token(target_token)
                                 grammar_completed = bool(constraint.completed)
-                            new_tokens.append(int(bonus_tok))
-                            new_token_logits.append(bonus_logits)
-                            round_bonus_candidate = True
-                        full_accept_rounds += 1
-                        round_outcomes.append("A")
-                    else:
-                        rejected_rounds += 1
-                        native_mtp_rejected += 1
-                        native_tree_misses += 1
+                            new_tokens.append(int(target_token))
+                            new_token_logits.append(authoritative_logits)
+                            break
+
+                        accepted += 1
+                        accepted_prefix += 1
+                        accepted_by_step[step] += 1
+                        native_mtp_accepted += 1
+                        round_tree_selected_path_list.append(int(selected_node))
+                        if selected_rank > 1:
+                            native_tree_rescued_branches += 1
                         if constraint is not None:
-                            constraint.accept_token(target_root)
+                            constraint.accept_token(target_token)
                             grammar_completed = bool(constraint.completed)
-                        new_tokens = [int(target_root)]
-                        new_token_logits = [root_logits]
-                        round_outcomes.append("R")
+                        new_tokens.append(int(target_token))
+                        new_token_logits.append(authoritative_logits)
+                        if _candidate_terminal(new_tokens):
+                            break
+                        if native_tree.children[selected_node]:
+                            current_node = int(selected_node)
+                            continue
+
+                        bonus_logits = (
+                            _authoritative_target_logits_from_hidden(
+                                tgt,
+                                spec_logits[selected_node],
+                                constraint,
+                                round_tree_verification.hidden_nodes[
+                                    selected_node],
+                            )
+                        )
+                        bonus_tok = sample(
+                            bonus_logits,
+                            sampling,
+                            history=all_tokens + new_tokens,
+                        )
+                        if constraint is not None:
+                            constraint.accept_token(bonus_tok)
+                            grammar_completed = bool(constraint.completed)
+                        new_tokens.append(int(bonus_tok))
+                        new_token_logits.append(bonus_logits)
+                        round_bonus_candidate = True
+                        break
+
+                    round_tree_selected_path = tuple(
+                        round_tree_selected_path_list)
+                    if accepted_prefix:
+                        native_tree_hits += 1
+                    if not round_rejected:
+                        full_accept_rounds += 1
+                        round_outcomes.append(
+                            "A" if self.depth == 1
+                            else f"A{accepted_prefix}"
+                        )
+                    else:
+                        round_outcomes.append(
+                            "R" if accepted_prefix == 0
+                            else f"A{accepted_prefix}R"
+                        )
                     next_catchup_tok = new_tokens[-1]
                     if round_rejected:
                         refeed_sweeps_saved += 1
@@ -2592,8 +2707,19 @@ class QwenMTPSpeculativeEngine:
                     raise RuntimeError(
                         "recurrent Qwen MTP chain changed its KV by an "
                         f"unexpected count: {mtp_growth}")
-                committed_mtp_steps = min(
-                    round_draft_steps_run, target_fed_positions)
+                # A rescue sibling is not an input to the primary MTP chain.
+                # Retain only steps whose consumed inputs are shared with the
+                # target-selected branch. On a correction, the extra proposal
+                # step consumed the last accepted primary token and remains
+                # valid; on an accepted sibling/bonus it does not.
+                if round_native_tree:
+                    committed_mtp_steps = min(
+                        round_draft_steps_run,
+                        accepted_prefix + int(round_rejected),
+                    )
+                else:
+                    committed_mtp_steps = min(
+                        round_draft_steps_run, target_fed_positions)
                 if committed_mtp_steps < round_draft_steps_run:
                     mtp_lengths = tuple(
                         start + (committed_mtp_steps if growth else 0)
@@ -2869,8 +2995,12 @@ class QwenMTPSpeculativeEngine:
             "qwen_mtp_native_tree_rounds": native_tree_rounds,
             "qwen_mtp_native_tree_hits": native_tree_hits,
             "qwen_mtp_native_tree_misses": native_tree_misses,
+            "qwen_mtp_native_tree_rescued_branches": (
+                native_tree_rescued_branches),
             "qwen_mtp_native_tree_selected_rank_counts": (
                 native_tree_selected_rank_counts),
+            "qwen_mtp_native_tree_selected_rank_counts_by_step": (
+                native_tree_selected_rank_counts_by_step),
             "qwen_mtp_native_tree_hit_rate": (
                 native_tree_hits / native_tree_rounds
                 if native_tree_rounds else 0.0),

@@ -293,6 +293,12 @@ class WeightStore:
         self._mtplx_mtp_sidecar_sha256: str | None = None
         self._mtplx_mtp_sidecar_layout: dict[str, tuple[str, tuple[int, ...], int]] = {}
         self._mtplx_mtp_exact_fast_names: frozenset[str] = frozenset()
+        # Proposal-only mixed checkpoints may keep selected MTP matrices in
+        # the released BF16 sidecar while reusing packed matrices from the
+        # target artifact.  These names are authoritative slow-tier tensors:
+        # an older all-MXFP4 raw-fast manifest must not replace them merely
+        # because the logical tensor name is identical.
+        self._mtp_proposal_plain_names: frozenset[str] = frozenset()
         # Optional proposal-only representation marker.  It never changes the
         # served target body; Qwen's MTP adapter uses it solely to give a
         # validated packed draft page a round-local cache identity/lifetime.
@@ -376,11 +382,55 @@ class WeightStore:
                 proposal_representation = index_metadata.get(
                     "vmodel_mtp_proposal_representation")
                 if proposal_representation is not None:
-                    if proposal_representation != "mxfp4-q4-g32":
+                    if proposal_representation not in {
+                        "mxfp4-q4-g32",
+                        "hybrid-bf16-attn-mxfp4-mlp",
+                    }:
                         raise ValueError(
                             "unsupported Qwen MTP proposal representation: "
                             f"{proposal_representation!r}")
                     self.mtp_proposal_representation = proposal_representation
+                    if proposal_representation == "hybrid-bf16-attn-mxfp4-mlp":
+                        plain_names = index_metadata.get(
+                            "vmodel_mtp_proposal_plain_names")
+                        proposal_sidecar = index_metadata.get(
+                            "vmodel_mtp_proposal_plain_sidecar")
+                        if not (
+                            isinstance(plain_names, list)
+                            and plain_names
+                            and len(plain_names) == len(set(plain_names))
+                            and all(
+                                isinstance(name, str)
+                                and name.startswith("mtp.")
+                                and name.endswith(".weight")
+                                for name in plain_names
+                            )
+                            and isinstance(proposal_sidecar, str)
+                            and Path(proposal_sidecar).name == proposal_sidecar
+                            and proposal_sidecar.endswith(".safetensors")
+                        ):
+                            raise ValueError(
+                                "hybrid Qwen MTP proposal metadata is invalid")
+                        sidecar_path = self.dir / proposal_sidecar
+                        if not sidecar_path.is_file():
+                            raise FileNotFoundError(
+                                "hybrid Qwen MTP proposal sidecar is missing: "
+                                f"{sidecar_path}")
+                        sidecar_tensors = mx.load(str(sidecar_path))
+                        invalid_plain = []
+                        for name in plain_names:
+                            value = sidecar_tensors.get(name)
+                            if (
+                                value is None
+                                or value.dtype != mx.bfloat16
+                                or self.weight_map.get(name) != proposal_sidecar
+                            ):
+                                invalid_plain.append(name)
+                        if invalid_plain:
+                            raise ValueError(
+                                "hybrid Qwen MTP plain tensors are not indexed "
+                                f"released BF16 arrays: {invalid_plain[:3]}")
+                        self._mtp_proposal_plain_names = frozenset(plain_names)
                 sidecar = index_metadata.get("mtplx_mtp_sidecar")
                 if sidecar is not None and proposal_representation is not None:
                     raise ValueError(
@@ -1955,6 +2005,7 @@ class WeightStore:
         fast_names = [
             n for n in source_physical_names
             if (n in self._raw_fast_tier_manifest
+                and n not in self._mtp_proposal_plain_names
                 and (
                     n not in self._mtplx_mtp_sidecar_names
                     or n in self._mtplx_mtp_exact_fast_names))]

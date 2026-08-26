@@ -372,6 +372,9 @@ def test_protocol_timing_exposes_qwen35_prefill_ceiling_and_selection():
             "paged_kv_reloads": 80,
             "paged_kv_reload_seconds": 1.25,
             "qwen_mtp_native_tree_selected_rank_counts": [1, 9, 0],
+            "qwen_mtp_native_tree_selected_rank_counts_by_step": [
+                [0, 4, 1], [1, 3, 0]],
+            "qwen_mtp_native_tree_rescued_branches": 1,
         },
     })
 
@@ -384,6 +387,9 @@ def test_protocol_timing_exposes_qwen35_prefill_ceiling_and_selection():
     assert timing["paged_kv_reloads"] == 80
     assert timing["paged_kv_reload_seconds"] == 1.25
     assert timing["qwen_mtp_native_tree_selected_rank_counts"] == [1, 9, 0]
+    assert timing["qwen_mtp_native_tree_selected_rank_counts_by_step"] == [
+        [0, 4, 1], [1, 3, 0]]
+    assert timing["qwen_mtp_native_tree_rescued_branches"] == 1
 
 
 def test_protocol_timing_exposes_qwen_delta_arithmetic_mode():

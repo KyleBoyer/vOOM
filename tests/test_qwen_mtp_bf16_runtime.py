@@ -243,3 +243,71 @@ def test_unknown_packed_mtp_representation_fails_closed(tmp_path):
     index_path.write_text(json.dumps(index))
     with pytest.raises(ValueError, match="unsupported Qwen MTP"):
         WeightStore(model)
+
+
+def _write_hybrid_mtp(tmp_path):
+    model = tmp_path / "hybrid-model"
+    model.mkdir()
+    packed_names = QwenMTPDrafter._HYBRID_PACKED_MATRIX_NAMES
+    plain_names = (
+        QwenMTPDrafter._HYBRID_PLAIN_MATRIX_NAMES
+        | QwenMTPDrafter._PACKED_NORM_NAMES)
+    packed_values = {}
+    for name in packed_names:
+        wq, scales = mx.quantize(
+            mx.ones((4, 64), dtype=mx.bfloat16),
+            group_size=32, bits=4, mode="mxfp4")
+        packed_values[name] = wq
+        packed_values[name.removesuffix(".weight") + ".scales"] = scales
+    packed = model / "packed.safetensors"
+    mx.save_safetensors(str(packed), packed_values)
+    plain_values = {
+        name: mx.ones(
+            (4, 64) if name in QwenMTPDrafter._HYBRID_PLAIN_MATRIX_NAMES
+            else (64,),
+            dtype=mx.bfloat16,
+        )
+        for name in plain_names
+    }
+    sidecar = model / "mtp-bf16.safetensors"
+    mx.save_safetensors(str(sidecar), plain_values)
+    values = {name: packed.name for name in packed_values}
+    values.update({name: sidecar.name for name in plain_values})
+    (model / "model.safetensors.index.json").write_text(json.dumps({
+        "metadata": {
+            "vmodel_mtp_proposal_representation": (
+                "hybrid-bf16-attn-mxfp4-mlp"),
+            "vmodel_mtp_proposal_plain_sidecar": sidecar.name,
+            "vmodel_mtp_proposal_plain_names": sorted(plain_names),
+        },
+        "weight_map": values,
+    }))
+    (model / "config.json").write_text(json.dumps(_config()))
+    return model, packed_names, plain_names
+
+
+def test_hybrid_mtp_page_preserves_attention_and_quantizes_only_mlp(tmp_path):
+    model, packed_names, plain_names = _write_hybrid_mtp(tmp_path)
+    store = WeightStore(model)
+    # Match the real all-MXFP4 target cache: its generic transform would
+    # quantize every eligible plain matrix unless this representation bypasses
+    # runtime transforms after WeightStore reconstructs on-disk triplets.
+    policy = quant.QuantPolicy(
+        bits=4, group_size=32, mode="mxfp4", min_dim=0)
+    cache = WeightCache(
+        store, max_bytes=1_000_000, transform=policy.transform)
+    engine = type("Engine", (), {"store": store, "cache": cache})()
+    drafter = QwenMTPDrafter(engine)
+
+    weights = drafter.prepare_request_weights()
+    assert drafter.request_weight_representation == (
+        "hybrid-bf16-attn-mxfp4-mlp")
+    assert all(isinstance(weights[name], quant.QTensor) for name in packed_names)
+    assert all(
+        isinstance(weights[name], mx.array)
+        and weights[name].dtype == mx.bfloat16 for name in plain_names)
+    assert cache.contains(
+        "qwen35_mtp:proposal-hybrid-bf16-attn-mxfp4-mlp")
+    info = drafter.release_request_weights(weights)
+    assert info["cache_discarded"] == 1
+    assert weights == {}

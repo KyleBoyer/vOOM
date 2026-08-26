@@ -1303,10 +1303,6 @@ class EngineManager:
             raise RequestValidationError(
                 "VMODEL_QWEN_MTP_NGRAM_FIRST=1 requires "
                 "VMODEL_QWEN_MTP_DEPTH=1")
-        if qwen_mtp_tree_width and qwen_mtp_depth != 1:
-            raise RequestValidationError(
-                "VMODEL_QWEN_MTP_TREE_WIDTH requires "
-                "VMODEL_QWEN_MTP_DEPTH=1")
         if qwen_mtp_tree_width and qwen_mtp_ngram_first:
             raise RequestValidationError(
                 "VMODEL_QWEN_MTP_TREE_WIDTH cannot be combined with "
@@ -8391,6 +8387,7 @@ def _vision_protocol_timing(result: dict) -> dict:
         "qwen_mtp_native_tree_rounds",
         "qwen_mtp_native_tree_hits",
         "qwen_mtp_native_tree_misses",
+        "qwen_mtp_native_tree_rescued_branches",
         "qwen_mtp_native_tree_nodes_verified",
         "qwen_mtp_native_tree_paths_committed",
         "qwen_mtp_native_tree_factor_bytes_peak",
@@ -8592,6 +8589,7 @@ def _vision_protocol_timing(result: dict) -> dict:
         "qwen_mtp_accepted_by_step",
         "qwen_mtp_verified_by_step",
         "qwen_mtp_native_tree_selected_rank_counts",
+        "qwen_mtp_native_tree_selected_rank_counts_by_step",
         "qwen_mtp_ngram_first_accepted_by_step",
         "qwen_mtp_ngram_first_verified_by_step",
         "qwen_mtp_stochastic_expected_acceptance_by_step",
