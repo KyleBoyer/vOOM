@@ -339,6 +339,45 @@ def test_released_drafter_step_returns_post_block_hidden(monkeypatch):
     assert mtp_kv.layer_lengths() == (1,)
 
 
+def test_native_mtp_phase_head_detaches_only_vocab_row_through_host():
+    engine = SimpleNamespace(
+        store=SimpleNamespace(
+            names_with_prefix=lambda prefix: (
+                ["mtp.fc.weight"] if prefix == "mtp." else []),
+            mtplx_mtp_sidecar=None,
+        ),
+        rc=SimpleNamespace(qwen35_serial_verify_suspend_lm_head=True),
+        _qwen35_lm_head_suspend_request_active=True,
+    )
+    drafter = QwenMTPDrafter(engine)
+    source = mx.array([1.5, -2.0, 3.25], dtype=mx.bfloat16)
+
+    detached = drafter._detach_head_logits_for_verification(source)
+
+    assert detached.dtype == mx.float32
+    assert detached.tolist() == [1.5, -2.0, 3.25]
+    assert drafter._head_host_detach_calls == 1
+    assert drafter._head_host_detach_bytes == 12
+    assert drafter._head_host_detach_s >= 0.0
+
+
+def test_native_mtp_phase_head_detach_is_neutral_when_disabled():
+    engine = SimpleNamespace(
+        store=SimpleNamespace(
+            names_with_prefix=lambda prefix: (
+                ["mtp.fc.weight"] if prefix == "mtp." else []),
+            mtplx_mtp_sidecar=None,
+        ),
+        rc=SimpleNamespace(qwen35_serial_verify_suspend_lm_head=False),
+        _qwen35_lm_head_suspend_request_active=False,
+    )
+    drafter = QwenMTPDrafter(engine)
+    source = mx.array([1.0], dtype=mx.bfloat16)
+
+    assert drafter._detach_head_logits_for_verification(source) is source
+    assert drafter._head_host_detach_calls == 0
+
+
 def test_native_mtp_ablation_projects_branches_not_accumulated_residual(
     monkeypatch,
 ):
@@ -1102,6 +1141,11 @@ def test_server_q_policy_is_strict_and_part_of_engine_cache_identity():
         with pytest.raises(RequestValidationError, match="must be 0 or 1"):
             EngineManager().get(Path("/tmp/not-opened"), "fast")
     with patch.dict(os.environ, {
+        "VMODEL_QWEN35_SERIAL_VERIFY_SUSPEND_LM_HEAD": "yes",
+    }):
+        with pytest.raises(RequestValidationError, match="must be 0 or 1"):
+            EngineManager().get(Path("/tmp/not-opened"), "fast")
+    with patch.dict(os.environ, {
         "VMODEL_QWEN_MTP_TREE_WIDTH": "2",
         "VMODEL_QWEN_MTP_NGRAM_FIRST": "1",
     }):
@@ -1142,6 +1186,7 @@ def test_server_q_policy_is_strict_and_part_of_engine_cache_identity():
         "VMODEL_QWEN_MTP_GRAMMAR_AWARE_DRAFT": "0",
         "VMODEL_QWEN35_SERIAL_VERIFY_EXACT_PAGE_ADMISSION": "0",
         "VMODEL_QWEN35_SERIAL_VERIFY_BATCHED_MLP": "0",
+        "VMODEL_QWEN35_SERIAL_VERIFY_SUSPEND_LM_HEAD": "0",
     }
     with patch.dict(os.environ, env), \
          patch("runtime.config.ModelConfig.from_dir", return_value=cfg), \
@@ -1166,6 +1211,10 @@ def test_server_q_policy_is_strict_and_part_of_engine_cache_identity():
         sixth = manager.get(Path("/tmp/fake-qwen-q-policy"), "fast")
         os.environ["VMODEL_QWEN_MTP_GRAMMAR_AWARE_DRAFT"] = "1"
         seventh = manager.get(Path("/tmp/fake-qwen-q-policy"), "fast")
+        os.environ[
+            "VMODEL_QWEN35_SERIAL_VERIFY_SUSPEND_LM_HEAD"
+        ] = "1"
+        eighth = manager.get(Path("/tmp/fake-qwen-q-policy"), "fast")
 
     assert first is made[0]
     assert second is made[1]
@@ -1174,12 +1223,14 @@ def test_server_q_policy_is_strict_and_part_of_engine_cache_identity():
     assert fifth is made[4]
     assert sixth is made[5]
     assert seventh is made[6]
+    assert eighth is made[7]
     assert first.closes == 1
     assert second.closes == 1
     assert third.closes == 1
     assert fourth.closes == 1
     assert fifth.closes == 1
     assert sixth.closes == 1
+    assert seventh.closes == 1
 
 
 def test_server_wires_typed_q_policy_and_explicit_deep_chain():
@@ -1229,6 +1280,7 @@ def test_server_wires_typed_q_policy_and_explicit_deep_chain():
         "VMODEL_QWEN_MTP_TREE_WIDTH": "0",
         "VMODEL_QWEN_MTP_GRAMMAR_AWARE_DRAFT": "1",
         "VMODEL_QWEN35_SERIAL_VERIFY_BATCHED_MLP": "1",
+        "VMODEL_QWEN35_SERIAL_VERIFY_SUSPEND_LM_HEAD": "1",
     }
     with patch.dict(os.environ, env), \
          patch("runtime.config.ModelConfig.from_dir", return_value=cfg), \
@@ -1248,6 +1300,7 @@ def test_server_wires_typed_q_policy_and_explicit_deep_chain():
     assert wrapped.kwargs["ngram_first"] is False
     assert wrapped.kwargs["grammar_aware_draft"] is True
     assert wrapped.target.rc.qwen35_serial_verify_batched_mlp is True
+    assert wrapped.target.rc.qwen35_serial_verify_suspend_lm_head is True
     policy = wrapped.kwargs["proposal_q_policy"]
     assert policy.name == "temperature-k8-t0.75"
 

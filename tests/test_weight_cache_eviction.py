@@ -304,6 +304,117 @@ def test_discard_retries_store_release_after_budget_evicted_page(monkeypatch):
     assert len(clears) == 2
 
 
+def test_phase_scoped_pin_release_and_zero_copy_promotion(monkeypatch):
+    clears = []
+    monkeypatch.setattr(
+        cache_module, "_clear_device_cache", lambda: clears.append(True))
+    store = FakeStore()
+    cache = WeightCache(store, max_bytes=100)
+    pinned = cache.pin("head:persistent", ["lm_head.weight"])
+
+    assert cache.release_pinned("head:persistent") == 10
+    assert cache.pinned_bytes == 0
+    assert cache.total_bytes == 0
+    assert store.released == [("lm_head.weight",)]
+    assert clears == [True]
+
+    demand = cache.get("lm_head", ["lm_head.weight"])
+    calls_before_promotion = store.calls
+    promoted = cache.promote_to_pin("lm_head", "head:persistent")
+
+    assert promoted is demand
+    assert promoted is not pinned
+    assert store.calls == calls_before_promotion
+    assert cache.resident_keys == ["head:persistent"]
+    assert cache.pinned_bytes == 10
+    assert cache.total_bytes == 10
+
+
+def test_phase_scoped_pin_promotion_refuses_budget_without_mutating_demand(
+        monkeypatch):
+    monkeypatch.setattr(cache_module, "_clear_device_cache", lambda: None)
+    cache = WeightCache(FakeStore(), max_bytes=20)
+    cache.pin("norm", ["norm.weight"])
+    demand = cache.get("lm_head", ["lm_head.weight"])
+    cache.max_bytes = 15
+
+    assert cache.promote_to_pin("lm_head", "head:persistent") is None
+    assert cache.get("lm_head", ["lm_head.weight"]) is demand
+    assert cache.resident_keys == ["norm", "lm_head"]
+    assert cache.pinned_bytes == 10
+
+
+def test_phase_scoped_pin_lease_restores_pass_through_after_budget_shrink(
+        monkeypatch):
+    monkeypatch.setattr(cache_module, "_clear_device_cache", lambda: None)
+    store = FakeStore()
+    cache = WeightCache(store, max_bytes=100)
+    cache.pin("head:persistent", ["lm_head.weight"])
+    assert cache.release_pinned("head:persistent") == 10
+    cache.max_bytes = 5
+
+    # The head is necessarily pass-through at this shrunken ordinary budget.
+    # Its startup-admitted lease may reclaim exactly the original 10 bytes
+    # without another store fetch or widening max_bytes.
+    demand = cache.get("lm_head", ["lm_head.weight"])
+    assert not cache.contains("lm_head")
+    calls_before_promotion = store.calls
+    promoted = cache.promote_to_pin(
+        "lm_head", "head:persistent", tensors=demand)
+
+    assert promoted is demand
+    assert store.calls == calls_before_promotion
+    assert cache.max_bytes == 5
+    assert cache.pinned_bytes == 10
+    assert cache.total_bytes == 10
+    assert cache.resident_keys == ["head:persistent"]
+
+
+def test_deferred_phase_pin_materializes_only_at_first_use(monkeypatch):
+    monkeypatch.setattr(cache_module, "_clear_device_cache", lambda: None)
+    store = FakeStore()
+    cache = WeightCache(store, max_bytes=100)
+
+    cache.register_suspended_pin("head:persistent", 10)
+    assert store.calls == 0
+    assert cache.pinned_bytes == 0
+    assert cache.total_bytes == 0
+
+    demand = cache.get("lm_head", ["lm_head.weight"])
+    calls_before_promotion = store.calls
+    promoted = cache.promote_to_pin(
+        "lm_head", "head:persistent", tensors=demand)
+
+    assert promoted is demand
+    assert store.calls == calls_before_promotion == 1
+    assert cache.pinned_bytes == 10
+    assert cache.resident_keys == ["head:persistent"]
+
+
+def test_deferred_phase_pin_rejects_inexact_or_over_budget_lease(monkeypatch):
+    monkeypatch.setattr(cache_module, "_clear_device_cache", lambda: None)
+    cache = WeightCache(FakeStore(), max_bytes=15)
+    cache.pin("norm", ["norm.weight"])
+
+    with pytest.raises(ValueError, match="must be positive"):
+        cache.register_suspended_pin("bad", 0)
+    with pytest.raises(MemoryError, match="exceeding"):
+        cache.register_suspended_pin("head:persistent", 10)
+
+    cache.register_suspended_pin("small", 5)
+    with pytest.raises(RuntimeError, match="cannot change"):
+        cache.register_suspended_pin("small", 4)
+
+
+def test_phase_scoped_pin_release_never_removes_unpinned_page(monkeypatch):
+    monkeypatch.setattr(cache_module, "_clear_device_cache", lambda: None)
+    cache = WeightCache(FakeStore(), max_bytes=100)
+    demand = cache.get("lm_head", ["lm_head.weight"])
+
+    assert cache.release_pinned("lm_head") == 0
+    assert cache.get("lm_head", ["lm_head.weight"]) is demand
+
+
 def test_concurrent_same_key_fetch_keeps_single_page_and_exact_accounting(
         monkeypatch):
     monkeypatch.setattr(cache_module, "_clear_device_cache", lambda: None)

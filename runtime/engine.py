@@ -45,6 +45,18 @@ _HYBRID_RECURRENT_MODEL_TYPES = frozenset({
 # set exact prevents a profile typo from silently selecting a never-gated
 # Metal shape on the 16 GB host.
 QWEN35_PREFILL_CHUNK_CEILINGS = frozenset((0, 1, 8, 32, 128, 512))
+# Two real, unchanged request shapes set this content-blind phase boundary:
+# 16,029 prompt tokens improved 5.65%, while 6,339 tokens regressed 1.0%.
+# Keep it implementation-stable and explicit until a wider corpus justifies
+# either a tunable policy or a default-on profile.
+QWEN35_PHASE_HEAD_MIN_PROMPT_TOKENS = 8192
+
+
+def qwen35_phase_head_request_active(enabled: bool, prompt_tokens: int) -> bool:
+    """Content-blind admission for the measured long-context head lifecycle."""
+    return bool(
+        enabled
+        and int(prompt_tokens) >= QWEN35_PHASE_HEAD_MIN_PROMPT_TOKENS)
 
 
 def attach_hybrid_recurrent_cache(
@@ -955,6 +967,12 @@ class RuntimeConfig:
     # The served BF16 lossless route never enables this; MXFP4 promotion still
     # requires identical target tokens plus the heterogeneous quality corpus.
     qwen35_serial_verify_batched_mlp: bool = False
+    # Exact-target, default-off memory-lifetime optimization for an untied
+    # Qwen LM head. Startup registers an exact dormant lease instead of
+    # materializing the head before prefill. The head is pinned on its first
+    # projection, released before each multi-position target-trunk sweep, then
+    # the verifier's demand-loaded head is re-pinned without a second read.
+    qwen35_serial_verify_suspend_lm_head: bool = False
     # F94: layer-major (not chunk-major) dense prefill for qwen3_5 (dense
     # hybrid DeltaNet/full-attention, e.g. Qwen3.5-4B/9B, Qwen3.6-27B) --
     # fetches each layer's weights exactly once for the whole prefill instead
@@ -1255,6 +1273,8 @@ class RuntimeConfig:
                 "qwen35_serial_verify_exact_page_admission", False),
             qwen35_serial_verify_batched_mlp=run.get(
                 "qwen35_serial_verify_batched_mlp", False),
+            qwen35_serial_verify_suspend_lm_head=run.get(
+                "qwen35_serial_verify_suspend_lm_head", False),
             qwen_mixed_depth_endpoint_persist=run.get(
                 "qwen_mixed_depth_endpoint_persist", False),
             prefill_last_token_separate=run.get(
@@ -2024,6 +2044,17 @@ class StreamingEngine:
         self._qwen35_serial_verify_linear_layer_compute_s = 0.0
         self._qwen35_serial_verify_full_layer_compute_s = 0.0
         self._qwen35_serial_verify_head_s = 0.0
+        self._qwen35_serial_verify_head_suspend_calls = 0
+        self._qwen35_serial_verify_head_suspend_bytes = 0
+        self._qwen35_serial_verify_head_suspend_active_released_bytes = 0
+        self._qwen35_serial_verify_head_suspend_active_peak_bytes = 0
+        self._qwen35_serial_verify_head_suspend_s = 0.0
+        self._qwen35_serial_verify_head_restore_calls = 0
+        self._qwen35_serial_verify_head_restore_successes = 0
+        self._qwen35_serial_verify_head_restore_refusals = 0
+        self._qwen35_serial_verify_head_restore_s = 0.0
+        self._qwen35_lm_head_pin_suspended = False
+        self._qwen35_lm_head_suspend_request_active = False
         self._layer_transient_margin = 400_000_000
         self._token_transient = 0  # F42: whole-token transient (greedy sync point)
         # 2026-07-13: F42's own per-layer/per-token mx.reset_peak_memory() calls
@@ -2089,12 +2120,27 @@ class StreamingEngine:
                 self.store.dir, self.store.weight_map,
                 real_name=self.store._real_name.get("lm_head.weight", "lm_head.weight"))
 
+        phase_scoped_qwen_head = bool(
+            self.rc.qwen35_serial_verify_suspend_lm_head)
+        if phase_scoped_qwen_head and (
+                self.cfg.model_type not in ("qwen3_5", "qwen3_5_moe")
+                or not self.rc.pin_lm_head
+                or self.rc.rerank_lm_head
+                or self._streamed_lm_head is not None
+                or self.cfg.tie_word_embeddings
+                or not self.store.has("lm_head.weight")):
+            raise ValueError(
+                "qwen35_serial_verify_suspend_lm_head requires an untied, "
+                "non-streamed, non-reranked pinned Qwen LM head")
+
         pin_names = ["model.norm.weight"]
         if self.rc.pin_embeddings and self._embed_rows is None:
             pin_names.append("model.embed_tokens.weight")
         if ((self.rc.pin_lm_head or self.rc.rerank_lm_head)
                 and self._streamed_lm_head is None
-                and not self.cfg.tie_word_embeddings and self.store.has("lm_head.weight")):
+                and not self.cfg.tie_word_embeddings
+                and self.store.has("lm_head.weight")
+                and not phase_scoped_qwen_head):
             pin_names.append("lm_head.weight")
         # F128: kimi_k3's AttnRes needs one final readout applied once after
         # ALL layers, before model.norm (real KimiLinearModel._apply_output_
@@ -2110,10 +2156,24 @@ class StreamingEngine:
             pin_names.extend(["model.hc_head_fn", "model.hc_head_scale",
                               "model.hc_head_base"])
         persistent = self.cache.pin("persistent", pin_names)
+        if phase_scoped_qwen_head:
+            phase_head_bytes = self.store.mlx_quantized_resident_bytes(
+                ["lm_head.weight"])
+            if phase_head_bytes <= 0:
+                raise ValueError(
+                    "qwen35_serial_verify_suspend_lm_head requires an "
+                    "exactly sizeable standard MLX-quantized LM head")
+            self.cache.register_suspended_pin(
+                "qwen35:lm_head:persistent", phase_head_bytes)
+            self._qwen35_lm_head_pin_suspended = True
 
         self._embed_w = persistent.get("model.embed_tokens.weight")
         self._norm_w = persistent["model.norm.weight"]
-        self._lm_head_w = persistent.get("lm_head.weight")
+        self._lm_head_w = (
+            None
+            if phase_scoped_qwen_head
+            else persistent.get("lm_head.weight")
+        )
         self._hc_head_fn = persistent.get("model.hc_head_fn")
         self._hc_head_scale = persistent.get("model.hc_head_scale")
         self._hc_head_base = persistent.get("model.hc_head_base")
@@ -4780,7 +4840,79 @@ class StreamingEngine:
             return self._streamed_lm_head
         if self._lm_head_w is not None:
             return self._lm_head_w
-        return self.cache.get("lm_head", ["lm_head.weight"])["lm_head.weight"]
+        head = self.cache.get(
+            "lm_head", ["lm_head.weight"])["lm_head.weight"]
+        if self._qwen35_lm_head_pin_suspended:
+            self._restore_qwen35_serial_verify_lm_head(head)
+        return head
+
+    def _suspend_qwen35_serial_verify_lm_head(self) -> int:
+        """Drop the phase-scoped head before a streamed verifier trunk.
+
+        The caller invokes this only after proposal projection has synchronized
+        and before any target layer is fetched. Clearing ``_lm_head_w`` first
+        ensures the cache owns the final live reference when it releases the
+        dedicated pin page.
+        """
+        if (not self.rc.qwen35_serial_verify_suspend_lm_head
+                or not self._qwen35_lm_head_suspend_request_active):
+            return 0
+        if self._lm_head_w is None:
+            return 0
+        started = time.perf_counter()
+        active_before = int(mx.get_active_memory())
+        self._lm_head_w = None
+        released = self.cache.release_pinned(
+            "qwen35:lm_head:persistent", ["lm_head.weight"])
+        active_after = int(mx.get_active_memory())
+        active_released = max(0, active_before - active_after)
+        self._qwen35_lm_head_pin_suspended = bool(released)
+        self._qwen35_serial_verify_head_suspend_calls += 1
+        self._qwen35_serial_verify_head_suspend_bytes += int(released)
+        self._qwen35_serial_verify_head_suspend_active_released_bytes += (
+            active_released)
+        self._qwen35_serial_verify_head_suspend_active_peak_bytes = max(
+            self._qwen35_serial_verify_head_suspend_active_peak_bytes,
+            active_released,
+        )
+        self._qwen35_serial_verify_head_suspend_s += (
+            time.perf_counter() - started)
+        if self._qwen35_serial_verify_head_suspend_calls == 1:
+            print(
+                "[engine] Qwen phase head: "
+                f"pin={int(released) / 1e6:.1f}MB, "
+                f"active={active_before / 1e9:.3f}->"
+                f"{active_after / 1e9:.3f}GB",
+                flush=True,
+            )
+        return int(released)
+
+    def _restore_qwen35_serial_verify_lm_head(self, head=None) -> bool:
+        """Re-pin the verifier's existing demand head without another read."""
+        if not self.rc.qwen35_serial_verify_suspend_lm_head:
+            return False
+        started = time.perf_counter()
+        self._qwen35_serial_verify_head_restore_calls += 1
+        promoted = self.cache.promote_to_pin(
+            "lm_head", "qwen35:lm_head:persistent",
+            tensors=(
+                {"lm_head.weight": head}
+                if head is not None else None
+            ),
+        )
+        restored = promoted is not None
+        if restored:
+            self._lm_head_w = promoted["lm_head.weight"]
+            self._qwen35_lm_head_pin_suspended = False
+            self._qwen35_serial_verify_head_restore_successes += 1
+        else:
+            # A tight governor budget can make the verifier head pass-through.
+            # Retain ordinary demand semantics instead of forcing a second
+            # read or weakening the active memory limit.
+            self._qwen35_serial_verify_head_restore_refusals += 1
+        self._qwen35_serial_verify_head_restore_s += (
+            time.perf_counter() - started)
+        return restored
 
     def _final_logits(self, hidden: mx.array, head=None) -> mx.array:
         head = self._lm_head_weight() if head is None else head
@@ -7216,6 +7348,8 @@ class StreamingEngine:
             raise ValueError("serial-position verification needs at least one token")
         if len(tokens) == 1:
             return self.forward_tokens(tokens, kv, tap_layers=tap_layers)
+        if qwen_family:
+            self._suspend_qwen35_serial_verify_lm_head()
 
         offset = kv.offset
         verifier_positions = len(tokens)
@@ -8019,6 +8153,16 @@ class StreamingEngine:
         self._qwen35_serial_verify_linear_layer_compute_s = 0.0
         self._qwen35_serial_verify_full_layer_compute_s = 0.0
         self._qwen35_serial_verify_head_s = 0.0
+        self._qwen35_serial_verify_head_suspend_calls = 0
+        self._qwen35_serial_verify_head_suspend_bytes = 0
+        self._qwen35_serial_verify_head_suspend_active_released_bytes = 0
+        self._qwen35_serial_verify_head_suspend_active_peak_bytes = 0
+        self._qwen35_serial_verify_head_suspend_s = 0.0
+        self._qwen35_serial_verify_head_restore_calls = 0
+        self._qwen35_serial_verify_head_restore_successes = 0
+        self._qwen35_serial_verify_head_restore_refusals = 0
+        self._qwen35_serial_verify_head_restore_s = 0.0
+        self._qwen35_lm_head_suspend_request_active = False
         self._true_peak_metal_bytes = mx.get_active_memory()  # see _note_true_peak
         if self.governor is not None:
             self.governor.reset_request_peak(self._true_peak_metal_bytes)
@@ -8174,11 +8318,52 @@ class StreamingEngine:
                 self.rc.qwen35_serial_verify_exact_page_admission)
             path_stats["qwen35_serial_verify_batched_mlp"] = int(
                 self.rc.qwen35_serial_verify_batched_mlp)
+            path_stats["qwen35_serial_verify_suspend_lm_head"] = int(
+                self.rc.qwen35_serial_verify_suspend_lm_head)
+            path_stats[
+                "qwen35_serial_verify_suspend_lm_head_min_prompt_tokens"
+            ] = QWEN35_PHASE_HEAD_MIN_PROMPT_TOKENS
+            path_stats["qwen35_serial_verify_head_suspend_calls"] = int(
+                self._qwen35_serial_verify_head_suspend_calls)
+            path_stats["qwen35_serial_verify_head_suspend_bytes"] = int(
+                self._qwen35_serial_verify_head_suspend_bytes)
+            path_stats[
+                "qwen35_serial_verify_head_suspend_active_released_bytes"
+            ] = int(
+                self._qwen35_serial_verify_head_suspend_active_released_bytes)
+            path_stats[
+                "qwen35_serial_verify_head_suspend_active_peak_bytes"
+            ] = int(
+                self._qwen35_serial_verify_head_suspend_active_peak_bytes)
+            path_stats["qwen35_serial_verify_head_suspend_s"] = float(
+                self._qwen35_serial_verify_head_suspend_s)
+            path_stats["qwen35_serial_verify_head_restore_calls"] = int(
+                self._qwen35_serial_verify_head_restore_calls)
+            path_stats["qwen35_serial_verify_head_restore_successes"] = int(
+                self._qwen35_serial_verify_head_restore_successes)
+            path_stats["qwen35_serial_verify_head_restore_refusals"] = int(
+                self._qwen35_serial_verify_head_restore_refusals)
+            path_stats["qwen35_serial_verify_head_restore_s"] = float(
+                self._qwen35_serial_verify_head_restore_s)
         tokenize_t0 = time.perf_counter()
         prepared_ids = getattr(prompt, "token_ids", None)
         tokens = (list(prepared_ids) if prepared_ids is not None
                   else self.tokenizer.encode(prompt).ids)
         path_stats["prompt_tokenize_s"] = time.perf_counter() - tokenize_t0
+        self._qwen35_lm_head_suspend_request_active = (
+            qwen35_phase_head_request_active(
+                self.rc.qwen35_serial_verify_suspend_lm_head, len(tokens)))
+        path_stats[
+            "qwen35_serial_verify_suspend_lm_head_request_active"
+        ] = int(self._qwen35_lm_head_suspend_request_active)
+        if self._qwen35_lm_head_suspend_request_active:
+            self._suspend_qwen35_serial_verify_lm_head()
+        elif (self.rc.qwen35_serial_verify_suspend_lm_head
+                and self._qwen35_lm_head_pin_suspended):
+            # Below the measured phase boundary, reproduce the established
+            # pinned-head request shape exactly: materialize the dormant lease
+            # before prefill and retain it through every verifier sweep.
+            self._lm_head_weight()
         if self.cfg.model_type == "kimi_k3":
             if self.rc.kimi_k3_prefill_tile_policy == "prompt-length":
                 (k3_tile_width, k3_dense_tile_size,

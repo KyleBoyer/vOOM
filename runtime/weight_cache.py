@@ -117,6 +117,11 @@ class WeightCache:
         self._lock = threading.Lock()
         self._inflight: dict[str, threading.Event] = {}
         self._inflight_origin: dict[str, str] = {}
+        # Exact byte allowances for explicitly suspended pin groups. A later
+        # zero-copy restoration may reclaim only the same key and byte count;
+        # this preserves a startup-admitted permanent pin even if the live
+        # governor has since lowered the ordinary demand-cache ceiling.
+        self._suspended_pin_bytes: dict[str, int] = {}
         self.stats = CacheStats()
         # F03: cumulative access frequency per key. Simulated on real MoE traces,
         # LFU-with-admission reaches 74% of the Belady bound at tight budgets
@@ -408,6 +413,7 @@ class WeightCache:
             self._total_bytes = 0
             self._reserved_bytes = 0
             self._inflight_origin.clear()
+            self._suspended_pin_bytes.clear()
         _clear_device_cache()
         release = getattr(self.store, "release_cache_pages", None)
         if release is not None and released_names:
@@ -444,6 +450,123 @@ class WeightCache:
         if release is not None and released_names:
             release(tuple(released_names))
         return removed
+
+    def release_pinned(
+        self, key: str, names: list[str] | tuple[str, ...] = (),
+    ) -> int:
+        """Release one explicitly pinned page at a proven consumer boundary.
+
+        This is deliberately separate from :meth:`discard`, which refuses
+        pinned pages.  A caller must first drop every tensor reference it owns;
+        the cache then removes the complete pin group, clears evaluated device
+        state, and invalidates any source-file mappings.  The returned byte
+        count is zero when ``key`` is absent or no longer pinned.
+
+        The operation exists for phase-scoped weights such as an untied Qwen
+        LM head: it is useful for proposal projection and target verification,
+        but dead throughout the much larger streamed target-trunk sweep.
+        """
+        released_names = list(names)
+        released_bytes = 0
+        removed_page = None
+        with self._lock:
+            page = self._pages.get(key)
+            if page is None or not page.pinned:
+                return 0
+            if not released_names:
+                released_names.extend(page.tensors)
+            removed_page = self._remove_page_locked(key)
+            released_bytes = removed_page.nbytes
+            self._suspended_pin_bytes[key] = released_bytes
+            self.stats.evictions += 1
+        # Do not retain a local page/tensor mapping across the explicit device
+        # clear. The caller has already dropped its own tensor reference.
+        del page, removed_page
+        _clear_device_cache()
+        release = getattr(self.store, "release_cache_pages", None)
+        if release is not None and released_names:
+            release(tuple(released_names))
+        return released_bytes
+
+    def register_suspended_pin(self, key: str, nbytes: int) -> None:
+        """Register an exact dormant pin lease without materializing tensors.
+
+        This is the startup counterpart to :meth:`release_pinned`: a caller
+        with an exact metadata-derived resident size may defer a phase-scoped
+        pin until its first real use.  The lease never widens ``max_bytes`` and
+        may only be consumed by a page with exactly the registered byte count.
+        Collisions and inconsistent repeated declarations fail closed.
+        """
+        nbytes = int(nbytes)
+        if nbytes <= 0:
+            raise ValueError("suspended pin bytes must be positive")
+        with self._lock:
+            if key in self._pages:
+                raise RuntimeError(
+                    f"cannot suspend pin {key!r}: cache key already exists")
+            previous = self._suspended_pin_bytes.get(key)
+            if previous is not None and previous != nbytes:
+                raise RuntimeError(
+                    f"cannot change suspended pin {key!r} from {previous} "
+                    f"to {nbytes} bytes")
+            pinned = sum(
+                page.nbytes for page in self._pages.values() if page.pinned)
+            if pinned + nbytes > self.max_bytes:
+                raise MemoryError(
+                    f"suspended pin {key!r} would require {pinned + nbytes} "
+                    f"resident pinned bytes, exceeding the "
+                    f"{self.max_bytes}-byte weight-cache capacity")
+            self._suspended_pin_bytes[key] = nbytes
+
+    def promote_to_pin(
+        self, source_key: str, target_key: str, *,
+        tensors: dict[str, mx.array] | None = None,
+    ) -> dict[str, mx.array] | None:
+        """Atomically reclassify a resident demand page as a permanent pin.
+
+        No fetch or tensor copy occurs.  Promotion fails softly when the source
+        page was pass-through/evicted or when the current cache budget cannot
+        contain it alongside existing pins.  In that case the demand page is
+        left unchanged and the caller may continue with ordinary demand loads.
+        A target-key collision is a lifecycle bug and fails closed.
+        """
+        with self._lock:
+            page = self._pages.get(source_key)
+            if page is not None and page.pinned:
+                return None
+            if target_key != source_key and target_key in self._pages:
+                raise RuntimeError(
+                    f"cannot promote {source_key!r}: target cache key "
+                    f"{target_key!r} already exists")
+            if page is None:
+                if tensors is None:
+                    return None
+                resident = sum(_tensor_bytes(value) for value in tensors.values())
+                page = WeightPage(
+                    source_key, tensors, resident, origin="demand")
+            allowance = self._suspended_pin_bytes.get(target_key)
+            pinned_before = sum(
+                value.nbytes for value in self._pages.values()
+                if value.pinned
+            )
+            leased_restore = allowance == page.nbytes
+            if not leased_restore and pinned_before + page.nbytes > self.max_bytes:
+                return None
+            if source_key in self._pages:
+                self._remove_page_locked(source_key)
+            page.key = target_key
+            page.pinned = True
+            page.origin = "pin"
+            self._put_page_locked(page)
+            if leased_restore:
+                self._suspended_pin_bytes.pop(target_key, None)
+            # A restored startup pin may legitimately exceed a cache ceiling
+            # that the governor lowered while it was suspended. Reclaim that
+            # exact pin first, then shed every evictable demand/prefetch page;
+            # this reproduces the pre-suspension invariant without ratcheting
+            # the configured budget upward.
+            self._evict_locked()
+            return page.tensors
 
     def would_fit(self, nbytes: int) -> bool:
         """True if a page of this size can be admitted by evicting only *consumed*

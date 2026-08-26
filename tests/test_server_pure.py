@@ -468,6 +468,38 @@ def test_protocol_timing_exposes_pin_and_prefetch_measurements():
     assert timing["planned_trunk_pin_bytes"] == 350_000_000
 
 
+def test_protocol_timing_exposes_phase_head_physical_lifetime():
+    timing = _vision_protocol_timing({
+        "path_stats": {
+            "qwen35_serial_verify_suspend_lm_head_min_prompt_tokens": 8192,
+            "qwen35_serial_verify_suspend_lm_head_request_active": 1,
+            "qwen_mtp_target_head_suspend_request_active": 1,
+            "qwen_mtp_target_head_suspend_active_released_bytes": 12_150_000_000,
+            "qwen_mtp_target_head_suspend_active_peak_bytes": 675_430_400,
+            "qwen_mtp_draft_head_host_detach_calls": 48,
+            "qwen_mtp_draft_head_host_detach_bytes": 47_677_440,
+            "qwen_mtp_draft_head_host_detach_s": 0.125,
+        },
+    })
+
+    assert timing[
+        "qwen35_serial_verify_suspend_lm_head_min_prompt_tokens"
+    ] == 8192
+    assert timing[
+        "qwen35_serial_verify_suspend_lm_head_request_active"
+    ] == 1
+    assert timing["qwen_mtp_target_head_suspend_request_active"] == 1
+    assert timing[
+        "qwen_mtp_target_head_suspend_active_released_bytes"
+    ] == 12_150_000_000
+    assert timing[
+        "qwen_mtp_target_head_suspend_active_peak_bytes"
+    ] == 675_430_400
+    assert timing["qwen_mtp_draft_head_host_detach_calls"] == 48
+    assert timing["qwen_mtp_draft_head_host_detach_bytes"] == 47_677_440
+    assert timing["qwen_mtp_draft_head_host_detach_s"] == 0.125
+
+
 def test_protocol_timing_exposes_governor_admission_measurements():
     timing = _vision_protocol_timing({
         "path_stats": {

@@ -837,6 +837,9 @@ class QwenMTPDrafter:
 
     def __init__(self, engine):
         self.engine = engine
+        self._head_host_detach_calls = 0
+        self._head_host_detach_bytes = 0
+        self._head_host_detach_s = 0.0
         self._ablation_direction: mx.array | None = None
         self._ablation_strength = 0.0
         self._ablation_fingerprint = ""
@@ -900,6 +903,40 @@ class QwenMTPDrafter:
 
         return project_out_direction(
             branch, self._ablation_direction, self._ablation_strength)
+
+    def _detach_head_logits_for_verification(
+        self, logits: mx.array,
+    ) -> mx.array:
+        """Copy one small draft row off Metal before streaming target weights.
+
+        An evaluated MLX result can retain its input graph.  With a quantized
+        27B output head that means a ~675 MB weight owner survives even after
+        WeightCache removes the pin, exactly during the 13 GB verifier trunk
+        sweep where the head is dead.  The opt-in phase-lifetime mode copies
+        only the rank-1 vocabulary row through host float32 memory and creates
+        a detached MLX row.  BF16/quantized head values are represented
+        losslessly by float32; proposals may affect acceptance, never the
+        authoritative target distribution.
+        """
+        if not bool(getattr(
+            self.engine,
+            "_qwen35_lm_head_suspend_request_active", False
+        )):
+            return logits
+        started = time.perf_counter()
+        import numpy as np
+
+        fp32 = logits.astype(mx.float32)
+        mx.eval(fp32)
+        host = np.array(fp32, dtype=np.float32, copy=True)
+        detached = mx.array(host)
+        mx.eval(detached)
+        copied = int(host.nbytes)
+        del fp32, host
+        self._head_host_detach_calls += 1
+        self._head_host_detach_bytes += copied
+        self._head_host_detach_s += time.perf_counter() - started
+        return detached
 
     def _weights(self, *, representation: str = "demand-cache") -> dict:
         # Representation is part of the cache identity.  MTPLX replaces the
@@ -1142,6 +1179,7 @@ class QwenMTPDrafter:
             logits = final_logits(
                 x, w["mtp.norm.weight"], shared_head, cfg.rms_norm_eps)
         mx.eval(logits, x)
+        logits = self._detach_head_logits_for_verification(logits)
         # qwen35.final_logits already removes batch/sequence axes and returns
         # one rank-1 vocabulary row. Indexing it again selected only the final
         # vocabulary scalar, degenerating q to a one-token distribution (and
@@ -1479,6 +1517,11 @@ class QwenMTPSpeculativeEngine:
 
         request_t0 = time.perf_counter()
         request_cache_before = _cache_io_snapshot(tgt)
+        draft_head_detach_before = (
+            int(getattr(self.drafter, "_head_host_detach_calls", 0)),
+            int(getattr(self.drafter, "_head_host_detach_bytes", 0)),
+            float(getattr(self.drafter, "_head_host_detach_s", 0.0)),
+        )
         bootstrap_cache_budget = int(getattr(tgt.cache, "max_bytes", 0) or 0)
         bootstrap_pressure_shrinks = int(getattr(
             getattr(tgt, "governor", None), "shrinks", 0) or 0)
@@ -2971,6 +3014,40 @@ class QwenMTPSpeculativeEngine:
                 tgt, "_qwen35_serial_verify_full_layer_compute_s", 0.0)),
             "qwen_mtp_target_head_s": float(getattr(
                 tgt, "_qwen35_serial_verify_head_s", 0.0)),
+            "qwen_mtp_target_head_suspend_enabled": int(getattr(
+                getattr(tgt, "rc", None),
+                "qwen35_serial_verify_suspend_lm_head", False)),
+            "qwen_mtp_target_head_suspend_request_active": int(getattr(
+                tgt, "_qwen35_lm_head_suspend_request_active", False)),
+            "qwen_mtp_target_head_suspend_calls": int(getattr(
+                tgt, "_qwen35_serial_verify_head_suspend_calls", 0)),
+            "qwen_mtp_target_head_suspend_bytes": int(getattr(
+                tgt, "_qwen35_serial_verify_head_suspend_bytes", 0)),
+            "qwen_mtp_target_head_suspend_active_released_bytes": int(getattr(
+                tgt,
+                "_qwen35_serial_verify_head_suspend_active_released_bytes",
+                0)),
+            "qwen_mtp_target_head_suspend_active_peak_bytes": int(getattr(
+                tgt, "_qwen35_serial_verify_head_suspend_active_peak_bytes", 0)),
+            "qwen_mtp_target_head_suspend_s": float(getattr(
+                tgt, "_qwen35_serial_verify_head_suspend_s", 0.0)),
+            "qwen_mtp_target_head_restore_calls": int(getattr(
+                tgt, "_qwen35_serial_verify_head_restore_calls", 0)),
+            "qwen_mtp_target_head_restore_successes": int(getattr(
+                tgt, "_qwen35_serial_verify_head_restore_successes", 0)),
+            "qwen_mtp_target_head_restore_refusals": int(getattr(
+                tgt, "_qwen35_serial_verify_head_restore_refusals", 0)),
+            "qwen_mtp_target_head_restore_s": float(getattr(
+                tgt, "_qwen35_serial_verify_head_restore_s", 0.0)),
+            "qwen_mtp_draft_head_host_detach_calls": int(getattr(
+                self.drafter, "_head_host_detach_calls", 0)
+                - draft_head_detach_before[0]),
+            "qwen_mtp_draft_head_host_detach_bytes": int(getattr(
+                self.drafter, "_head_host_detach_bytes", 0)
+                - draft_head_detach_before[1]),
+            "qwen_mtp_draft_head_host_detach_s": float(getattr(
+                self.drafter, "_head_host_detach_s", 0.0)
+                - draft_head_detach_before[2]),
             "qwen_mtp_plain_round_s": plain_round_s,
             "qwen_mtp_kda_endpoint_restores": kda_endpoint_restores,
             "qwen_mtp_refeed_sweeps_saved": refeed_sweeps_saved,

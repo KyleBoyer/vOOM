@@ -62,6 +62,17 @@ poor opening region cannot hide a later predictable span.
 Grammar jump-forward and experimental fused DeltaNet kernels stay off because
 they do not have an accepted quality case here.
 
+An additional long-context-only head lifecycle is available with
+`VMODEL_QWEN35_SERIAL_VERIFY_SUSPEND_LM_HEAD=1`.  It is default-off and
+content-blind gated at 8,192 prompt tokens.  Startup defers the 675.4MB MXFP4
+head until first projection; native-MTP copies only its evaluated vocabulary
+row through host float32, then the target drops the physical head during each
+streamed trunk sweep and zero-copy re-pins it for projection.  On the 16K/64
+gate this reduced wall 287.2454s -> 271.0189s and reads 314.125GB -> 275.822GB
+with the identical output SHA and a passing pressure gate.  Forcing it on the
+6,339-token capture regressed 106.1934s -> 107.2490s, which is why it is not in
+the recommended profile.
+
 The captured request is 178,616 bytes with 134 tools, 3 input items, 15,630
 message characters, and 162,441 raw tool-schema characters. The fast gateway
 turns that incoming shape into a 4,924-token host catalog decision and a

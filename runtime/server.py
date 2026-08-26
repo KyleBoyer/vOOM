@@ -1450,6 +1450,12 @@ class EngineManager:
         if qwen35_batched_mlp_request not in ("0", "1"):
             raise RequestValidationError(
                 "VMODEL_QWEN35_SERIAL_VERIFY_BATCHED_MLP must be 0 or 1")
+        qwen35_suspend_lm_head_request = os.environ.get(
+            "VMODEL_QWEN35_SERIAL_VERIFY_SUSPEND_LM_HEAD", "0"
+        ).strip()
+        if qwen35_suspend_lm_head_request not in ("0", "1"):
+            raise RequestValidationError(
+                "VMODEL_QWEN35_SERIAL_VERIFY_SUSPEND_LM_HEAD must be 0 or 1")
         qwen_quant_lm_head_request = os.environ.get(
             "VMODEL_QWEN35_QUANT_LM_HEAD", "0").strip()
         if qwen_quant_lm_head_request not in ("0", "1"):
@@ -1841,6 +1847,7 @@ class EngineManager:
             qwen35_prefill_chunk_ceiling,
             qwen35_exact_page_admission_request,
             qwen35_batched_mlp_request,
+            qwen35_suspend_lm_head_request,
             qwen_lossy_suffix_request,
             qwen_hot_kv_request,
             qwen_hot_kv_persist_dir_request,
@@ -1940,6 +1947,7 @@ class EngineManager:
             qwen35_prefill_chunk_ceiling,
             qwen35_exact_page_admission_request,
             qwen35_batched_mlp_request,
+            qwen35_suspend_lm_head_request,
             qwen_lossy_suffix_request,
             qwen_hot_kv_request,
             qwen_hot_kv_persist_dir_request,
@@ -2079,6 +2087,8 @@ class EngineManager:
                     qwen35_exact_page_admission_request == "1")
                 rc.qwen35_serial_verify_batched_mlp = (
                     qwen35_batched_mlp_request == "1")
+                rc.qwen35_serial_verify_suspend_lm_head = (
+                    qwen35_suspend_lm_head_request == "1")
                 rc.qwen_mixed_depth_endpoint_persist = (
                     qwen_mixed_depth_endpoint_request == "1")
             # Grammar fast-forward (token-level jump-forward decoding,
@@ -8485,6 +8495,27 @@ def _vision_protocol_timing(result: dict) -> dict:
         "qwen35_prefill_chunk_selected",
         "qwen35_serial_verify_exact_page_admission",
         "qwen35_serial_verify_batched_mlp",
+        "qwen35_serial_verify_suspend_lm_head",
+        "qwen35_serial_verify_suspend_lm_head_min_prompt_tokens",
+        "qwen35_serial_verify_suspend_lm_head_request_active",
+        "qwen35_serial_verify_head_suspend_calls",
+        "qwen35_serial_verify_head_suspend_bytes",
+        "qwen35_serial_verify_head_suspend_active_released_bytes",
+        "qwen35_serial_verify_head_suspend_active_peak_bytes",
+        "qwen35_serial_verify_head_restore_calls",
+        "qwen35_serial_verify_head_restore_successes",
+        "qwen35_serial_verify_head_restore_refusals",
+        "qwen_mtp_target_head_suspend_enabled",
+        "qwen_mtp_target_head_suspend_request_active",
+        "qwen_mtp_target_head_suspend_calls",
+        "qwen_mtp_target_head_suspend_bytes",
+        "qwen_mtp_target_head_suspend_active_released_bytes",
+        "qwen_mtp_target_head_suspend_active_peak_bytes",
+        "qwen_mtp_target_head_restore_calls",
+        "qwen_mtp_target_head_restore_successes",
+        "qwen_mtp_target_head_restore_refusals",
+        "qwen_mtp_draft_head_host_detach_calls",
+        "qwen_mtp_draft_head_host_detach_bytes",
         "kimi_k3_prefill_tile_width",
         "kimi_k3_dense_mlp_tile_size",
         "kimi_k3_prefill_long_context_tokens",
@@ -8519,6 +8550,11 @@ def _vision_protocol_timing(result: dict) -> dict:
         "qwen_mtp_target_linear_layer_compute_s",
         "qwen_mtp_target_full_layer_compute_s",
         "qwen_mtp_target_head_s",
+        "qwen35_serial_verify_head_suspend_s",
+        "qwen35_serial_verify_head_restore_s",
+        "qwen_mtp_target_head_suspend_s",
+        "qwen_mtp_target_head_restore_s",
+        "qwen_mtp_draft_head_host_detach_s",
         "qwen_mtp_plain_round_s",
         "qwen_mtp_estimated_net_saved_s",
         "qwen_mtp_estimated_break_even_accept_rate",
@@ -8680,6 +8716,9 @@ def _execution_profile_fields(engine) -> dict[str, object]:
     if rc is not None and getattr(rc, "qwen35_prefill_chunk_ceiling", 0):
         fields["vmodel_qwen35_prefill_chunk_ceiling"] = int(
             rc.qwen35_prefill_chunk_ceiling)
+    if rc is not None and getattr(
+            rc, "qwen35_serial_verify_suspend_lm_head", False):
+        fields["vmodel_qwen35_serial_verify_suspend_lm_head"] = 1
     if rc is not None and getattr(
             rc, "rerank_lm_head_source_fingerprint", ""):
         fields.update({
