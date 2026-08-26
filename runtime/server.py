@@ -1507,10 +1507,12 @@ class EngineManager:
             raise RequestValidationError(
                 "VMODEL_QWEN35_PAGED_ONLINE_TILE_POSITIONS must be an integer"
             ) from error
-        if qwen35_paged_online_tile_positions not in (256, 512, 1024, 2048):
+        if qwen35_paged_online_tile_positions not in (
+            256, 512, 1024, 2048, 4096,
+        ):
             raise RequestValidationError(
                 "VMODEL_QWEN35_PAGED_ONLINE_TILE_POSITIONS must be one of "
-                "256, 512, 1024, or 2048")
+                "256, 512, 1024, 2048, or 4096")
         try:
             qwen35_kv_page_positions = int(os.environ.get(
                 "VMODEL_QWEN35_KV_PAGE_POSITIONS", "256"))

@@ -648,6 +648,8 @@ not allowed.
   `logs/qwen38_paged64_online2048_exact_greedy_capture16_20260826.json`
 - Winning depth-12 plus tiled-paged 16K/64 gate:
   `logs/qwen38_suffix12_anchor128_paged_large16k_out64_20260826.json`
+- Winning 4,096-position attention-tile composition:
+  `logs/qwen38_suffix12_tile4096_large16k_out64_20260826.json`
 - Untouched captured-shape depth-12 quality sample:
   `logs/qwen38_suffix12_unmodified_capture16_20260826.json`
 - Rejected heterogeneous developer/tool depth-12 and depth-14 gates:

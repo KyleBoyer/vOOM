@@ -166,7 +166,7 @@ def test_server_paged_online_attention_is_strict_and_explicit(tmp_path):
         with pytest.raises(RequestValidationError, match="must be 0 or 1"):
             EngineManager().get(Path("/tmp/not-opened-paged-online"), "fast")
     with patch.dict(os.environ, {
-        "VMODEL_QWEN35_PAGED_ONLINE_TILE_POSITIONS": "4096",
+        "VMODEL_QWEN35_PAGED_ONLINE_TILE_POSITIONS": "8192",
     }):
         with pytest.raises(RequestValidationError, match="must be one of"):
             EngineManager().get(Path("/tmp/not-opened-paged-tile"), "fast")
@@ -200,7 +200,7 @@ def test_server_paged_online_attention_is_strict_and_explicit(tmp_path):
         "VMODEL_QWEN35_KV_SPILL_DIR": str(tmp_path / "spill"),
         "VMODEL_QWEN35_KV_PAGE_POSITIONS": "1024",
         "VMODEL_QWEN35_PAGED_ONLINE_ATTENTION": "1",
-        "VMODEL_QWEN35_PAGED_ONLINE_TILE_POSITIONS": "1024",
+        "VMODEL_QWEN35_PAGED_ONLINE_TILE_POSITIONS": "4096",
     }
     with patch.dict(os.environ, env), \
          patch("runtime.config.ModelConfig.from_dir", return_value=cfg), \
@@ -214,4 +214,4 @@ def test_server_paged_online_attention_is_strict_and_explicit(tmp_path):
     assert captured[0].max_kv_mb == 64
     assert captured[0].kv_page_positions == 1024
     assert captured[0].qwen35_paged_online_attention
-    assert captured[0].qwen35_paged_online_tile_positions == 1024
+    assert captured[0].qwen35_paged_online_tile_positions == 4096

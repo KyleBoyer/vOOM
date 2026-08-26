@@ -139,7 +139,7 @@ def test_builtin_profiles_resolve_complete_agent_group():
     assert long_settings[
         "VMODEL_QWEN35_PAGED_ONLINE_ATTENTION"] == "1"
     assert long_settings[
-        "VMODEL_QWEN35_PAGED_ONLINE_TILE_POSITIONS"] == "2048"
+        "VMODEL_QWEN35_PAGED_ONLINE_TILE_POSITIONS"] == "4096"
     assert long_settings[
         "VMODEL_QWEN_MTP_SELECTIVE_TREE_MARGIN"] == "0"
 
