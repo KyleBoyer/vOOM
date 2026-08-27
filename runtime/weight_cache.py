@@ -488,13 +488,19 @@ class WeightCache:
             release(tuple(released_names))
         return released_bytes
 
-    def register_suspended_pin(self, key: str, nbytes: int) -> None:
+    def register_suspended_pin(
+        self, key: str, nbytes: int, *, allow_over_capacity: bool = False,
+    ) -> None:
         """Register an exact dormant pin lease without materializing tensors.
 
         This is the startup counterpart to :meth:`release_pinned`: a caller
         with an exact metadata-derived resident size may defer a phase-scoped
         pin until its first real use.  The lease never widens ``max_bytes`` and
         may only be consumed by a page with exactly the registered byte count.
+        ``allow_over_capacity`` is reserved for a phase-exclusive pin whose
+        consumer proves the ordinary demand cache is dead before materializing
+        it.  It does not allocate memory or change the cache ceiling; the exact
+        lease is still the only page allowed to exceed that ceiling.
         Collisions and inconsistent repeated declarations fail closed.
         """
         nbytes = int(nbytes)
@@ -511,7 +517,7 @@ class WeightCache:
                     f"to {nbytes} bytes")
             pinned = sum(
                 page.nbytes for page in self._pages.values() if page.pinned)
-            if pinned + nbytes > self.max_bytes:
+            if pinned + nbytes > self.max_bytes and not allow_over_capacity:
                 raise MemoryError(
                     f"suspended pin {key!r} would require {pinned + nbytes} "
                     f"resident pinned bytes, exceeding the "

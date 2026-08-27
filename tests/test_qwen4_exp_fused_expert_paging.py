@@ -269,3 +269,32 @@ def test_qwen4_virtual_fast_and_archive_experts_overlap(tmp_path, monkeypatch):
     assert snapshot[1:3] == (24, 24)
     assert snapshot[6] >= 0
     store.close()
+
+
+def test_qwen4_virtual_fast_tier_can_be_disabled_for_prefill(tmp_path):
+    from formats.qwen4_fast_tier import build_qwen4_fast_tier
+
+    root, expected = _fixture(tmp_path)
+    fast_root = tmp_path / "fast"
+    build_qwen4_fast_tier(root, fast_root, max_bytes=2_000_000 + 72)
+    store = WeightStore(
+        root, fast_dirs=[fast_root], parallel_storage_reads=True)
+    store.qwen4_virtual_fast_tier_enabled = False
+    names = [
+        f"model.layers.0.mlp.experts.0.{projection}.weight"
+        for projection in ("gate_proj", "up_proj", "down_proj")
+    ]
+
+    values, _seconds, nbytes = store.fetch(names)
+
+    np.testing.assert_array_equal(
+        _bits(values[names[0]]), expected["gate"][0, :expected["width"]])
+    np.testing.assert_array_equal(
+        _bits(values[names[1]]), expected["gate"][0, expected["width"]:])
+    np.testing.assert_array_equal(
+        _bits(values[names[2]]), expected["down"][0])
+    assert nbytes == 72
+    assert store.fast_tier_bytes == 0
+    assert store.archive_bytes == 72
+    assert store.parallel_tier_snapshot()[0] == 0
+    store.close()

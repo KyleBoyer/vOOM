@@ -698,6 +698,16 @@ class RuntimeConfig:
     # every tile retains ascending expert accumulation; only the host/device
     # synchronization boundary is coalesced. One is the validated baseline.
     qwen4_expert_tile_eval_batch: int = 1
+    # When a Qwen4 exact fast tier is configured, keep the long host-spooled
+    # prefill on the archive device only and enable the two-device overlay for
+    # decode. This avoids competing OS read caches at the 49K memory peak.
+    qwen4_fast_tier_decode_only: bool = False
+    # Keep the exact untied Qwen4 output head absent during host-spooled
+    # prefill, then load and pin it at the first post-prefill projection.  The
+    # next request releases it before touching the target trunk.  This keeps
+    # the 1.27 GB released BF16 head out of the 49K prompt high-water while
+    # avoiding repeated row streaming during target-verified MTP decode.
+    qwen4_phase_lm_head: bool = False
     # Opt-in request-local attribution. "" disables it; "layers" records the
     # runtime's existing materialization boundaries; "ops" adds diagnostic
     # attention/router/MLP barriers for supported Qwen/Kimi/GLM hybrid blocks.
@@ -2111,6 +2121,15 @@ class StreamingEngine:
         self._qwen35_serial_verify_head_restore_s = 0.0
         self._qwen35_lm_head_pin_suspended = False
         self._qwen35_lm_head_suspend_request_active = False
+        self._qwen4_lm_head_pin_suspended = False
+        self._qwen4_phase_head_bytes = 0
+        self._qwen4_phase_head_suspend_calls = 0
+        self._qwen4_phase_head_suspend_bytes = 0
+        self._qwen4_phase_head_suspend_s = 0.0
+        self._qwen4_phase_head_restore_calls = 0
+        self._qwen4_phase_head_restore_successes = 0
+        self._qwen4_phase_head_restore_refusals = 0
+        self._qwen4_phase_head_restore_s = 0.0
         self._layer_transient_margin = 400_000_000
         self._token_transient = 0  # F42: whole-token transient (greedy sync point)
         # 2026-07-13: F42's own per-layer/per-token mx.reset_peak_memory() calls
@@ -2178,9 +2197,10 @@ class StreamingEngine:
                 self.store.dir, self.store.weight_map,
                 real_name=self.store._real_name.get("lm_head.weight", "lm_head.weight"))
 
-        phase_scoped_qwen_head = bool(
+        phase_scoped_qwen35_head = bool(
             self.rc.qwen35_serial_verify_suspend_lm_head)
-        if phase_scoped_qwen_head and (
+        phase_scoped_qwen4_head = bool(self.rc.qwen4_phase_lm_head)
+        if phase_scoped_qwen35_head and (
                 self.cfg.model_type not in ("qwen3_5", "qwen3_5_moe")
                 or not self.rc.pin_lm_head
                 or self.rc.rerank_lm_head
@@ -2190,6 +2210,20 @@ class StreamingEngine:
             raise ValueError(
                 "qwen35_serial_verify_suspend_lm_head requires an untied, "
                 "non-streamed, non-reranked pinned Qwen LM head")
+        if phase_scoped_qwen4_head and (
+                self.cfg.model_type != "qwen4_exp"
+                or not self.rc.pin_lm_head
+                or self.rc.rerank_lm_head
+                or self._streamed_lm_head is not None
+                or self.cfg.tie_word_embeddings
+                or not self.store.has("lm_head.weight")):
+            raise ValueError(
+                "qwen4_phase_lm_head requires an untied, non-streamed, "
+                "non-reranked pinned Qwen4 LM head")
+        if phase_scoped_qwen35_head and phase_scoped_qwen4_head:
+            raise ValueError("Qwen phase-scoped LM-head modes conflict")
+        phase_scoped_qwen_head = bool(
+            phase_scoped_qwen35_head or phase_scoped_qwen4_head)
 
         if self.cfg.model_type == "qwen4_exp":
             pin_names = self.store.names_with_prefix(
@@ -2221,15 +2255,29 @@ class StreamingEngine:
                               "model.hc_head_base"])
         persistent = self.cache.pin("persistent", pin_names)
         if phase_scoped_qwen_head:
-            phase_head_bytes = self.store.mlx_quantized_resident_bytes(
-                ["lm_head.weight"])
+            if phase_scoped_qwen35_head:
+                phase_head_bytes = self.store.mlx_quantized_resident_bytes(
+                    ["lm_head.weight"])
+            else:
+                phase_head_bytes = self.store.storage_bytes(
+                    ["lm_head.weight"])
             if phase_head_bytes <= 0:
                 raise ValueError(
-                    "qwen35_serial_verify_suspend_lm_head requires an "
-                    "exactly sizeable standard MLX-quantized LM head")
-            self.cache.register_suspended_pin(
-                "qwen35:lm_head:persistent", phase_head_bytes)
-            self._qwen35_lm_head_pin_suspended = True
+                    "phase-scoped Qwen LM head requires exactly sizeable "
+                    "checkpoint metadata")
+            if self.store.storage_bytes_unknown(["lm_head.weight"]):
+                raise ValueError(
+                    "phase-scoped Qwen LM head metadata is incomplete")
+            if phase_scoped_qwen35_head:
+                self.cache.register_suspended_pin(
+                    "qwen35:lm_head:persistent", phase_head_bytes)
+                self._qwen35_lm_head_pin_suspended = True
+            else:
+                self.cache.register_suspended_pin(
+                    "qwen4:lm_head:persistent", phase_head_bytes,
+                    allow_over_capacity=True)
+                self._qwen4_lm_head_pin_suspended = True
+                self._qwen4_phase_head_bytes = int(phase_head_bytes)
 
         self._embed_w = persistent.get("model.embed_tokens.weight")
         self._norm_w = persistent.get("model.norm.weight")
@@ -4977,7 +5025,49 @@ class StreamingEngine:
             "lm_head", ["lm_head.weight"])["lm_head.weight"]
         if self._qwen35_lm_head_pin_suspended:
             self._restore_qwen35_serial_verify_lm_head(head)
+        elif self._qwen4_lm_head_pin_suspended:
+            self._restore_qwen4_phase_lm_head(head)
         return head
+
+    def _suspend_qwen4_phase_lm_head(self) -> int:
+        """Release the prior request's exact head before Qwen4 prefill."""
+        if not bool(getattr(
+                getattr(self, "rc", None), "qwen4_phase_lm_head", False)):
+            return 0
+        if self._lm_head_w is None:
+            return 0
+        started = time.perf_counter()
+        self._lm_head_w = None
+        released = self.cache.release_pinned(
+            "qwen4:lm_head:persistent", ["lm_head.weight"])
+        self._qwen4_lm_head_pin_suspended = bool(released)
+        self._qwen4_phase_head_suspend_calls += 1
+        self._qwen4_phase_head_suspend_bytes += int(released)
+        self._qwen4_phase_head_suspend_s += time.perf_counter() - started
+        return int(released)
+
+    def _restore_qwen4_phase_lm_head(self, head=None) -> bool:
+        """Promote the already-read post-prefill BF16 head without a copy."""
+        if not self.rc.qwen4_phase_lm_head:
+            return False
+        started = time.perf_counter()
+        self._qwen4_phase_head_restore_calls += 1
+        promoted = self.cache.promote_to_pin(
+            "lm_head", "qwen4:lm_head:persistent",
+            tensors=(
+                {"lm_head.weight": head}
+                if head is not None else None
+            ),
+        )
+        restored = promoted is not None
+        if restored:
+            self._lm_head_w = promoted["lm_head.weight"]
+            self._qwen4_lm_head_pin_suspended = False
+            self._qwen4_phase_head_restore_successes += 1
+        else:
+            self._qwen4_phase_head_restore_refusals += 1
+        self._qwen4_phase_head_restore_s += time.perf_counter() - started
+        return restored
 
     def _suspend_qwen35_serial_verify_lm_head(self) -> int:
         """Drop the phase-scoped head before a streamed verifier trunk.
@@ -6279,8 +6369,22 @@ class StreamingEngine:
                              or end % (tile_width * 8) == 0))
 
             expert_ids = sorted(global_positions)
-            batches = self._iter_expert_batches(
-                i, expert_ids, positions=global_positions)
+
+            def archive_only_prefill_batches():
+                prior = self.store.qwen4_virtual_fast_tier_enabled
+                self.store.qwen4_virtual_fast_tier_enabled = False
+                try:
+                    yield from self._iter_expert_batches(
+                        i, expert_ids, positions=global_positions)
+                finally:
+                    self.store.qwen4_virtual_fast_tier_enabled = prior
+
+            batches = (
+                archive_only_prefill_batches()
+                if self.rc.qwen4_fast_tier_decode_only
+                else self._iter_expert_batches(
+                    i, expert_ids, positions=global_positions)
+            )
             expert_batches_done = 0
 
             def consume_batch(batch_ids, experts):
@@ -6511,6 +6615,8 @@ class StreamingEngine:
                 self.rc.qwen4_expert_tile_eval_batch),
             "expert_tile_eval_syncs": spool_expert_tile_eval_syncs,
             "expert_tile_eval_groups": spool_expert_tile_eval_groups,
+            "fast_tier_decode_only": int(
+                self.rc.qwen4_fast_tier_decode_only),
             **{
                 f"{name}_seconds": round(seconds, 6)
                 for name, seconds in spool_phase_seconds.items()
@@ -8990,6 +9096,13 @@ class StreamingEngine:
         self._qwen35_serial_verify_head_restore_refusals = 0
         self._qwen35_serial_verify_head_restore_s = 0.0
         self._qwen35_lm_head_suspend_request_active = False
+        self._qwen4_phase_head_suspend_calls = 0
+        self._qwen4_phase_head_suspend_bytes = 0
+        self._qwen4_phase_head_suspend_s = 0.0
+        self._qwen4_phase_head_restore_calls = 0
+        self._qwen4_phase_head_restore_successes = 0
+        self._qwen4_phase_head_restore_refusals = 0
+        self._qwen4_phase_head_restore_s = 0.0
         self._true_peak_metal_bytes = mx.get_active_memory()  # see _note_true_peak
         if self.governor is not None:
             self.governor.reset_request_peak(self._true_peak_metal_bytes)
@@ -9208,6 +9321,12 @@ class StreamingEngine:
             # pinned-head request shape exactly: materialize the dormant lease
             # before prefill and retain it through every verifier sweep.
             self._lm_head_weight()
+        if self.cfg.model_type == "qwen4_exp" and self.rc.qwen4_phase_lm_head:
+            # A prior request may have retained the phase pin for its complete
+            # decode.  Drop it before any prompt trunk page or prompt state is
+            # materialized.  The first endpoint-logit projection after prefill
+            # restores the exact dormant lease automatically.
+            self._suspend_qwen4_phase_lm_head()
         if self.cfg.model_type == "kimi_k3":
             if self.rc.kimi_k3_prefill_tile_policy == "prompt-length":
                 (k3_tile_width, k3_dense_tile_size,
@@ -11488,6 +11607,24 @@ class StreamingEngine:
                 qwen4_ple_after["source_verified_release_hash"])
             for key, value in self._qwen4_host_spool_stats.items():
                 path_stats[f"qwen4_host_spool_{key}"] = value
+            path_stats["qwen4_phase_lm_head"] = int(
+                self.rc.qwen4_phase_lm_head)
+            path_stats["qwen4_phase_lm_head_bytes"] = int(
+                self._qwen4_phase_head_bytes)
+            path_stats["qwen4_phase_lm_head_suspend_calls"] = int(
+                self._qwen4_phase_head_suspend_calls)
+            path_stats["qwen4_phase_lm_head_suspend_bytes"] = int(
+                self._qwen4_phase_head_suspend_bytes)
+            path_stats["qwen4_phase_lm_head_suspend_s"] = float(
+                self._qwen4_phase_head_suspend_s)
+            path_stats["qwen4_phase_lm_head_restore_calls"] = int(
+                self._qwen4_phase_head_restore_calls)
+            path_stats["qwen4_phase_lm_head_restore_successes"] = int(
+                self._qwen4_phase_head_restore_successes)
+            path_stats["qwen4_phase_lm_head_restore_refusals"] = int(
+                self._qwen4_phase_head_restore_refusals)
+            path_stats["qwen4_phase_lm_head_restore_s"] = float(
+                self._qwen4_phase_head_restore_s)
         if reranked_telemetry_before:
             reranked_after = reranked_head.telemetry_snapshot()
             for key, value in reranked_after.items():

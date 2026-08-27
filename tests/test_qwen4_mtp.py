@@ -12,6 +12,7 @@ from runtime.qwen4_mtp import (
     Qwen4MTPDrafter,
     Qwen4MTPSpeculativeEngine,
     _REQUIRED_NON_EXPERT_NAMES,
+    _verify_stochastic_token,
 )
 from runtime.sampler import SamplingParams
 
@@ -440,6 +441,59 @@ def test_speculative_controller_all_reject_keeps_final_token_unfed(
 
     assert result["tokens"] == [10, 77]
     assert target.verify_calls == [(10, 11)]
+    assert target.last_kv.offset == 3
+    assert target.last_kv.kda_cache.marker == "kda-1"
+    assert target.last_kv.qwen4_cache.restores == [("aux-1", 3)]
+    assert result["path_stats"]["qwen4_mtp_round_outcomes"] == "R"
+
+
+def test_stochastic_verifier_uses_positive_part_rejection_correction():
+    sampling = SamplingParams(temperature=1.0, seed=17)
+    sampling.seed_rng()
+    accepted, token, probabilities, overlap = _verify_stochastic_token(
+        0,
+        mx.array([1.0, 0.0, 0.0]),
+        mx.array([-100.0, 100.0, -100.0]),
+        sampling,
+        history=[2],
+    )
+
+    assert not accepted
+    assert token == 1
+    assert probabilities.tolist() == [0.0, 1.0, 0.0]
+    assert overlap == pytest.approx(0.0)
+
+
+def test_stochastic_controller_full_accept_uses_exact_target_verifier(
+        _cache_io_noop):
+    target = _FakeTarget([11, 12, 13])
+    engine = Qwen4MTPSpeculativeEngine(
+        target, depth=2, drafter=_FakeDrafter([11, 12]))
+
+    result = engine.generate(
+        "prompt", max_tokens=4,
+        sampling=SamplingParams(temperature=1.0, seed=29))
+
+    assert result["tokens"] == [10, 11, 12, 13]
+    assert target.verify_calls == [(10, 11, 12)]
+    stats = result["path_stats"]
+    assert stats["qwen4_mtp_used"] == 1
+    assert stats["qwen4_mtp_stochastic"] == 1
+    assert stats["qwen4_mtp_stochastic_verified"] == 2
+    assert stats["qwen4_mtp_expected_acceptance"] == pytest.approx(1.0)
+
+
+def test_stochastic_controller_all_reject_restores_exact_target_state(
+        _cache_io_noop):
+    target = _FakeTarget([77, 12])
+    engine = Qwen4MTPSpeculativeEngine(
+        target, depth=2, drafter=_FakeDrafter([11, 12]))
+
+    result = engine.generate(
+        "prompt", max_tokens=2,
+        sampling=SamplingParams(temperature=1.0, seed=41))
+
+    assert result["tokens"] == [10, 77]
     assert target.last_kv.offset == 3
     assert target.last_kv.kda_cache.marker == "kda-1"
     assert target.last_kv.qwen4_cache.restores == [("aux-1", 3)]

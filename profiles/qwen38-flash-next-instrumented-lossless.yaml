@@ -14,6 +14,8 @@ notes:
   - Layer telemetry is enabled for diagnosis. Publish clean timing separately if profiling overhead is measurable.
   - Keep this profile explicit until the unmodified 134-tool capture and a heterogeneous corpus spanning tool count, system length, developer presence, streaming, and sampling all pass.
   - Exact request-local hot state is enabled for measurement. It retains one scaffold-free BF16 KV/DeltaNet/QSA/PLE endpoint and only admits exact endpoint or strict-extension matches; unrelated prompts remain cold. Cross-restart persistence remains disabled until its auxiliary-state journal passes the same state oracle.
+  - The released Lightning-MTP block proposes up to four tokens and the full released BF16 target authoritatively verifies every proposal. The 16-token greedy real oracle accepted 10/20 proposals, reduced target sweeps from 15 to 6, and preserved every token plus all 121 KV/DeltaNet/QSA/PLE arrays. Categorical sampling uses exact p/q rejection correction; non-default repetition penalties still fall back to the ordinary target.
+  - The exact 1.271 GB BF16 output head is absent during host-spooled prefill, loaded once at the first endpoint projection, and retained through MTP verification. It is released before the next prompt sweep. This phase lease reduced the real MTP oracle to 110.79 seconds generation / 93.44 seconds decode without widening the ordinary 96 MB scan cache.
 settings:
   VMODEL_RESIDENT_BACKEND: voom
   VMODEL_EXECUTION_PROFILE: layers
@@ -33,6 +35,9 @@ settings:
   VMODEL_QWEN4_COMPILED_DELTA: true
   VMODEL_QWEN4_FAST_TIER_DIR: ""
   VMODEL_QWEN4_PARALLEL_STORAGE_READS: false
+  VMODEL_QWEN4_FAST_TIER_DECODE_ONLY: false
+  VMODEL_QWEN4_PHASE_LM_HEAD: true
+  VMODEL_QWEN4_MTP_DEPTH: 4
   VMODEL_QWEN4_HOT_PROMPT_KV: true
   VMODEL_QWEN4_HOT_KV_SLOTS: 1
   VMODEL_QWEN4_HOT_KV_MIN_TOKENS: 2048

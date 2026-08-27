@@ -406,6 +406,26 @@ def test_deferred_phase_pin_rejects_inexact_or_over_budget_lease(monkeypatch):
         cache.register_suspended_pin("small", 4)
 
 
+def test_phase_exclusive_lease_can_restore_exact_pin_above_demand_budget(
+        monkeypatch):
+    monkeypatch.setattr(cache_module, "_clear_device_cache", lambda: None)
+    store = FakeStore()
+    cache = WeightCache(store, max_bytes=5)
+
+    cache.register_suspended_pin(
+        "head:persistent", 10, allow_over_capacity=True)
+    demand = cache.get("lm_head", ["lm_head.weight"])
+    assert not cache.contains("lm_head")
+    promoted = cache.promote_to_pin(
+        "lm_head", "head:persistent", tensors=demand)
+
+    assert promoted is demand
+    assert cache.max_bytes == 5
+    assert cache.total_bytes == 10
+    assert cache.pinned_bytes == 10
+    assert cache.resident_keys == ["head:persistent"]
+
+
 def test_phase_scoped_pin_release_never_removes_unpinned_page(monkeypatch):
     monkeypatch.setattr(cache_module, "_clear_device_cache", lambda: None)
     cache = WeightCache(FakeStore(), max_bytes=100)

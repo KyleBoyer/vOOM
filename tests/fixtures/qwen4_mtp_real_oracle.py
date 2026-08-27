@@ -41,7 +41,11 @@ def _pressure() -> dict[str, int]:
     }
 
 
-def _config(cache_mb: int) -> RuntimeConfig:
+def _config(
+    cache_mb: int, *, pin_head: bool = False, phase_head: bool = False,
+) -> RuntimeConfig:
+    if pin_head and phase_head:
+        raise ValueError("pin_head and phase_head are mutually exclusive")
     return RuntimeConfig(
         max_weight_cache_mb=cache_mb,
         min_weight_cache_mb=64,
@@ -53,22 +57,25 @@ def _config(cache_mb: int) -> RuntimeConfig:
         prefetch_depth=0,
         qwen4_ple_read_workers=8,
         pin_embeddings=False,
-        pin_lm_head=False,
-        stream_lm_head=True,
+        pin_lm_head=pin_head or phase_head,
+        stream_lm_head=not (pin_head or phase_head),
+        qwen4_phase_lm_head=phase_head,
         embed_rows=True,
         layer_stationary_prefill=True,
         qwen_compiled_delta_prefill=True,
+        expert_route_overlap_telemetry=True,
         governor=True,
     )
 
 
 def _run(
     model: Path, prompt: str, max_tokens: int, depth: int | None,
-    cache_mb: int,
+    cache_mb: int, *, pin_head: bool = False, phase_head: bool = False,
 ) -> dict:
     before = _pressure()
     started = time.perf_counter()
-    target = StreamingEngine(str(model), _config(cache_mb))
+    target = StreamingEngine(str(model), _config(
+        cache_mb, pin_head=pin_head, phase_head=phase_head))
     initialized = time.perf_counter()
     engine = (
         target if depth is None
@@ -83,8 +90,20 @@ def _run(
         completed = time.perf_counter()
         kv = target.last_kv
         state_sha, arrays, payload, components = _state_digest(kv)
+        decode_routes = [
+            row for row in target.expert_route_overlap_trace
+            if int(row.get("positions", 0)) == 1
+        ]
+        decode_current = sum(
+            int(row.get("cross_call_current_experts", 0))
+            for row in decode_routes)
+        decode_reused = sum(
+            int(row.get("cross_call_intersection_experts", 0))
+            for row in decode_routes)
         return {
             "mode": "plain" if depth is None else f"mtp-depth{depth}",
+            "pin_lm_head": int(pin_head),
+            "phase_lm_head": int(phase_head),
             "tokens": list(result["tokens"]),
             "text_sha256": hashlib.sha256(
                 result["text"].encode()).hexdigest(),
@@ -105,10 +124,19 @@ def _run(
                 for key, value in result.get("path_stats", {}).items()
                 if key.startswith("qwen4_mtp_")
                 or key.startswith("qwen4_serial_verify_")
+                or key.startswith("qwen4_phase_lm_head")
                 or key in {
                     "weight_store_bytes_read", "weight_archive_bytes",
                     "weight_fast_tier_bytes", "cache_source",
                 }
+            },
+            "decode_route_overlap": {
+                "calls": len(decode_routes),
+                "current_experts": decode_current,
+                "reused_experts": decode_reused,
+                "reuse_fraction": (
+                    decode_reused / decode_current
+                    if decode_current else 0.0),
             },
             "pressure_before": before,
             "pressure_after": _pressure(),
@@ -128,17 +156,50 @@ def main() -> int:
     parser.add_argument("--max-tokens", type=int, default=4)
     parser.add_argument("--depth", type=int, default=4)
     parser.add_argument("--cache-mb", type=int, default=96)
+    parser.add_argument("--mtp-cache-mb", type=int)
+    parser.add_argument("--mtp-pin-head", action="store_true")
+    parser.add_argument("--mtp-phase-head", action="store_true")
+    parser.add_argument("--plain-only", action="store_true")
     args = parser.parse_args()
     if args.max_tokens < 2:
         parser.error("max-tokens must be at least two")
     if args.cache_mb < 64:
         parser.error("cache-mb must be at least 64")
+    mtp_cache_mb = int(args.mtp_cache_mb or args.cache_mb)
+    if mtp_cache_mb < 64:
+        parser.error("mtp-cache-mb must be at least 64")
+    if args.mtp_pin_head and mtp_cache_mb < 1400:
+        parser.error("mtp-pin-head requires mtp-cache-mb at least 1400")
+    if args.mtp_pin_head and args.mtp_phase_head:
+        parser.error("mtp-pin-head and mtp-phase-head are mutually exclusive")
 
     initial = _pressure()
     plain = _run(
         args.model, args.prompt, args.max_tokens, None, args.cache_mb)
+    if args.plain_only:
+        pressure_after = _pressure()
+        swap_out_growth = max(
+            0,
+            pressure_after["swap_out_bytes"] - initial["swap_out_bytes"],
+        )
+        report = {
+            "schema": "voom.qwen4-decode-overlap-probe.v1",
+            "model": args.model.name,
+            "prompt_sha256": hashlib.sha256(args.prompt.encode()).hexdigest(),
+            "max_tokens": args.max_tokens,
+            "weight_cache_mb": args.cache_mb,
+            "plain": plain,
+            "swap_out_growth_bytes": swap_out_growth,
+            "passed": swap_out_growth <= 16_000_000,
+        }
+        args.result.parent.mkdir(parents=True, exist_ok=True)
+        encoded = json.dumps(report, indent=2, sort_keys=True) + "\n"
+        args.result.write_text(encoded)
+        print(encoded, end="")
+        return 0 if report["passed"] else 1
     mtp = _run(
-        args.model, args.prompt, args.max_tokens, args.depth, args.cache_mb)
+        args.model, args.prompt, args.max_tokens, args.depth, mtp_cache_mb,
+        pin_head=args.mtp_pin_head, phase_head=args.mtp_phase_head)
     tokens_equal = plain["tokens"] == mtp["tokens"]
     text_equal = plain["text_sha256"] == mtp["text_sha256"]
     state_equal = plain["state_sha256"] == mtp["state_sha256"]
@@ -153,6 +214,7 @@ def main() -> int:
         "prompt_sha256": hashlib.sha256(args.prompt.encode()).hexdigest(),
         "max_tokens": args.max_tokens,
         "weight_cache_mb": args.cache_mb,
+        "mtp_weight_cache_mb": mtp_cache_mb,
         "plain": plain,
         "mtp": mtp,
         "tokens_equal": tokens_equal,

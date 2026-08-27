@@ -1219,6 +1219,9 @@ class EngineManager:
                 ("VMODEL_QWEN4_HOT_KV_PERSIST_MAX_CHECKPOINTS", "4"),
                 ("VMODEL_QWEN4_HOT_KV_PERSIST_MAX_MB", "8192"),
                 ("VMODEL_QWEN4_EXPERT_TILE_EVAL_BATCH", "1"),
+                ("VMODEL_QWEN4_FAST_TIER_DECODE_ONLY", "0"),
+                ("VMODEL_QWEN4_PHASE_LM_HEAD", "0"),
+                ("VMODEL_QWEN4_MTP_DEPTH", "0"),
             )
         )
         dspark_request_identity = tuple(
@@ -2806,14 +2809,36 @@ class EngineManager:
                     raise RequestValidationError(
                         "VMODEL_QWEN4_EXPERT_TILE_EVAL_BATCH must be in "
                         "[1, 16]")
+                if qwen4_request_identity[22] not in ("0", "1"):
+                    raise RequestValidationError(
+                        "VMODEL_QWEN4_FAST_TIER_DECODE_ONLY must be 0 or 1")
+                rc.qwen4_fast_tier_decode_only = (
+                    qwen4_request_identity[22] == "1")
+                if rc.qwen4_fast_tier_decode_only and not rc.fast_dirs:
+                    raise RequestValidationError(
+                        "VMODEL_QWEN4_FAST_TIER_DECODE_ONLY requires "
+                        "VMODEL_QWEN4_FAST_TIER_DIR")
+                if qwen4_request_identity[23] not in ("0", "1"):
+                    raise RequestValidationError(
+                        "VMODEL_QWEN4_PHASE_LM_HEAD must be 0 or 1")
+                rc.qwen4_phase_lm_head = (
+                    qwen4_request_identity[23] == "1")
+                try:
+                    qwen4_mtp_depth = int(qwen4_request_identity[24])
+                except ValueError as error:
+                    raise RequestValidationError(
+                        "VMODEL_QWEN4_MTP_DEPTH must be an integer") from error
+                if not 0 <= qwen4_mtp_depth <= 7:
+                    raise RequestValidationError(
+                        "VMODEL_QWEN4_MTP_DEPTH must be in [0, 7]")
                 rc.hot_prompt_kv_persist_dir = qwen4_request_identity[18]
                 if rc.hot_prompt_kv_persist_dir and not rc.hot_prompt_kv:
                     raise RequestValidationError(
                         "VMODEL_QWEN4_HOT_KV_PERSIST_DIR requires "
                         "VMODEL_QWEN4_HOT_PROMPT_KV=1")
                 rc.hot_prompt_kv_chunk_size = rc.prefill_chunk_size
-                rc.pin_lm_head = False
-                rc.stream_lm_head = True
+                rc.pin_lm_head = rc.qwen4_phase_lm_head
+                rc.stream_lm_head = not rc.qwen4_phase_lm_head
                 rc.pin_embeddings = False
                 rc.embed_rows = True
                 rc.prompt_kv_dir = ""
@@ -4078,6 +4103,8 @@ class EngineManager:
             fast_tier_candidate = (
                 Path.home() / "vmodel_fast_tier" / model_dir.name)
             if (
+                mtype != "qwen4_exp"
+                and
                 not rc.fast_dirs
                 and fast_tier_candidate.is_dir()
                 and (
@@ -4788,7 +4815,25 @@ class EngineManager:
                         f"DSpark not needed",
                         flush=True,
                     )
-            if dflash2_dir is not None:
+            if mtype == "qwen4_exp" and qwen4_mtp_depth:
+                from .qwen4_mtp import Qwen4MTPSpeculativeEngine
+
+                try:
+                    self._engine = Qwen4MTPSpeculativeEngine(
+                        target_engine, depth=qwen4_mtp_depth)
+                    print(
+                        "[server] exact Qwen4 Lightning-MTP speculation: "
+                        f"target={model_dir.name} depth={qwen4_mtp_depth} "
+                        f"phase_head={int(rc.qwen4_phase_lm_head)}",
+                        flush=True,
+                    )
+                except Exception as error:
+                    target_engine.close()
+                    self._engine = None
+                    raise RequestValidationError(
+                        "could not initialize explicit Qwen4 Lightning-MTP: "
+                        f"{error}") from error
+            elif dflash2_dir is not None:
                 from .dflash2_adapter import DFlash2SpeculativeEngine
 
                 try:
@@ -8917,6 +8962,7 @@ def _vision_protocol_timing(result: dict) -> dict:
         "qwen4_host_spool_expert_tile_eval_batch",
         "qwen4_host_spool_expert_tile_eval_syncs",
         "qwen4_host_spool_expert_tile_eval_groups",
+        "qwen4_host_spool_fast_tier_decode_only",
         "qwen4_ple_read_calls",
         "qwen4_ple_read_extents",
         "qwen4_ple_rows_requested",
@@ -8928,6 +8974,34 @@ def _vision_protocol_timing(result: dict) -> dict:
         "qwen4_fused_expert_requested_tensors",
         "qwen4_fused_expert_bytes",
         "qwen4_fused_expert_virtual_tensors",
+        "qwen4_mtp_enabled",
+        "qwen4_mtp_used",
+        "qwen4_mtp_depth",
+        "qwen4_mtp_rounds",
+        "qwen4_mtp_proposed",
+        "qwen4_mtp_accepted",
+        "qwen4_mtp_target_sweeps",
+        "qwen4_mtp_plain_equivalent_target_sweeps",
+        "qwen4_mtp_target_sweeps_avoided",
+        "qwen4_mtp_target_prefix_rollbacks",
+        "qwen4_mtp_kda_endpoint_restores",
+        "qwen4_mtp_aux_endpoint_restores",
+        "qwen4_mtp_proposal_expert_pages",
+        "qwen4_mtp_proposal_expert_bytes",
+        "qwen4_mtp_constraint_verified",
+        "qwen4_mtp_stochastic",
+        "qwen4_mtp_stochastic_verified",
+        "qwen4_serial_verify_union_layers",
+        "qwen4_serial_verify_expert_slots",
+        "qwen4_serial_verify_union_experts",
+        "qwen4_serial_verify_expert_pages_avoided",
+        "qwen4_phase_lm_head",
+        "qwen4_phase_lm_head_bytes",
+        "qwen4_phase_lm_head_suspend_calls",
+        "qwen4_phase_lm_head_suspend_bytes",
+        "qwen4_phase_lm_head_restore_calls",
+        "qwen4_phase_lm_head_restore_successes",
+        "qwen4_phase_lm_head_restore_refusals",
     )
     for key in optional_integer_fields:
         if key in stats or key in result:
@@ -9014,6 +9088,14 @@ def _vision_protocol_timing(result: dict) -> dict:
         "qwen4_host_spool_route_and_spool_seconds",
         "qwen4_host_spool_experts_seconds",
         "qwen4_host_spool_output_seconds",
+        "qwen4_mtp_accept_rate",
+        "qwen4_mtp_target_tokens_per_sweep",
+        "qwen4_mtp_draft_s",
+        "qwen4_mtp_verifier_s",
+        "qwen4_mtp_expected_acceptance",
+        "qwen4_serial_verify_union_fetch_s",
+        "qwen4_phase_lm_head_suspend_s",
+        "qwen4_phase_lm_head_restore_s",
     )
     for key in optional_float_fields:
         if key in stats or key in result:
@@ -9031,6 +9113,8 @@ def _vision_protocol_timing(result: dict) -> dict:
         "dflash2_proposal_sources",
         "kimi_k3_prefill_tile_policy",
         "kimi_k3_prefill_schedule",
+        "qwen4_mtp_engine_identity",
+        "qwen4_mtp_round_outcomes",
     ):
         if key in stats or key in result:
             value[key] = str(metric(key) or "")
@@ -9148,6 +9232,12 @@ def _execution_profile_fields(engine) -> dict[str, object]:
             "qwen35_serial_verify_suspend_lm_head_min_prompt_tokens",
             8192,
         ))
+    if rc is not None and getattr(rc, "qwen4_phase_lm_head", False):
+        fields["vmodel_qwen4_phase_lm_head"] = 1
+    qwen4_mtp_identity = str(getattr(
+        engine, "mtp_engine_identity", "") or "")
+    if qwen4_mtp_identity.startswith("qwen4-mtp-"):
+        fields["vmodel_qwen4_mtp"] = qwen4_mtp_identity
     if rc is not None and getattr(
             rc, "rerank_lm_head_source_fingerprint", ""):
         fields.update({

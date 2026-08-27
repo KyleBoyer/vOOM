@@ -109,7 +109,9 @@ def _run(
     expert_tile_eval_batch: int = 1,
     fast_tier_dir: str = "",
     parallel_storage_reads: bool = False,
+    fast_tier_decode_only: bool = False,
     native_fused_delta: bool = False,
+    max_tokens: int = 1,
 ) -> dict:
     before = _pressure()
     rc = RuntimeConfig(
@@ -134,6 +136,7 @@ def _run(
         qwen4_expert_tile_eval_batch=expert_tile_eval_batch,
         fast_dirs=((fast_tier_dir,) if fast_tier_dir else ()),
         parallel_storage_reads=parallel_storage_reads,
+        qwen4_fast_tier_decode_only=fast_tier_decode_only,
         governor=True,
     )
     started = time.perf_counter()
@@ -141,7 +144,7 @@ def _run(
     try:
         initialized = time.perf_counter()
         result = engine.generate(
-            prompt, max_tokens=1,
+            prompt, max_tokens=max_tokens,
             sampling=SamplingParams(temperature=0.0))
         completed = time.perf_counter()
         (state_sha, state_arrays, state_bytes,
@@ -161,6 +164,8 @@ def _run(
             "expert_tile_eval_batch": expert_tile_eval_batch,
             "fast_tier_dir": fast_tier_dir,
             "parallel_storage_reads": parallel_storage_reads,
+            "fast_tier_decode_only": fast_tier_decode_only,
+            "max_tokens": max_tokens,
             "startup_seconds": round(initialized - started, 6),
             "generation_seconds": round(completed - initialized, 6),
             "wall_seconds": round(completed - started, 6),
@@ -235,6 +240,9 @@ def main() -> int:
     parser.add_argument("--candidate-fast-tier-dir", default="")
     parser.add_argument(
         "--candidate-parallel-storage-reads", action="store_true")
+    parser.add_argument(
+        "--candidate-fast-tier-decode-only", action="store_true")
+    parser.add_argument("--max-tokens", type=int, default=1)
     parser.add_argument("--result", type=Path)
     args = parser.parse_args()
     if args.chunk <= 0:
@@ -245,13 +253,15 @@ def main() -> int:
         parser.error("prompt-repeat must be positive")
     if not 1 <= args.candidate_expert_tile_eval_batch <= 16:
         parser.error("candidate-expert-tile-eval-batch must be in [1, 16]")
+    if args.max_tokens <= 0:
+        parser.error("max-tokens must be positive")
     prompt = "Say hello in one word. " * args.prompt_repeat
     baseline = _run(
         args.model, prompt, args.chunk, args.compare_layer_stationary,
         args.candidate_compiled if args.compare_layer_stationary else False,
         (args.candidate_ple_read_workers
          if args.compare_layer_stationary else 1),
-        False, False, 1, "", False, False)
+        False, False, 1, "", False, False, False, args.max_tokens)
     candidate = _run(
         args.model, prompt, args.chunk, True,
         (args.candidate_compiled
@@ -261,7 +271,9 @@ def main() -> int:
         args.candidate_expert_tile_eval_batch,
         args.candidate_fast_tier_dir,
         args.candidate_parallel_storage_reads,
-        args.candidate_native_fused_delta)
+        args.candidate_fast_tier_decode_only,
+        args.candidate_native_fused_delta,
+        args.max_tokens)
     matched = {
         "tokens": candidate["tokens"] == baseline["tokens"],
         "text": candidate["text_sha256"] == baseline["text_sha256"],
@@ -289,6 +301,7 @@ def main() -> int:
         "model_revision": "f5d08274bafd880402bd16f5e3e6c514136ec06c",
         "chunk": args.chunk,
         "prompt_repeat": args.prompt_repeat,
+        "max_tokens": args.max_tokens,
         "compare_layer_stationary": args.compare_layer_stationary,
         "baseline": baseline,
         "candidate": candidate,

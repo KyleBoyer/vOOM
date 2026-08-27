@@ -191,6 +191,11 @@ class WeightStore:
         self.fast_tier_tensors = 0
         self.archive_bytes = 0
         self.parallel_storage_reads = bool(parallel_storage_reads)
+        # Engine phase hint for Qwen4's exact virtual expert overlay. The
+        # released archive remains authoritative when false; decode-only tier
+        # profiles use this to avoid a second device/page-cache stream during
+        # the already memory-dominant long prefill, then restore it for decode.
+        self.qwen4_virtual_fast_tier_enabled = True
         self.parallel_tier_fetches = 0
         self.parallel_tier_fast_bytes = 0
         self.parallel_tier_archive_bytes = 0
@@ -2025,7 +2030,8 @@ class WeightStore:
         self._ensure_raw_fast_tier_loaded()
         fast_names = [
             name for name in names
-            if name in (self._raw_fast_tier_manifest or {})
+            if self.qwen4_virtual_fast_tier_enabled
+            and name in (self._raw_fast_tier_manifest or {})
         ]
         fast_set = set(fast_names)
         slow_names = [name for name in names if name not in fast_set]

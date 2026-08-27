@@ -21,6 +21,7 @@ import time
 from typing import Sequence
 
 import mlx.core as mx
+import numpy as np
 
 from . import layer_runner, quant
 from .kv_cache import KVCache
@@ -31,7 +32,13 @@ from .qwen4_exp import (
     run_qwen4_block,
 )
 from .qwen4_exp_state import Qwen4ExpStateCache
-from .sampler import SamplingParams
+from .sampler import (
+    SamplingParams,
+    filtered_probabilities,
+    sample,
+    sample_probabilities,
+    speculative_residual_probabilities,
+)
 
 
 _REQUIRED_NON_EXPERT_NAMES = frozenset({
@@ -289,13 +296,66 @@ class _Qwen4MTPBootstrapPrompt(str):
         return instance
 
 
-class Qwen4MTPSpeculativeEngine:
-    """Greedy exact-target Lightning-MTP serving prototype.
+def _detached_probabilities(
+    logits: mx.array,
+    sampling: SamplingParams,
+    history: Sequence[int],
+) -> mx.array:
+    """Materialize q without retaining the released MTP weight graph.
 
-    This controller is intentionally not wired into ``runtime.server`` yet.
-    Promotion requires a real-checkpoint all-reject/partial/full-accept state
-    oracle plus a clean cold/warm harness A/B.  Unsupported sampling or
-    constraints fall back to the unchanged target before any bootstrap work.
+    A Qwen4 vocabulary row is about one MiB in FP32.  Copying at most seven
+    such rows through host memory is cheap compared with one target sweep and
+    lets ``release_round_weights`` actually free every draft-only page before
+    verification starts.
+    """
+    probabilities = filtered_probabilities(
+        logits, sampling, history=history).reshape(-1)
+    mx.eval(probabilities)
+    host = np.array(probabilities, dtype=np.float32, copy=True)
+    detached = mx.array(host)
+    mx.eval(detached)
+    return detached
+
+
+def _verify_stochastic_token(
+    proposal: int,
+    draft_probabilities: mx.array,
+    target_logits: mx.array,
+    sampling: SamplingParams,
+    history: Sequence[int],
+) -> tuple[bool, int, mx.array, float]:
+    """Exact Leviathan p/q verification for one Qwen4 MTP proposal."""
+    target_probabilities = filtered_probabilities(
+        target_logits, sampling, history=history).reshape(-1)
+    draft_probabilities = draft_probabilities.reshape(-1)
+    if target_probabilities.shape != draft_probabilities.shape:
+        raise ValueError(
+            "Qwen4 MTP target/draft vocabulary mismatch: "
+            f"target={target_probabilities.shape}, "
+            f"draft={draft_probabilities.shape}")
+    overlap = mx.sum(mx.minimum(
+        target_probabilities, draft_probabilities))
+    mx.eval(target_probabilities, draft_probabilities, overlap)
+    p_token = float(target_probabilities[int(proposal)].item())
+    q_token = float(draft_probabilities[int(proposal)].item())
+    ratio = 1.0 if q_token <= 0.0 else min(1.0, p_token / q_token)
+    if float(mx.random.uniform().item()) <= ratio:
+        return (
+            True, int(proposal), target_probabilities, float(overlap.item()))
+    replacement = sample_probabilities(
+        speculative_residual_probabilities(
+            target_probabilities, draft_probabilities))
+    return (
+        False, int(replacement), target_probabilities, float(overlap.item()))
+
+
+class Qwen4MTPSpeculativeEngine:
+    """Exact-target Lightning-MTP serving prototype.
+
+    The server exposes it only through an explicit Qwen4 profile knob.  The
+    full target remains authoritative for both greedy and categorical
+    sampling, including rejection correction and exact recurrent rollback.
+    Unsupported request features fall back before any bootstrap work.
     """
 
     def __init__(self, target, *, depth: int = 4, drafter=None):
@@ -306,7 +366,7 @@ class Qwen4MTPSpeculativeEngine:
         self.target = target
         self.depth = depth
         self.drafter = drafter or Qwen4MTPDrafter(target)
-        self.mtp_engine_identity = f"qwen4-mtp-greedy-depth{depth}-exact-target"
+        self.mtp_engine_identity = f"qwen4-mtp-depth{depth}-exact-target"
 
     def __getattr__(self, name):
         return getattr(self.target, name)
@@ -350,9 +410,9 @@ class Qwen4MTPSpeculativeEngine:
         sampling = sampling or SamplingParams()
         if isinstance(max_tokens, bool) or not isinstance(max_tokens, int) or max_tokens <= 0:
             raise ValueError("max_tokens must be a positive integer")
-        if not sampling.is_greedy or sampling.repetition_penalty != 1.0:
+        if sampling.repetition_penalty != 1.0:
             return self._fallback(
-                "non-greedy", prompt, max_tokens, on_token, stop,
+                "repetition-penalty", prompt, max_tokens, on_token, stop,
                 on_progress, sampling, constraint)
         if constraint is not None and not all(callable(getattr(
                 constraint, name, None)) for name in (
@@ -424,8 +484,6 @@ class Qwen4MTPSpeculativeEngine:
         # longer needed after bootstrap.  BF16 -> host FP32 -> BF16 preserves
         # every value while severing its lazy weight graph before MTP pages are
         # admitted.
-        import numpy as np
-
         endpoint_fp32 = h_last.astype(mx.float32)
         mx.eval(endpoint_fp32)
         endpoint_host = np.array(endpoint_fp32, dtype=np.float32, copy=True)
@@ -476,6 +534,8 @@ class Qwen4MTPSpeculativeEngine:
         qwen4_restores = 0
         draft_s = 0.0
         verifier_s = 0.0
+        stochastic_overlap_sum = 0.0
+        stochastic_verified = 0
         outcomes = []
         decode_started = time.perf_counter()
         while (
@@ -494,6 +554,7 @@ class Qwen4MTPSpeculativeEngine:
             mtp_start_lengths = mtp_kv.layer_lengths()
             draft_constraint = constraint.fork() if constraint is not None else None
             draft_tokens = []
+            draft_probabilities = []
             draft_hidden = h_last
             current = catchup_token
             weights = None
@@ -510,8 +571,18 @@ class Qwen4MTPSpeculativeEngine:
                     )
                     if draft_constraint is not None:
                         logits = draft_constraint.mask_logits(logits)
-                    token = int(mx.argmax(logits).item())
+                    if sampling.is_greedy:
+                        token = int(mx.argmax(logits).item())
+                        step_probabilities = None
+                    else:
+                        step_probabilities = _detached_probabilities(
+                            logits,
+                            sampling,
+                            all_tokens + draft_tokens,
+                        )
+                        token = sample_probabilities(step_probabilities)
                     draft_tokens.append(token)
+                    draft_probabilities.append(step_probabilities)
                     proposed += 1
                     if draft_constraint is not None:
                         draft_constraint.accept_token(token)
@@ -556,12 +627,37 @@ class Qwen4MTPSpeculativeEngine:
                         constraint,
                         hidden=target._h_window[:, index:index + 1],
                     )
-                target_token = int(mx.argmax(target_logits).item())
-                if target_token != draft_token:
-                    new_tokens.append(target_token)
+                if sampling.is_greedy:
+                    draft_accepted = int(mx.argmax(
+                        target_logits).item()) == draft_token
+                    true_token = (
+                        draft_token if draft_accepted
+                        else int(mx.argmax(target_logits).item())
+                    )
+                else:
+                    step_probabilities = draft_probabilities[index]
+                    if step_probabilities is None:
+                        raise RuntimeError(
+                            "stochastic Qwen4 MTP proposal omitted q")
+                    (
+                        draft_accepted,
+                        true_token,
+                        _target_probabilities,
+                        overlap,
+                    ) = _verify_stochastic_token(
+                        draft_token,
+                        step_probabilities,
+                        target_logits,
+                        sampling,
+                        all_tokens + new_tokens,
+                    )
+                    stochastic_overlap_sum += overlap
+                    stochastic_verified += 1
+                if not draft_accepted:
+                    new_tokens.append(true_token)
                     new_logits.append(target_logits)
                     if constraint is not None:
-                        constraint.accept_token(target_token)
+                        constraint.accept_token(true_token)
                     rejected = True
                     break
                 accepted += 1
@@ -592,7 +688,11 @@ class Qwen4MTPSpeculativeEngine:
                         hidden=target._h_window[
                             :, len(draft_tokens):len(draft_tokens) + 1],
                     )
-                bonus = int(mx.argmax(bonus_logits).item())
+                bonus = sample(
+                    bonus_logits,
+                    sampling,
+                    history=all_tokens + new_tokens,
+                )
                 new_tokens.append(bonus)
                 new_logits.append(bonus_logits)
                 if constraint is not None:
@@ -695,6 +795,11 @@ class Qwen4MTPSpeculativeEngine:
             "qwen4_mtp_proposed": proposed,
             "qwen4_mtp_accepted": accepted,
             "qwen4_mtp_accept_rate": accepted / proposed if proposed else 0.0,
+            "qwen4_mtp_stochastic": int(not sampling.is_greedy),
+            "qwen4_mtp_stochastic_verified": stochastic_verified,
+            "qwen4_mtp_expected_acceptance": (
+                stochastic_overlap_sum / stochastic_verified
+                if stochastic_verified else 0.0),
             "qwen4_mtp_target_sweeps": target_sweeps,
             "qwen4_mtp_plain_equivalent_target_sweeps": max(
                 0, len(emitted) - 1),
