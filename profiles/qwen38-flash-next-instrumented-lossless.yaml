@@ -16,6 +16,8 @@ notes:
   - Exact request-local hot state is enabled for measurement. It retains one scaffold-free BF16 KV/DeltaNet/QSA/PLE endpoint and only admits exact endpoint or strict-extension matches; unrelated prompts remain cold. Cross-restart persistence remains disabled until its auxiliary-state journal passes the same state oracle.
   - The released Lightning-MTP block proposes up to four tokens and the full released BF16 target authoritatively verifies every proposal. The 16-token greedy real oracle accepted 10/20 proposals, reduced target sweeps from 15 to 6, and preserved every token plus all 121 KV/DeltaNet/QSA/PLE arrays. Categorical sampling uses exact p/q rejection correction; non-default repetition penalties still fall back to the ordinary target.
   - The exact 1.271 GB BF16 output head is absent during host-spooled prefill, loaded once at the first endpoint projection, and retained through MTP verification. It is released before the next prompt sweep. This phase lease reduced the real MTP oracle to 110.79 seconds generation / 93.44 seconds decode without widening the ordinary 96 MB scan cache.
+  - The phase head is released again immediately after response state and logits are committed, so an idle server does not sacrifice the admission headroom needed by its next request.
+  - The exact Qwen4 hybrid prefix journal is enabled only in this named profile. It fingerprints released weights/runtime/tokenizer state, persists full QSA/DeltaNet/PLE/KV boundaries, and must miss rather than reuse when a perturbed prompt does not share the exact token prefix.
 settings:
   VMODEL_RESIDENT_BACKEND: voom
   VMODEL_EXECUTION_PROFILE: layers
@@ -41,7 +43,7 @@ settings:
   VMODEL_QWEN4_HOT_PROMPT_KV: true
   VMODEL_QWEN4_HOT_KV_SLOTS: 1
   VMODEL_QWEN4_HOT_KV_MIN_TOKENS: 2048
-  VMODEL_QWEN4_HOT_KV_PERSIST_DIR: ""
+  VMODEL_QWEN4_HOT_KV_PERSIST_DIR: .kv_prompts/qwen38-flash-next
   VMODEL_EXPERT_BATCH_PREFETCH: false
   VMODEL_FAST_TOOL_GATEWAY: false
   VMODEL_QWEN_MTP_SPECULATIVE: false

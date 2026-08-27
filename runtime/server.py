@@ -8991,6 +8991,8 @@ def _vision_protocol_timing(result: dict) -> dict:
         "qwen4_mtp_constraint_verified",
         "qwen4_mtp_stochastic",
         "qwen4_mtp_stochastic_verified",
+        "qwen4_mtp_idle_head_release_calls",
+        "qwen4_mtp_idle_head_release_bytes",
         "qwen4_serial_verify_union_layers",
         "qwen4_serial_verify_expert_slots",
         "qwen4_serial_verify_union_experts",

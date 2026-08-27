@@ -374,6 +374,20 @@ class Qwen4MTPSpeculativeEngine:
     def close(self) -> None:
         self.target.close()
 
+    def _release_idle_phase_head(self, result: dict) -> None:
+        """Drop the exact head after response state/logits are committed.
+
+        The next request restores it at its first post-prefill projection.
+        Keeping 1.27 GB resident while the server is idle only reduces the
+        admission headroom for that request and cannot save any work before
+        the projection point.
+        """
+        release = getattr(self.target, "_suspend_qwen4_phase_lm_head", None)
+        released = int(release() or 0) if callable(release) else 0
+        stats = result.setdefault("path_stats", {})
+        stats["qwen4_mtp_idle_head_release_calls"] = int(callable(release))
+        stats["qwen4_mtp_idle_head_release_bytes"] = released
+
     def _fallback(
         self, reason, prompt, max_tokens, on_token, stop, on_progress,
         sampling, constraint,
@@ -395,6 +409,7 @@ class Qwen4MTPSpeculativeEngine:
             "qwen4_mtp_fallback_reason": reason,
             "qwen4_mtp_engine_identity": self.mtp_engine_identity,
         })
+        self._release_idle_phase_head(result)
         return result
 
     def generate(
@@ -466,6 +481,7 @@ class Qwen4MTPSpeculativeEngine:
             bootstrap["path_stats"] = path_stats
             if on_token is not None and bootstrap.get("text"):
                 on_token(bootstrap["text"])
+            self._release_idle_phase_head(bootstrap)
             return bootstrap
 
         kv = getattr(target, "last_kv", None)
@@ -857,7 +873,7 @@ class Qwen4MTPSpeculativeEngine:
         total_s = time.perf_counter() - request_started
         grammar_completed = bool(
             constraint is not None and constraint.completed)
-        return {
+        result = {
             "text": final_text,
             "tokens": emitted,
             "prefill_s": float(bootstrap.get("prefill_s", 0.0)),
@@ -879,3 +895,5 @@ class Qwen4MTPSpeculativeEngine:
             "path_stats": path_stats,
             "prompt_tokens": len(ids),
         }
+        self._release_idle_phase_head(result)
+        return result

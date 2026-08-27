@@ -298,6 +298,7 @@ class _FakeTarget:
         self.verify_calls = []
         self._kda_endpoints = None
         self._aux_endpoints = None
+        self.idle_head_releases = 0
 
     def generate(self, _prompt, max_tokens, **_kwargs):
         assert max_tokens == 1
@@ -346,6 +347,10 @@ class _FakeTarget:
 
     def _append_hot_prompt_slot(self, _slot):
         pass
+
+    def _suspend_qwen4_phase_lm_head(self):
+        self.idle_head_releases += 1
+        return 123
 
     def close(self):
         pass
@@ -408,6 +413,8 @@ def test_speculative_controller_full_accept_emits_bonus_in_one_target_sweep(
     assert result["path_stats"]["qwen4_mtp_target_sweeps"] == 1
     assert result["path_stats"]["qwen4_mtp_target_sweeps_avoided"] == 2
     assert result["path_stats"]["qwen4_mtp_round_outcomes"] == "A2"
+    assert result["path_stats"]["qwen4_mtp_idle_head_release_bytes"] == 123
+    assert target.idle_head_releases == 1
     assert target.last_kv.offset == 5
 
 
