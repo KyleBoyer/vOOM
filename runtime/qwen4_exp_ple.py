@@ -10,6 +10,7 @@ Apache-2.0). No model tensor is loaded here.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from functools import cached_property
 import math
 from typing import Mapping, Sequence
 
@@ -172,7 +173,7 @@ class Qwen4ExpPLELayout:
     def bytes_per_token_bf16(self) -> int:
         return self.ngram_heads * self.row_bytes_bf16
 
-    @property
+    @cached_property
     def head_vocab_sizes(self) -> tuple[int, ...]:
         return tuple(
             _find_nth_prime_after(
@@ -182,7 +183,7 @@ class Qwen4ExpPLELayout:
             for head in range(self.ngram_heads)
         )
 
-    @property
+    @cached_property
     def head_offsets(self) -> tuple[int, ...]:
         offsets = []
         total = 0
@@ -191,16 +192,16 @@ class Qwen4ExpPLELayout:
             total += size
         return tuple(offsets)
 
-    @property
+    @cached_property
     def total_vocab_size(self) -> int:
         return sum(self.head_vocab_sizes)
 
-    @property
+    @cached_property
     def padded_vocab_size(self) -> int:
         divisor = self.make_vocab_divisible_by
         return math.ceil(self.total_vocab_size / divisor) * divisor
 
-    @property
+    @cached_property
     def multipliers(self) -> tuple[int, ...]:
         return _build_layer_multipliers(
             self.unigram_vocab_size,

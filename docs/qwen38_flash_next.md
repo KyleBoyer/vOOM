@@ -66,9 +66,10 @@ tensors are three I64 PLE buffers. No unknown dtype was accepted.
 | Router gates | 125,829,120 |
 | QSA indexers | 39,327,744 |
 
-The ten selected routed experts account for about 4.395GiB of released BF16
-weights per layer if every selected expert is cold. That is the first major
-streaming and placement target. The 5.214GB MTP block is too large to make
+At one generated position, ten cold routed experts per layer account for
+4,718,592,000 bytes / 4.395GiB across the complete 48-layer target sweep
+(about 98.3MB per layer), before trunk, shared-expert, and head reads. That is
+the first major streaming and placement target. The 5.214GB MTP block is too large to make
 resident on this 16GB machine; it must remain opt-in and prove that avoided
 target sweeps repay its I/O.
 

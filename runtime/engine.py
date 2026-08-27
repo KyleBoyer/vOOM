@@ -37,7 +37,7 @@ from .weight_cache import WeightCache
 
 _HYBRID_RECURRENT_MODEL_TYPES = frozenset({
     "kimi_linear", "kimi_k3", "qwen3_5_moe", "qwen3_5",
-    "jet_nemotron", "lfm2",
+    "qwen4_exp", "jet_nemotron", "lfm2",
 })
 
 # Deliberately sparse: these are the already-supported Qwen hybrid prefill
@@ -674,6 +674,25 @@ def _gptoss_rope_state(cfg, *, packed: bool):
 class RuntimeConfig:
     max_weight_cache_mb: int = 6000
     mlx_cache_limit_mb: int = 1024
+    # Optional hard Metal ceiling for explicitly memory-bounded profiles.
+    # Zero preserves the device-recommended default used by existing models.
+    # Qwen4's 49K host-spooled prefill sets this to 8.5 GB and also checks the
+    # boundary synchronously at its tile materialization points.
+    metal_limit_mb: int = 0
+    # Exact Qwen4 PLE row reads can issue one tiny random extent per hashed
+    # n-gram row. One preserves the baseline; explicit profiles may overlap
+    # independent preads while retaining identical BF16 row bytes/order.
+    qwen4_ple_read_workers: int = 1
+    # Candidate layer-stationary MoE schedule. Gather only the prompt rows
+    # assigned to each expert and evaluate that expert once per layer instead
+    # of re-uploading every mixed tile for every expert-page batch. The served
+    # target weights remain released BF16; default-off until real checkpoint
+    # row-shape/state oracles prove the changed batch geometry bit-identical.
+    qwen4_global_expert_rows: bool = False
+    # Exact-shape candidate: for each existing tile/expert-page batch, upload
+    # only the union of positions routed to that batch. Every individual
+    # expert still receives the same rows, order, shape, and accumulation.
+    qwen4_sparse_expert_batch_rows: bool = False
     # Opt-in request-local attribution. "" disables it; "layers" records the
     # runtime's existing materialization boundaries; "ops" adds diagnostic
     # attention/router/MLP barriers for supported Qwen/Kimi/GLM hybrid blocks.
@@ -1717,12 +1736,24 @@ class StreamingEngine:
         self._model_dir = self.store.dir
         self.cfg = self.store.config
         _apply_runtime_expert_top_k(self.rc, self.cfg)
+        self._qwen4_ple_rows = None
+        if self.cfg.model_type == "qwen4_exp":
+            from .qwen4_exp_ple_rows import Qwen4ExpPLERowStore
+
+            # The source witness binds all 33 PLE-bearing release shards to the
+            # pinned Hub revision. Row paging is mandatory: loading the table
+            # as an ordinary layer weight would require roughly 95 GiB.
+            self._qwen4_ple_rows = Qwen4ExpPLERowStore(
+                self._model_dir, row_cache=8192, require_release_hash=True,
+                read_workers=self.rc.qwen4_ple_read_workers)
         if (self.rc.paged_kv_persist
                 and self.cfg.model_type not in ("qwen3_5", "qwen3_5_moe")):
             raise ValueError(
                 "paged_kv_persist requires a qwen3_5/qwen3_5_moe hybrid "
                 f"checkpoint, got {self.cfg.model_type!r}")
-        if (self.cfg.model_type in ("kimi_linear", "kimi_k3", "qwen3_5_moe", "qwen3_5")
+        if (self.cfg.model_type in (
+                "kimi_linear", "kimi_k3", "qwen3_5_moe", "qwen3_5",
+                "qwen4_exp")
                 and self.rc.prompt_kv_dir):
             raise ValueError(
                 f"{self.cfg.model_type} recurrent attention state is not "
@@ -1794,7 +1825,8 @@ class StreamingEngine:
                     f"{len(self.cfg.indexer_types)} != {self.cfg.num_hidden_layers}"
                 )
         if (self.cfg.model_type in (
-                "glm_moe_dsa", "kimi_linear", "kimi_k3", "kimi_k25", "qwen3_5_moe")
+                "glm_moe_dsa", "kimi_linear", "kimi_k3", "kimi_k25",
+                "qwen3_5_moe", "qwen4_exp")
                 and self.rc.expert_fetch_batch <= 0):
             # F74-v2 is a safety default for every construction path, including
             # direct experiments and YAML. Leaving zero as "unbounded" silently
@@ -2152,7 +2184,13 @@ class StreamingEngine:
                 "qwen35_serial_verify_suspend_lm_head requires an untied, "
                 "non-streamed, non-reranked pinned Qwen LM head")
 
-        pin_names = ["model.norm.weight"]
+        if self.cfg.model_type == "qwen4_exp":
+            pin_names = self.store.names_with_prefix(
+                "model.hyper_connection_mixer.")
+            if not pin_names:
+                raise ValueError("Qwen4-Exp final hyper mixer is missing")
+        else:
+            pin_names = ["model.norm.weight"]
         if self.rc.pin_embeddings and self._embed_rows is None:
             pin_names.append("model.embed_tokens.weight")
         if ((self.rc.pin_lm_head or self.rc.rerank_lm_head)
@@ -2187,7 +2225,7 @@ class StreamingEngine:
             self._qwen35_lm_head_pin_suspended = True
 
         self._embed_w = persistent.get("model.embed_tokens.weight")
-        self._norm_w = persistent["model.norm.weight"]
+        self._norm_w = persistent.get("model.norm.weight")
         self._lm_head_w = (
             None
             if phase_scoped_qwen_head
@@ -2196,6 +2234,10 @@ class StreamingEngine:
         self._hc_head_fn = persistent.get("model.hc_head_fn")
         self._hc_head_scale = persistent.get("model.hc_head_scale")
         self._hc_head_base = persistent.get("model.hc_head_base")
+        self._qwen4_final_mixer_w = {
+            name: value for name, value in persistent.items()
+            if name.startswith("model.hyper_connection_mixer.")
+        }
         self._output_attn_res_proj_w = persistent.get("model.output_attn_res_proj.weight")
         self._output_attn_res_norm_w = persistent.get("model.output_attn_res_norm.weight")
         self._reranked_lm_head_bytes = 0
@@ -2519,6 +2561,9 @@ class StreamingEngine:
                     self.cache.max_bytes,
                     self.rc.min_weight_cache_mb * 1_000_000,
                 ),
+                metal_limit=(
+                    self.rc.metal_limit_mb * 1_000_000
+                    if self.rc.metal_limit_mb else None),
                 **governor_kwargs,
             )
 
@@ -2604,7 +2649,8 @@ class StreamingEngine:
                         and not self._dsa_elided),
                     require_recurrent=(
                         self.cfg.model_type in (
-                            "kimi_linear", "kimi_k3", "qwen3_5_moe", "qwen3_5")),
+                            "kimi_linear", "kimi_k3", "qwen3_5_moe",
+                            "qwen3_5", "qwen4_exp")),
                     paged_cache_factory=paged_cache_factory,
                 )
             if not self._defer_persisted_kv_until_bootstrap:
@@ -2694,6 +2740,35 @@ class StreamingEngine:
     def _project_dense_text_kv_bytes(
             self, positions: int, *, stable_boundary_positions: int | None = None
     ) -> int:
+        if self.cfg.model_type == "qwen4_exp":
+            full_layers = sum(
+                kind == "full_attention" for kind in self.cfg.layer_types)
+            linear_layers = self.cfg.num_hidden_layers - full_layers
+            attention = (
+                positions * full_layers * 2
+                * self.cfg.num_key_value_heads * self.cfg.head_dim * 2)
+            recurrent = (
+                linear_layers * self.cfg.linear_num_value_heads
+                * self.cfg.linear_key_head_dim
+                * self.cfg.linear_value_head_dim * 4)
+            conv_width = (
+                2 * self.cfg.linear_num_key_heads
+                * self.cfg.linear_key_head_dim
+                + self.cfg.linear_num_value_heads
+                * self.cfg.linear_value_head_dim)
+            recurrent_conv = (
+                linear_layers
+                * max(0, self.cfg.linear_conv_kernel_dim - 1)
+                * conv_width * 2)
+            qsa_aux = positions * full_layers * (
+                self.cfg.qwen4_indexer_kv_heads
+                * self.cfg.qwen4_indexer_head_dim * 2 + 4)
+            ple_conv = (
+                len(self.cfg.qwen4_ple_layers)
+                * max(0, self.cfg.qwen4_ple_conv_kernel_size - 1)
+                * self.cfg.qwen4_ngram_size
+                * self.cfg.qwen4_hc_count * self.cfg.hidden_size * 2)
+            return attention + recurrent + recurrent_conv + qsa_aux + ple_conv
         if self.cfg.model_type in ("qwen3_5_moe", "qwen3_5"):
             layer_types = tuple(self.cfg.layer_types)
             full_layers = sum(
@@ -3071,6 +3146,15 @@ class StreamingEngine:
         if self.cfg.num_experts:
             expert_marker = f".{self.cfg.moe_expert_prefix}."
             names = [n for n in names if expert_marker not in n]
+        if self.cfg.model_type == "qwen4_exp":
+            # PLE's 128 embedding bodies are served by the authenticated
+            # direct-row provider. The small learned projection/norm/conv
+            # tensors remain in this layer page; table metadata and giant row
+            # bodies must never enter the ordinary WeightCache.
+            names = [
+                name for name in names
+                if ".ple.ple_embedding." not in name
+            ]
         if self._dsa_elided:
             # F43: with S bounded <= index_topk the indexer selects every position
             # by construction — its weights can never affect output. Skip the bytes.
@@ -4856,6 +4940,12 @@ class StreamingEngine:
             result = self._embed_rows.lookup(tokens)
         else:
             result = layer_runner.embed(mx.array(tokens), self._embed_weight())
+        if self.cfg.model_type == "qwen4_exp":
+            # PLE consumes the exact ids at its released decoder layer, while
+            # the trunk carries four hyper-connection streams from embedding
+            # through the final mixer.
+            self._qwen4_input_ids = tuple(int(token) for token in tokens)
+            result = mx.tile(result, (1, 1, self.cfg.qwen4_hc_count))
         if self.cfg.mup_enabled:
             # Afmoe (Trinity Nano/Mini): real modeling_afmoe.py applies this
             # ONCE right after embed_tokens, before any layer -- see
@@ -4947,6 +5037,11 @@ class StreamingEngine:
 
     def _final_logits(self, hidden: mx.array, head=None) -> mx.array:
         head = self._lm_head_weight() if head is None else head
+        if self.cfg.model_type == "qwen4_exp":
+            from .qwen4_exp import final_logits
+
+            return final_logits(
+                hidden, self._qwen4_final_mixer_w, head, self.cfg)
         if self.cfg.model_type in ("qwen3_5_moe", "qwen3_5"):
             from .qwen35 import final_logits
 
@@ -5000,6 +5095,11 @@ class StreamingEngine:
 
     def _all_logits(self, hidden: mx.array) -> mx.array:
         head = self._lm_head_weight()
+        if self.cfg.model_type == "qwen4_exp":
+            from .qwen4_exp import all_logits
+
+            return all_logits(
+                hidden, self._qwen4_final_mixer_w, head, self.cfg)
         if self.cfg.model_type in ("qwen3_5_moe", "qwen3_5"):
             from .qwen35 import all_logits
 
@@ -5407,6 +5507,27 @@ class StreamingEngine:
                     fused_attnres_tile_size=(
                         self.rc.kimi_k3_fused_attnres_tile_size),
                 )
+            elif self.cfg.model_type == "qwen4_exp":
+                from .qwen4_exp import run_qwen4_block
+
+                input_ids = getattr(self, "_qwen4_input_ids", ())
+                if len(input_ids) != int(x.shape[1]):
+                    raise ValueError(
+                        "Qwen4 sweep lost its position-aligned input ids")
+                x = run_qwen4_block(
+                    x, input_ids, w, f"model.layers.{i}", self.cfg,
+                    kv, i, offset, self._get_experts,
+                    row_store=self._qwen4_ple_rows,
+                    iter_expert_batches=self._iter_expert_batches,
+                    profile=profiler,
+                    compiled_delta_prefill=(
+                        self.rc.qwen_compiled_delta_prefill),
+                    native_fused_delta_prefill=(
+                        self.rc.qwen_native_fused_delta_prefill),
+                )
+                if last_only:
+                    x = x[:, -1:, :]
+                    self._qwen4_input_ids = (input_ids[-1],)
             elif self.cfg.model_type in ("qwen3_5_moe", "qwen3_5"):
                 from .qwen35 import run_qwen35_block
 
@@ -5889,6 +6010,471 @@ class StreamingEngine:
             del w
         self._restore_aggregate_layer_transient(transient_shape_positions)
         return x
+
+    def _layer_stationary_qwen4_sweep(
+            self, x: mx.array, kv: KVCache, offset: int,
+            tile_width: int, on_progress=None) -> mx.array:
+        """Bounded-position, layer-major prefill for Qwen4-Exp.
+
+        The 49K released-schema capture makes one four-stream hidden state
+        about 1 GiB. Running a whole Qwen4 block on it also materializes PLE,
+        hyper-mixer and attention intermediates; the first real request rose
+        above 12.8 GiB Metal and was stopped. PLE, QSA, DeltaNet and KV update
+        here in causal tile order while each layer trunk remains loaded once.
+        Row-local routed MoE arithmetic retains the original tile shapes, but
+        its union of physical expert pages is fetched once per complete layer,
+        so the 241.6 GB released expert body is not reread per tile.
+
+        The tile arithmetic and complete recurrent endpoint are covered by the
+        real greedy/state oracle. The host-spooled 49K memory shape remains an
+        explicit candidate until its peak/swap and full-response gates clear.
+        """
+        from .qwen4_exp import (
+            apply_ple,
+            hyper_connection_inject,
+            hyper_connection_mix,
+            qwen4_attention_branch,
+        )
+        from .expert_batching import consume_expert_batches
+        from .glm import _group_routes
+        from .layer_runner import _linear, _swiglu
+        from .qwen35 import _route_experts
+        import numpy as np
+
+        if tile_width <= 0:
+            raise ValueError("Qwen4 layer-stationary tile width must be positive")
+        total = int(x.shape[1])
+        input_ids = tuple(getattr(self, "_qwen4_input_ids", ()))
+        if len(input_ids) != total:
+            raise ValueError(
+                "Qwen4 layer-stationary sweep lost position-aligned input ids")
+        profiler = self._request_profiler
+        if profiler is not None:
+            profiler.begin_sweep(total, path="layer_stationary_qwen4")
+
+        spool_h2d_bytes = 0
+        spool_d2h_bytes = 0
+        spool_copy_s = 0.0
+        spool_peak_host_bytes = 0
+        spool_samples = 0
+        spool_expert_row_gathers = 0
+        spool_expert_rows_uploaded = 0
+        spool_expert_batch_tile_gathers = 0
+        spool_expert_batch_tile_rows_uploaded = 0
+        spool_phase_seconds = {
+            "ple": 0.0,
+            "attention": 0.0,
+            "route_and_spool": 0.0,
+            "experts": 0.0,
+            "output": 0.0,
+        }
+        metal_limit_bytes = max(0, int(self.rc.metal_limit_mb)) * 1_000_000
+
+        def note_spool(
+            phase: str, *, layer: int, completed_tokens: int = 0,
+            host_bytes: int = 0, publish: bool = True,
+        ) -> None:
+            """Publish content-blind memory progress and enforce the cap."""
+            nonlocal spool_samples
+            active = int(mx.get_active_memory())
+            peak = int(mx.get_peak_memory())
+            observed = max(active, peak)
+            spool_samples += 1
+            self._note_true_peak()
+            progress = {
+                "phase": "prefill_layer",
+                "diagnostic": "qwen4_host_spool",
+                "subphase": phase,
+                "layer": int(layer),
+                "completed_layers": max(0, int(layer)),
+                "total_layers": self.cfg.num_hidden_layers,
+                "completed_tokens": int(completed_tokens),
+                "total_tokens": total,
+                "active_metal_bytes": active,
+                "peak_metal_bytes": peak,
+                "host_spool_bytes": int(host_bytes),
+                "metal_limit_bytes": metal_limit_bytes,
+                "cache_source": "cold",
+            }
+            if publish and on_progress is not None:
+                on_progress(progress)
+            if metal_limit_bytes and observed > metal_limit_bytes:
+                raise MemoryError(
+                    "Qwen4 host-spooled prefill crossed its hard Metal cap: "
+                    f"phase={phase} layer={layer} tokens={completed_tokens} "
+                    f"observed={observed} limit={metal_limit_bytes}")
+
+        def host_bits(value: mx.array) -> np.ndarray:
+            """Copy exact BF16 payload out of Metal without FP conversion."""
+            nonlocal spool_d2h_bytes, spool_copy_s
+            if value.dtype != mx.bfloat16:
+                raise TypeError(
+                    "Qwen4 host spool requires released BF16 activations, "
+                    f"got {value.dtype}")
+            started = time.perf_counter()
+            mx.eval(value)
+            result = np.array(
+                np.asarray(value.view(mx.uint16)), dtype=np.uint16, copy=True)
+            spool_d2h_bytes += int(result.nbytes)
+            spool_copy_s += time.perf_counter() - started
+            return result
+
+        def metal_bits(value: np.ndarray) -> mx.array:
+            nonlocal spool_h2d_bytes, spool_copy_s
+            started = time.perf_counter()
+            result = mx.array(value, dtype=mx.uint16).view(mx.bfloat16)
+            mx.eval(result)
+            spool_h2d_bytes += int(value.nbytes)
+            spool_copy_s += time.perf_counter() - started
+            return result
+
+        # One prompt-sized host copy is intentionally retained while Metal
+        # owns only bounded tiles. On this model the four-stream 49K hidden is
+        # ~1.01GB; retaining all seven Metal tiles and their lazy parents was
+        # measured at 14.4GB. Host uint16 preserves every released BF16 bit.
+        # Each causal tile's input is dead after its attention/recurrent state
+        # update, so the same host allocation is overwritten first with the
+        # post-attention bits and later with the final layer-output bits. This
+        # avoids a second prompt-sized host array without changing arithmetic,
+        # tile boundaries, or any BF16 payload.
+        hidden_host = host_bits(x)
+        spool_peak_host_bytes = int(hidden_host.nbytes)
+        note_spool(
+            "initial_hidden", layer=0, completed_tokens=total,
+            host_bytes=spool_peak_host_bytes)
+
+        for i in range(self.cfg.num_hidden_layers):
+            self._select_layer_transient(total, i)
+            cache_before = (
+                profiler.cache_snapshot(self.cache)
+                if profiler is not None else None)
+            layer_key = self._layer_key(i)
+            layer_names = self._layer_names(i)
+            wait_t0 = time.perf_counter()
+            if not self.cache.contains(layer_key):
+                incoming_page = self._layer_fetch_bytes_estimate(i)
+                if incoming_page:
+                    self.cache.prepare_for(incoming_page)
+                    if self.governor is not None:
+                        self.governor.reserve(
+                            incoming_page, reason="qwen4-prefill-layer-page")
+            w = self.cache.get(layer_key, layer_names)
+            weight_wait_s = time.perf_counter() - wait_t0
+            self.timer.add("weights_wait", weight_wait_s)
+
+            active_before = mx.get_active_memory()
+            mx.reset_peak_memory()
+            compute_t0 = time.perf_counter()
+            prefix = f"model.layers.{i}"
+
+            if (i in self.cfg.qwen4_ple_layers
+                    and self._qwen4_ple_rows is None):
+                raise ValueError(
+                    "Qwen4 layer-stationary PLE is missing its row store")
+
+            # Preserve every row-local operator's original tile shape. Spill
+            # evaluated intermediates to host BF16 bits between phases so no
+            # prompt-sized MLX graph/list survives across tiles.
+            mixed_host = np.empty(
+                (1, total, self.cfg.hidden_size), dtype=np.uint16)
+            injection_host = np.empty(
+                (1, total, self.cfg.qwen4_hc_count), dtype=np.uint16)
+            spool_peak_host_bytes = max(
+                spool_peak_host_bytes,
+                int(hidden_host.nbytes
+                    + mixed_host.nbytes + injection_host.nbytes))
+            records = []
+            global_positions: dict[int, list[int]] = {}
+            global_routes: dict[int, list[tuple[int, float]]] = {}
+            for pos in range(0, total, tile_width):
+                end = min(pos + tile_width, total)
+                source = metal_bits(hidden_host[:, pos:end])
+                phase_started = time.perf_counter()
+                if i in self.cfg.qwen4_ple_layers:
+                    ple = apply_ple(
+                        source, input_ids[pos:end], w, f"{prefix}.ple",
+                        self.cfg, i, self._qwen4_ple_rows,
+                        getattr(kv, "qwen4_cache", None))
+                    source = source + ple
+                    mx.eval(source)
+                    spool_phase_seconds["ple"] += (
+                        time.perf_counter() - phase_started)
+                phase_started = time.perf_counter()
+                mixed, hyper_input, injection = hyper_connection_mix(
+                    source, w, f"{prefix}.attn_hyper_connection", self.cfg)
+                mx.eval(mixed, injection)
+                branch = qwen4_attention_branch(
+                    mixed, w, prefix, self.cfg, kv, i, offset + pos,
+                    compiled_delta_prefill=(
+                        self.rc.qwen_compiled_delta_prefill),
+                    native_fused_delta_prefill=(
+                        self.rc.qwen_native_fused_delta_prefill))
+                post_attention = hyper_connection_inject(
+                    branch, hyper_input, injection)
+                mx.eval(post_attention)
+                spool_phase_seconds["attention"] += (
+                    time.perf_counter() - phase_started)
+                phase_started = time.perf_counter()
+                mixed, hyper_input, injection = hyper_connection_mix(
+                    post_attention, w,
+                    f"{prefix}.mlp_hyper_connection", self.cfg)
+                indices, scores = _route_experts(
+                    mixed, w, prefix, self.cfg, i)
+                mx.eval(mixed, injection, indices, scores)
+                groups = _group_routes(indices, scores)
+                # ``source`` has been evaluated and the causal state for this
+                # tile has already been committed. No later tile reads the old
+                # host slice, so replace it with the exact post-attention bits.
+                hidden_host[:, pos:end] = host_bits(post_attention)
+                mixed_host[:, pos:end] = host_bits(mixed)
+                injection_host[:, pos:end] = host_bits(injection)
+                for expert, rows in groups.items():
+                    global_positions.setdefault(int(expert), []).extend(
+                        pos + int(row) for row, _weight in rows)
+                    global_routes.setdefault(int(expert), []).extend(
+                        (pos + int(row), float(weight))
+                        for row, weight in rows)
+                records.append({
+                    "start": pos,
+                    "end": end,
+                    "groups": groups,
+                    "routed": mx.zeros(
+                        (1, end - pos, self.cfg.hidden_size),
+                        dtype=mx.bfloat16),
+                })
+                source = ple = mixed = hyper_input = injection = None
+                branch = post_attention = indices = scores = None
+                mx.clear_cache()
+                spool_phase_seconds["route_and_spool"] += (
+                    time.perf_counter() - phase_started)
+                note_spool(
+                    "attention_tile", layer=i, completed_tokens=end,
+                    host_bytes=spool_peak_host_bytes,
+                    publish=(pos == 0 or end == total
+                             or end % (tile_width * 8) == 0))
+
+            expert_ids = sorted(global_positions)
+            batches = self._iter_expert_batches(
+                i, expert_ids, positions=global_positions)
+            expert_batches_done = 0
+
+            def consume_batch(batch_ids, experts):
+                nonlocal expert_batches_done
+                nonlocal spool_expert_row_gathers
+                nonlocal spool_expert_rows_uploaded
+                nonlocal spool_expert_batch_tile_gathers
+                nonlocal spool_expert_batch_tile_rows_uploaded
+                if self.rc.qwen4_global_expert_rows:
+                    # For a long prompt, virtually every 16-expert page batch
+                    # touches every position at least once. The baseline thus
+                    # uploads the complete mixed tile for all 32 batches. This
+                    # schedule gathers only the rows routed to one expert and
+                    # evaluates that expert once over the complete prompt.
+                    # Routes retain tile order, and each per-tile accumulator
+                    # is updated in the same ascending expert-id order.
+                    for expert in batch_ids:
+                        routes = global_routes.get(int(expert), ())
+                        if not routes:
+                            continue
+                        positions = [position for position, _ in routes]
+                        mixed_rows = metal_bits(mixed_host[:, positions])
+                        route_weights = mx.array(
+                            [weight for _, weight in routes],
+                            dtype=mixed_rows.dtype)
+                        expert_prefix = f"{prefix}.mlp.experts.{expert}"
+                        contribution = _swiglu(
+                            mixed_rows, experts[expert], expert_prefix)
+                        weighted = (
+                            contribution * route_weights[None, :, None])
+                        mx.eval(weighted)
+                        spool_expert_row_gathers += 1
+                        spool_expert_rows_uploaded += len(positions)
+
+                        cursor = 0
+                        touched = []
+                        for record in records:
+                            rows = record["groups"].get(expert)
+                            if not rows:
+                                continue
+                            count = len(rows)
+                            local_positions = [
+                                int(position) for position, _ in rows]
+                            record["routed"] = record["routed"].at[
+                                :, local_positions, :].add(
+                                    weighted[:, cursor:cursor + count, :])
+                            touched.append(record["routed"])
+                            cursor += count
+                        if cursor != len(routes):
+                            raise RuntimeError(
+                                "Qwen4 global expert route gather lost rows")
+                        if touched:
+                            mx.eval(*touched)
+                        mixed_rows = route_weights = None
+                        contribution = weighted = touched = None
+                        mx.clear_cache()
+                    expert_batches_done += 1
+                    if (expert_batches_done == 1
+                            or expert_batches_done % 8 == 0):
+                        note_spool(
+                            "expert_batch", layer=i, completed_tokens=total,
+                            host_bytes=spool_peak_host_bytes)
+                    return
+                # Evaluate one tile before loading the next. A union batch's
+                # released pages remain shared, while routed accumulation has
+                # the same expert-id order and tile shapes as chunk-major.
+                for record in records:
+                    start, end = record["start"], record["end"]
+                    if self.rc.qwen4_sparse_expert_batch_rows:
+                        batch_positions = sorted({
+                            int(position)
+                            for expert in batch_ids
+                            for position, _weight in (
+                                record["groups"].get(expert) or ())
+                        })
+                        if not batch_positions:
+                            continue
+                        compact_position = {
+                            position: compact
+                            for compact, position in enumerate(batch_positions)
+                        }
+                        mixed_tile = metal_bits(
+                            mixed_host[:, start:end][:, batch_positions])
+                        spool_expert_batch_tile_gathers += 1
+                        spool_expert_batch_tile_rows_uploaded += len(
+                            batch_positions)
+                    else:
+                        compact_position = None
+                        mixed_tile = metal_bits(mixed_host[:, start:end])
+                    for expert in batch_ids:
+                        rows = record["groups"].get(expert)
+                        if not rows:
+                            continue
+                        expert_prefix = f"{prefix}.mlp.experts.{expert}"
+                        positions = [int(position) for position, _ in rows]
+                        source_positions = (
+                            positions if compact_position is None else
+                            [compact_position[position]
+                             for position in positions])
+                        route_weights = mx.array(
+                            [weight for _, weight in rows],
+                            dtype=mixed_tile.dtype)
+                        contribution = _swiglu(
+                            mixed_tile[:, source_positions],
+                            experts[expert], expert_prefix)
+                        record["routed"] = record["routed"].at[
+                            :, positions, :].add(
+                                contribution * route_weights[None, :, None])
+                    mx.eval(record["routed"])
+                    mixed_tile = contribution = route_weights = None
+                    mx.clear_cache()
+                expert_batches_done += 1
+                if expert_batches_done == 1 or expert_batches_done % 8 == 0:
+                    note_spool(
+                        "expert_batch", layer=i, completed_tokens=total,
+                        host_bytes=spool_peak_host_bytes)
+
+            phase_started = time.perf_counter()
+            # The layer transient learned above is the attention/GDN tile
+            # peak (4.9GB on the real 49K capture). Those graphs have already
+            # been evaluated, copied to host, and cleared before routed expert
+            # pages are fetched; charging that dead phase to every expert
+            # batch produced a false 3.56GB reservation and aborted at layer
+            # four while live Metal was only 1.62GB. Bound only the incremental
+            # expert-phase scratch here. The 640MB allowance exceeds the
+            # measured active rise (~411MB) and the released 16-expert BF16
+            # page payload (~157MB); the hard 8.5GB sampler remains in force.
+            attention_transient = self._layer_transient
+            self._layer_transient = 640_000_000
+            try:
+                consume_expert_batches(batches, consume_batch)
+            finally:
+                self._layer_transient = attention_transient
+            spool_phase_seconds["experts"] += (
+                time.perf_counter() - phase_started)
+
+            phase_started = time.perf_counter()
+            for record in records:
+                start, end = record["start"], record["end"]
+                mixed = metal_bits(mixed_host[:, start:end])
+                hyper_input = metal_bits(hidden_host[:, start:end])
+                injection = metal_bits(injection_host[:, start:end])
+                shared = _swiglu(
+                    mixed, w, f"{prefix}.mlp.shared_expert")
+                shared_gate = mx.sigmoid(_linear(
+                    mixed, w, f"{prefix}.mlp.shared_expert_gate"))
+                branch = record["routed"] + shared_gate * shared
+                output = hyper_connection_inject(
+                    branch, hyper_input, injection)
+                mx.eval(output)
+                # The post-attention slice has been copied into Metal and is
+                # no longer needed after injection; replace it in place with
+                # the exact final layer-output bits.
+                hidden_host[:, start:end] = host_bits(output)
+                mixed = hyper_input = injection = None
+                shared = shared_gate = branch = output = None
+                record["routed"] = None
+                mx.clear_cache()
+                note_spool(
+                    "output_tile", layer=i, completed_tokens=end,
+                    host_bytes=spool_peak_host_bytes,
+                    publish=(start == 0 or end == total
+                             or end % (tile_width * 8) == 0))
+            spool_phase_seconds["output"] += (
+                time.perf_counter() - phase_started)
+            mixed_host = injection_host = None
+            records.clear()
+
+            compute_s = time.perf_counter() - compute_t0
+            self.timer.add("layer_compute", compute_s)
+            if profiler is not None:
+                profiler.record_layer(
+                    i, positions=total, weight_wait_s=weight_wait_s,
+                    compute_s=compute_s, cache_before=cache_before,
+                    cache_after=profiler.cache_snapshot(self.cache),
+                    layer_type=self._profile_layer_type(i))
+            if on_progress is not None:
+                on_progress({
+                    "phase": "prefill_layer",
+                    "completed_layers": i + 1,
+                    "total_layers": self.cfg.num_hidden_layers,
+                    "total_tokens": total,
+                    "cache_source": "cold",
+                })
+            note_spool(
+                "layer_complete", layer=i + 1, completed_tokens=total,
+                host_bytes=spool_peak_host_bytes)
+            self._record_layer_transient(
+                total, i,
+                _resident_adjusted_transient(
+                    active_before, mx.get_active_memory(),
+                    mx.get_peak_memory()))
+            self._note_true_peak()
+            del w
+            mx.clear_cache()
+        self._restore_aggregate_layer_transient(total)
+        self._qwen4_host_spool_stats = {
+            "h2d_bytes": spool_h2d_bytes,
+            "d2h_bytes": spool_d2h_bytes,
+            "copy_seconds": spool_copy_s,
+            "peak_host_bytes": spool_peak_host_bytes,
+            "memory_samples": spool_samples,
+            "global_expert_rows": int(self.rc.qwen4_global_expert_rows),
+            "expert_row_gathers": spool_expert_row_gathers,
+            "expert_rows_uploaded": spool_expert_rows_uploaded,
+            "sparse_expert_batch_rows": int(
+                self.rc.qwen4_sparse_expert_batch_rows),
+            "expert_batch_tile_gathers": spool_expert_batch_tile_gathers,
+            "expert_batch_tile_rows_uploaded": (
+                spool_expert_batch_tile_rows_uploaded),
+            **{
+                f"{name}_seconds": round(seconds, 6)
+                for name, seconds in spool_phase_seconds.items()
+            },
+        }
+        # All causal state covers the complete prompt; only the final hidden
+        # row is consumed by the output mixer/head at this endpoint.
+        self._qwen4_input_ids = (input_ids[-1],)
+        return metal_bits(hidden_host[:, -1:])
 
     def _layer_stationary_gptoss_sweep(
             self, x: mx.array, kv: KVCache, offset: int,
@@ -8081,6 +8667,11 @@ class StreamingEngine:
                     self.rc.kimi_k3_kda_spill_dir
                     if self.cfg.model_type == "kimi_k3" else ""),
             )
+        if self.cfg.model_type == "qwen4_exp":
+            from .qwen4_exp_state import Qwen4ExpStateCache
+
+            kv.qwen4_cache = Qwen4ExpStateCache(
+                self.cfg.num_hidden_layers)
         return kv
 
     def _configure_restored_k3_spill(self, kv: KVCache) -> KVCache:
@@ -8155,6 +8746,17 @@ class StreamingEngine:
         is never passed to `on_token` (streaming clients never see past the
         stop point)."""
         request_t0 = time.perf_counter()
+        qwen4_expert_before = (
+            self.store.qwen4_fused_expert_snapshot()
+            if self.cfg.model_type == "qwen4_exp" else None)
+        qwen4_ple_before = (
+            self._qwen4_ple_rows.telemetry()
+            if self._qwen4_ple_rows is not None else None)
+        if self.cfg.model_type == "qwen4_exp":
+            self._qwen4_host_spool_stats = {
+                "h2d_bytes": 0, "d2h_bytes": 0,
+                "copy_seconds": 0.0, "peak_host_bytes": 0,
+            }
         self._request_profiler = (
             telemetry.RequestProfiler(self.rc.execution_profile)
             if self.rc.execution_profile else None)
@@ -8518,7 +9120,8 @@ class StreamingEngine:
         # endpoint and extended with a suffix. Candidate selection below
         # limits hybrid models to those two no-trim cases.
         recurrent_exact_only = self.cfg.model_type in (
-            "kimi_linear", "kimi_k3", "qwen3_5_moe", "qwen3_5", "jet_nemotron")
+            "kimi_linear", "kimi_k3", "qwen3_5_moe", "qwen3_5",
+            "qwen4_exp", "jet_nemotron")
         hot_eligible = bool(
             self.rc.hot_prompt_kv
             and (not self.rc.max_kv_mb or self.rc.paged_kv_persist)
@@ -9388,7 +9991,7 @@ class StreamingEngine:
                     boundary_layer_stationary = (
                         self.rc.layer_stationary_prefill
                         and self.cfg.model_type in (
-                            "qwen3_5", "qwen3_5_moe", "gpt_oss",
+                            "qwen3_5", "qwen3_5_moe", "qwen4_exp", "gpt_oss",
                             "kimi_linear", "kimi_k3",
                             "glm_moe_dsa", "kimi_k25", "glm4_moe_lite")
                         and not self.rc.adaptive_chunk_size
@@ -9441,6 +10044,11 @@ class StreamingEngine:
                                 on_progress=on_progress)
                         elif self.cfg.model_type == "gpt_oss":
                             bx = self._layer_stationary_gptoss_sweep(
+                                bx, kv, offset=pos,
+                                tile_width=boundary_chunk,
+                                on_progress=on_progress)
+                        elif self.cfg.model_type == "qwen4_exp":
+                            bx = self._layer_stationary_qwen4_sweep(
                                 bx, kv, offset=pos,
                                 tile_width=boundary_chunk,
                                 on_progress=on_progress)
@@ -9587,7 +10195,7 @@ class StreamingEngine:
                 bool(chunk)
                 and self.rc.layer_stationary_prefill
                 and self.cfg.model_type in (
-                    "qwen3_5", "qwen3_5_moe", "gpt_oss",
+                    "qwen3_5", "qwen3_5_moe", "qwen4_exp", "gpt_oss",
                     "kimi_linear", "kimi_k3", "deepseek_v4",
                     "glm_moe_dsa", "kimi_k25", "glm4_moe_lite")
                 and adaptive is None
@@ -9601,7 +10209,7 @@ class StreamingEngine:
                 if not self.rc.layer_stationary_prefill:
                     blockers.append("disabled")
                 if self.cfg.model_type not in (
-                        "qwen3_5", "qwen3_5_moe", "gpt_oss",
+                        "qwen3_5", "qwen3_5_moe", "qwen4_exp", "gpt_oss",
                         "kimi_linear", "kimi_k3", "deepseek_v4",
                         "glm_moe_dsa", "kimi_k25", "glm4_moe_lite"):
                     blockers.append("architecture")
@@ -9664,6 +10272,10 @@ class StreamingEngine:
                             on_progress=on_progress)
                     elif self.cfg.model_type == "gpt_oss":
                         xc = self._layer_stationary_gptoss_sweep(
+                            xc, kv, offset=pos, tile_width=chunk,
+                            on_progress=on_progress)
+                    elif self.cfg.model_type == "qwen4_exp":
+                        xc = self._layer_stationary_qwen4_sweep(
                             xc, kv, offset=pos, tile_width=chunk,
                             on_progress=on_progress)
                     elif self.cfg.model_type in (
@@ -10478,6 +11090,9 @@ class StreamingEngine:
             recurrent_state = getattr(kv, "kda_cache", None)
             if recurrent_state is not None:
                 recurrent_state.synchronize()
+            qwen4_state = getattr(kv, "qwen4_cache", None)
+            if qwen4_state is not None:
+                qwen4_state.synchronize()
             full_tokens = tuple(tokens + generated[:-1])
             segment_chain: tuple[str, ...] = ()
             if self._hot_kv_persist is not None:
@@ -10493,7 +11108,8 @@ class StreamingEngine:
                 # recurrent checkpoint payload rather than duplicating prefix
                 # KV bytes.
                 stable_boundary_available = bool(
-                    self.cfg.model_type in ("qwen3_5", "qwen3_5_moe")
+                    self.cfg.model_type in (
+                        "qwen3_5", "qwen3_5_moe", "qwen4_exp")
                     and boundary_fork_kv is not None
                     and 0 < boundary_fork_tokens <= len(tokens)
                 )
@@ -10511,6 +11127,13 @@ class StreamingEngine:
                         raise RuntimeError(
                             "Qwen stable boundary is missing recurrent state")
                     boundary_recurrent.synchronize()
+                    boundary_qwen4 = getattr(
+                        boundary_fork_kv, "qwen4_cache", None)
+                    if self.cfg.model_type == "qwen4_exp":
+                        if boundary_qwen4 is None:
+                            raise RuntimeError(
+                                "Qwen4 stable boundary is missing QSA/PLE state")
+                        boundary_qwen4.synchronize()
                     boundary_segment_chain = self._hot_kv_persist.save(
                         parent_chain=persist_parent_chain,
                         parent_covered=persist_parent_covered,
@@ -10636,6 +11259,31 @@ class StreamingEngine:
         _record_cache_io_delta(
             self, prefill_cache_after, path_stats, prefix="decode_",
             after=request_cache_after)
+        if qwen4_expert_before is not None:
+            qwen4_expert_after = self.store.qwen4_fused_expert_snapshot()
+            for key in ("calls", "extents", "requested_tensors", "bytes"):
+                path_stats[f"qwen4_fused_expert_{key}"] = max(
+                    0, int(qwen4_expert_after[key])
+                    - int(qwen4_expert_before[key]))
+            path_stats["qwen4_fused_expert_virtual_tensors"] = int(
+                qwen4_expert_after["virtual_tensors"])
+        if qwen4_ple_before is not None:
+            qwen4_ple_after = self._qwen4_ple_rows.telemetry()
+            for key in (
+                "read_calls", "read_extents", "rows_requested",
+                "unique_rows_read", "bytes_read", "cache_hits",
+            ):
+                path_stats[f"qwen4_ple_{key}"] = max(
+                    0, int(qwen4_ple_after[key])
+                    - int(qwen4_ple_before[key]))
+            path_stats["qwen4_ple_source_fingerprint"] = (
+                qwen4_ple_after["source_fingerprint"])
+            path_stats["qwen4_ple_source_revision"] = (
+                qwen4_ple_after["source_revision"])
+            path_stats["qwen4_ple_source_verified_release_hash"] = int(
+                qwen4_ple_after["source_verified_release_hash"])
+            for key, value in self._qwen4_host_spool_stats.items():
+                path_stats[f"qwen4_host_spool_{key}"] = value
         if reranked_telemetry_before:
             reranked_after = reranked_head.telemetry_snapshot()
             for key, value in reranked_after.items():
@@ -11094,6 +11742,9 @@ class StreamingEngine:
             self._streamed_lm_head.close()
         if self._embed_rows is not None:
             self._embed_rows.close()
+        if self._qwen4_ple_rows is not None:
+            self._qwen4_ple_rows.close()
+            self._qwen4_ple_rows = None
         close_store = getattr(self.store, "close", None)
         if close_store is not None:
             close_store()

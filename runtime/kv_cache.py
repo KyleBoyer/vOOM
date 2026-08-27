@@ -91,6 +91,9 @@ class KVCache:
         recurrent = getattr(self, "kda_cache", None)
         if recurrent is not None:
             total += recurrent.nbytes()
+        qwen4 = getattr(self, "qwen4_cache", None)
+        if qwen4 is not None:
+            total += qwen4.nbytes()
         return total
 
     def allocated_nbytes(self) -> int:
@@ -115,6 +118,12 @@ class KVCache:
             if not callable(fork_recurrent):
                 raise TypeError("recurrent KV companion cannot be forked")
             branch.kda_cache = fork_recurrent()
+        qwen4 = getattr(self, "qwen4_cache", None)
+        if qwen4 is not None:
+            fork_qwen4 = getattr(qwen4, "fork", None)
+            if not callable(fork_qwen4):
+                raise TypeError("Qwen4 auxiliary KV state cannot be forked")
+            branch.qwen4_cache = fork_qwen4()
         return branch
 
     def update_latent(self, layer: int, lat):
@@ -156,6 +165,9 @@ class KVCache:
         dsa = getattr(self, "dsa", None)
         if dsa is not None:
             dsa.trim(length)
+        qwen4 = getattr(self, "qwen4_cache", None)
+        if qwen4 is not None:
+            qwen4.trim(length)
 
     def layer_lengths(self) -> tuple[int, ...]:
         """Return each layer's local append length.
@@ -263,6 +275,9 @@ def fork_hybrid_kv_endpoint(kv: "KVCache") -> "KVCache":
     snapshot.values = list(kv.values)
     snapshot.compressed_mla = kv.compressed_mla
     snapshot.kda_cache = recurrent.fork()
+    qwen4 = getattr(kv, "qwen4_cache", None)
+    if qwen4 is not None:
+        snapshot.qwen4_cache = qwen4.fork()
     arrays = [
         value for value in (*snapshot.keys, *snapshot.values)
         if value is not None

@@ -83,6 +83,15 @@ def test_budgeted_selection_balances_layers():
     assert selected_by_layer == {0: 60, 1: 60}
 
 
+def test_fast_tier_excludes_qwen4_direct_ple_rows():
+    from formats.kimi_k3_fast_tier import _category
+
+    assert _category(
+        "model.layers.1.ple.embedding.weight") is None
+    assert _category(
+        "model.layers.1.self_attn.q_proj.weight") == "keep"
+
+
 def test_budgeted_selection_balances_qwen_multimodal_wrapper_layers():
     """Qwen uses model.language_model.layers, unlike K3's older fixture."""
     from formats.kimi_k3_fast_tier import _select_budgeted

@@ -1026,7 +1026,7 @@ def _qwen_compiled_delta_policy(
     requested = str(requested or "0").strip().lower()
     if requested not in ("0", "1"):
         raise ValueError("VMODEL_QWEN35_COMPILED_DELTA must be 0 or 1")
-    if model_type not in ("qwen3_5", "qwen3_5_moe"):
+    if model_type not in ("qwen3_5", "qwen3_5_moe", "qwen4_exp"):
         return False, "unsupported-architecture"
     if requested == "0":
         return False, "operator-disabled"
@@ -1190,6 +1190,36 @@ class EngineManager:
                     "VMODEL_FAST_LONG_YARN_FACTOR must be finite and greater than 1")
         resident_backend_request = os.environ.get(
             "VMODEL_RESIDENT_BACKEND", "auto").strip().lower()
+        # Qwen3.8-Flash-Next is a distinct Qwen4-Exp hybrid. Keep its first
+        # rollout knobs in the engine identity so changing an instrumented
+        # paging profile can never silently reuse an engine built under a
+        # different memory/I/O schedule.
+        qwen4_request_identity = tuple(
+            os.environ.get(name, default).strip()
+            for name, default in (
+                ("VMODEL_QWEN4_WEIGHT_CACHE_MB", "300"),
+                ("VMODEL_QWEN4_MIN_WEIGHT_CACHE_MB", "64"),
+                ("VMODEL_QWEN4_MLX_CACHE_MB", "128"),
+                ("VMODEL_QWEN4_PREFILL_CHUNK", "8192"),
+                ("VMODEL_QWEN4_EXPERT_FETCH_BATCH", "16"),
+                ("VMODEL_QWEN4_DECODE_EXPERT_FETCH_BATCH", "16"),
+                ("VMODEL_QWEN4_PREFETCH_DEPTH", "0"),
+                ("VMODEL_QWEN4_PREFETCH_WORKERS", "1"),
+                ("VMODEL_QWEN4_PLE_READ_WORKERS", "1"),
+                ("VMODEL_QWEN4_MAX_METAL_MB", "8500"),
+                ("VMODEL_QWEN4_SPARSE_EXPERT_BATCH_ROWS", "0"),
+                ("VMODEL_QWEN4_GLOBAL_EXPERT_ROWS", "0"),
+                ("VMODEL_QWEN4_COMPILED_DELTA", "0"),
+                ("VMODEL_QWEN4_FAST_TIER_DIR", ""),
+                ("VMODEL_QWEN4_PARALLEL_STORAGE_READS", "0"),
+                ("VMODEL_QWEN4_HOT_PROMPT_KV", "0"),
+                ("VMODEL_QWEN4_HOT_KV_SLOTS", "1"),
+                ("VMODEL_QWEN4_HOT_KV_MIN_TOKENS", "2048"),
+                ("VMODEL_QWEN4_HOT_KV_PERSIST_DIR", ""),
+                ("VMODEL_QWEN4_HOT_KV_PERSIST_MAX_CHECKPOINTS", "4"),
+                ("VMODEL_QWEN4_HOT_KV_PERSIST_MAX_MB", "8192"),
+            )
+        )
         dspark_request_identity = tuple(
             os.environ.get(name, default).strip()
             for name, default in (
@@ -1931,6 +1961,7 @@ class EngineManager:
         key = (
             str(model_dir), mode, yarn_factor.hex(),
             bool(requires_vision), resident_backend_request,
+            qwen4_request_identity,
             dspark_request_identity,
             dflash2_draft_request,
             dflash2_max_draft_tokens,
@@ -2039,6 +2070,7 @@ class EngineManager:
         key = (
             str(model_dir), mode, yarn_factor.hex(),
             bool(requires_vision), resident_backend_request,
+            qwen4_request_identity,
             dspark_request_identity,
             dflash2_draft_request,
             dflash2_max_draft_tokens,
@@ -2640,6 +2672,140 @@ class EngineManager:
                 rc.prefetch_depth = (
                     1 if native_ct_mxfp4_request == "1" else 0)
                 rc.prefetch_workers = 1
+            elif mtype == "qwen4_exp":
+                # Qwen3.8-Flash-Next / Qwen4-Exp is a released-BF16 sparse
+                # hybrid: 36 sigmoid-gated DeltaNet layers, 12 QSA layers,
+                # 512 routed experts (top 10), and a 95 GiB exact PLE table.
+                # The first server profile is deliberately ordinary and
+                # content-blind. It pages the fused expert slices and direct
+                # PLE rows from their authenticated released bytes, keeps no
+                # giant embedding/head resident, and does not enable prompt
+                # routing, pruning, MTP, or approximate kernels.
+                labels = (
+                    "VMODEL_QWEN4_WEIGHT_CACHE_MB",
+                    "VMODEL_QWEN4_MIN_WEIGHT_CACHE_MB",
+                    "VMODEL_QWEN4_MLX_CACHE_MB",
+                    "VMODEL_QWEN4_PREFILL_CHUNK",
+                    "VMODEL_QWEN4_EXPERT_FETCH_BATCH",
+                    "VMODEL_QWEN4_DECODE_EXPERT_FETCH_BATCH",
+                    "VMODEL_QWEN4_PREFETCH_DEPTH",
+                    "VMODEL_QWEN4_PREFETCH_WORKERS",
+                    "VMODEL_QWEN4_PLE_READ_WORKERS",
+                    "VMODEL_QWEN4_MAX_METAL_MB",
+                )
+                try:
+                    (
+                        rc.max_weight_cache_mb,
+                        rc.min_weight_cache_mb,
+                        rc.mlx_cache_limit_mb,
+                        rc.prefill_chunk_size,
+                        rc.expert_fetch_batch,
+                        rc.decode_expert_fetch_batch,
+                        rc.prefetch_depth,
+                        rc.prefetch_workers,
+                        rc.qwen4_ple_read_workers,
+                        rc.metal_limit_mb,
+                    ) = tuple(int(value) for value in qwen4_request_identity[:10])
+                except ValueError as error:
+                    raise RequestValidationError(
+                        "Qwen4 runtime settings must be integers"
+                    ) from error
+                bounds = (
+                    (64, 2000), (0, 2000), (64, 1024), (1, 8192),
+                    (1, 64), (1, 64), (0, 4), (1, 4), (1, 16),
+                    (1000, 8500),
+                )
+                for label, value, (minimum, maximum) in zip(
+                    labels,
+                    (
+                        rc.max_weight_cache_mb,
+                        rc.min_weight_cache_mb,
+                        rc.mlx_cache_limit_mb,
+                        rc.prefill_chunk_size,
+                        rc.expert_fetch_batch,
+                        rc.decode_expert_fetch_batch,
+                        rc.prefetch_depth,
+                        rc.prefetch_workers,
+                        rc.qwen4_ple_read_workers,
+                        rc.metal_limit_mb,
+                    ),
+                    bounds,
+                ):
+                    if not minimum <= value <= maximum:
+                        raise RequestValidationError(
+                            f"{label} must be in [{minimum}, {maximum}]")
+                if rc.min_weight_cache_mb > rc.max_weight_cache_mb:
+                    raise RequestValidationError(
+                        "VMODEL_QWEN4_MIN_WEIGHT_CACHE_MB cannot exceed "
+                        "VMODEL_QWEN4_WEIGHT_CACHE_MB")
+                if qwen4_request_identity[10] not in ("0", "1"):
+                    raise RequestValidationError(
+                        "VMODEL_QWEN4_SPARSE_EXPERT_BATCH_ROWS must be 0 or 1")
+                rc.qwen4_sparse_expert_batch_rows = (
+                    qwen4_request_identity[10] == "1")
+                if qwen4_request_identity[11] not in ("0", "1"):
+                    raise RequestValidationError(
+                        "VMODEL_QWEN4_GLOBAL_EXPERT_ROWS must be 0 or 1")
+                rc.qwen4_global_expert_rows = (
+                    qwen4_request_identity[11] == "1")
+                if qwen4_request_identity[12] not in ("0", "1"):
+                    raise RequestValidationError(
+                        "VMODEL_QWEN4_COMPILED_DELTA must be 0 or 1")
+                if qwen4_request_identity[14] not in ("0", "1"):
+                    raise RequestValidationError(
+                        "VMODEL_QWEN4_PARALLEL_STORAGE_READS must be 0 or 1")
+                fast_tier_request = qwen4_request_identity[13]
+                if fast_tier_request:
+                    fast_tier = Path(fast_tier_request).expanduser()
+                    if not (fast_tier / "fast_tier_manifest.json").is_file():
+                        raise RequestValidationError(
+                            "VMODEL_QWEN4_FAST_TIER_DIR lacks "
+                            "fast_tier_manifest.json")
+                    rc.fast_dirs = (str(fast_tier),)
+                else:
+                    rc.fast_dirs = ()
+                rc.parallel_storage_reads = (
+                    qwen4_request_identity[14] == "1")
+                if rc.parallel_storage_reads and not rc.fast_dirs:
+                    raise RequestValidationError(
+                        "VMODEL_QWEN4_PARALLEL_STORAGE_READS requires "
+                        "VMODEL_QWEN4_FAST_TIER_DIR")
+                if qwen4_request_identity[15] not in ("0", "1"):
+                    raise RequestValidationError(
+                        "VMODEL_QWEN4_HOT_PROMPT_KV must be 0 or 1")
+                rc.hot_prompt_kv = qwen4_request_identity[15] == "1"
+                try:
+                    rc.hot_prompt_kv_slots = int(qwen4_request_identity[16])
+                    rc.hot_prompt_kv_min_tokens = int(qwen4_request_identity[17])
+                    rc.hot_prompt_kv_persist_max_checkpoints = int(
+                        qwen4_request_identity[19])
+                    rc.hot_prompt_kv_persist_max_mb = int(
+                        qwen4_request_identity[20])
+                except ValueError as error:
+                    raise RequestValidationError(
+                        "Qwen4 hot-KV settings must be integers") from error
+                if not 1 <= rc.hot_prompt_kv_slots <= 4:
+                    raise RequestValidationError(
+                        "VMODEL_QWEN4_HOT_KV_SLOTS must be in [1, 4]")
+                if rc.hot_prompt_kv_min_tokens < 0:
+                    raise RequestValidationError(
+                        "VMODEL_QWEN4_HOT_KV_MIN_TOKENS must be non-negative")
+                if (not 0 <= rc.hot_prompt_kv_persist_max_checkpoints <= 64
+                        or not 0 <= rc.hot_prompt_kv_persist_max_mb <= 32768):
+                    raise RequestValidationError(
+                        "Qwen4 durable hot-KV limits are outside their bounds")
+                rc.hot_prompt_kv_persist_dir = qwen4_request_identity[18]
+                if rc.hot_prompt_kv_persist_dir and not rc.hot_prompt_kv:
+                    raise RequestValidationError(
+                        "VMODEL_QWEN4_HOT_KV_PERSIST_DIR requires "
+                        "VMODEL_QWEN4_HOT_PROMPT_KV=1")
+                rc.hot_prompt_kv_chunk_size = rc.prefill_chunk_size
+                rc.pin_lm_head = False
+                rc.stream_lm_head = True
+                rc.pin_embeddings = False
+                rc.embed_rows = True
+                rc.prompt_kv_dir = ""
+                rc.layer_stationary_prefill = True
             elif mtype == "qwen3_5_moe":
                 # Qwen3.6-35B-A3B retains Qwen3.5's architecture id. Thirty
                 # DeltaNet layers carry fixed recurrent+conv state that the
@@ -4315,8 +4481,11 @@ class EngineManager:
             rc.kimi_k3_dense_mlp_short_tile_size = (
                 k3_dense_mlp_short_tile_size
             )
-            compiled_delta_request = os.environ.get(
-                "VMODEL_QWEN35_COMPILED_DELTA", "0")
+            compiled_delta_request = (
+                qwen4_request_identity[12]
+                if mtype == "qwen4_exp" else
+                os.environ.get("VMODEL_QWEN35_COMPILED_DELTA", "0")
+            )
             chunked_delta_request = os.environ.get(
                 "VMODEL_QWEN35_CHUNKED_DELTA", "auto")
             native_delta_request = os.environ.get(
@@ -7572,7 +7741,9 @@ def _hidden_gateway_catalogs(tools, raw_tools, messages, query: str | None = Non
     )
 
 
-_HYBRID_RECURRENT_MODEL_TYPES = ("qwen3_5", "qwen3_5_moe", "kimi_linear", "kimi_k3")
+_HYBRID_RECURRENT_MODEL_TYPES = (
+    "qwen3_5", "qwen3_5_moe", "qwen4_exp", "kimi_linear", "kimi_k3",
+)
 
 
 def _hybrid_stable_boundary_tokens(
@@ -8721,6 +8892,27 @@ def _vision_protocol_timing(result: dict) -> dict:
         "kimi_k3_prefill_tile_width",
         "kimi_k3_dense_mlp_tile_size",
         "kimi_k3_prefill_long_context_tokens",
+        "qwen4_host_spool_h2d_bytes",
+        "qwen4_host_spool_d2h_bytes",
+        "qwen4_host_spool_peak_host_bytes",
+        "qwen4_host_spool_memory_samples",
+        "qwen4_host_spool_global_expert_rows",
+        "qwen4_host_spool_expert_row_gathers",
+        "qwen4_host_spool_expert_rows_uploaded",
+        "qwen4_host_spool_sparse_expert_batch_rows",
+        "qwen4_host_spool_expert_batch_tile_gathers",
+        "qwen4_host_spool_expert_batch_tile_rows_uploaded",
+        "qwen4_ple_read_calls",
+        "qwen4_ple_read_extents",
+        "qwen4_ple_rows_requested",
+        "qwen4_ple_unique_rows_read",
+        "qwen4_ple_bytes_read",
+        "qwen4_ple_cache_hits",
+        "qwen4_fused_expert_calls",
+        "qwen4_fused_expert_extents",
+        "qwen4_fused_expert_requested_tensors",
+        "qwen4_fused_expert_bytes",
+        "qwen4_fused_expert_virtual_tensors",
     )
     for key in optional_integer_fields:
         if key in stats or key in result:
@@ -8801,6 +8993,12 @@ def _vision_protocol_timing(result: dict) -> dict:
         "disk_prompt_lookup_s",
         "hot_prompt_kv_persist_write_s",
         "hot_prompt_endpoint_snapshot_write_s",
+        "qwen4_host_spool_copy_seconds",
+        "qwen4_host_spool_ple_seconds",
+        "qwen4_host_spool_attention_seconds",
+        "qwen4_host_spool_route_and_spool_seconds",
+        "qwen4_host_spool_experts_seconds",
+        "qwen4_host_spool_output_seconds",
     )
     for key in optional_float_fields:
         if key in stats or key in result:
@@ -11207,6 +11405,17 @@ class Handler(BaseHTTPRequestHandler):
                     total = int(progress.get("total_tokens", 0))
                     label = "prefill"
                 if progress_events:
+                    if progress.get("diagnostic") == "qwen4_host_spool":
+                        print(
+                            "[qwen4-spool] "
+                            f"layer={progress.get('layer')} "
+                            f"phase={progress.get('subphase')} "
+                            f"tokens={progress.get('completed_tokens')} "
+                            f"metal={int(progress.get('active_metal_bytes', 0)) / 1e9:.3f}GB "
+                            f"peak={int(progress.get('peak_metal_bytes', 0)) / 1e9:.3f}GB "
+                            f"host={int(progress.get('host_spool_bytes', 0)) / 1e9:.3f}GB",
+                            flush=True,
+                        )
                     emit(
                         f"response.vmodel.{label}_progress",
                         phase=label,
@@ -11215,6 +11424,14 @@ class Handler(BaseHTTPRequestHandler):
                         fraction=(done / total if total else 0.0),
                         cache_source=progress.get("cache_source", "cold"),
                         token_total=progress.get("total_tokens"),
+                        diagnostic=progress.get("diagnostic"),
+                        subphase=progress.get("subphase"),
+                        layer=progress.get("layer"),
+                        completed_tokens=progress.get("completed_tokens"),
+                        active_metal_bytes=progress.get("active_metal_bytes"),
+                        peak_metal_bytes=progress.get("peak_metal_bytes"),
+                        host_spool_bytes=progress.get("host_spool_bytes"),
+                        metal_limit_bytes=progress.get("metal_limit_bytes"),
                     )
                 else:
                     self.wfile.write(f": {label} {done}/{total}\n\n".encode())

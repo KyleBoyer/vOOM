@@ -205,3 +205,88 @@ def test_mismatched_qwen3vl_video_geometry_fails_closed(tmp_path, override):
 
     with pytest.raises(ValueError, match="video .*size"):
         ModelConfig.from_dir(tmp_path)
+
+
+def _qwen4_exp_config() -> dict:
+    text = _text_config(eos_token_id=31, vocab_size=64)
+    text.update({
+        "model_type": "qwen4_exp_text",
+        "num_hidden_layers": 4,
+        "layer_types": [
+            "linear_attention", "linear_attention",
+            "linear_attention", "full_attention",
+        ],
+        "full_attention_interval": 4,
+        "linear_num_key_heads": 2,
+        "linear_num_value_heads": 4,
+        "linear_key_head_dim": 8,
+        "linear_value_head_dim": 8,
+        "linear_conv_kernel_dim": 4,
+        "num_experts": 8,
+        "num_experts_per_tok": 2,
+        "moe_intermediate_size": 16,
+        "shared_expert_intermediate_size": 16,
+        "hc_count": 4,
+        "hc_lowrank": 8,
+        "ple_layer_ids": [2],
+        "ple_embed_dim": 32,
+        "ple_conv_kernel_size": 4,
+        "ngram_size": 3,
+        "heads_per_ngram": 2,
+        "ngram_vocab_size_base": 100,
+        "make_ngram_vocab_size_divisible_by": 8,
+        "split_ngram_parts": 4,
+        "indexer_budget": 16,
+        "indexer_compress_ratio": 4,
+        "indexer_head_dim": 8,
+        "indexer_kv_heads": 1,
+        "indexer_n_heads": 2,
+        "output_gate_type": "sigmoid",
+    })
+    return {
+        "model_type": "qwen4_exp",
+        "architectures": ["Qwen4ExpForConditionalGeneration"],
+        "text_config": text,
+        "vision_config": {"model_type": "qwen4_exp", "hidden_size": 16},
+    }
+
+
+def test_qwen4_exp_lifts_exact_text_geometry_and_preserves_outer_family(tmp_path):
+    config = _qwen4_exp_config()
+    _write_config(tmp_path, config)
+
+    loaded = ModelConfig.from_dir(tmp_path)
+
+    assert loaded.model_type == "qwen4_exp"
+    assert loaded.vision_backend == "qwen4_exp"
+    assert loaded.architectures == ("Qwen4ExpForConditionalGeneration",)
+    assert loaded.qwen4_hc_count == 4
+    assert loaded.qwen4_hc_lowrank == 8
+    assert loaded.qwen4_ple_layers == (1,)
+    assert loaded.qwen4_ple_embed_dim == 32
+    assert loaded.qwen4_ngram_size == 3
+    assert loaded.qwen4_split_ngram_parts == 4
+    assert loaded.qwen4_indexer_budget == 16
+    assert loaded.qwen4_indexer_compress_ratio == 4
+    assert loaded.qwen4_output_gate_type == "sigmoid"
+
+
+@pytest.mark.parametrize(
+    ("key", "value", "match"),
+    [
+        ("ple_layer_ids", [0], "ple_layer_ids"),
+        ("ple_layer_ids", [5], "ple_layer_ids"),
+        ("layer_types", ["linear_attention"] * 3 + ["dense_attention"],
+         "layer type"),
+        ("output_gate_type", "relu", "geometry"),
+        ("split_ngram_parts", 0, "geometry"),
+    ],
+)
+def test_qwen4_exp_incomplete_geometry_fails_closed(
+        tmp_path, key, value, match):
+    config = _qwen4_exp_config()
+    config["text_config"][key] = value
+    _write_config(tmp_path, config)
+
+    with pytest.raises(ValueError, match=match):
+        ModelConfig.from_dir(tmp_path)

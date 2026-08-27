@@ -132,6 +132,28 @@ class ModelConfig:
     linear_value_head_dim: int = 0
     linear_conv_kernel_dim: int = 4
     full_attention_interval: int = 0
+    # Qwen3.8 Flash-Next / Qwen4-Exp.  The checkpoint wraps a four-stream
+    # hyper-connected text trunk inside a multimodal outer config, uses a
+    # paged lexical embedding (PLE) at selected 1-indexed layers, and replaces
+    # ordinary full attention with Qwen Sparse Attention (QSA).  Keep these
+    # fields explicit: silently treating this as Qwen3.5 would get the residual
+    # topology, output gate, position selection, and PLE state all wrong.
+    qwen4_hc_count: int = 1
+    qwen4_hc_lowrank: int = 0
+    qwen4_ple_layers: tuple[int, ...] = ()
+    qwen4_ple_embed_dim: int = 0
+    qwen4_ple_conv_kernel_size: int = 4
+    qwen4_ngram_size: int = 0
+    qwen4_heads_per_ngram: int = 0
+    qwen4_ngram_vocab_size_base: int = 0
+    qwen4_ngram_vocab_divisor: int = 0
+    qwen4_split_ngram_parts: int = 0
+    qwen4_indexer_budget: int = 0
+    qwen4_indexer_compress_ratio: int = 0
+    qwen4_indexer_head_dim: int = 0
+    qwen4_indexer_kv_heads: int = 0
+    qwen4_indexer_n_heads: int = 0
+    qwen4_output_gate_type: str = ""
     # Jet-Nemotron (jet-ai/Jet-Nemotron-4B/2B) JetBlock hybrid -- a THIRD,
     # distinct layer-type mix (see docs/future_lossless_techniques.md): "jet"
     # (JetBlock, gated-delta-rule + a dynamically-generated per-token causal
@@ -425,6 +447,24 @@ class ModelConfig:
                 if k in outer:
                     t[k] = outer[k]
             raw = t
+        elif ("text_config" in raw
+              and raw.get("model_type", "") == "qwen4_exp"):
+            # Qwen3.8-Flash-Next is a multimodal wrapper whose released text
+            # weights live below model.language_model.*.  Preserve the outer
+            # family for exact dispatch while lifting the text geometry, just
+            # as the Qwen3.5 wrapper branch above does.  PLE layer ids in the
+            # public config are one-indexed (the released [2] tensors live in
+            # model.layers.1), normalized below at construction time.
+            outer = raw
+            t = dict(outer["text_config"])
+            t["model_type"] = outer["model_type"]
+            t.setdefault("tie_word_embeddings", outer.get(
+                "tie_word_embeddings", False))
+            for k in ("image_token_id", "video_token_id",
+                      "vision_start_token_id", "vision_end_token_id"):
+                if k in outer:
+                    t[k] = outer[k]
+            raw = t
 
         vocab_size = raw["vocab_size"]
         eos = list(_validated_token_ids(
@@ -603,6 +643,27 @@ class ModelConfig:
             linear_value_head_dim=raw.get("linear_value_head_dim", 0),
             linear_conv_kernel_dim=raw.get("linear_conv_kernel_dim", 4),
             full_attention_interval=raw.get("full_attention_interval", 0),
+            qwen4_hc_count=raw.get("hc_count", 1),
+            qwen4_hc_lowrank=raw.get("hc_lowrank", 0),
+            qwen4_ple_layers=tuple(sorted(
+                int(layer) - 1 for layer in raw.get("ple_layer_ids", ()))),
+            qwen4_ple_embed_dim=raw.get("ple_embed_dim", 0),
+            qwen4_ple_conv_kernel_size=raw.get(
+                "ple_conv_kernel_size", 4),
+            qwen4_ngram_size=raw.get("ngram_size", 0),
+            qwen4_heads_per_ngram=raw.get("heads_per_ngram", 0),
+            qwen4_ngram_vocab_size_base=raw.get(
+                "ngram_vocab_size_base", 0),
+            qwen4_ngram_vocab_divisor=raw.get(
+                "make_ngram_vocab_size_divisible_by", 0),
+            qwen4_split_ngram_parts=raw.get("split_ngram_parts", 0),
+            qwen4_indexer_budget=raw.get("indexer_budget", 0),
+            qwen4_indexer_compress_ratio=raw.get(
+                "indexer_compress_ratio", 0),
+            qwen4_indexer_head_dim=raw.get("indexer_head_dim", 0),
+            qwen4_indexer_kv_heads=raw.get("indexer_kv_heads", 0),
+            qwen4_indexer_n_heads=raw.get("indexer_n_heads", 0),
+            qwen4_output_gate_type=raw.get("output_gate_type", ""),
             jet_num_heads=jet_num_heads,
             jet_head_dim=jet_head_dim,
             jet_head_v_dim=jet_head_v_dim,
@@ -669,6 +730,38 @@ class ModelConfig:
             moe_latent_use_norm=raw.get("latent_moe_use_norm", False),
             attn_res_block_size=raw.get("attn_res_block_size", 0) or 0,
         )
+        if config.model_type == "qwen4_exp":
+            ple_ids = raw.get("ple_layer_ids", ())
+            if (not isinstance(ple_ids, (list, tuple))
+                    or any(not isinstance(layer, int)
+                           or isinstance(layer, bool)
+                           or not 1 <= layer <= config.num_hidden_layers
+                           for layer in ple_ids)):
+                raise ValueError(
+                    "Qwen4-Exp ple_layer_ids must be one-indexed decoder "
+                    "layers within the released layer count")
+            if (
+                config.qwen4_hc_count <= 0
+                or config.qwen4_hc_lowrank <= 0
+                or config.qwen4_ple_embed_dim != config.hidden_size
+                or config.qwen4_ple_conv_kernel_size <= 0
+                or config.qwen4_ngram_size < 2
+                or config.qwen4_heads_per_ngram <= 0
+                or config.qwen4_split_ngram_parts <= 0
+                or config.qwen4_indexer_budget <= 0
+                or config.qwen4_indexer_compress_ratio <= 0
+                or config.qwen4_indexer_head_dim <= 0
+                or config.qwen4_indexer_kv_heads <= 0
+                or config.qwen4_indexer_n_heads <= 0
+                or config.qwen4_output_gate_type not in {"sigmoid", "silu"}
+            ):
+                raise ValueError("invalid or incomplete Qwen4-Exp text geometry")
+            if len(config.layer_types) != config.num_hidden_layers:
+                raise ValueError(
+                    "Qwen4-Exp layer_types must cover every decoder layer")
+            if any(layer not in {"linear_attention", "full_attention"}
+                   for layer in config.layer_types):
+                raise ValueError("unknown Qwen4-Exp layer type")
         if config.model_type == "kimi_k3":
             manifest_path = os.environ.get(
                 "VMODEL_K3_EXPERT_PRUNE_MANIFEST", "")

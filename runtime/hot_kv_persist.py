@@ -329,6 +329,8 @@ class HotPromptKVPersistence:
         # did not cover tensor bytes) from entering the verified journal.
         self.fp = (fingerprint + "|hot-kv-v3-durable-dsa"
                    + ("|hybrid-recurrent-v1" if require_recurrent else "")
+                   + ("|qwen4-aux-v1" if getattr(
+                       config, "model_type", "") == "qwen4_exp" else "")
                    + ("|paged-stream-v1" if paged_cache_factory else ""))
         self.chunk_size = chunk_size
         self.max_checkpoints = max_checkpoints
@@ -369,6 +371,12 @@ class HotPromptKVPersistence:
             arrays.update(recurrent.export_arrays())
         if self.require_recurrent and recurrent is None:
             raise ValueError("hybrid checkpoint is missing recurrent state")
+        if getattr(self.config, "model_type", "") == "qwen4_exp":
+            auxiliary = getattr(kv, "qwen4_cache", None)
+            if auxiliary is None:
+                raise ValueError("Qwen4 checkpoint is missing QSA/PLE state")
+            self._validate_qwen4_auxiliary(kv)
+            arrays.update(auxiliary.export_arrays())
         return arrays
 
     def _attach_recurrent(self, kv: KVCache, arrays: dict[str, mx.array]) -> bool:
@@ -376,21 +384,68 @@ class HotPromptKVPersistence:
             name: value for name, value in arrays.items()
             if name.startswith("kda_state_") or name.startswith("kda_conv_")
         }
-        if not recurrent_arrays:
-            return not self.require_recurrent
-        try:
-            from .kda_state import KDAStateCache
+        if recurrent_arrays:
+            try:
+                from .kda_state import KDAStateCache
 
-            kv.kda_cache = KDAStateCache.from_arrays(
-                int(getattr(kv, "num_layers", len(getattr(kv, "keys", ())))),
-                recurrent_arrays,
-                expected_layers=self._recurrent_layers())
-        except (TypeError, ValueError, RuntimeError) as error:
-            print(
-                f"[hot-kv-persist] recurrent checkpoint rejected: "
-                f"{type(error).__name__}: {error}", flush=True)
+                kv.kda_cache = KDAStateCache.from_arrays(
+                    int(getattr(kv, "num_layers", len(getattr(kv, "keys", ())))),
+                    recurrent_arrays,
+                    expected_layers=self._recurrent_layers())
+            except (TypeError, ValueError, RuntimeError) as error:
+                print(
+                    f"[hot-kv-persist] recurrent checkpoint rejected: "
+                    f"{type(error).__name__}: {error}", flush=True)
+                return False
+        elif self.require_recurrent:
             return False
+        if getattr(self.config, "model_type", "") == "qwen4_exp":
+            auxiliary_arrays = {
+                name: value for name, value in arrays.items()
+                if name.startswith("qwen4_")
+            }
+            try:
+                from .qwen4_exp_state import Qwen4ExpStateCache
+
+                kv.qwen4_cache = Qwen4ExpStateCache.from_arrays(
+                    int(getattr(kv, "num_layers", len(getattr(kv, "keys", ())))),
+                    auxiliary_arrays,
+                    expected_qsa_layers=self._full_attention_layers(),
+                    expected_ple_layers=tuple(
+                        getattr(self.config, "qwen4_ple_layers", ())),
+                    expected_length=int(getattr(kv, "offset", -1)),
+                    indexer_dim=int(self.config.qwen4_indexer_head_dim),
+                    ple_context_len=int(self.config.qwen4_ngram_size) - 1,
+                    ple_state_len=(
+                        (int(self.config.qwen4_ple_conv_kernel_size) - 1)
+                        * int(self.config.qwen4_ngram_size)),
+                    ple_width=int(self.config.qwen4_ple_embed_dim),
+                )
+            except (TypeError, ValueError, RuntimeError) as error:
+                print(
+                    f"[hot-kv-persist] Qwen4 auxiliary checkpoint rejected: "
+                    f"{type(error).__name__}: {error}", flush=True)
+                return False
         return True
+
+    def _validate_qwen4_auxiliary(self, kv: KVCache) -> None:
+        if getattr(self.config, "model_type", "") != "qwen4_exp":
+            return
+        auxiliary = getattr(kv, "qwen4_cache", None)
+        if auxiliary is None:
+            raise ValueError("Qwen4 checkpoint is missing QSA/PLE state")
+        auxiliary.validate(
+            expected_qsa_layers=self._full_attention_layers(),
+            expected_ple_layers=tuple(
+                getattr(self.config, "qwen4_ple_layers", ())),
+            expected_length=int(getattr(kv, "offset", -1)),
+            indexer_dim=int(self.config.qwen4_indexer_head_dim),
+            ple_context_len=int(self.config.qwen4_ngram_size) - 1,
+            ple_state_len=(
+                (int(self.config.qwen4_ple_conv_kernel_size) - 1)
+                * int(self.config.qwen4_ngram_size)),
+            ple_width=int(self.config.qwen4_ple_embed_dim),
+        )
 
     def _full_attention_layers(self) -> tuple[int, ...]:
         if self.config is None:
@@ -404,7 +459,7 @@ class HotPromptKVPersistence:
     def _has_complete_full_attention(self, kv: KVCache) -> bool:
         """Fail closed if a hybrid snapshot omitted conventional KV layers."""
         if getattr(self.config, "model_type", "") not in (
-                "qwen3_5", "qwen3_5_moe"):
+                "qwen3_5", "qwen3_5_moe", "qwen4_exp"):
             return True
         layer_positions = getattr(kv, "layer_positions", None)
         if layer_positions is not None:
@@ -713,6 +768,7 @@ class HotPromptKVPersistence:
             if not self._has_complete_full_attention(kv):
                 raise ValueError(
                     "hybrid checkpoint is missing full-attention KV")
+            self._validate_qwen4_auxiliary(kv)
         if checkpoint_kind == "endpoint":
             if logits is None or prompt_logits is None:
                 raise ValueError(

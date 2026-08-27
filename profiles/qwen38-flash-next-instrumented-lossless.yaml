@@ -1,0 +1,40 @@
+schema: voom.runtime-profile.v1
+name: qwen38-flash-next-instrumented-lossless
+description: Exact released-BF16 Qwen3.8-Flash-Next baseline with content-blind paging telemetry.
+notes:
+  - The model, routed experts, QSA/DeltaNet state, PLE rows, embeddings, and output head remain at their released BF16 precision; no pruning, quantization, approximate attention, speculative draft, or host-authored answer path is enabled.
+  - "The 96 MB weight-cache ceiling follows measured zero-hit scans at 300 MB: 24.97GB was read with 1841 misses and zero hits while 249MB remained resident. Pass-through pages are still held for their immediate exact compute batch, but dead scan residency no longer competes with the 49K prompt state."
+  - Exact layer-stationary prefill retains one layer trunk while PLE/QSA/DeltaNet and MoE arithmetic preserve fixed 1024-position tile shapes. The union of physical routed-expert pages is loaded once per layer, avoiding both the measured 12.8 GB whole-prompt transient and repeated reads of the 241.6 GB expert body. The first instrumented 8192-position DeltaNet tile peaked at 28.14 GB despite compiled 32-position segments, so 1024 is the conservative content-blind bound pending a measured ladder.
+  - The DeltaNet recurrence uses the exact same-operator compiled 32-position segments. This preserves the released FP32 state/update order while bounding the lazy recurrence graph; the real greedy/state oracle must remain bit-identical before this candidate is used.
+  - Evaluated BF16 hidden, mixed, and injection tiles are copied bit-for-bit to a bounded host spool between phases. This prevents prompt-length many Metal graphs from remaining live; copy bytes, copy time, and peak host bytes are reported explicitly.
+  - A synchronous 8.5 GB Metal ceiling fails closed at every spooled attention/output tile and sampled expert batch; diagnostic SSE events carry active/peak Metal and host-spool bytes.
+  - Eight PLE row workers overlap independent exact preads from the released shards. Returned BF16 rows, physical-sort assembly order, and cache order are unchanged; read extents and read time are attributed separately for cold A/B promotion.
+  - Exact routed-expert byte ranges can be balanced across the internal and external NVMe devices, and the 2026-08-27 769-token oracle preserved every state hash while reducing wall 121.27s to 115.18s. It remains disabled here because the untouched 49,255-token capture regressed wall 1,849.47s to 1,883.21s and produced 3.15 GB of swap-out growth. The capability is retained for bounded short-context experiments only.
+  - Layer telemetry is enabled for diagnosis. Publish clean timing separately if profiling overhead is measurable.
+  - Keep this profile explicit until the unmodified 134-tool capture and a heterogeneous corpus spanning tool count, system length, developer presence, streaming, and sampling all pass.
+  - Exact request-local hot state is enabled for measurement. It retains one scaffold-free BF16 KV/DeltaNet/QSA/PLE endpoint and only admits exact endpoint or strict-extension matches; unrelated prompts remain cold. Cross-restart persistence remains disabled until its auxiliary-state journal passes the same state oracle.
+settings:
+  VMODEL_RESIDENT_BACKEND: voom
+  VMODEL_EXECUTION_PROFILE: layers
+  VMODEL_QWEN4_WEIGHT_CACHE_MB: 96
+  VMODEL_QWEN4_MIN_WEIGHT_CACHE_MB: 64
+  VMODEL_QWEN4_MLX_CACHE_MB: 128
+  VMODEL_QWEN4_PREFILL_CHUNK: 1024
+  VMODEL_QWEN4_EXPERT_FETCH_BATCH: 16
+  VMODEL_QWEN4_DECODE_EXPERT_FETCH_BATCH: 16
+  VMODEL_QWEN4_PREFETCH_DEPTH: 0
+  VMODEL_QWEN4_PREFETCH_WORKERS: 1
+  VMODEL_QWEN4_PLE_READ_WORKERS: 8
+  VMODEL_QWEN4_MAX_METAL_MB: 8500
+  VMODEL_QWEN4_SPARSE_EXPERT_BATCH_ROWS: false
+  VMODEL_QWEN4_GLOBAL_EXPERT_ROWS: false
+  VMODEL_QWEN4_COMPILED_DELTA: true
+  VMODEL_QWEN4_FAST_TIER_DIR: ""
+  VMODEL_QWEN4_PARALLEL_STORAGE_READS: false
+  VMODEL_QWEN4_HOT_PROMPT_KV: true
+  VMODEL_QWEN4_HOT_KV_SLOTS: 1
+  VMODEL_QWEN4_HOT_KV_MIN_TOKENS: 2048
+  VMODEL_QWEN4_HOT_KV_PERSIST_DIR: ""
+  VMODEL_EXPERT_BATCH_PREFETCH: false
+  VMODEL_FAST_TOOL_GATEWAY: false
+  VMODEL_QWEN_MTP_SPECULATIVE: false

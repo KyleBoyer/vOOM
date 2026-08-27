@@ -112,6 +112,24 @@ def test_direct_rows_cross_parts_coalesce_and_cache(tmp_path):
         assert store.telemetry()["bytes_read"] == 8 * 4
 
 
+def test_parallel_exact_rows_preserve_bits_order_and_extent_accounting(tmp_path):
+    root, _ = _fixture(tmp_path)
+    requested = np.array([[59, 0, 30, 16], [1, 31, 15, 14]])
+    with Qwen4ExpPLERowStore(root, row_cache=0) as serial:
+        expected = serial.read_rows(requested)
+        serial_stats = serial.telemetry()
+    with Qwen4ExpPLERowStore(
+            root, row_cache=0, read_workers=4) as parallel:
+        actual = parallel.read_rows(requested)
+        parallel_stats = parallel.telemetry()
+    np.testing.assert_array_equal(actual, expected)
+    assert parallel_stats["bytes_read"] == serial_stats["bytes_read"]
+    assert parallel_stats["read_extents"] == serial_stats["read_extents"]
+    assert parallel_stats["read_workers"] == 4
+    assert parallel_stats["parallel_read_calls"] == 1
+    assert parallel_stats["read_microseconds"] >= 0
+
+
 def test_missing_release_witness_and_bad_rows_fail_closed(tmp_path):
     root, _ = _fixture(tmp_path)
     tree = next((root / ".cache" / "huggingface" / "trees").iterdir())

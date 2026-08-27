@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import bisect
 from collections import OrderedDict
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 import hashlib
 import json
@@ -17,6 +18,7 @@ import os
 from pathlib import Path
 import re
 import struct
+import time
 from typing import Sequence
 
 import numpy as np
@@ -94,9 +96,13 @@ class Qwen4ExpPLERowStore:
         *,
         row_cache: int = 8192,
         require_release_hash: bool = True,
+        read_workers: int = 1,
     ):
         if isinstance(row_cache, bool) or row_cache < 0:
             raise ValueError("row_cache must be non-negative")
+        if (isinstance(read_workers, bool) or not isinstance(read_workers, int)
+                or not 1 <= read_workers <= 16):
+            raise ValueError("read_workers must be an integer in [1, 16]")
         self.model_dir = Path(model_dir).expanduser().resolve()
         config = json.loads((self.model_dir / "config.json").read_text())
         text_config = config.get("text_config")
@@ -178,12 +184,20 @@ class Qwen4ExpPLERowStore:
         }
         self._cache: OrderedDict[int, np.ndarray] = OrderedDict()
         self._cache_cap = row_cache
+        self.read_workers = read_workers
+        self._executor = (
+            ThreadPoolExecutor(
+                max_workers=read_workers,
+                thread_name_prefix="qwen4-ple-row")
+            if read_workers > 1 else None)
         self.read_calls = 0
         self.read_extents = 0
         self.rows_requested = 0
         self.unique_rows_read = 0
         self.bytes_read = 0
         self.cache_hits = 0
+        self.read_seconds = 0.0
+        self.parallel_read_calls = 0
 
     def _source_identity(
         self, shards: tuple[str, ...], split_parts: int, index_path: Path,
@@ -295,7 +309,7 @@ class Qwen4ExpPLERowStore:
             ))
         locations.sort(key=lambda value: (value[0], value[1]))
         cursor = 0
-        extents = 0
+        extents = []
         while cursor < len(locations):
             shard, offset, _ = locations[cursor]
             end = cursor + 1
@@ -304,8 +318,44 @@ class Qwen4ExpPLERowStore:
                    and locations[end][1]
                    == locations[end - 1][1] + self.row_bytes):
                 end += 1
-            raw = _pread_exact(
-                self._fds[shard], (end - cursor) * self.row_bytes, offset)
+            extents.append((
+                shard, offset, cursor, end,
+                (end - cursor) * self.row_bytes))
+            cursor = end
+
+        started = time.perf_counter()
+        if self._executor is None or len(extents) <= 1:
+            raw_extents = [
+                _pread_exact(self._fds[shard], size, offset)
+                for shard, offset, _start, _end, size in extents
+            ]
+        else:
+            # Contiguous chunks keep every worker moving forward through a
+            # small shard subset while the device services several exact
+            # random-read streams. Results are consumed in the original
+            # sorted physical order, so cache order and returned rows remain
+            # deterministic regardless of completion order.
+            workers = min(self.read_workers, len(extents))
+            chunk = (len(extents) + workers - 1) // workers
+
+            def read_group(group):
+                return [
+                    _pread_exact(self._fds[shard], size, offset)
+                    for shard, offset, _start, _end, size in group
+                ]
+
+            futures = [
+                self._executor.submit(read_group, extents[start:start + chunk])
+                for start in range(0, len(extents), chunk)
+            ]
+            raw_extents = []
+            for future in futures:
+                raw_extents.extend(future.result())
+            self.parallel_read_calls += 1
+        self.read_seconds += time.perf_counter() - started
+
+        for extent, raw in zip(extents, raw_extents):
+            _shard, _offset, cursor, end, _size = extent
             storage = np.frombuffer(raw, dtype=np.uint16).reshape(
                 end - cursor, self.layout.row_width)
             for local_index, (_, _, row_id) in enumerate(
@@ -317,11 +367,8 @@ class Qwen4ExpPLERowStore:
                     self._cache.move_to_end(row_id)
                     if len(self._cache) > self._cache_cap:
                         self._cache.popitem(last=False)
-            extents += 1
-            cursor = end
-
         self.read_calls += 1
-        self.read_extents += extents
+        self.read_extents += len(extents)
         self.rows_requested += int(flat.size)
         self.unique_rows_read += len(locations)
         self.bytes_read += len(locations) * self.row_bytes
@@ -343,9 +390,15 @@ class Qwen4ExpPLERowStore:
             "bytes_read": self.bytes_read,
             "cache_hits": self.cache_hits,
             "cache_rows": len(self._cache),
+            "read_workers": self.read_workers,
+            "parallel_read_calls": self.parallel_read_calls,
+            "read_microseconds": int(self.read_seconds * 1_000_000),
         }
 
     def close(self) -> None:
+        if self._executor is not None:
+            self._executor.shutdown(wait=True, cancel_futures=True)
+            self._executor = None
         for fd in self._fds.values():
             os.close(fd)
         self._fds.clear()

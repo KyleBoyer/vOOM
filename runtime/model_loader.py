@@ -87,6 +87,18 @@ class _CTMXFP4Aux:
     scale: str
 
 
+@dataclass(frozen=True)
+class _Qwen4FusedExpertSlice:
+    """One exact logical expert matrix inside Qwen4-Exp's fused BF16 body."""
+
+    shard: str
+    physical_name: str
+    dtype: str
+    shape: tuple[int, int]
+    offset: int
+    nbytes: int
+
+
 def _quant_params(value) -> tuple[int, int, str] | None:
     """Normalize one standard-MLX quantization descriptor."""
     if not isinstance(value, dict):
@@ -189,6 +201,13 @@ class WeightStore:
         self.safetensors_offset_order = bool(safetensors_offset_order)
         self._safetensors_headers: dict[str, dict] = {}
         self._safetensors_header_lock = threading.Lock()
+        self._qwen4_fused_expert_slices: dict[
+            str, _Qwen4FusedExpertSlice] = {}
+        self._qwen4_fused_physical_names: set[str] = set()
+        self.qwen4_fused_read_calls = 0
+        self.qwen4_fused_read_extents = 0
+        self.qwen4_fused_requested_tensors = 0
+        self.qwen4_fused_read_bytes = 0
         # Experimental lossless representation switch for published
         # compressed-tensors MXFP4 pairs. The format probe and runtime fetch
         # path fail closed unless the descriptor and physical dtypes match
@@ -591,6 +610,14 @@ class WeightStore:
             self._real_name["model.norm.weight"] = self._real_name.get(
                 "model.embedding_norm.weight", "model.embedding_norm.weight")
 
+        # Qwen3.8 Flash-Next stores each layer's 512 routed experts as two
+        # enormous fused BF16 tensors.  Register exact virtual matrix names so
+        # the existing expert pager can address selected experts directly from
+        # their contiguous safetensor extents.  No rewritten checkpoint, copy,
+        # or quantization is involved; the released bytes are returned exactly.
+        if self.config.model_type == "qwen4_exp":
+            self._register_qwen4_fused_expert_slices()
+
         # Standard MLX quantized checkpoints store one logical matrix as
         # ``name.weight`` plus row/group metadata in ``name.scales`` and,
         # for affine quantization, ``name.biases``. Expose only the logical
@@ -832,7 +859,10 @@ class WeightStore:
                 self.dir, self._bf16_nf12_sidecar_request
             )
 
-        self._names = sorted(n for n in self.weight_map if n not in quant_aux_names)
+        self._names = sorted(
+            n for n in self.weight_map
+            if n not in quant_aux_names
+            and n not in self._qwen4_fused_physical_names)
 
     # ---- name queries -------------------------------------------------
 
@@ -958,6 +988,193 @@ class WeightStore:
                 f"{real_name!r} missing from safetensors header {shard}"
             )
         return int(metadata["data_offsets"][0])
+
+    def _register_qwen4_fused_expert_slices(self) -> None:
+        """Expose released fused expert rows as ordinary logical matrices.
+
+        The released layout is gate_up=[E,2M,H] and down=[E,H,M].  A single
+        expert's gate/up/down matrices are therefore contiguous file ranges.
+        Registration is metadata-only and fails closed on any unexpected
+        dtype, shape, missing layer, or overlapping tensor extent.
+        """
+        if self.packed or self.vpack2 is not None:
+            raise ValueError(
+                "Qwen4-Exp fused expert slicing currently requires the "
+                "released raw safetensors checkpoint")
+        cfg = self.config
+        experts = int(cfg.num_experts)
+        width = int(cfg.moe_intermediate_size)
+        hidden = int(cfg.hidden_size)
+        if experts <= 0 or width <= 0 or hidden <= 0:
+            raise ValueError("Qwen4-Exp fused expert geometry is incomplete")
+
+        for layer in range(cfg.num_hidden_layers):
+            prefix = f"model.layers.{layer}.mlp.experts"
+            fused_specs = (
+                (f"{prefix}.gate_up_proj", (experts, 2 * width, hidden)),
+                (f"{prefix}.down_proj", (experts, hidden, width)),
+            )
+            metadata_by_name: dict[str, tuple[str, str, dict, int]] = {}
+            for canonical, expected_shape in fused_specs:
+                shard = self.weight_map.get(canonical)
+                if shard is None:
+                    raise ValueError(
+                        f"Qwen4-Exp checkpoint lacks fused tensor {canonical}")
+                real = self._real_name.get(canonical, canonical)
+                header = self._safetensors_header(shard)
+                metadata = header.get(real)
+                if not isinstance(metadata, dict):
+                    raise ValueError(
+                        f"Qwen4-Exp tensor {real!r} is missing from {shard}")
+                shape = tuple(int(value) for value in metadata.get("shape", ()))
+                offsets = metadata.get("data_offsets")
+                if (
+                    metadata.get("dtype") != "BF16"
+                    or shape != expected_shape
+                    or not isinstance(offsets, list)
+                    or len(offsets) != 2
+                    or int(offsets[1]) - int(offsets[0])
+                    != 2 * experts * expected_shape[1] * expected_shape[2]
+                ):
+                    raise ValueError(
+                        f"unexpected Qwen4-Exp fused expert metadata for "
+                        f"{canonical}: {metadata}")
+                with (self.dir / shard).open("rb") as handle:
+                    length_raw = handle.read(8)
+                if len(length_raw) != 8:
+                    raise EOFError(f"truncated safetensors shard {shard}")
+                payload_base = 8 + struct.unpack("<Q", length_raw)[0]
+                metadata_by_name[canonical] = (
+                    shard, real, metadata, payload_base)
+                self._qwen4_fused_physical_names.add(canonical)
+
+            gate_name = f"{prefix}.gate_up_proj"
+            down_name = f"{prefix}.down_proj"
+            gate_shard, gate_real, gate_meta, gate_base = metadata_by_name[
+                gate_name]
+            down_shard, down_real, down_meta, down_base = metadata_by_name[
+                down_name]
+            gate_tensor_start = gate_base + int(gate_meta["data_offsets"][0])
+            down_tensor_start = down_base + int(down_meta["data_offsets"][0])
+            matrix_bytes = width * hidden * 2
+            down_bytes = hidden * width * 2
+            for expert in range(experts):
+                expert_prefix = f"{prefix}.{expert}"
+                gate_expert_start = gate_tensor_start + expert * 2 * matrix_bytes
+                entries = (
+                    (
+                        f"{expert_prefix}.gate_proj.weight",
+                        _Qwen4FusedExpertSlice(
+                            gate_shard, gate_real, "BF16", (width, hidden),
+                            gate_expert_start, matrix_bytes),
+                    ),
+                    (
+                        f"{expert_prefix}.up_proj.weight",
+                        _Qwen4FusedExpertSlice(
+                            gate_shard, gate_real, "BF16", (width, hidden),
+                            gate_expert_start + matrix_bytes, matrix_bytes),
+                    ),
+                    (
+                        f"{expert_prefix}.down_proj.weight",
+                        _Qwen4FusedExpertSlice(
+                            down_shard, down_real, "BF16", (hidden, width),
+                            down_tensor_start + expert * down_bytes,
+                            down_bytes),
+                    ),
+                )
+                for logical, spec in entries:
+                    if logical in self.weight_map:
+                        raise ValueError(
+                            f"Qwen4-Exp virtual expert name collides: {logical}")
+                    self.weight_map[logical] = spec.shard
+                    self._qwen4_fused_expert_slices[logical] = spec
+
+    def qwen4_fused_expert_snapshot(self) -> dict[str, int]:
+        """Cumulative exact direct-row I/O counters."""
+        with self._stage_lock:
+            return {
+                "calls": int(self.qwen4_fused_read_calls),
+                "extents": int(self.qwen4_fused_read_extents),
+                "requested_tensors": int(
+                    self.qwen4_fused_requested_tensors),
+                "bytes": int(self.qwen4_fused_read_bytes),
+                "virtual_tensors": len(self._qwen4_fused_expert_slices),
+            }
+
+    def _read_qwen4_fused_expert_slices(
+        self, names: Sequence[str],
+    ) -> tuple[dict[str, mx.array], int]:
+        """Read sorted/coalesced virtual expert matrices with exact BF16 bits."""
+        from formats.packed import to_mx
+
+        by_shard: dict[str, list[tuple[str, _Qwen4FusedExpertSlice]]] = (
+            defaultdict(list))
+        for name in names:
+            spec = self._qwen4_fused_expert_slices.get(name)
+            if spec is None:
+                raise KeyError(f"unknown Qwen4-Exp virtual expert tensor {name}")
+            by_shard[spec.shard].append((name, spec))
+
+        out: dict[str, mx.array] = {}
+        read_bytes = 0
+        extent_count = 0
+        for shard, items in by_shard.items():
+            ordered = sorted(items, key=lambda item: item[1].offset)
+            runs: list[list[tuple[str, _Qwen4FusedExpertSlice]]] = []
+            for item in ordered:
+                if runs:
+                    previous = runs[-1][-1][1]
+                    run_start = runs[-1][0][1].offset
+                    adjacent = item[1].offset == previous.offset + previous.nbytes
+                    bounded = (
+                        item[1].offset + item[1].nbytes - run_start
+                        <= _RAW_FAST_TIER_MAX_RUN_BYTES)
+                else:
+                    adjacent = bounded = False
+                if runs and adjacent and bounded:
+                    runs[-1].append(item)
+                else:
+                    runs.append([item])
+
+            path = self.dir / shard
+            fd = os.open(path, os.O_RDONLY)
+            try:
+                file_size = os.fstat(fd).st_size
+                for run in runs:
+                    start = run[0][1].offset
+                    end = run[-1][1].offset + run[-1][1].nbytes
+                    if start < 0 or end > file_size:
+                        raise IOError(
+                            f"Qwen4-Exp expert extent [{start}, {end}) "
+                            f"exceeds {path} ({file_size} bytes)")
+                    chunks = []
+                    done = 0
+                    while done < end - start:
+                        chunk = os.pread(fd, end - start - done, start + done)
+                        if not chunk:
+                            raise IOError(
+                                f"truncated Qwen4-Exp expert read from {path}")
+                        chunks.append(chunk)
+                        done += len(chunk)
+                    raw = b"".join(chunks)
+                    read_bytes += len(raw)
+                    extent_count += 1
+                    view = memoryview(raw)
+                    for name, spec in run:
+                        relative = spec.offset - start
+                        out[name] = to_mx(
+                            {"dtype": spec.dtype, "shape": spec.shape},
+                            view[relative:relative + spec.nbytes],
+                        )
+            finally:
+                os.close(fd)
+        mx.eval(list(out.values()))
+        with self._stage_lock:
+            self.qwen4_fused_read_calls += 1
+            self.qwen4_fused_read_extents += extent_count
+            self.qwen4_fused_requested_tensors += len(names)
+            self.qwen4_fused_read_bytes += read_bytes
+        return out, read_bytes
 
     def _decode_bf16_nf12_layer(
         self, layer: int, requested_names: list[str],
@@ -1224,6 +1441,10 @@ class WeightStore:
         """
         total = 0
         for name in names:
+            virtual = self._qwen4_fused_expert_slices.get(name)
+            if virtual is not None:
+                total += virtual.nbytes
+                continue
             entry = (self._raw_fast_tier_manifest or {}).get(name)
             if entry is not None:
                 total += int(entry["nbytes"])
@@ -1278,6 +1499,16 @@ class WeightStore:
         ``language_model.model.layers.*``). Resolving only one of the two
         silently loses every tensor whose prefix was rewritten.
         """
+        virtual = self._qwen4_fused_expert_slices.get(name)
+        if virtual is not None:
+            return {
+                "dtype": virtual.dtype,
+                "shape": list(virtual.shape),
+                # Only the extent length is consumed by storage accounting;
+                # retain the absolute direct-read coordinates for diagnostics.
+                "data_offsets": [virtual.offset,
+                                 virtual.offset + virtual.nbytes],
+            }
         real = self._real_name.get(name, name)
         shard = self.weight_map.get(name)
         if shard is None:
@@ -1489,7 +1720,60 @@ class WeightStore:
             manifest = json.loads(manifest_bytes)
             if not isinstance(manifest, dict):
                 raise ValueError("raw fast-tier manifest must be an object")
-            if self.mtp_proposal_representation is not None:
+            qwen4_slices = getattr(
+                self, "_qwen4_fused_expert_slices", {})
+            qwen4_virtual_names = [
+                name for name in manifest
+                if name in qwen4_slices
+            ]
+            if qwen4_virtual_names:
+                binding_path = candidate / "qwen4_fused_expert_fast_tier.json"
+                try:
+                    binding = json.loads(binding_path.read_text())
+                    index_bytes = (
+                        self.dir / "model.safetensors.index.json").read_bytes()
+                    config_bytes = (self.dir / "config.json").read_bytes()
+                except (OSError, ValueError) as error:
+                    raise ValueError(
+                        "Qwen4 virtual fast tier lacks a readable binding"
+                    ) from error
+                if not (
+                    isinstance(binding, dict)
+                    and binding.get("schema")
+                    == "voom.qwen4-fused-expert-fast-tier.v1"
+                    and binding.get("target_model") == self.dir.name
+                    and binding.get("source_index_sha256")
+                    == hashlib.sha256(index_bytes).hexdigest()
+                    and binding.get("source_config_sha256")
+                    == hashlib.sha256(config_bytes).hexdigest()
+                    and binding.get("fast_manifest_sha256")
+                    == hashlib.sha256(manifest_bytes).hexdigest()
+                ):
+                    raise ValueError(
+                        "Qwen4 virtual fast-tier source identity mismatch")
+                for name in qwen4_virtual_names:
+                    entry = manifest[name]
+                    spec = qwen4_slices[name]
+                    filename = entry.get("file") if isinstance(entry, dict) else None
+                    if not (
+                        isinstance(filename, str)
+                        and Path(filename).name == filename
+                        and (candidate / filename).is_file()
+                        and str(entry.get("dtype", "")).upper() == spec.dtype
+                        and tuple(int(value) for value in entry.get("shape", ()))
+                        == spec.shape
+                        and int(entry.get("nbytes", -1)) == spec.nbytes
+                        and entry.get("source_file") == spec.shard
+                        and int(entry.get("source_offset", -1)) == spec.offset
+                    ):
+                        raise ValueError(
+                            f"Qwen4 virtual fast-tier metadata mismatch: {name}")
+                    file_size = (candidate / filename).stat().st_size
+                    offset = int(entry.get("offset", -1))
+                    if offset < 0 or offset + spec.nbytes > file_size:
+                        raise ValueError(
+                            f"Qwen4 virtual fast-tier extent mismatch: {name}")
+            if getattr(self, "mtp_proposal_representation", None) is not None:
                 alias_path = candidate / "mtp-quant-fast-alias.manifest.json"
                 try:
                     alias_bytes = alias_path.read_bytes()
@@ -1728,6 +2012,71 @@ class WeightStore:
                 )
             return self._raw_fast_tier_executor
 
+    def _read_qwen4_virtual_expert_tiers(
+        self, names: list[str],
+    ) -> tuple[dict[str, mx.array], int]:
+        """Read exact virtual expert rows across independent raw tiers."""
+        self._ensure_raw_fast_tier_loaded()
+        fast_names = [
+            name for name in names
+            if name in (self._raw_fast_tier_manifest or {})
+        ]
+        fast_set = set(fast_names)
+        slow_names = [name for name in names if name not in fast_set]
+        out: dict[str, mx.array] = {}
+        fast_bytes = 0
+        slow_bytes = 0
+
+        if (
+            self.parallel_storage_reads
+            and fast_names and slow_names
+            and self._raw_fast_tier_is_independent(fast_names)
+        ):
+            executor = self._raw_fast_tier_executor_for_reads()
+            parallel_started_ns = time.perf_counter_ns()
+
+            def load_fast_timed():
+                started_ns = time.perf_counter_ns()
+                value = self._read_raw_fast_tier_tensors(fast_names)
+                return value, time.perf_counter_ns() - started_ns
+
+            future = executor.submit(load_fast_timed)
+            archive_started_ns = time.perf_counter_ns()
+            slow_out, slow_bytes = self._read_qwen4_fused_expert_slices(
+                slow_names)
+            archive_service_ns = time.perf_counter_ns() - archive_started_ns
+            (fast_out, fast_bytes), fast_service_ns = future.result()
+            wall_ns = time.perf_counter_ns() - parallel_started_ns
+            out.update(slow_out)
+            out.update(fast_out)
+            self._record_parallel_tier(
+                fast_bytes=fast_bytes,
+                archive_bytes=slow_bytes,
+                wall_ns=wall_ns,
+                fast_service_ns=fast_service_ns,
+                archive_service_ns=archive_service_ns,
+            )
+        else:
+            if fast_names:
+                fast_out, fast_bytes = self._read_raw_fast_tier_tensors(
+                    fast_names)
+                out.update(fast_out)
+            if slow_names:
+                slow_out, slow_bytes = self._read_qwen4_fused_expert_slices(
+                    slow_names)
+                out.update(slow_out)
+
+        if fast_names:
+            self.fast_tier_bytes += fast_bytes
+            self.fast_tier_tensors += len(fast_names)
+            with self._stage_lock:
+                self.qwen4_fused_requested_tensors += len(fast_names)
+                self.qwen4_fused_read_bytes += fast_bytes
+                if not slow_names:
+                    self.qwen4_fused_read_calls += 1
+        self.archive_bytes += slow_bytes
+        return out, fast_bytes + slow_bytes
+
     def close(self) -> None:
         """Join the optional fast-tier worker owned by this store."""
         with self._stage_lock:
@@ -1744,6 +2093,20 @@ class WeightStore:
         backends may account compressed extents. Callers must not label this
         field "physical bytes" without independent process/device counters.
         """
+        virtual_names = [
+            name for name in names
+            if name in self._qwen4_fused_expert_slices]
+        if virtual_names:
+            started = time.perf_counter()
+            virtual_out, virtual_bytes = (
+                self._read_qwen4_virtual_expert_tiers(virtual_names))
+            remaining = [name for name in names if name not in virtual_out]
+            if remaining:
+                regular_out, _regular_seconds, regular_bytes = self.fetch(
+                    remaining)
+                virtual_out.update(regular_out)
+                virtual_bytes += regular_bytes
+            return virtual_out, time.perf_counter() - started, virtual_bytes
         if self.gguf is not None:
             # Dequantize eagerly to a dense bf16 array at fetch time -- same
             # convention as the compressed-tensors INT4/MXFP4 paths below,

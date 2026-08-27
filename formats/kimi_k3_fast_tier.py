@@ -67,7 +67,7 @@ def _category(name: str) -> str | None:
     """
     if _EXPERT_RE.search(name):
         return None
-    if ("embed_tokens" in name or "lm_head" in name
+    if ("embed_tokens" in name or "lm_head" in name or ".ple." in name
             or "vision_tower" in name or "mm_projector" in name
             or ".visual." in name or name.startswith("visual.")):
         return None

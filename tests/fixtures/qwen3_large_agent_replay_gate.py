@@ -385,7 +385,10 @@ def _post(
                             key: event.get(key)
                             for key in (
                                 "phase", "completed", "total", "fraction",
-                                "cache_source")
+                                "cache_source", "diagnostic", "subphase",
+                                "layer", "completed_tokens",
+                                "active_metal_bytes", "peak_metal_bytes",
+                                "host_spool_bytes", "metal_limit_bytes")
                         })
                     if event_type in (
                             "response.completed", "response.incomplete",

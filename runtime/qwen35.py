@@ -169,6 +169,18 @@ def _silu_gated_rms_norm(
     return (normalized * silu_gate).astype(source_dtype)
 
 
+def _sigmoid_gated_rms_norm(
+    x: mx.array, gate: mx.array, weight: mx.array, eps: float,
+) -> mx.array:
+    """Qwen4-Exp's released DeltaNet output gate (plain sigmoid)."""
+    source_dtype = x.dtype
+    normalized = mx.fast.rms_norm(
+        x.astype(mx.float32), weight.astype(mx.float32), eps)
+    return (
+        normalized * mx.sigmoid(gate.astype(mx.float32))
+    ).astype(source_dtype)
+
+
 def _rotate_half(x: mx.array) -> mx.array:
     half = x.shape[-1] // 2
     return mx.concatenate([-x[..., half:], x[..., :half]], axis=-1)
@@ -725,6 +737,13 @@ def _gated_delta_net(
         output = step_out[:, None]
     else:
         output, state = _sequential_gated_delta_rule(q, k, v, beta, decay, state)
+    # The released Transformers kernels accumulate the DeltaNet recurrence in
+    # FP32 but cast ``core_attn_out`` back to the input Q/K dtype before the
+    # gated RMSNorm and output projection.  ``q`` above is deliberately
+    # promoted for the reference recurrence, so leaving its result in FP32
+    # silently promotes every Qwen4 hyper residual after a linear-attention
+    # layer and doubles long-context activation storage.
+    output = output.astype(h.dtype)
     if state_cache is not None:
         if state_cache.factor_capture_active:
             if length != 1:
@@ -752,9 +771,13 @@ def _gated_delta_net(
 
     z = _linear(h, w, f"{prefix}.linear_attn.in_proj_z").reshape(
         batch, length, value_heads, value_dim)
-    norm_fn = (
-        _zmlx_silu_gated_rms_norm if zmlx_fused_decode and length == 1
-        else _silu_gated_rms_norm)
+    output_gate_type = getattr(cfg, "qwen4_output_gate_type", "")
+    if output_gate_type == "sigmoid":
+        norm_fn = _sigmoid_gated_rms_norm
+    else:
+        norm_fn = (
+            _zmlx_silu_gated_rms_norm if zmlx_fused_decode and length == 1
+            else _silu_gated_rms_norm)
     output = norm_fn(
         output, z, w[f"{prefix}.linear_attn.norm.weight"],
         cfg.rms_norm_eps)

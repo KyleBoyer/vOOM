@@ -187,6 +187,51 @@ def test_vision_protocol_timing_uses_generic_path_stats():
     }
 
 
+def test_vision_protocol_timing_exposes_qwen4_spool_phases():
+    timing = _vision_protocol_timing({
+        "path_stats": {
+            "qwen4_host_spool_h2d_bytes": 11,
+            "qwen4_host_spool_d2h_bytes": 12,
+            "qwen4_host_spool_peak_host_bytes": 13,
+            "qwen4_host_spool_memory_samples": 14,
+            "qwen4_host_spool_global_expert_rows": 1,
+            "qwen4_host_spool_expert_row_gathers": 17,
+            "qwen4_host_spool_expert_rows_uploaded": 18,
+            "qwen4_host_spool_sparse_expert_batch_rows": 1,
+            "qwen4_host_spool_expert_batch_tile_gathers": 19,
+            "qwen4_host_spool_expert_batch_tile_rows_uploaded": 20,
+            "qwen4_host_spool_copy_seconds": 1.25,
+            "qwen4_host_spool_ple_seconds": 2.25,
+            "qwen4_host_spool_attention_seconds": 3.25,
+            "qwen4_host_spool_route_and_spool_seconds": 4.25,
+            "qwen4_host_spool_experts_seconds": 5.25,
+            "qwen4_host_spool_output_seconds": 6.25,
+            "qwen4_ple_bytes_read": 15,
+            "qwen4_fused_expert_bytes": 16,
+        },
+    })
+
+    assert timing["qwen4_host_spool_h2d_bytes"] == 11
+    assert timing["qwen4_host_spool_d2h_bytes"] == 12
+    assert timing["qwen4_host_spool_peak_host_bytes"] == 13
+    assert timing["qwen4_host_spool_memory_samples"] == 14
+    assert timing["qwen4_host_spool_global_expert_rows"] == 1
+    assert timing["qwen4_host_spool_expert_row_gathers"] == 17
+    assert timing["qwen4_host_spool_expert_rows_uploaded"] == 18
+    assert timing["qwen4_host_spool_sparse_expert_batch_rows"] == 1
+    assert timing["qwen4_host_spool_expert_batch_tile_gathers"] == 19
+    assert timing[
+        "qwen4_host_spool_expert_batch_tile_rows_uploaded"] == 20
+    assert timing["qwen4_host_spool_copy_seconds"] == 1.25
+    assert timing["qwen4_host_spool_ple_seconds"] == 2.25
+    assert timing["qwen4_host_spool_attention_seconds"] == 3.25
+    assert timing["qwen4_host_spool_route_and_spool_seconds"] == 4.25
+    assert timing["qwen4_host_spool_experts_seconds"] == 5.25
+    assert timing["qwen4_host_spool_output_seconds"] == 6.25
+    assert timing["qwen4_ple_bytes_read"] == 15
+    assert timing["qwen4_fused_expert_bytes"] == 16
+
+
 def test_vision_protocol_timing_exposes_qwen_mtp_round_trace():
     replay = [{"depth": 1, "draft_token_ids": [7, 9]}]
     timing = _vision_protocol_timing({
@@ -1816,6 +1861,9 @@ def test_qwen_compiled_delta_is_explicit_and_architecture_scoped():
         "1", model_type="qwen3_5_moe",
     ) == (True, "operator-forced")
     assert _qwen_compiled_delta_policy(
+        "1", model_type="qwen4_exp",
+    ) == (True, "operator-forced")
+    assert _qwen_compiled_delta_policy(
         "1", model_type="glm_moe_dsa",
     ) == (False, "unsupported-architecture")
     with pytest.raises(ValueError, match="must be 0 or 1"):
@@ -2659,6 +2707,111 @@ def test_qwen36_profiles_bound_experts_and_use_hybrid_endpoint_cache():
     # The real 35B lossy capture crossed the paging cliff at 5.5/7.0 GB.
     # 5.0 GB completed safely at 7.24 GB Metal; lossless remains unchanged.
     assert fast.max_weight_cache_mb == 5000
+
+
+def test_qwen4_instrumented_profile_is_exact_bounded_and_in_engine_identity():
+    from unittest.mock import patch
+
+    from runtime.server import EngineManager
+
+    captured = []
+
+    class FakeEngine:
+        def __init__(self, _path, rc):
+            captured.append(rc)
+
+        def close(self):
+            pass
+
+    cfg = SimpleNamespace(
+        model_type="qwen4_exp", tie_word_embeddings=False,
+        vision_config={"model_type": "qwen4_exp_vision"},
+        num_hidden_layers=48, num_experts=512,
+    )
+    settings = {
+        "VMODEL_QWEN4_WEIGHT_CACHE_MB": "300",
+        "VMODEL_QWEN4_MIN_WEIGHT_CACHE_MB": "64",
+        "VMODEL_QWEN4_MLX_CACHE_MB": "128",
+        "VMODEL_QWEN4_PREFILL_CHUNK": "8192",
+        "VMODEL_QWEN4_EXPERT_FETCH_BATCH": "16",
+        "VMODEL_QWEN4_DECODE_EXPERT_FETCH_BATCH": "16",
+        "VMODEL_QWEN4_PREFETCH_DEPTH": "0",
+        "VMODEL_QWEN4_PREFETCH_WORKERS": "1",
+        "VMODEL_QWEN4_PLE_READ_WORKERS": "1",
+        "VMODEL_QWEN4_MAX_METAL_MB": "8500",
+        "VMODEL_QWEN4_SPARSE_EXPERT_BATCH_ROWS": "0",
+        "VMODEL_QWEN4_GLOBAL_EXPERT_ROWS": "0",
+        "VMODEL_QWEN4_COMPILED_DELTA": "0",
+        "VMODEL_QWEN4_FAST_TIER_DIR": "",
+        "VMODEL_QWEN4_PARALLEL_STORAGE_READS": "0",
+        "VMODEL_QWEN4_HOT_PROMPT_KV": "1",
+        "VMODEL_QWEN4_HOT_KV_SLOTS": "1",
+        "VMODEL_QWEN4_HOT_KV_MIN_TOKENS": "2048",
+        "VMODEL_QWEN4_HOT_KV_PERSIST_DIR": "",
+        "VMODEL_QWEN4_HOT_KV_PERSIST_MAX_CHECKPOINTS": "4",
+        "VMODEL_QWEN4_HOT_KV_PERSIST_MAX_MB": "8192",
+    }
+    with patch.dict(os.environ, settings, clear=False), \
+         patch("runtime.config.ModelConfig.from_dir", return_value=cfg), \
+         patch("runtime.path_resolver.resolve_model_dir", side_effect=lambda path: path), \
+         patch("runtime.engine.StreamingEngine", FakeEngine):
+        manager = EngineManager()
+        manager.get(Path("/tmp/fake-qwen4"), "lossless")
+        os.environ["VMODEL_QWEN4_WEIGHT_CACHE_MB"] = "301"
+        manager.get(Path("/tmp/fake-qwen4"), "lossless")
+
+    assert len(captured) == 2
+    baseline, changed = captured
+    assert baseline.max_weight_cache_mb == 300
+    assert changed.max_weight_cache_mb == 301
+    for rc in captured:
+        assert rc.min_weight_cache_mb == 64
+        assert rc.mlx_cache_limit_mb == 128
+        assert rc.prefill_chunk_size == 8192
+        assert rc.expert_fetch_batch == 16
+        assert rc.decode_expert_fetch_batch == 16
+        assert rc.prefetch_depth == 0
+        assert rc.prefetch_workers == 1
+        assert rc.qwen4_ple_read_workers == 1
+        assert rc.metal_limit_mb == 8500
+        assert not rc.qwen4_sparse_expert_batch_rows
+        assert not rc.qwen4_global_expert_rows
+        assert not rc.pin_lm_head
+        assert rc.stream_lm_head
+        assert not rc.pin_embeddings
+        assert rc.embed_rows
+        assert rc.prompt_kv_dir == ""
+        assert rc.hot_prompt_kv
+        assert rc.hot_prompt_kv_slots == 1
+        assert rc.hot_prompt_kv_min_tokens == 2048
+        assert rc.hot_prompt_kv_persist_dir == ""
+        assert rc.hot_prompt_kv_chunk_size == rc.prefill_chunk_size
+        assert rc.layer_stationary_prefill
+        assert not rc.parallel_storage_reads
+        assert rc.quant_bits == 0
+        assert not rc.qwen_compiled_delta_prefill
+
+
+def test_qwen4_instrumented_profile_rejects_invalid_cache_bounds():
+    from unittest.mock import patch
+
+    from runtime.server import EngineManager
+
+    cfg = SimpleNamespace(
+        model_type="qwen4_exp", tie_word_embeddings=False,
+        vision_config={"model_type": "qwen4_exp_vision"},
+        num_hidden_layers=48, num_experts=512,
+    )
+    with patch.dict(os.environ, {
+        "VMODEL_QWEN4_WEIGHT_CACHE_MB": "63",
+    }, clear=False), \
+         patch("runtime.config.ModelConfig.from_dir", return_value=cfg), \
+         patch("runtime.path_resolver.resolve_model_dir", side_effect=lambda path: path):
+        with pytest.raises(
+            RequestValidationError,
+            match="VMODEL_QWEN4_WEIGHT_CACHE_MB must be in",
+        ):
+            EngineManager().get(Path("/tmp/fake-qwen4"), "lossless")
 
 
 def test_qwen36_explicit_quantized_head_replaces_repeated_bf16_stream():
