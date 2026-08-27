@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import re
 from collections import Counter, defaultdict
 from pathlib import Path
@@ -31,6 +32,17 @@ from pathlib import Path
 # exhaustive per-architecture list, since the whole point is not to assume
 # K3's naming matches anything already known.
 _CATEGORY_PATTERNS = (
+    ("ple_ngram", re.compile(
+        r"(?:^|\.)ple\.|ngram_embedding|ple_embedding", re.IGNORECASE)),
+    ("mtp", re.compile(r"(?:^|\.)mtp\.", re.IGNORECASE)),
+    ("qsa_indexer", re.compile(
+        r"qsa.*index|indexer|index_qk_proj", re.IGNORECASE)),
+    ("gated_residual", re.compile(
+        r"hyper_connection|input_mix_weight|block_inject_weight",
+        re.IGNORECASE)),
+    ("vision", re.compile(
+        r"(?:^|\.)(?:visual|vision_model|vision_tower)\.|patch_embed",
+        re.IGNORECASE)),
     ("expert", re.compile(r"\.experts?\.", re.IGNORECASE)),
     ("shared_expert", re.compile(r"shared_expert", re.IGNORECASE)),
     ("attention", re.compile(
@@ -42,6 +54,24 @@ _CATEGORY_PATTERNS = (
     ("embedding", re.compile(r"embed_tokens|wte\b", re.IGNORECASE)),
     ("lm_head", re.compile(r"lm_head", re.IGNORECASE)),
 )
+
+_DTYPE_BITS = {
+    "BOOL": 8,
+    "I8": 8,
+    "U8": 8,
+    "F8_E4M3": 8,
+    "F8_E5M2": 8,
+    "I16": 16,
+    "U16": 16,
+    "F16": 16,
+    "BF16": 16,
+    "I32": 32,
+    "U32": 32,
+    "F32": 32,
+    "I64": 64,
+    "U64": 64,
+    "F64": 64,
+}
 
 
 def _categorize(tensor_name: str) -> str:
@@ -60,12 +90,21 @@ def inspect(model_dir: Path) -> dict:
 
     if config_path.exists():
         config = json.loads(config_path.read_text())
+        text_config = config.get("text_config") or config
         report["config_model_type"] = config.get("model_type")
         report["config_architectures"] = config.get("architectures")
-        report["config_num_hidden_layers"] = config.get("num_hidden_layers")
+        report["config_text_model_type"] = text_config.get("model_type")
+        report["config_num_hidden_layers"] = text_config.get(
+            "num_hidden_layers")
         report["config_num_experts"] = (
-            config.get("num_experts") or config.get("n_routed_experts"))
-        report["config_layer_types_present"] = "layer_types" in config
+            text_config.get("num_experts")
+            or text_config.get("n_routed_experts"))
+        report["config_num_experts_per_tok"] = text_config.get(
+            "num_experts_per_tok")
+        report["config_layer_types_present"] = "layer_types" in text_config
+        report["config_ple_layer_ids"] = text_config.get("ple_layer_ids")
+        report["config_mtp_num_hidden_layers"] = text_config.get(
+            "mtp_num_hidden_layers")
         # If the checkpoint documents its own quantization scheme, that is
         # authoritative -- print it in full rather than inferring from
         # dtype strings alone, exactly like K2.5's real
@@ -77,6 +116,8 @@ def inspect(model_dir: Path) -> dict:
         report["config_error"] = f"missing {config_path}"
 
     dtype_by_category: dict[str, Counter] = defaultdict(Counter)
+    bytes_by_category: Counter = Counter()
+    unknown_dtype_tensors: list[dict] = []
     total_tensors = 0
     if index_path.exists():
         index = json.loads(index_path.read_text())
@@ -96,9 +137,20 @@ def inspect(model_dir: Path) -> dict:
                 continue
             with safe_open(str(shard_path), framework="numpy") as handle:
                 for name in handle.keys():
-                    dtype = handle.get_slice(name).get_dtype()
+                    tensor_slice = handle.get_slice(name)
+                    dtype = str(tensor_slice.get_dtype())
+                    shape = tuple(tensor_slice.get_shape())
                     category = _categorize(name)
-                    dtype_by_category[category][str(dtype)] += 1
+                    dtype_by_category[category][dtype] += 1
+                    bits = _DTYPE_BITS.get(dtype)
+                    if bits is None:
+                        unknown_dtype_tensors.append({
+                            "name": name,
+                            "dtype": dtype,
+                            "shape": list(shape),
+                        })
+                    else:
+                        bytes_by_category[category] += math.prod(shape) * bits // 8
                     total_tensors += 1
         report["index_shard_count"] = len(shard_files)
     elif single_file.exists():
@@ -106,9 +158,20 @@ def inspect(model_dir: Path) -> dict:
 
         with safe_open(str(single_file), framework="numpy") as handle:
             for name in handle.keys():
-                dtype = handle.get_slice(name).get_dtype()
+                tensor_slice = handle.get_slice(name)
+                dtype = str(tensor_slice.get_dtype())
+                shape = tuple(tensor_slice.get_shape())
                 category = _categorize(name)
-                dtype_by_category[category][str(dtype)] += 1
+                dtype_by_category[category][dtype] += 1
+                bits = _DTYPE_BITS.get(dtype)
+                if bits is None:
+                    unknown_dtype_tensors.append({
+                        "name": name,
+                        "dtype": dtype,
+                        "shape": list(shape),
+                    })
+                else:
+                    bytes_by_category[category] += math.prod(shape) * bits // 8
                 total_tensors += 1
         report["index_shard_count"] = 1
     else:
@@ -120,6 +183,12 @@ def inspect(model_dir: Path) -> dict:
         category: dict(counts)
         for category, counts in sorted(dtype_by_category.items())
     }
+    report["tensor_bytes_by_category"] = {
+        category: int(size)
+        for category, size in sorted(bytes_by_category.items())
+    }
+    report["total_tensor_bytes"] = int(sum(bytes_by_category.values()))
+    report["unknown_dtype_tensors"] = unknown_dtype_tensors
     return report
 
 
