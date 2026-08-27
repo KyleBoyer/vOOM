@@ -262,15 +262,26 @@ def _full_attention(
         length == 1 and getattr(kv, "online_attention", False))
     if online_paged:
         kv.append_for_online_attention(layer, k, v)
-        from .qwen35_paged_attention import tiled_paged_attention
+        if getattr(kv, "online_attention_page_native", False):
+            from .qwen35_paged_attention import page_native_paged_attention
 
-        attended = tiled_paged_attention(
-            q,
-            kv,
-            layer,
-            tile_positions=int(getattr(
-                kv, "online_attention_tile_positions", 2048)),
-        )
+            attended = page_native_paged_attention(
+                q,
+                kv,
+                layer,
+                pages_per_tile=int(getattr(
+                    kv, "online_attention_pages_per_tile", 8)),
+            )
+        else:
+            from .qwen35_paged_attention import tiled_paged_attention
+
+            attended = tiled_paged_attention(
+                q,
+                kv,
+                layer,
+                tile_positions=int(getattr(
+                    kv, "online_attention_tile_positions", 2048)),
+            )
     else:
         keys, values = kv.update(layer, k, v)
 

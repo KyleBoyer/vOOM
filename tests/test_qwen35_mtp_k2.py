@@ -256,6 +256,58 @@ class _WideRecurrentDrafter(_RecurrentDrafter):
         return logits, mx.array([[[1000.0 + step]]])
 
 
+class _DepthFiveTarget(_Target):
+    """Width-six serial oracle for the experimental fifth MTP step."""
+
+    draft_tokens = (10, 11, 12, 13, 14)
+    correction_tokens = (5, 6, 7, 9, 15)
+
+    def __init__(self, accepted_prefix):
+        super().__init__(accepted_prefix)
+        self.endpoints = {index: _Endpoint(index) for index in range(1, 7)}
+
+    def forward_tokens_serial_positions(
+        self, tokens, kv, *, capture_kda_endpoints=False,
+    ):
+        expected = [4, *self.draft_tokens]
+        assert tokens == expected
+        assert capture_kda_endpoints
+        self.serial_calls.append(list(tokens))
+        width = len(expected)
+        kv.offset += width
+        kv.lengths[0] += width
+        kv.kda_cache = self.endpoints[width]
+        hidden_rows = (40.0, 100.0, 110.0, 120.0, 130.0, 140.0)
+        self._h_window = mx.array([[[value] for value in hidden_rows]])
+        self._h_last = self._h_window[:, -1:, :]
+        winners = [
+            proposal if self.accepted_prefix > index
+            else self.correction_tokens[index]
+            for index, proposal in enumerate(self.draft_tokens)
+        ]
+        winners.append(8)
+        logits = mx.full((width, 16), -100.0)
+        for row, token in enumerate(winners):
+            logits = logits.at[row, token].add(200.0)
+        return logits
+
+
+class _DepthFiveDrafter(_RecurrentDrafter):
+    def draft_step(self, hidden, token, mtp_kv, offset, _weights=None):
+        step = len(self.calls)
+        self.mtp_kv = mtp_kv
+        self.calls.append({
+            "hidden": float(hidden.reshape(-1)[0].item()),
+            "token": int(token),
+            "offset": int(offset),
+        })
+        key = mx.full((1, 1, 1, 1), float(step + 1))
+        mtp_kv.update(0, key, key)
+        proposal = _DepthFiveTarget.draft_tokens[step]
+        logits = mx.full((16,), -100.0).at[proposal].add(200.0)
+        return logits, mx.array([[[1000.0 + step]]])
+
+
 class _ExternalARDrafter:
     proposal_source = "A"
     request_weight_representation = "resident-ar-mxfp4"
@@ -890,6 +942,10 @@ def test_paged_wrapper_publishes_complete_reuse_and_spill_telemetry():
             reload_s=0.5,
             spill_bytes_raw=700,
             spill_bytes_compressed=350,
+            page_native_calls=11,
+            page_native_groups=23,
+            page_native_positions=4567,
+            page_native_s=0.25,
         )
         return result
 
@@ -898,6 +954,10 @@ def test_paged_wrapper_publishes_complete_reuse_and_spill_telemetry():
 
     assert stats["paged_kv_spills"] == 7
     assert stats["paged_kv_reloads"] == 5
+    assert stats["paged_kv_page_native_calls"] == 11
+    assert stats["paged_kv_page_native_groups"] == 23
+    assert stats["paged_kv_page_native_positions"] == 4567
+    assert stats["paged_kv_page_native_seconds"] == 0.25
 
 
 def test_k2_greedy_rank_capture_identifies_rescuable_second_choice():
@@ -1015,6 +1075,64 @@ def test_k4_every_accepted_prefix_matches_ordinary_state_oracle(
         expected_fed < 5)
     assert stats["qwen_mtp_draft_kv_rollbacks"] == int(
         expected_mtp_length < 4)
+
+
+@pytest.mark.parametrize("accepted_prefix", range(6))
+def test_k5_every_accepted_prefix_matches_ordinary_state_oracle(
+    accepted_prefix,
+):
+    target = _DepthFiveTarget(accepted_prefix)
+    engine = QwenMTPSpeculativeEngine(
+        target,
+        max_prompt_tokens=8,
+        min_output_tokens=2,
+        plain_warmup_tokens=0,
+        adaptive_stop=False,
+        depth=5,
+    )
+    drafter = _DepthFiveDrafter()
+    engine.drafter = drafter
+
+    result = engine.generate("x", accepted_prefix + 2)
+
+    accepted_tokens = list(
+        _DepthFiveTarget.draft_tokens[:accepted_prefix])
+    final_token = (
+        8 if accepted_prefix == 5
+        else _DepthFiveTarget.correction_tokens[accepted_prefix]
+    )
+    expected_tokens = [4, *accepted_tokens, final_token]
+    expected_fed = accepted_prefix + 1
+    expected_mtp_length = min(5, expected_fed)
+    assert result["tokens"] == expected_tokens
+    assert target.last_kv.offset == 3 + expected_fed
+    assert target.last_kv.lengths == [3 + expected_fed, 1]
+    assert target.last_kv.kda_cache is target.endpoints[expected_fed]
+    assert float(target._h_last.reshape(-1)[0].item()) == {
+        1: 40.0,
+        2: 100.0,
+        3: 110.0,
+        4: 120.0,
+        5: 130.0,
+        6: 140.0,
+    }[expected_fed]
+    assert target.endpoint_requests == [
+        None if expected_fed == 6 else expected_fed]
+    assert drafter.mtp_kv.layer_lengths() == (expected_mtp_length,)
+    assert [call["token"] for call in drafter.calls] == [4, 10, 11, 12, 13]
+    assert [call["offset"] for call in drafter.calls] == [2, 3, 4, 5, 6]
+    stats = result["path_stats"]
+    assert stats["qwen_mtp_depth"] == 5
+    assert stats["qwen_mtp_verify_width"] == 6
+    assert stats["qwen_mtp_accepted"] == accepted_prefix
+    assert stats["qwen_mtp_accepted_by_step"] == [
+        int(index < accepted_prefix) for index in range(5)]
+    assert stats["qwen_mtp_verified_by_step"] == [
+        int(index <= accepted_prefix) for index in range(5)]
+    assert stats["qwen_mtp_target_prefix_rollbacks"] == int(
+        expected_fed < 6)
+    assert stats["qwen_mtp_draft_kv_rollbacks"] == int(
+        expected_mtp_length < 5)
 
 
 @pytest.mark.parametrize("accepted_prefix", range(5))
@@ -1416,8 +1534,9 @@ def test_k2_constructor_is_strict_and_opt_in():
     target = _Target(2)
     assert QwenMTPSpeculativeEngine(target).depth == 1
     assert QwenMTPSpeculativeEngine(target, depth=4).depth == 4
-    for invalid in (0, 5, True, "2"):
-        with pytest.raises(ValueError, match=r"depth must be in \[1, 4\]"):
+    assert QwenMTPSpeculativeEngine(target, depth=5).depth == 5
+    for invalid in (0, 6, True, "2"):
+        with pytest.raises(ValueError, match=r"depth must be in \[1, 5\]"):
             QwenMTPSpeculativeEngine(target, depth=invalid)
     cascade = QwenMTPSpeculativeEngine(
         target, depth=4, ngram_first=True)
@@ -1477,8 +1596,8 @@ def test_server_q_policy_is_strict_and_part_of_engine_cache_identity():
     with patch.dict(os.environ, {"VMODEL_QWEN_MTP_Q_POLICY": "mystery"}):
         with pytest.raises(RequestValidationError, match="flat, temperature"):
             EngineManager().get(Path("/tmp/not-opened"), "fast")
-    with patch.dict(os.environ, {"VMODEL_QWEN_MTP_DEPTH": "5"}):
-        with pytest.raises(RequestValidationError, match=r"in \[1, 4\]"):
+    with patch.dict(os.environ, {"VMODEL_QWEN_MTP_DEPTH": "6"}):
+        with pytest.raises(RequestValidationError, match=r"in \[1, 5\]"):
             EngineManager().get(Path("/tmp/not-opened"), "fast")
     with patch.dict(os.environ, {"VMODEL_QWEN_MTP_NGRAM_FIRST": "auto"}):
         with pytest.raises(RequestValidationError, match="must be 0 or 1"):

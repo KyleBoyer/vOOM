@@ -165,6 +165,7 @@ def test_vision_protocol_timing_uses_generic_path_stats():
         "prompt_kv_projection": "",
         "qwen35_paged_online_attention": 0,
         "qwen35_paged_online_tile_positions": 0,
+        "qwen35_paged_online_page_native": 0,
         "qwen35_kv_page_positions": 0,
         "vision_cache_hits": 2,
         "vision_cache_misses": 1,

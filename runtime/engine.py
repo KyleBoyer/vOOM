@@ -727,6 +727,7 @@ class RuntimeConfig:
     # The changed reduction order is never enabled on released/lossless paths.
     qwen35_paged_online_attention: bool = False
     qwen35_paged_online_tile_positions: int = 2048
+    qwen35_paged_online_page_native: bool = False
     # Explicit Qwen hybrid mode: durable journal tensors restore directly into
     # bounded PagedKVCache pages and are never preloaded into the resident LRU.
     # Default-off until the real 49K replay passes the cold/restart proof gate.
@@ -2566,6 +2567,11 @@ class StreamingEngine:
                         and self.rc.qwen35_paged_online_attention)
                     cache.online_attention_tile_positions = int(
                         self.rc.qwen35_paged_online_tile_positions)
+                    cache.online_attention_page_native = bool(
+                        self.rc.qwen35_paged_online_page_native)
+                    cache.online_attention_pages_per_tile = int(
+                        self.rc.qwen35_paged_online_tile_positions
+                        // self.rc.kv_page_positions)
                     return cache
 
             if mixed_depth_persistence:
@@ -7940,6 +7946,11 @@ class StreamingEngine:
                 f"qwenchunkeddelta{int(self.rc.qwen_chunked_delta_prefill)}"
                 f"qwenserialbatchmlp{int(
                     self.rc.qwen35_serial_verify_batched_mlp)}"
+                f"qwenpagedonline{int(
+                    self.rc.qwen35_paged_online_attention)}"
+                f"qwenpagedtile{self.rc.qwen35_paged_online_tile_positions}"
+                f"qwenpagednative{int(
+                    self.rc.qwen35_paged_online_page_native)}"
                 f"k3scalesidecar{scale_sidecar_identity}"
                 f"k3nf12sidecar{nf12_sidecar_identity}"
                 f"k3nf12direct{int(self.rc.bf16_nf12_direct_linear)}"
@@ -8345,6 +8356,8 @@ class StreamingEngine:
                 self.rc.qwen35_paged_online_attention)
             path_stats["qwen35_paged_online_tile_positions"] = int(
                 self.rc.qwen35_paged_online_tile_positions)
+            path_stats["qwen35_paged_online_page_native"] = int(
+                self.rc.qwen35_paged_online_page_native)
             path_stats["qwen35_kv_page_positions"] = int(
                 self.rc.kv_page_positions)
             path_stats["qwen35_serial_verify_batched_mlp"] = int(
@@ -9152,6 +9165,11 @@ class StreamingEngine:
                     and self.rc.qwen35_paged_online_attention)
                 kv.online_attention_tile_positions = int(
                     self.rc.qwen35_paged_online_tile_positions)
+                kv.online_attention_page_native = bool(
+                    self.rc.qwen35_paged_online_page_native)
+                kv.online_attention_pages_per_tile = int(
+                    self.rc.qwen35_paged_online_tile_positions
+                    // self.rc.kv_page_positions)
                 attach_hybrid_recurrent_cache(
                     kv,
                     model_type=self.cfg.model_type,
@@ -10433,6 +10451,14 @@ class StreamingEngine:
             getattr(paged_stats, "spill_s", 0.0) or 0.0)
         path_stats["paged_kv_reload_seconds"] = float(
             getattr(paged_stats, "reload_s", 0.0) or 0.0)
+        path_stats["paged_kv_page_native_calls"] = int(
+            getattr(paged_stats, "page_native_calls", 0) or 0)
+        path_stats["paged_kv_page_native_groups"] = int(
+            getattr(paged_stats, "page_native_groups", 0) or 0)
+        path_stats["paged_kv_page_native_positions"] = int(
+            getattr(paged_stats, "page_native_positions", 0) or 0)
+        path_stats["paged_kv_page_native_seconds"] = float(
+            getattr(paged_stats, "page_native_s", 0.0) or 0.0)
         if getattr(kv, "position_free", False):
             # The view exists only to make this request's long decode use MLX's
             # fast pre-rotated SDPA. The retained hot slot owns shared physical

@@ -1433,8 +1433,8 @@ class QwenMTPSpeculativeEngine:
         if isinstance(proposal_replay_top_k, bool) or proposal_replay_top_k < 0:
             raise ValueError("proposal_replay_top_k must be non-negative")
         if (isinstance(depth, bool) or not isinstance(depth, int)
-                or not 1 <= depth <= 4):
-            raise ValueError("Qwen MTP depth must be in [1, 4]")
+                or not 1 <= depth <= 5):
+            raise ValueError("Qwen MTP depth must be in [1, 5]")
         if not isinstance(ngram_first, bool):
             raise TypeError("Qwen MTP ngram_first must be bool")
         if (isinstance(ngram_min_ngram, bool)
@@ -4070,6 +4070,14 @@ class QwenMTPSpeculativeEngine:
                     getattr(paged_stats, "spill_s", 0.0)),
                 "paged_kv_reload_seconds": float(
                     getattr(paged_stats, "reload_s", 0.0)),
+                "paged_kv_page_native_calls": int(
+                    getattr(paged_stats, "page_native_calls", 0)),
+                "paged_kv_page_native_groups": int(
+                    getattr(paged_stats, "page_native_groups", 0)),
+                "paged_kv_page_native_positions": int(
+                    getattr(paged_stats, "page_native_positions", 0)),
+                "paged_kv_page_native_seconds": float(
+                    getattr(paged_stats, "page_native_s", 0.0)),
                 "paged_kv_spill_bytes_raw": int(
                     getattr(paged_stats, "spill_bytes_raw", 0)),
                 "paged_kv_spill_bytes_compressed": int(

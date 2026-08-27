@@ -35,6 +35,10 @@ class QwenTreeKVProxy:
             getattr(base, "online_attention", False))
         self.online_attention_tile_positions = int(getattr(
             base, "online_attention_tile_positions", 2048))
+        self.online_attention_page_native = bool(getattr(
+            base, "online_attention_page_native", False))
+        self.online_attention_pages_per_tile = int(getattr(
+            base, "online_attention_pages_per_tile", 8))
         self.kda_cache = KDAStateCache(self.num_layers)
         size = len(tree.token_ids)
         self.node_keys: list[list[mx.array | None]] = [
@@ -126,6 +130,22 @@ class QwenTreeKVProxy:
                 part_v[0] if len(part_v) == 1
                 else mx.concatenate(part_v, axis=2),
             )
+
+    def iter_materialized_layer_pages(self, layer: int):
+        """Yield exact prompt pages followed by one-token ancestor pages."""
+        if not self.online_attention_page_native:
+            raise RuntimeError("tree proxy page-native attention is disabled")
+        iterator = getattr(self.base, "iter_materialized_layer_pages", None)
+        if not callable(iterator):
+            raise TypeError(
+                "Qwen tree page-native attention requires paged prompt K/V")
+        yield from iterator(layer)
+        path = self.tree.path(int(self.current_node))
+        keys = [self.node_keys[layer][index] for index in path]
+        values = [self.node_values[layer][index] for index in path]
+        if any(item is None for item in (*keys, *values)):
+            raise RuntimeError("Qwen tree attention parent K/V is incomplete")
+        yield from zip(keys, values)
 
     def layer_positions(self, layer: int) -> int:
         base_positions = getattr(self.base, "layer_positions", None)

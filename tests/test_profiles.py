@@ -138,10 +138,24 @@ def test_builtin_profiles_resolve_complete_agent_group():
         "VMODEL_QWEN35_KV_PAGE_POSITIONS"] == "1024"
     assert long_settings[
         "VMODEL_QWEN35_PAGED_ONLINE_ATTENTION"] == "1"
+    assert "VMODEL_QWEN35_PAGED_ONLINE_PAGE_NATIVE" not in long_settings
     assert long_settings[
         "VMODEL_QWEN35_PAGED_ONLINE_TILE_POSITIONS"] == "4096"
+    assert long_settings["VMODEL_QWEN_MTP_DEPTH"] == "4"
     assert long_settings[
         "VMODEL_QWEN_MTP_SELECTIVE_TREE_MARGIN"] == "0"
+
+    mtpquant_order, mtpquant_settings = resolve_runtime_profiles(
+        ("huihui-qwen38-27b-fast-long-context-mtpquant",), catalog)
+    assert mtpquant_order == (
+        "agent-tool-gateway",
+        "huihui-qwen38-27b-fast-agent",
+        "huihui-qwen38-27b-fast-long-context",
+        "huihui-qwen38-27b-fast-long-context-mtpquant",
+    )
+    assert mtpquant_settings["VMODEL_QWEN_MTP_DEPTH"] == "5"
+    assert mtpquant_settings[
+        "VMODEL_QWEN35_PAGED_ONLINE_TILE_POSITIONS"] == "4096"
 
     persist_order, persist_settings = resolve_runtime_profiles(
         ("huihui-qwen38-27b-lossless-paged-persist",), catalog)

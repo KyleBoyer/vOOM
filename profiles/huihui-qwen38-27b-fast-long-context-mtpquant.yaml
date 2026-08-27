@@ -1,0 +1,12 @@
+schema: voom.runtime-profile.v1
+name: huihui-qwen38-27b-fast-long-context-mtpquant
+description: Explicit Huihui Qwen3.8 27B long-context route for the quantized native-MTP sidecar.
+notes:
+  - "This profile inherits the lossy operator-selected long-context target route and raises only the target-authoritative native-MTP proposal depth from four to five."
+  - "Pair it with model alias lossy-Huihui-Qwen3.8-27B-abliterated-mlx-all-mxfp4-mtpquant. Profiles do not select request model aliases, so using the ordinary alias would load the larger released-BF16 proposal sidecar and is not the pressure-qualified path."
+  - "The fixed 16,029-input / 64-output gate preserved the established output SHA and reduced wall 221.8704s -> 196.5540s, decode 117.4621s -> 91.2450s, and target sweeps 14 -> 11. The untouched captured max-16 request preserved its known SHA in 74.6620s with three target sweeps."
+  - "An ordinary-alias BF16 control also preserved the captured output and stayed below 90 seconds at 84.9447s, but failed promotion because swap allocation grew 295.895MB; this child profile is therefore not a BF16-sidecar default."
+extends:
+  - huihui-qwen38-27b-fast-long-context
+settings:
+  VMODEL_QWEN_MTP_DEPTH: 5

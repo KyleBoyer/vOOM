@@ -41,6 +41,10 @@ class KVStats:
     reload_s: float = 0.0
     spill_bytes_raw: int = 0  # only tracked when compress_spill is on
     spill_bytes_compressed: int = 0
+    page_native_calls: int = 0
+    page_native_groups: int = 0
+    page_native_positions: int = 0
+    page_native_s: float = 0.0
 
     def summary(self) -> str:
         base = (
@@ -149,6 +153,8 @@ class PagedKVCache:
         # materialization plus MLX SDPA.
         self.online_attention = False
         self.online_attention_tile_positions = 2048
+        self.online_attention_page_native = False
+        self.online_attention_pages_per_tile = 8
 
     # ---- KVCache API ------------------------------------------------------
 
@@ -236,6 +242,26 @@ class PagedKVCache:
         result = materialize_pending()
         if result is not None:
             yield result
+
+    def iter_materialized_layer_pages(self, layer: int):
+        """Yield exact stored pages without concatenating adjacent pages.
+
+        This is the bounded input surface for page-native attention kernels.
+        Spilled pages are still loaded only for the duration of the consumer's
+        current page group; they are never installed back into the cache.
+        """
+        for page in self._pages[layer]:
+            if not page.resident:
+                t0 = time.perf_counter()
+                keys, values = page.load()
+                self.stats.reloads += 1
+                self.stats.reload_s += time.perf_counter() - t0
+            else:
+                keys, values = page.k, page.v
+            yield keys, values
+        tail_k, tail_v = self._tail_k[layer], self._tail_v[layer]
+        if tail_k is not None and int(tail_k.shape[2]) > 0:
+            yield tail_k, tail_v
 
     def _append_layer(self, layer: int, k: mx.array, v: mx.array) -> None:
         if self._tail_k[layer] is None:

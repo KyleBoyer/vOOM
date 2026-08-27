@@ -510,6 +510,43 @@ attempt also remains a STOP: prefill completed, but decode hit the memory floor
 and swap growth reached 706MB. The released model advertises 262,144 context;
 this work validates 30K on this machine, not the advertised maximum.
 
+## Quantized native-MTP depth 5 (2026-08-26)
+
+The exact target verifier now admits five repeated native-MTP draft steps.  A
+six-position exhaustive oracle covers all accepted prefixes 0..5, including
+target K/V and DeltaNet endpoint selection, hidden-row recovery, and MTP-KV
+rollback.  The fifth step is default-off globally and enabled only in the
+child profile `huihui-qwen38-27b-fast-long-context-mtpquant`; the established
+long-context profile remains at its pressure-qualified depth four.
+
+Using the explicit 225.660MB quantized-MTP model alias, the fixed 16K/64 gate
+accepted 53/55 drafts (fifth step 9/11) and reduced target sweeps 14 -> 11.  It
+preserved the established output SHA and all content/pressure checks while
+cutting wall **221.8704s -> 196.5540s**, decode **117.4621s -> 91.2450s**, and
+streamed bytes 218.375GB -> 170.762GB.  Peak Metal was 2.724GB and swap growth
+5.439MB.
+
+The untouched captured 134-tool request also retained its known output SHA and
+returned in **74.6620s** with three target sweeps.  This replay changed only the
+request model alias to
+`lossy-Huihui-Qwen3.8-27B-abliterated-mlx-all-mxfp4-mtpquant`; its prompt, tools,
+messages, and streaming shape remained capture-derived.  The ordinary model
+alias still chooses released-BF16 proposal weights.  A depth-five BF16 control
+also preserved that SHA and stayed below 90 seconds at 84.9447s, but failed the
+pressure gate because swap allocation grew 295.895MB (actual swap-out 7.242MB).
+It is not promoted into the parent profile.
+
+The adjacent page-native attention experiment is retained as an explicit
+research path, not a profile default.  It removes adjacent-page concatenation
+and is bit-identical to the existing concatenated 8K kernel, but two exact-output
+16K/64 cold runs took 227.2242s and 237.5807s versus 221.8704s for the 4K winner.
+
+Evidence: `logs/qwen38_suffix12_tile4096_mtpquant_depth5_large16k_out64_20260826.json`,
+`logs/qwen38_suffix12_tile4096_mtpquant_depth5_unmodified_capture16_20260826.json`,
+`logs/qwen38_suffix12_tile4096_mtpbf16_depth5_unmodified_capture16_20260826.json`,
+`logs/qwen38_suffix12_page_native8x1024_large16k_out64_20260826.json`, and
+`logs/qwen38_suffix12_page_native8x1024_large16k_out64_rerun_20260826.json`.
+
 ## Depth-4 n-gram/MTP cascade and pressure follow-up (2026-08-26)
 
 `VMODEL_QWEN_MTP_NGRAM_FIRST=1` now composes with the existing native-MTP

@@ -14,6 +14,7 @@ import pytest
 from runtime.kv_paged import PagedKVCache
 from runtime.qwen35_tree_verify import QwenTreeKVProxy
 from runtime.qwen35_paged_attention import (
+    page_native_paged_attention,
     theoretical_tile_count,
     tiled_paged_attention,
 )
@@ -41,12 +42,33 @@ def test_paged_chunk_iterator_reconstructs_spilled_bits_exactly(tmp_path):
     assert theoretical_tile_count(14, 5) == 3
 
 
+def test_paged_page_iterator_reconstructs_spilled_bits_exactly(tmp_path):
+    kv = PagedKVCache(
+        1, max_bytes=1, spill_dir=tmp_path,
+        page_positions=4, resident_pages=0)
+    keys = mx.arange(11 * 8, dtype=mx.float32).reshape(1, 2, 11, 4)
+    values = keys + 1000
+    kv.append_for_online_attention(0, keys, values)
+
+    pages = list(kv.iter_materialized_layer_pages(0))
+    actual_keys = mx.concatenate([page[0] for page in pages], axis=2)
+    actual_values = mx.concatenate([page[1] for page in pages], axis=2)
+    mx.eval(actual_keys, actual_values)
+
+    assert [int(page[0].shape[2]) for page in pages] == [4, 4, 3]
+    np.testing.assert_array_equal(np.asarray(actual_keys), np.asarray(keys))
+    np.testing.assert_array_equal(np.asarray(actual_values), np.asarray(values))
+    assert kv.stats.reloads == 2
+
+
 def test_tree_proxy_streams_prompt_then_only_current_ancestor_path(tmp_path):
     kv = PagedKVCache(
         1, max_bytes=1, spill_dir=tmp_path,
         page_positions=4, resident_pages=0)
     kv.online_attention = True
     kv.online_attention_tile_positions = 5
+    kv.online_attention_page_native = True
+    kv.online_attention_pages_per_tile = 4
     base_keys = mx.arange(12 * 8, dtype=mx.float32).reshape(1, 2, 12, 4)
     base_values = base_keys + 1000
     kv.append_for_online_attention(0, base_keys, base_values)
@@ -80,12 +102,22 @@ def test_tree_proxy_streams_prompt_then_only_current_ancestor_path(tmp_path):
 
     assert proxy.online_attention
     assert proxy.online_attention_tile_positions == 5
+    assert proxy.online_attention_page_native
+    assert proxy.online_attention_pages_per_tile == 4
     assert proxy.layer_positions(0) == 15
     assert [int(item[0].shape[2]) for item in chunks] == [5, 5, 2, 3]
     np.testing.assert_array_equal(
         np.asarray(actual_keys), np.asarray(expected_keys))
     np.testing.assert_array_equal(
         np.asarray(actual_values), np.asarray(expected_values))
+    page_items = list(proxy.iter_materialized_layer_pages(0))
+    page_keys = mx.concatenate([item[0] for item in page_items], axis=2)
+    page_values = mx.concatenate([item[1] for item in page_items], axis=2)
+    mx.eval(page_keys, page_values)
+    assert [int(item[0].shape[2]) for item in page_items] == [4, 4, 4, 1, 1, 1]
+    np.testing.assert_array_equal(np.asarray(page_keys), np.asarray(expected_keys))
+    np.testing.assert_array_equal(
+        np.asarray(page_values), np.asarray(expected_values))
     # The immutable base prompt is never extended by speculative nodes.
     assert kv.layer_positions(0) == 12
 
@@ -157,6 +189,46 @@ def test_tiled_online_attention_is_close_and_bounded_across_spills(tmp_path):
     assert kv.stats.reloads >= 2
 
 
+@pytest.mark.skipif(not mx.metal.is_available(), reason="requires Metal")
+def test_page_native_attention_matches_concatenated_tile_bits(tmp_path):
+    mx.random.seed(8248)
+    kv = PagedKVCache(
+        1, max_bytes=1, spill_dir=tmp_path,
+        page_positions=16, resident_pages=0)
+    q = mx.random.normal((1, 4, 1, 128)).astype(mx.bfloat16)
+    keys = mx.random.normal((1, 2, 149, 128)).astype(mx.bfloat16)
+    values = mx.random.normal((1, 2, 149, 128)).astype(mx.bfloat16)
+    kv.append_for_online_attention(0, keys, values)
+
+    concatenated = tiled_paged_attention(q, kv, 0, tile_positions=128)
+    page_native = page_native_paged_attention(
+        q, kv, 0, pages_per_tile=8)
+    reference = mx.fast.scaled_dot_product_attention(
+        q, keys, values, scale=128 ** -0.5)
+    mx.eval(concatenated, page_native, reference)
+
+    np.testing.assert_array_equal(
+        np.asarray(page_native.view(mx.uint16)),
+        np.asarray(concatenated.view(mx.uint16)),
+    )
+    actual = np.asarray(page_native.astype(mx.float32))
+    expected = np.asarray(reference.astype(mx.float32))
+    assert float(np.max(np.abs(actual - expected))) <= 0.002
+    denominator = np.linalg.norm(actual) * np.linalg.norm(expected)
+    assert float(np.vdot(actual, expected) / denominator) >= 0.9999
+    assert kv.stats.page_native_calls == 1
+    assert kv.stats.page_native_groups == 2
+    assert kv.stats.page_native_positions == 149
+    assert kv.stats.page_native_s > 0
+
+    with pytest.raises(ValueError, match="must be in"):
+        page_native_paged_attention(q, kv, 0, pages_per_tile=9)
+
+    with pytest.raises(ValueError, match="dtype|geometry"):
+        page_native_paged_attention(
+            q.astype(mx.float32), kv, 0, pages_per_tile=8)
+
+
 def test_server_paged_online_attention_is_strict_and_explicit(tmp_path):
     from runtime.server import EngineManager, RequestValidationError
 
@@ -168,8 +240,18 @@ def test_server_paged_online_attention_is_strict_and_explicit(tmp_path):
     with patch.dict(os.environ, {
         "VMODEL_QWEN35_PAGED_ONLINE_TILE_POSITIONS": "8192",
     }):
-        with pytest.raises(RequestValidationError, match="must be one of"):
+        with pytest.raises(RequestValidationError, match="page-native"):
             EngineManager().get(Path("/tmp/not-opened-paged-tile"), "fast")
+    with patch.dict(os.environ, {
+        "VMODEL_QWEN35_PAGED_ONLINE_PAGE_NATIVE": "yes",
+    }):
+        with pytest.raises(RequestValidationError, match="must be 0 or 1"):
+            EngineManager().get(Path("/tmp/not-opened-page-native"), "fast")
+    with patch.dict(os.environ, {
+        "VMODEL_QWEN35_PAGED_ONLINE_PAGE_NATIVE": "1",
+    }):
+        with pytest.raises(RequestValidationError, match="requires"):
+            EngineManager().get(Path("/tmp/not-opened-page-native"), "fast")
     with patch.dict(os.environ, {
         "VMODEL_QWEN35_KV_PAGE_POSITIONS": "4096",
     }):
@@ -200,7 +282,8 @@ def test_server_paged_online_attention_is_strict_and_explicit(tmp_path):
         "VMODEL_QWEN35_KV_SPILL_DIR": str(tmp_path / "spill"),
         "VMODEL_QWEN35_KV_PAGE_POSITIONS": "1024",
         "VMODEL_QWEN35_PAGED_ONLINE_ATTENTION": "1",
-        "VMODEL_QWEN35_PAGED_ONLINE_TILE_POSITIONS": "4096",
+        "VMODEL_QWEN35_PAGED_ONLINE_PAGE_NATIVE": "1",
+        "VMODEL_QWEN35_PAGED_ONLINE_TILE_POSITIONS": "8192",
     }
     with patch.dict(os.environ, env), \
          patch("runtime.config.ModelConfig.from_dir", return_value=cfg), \
@@ -214,4 +297,5 @@ def test_server_paged_online_attention_is_strict_and_explicit(tmp_path):
     assert captured[0].max_kv_mb == 64
     assert captured[0].kv_page_positions == 1024
     assert captured[0].qwen35_paged_online_attention
-    assert captured[0].qwen35_paged_online_tile_positions == 4096
+    assert captured[0].qwen35_paged_online_page_native
+    assert captured[0].qwen35_paged_online_tile_positions == 8192

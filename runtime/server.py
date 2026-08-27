@@ -1290,9 +1290,9 @@ class EngineManager:
         if qwen_mtp_proposal_replay_top_k < 0:
             raise RequestValidationError(
                 "VMODEL_QWEN_MTP_PROPOSAL_REPLAY_TOP_K must be non-negative")
-        if not 1 <= qwen_mtp_depth <= 4:
+        if not 1 <= qwen_mtp_depth <= 5:
             raise RequestValidationError(
-                "VMODEL_QWEN_MTP_DEPTH must be in [1, 4]")
+                "VMODEL_QWEN_MTP_DEPTH must be in [1, 5]")
         if qwen_mtp_tree_width not in (0, 2, 3, 4):
             raise RequestValidationError(
                 "VMODEL_QWEN_MTP_TREE_WIDTH must be 0 or in [2, 4]")
@@ -1500,6 +1500,12 @@ class EngineManager:
         if qwen35_paged_online_request not in ("0", "1"):
             raise RequestValidationError(
                 "VMODEL_QWEN35_PAGED_ONLINE_ATTENTION must be 0 or 1")
+        qwen35_paged_online_page_native_request = os.environ.get(
+            "VMODEL_QWEN35_PAGED_ONLINE_PAGE_NATIVE", "0"
+        ).strip()
+        if qwen35_paged_online_page_native_request not in ("0", "1"):
+            raise RequestValidationError(
+                "VMODEL_QWEN35_PAGED_ONLINE_PAGE_NATIVE must be 0 or 1")
         try:
             qwen35_paged_online_tile_positions = int(os.environ.get(
                 "VMODEL_QWEN35_PAGED_ONLINE_TILE_POSITIONS", "2048"))
@@ -1508,11 +1514,11 @@ class EngineManager:
                 "VMODEL_QWEN35_PAGED_ONLINE_TILE_POSITIONS must be an integer"
             ) from error
         if qwen35_paged_online_tile_positions not in (
-            256, 512, 1024, 2048, 4096,
+            256, 512, 1024, 2048, 4096, 8192,
         ):
             raise RequestValidationError(
                 "VMODEL_QWEN35_PAGED_ONLINE_TILE_POSITIONS must be one of "
-                "256, 512, 1024, 2048, or 4096")
+                "256, 512, 1024, 2048, 4096, or 8192")
         try:
             qwen35_kv_page_positions = int(os.environ.get(
                 "VMODEL_QWEN35_KV_PAGE_POSITIONS", "256"))
@@ -1524,6 +1530,27 @@ class EngineManager:
             raise RequestValidationError(
                 "VMODEL_QWEN35_KV_PAGE_POSITIONS must be one of "
                 "256, 512, 1024, or 2048")
+        qwen35_paged_online_page_native = (
+            qwen35_paged_online_page_native_request == "1")
+        if (qwen35_paged_online_page_native
+                and qwen35_paged_online_request != "1"):
+            raise RequestValidationError(
+                "VMODEL_QWEN35_PAGED_ONLINE_PAGE_NATIVE=1 requires "
+                "VMODEL_QWEN35_PAGED_ONLINE_ATTENTION=1")
+        if (qwen35_paged_online_tile_positions == 8192
+                and not qwen35_paged_online_page_native):
+            raise RequestValidationError(
+                "8192-position Qwen online attention requires the "
+                "page-native path")
+        if qwen35_paged_online_page_native:
+            pages_per_tile, remainder = divmod(
+                qwen35_paged_online_tile_positions,
+                qwen35_kv_page_positions,
+            )
+            if remainder or not 1 <= pages_per_tile <= 8:
+                raise RequestValidationError(
+                    "page-native Qwen online attention requires an integral "
+                    "one-to-eight KV pages per tile")
         qwen35_batched_mlp_request = os.environ.get(
             "VMODEL_QWEN35_SERIAL_VERIFY_BATCHED_MLP", "0"
         ).strip()
@@ -1944,6 +1971,7 @@ class EngineManager:
             qwen35_exact_page_admission_request,
             qwen35_paged_online_request,
             qwen35_paged_online_tile_positions,
+            qwen35_paged_online_page_native_request,
             qwen35_kv_page_positions,
             qwen35_batched_mlp_request,
             qwen35_suspend_lm_head_request,
@@ -2051,6 +2079,7 @@ class EngineManager:
             qwen35_exact_page_admission_request,
             qwen35_paged_online_request,
             qwen35_paged_online_tile_positions,
+            qwen35_paged_online_page_native_request,
             qwen35_kv_page_positions,
             qwen35_batched_mlp_request,
             qwen35_suspend_lm_head_request,
@@ -2196,6 +2225,8 @@ class EngineManager:
                     qwen35_paged_online_request == "1")
                 rc.qwen35_paged_online_tile_positions = (
                     qwen35_paged_online_tile_positions)
+                rc.qwen35_paged_online_page_native = (
+                    qwen35_paged_online_page_native)
                 rc.qwen35_serial_verify_batched_mlp = (
                     qwen35_batched_mlp_request == "1")
                 rc.qwen35_serial_verify_suspend_lm_head = (
@@ -8296,6 +8327,8 @@ def _vision_protocol_timing(result: dict) -> dict:
             "qwen35_paged_online_attention", default=0) or 0),
         "qwen35_paged_online_tile_positions": int(metric(
             "qwen35_paged_online_tile_positions", default=0) or 0),
+        "qwen35_paged_online_page_native": int(metric(
+            "qwen35_paged_online_page_native", default=0) or 0),
         "qwen35_kv_page_positions": int(metric(
             "qwen35_kv_page_positions", default=0) or 0),
         "vision_cache_hits": int(metric("vision_cache_hits") or 0),
@@ -8604,6 +8637,9 @@ def _vision_protocol_timing(result: dict) -> dict:
         "qwen_mtp_paged_bootstrap_budget_restored_bytes",
         "paged_kv_spills",
         "paged_kv_reloads",
+        "paged_kv_page_native_calls",
+        "paged_kv_page_native_groups",
+        "paged_kv_page_native_positions",
         "paged_kv_spill_bytes_raw",
         "paged_kv_spill_bytes_compressed",
         "qwen_mtp_request_local_sidecar_pin",
@@ -8746,6 +8782,7 @@ def _vision_protocol_timing(result: dict) -> dict:
         "qwen_mtp_staged_draft_load_s",
         "paged_kv_spill_seconds",
         "paged_kv_reload_seconds",
+        "paged_kv_page_native_seconds",
         "reranked_lm_head_candidate_recall",
         "qwen_mtp_target_reranked_lm_head_candidate_recall",
         "qwen_mtp_draft_reranked_lm_head_candidate_recall",
