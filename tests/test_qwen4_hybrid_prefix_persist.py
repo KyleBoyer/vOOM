@@ -29,7 +29,9 @@ def _config():
         qwen4_indexer_head_dim=4,
         qwen4_ngram_size=3,
         qwen4_ple_conv_kernel_size=4,
-        qwen4_ple_embed_dim=8,
+        qwen4_ple_embed_dim=2,
+        qwen4_hc_count=4,
+        hidden_size=2,
     )
 
 

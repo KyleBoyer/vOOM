@@ -419,7 +419,13 @@ class HotPromptKVPersistence:
                     ple_state_len=(
                         (int(self.config.qwen4_ple_conv_kernel_size) - 1)
                         * int(self.config.qwen4_ngram_size)),
-                    ple_width=int(self.config.qwen4_ple_embed_dim),
+                    # PLE row embeddings are projected into every HC stream
+                    # before the recurrent convolution.  The released state
+                    # width is therefore hc_count * hidden_size, not the
+                    # source row-embedding width.
+                    ple_width=(
+                        int(self.config.qwen4_hc_count)
+                        * int(self.config.hidden_size)),
                 )
             except (TypeError, ValueError, RuntimeError) as error:
                 print(
@@ -444,7 +450,9 @@ class HotPromptKVPersistence:
             ple_state_len=(
                 (int(self.config.qwen4_ple_conv_kernel_size) - 1)
                 * int(self.config.qwen4_ngram_size)),
-            ple_width=int(self.config.qwen4_ple_embed_dim),
+            ple_width=(
+                int(self.config.qwen4_hc_count)
+                * int(self.config.hidden_size)),
         )
 
     def _full_attention_layers(self) -> tuple[int, ...]:

@@ -176,7 +176,11 @@ class Qwen4ExpStateCache:
                     or tuple(conv.shape) != (
                         1, int(ple_state_len), int(ple_width))):
                 raise ValueError(
-                    f"Qwen4 PLE convolution geometry mismatch at layer {layer}")
+                    "Qwen4 PLE convolution geometry mismatch at layer "
+                    f"{layer}: actual={tuple(conv.shape)}/{conv.dtype}, "
+                    "expected="
+                    f"{(1, int(ple_state_len), int(ple_width))}/"
+                    f"{mx.bfloat16}")
             if context is None or len(context) != int(ple_context_len):
                 raise ValueError(
                     f"Qwen4 PLE token context is incomplete at layer {layer}")
