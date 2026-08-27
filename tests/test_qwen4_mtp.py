@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from types import SimpleNamespace
 
 import mlx.core as mx
@@ -391,6 +392,26 @@ class _FakeDrafter:
         }
 
 
+class _ConfidenceDrafter(_FakeDrafter):
+    def __init__(self, draft_rows):
+        super().__init__([token for token, _probability in draft_rows])
+        self.draft_rows = list(draft_rows)
+
+    def draft_step(self, hidden, _token, cache, _offset, *, weights):
+        assert weights == {}
+        token, probability = self.draft_rows[
+            self.index % len(self.draft_rows)]
+        self.index += 1
+        self.proposal_steps += 1
+        cache.grow(1)
+        row = mx.full((256,), -100.0)
+        competitor = (token + 1) % 256
+        margin = math.log(probability / (1.0 - probability))
+        row = row.at[competitor].add(100.0)
+        row = row.at[token].add(100.0 + margin)
+        return row, hidden + 1
+
+
 @pytest.fixture
 def _cache_io_noop(monkeypatch):
     monkeypatch.setattr("runtime.engine._cache_io_snapshot", lambda _target: {})
@@ -416,6 +437,43 @@ def test_speculative_controller_full_accept_emits_bonus_in_one_target_sweep(
     assert result["path_stats"]["qwen4_mtp_idle_head_release_bytes"] == 123
     assert target.idle_head_releases == 1
     assert target.last_kv.offset == 5
+
+
+def test_confidence_adaptive_width_keeps_low_confidence_token_and_verifies_it(
+        _cache_io_noop):
+    target = _FakeTarget([11, 12, 13])
+    engine = Qwen4MTPSpeculativeEngine(
+        target,
+        depth=4,
+        min_draft_probability=0.8,
+        drafter=_ConfidenceDrafter([(11, 0.99), (12, 0.60), (99, 0.99)]),
+    )
+
+    result = engine.generate(
+        "prompt", max_tokens=4,
+        sampling=SamplingParams(temperature=0.0))
+
+    assert result["tokens"] == [10, 11, 12, 13]
+    assert target.verify_calls == [(10, 11, 12)]
+    stats = result["path_stats"]
+    assert stats["qwen4_mtp_adaptive_width_enabled"] == 1
+    assert stats["qwen4_mtp_adaptive_truncations"] == 1
+    assert stats["qwen4_mtp_round_widths"] == "2"
+    assert stats["qwen4_mtp_proposed"] == 2
+    assert stats["qwen4_mtp_selected_probability_min"] == pytest.approx(0.6)
+    assert stats["qwen4_mtp_selected_probability_max"] == pytest.approx(0.99)
+    assert float(stats["qwen4_mtp_truncation_probabilities"]) == pytest.approx(
+        0.6)
+    assert stats["qwen4_mtp_target_prefix_rollbacks"] == 0
+
+
+@pytest.mark.parametrize("value", [-0.1, 1.1, float("nan"), True, "bad"])
+def test_confidence_adaptive_width_rejects_invalid_threshold(value):
+    target = _FakeTarget([11])
+    with pytest.raises(ValueError, match="minimum draft probability"):
+        Qwen4MTPSpeculativeEngine(
+            target, depth=2, min_draft_probability=value,
+            drafter=_FakeDrafter([11]))
 
 
 def test_speculative_controller_partial_reject_restores_all_target_state(

@@ -1222,6 +1222,7 @@ class EngineManager:
                 ("VMODEL_QWEN4_FAST_TIER_DECODE_ONLY", "0"),
                 ("VMODEL_QWEN4_PHASE_LM_HEAD", "0"),
                 ("VMODEL_QWEN4_MTP_DEPTH", "0"),
+                ("VMODEL_QWEN4_MTP_MIN_DRAFT_PROBABILITY", "0"),
             )
         )
         dspark_request_identity = tuple(
@@ -2831,6 +2832,18 @@ class EngineManager:
                 if not 0 <= qwen4_mtp_depth <= 7:
                     raise RequestValidationError(
                         "VMODEL_QWEN4_MTP_DEPTH must be in [0, 7]")
+                try:
+                    qwen4_mtp_min_draft_probability = float(
+                        qwen4_request_identity[25])
+                except ValueError as error:
+                    raise RequestValidationError(
+                        "VMODEL_QWEN4_MTP_MIN_DRAFT_PROBABILITY must be "
+                        "numeric") from error
+                if not math.isfinite(qwen4_mtp_min_draft_probability) or not (
+                        0.0 <= qwen4_mtp_min_draft_probability <= 1.0):
+                    raise RequestValidationError(
+                        "VMODEL_QWEN4_MTP_MIN_DRAFT_PROBABILITY must be in "
+                        "[0, 1]")
                 rc.hot_prompt_kv_persist_dir = qwen4_request_identity[18]
                 if rc.hot_prompt_kv_persist_dir and not rc.hot_prompt_kv:
                     raise RequestValidationError(
@@ -4820,10 +4833,16 @@ class EngineManager:
 
                 try:
                     self._engine = Qwen4MTPSpeculativeEngine(
-                        target_engine, depth=qwen4_mtp_depth)
+                        target_engine,
+                        depth=qwen4_mtp_depth,
+                        min_draft_probability=(
+                            qwen4_mtp_min_draft_probability),
+                    )
                     print(
                         "[server] exact Qwen4 Lightning-MTP speculation: "
                         f"target={model_dir.name} depth={qwen4_mtp_depth} "
+                        "min_draft_probability="
+                        f"{qwen4_mtp_min_draft_probability:g} "
                         f"phase_head={int(rc.qwen4_phase_lm_head)}",
                         flush=True,
                     )
@@ -8978,6 +8997,8 @@ def _vision_protocol_timing(result: dict) -> dict:
         "qwen4_mtp_enabled",
         "qwen4_mtp_used",
         "qwen4_mtp_depth",
+        "qwen4_mtp_adaptive_width_enabled",
+        "qwen4_mtp_adaptive_truncations",
         "qwen4_mtp_rounds",
         "qwen4_mtp_proposed",
         "qwen4_mtp_accepted",
@@ -9096,6 +9117,10 @@ def _vision_protocol_timing(result: dict) -> dict:
         "qwen4_mtp_draft_s",
         "qwen4_mtp_verifier_s",
         "qwen4_mtp_expected_acceptance",
+        "qwen4_mtp_min_draft_probability",
+        "qwen4_mtp_selected_probability_min",
+        "qwen4_mtp_selected_probability_mean",
+        "qwen4_mtp_selected_probability_max",
         "qwen4_serial_verify_union_fetch_s",
         "qwen4_phase_lm_head_suspend_s",
         "qwen4_phase_lm_head_restore_s",
@@ -9118,6 +9143,8 @@ def _vision_protocol_timing(result: dict) -> dict:
         "kimi_k3_prefill_schedule",
         "qwen4_mtp_engine_identity",
         "qwen4_mtp_round_outcomes",
+        "qwen4_mtp_round_widths",
+        "qwen4_mtp_truncation_probabilities",
     ):
         if key in stats or key in result:
             value[key] = str(metric(key) or "")

@@ -17,6 +17,7 @@ the MTP hyper-connection mixer and the target's shared output head.
 from __future__ import annotations
 
 from dataclasses import replace
+import math
 import time
 from typing import Sequence
 
@@ -358,15 +359,38 @@ class Qwen4MTPSpeculativeEngine:
     Unsupported request features fall back before any bootstrap work.
     """
 
-    def __init__(self, target, *, depth: int = 4, drafter=None):
+    def __init__(
+        self,
+        target,
+        *,
+        depth: int = 4,
+        min_draft_probability: float = 0.0,
+        drafter=None,
+    ):
         if target.cfg.model_type != "qwen4_exp":
             raise ValueError("Qwen4 MTP requires a qwen4_exp target")
         if isinstance(depth, bool) or not isinstance(depth, int) or not 1 <= depth <= 7:
             raise ValueError("Qwen4 MTP depth must be in [1, 7]")
+        if isinstance(min_draft_probability, bool):
+            raise ValueError(
+                "Qwen4 MTP minimum draft probability must be in [0, 1]")
+        try:
+            min_draft_probability = float(min_draft_probability)
+        except (TypeError, ValueError) as error:
+            raise ValueError(
+                "Qwen4 MTP minimum draft probability must be in [0, 1]"
+            ) from error
+        if not math.isfinite(min_draft_probability) or not (
+                0.0 <= min_draft_probability <= 1.0):
+            raise ValueError(
+                "Qwen4 MTP minimum draft probability must be in [0, 1]")
         self.target = target
         self.depth = depth
+        self.min_draft_probability = min_draft_probability
         self.drafter = drafter or Qwen4MTPDrafter(target)
-        self.mtp_engine_identity = f"qwen4-mtp-depth{depth}-exact-target"
+        self.mtp_engine_identity = (
+            f"qwen4-mtp-depth{depth}-qmin{min_draft_probability:g}"
+            "-exact-target")
 
     def __getattr__(self, name):
         return getattr(self.target, name)
@@ -406,6 +430,9 @@ class Qwen4MTPSpeculativeEngine:
         result.setdefault("path_stats", {}).update({
             "qwen4_mtp_enabled": 1,
             "qwen4_mtp_used": 0,
+            "qwen4_mtp_min_draft_probability": self.min_draft_probability,
+            "qwen4_mtp_adaptive_width_enabled": int(
+                self.min_draft_probability > 0.0),
             "qwen4_mtp_fallback_reason": reason,
             "qwen4_mtp_engine_identity": self.mtp_engine_identity,
         })
@@ -473,6 +500,10 @@ class Qwen4MTPSpeculativeEngine:
             path_stats.update({
                 "qwen4_mtp_enabled": 1,
                 "qwen4_mtp_used": 0,
+                "qwen4_mtp_min_draft_probability": (
+                    self.min_draft_probability),
+                "qwen4_mtp_adaptive_width_enabled": int(
+                    self.min_draft_probability > 0.0),
                 "qwen4_mtp_fallback_reason": (
                     "single-token-budget" if max_tokens == 1
                     else "terminal-first-token"),
@@ -552,6 +583,9 @@ class Qwen4MTPSpeculativeEngine:
         verifier_s = 0.0
         stochastic_overlap_sum = 0.0
         stochastic_verified = 0
+        selected_probabilities = []
+        truncation_probabilities = []
+        round_widths = []
         outcomes = []
         decode_started = time.perf_counter()
         while (
@@ -590,6 +624,12 @@ class Qwen4MTPSpeculativeEngine:
                     if sampling.is_greedy:
                         token = int(mx.argmax(logits).item())
                         step_probabilities = None
+                        selected_probability = None
+                        if self.min_draft_probability > 0.0:
+                            selected_probability = float(mx.softmax(
+                                logits.astype(mx.float32),
+                                axis=-1,
+                            ).reshape(-1)[token].item())
                     else:
                         step_probabilities = _detached_probabilities(
                             logits,
@@ -597,9 +637,13 @@ class Qwen4MTPSpeculativeEngine:
                             all_tokens + draft_tokens,
                         )
                         token = sample_probabilities(step_probabilities)
+                        selected_probability = float(
+                            step_probabilities.reshape(-1)[token].item())
                     draft_tokens.append(token)
                     draft_probabilities.append(step_probabilities)
                     proposed += 1
+                    if selected_probability is not None:
+                        selected_probabilities.append(selected_probability)
                     if draft_constraint is not None:
                         draft_constraint.accept_token(token)
                     current = token
@@ -608,12 +652,21 @@ class Qwen4MTPSpeculativeEngine:
                         and draft_constraint.completed
                     ):
                         break
+                    if (
+                        self.min_draft_probability > 0.0
+                        and selected_probability is not None
+                        and selected_probability < self.min_draft_probability
+                        and step + 1 < round_depth
+                    ):
+                        truncation_probabilities.append(selected_probability)
+                        break
             finally:
                 weights = None
                 release_info = self.drafter.release_round_weights()
             draft_s += time.perf_counter() - draft_started
             if not draft_tokens:
                 raise RuntimeError("Qwen4 MTP produced an empty draft round")
+            round_widths.append(len(draft_tokens))
 
             verify_tokens = [catchup_token, *draft_tokens]
             verifier_started = time.perf_counter()
@@ -806,6 +859,23 @@ class Qwen4MTPSpeculativeEngine:
             "qwen4_mtp_enabled": 1,
             "qwen4_mtp_used": int(proposed > 0),
             "qwen4_mtp_depth": self.depth,
+            "qwen4_mtp_min_draft_probability": self.min_draft_probability,
+            "qwen4_mtp_adaptive_width_enabled": int(
+                self.min_draft_probability > 0.0),
+            "qwen4_mtp_adaptive_truncations": len(
+                truncation_probabilities),
+            "qwen4_mtp_round_widths": ",".join(
+                str(width) for width in round_widths),
+            "qwen4_mtp_selected_probability_min": (
+                min(selected_probabilities) if selected_probabilities else 0.0),
+            "qwen4_mtp_selected_probability_mean": (
+                sum(selected_probabilities) / len(selected_probabilities)
+                if selected_probabilities else 0.0),
+            "qwen4_mtp_selected_probability_max": (
+                max(selected_probabilities) if selected_probabilities else 0.0),
+            "qwen4_mtp_truncation_probabilities": ",".join(
+                f"{probability:.8g}"
+                for probability in truncation_probabilities),
             "qwen4_mtp_engine_identity": self.mtp_engine_identity,
             "qwen4_mtp_rounds": rounds,
             "qwen4_mtp_proposed": proposed,
