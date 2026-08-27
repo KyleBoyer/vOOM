@@ -277,8 +277,11 @@ class _FakeKV:
 
 
 class _FakeTokenizer:
+    def __init__(self, ids=(1, 2)):
+        self.ids = tuple(ids)
+
     def encode(self, _prompt):
-        return SimpleNamespace(ids=[1, 2])
+        return SimpleNamespace(ids=list(self.ids))
 
     def decode(self, tokens):
         return " ".join(str(token) for token in tokens)
@@ -287,7 +290,7 @@ class _FakeTokenizer:
 class _FakeTarget:
     def __init__(self, target_rows):
         self.cfg = SimpleNamespace(
-            model_type="qwen4_exp", eos_token_ids=(255,))
+            model_type="qwen4_exp", eos_token_ids=(255,), vocab_size=256)
         self.tokenizer = _FakeTokenizer()
         self.effective_max_position_embeddings = 128
         self.target_rows = list(target_rows)
@@ -303,7 +306,7 @@ class _FakeTarget:
 
     def generate(self, _prompt, max_tokens, **_kwargs):
         assert max_tokens == 1
-        self.last_kv = _FakeKV(2)
+        self.last_kv = _FakeKV(len(self.tokenizer.encode(_prompt).ids))
         self._h_last = mx.ones((1, 1, 4), dtype=mx.bfloat16)
         self._h_window = self._h_last
         return {
@@ -474,6 +477,111 @@ def test_confidence_adaptive_width_rejects_invalid_threshold(value):
         Qwen4MTPSpeculativeEngine(
             target, depth=2, min_draft_probability=value,
             drafter=_FakeDrafter([11]))
+
+
+def test_ngram_first_bypasses_native_draft_and_keeps_target_authoritative(
+        _cache_io_noop):
+    target = _FakeTarget([11, 5, 13])
+    target.tokenizer = _FakeTokenizer((5, 10, 11, 5))
+    drafter = _FakeDrafter([99])
+    engine = Qwen4MTPSpeculativeEngine(
+        target,
+        depth=3,
+        ngram_first=True,
+        ngram_max_draft_tokens=2,
+        drafter=drafter,
+    )
+
+    result = engine.generate(
+        "prompt", max_tokens=4,
+        sampling=SamplingParams(temperature=0.0))
+
+    assert result["tokens"] == [10, 11, 5, 13]
+    assert target.verify_calls == [(10, 11, 5)]
+    assert drafter.proposal_steps == 0
+    stats = result["path_stats"]
+    assert stats["qwen4_mtp_ngram_first_attempts"] == 1
+    assert stats["qwen4_mtp_ngram_first_matches"] == 1
+    assert stats["qwen4_mtp_ngram_first_proposed"] == 2
+    assert stats["qwen4_mtp_ngram_first_accepted"] == 2
+    assert stats["qwen4_mtp_ngram_first_rejected"] == 0
+    assert stats["qwen4_mtp_ngram_first_native_draft_bypasses"] == 1
+    assert stats["qwen4_mtp_proposal_sources"] == "N"
+    assert stats["qwen4_mtp_round_outcomes"] == "N:A2"
+    assert stats["qwen4_mtp_target_sweeps"] == 1
+
+
+def test_ngram_first_stochastic_point_mass_q_is_exactly_verified(
+        _cache_io_noop):
+    target = _FakeTarget([11, 5, 13])
+    target.tokenizer = _FakeTokenizer((5, 10, 11, 5))
+    drafter = _FakeDrafter([99])
+    engine = Qwen4MTPSpeculativeEngine(
+        target,
+        depth=3,
+        ngram_first=True,
+        ngram_max_draft_tokens=2,
+        drafter=drafter,
+    )
+
+    result = engine.generate(
+        "prompt", max_tokens=4,
+        sampling=SamplingParams(temperature=1.0, seed=17))
+
+    assert result["tokens"] == [10, 11, 5, 13]
+    assert drafter.proposal_steps == 0
+    stats = result["path_stats"]
+    assert stats["qwen4_mtp_stochastic_verified"] == 2
+    assert stats["qwen4_mtp_expected_acceptance"] == pytest.approx(1.0)
+    assert stats["qwen4_mtp_proposal_sources"] == "N"
+
+
+def test_ngram_first_rejection_restores_exact_hybrid_target_prefix(
+        _cache_io_noop):
+    target = _FakeTarget([11, 255, 13])
+    target.tokenizer = _FakeTokenizer((5, 10, 11, 5))
+    drafter = _FakeDrafter([77])
+    engine = Qwen4MTPSpeculativeEngine(
+        target,
+        depth=3,
+        ngram_first=True,
+        ngram_max_draft_tokens=2,
+        drafter=drafter,
+    )
+
+    result = engine.generate(
+        "prompt", max_tokens=4,
+        sampling=SamplingParams(temperature=1.0, seed=41))
+
+    assert result["tokens"] == [10, 11, 255]
+    assert target.verify_calls == [(10, 11, 5)]
+    assert target.last_kv.offset == 6
+    assert target.last_kv.kda_cache.marker == "kda-2"
+    assert target.last_kv.qwen4_cache.restores == [("aux-2", 6)]
+    assert drafter.proposal_steps == 0
+    stats = result["path_stats"]
+    assert stats["qwen4_mtp_ngram_first_accepted"] == 1
+    assert stats["qwen4_mtp_ngram_first_rejected"] == 1
+    assert stats["qwen4_mtp_round_outcomes"] == "N:A1R"
+    assert stats["qwen4_mtp_target_prefix_rollbacks"] == 1
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"ngram_first": 1},
+        {"ngram_min_ngram": 0},
+        {"ngram_min_ngram": 3, "ngram_max_ngram": 2},
+        {"ngram_max_draft_tokens": 1},
+        {"ngram_max_draft_tokens": 8},
+        {"ngram_first": True, "min_draft_probability": 0.1},
+    ],
+)
+def test_ngram_first_rejects_invalid_configuration(kwargs):
+    target = _FakeTarget([11])
+    with pytest.raises((TypeError, ValueError)):
+        Qwen4MTPSpeculativeEngine(
+            target, depth=2, drafter=_FakeDrafter([11]), **kwargs)
 
 
 def test_speculative_controller_partial_reject_restores_all_target_state(

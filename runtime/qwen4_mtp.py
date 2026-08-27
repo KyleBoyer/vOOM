@@ -40,6 +40,7 @@ from .sampler import (
     sample_probabilities,
     speculative_residual_probabilities,
 )
+from .speculative import ngram_propose
 
 
 _REQUIRED_NON_EXPERT_NAMES = frozenset({
@@ -365,6 +366,10 @@ class Qwen4MTPSpeculativeEngine:
         *,
         depth: int = 4,
         min_draft_probability: float = 0.0,
+        ngram_first: bool = False,
+        ngram_min_ngram: int = 2,
+        ngram_max_ngram: int = 6,
+        ngram_max_draft_tokens: int = 7,
         drafter=None,
     ):
         if target.cfg.model_type != "qwen4_exp":
@@ -384,13 +389,39 @@ class Qwen4MTPSpeculativeEngine:
                 0.0 <= min_draft_probability <= 1.0):
             raise ValueError(
                 "Qwen4 MTP minimum draft probability must be in [0, 1]")
+        if not isinstance(ngram_first, bool):
+            raise TypeError("Qwen4 MTP ngram_first must be bool")
+        if (isinstance(ngram_min_ngram, bool)
+                or not isinstance(ngram_min_ngram, int)
+                or ngram_min_ngram <= 0):
+            raise ValueError("Qwen4 MTP minimum n-gram must be positive")
+        if (isinstance(ngram_max_ngram, bool)
+                or not isinstance(ngram_max_ngram, int)
+                or ngram_max_ngram < ngram_min_ngram):
+            raise ValueError(
+                "Qwen4 MTP maximum n-gram must be >= minimum n-gram")
+        if (isinstance(ngram_max_draft_tokens, bool)
+                or not isinstance(ngram_max_draft_tokens, int)
+                or not 2 <= ngram_max_draft_tokens <= 7):
+            raise ValueError(
+                "Qwen4 MTP n-gram draft tokens must be in [2, 7]")
+        if ngram_first and min_draft_probability > 0.0:
+            raise ValueError(
+                "Qwen4 MTP n-gram-first and adaptive width are mutually "
+                "exclusive experiments")
         self.target = target
         self.depth = depth
         self.min_draft_probability = min_draft_probability
+        self.ngram_first = ngram_first
+        self.ngram_min_ngram = ngram_min_ngram
+        self.ngram_max_ngram = ngram_max_ngram
+        self.ngram_max_draft_tokens = ngram_max_draft_tokens
         self.drafter = drafter or Qwen4MTPDrafter(target)
         self.mtp_engine_identity = (
             f"qwen4-mtp-depth{depth}-qmin{min_draft_probability:g}"
-            "-exact-target")
+            + (f"-ngram-first-k{ngram_max_draft_tokens}"
+               if ngram_first else "")
+            + "-exact-target")
 
     def __getattr__(self, name):
         return getattr(self.target, name)
@@ -433,6 +464,7 @@ class Qwen4MTPSpeculativeEngine:
             "qwen4_mtp_min_draft_probability": self.min_draft_probability,
             "qwen4_mtp_adaptive_width_enabled": int(
                 self.min_draft_probability > 0.0),
+            "qwen4_mtp_ngram_first_enabled": int(self.ngram_first),
             "qwen4_mtp_fallback_reason": reason,
             "qwen4_mtp_engine_identity": self.mtp_engine_identity,
         })
@@ -504,6 +536,7 @@ class Qwen4MTPSpeculativeEngine:
                     self.min_draft_probability),
                 "qwen4_mtp_adaptive_width_enabled": int(
                     self.min_draft_probability > 0.0),
+                "qwen4_mtp_ngram_first_enabled": int(self.ngram_first),
                 "qwen4_mtp_fallback_reason": (
                     "single-token-budget" if max_tokens == 1
                     else "terminal-first-token"),
@@ -586,6 +619,13 @@ class Qwen4MTPSpeculativeEngine:
         selected_probabilities = []
         truncation_probabilities = []
         round_widths = []
+        proposal_sources = []
+        ngram_attempts = 0
+        ngram_matches = 0
+        ngram_proposed = 0
+        ngram_accepted = 0
+        ngram_rejected = 0
+        ngram_native_draft_bypasses = 0
         outcomes = []
         decode_started = time.perf_counter()
         while (
@@ -609,60 +649,103 @@ class Qwen4MTPSpeculativeEngine:
             current = catchup_token
             weights = None
             draft_started = time.perf_counter()
+            ngram_tokens = []
+            if self.ngram_first:
+                ngram_attempts += 1
+                ngram_width = min(
+                    self.ngram_max_draft_tokens,
+                    max(0, remaining - 1),
+                )
+                if ngram_width >= 2:
+                    ngram_tokens = [int(token) for token in ngram_propose(
+                        all_tokens,
+                        ngram_width,
+                        self.ngram_max_ngram,
+                        self.ngram_min_ngram,
+                    )]
+                    # A one-token match cannot amortize the target sweep and
+                    # is intentionally treated as a miss.
+                    if len(ngram_tokens) < 2:
+                        ngram_tokens = []
+                if ngram_tokens:
+                    ngram_matches += 1
+                    ngram_native_draft_bypasses += 1
+                    ngram_proposed += len(ngram_tokens)
+
+            proposal_source = "N" if ngram_tokens else "M"
+            proposal_sources.append(proposal_source)
             try:
-                weights = self.drafter._weights()
-                for step in range(round_depth):
-                    logits, draft_hidden = self.drafter.draft_step(
-                        draft_hidden,
-                        current,
-                        mtp_kv,
-                        round_start_offset + step,
-                        weights=weights,
-                    )
-                    if draft_constraint is not None:
-                        logits = draft_constraint.mask_logits(logits)
-                    if sampling.is_greedy:
-                        token = int(mx.argmax(logits).item())
+                weights = None if ngram_tokens else self.drafter._weights()
+                if ngram_tokens:
+                    for token in ngram_tokens:
                         step_probabilities = None
-                        selected_probability = None
-                        if self.min_draft_probability > 0.0:
-                            selected_probability = float(mx.softmax(
-                                logits.astype(mx.float32),
-                                axis=-1,
-                            ).reshape(-1)[token].item())
-                    else:
-                        step_probabilities = _detached_probabilities(
-                            logits,
-                            sampling,
-                            all_tokens + draft_tokens,
+                        if not sampling.is_greedy:
+                            step_probabilities = mx.zeros(
+                                (int(target.cfg.vocab_size),),
+                                dtype=mx.float32,
+                            ).at[token].add(1.0)
+                            mx.eval(step_probabilities)
+                        draft_tokens.append(token)
+                        draft_probabilities.append(step_probabilities)
+                        proposed += 1
+                        selected_probabilities.append(1.0)
+                else:
+                    for step in range(round_depth):
+                        logits, draft_hidden = self.drafter.draft_step(
+                            draft_hidden,
+                            current,
+                            mtp_kv,
+                            round_start_offset + step,
+                            weights=weights,
                         )
-                        token = sample_probabilities(step_probabilities)
-                        selected_probability = float(
-                            step_probabilities.reshape(-1)[token].item())
-                    draft_tokens.append(token)
-                    draft_probabilities.append(step_probabilities)
-                    proposed += 1
-                    if selected_probability is not None:
-                        selected_probabilities.append(selected_probability)
-                    if draft_constraint is not None:
-                        draft_constraint.accept_token(token)
-                    current = token
-                    if token in eos or bool(
-                        draft_constraint is not None
-                        and draft_constraint.completed
-                    ):
-                        break
-                    if (
-                        self.min_draft_probability > 0.0
-                        and selected_probability is not None
-                        and selected_probability < self.min_draft_probability
-                        and step + 1 < round_depth
-                    ):
-                        truncation_probabilities.append(selected_probability)
-                        break
+                        if draft_constraint is not None:
+                            logits = draft_constraint.mask_logits(logits)
+                        if sampling.is_greedy:
+                            token = int(mx.argmax(logits).item())
+                            step_probabilities = None
+                            selected_probability = None
+                            if self.min_draft_probability > 0.0:
+                                selected_probability = float(mx.softmax(
+                                    logits.astype(mx.float32),
+                                    axis=-1,
+                                ).reshape(-1)[token].item())
+                        else:
+                            step_probabilities = _detached_probabilities(
+                                logits,
+                                sampling,
+                                all_tokens + draft_tokens,
+                            )
+                            token = sample_probabilities(step_probabilities)
+                            selected_probability = float(
+                                step_probabilities.reshape(-1)[token].item())
+                        draft_tokens.append(token)
+                        draft_probabilities.append(step_probabilities)
+                        proposed += 1
+                        if selected_probability is not None:
+                            selected_probabilities.append(selected_probability)
+                        if draft_constraint is not None:
+                            draft_constraint.accept_token(token)
+                        current = token
+                        if token in eos or bool(
+                            draft_constraint is not None
+                            and draft_constraint.completed
+                        ):
+                            break
+                        if (
+                            self.min_draft_probability > 0.0
+                            and selected_probability is not None
+                            and selected_probability < self.min_draft_probability
+                            and step + 1 < round_depth
+                        ):
+                            truncation_probabilities.append(selected_probability)
+                            break
             finally:
                 weights = None
-                release_info = self.drafter.release_round_weights()
+                release_info = (
+                    {"proposal_expert_pages": 0, "proposal_expert_bytes": 0}
+                    if ngram_tokens
+                    else self.drafter.release_round_weights()
+                )
             draft_s += time.perf_counter() - draft_started
             if not draft_tokens:
                 raise RuntimeError("Qwen4 MTP produced an empty draft round")
@@ -723,6 +806,8 @@ class Qwen4MTPSpeculativeEngine:
                     stochastic_overlap_sum += overlap
                     stochastic_verified += 1
                 if not draft_accepted:
+                    if proposal_source == "N":
+                        ngram_rejected += 1
                     new_tokens.append(true_token)
                     new_logits.append(target_logits)
                     if constraint is not None:
@@ -731,6 +816,8 @@ class Qwen4MTPSpeculativeEngine:
                     break
                 accepted += 1
                 accepted_prefix += 1
+                if proposal_source == "N":
+                    ngram_accepted += 1
                 new_tokens.append(draft_token)
                 new_logits.append(target_logits)
                 if constraint is not None:
@@ -834,9 +921,10 @@ class Qwen4MTPSpeculativeEngine:
                     mtp_start_lengths[0] + committed_mtp)
 
             outcomes.append(
-                (f"A{accepted_prefix}" if not rejected
-                 else ("R" if accepted_prefix == 0
-                       else f"A{accepted_prefix}R")))
+                ("N:" if proposal_source == "N" else "")
+                + (f"A{accepted_prefix}" if not rejected
+                   else ("R" if accepted_prefix == 0
+                         else f"A{accepted_prefix}R")))
             catchup_token = emitted[-1]
 
         final_text = (
@@ -876,6 +964,15 @@ class Qwen4MTPSpeculativeEngine:
             "qwen4_mtp_truncation_probabilities": ",".join(
                 f"{probability:.8g}"
                 for probability in truncation_probabilities),
+            "qwen4_mtp_ngram_first_enabled": int(self.ngram_first),
+            "qwen4_mtp_ngram_first_attempts": ngram_attempts,
+            "qwen4_mtp_ngram_first_matches": ngram_matches,
+            "qwen4_mtp_ngram_first_proposed": ngram_proposed,
+            "qwen4_mtp_ngram_first_accepted": ngram_accepted,
+            "qwen4_mtp_ngram_first_rejected": ngram_rejected,
+            "qwen4_mtp_ngram_first_native_draft_bypasses": (
+                ngram_native_draft_bypasses),
+            "qwen4_mtp_proposal_sources": ",".join(proposal_sources),
             "qwen4_mtp_engine_identity": self.mtp_engine_identity,
             "qwen4_mtp_rounds": rounds,
             "qwen4_mtp_proposed": proposed,

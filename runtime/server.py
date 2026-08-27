@@ -1223,6 +1223,7 @@ class EngineManager:
                 ("VMODEL_QWEN4_PHASE_LM_HEAD", "0"),
                 ("VMODEL_QWEN4_MTP_DEPTH", "0"),
                 ("VMODEL_QWEN4_MTP_MIN_DRAFT_PROBABILITY", "0"),
+                ("VMODEL_QWEN4_MTP_NGRAM_FIRST", "0"),
             )
         )
         dspark_request_identity = tuple(
@@ -2844,6 +2845,15 @@ class EngineManager:
                     raise RequestValidationError(
                         "VMODEL_QWEN4_MTP_MIN_DRAFT_PROBABILITY must be in "
                         "[0, 1]")
+                if qwen4_request_identity[26] not in ("0", "1"):
+                    raise RequestValidationError(
+                        "VMODEL_QWEN4_MTP_NGRAM_FIRST must be 0 or 1")
+                qwen4_mtp_ngram_first = qwen4_request_identity[26] == "1"
+                if (qwen4_mtp_ngram_first
+                        and qwen4_mtp_min_draft_probability > 0.0):
+                    raise RequestValidationError(
+                        "VMODEL_QWEN4_MTP_NGRAM_FIRST cannot be combined "
+                        "with VMODEL_QWEN4_MTP_MIN_DRAFT_PROBABILITY")
                 rc.hot_prompt_kv_persist_dir = qwen4_request_identity[18]
                 if rc.hot_prompt_kv_persist_dir and not rc.hot_prompt_kv:
                     raise RequestValidationError(
@@ -4837,12 +4847,14 @@ class EngineManager:
                         depth=qwen4_mtp_depth,
                         min_draft_probability=(
                             qwen4_mtp_min_draft_probability),
+                        ngram_first=qwen4_mtp_ngram_first,
                     )
                     print(
                         "[server] exact Qwen4 Lightning-MTP speculation: "
                         f"target={model_dir.name} depth={qwen4_mtp_depth} "
                         "min_draft_probability="
                         f"{qwen4_mtp_min_draft_probability:g} "
+                        f"ngram_first={int(qwen4_mtp_ngram_first)} "
                         f"phase_head={int(rc.qwen4_phase_lm_head)}",
                         flush=True,
                     )
@@ -8999,6 +9011,13 @@ def _vision_protocol_timing(result: dict) -> dict:
         "qwen4_mtp_depth",
         "qwen4_mtp_adaptive_width_enabled",
         "qwen4_mtp_adaptive_truncations",
+        "qwen4_mtp_ngram_first_enabled",
+        "qwen4_mtp_ngram_first_attempts",
+        "qwen4_mtp_ngram_first_matches",
+        "qwen4_mtp_ngram_first_proposed",
+        "qwen4_mtp_ngram_first_accepted",
+        "qwen4_mtp_ngram_first_rejected",
+        "qwen4_mtp_ngram_first_native_draft_bypasses",
         "qwen4_mtp_rounds",
         "qwen4_mtp_proposed",
         "qwen4_mtp_accepted",
@@ -9145,6 +9164,7 @@ def _vision_protocol_timing(result: dict) -> dict:
         "qwen4_mtp_round_outcomes",
         "qwen4_mtp_round_widths",
         "qwen4_mtp_truncation_probabilities",
+        "qwen4_mtp_proposal_sources",
     ):
         if key in stats or key in result:
             value[key] = str(metric(key) or "")
