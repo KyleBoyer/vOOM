@@ -28,7 +28,12 @@ def _write_safetensor(path: Path, tensors: dict[str, tuple[np.ndarray, str]]) ->
     path.write_bytes(struct.pack("<Q", len(encoded)) + encoded + body)
 
 
-def _fixture(tmp_path: Path, *, bad_gate_shape: bool = False) -> tuple[Path, dict]:
+def _fixture(
+    tmp_path: Path,
+    *,
+    bad_gate_shape: bool = False,
+    include_mtp: bool = False,
+) -> tuple[Path, dict]:
     root = tmp_path / "flash-next"
     root.mkdir()
     hidden, width, experts = 4, 3, 2
@@ -97,6 +102,16 @@ def _fixture(tmp_path: Path, *, bad_gate_shape: bool = False) -> tuple[Path, dic
         f"{prefix}.experts.down_proj": (down_bits, "BF16"),
         f"{prefix}.gate.weight": (router_bits, "BF16"),
     }
+    mtp_gate_bits = gate_bits + 3000
+    mtp_down_bits = down_bits + 3000
+    if include_mtp:
+        tensors.update({
+            "mtp.layers.0.mlp.experts.gate_up_proj": (
+                mtp_gate_bits, "BF16"),
+            "mtp.layers.0.mlp.experts.down_proj": (
+                mtp_down_bits, "BF16"),
+            "mtp.layers.0.mlp.gate.weight": (router_bits + 3000, "BF16"),
+        })
     shard = root / "model.safetensors"
     _write_safetensor(shard, tensors)
     (root / "model.safetensors.index.json").write_text(json.dumps({
@@ -106,6 +121,8 @@ def _fixture(tmp_path: Path, *, bad_gate_shape: bool = False) -> tuple[Path, dic
         "gate": gate_bits,
         "down": down_bits,
         "router": router_bits,
+        "mtp_gate": mtp_gate_bits,
+        "mtp_down": mtp_down_bits,
         "hidden": hidden,
         "width": width,
     }
@@ -160,6 +177,36 @@ def test_virtual_and_regular_tensor_fetches_can_share_one_cache_page(tmp_path):
         _bits(values[virtual]), expected["gate"][0, :expected["width"]])
     np.testing.assert_array_equal(_bits(values[router]), expected["router"])
     assert nbytes == values[virtual].nbytes + values[router].nbytes
+
+
+def test_mtp_fused_experts_are_direct_paged_without_materializing_all_experts(
+        tmp_path):
+    root, expected = _fixture(tmp_path, include_mtp=True)
+    store = WeightStore(root)
+    prefix = "mtp.layers.0.mlp.experts.1"
+    names = [
+        f"{prefix}.{projection}.weight"
+        for projection in ("gate_proj", "up_proj", "down_proj")
+    ]
+
+    assert all(store.has(name) for name in names)
+    assert "mtp.layers.0.mlp.experts.gate_up_proj" not in (
+        store.names_with_prefix("mtp.layers.0.mlp.experts"))
+    values, _seconds, nbytes = store.fetch(names)
+
+    np.testing.assert_array_equal(
+        _bits(values[names[0]]),
+        expected["mtp_gate"][1, :expected["width"]],
+    )
+    np.testing.assert_array_equal(
+        _bits(values[names[1]]),
+        expected["mtp_gate"][1, expected["width"]:],
+    )
+    np.testing.assert_array_equal(
+        _bits(values[names[2]]), expected["mtp_down"][1],
+    )
+    assert nbytes == 3 * expected["hidden"] * expected["width"] * 2
+    assert store.qwen4_fused_expert_snapshot()["virtual_tensors"] == 12
 
 
 def test_unexpected_fused_expert_shape_fails_closed(tmp_path):

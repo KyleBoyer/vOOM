@@ -60,6 +60,45 @@ class Qwen4ExpStateCache:
         if pending:
             mx.eval(*pending)
 
+    def restore_recurrent_prefix(
+        self,
+        endpoint: "Qwen4ExpStateCache",
+        length: int,
+    ) -> None:
+        """Restore exact PLE recurrence, then trim append-only QSA state.
+
+        Serial speculative verification retains only PLE convolution/context
+        tensors for strict prefixes.  Copying every long-context QSA key array
+        at every proposal depth would scale as ``context * depth`` for state
+        that is already safely trimmable.  Install the non-trimmable PLE
+        endpoint first so :meth:`trim` may then shorten QSA in place.
+        """
+        if not isinstance(endpoint, Qwen4ExpStateCache):
+            raise TypeError("Qwen4 recurrent endpoint has the wrong type")
+        if len(endpoint.ple_conv) != len(self.ple_conv):
+            raise ValueError("Qwen4 recurrent endpoint layer count mismatch")
+        target = int(length)
+        if target < 0:
+            raise ValueError("Qwen4 recurrent endpoint length must be non-negative")
+        for layer, current in enumerate(self.ple_conv):
+            candidate = endpoint.ple_conv[layer]
+            if current is None:
+                if candidate is not None:
+                    raise ValueError(
+                        "Qwen4 recurrent endpoint contains an unexpected PLE layer")
+                continue
+            if (
+                candidate is None
+                or endpoint.ple_context[layer] is None
+                or endpoint.ple_lengths[layer] != target
+            ):
+                raise ValueError(
+                    f"Qwen4 recurrent endpoint is incomplete at layer {layer}")
+            self.ple_conv[layer] = candidate
+            self.ple_context[layer] = endpoint.ple_context[layer]
+            self.ple_lengths[layer] = target
+        self.trim(target)
+
     def nbytes(self) -> int:
         return sum(
             value.nbytes

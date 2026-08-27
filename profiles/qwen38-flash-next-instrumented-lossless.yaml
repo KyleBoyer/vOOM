@@ -7,6 +7,7 @@ notes:
   - Exact layer-stationary prefill retains one layer trunk while PLE/QSA/DeltaNet and MoE arithmetic preserve fixed 1024-position tile shapes. The union of physical routed-expert pages is loaded once per layer, avoiding both the measured 12.8 GB whole-prompt transient and repeated reads of the 241.6 GB expert body. The first instrumented 8192-position DeltaNet tile peaked at 28.14 GB despite compiled 32-position segments, so 1024 is the conservative content-blind bound pending a measured ladder.
   - The DeltaNet recurrence uses the exact same-operator compiled 32-position segments. This preserves the released FP32 state/update order while bounding the lazy recurrence graph; the real greedy/state oracle must remain bit-identical before this candidate is used.
   - Evaluated BF16 hidden, mixed, and injection tiles are copied bit-for-bit to a bounded host spool between phases. This prevents prompt-length many Metal graphs from remaining live; copy bytes, copy time, and peak host bytes are reported explicitly.
+  - Four independent routed tile graphs share one host/device synchronization without changing any expert GEMM shape or accumulation order. The 769-token released-BF16 oracle matched every KV/KDA/QSA/PLE state hash, held peak Metal at 1.157 GB, and improved generation 110.32s to 107.27s. This remains profile-scoped pending the 8K and heterogeneous replay rungs.
   - A synchronous 8.5 GB Metal ceiling fails closed at every spooled attention/output tile and sampled expert batch; diagnostic SSE events carry active/peak Metal and host-spool bytes.
   - Eight PLE row workers overlap independent exact preads from the released shards. Returned BF16 rows, physical-sort assembly order, and cache order are unchanged; read extents and read time are attributed separately for cold A/B promotion.
   - Exact routed-expert byte ranges can be balanced across the internal and external NVMe devices, and the 2026-08-27 769-token oracle preserved every state hash while reducing wall 121.27s to 115.18s. It remains disabled here because the untouched 49,255-token capture regressed wall 1,849.47s to 1,883.21s and produced 3.15 GB of swap-out growth. The capability is retained for bounded short-context experiments only.
@@ -28,6 +29,7 @@ settings:
   VMODEL_QWEN4_MAX_METAL_MB: 8500
   VMODEL_QWEN4_SPARSE_EXPERT_BATCH_ROWS: false
   VMODEL_QWEN4_GLOBAL_EXPERT_ROWS: false
+  VMODEL_QWEN4_EXPERT_TILE_EVAL_BATCH: 4
   VMODEL_QWEN4_COMPILED_DELTA: true
   VMODEL_QWEN4_FAST_TIER_DIR: ""
   VMODEL_QWEN4_PARALLEL_STORAGE_READS: false

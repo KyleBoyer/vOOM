@@ -1008,8 +1008,14 @@ class WeightStore:
         if experts <= 0 or width <= 0 or hidden <= 0:
             raise ValueError("Qwen4-Exp fused expert geometry is incomplete")
 
-        for layer in range(cfg.num_hidden_layers):
-            prefix = f"model.layers.{layer}.mlp.experts"
+        expert_prefixes = [
+            f"model.layers.{layer}.mlp.experts"
+            for layer in range(cfg.num_hidden_layers)
+        ]
+        has_mtp = any(name.startswith("mtp.") for name in self.weight_map)
+        if has_mtp:
+            expert_prefixes.append("mtp.layers.0.mlp.experts")
+        for prefix in expert_prefixes:
             fused_specs = (
                 (f"{prefix}.gate_up_proj", (experts, 2 * width, hidden)),
                 (f"{prefix}.down_proj", (experts, hidden, width)),

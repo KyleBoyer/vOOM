@@ -12,9 +12,12 @@ from runtime.qwen4_exp import (
     _qsa_selection_mask,
     hyper_connection_inject,
     hyper_connection_mix,
+    qwen4_mlp_from_groups,
+    qwen4_mlp_route,
     qwen4_rms_norm,
 )
 from runtime.qwen4_exp_state import Qwen4ExpStateCache
+from runtime.qwen35 import _moe
 
 
 def _cfg(**overrides):
@@ -125,6 +128,75 @@ def test_hyper_injection_rejects_promoted_branch_dtype():
         hyper_connection_inject(branch, residual, injection)
 
 
+def test_serial_route_union_reuses_pages_without_changing_one_row_math():
+    cfg = _cfg(num_experts_per_tok=1)
+    rng = np.random.default_rng(29)
+    prefix = "model.layers.0"
+
+    def bf16(shape, scale=.1):
+        return mx.array(
+            rng.normal(scale=scale, size=shape).astype(np.float32)
+        ).astype(mx.bfloat16)
+
+    weights = {
+        f"{prefix}.mlp_hyper_connection.hc_norm.weight": bf16((8,)),
+        f"{prefix}.mlp_hyper_connection.input_mix_weight_down.weight": bf16((3, 8)),
+        f"{prefix}.mlp_hyper_connection.input_mix_weight_up.weight": bf16((8, 3)),
+        f"{prefix}.mlp_hyper_connection.block_inject_weight.weight": bf16((2, 8)),
+        f"{prefix}.mlp.gate.weight": mx.array([
+            [1.0, 0.0, 0.0, 0.0],
+            [-1.0, 0.0, 0.0, 0.0],
+        ], dtype=mx.bfloat16),
+        f"{prefix}.mlp.shared_expert.gate_proj.weight": bf16((3, 4)),
+        f"{prefix}.mlp.shared_expert.up_proj.weight": bf16((3, 4)),
+        f"{prefix}.mlp.shared_expert.down_proj.weight": bf16((4, 3)),
+        f"{prefix}.mlp.shared_expert_gate.weight": bf16((1, 4)),
+    }
+    experts = {}
+    for expert in range(2):
+        page = {
+            f"{prefix}.mlp.experts.{expert}.gate_proj.weight": bf16((3, 4)),
+            f"{prefix}.mlp.experts.{expert}.up_proj.weight": bf16((3, 4)),
+            f"{prefix}.mlp.experts.{expert}.down_proj.weight": bf16((4, 3)),
+        }
+        experts[expert] = page
+        weights.update(page)
+
+    hidden = mx.array([
+        [[2.0, 0.5, -0.25, 0.75, 1.0, -0.5, 0.25, 0.5],
+         [-2.0, 0.25, 0.5, -0.75, -1.0, 0.5, -0.25, -0.5],
+         [1.5, -0.5, 0.75, 0.25, 0.5, 0.75, -0.5, 1.0]],
+    ], dtype=mx.bfloat16)
+
+    routes = [
+        qwen4_mlp_route(
+            hidden[:, position:position + 1], weights, prefix, cfg, 0)
+        for position in range(hidden.shape[1])
+    ]
+    assert {expert for route in routes for expert in route[3]} == {0, 1}
+    actual = []
+    expected = []
+    for route in routes:
+        actual.append(qwen4_mlp_from_groups(
+            route, experts, weights, prefix))
+        mixed, residual, injection, _groups = route
+        branch = _moe(
+            mixed, weights, prefix, cfg, 0,
+            lambda _layer, ids, positions=None: {
+                expert: experts[expert] for expert in ids
+            },
+        )
+        expected.append(hyper_connection_inject(
+            branch, residual, injection))
+
+    mx.eval(*actual, *expected)
+    for got, want in zip(actual, expected, strict=True):
+        np.testing.assert_array_equal(
+            np.asarray(got.view(mx.uint16)),
+            np.asarray(want.view(mx.uint16)),
+        )
+
+
 def test_dilated_ple_convolution_split_endpoint_is_exact():
     rng = np.random.default_rng(11)
     x = mx.array(rng.normal(size=(1, 9, 6)).astype(np.float32))
@@ -169,3 +241,40 @@ def test_qsa_mask_is_causal_and_switches_to_bounded_blocks():
     assert host[10].sum() <= cfg.qwen4_indexer_budget + 1
     assert state.qsa_keys[0].shape == (1, length, 4)
     assert state.qsa_positions[0].shape == (1, length)
+
+
+def test_recurrent_prefix_restore_keeps_only_small_ple_endpoint_and_trims_qsa():
+    state = Qwen4ExpStateCache(2)
+    state.qsa_keys[1] = mx.arange(24, dtype=mx.float32).reshape(1, 6, 4)
+    state.qsa_positions[1] = mx.arange(6, dtype=mx.int32)[None]
+    state.ple_conv[0] = mx.full((1, 3, 4), 9.0)
+    state.ple_context[0] = (3, 4)
+    state.ple_lengths[0] = 6
+
+    endpoint = Qwen4ExpStateCache(2)
+    endpoint.ple_conv[0] = mx.full((1, 3, 4), 5.0)
+    endpoint.ple_context[0] = (1, 2)
+    endpoint.ple_lengths[0] = 4
+
+    state.restore_recurrent_prefix(endpoint, 4)
+
+    mx.eval(state.qsa_keys[1], state.qsa_positions[1], state.ple_conv[0])
+    assert tuple(state.qsa_keys[1].shape) == (1, 4, 4)
+    np.testing.assert_array_equal(
+        np.asarray(state.qsa_positions[1]), [[0, 1, 2, 3]])
+    np.testing.assert_array_equal(
+        np.asarray(state.ple_conv[0]), np.full((1, 3, 4), 5.0))
+    assert state.ple_context[0] == (1, 2)
+    assert state.ple_lengths[0] == 4
+    assert endpoint.qsa_keys == [None, None]
+
+
+def test_recurrent_prefix_restore_fails_closed_on_incomplete_ple_state():
+    state = Qwen4ExpStateCache(1)
+    state.ple_conv[0] = mx.zeros((1, 3, 4))
+    state.ple_context[0] = (3, 4)
+    state.ple_lengths[0] = 6
+    endpoint = Qwen4ExpStateCache(1)
+
+    with pytest.raises(ValueError, match="incomplete"):
+        state.restore_recurrent_prefix(endpoint, 4)

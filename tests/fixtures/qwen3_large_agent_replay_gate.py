@@ -188,7 +188,8 @@ def _summary(response: dict, *, wall_s: float, events: list[str],
              expected_positive_function_arguments: tuple[str, ...] = (),
              expected_nonempty_function_arguments: tuple[str, ...] = (),
              expected_output_text_terms: tuple[str, ...] = (),
-             expected_output_text_any_terms: tuple[str, ...] = ()) -> dict:
+             expected_output_text_any_terms: tuple[str, ...] = (),
+             score_plex_profile: bool = False) -> dict:
     output = response.get("output") or []
     stable_output = []
     for item in output:
@@ -210,6 +211,7 @@ def _summary(response: dict, *, wall_s: float, events: list[str],
     delta_sizes = [len(delta.encode("utf-8")) for delta in deltas]
     final_output_text = response.get("output_text", "")
     parsed_function_arguments = []
+    parsed_function_calls = []
     for item in output:
         if not isinstance(item, dict) or item.get("type") != "function_call":
             continue
@@ -219,6 +221,10 @@ def _summary(response: dict, *, wall_s: float, events: list[str],
             continue
         if isinstance(arguments, dict):
             parsed_function_arguments.append(arguments)
+            parsed_function_calls.append({
+                "name": str(item.get("name") or ""),
+                "arguments": arguments,
+            })
     argument_match = (
         None if expected_function_arguments is None else any(
             all(arguments.get(key) == value
@@ -270,6 +276,23 @@ def _summary(response: dict, *, wall_s: float, events: list[str],
             if isinstance(text, str):
                 private_text_parts.append(text)
     folded_output_text = "\n".join(private_text_parts).casefold()
+    visible_output_text = (
+        final_output_text
+        if isinstance(final_output_text, str) and final_output_text
+        else "\n".join(private_text_parts)
+    )
+    plex_profile = None
+    if score_plex_profile:
+        # Import only when explicitly requested. The scorer returns static
+        # rubric booleans/points and never the private response text or tool
+        # arguments, preserving this fixture's artifact privacy contract.
+        from plex_agent_profile import score_profile
+
+        plex_profile = score_profile(
+            parsed_function_calls,
+            visible_output_text,
+            str(response.get("vmodel_reasoning") or ""),
+        )
     output_text_terms_match = (
         None if not expected_output_text_terms else all(
             term.casefold() in folded_output_text
@@ -330,6 +353,10 @@ def _summary(response: dict, *, wall_s: float, events: list[str],
         "output_text_term_matches": output_text_term_matches,
         "output_text_any_term_match": output_text_any_term_match,
         "output_text_any_term_matches": output_text_any_term_matches,
+        "plex_profile": plex_profile,
+        "plex_profile_scope": (
+            "single_response_whole_visible_output"
+            if score_plex_profile else None),
         "output_sha256": hashlib.sha256(private_output).hexdigest(),
         "output_bytes": len(private_output),
         "sse_event_types": events,
@@ -354,7 +381,8 @@ def _post(
         expected_positive_function_arguments: tuple[str, ...] = (),
         expected_nonempty_function_arguments: tuple[str, ...] = (),
         expected_output_text_terms: tuple[str, ...] = (),
-        expected_output_text_any_terms: tuple[str, ...] = ()) -> dict:
+        expected_output_text_any_terms: tuple[str, ...] = (),
+        score_plex_profile: bool = False) -> dict:
     request = urllib.request.Request(
         url, data=payload, headers={"Content-Type": "application/json"},
         method="POST")
@@ -450,7 +478,8 @@ def _post(
         expected_nonempty_function_arguments=(
             expected_nonempty_function_arguments),
         expected_output_text_terms=expected_output_text_terms,
-        expected_output_text_any_terms=expected_output_text_any_terms)
+        expected_output_text_any_terms=expected_output_text_any_terms,
+        score_plex_profile=score_plex_profile)
 
 
 def _write(path: Path | None, value: dict) -> None:
@@ -602,6 +631,15 @@ def main() -> int:
         help=(
             "require at least one case-insensitive term in final output_text; "
             "only boolean match witnesses are persisted"))
+    parser.add_argument(
+        "--score-plex-profile", action="store_true",
+        help=(
+            "score each single response with the whole-visible Plex rubric; "
+            "only the static rubric result is persisted, never response text "))
+    parser.add_argument("--expected-min-plex-score", type=float)
+    parser.add_argument(
+        "--expected-plex-pass", action="store_true",
+        help="require the whole-visible single-response Plex rubric to pass")
     parser.add_argument("--expected-backend")
     parser.add_argument(
         "--expected-runtime-profile", action="append", default=[])
@@ -684,6 +722,13 @@ def main() -> int:
     if (args.expected_min_repeat_cached_tokens is not None
             and args.expected_min_repeat_cached_tokens <= 0):
         parser.error("expected-min-repeat-cached-tokens must be positive")
+    if args.expected_min_plex_score is not None:
+        if not 0 <= args.expected_min_plex_score <= 100:
+            parser.error("expected-min-plex-score must be in [0, 100]")
+        if not args.score_plex_profile:
+            parser.error("expected-min-plex-score requires --score-plex-profile")
+    if args.expected_plex_pass and not args.score_plex_profile:
+        parser.error("expected-plex-pass requires --score-plex-profile")
     mutations = sum(value is not None for value in (
         args.replacement_user_text, args.append_final_user_text,
         args.scenario, args.kai_conversation))
@@ -837,7 +882,8 @@ def main() -> int:
             expected_output_text_terms=tuple(
                 args.expected_output_text_term),
             expected_output_text_any_terms=tuple(
-                args.expected_output_text_any_term))
+                args.expected_output_text_any_term),
+            score_plex_profile=args.score_plex_profile)
         after = _pressure()
         row["repeat"] = index + 1
         row["request_label"] = label
@@ -947,6 +993,17 @@ def main() -> int:
             failures.append(
                 f"repeat {index + 1}: output text did not contain any "
                 "accepted mechanism term")
+        plex_profile = row.get("plex_profile") or {}
+        if (args.expected_min_plex_score is not None
+                and float(plex_profile.get("score", -1))
+                < args.expected_min_plex_score):
+            failures.append(
+                f"repeat {index + 1}: Plex score "
+                f"{plex_profile.get('score')!r} is below "
+                f"{args.expected_min_plex_score}")
+        if args.expected_plex_pass and plex_profile.get("passed") is not True:
+            failures.append(
+                f"repeat {index + 1}: whole-visible Plex rubric did not pass")
         if (args.expected_backend is not None
                 and row.get("backend") != args.expected_backend):
             failures.append(
@@ -1098,6 +1155,7 @@ def main() -> int:
                 len(str(item.get("content", "")))
                 for item in (request_value.get("input") or ())
                 if isinstance(item, dict) and item.get("role") == "system"),
+            "score_plex_profile": args.score_plex_profile,
         },
         "expectations": {
             "max_first_wall_seconds": args.expected_max_first_wall_seconds,
@@ -1115,6 +1173,8 @@ def main() -> int:
                 args.expected_no_runtime_profile_overrides),
             "gateway_real_tool_required": (
                 args.expected_gateway_real_tool_required),
+            "min_plex_score": args.expected_min_plex_score,
+            "plex_pass": args.expected_plex_pass,
         },
         "initial_pressure": asdict(initial),
         "runs": rows,

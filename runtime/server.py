@@ -1218,6 +1218,7 @@ class EngineManager:
                 ("VMODEL_QWEN4_HOT_KV_PERSIST_DIR", ""),
                 ("VMODEL_QWEN4_HOT_KV_PERSIST_MAX_CHECKPOINTS", "4"),
                 ("VMODEL_QWEN4_HOT_KV_PERSIST_MAX_MB", "8192"),
+                ("VMODEL_QWEN4_EXPERT_TILE_EVAL_BATCH", "1"),
             )
         )
         dspark_request_identity = tuple(
@@ -2794,6 +2795,17 @@ class EngineManager:
                         or not 0 <= rc.hot_prompt_kv_persist_max_mb <= 32768):
                     raise RequestValidationError(
                         "Qwen4 durable hot-KV limits are outside their bounds")
+                try:
+                    rc.qwen4_expert_tile_eval_batch = int(
+                        qwen4_request_identity[21])
+                except ValueError as error:
+                    raise RequestValidationError(
+                        "VMODEL_QWEN4_EXPERT_TILE_EVAL_BATCH must be an "
+                        "integer") from error
+                if not 1 <= rc.qwen4_expert_tile_eval_batch <= 16:
+                    raise RequestValidationError(
+                        "VMODEL_QWEN4_EXPERT_TILE_EVAL_BATCH must be in "
+                        "[1, 16]")
                 rc.hot_prompt_kv_persist_dir = qwen4_request_identity[18]
                 if rc.hot_prompt_kv_persist_dir and not rc.hot_prompt_kv:
                     raise RequestValidationError(
@@ -8902,6 +8914,9 @@ def _vision_protocol_timing(result: dict) -> dict:
         "qwen4_host_spool_sparse_expert_batch_rows",
         "qwen4_host_spool_expert_batch_tile_gathers",
         "qwen4_host_spool_expert_batch_tile_rows_uploaded",
+        "qwen4_host_spool_expert_tile_eval_batch",
+        "qwen4_host_spool_expert_tile_eval_syncs",
+        "qwen4_host_spool_expert_tile_eval_groups",
         "qwen4_ple_read_calls",
         "qwen4_ple_read_extents",
         "qwen4_ple_rows_requested",

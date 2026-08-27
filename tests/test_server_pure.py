@@ -2750,6 +2750,7 @@ def test_qwen4_instrumented_profile_is_exact_bounded_and_in_engine_identity():
         "VMODEL_QWEN4_HOT_KV_PERSIST_DIR": "",
         "VMODEL_QWEN4_HOT_KV_PERSIST_MAX_CHECKPOINTS": "4",
         "VMODEL_QWEN4_HOT_KV_PERSIST_MAX_MB": "8192",
+        "VMODEL_QWEN4_EXPERT_TILE_EVAL_BATCH": "1",
     }
     with patch.dict(os.environ, settings, clear=False), \
          patch("runtime.config.ModelConfig.from_dir", return_value=cfg), \
@@ -2776,6 +2777,7 @@ def test_qwen4_instrumented_profile_is_exact_bounded_and_in_engine_identity():
         assert rc.metal_limit_mb == 8500
         assert not rc.qwen4_sparse_expert_batch_rows
         assert not rc.qwen4_global_expert_rows
+        assert rc.qwen4_expert_tile_eval_batch == 1
         assert not rc.pin_lm_head
         assert rc.stream_lm_head
         assert not rc.pin_embeddings
@@ -2810,6 +2812,28 @@ def test_qwen4_instrumented_profile_rejects_invalid_cache_bounds():
         with pytest.raises(
             RequestValidationError,
             match="VMODEL_QWEN4_WEIGHT_CACHE_MB must be in",
+        ):
+            EngineManager().get(Path("/tmp/fake-qwen4"), "lossless")
+
+
+def test_qwen4_expert_tile_eval_batch_is_strictly_bounded():
+    from unittest.mock import patch
+
+    from runtime.server import EngineManager
+
+    cfg = SimpleNamespace(
+        model_type="qwen4_exp", tie_word_embeddings=False,
+        vision_config={"model_type": "qwen4_exp_vision"},
+        num_hidden_layers=48, num_experts=512,
+    )
+    with patch.dict(os.environ, {
+        "VMODEL_QWEN4_EXPERT_TILE_EVAL_BATCH": "17",
+    }, clear=False), \
+         patch("runtime.config.ModelConfig.from_dir", return_value=cfg), \
+         patch("runtime.path_resolver.resolve_model_dir", side_effect=lambda path: path):
+        with pytest.raises(
+            RequestValidationError,
+            match="VMODEL_QWEN4_EXPERT_TILE_EVAL_BATCH must be in",
         ):
             EngineManager().get(Path("/tmp/fake-qwen4"), "lossless")
 

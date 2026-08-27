@@ -693,6 +693,11 @@ class RuntimeConfig:
     # only the union of positions routed to that batch. Every individual
     # expert still receives the same rows, order, shape, and accumulation.
     qwen4_sparse_expert_batch_rows: bool = False
+    # Evaluate this many already-independent routed tile accumulators in one
+    # mx.eval call. Each expert GEMM retains its original per-tile shape and
+    # every tile retains ascending expert accumulation; only the host/device
+    # synchronization boundary is coalesced. One is the validated baseline.
+    qwen4_expert_tile_eval_batch: int = 1
     # Opt-in request-local attribution. "" disables it; "layers" records the
     # runtime's existing materialization boundaries; "ops" adds diagnostic
     # attention/router/MLP barriers for supported Qwen/Kimi/GLM hybrid blocks.
@@ -2137,6 +2142,8 @@ class StreamingEngine:
         # acceptance is known; ordinary calls leave this empty.
         self._serial_kda_endpoints = None
         self._serial_kda_endpoint_retained_bytes = 0
+        self._serial_qwen4_endpoints = None
+        self._serial_qwen4_endpoint_retained_bytes = 0
         self._serial_kda_factors = None
         self._serial_kda_factor_retained_bytes = 0
         self._dspark_expert_prefetch_plan = None
@@ -2364,6 +2371,11 @@ class StreamingEngine:
         self.expert_route_overlap_trace: list[dict] = []
         self._expert_route_last_by_layer: dict[int, tuple[int, ...]] = {}
         self._expert_route_overlap_totals: dict[str, int] = {}
+        self._qwen4_serial_verify_union_layers = 0
+        self._qwen4_serial_verify_expert_slots = 0
+        self._qwen4_serial_verify_union_experts = 0
+        self._qwen4_serial_verify_expert_pages_avoided = 0
+        self._qwen4_serial_verify_union_fetch_s = 0.0
         self._expert_compute_batches = 0
         self._max_experts_per_compute_batch = 0
         self._adaptive_expert_batch_clamps = 0
@@ -4975,8 +4987,11 @@ class StreamingEngine:
         ensures the cache owns the final live reference when it releases the
         dedicated pin page.
         """
-        if (not self.rc.qwen35_serial_verify_suspend_lm_head
-                or not self._qwen35_lm_head_suspend_request_active):
+        if (not bool(getattr(
+                getattr(self, "rc", None),
+                "qwen35_serial_verify_suspend_lm_head", False))
+                or not bool(getattr(
+                    self, "_qwen35_lm_head_suspend_request_active", False))):
             return 0
         if self._lm_head_w is None:
             return 0
@@ -5072,7 +5087,15 @@ class StreamingEngine:
         head = self._lm_head_weight()
         source = hidden if hidden is not None else self._h_last
         if isinstance(head, RerankedQHead) and source is not None:
-            if self.cfg.model_type in ("qwen3_5_moe", "qwen3_5"):
+            if self.cfg.model_type == "qwen4_exp":
+                from .qwen4_exp import final_hidden
+
+                normalized = final_hidden(
+                    source[:, -1:, :],
+                    self._qwen4_final_mixer_w,
+                    self.cfg,
+                )
+            elif self.cfg.model_type in ("qwen3_5_moe", "qwen3_5"):
                 from .qwen35 import qwen35_rms_norm
 
                 normalized = qwen35_rms_norm(
@@ -6061,6 +6084,8 @@ class StreamingEngine:
         spool_expert_rows_uploaded = 0
         spool_expert_batch_tile_gathers = 0
         spool_expert_batch_tile_rows_uploaded = 0
+        spool_expert_tile_eval_syncs = 0
+        spool_expert_tile_eval_groups = 0
         spool_phase_seconds = {
             "ple": 0.0,
             "attention": 0.0,
@@ -6264,6 +6289,8 @@ class StreamingEngine:
                 nonlocal spool_expert_rows_uploaded
                 nonlocal spool_expert_batch_tile_gathers
                 nonlocal spool_expert_batch_tile_rows_uploaded
+                nonlocal spool_expert_tile_eval_syncs
+                nonlocal spool_expert_tile_eval_groups
                 if self.rc.qwen4_global_expert_rows:
                     # For a long prompt, virtually every 16-expert page batch
                     # touches every position at least once. The baseline thus
@@ -6322,6 +6349,9 @@ class StreamingEngine:
                 # Evaluate one tile before loading the next. A union batch's
                 # released pages remain shared, while routed accumulation has
                 # the same expert-id order and tile shapes as chunk-major.
+                pending_routed = []
+                eval_batch = max(
+                    1, int(self.rc.qwen4_expert_tile_eval_batch))
                 for record in records:
                     start, end = record["start"], record["end"]
                     if self.rc.qwen4_sparse_expert_batch_rows:
@@ -6364,8 +6394,19 @@ class StreamingEngine:
                         record["routed"] = record["routed"].at[
                             :, positions, :].add(
                                 contribution * route_weights[None, :, None])
-                    mx.eval(record["routed"])
+                    pending_routed.append(record["routed"])
+                    if len(pending_routed) >= eval_batch:
+                        mx.eval(*pending_routed)
+                        spool_expert_tile_eval_syncs += 1
+                        spool_expert_tile_eval_groups += len(pending_routed)
+                        pending_routed.clear()
+                        mx.clear_cache()
                     mixed_tile = contribution = route_weights = None
+                if pending_routed:
+                    mx.eval(*pending_routed)
+                    spool_expert_tile_eval_syncs += 1
+                    spool_expert_tile_eval_groups += len(pending_routed)
+                    pending_routed.clear()
                     mx.clear_cache()
                 expert_batches_done += 1
                 if expert_batches_done == 1 or expert_batches_done % 8 == 0:
@@ -6466,6 +6507,10 @@ class StreamingEngine:
             "expert_batch_tile_gathers": spool_expert_batch_tile_gathers,
             "expert_batch_tile_rows_uploaded": (
                 spool_expert_batch_tile_rows_uploaded),
+            "expert_tile_eval_batch": int(
+                self.rc.qwen4_expert_tile_eval_batch),
+            "expert_tile_eval_syncs": spool_expert_tile_eval_syncs,
+            "expert_tile_eval_groups": spool_expert_tile_eval_groups,
             **{
                 f"{name}_seconds": round(seconds, 6)
                 for name, seconds in spool_phase_seconds.items()
@@ -7884,10 +7929,35 @@ class StreamingEngine:
         self._serial_kda_factor_retained_bytes = 0
         return factors
 
+    def consume_serial_qwen4_endpoint(
+        self, fed_positions: int | None,
+    ):
+        """Consume one exact QSA/PLE endpoint from the last verify window.
+
+        QSA keys are append-only and are trimmed from the installed full-window
+        state, but PLE convolution/context state cannot be
+        reconstructed by trimming a rejected suffix.  Qwen4 speculative
+        verification therefore retains every strict prefix alongside the
+        existing KDA endpoint window.  The full-window endpoint remains
+        installed in ``kv.qwen4_cache`` and is not duplicated here.
+        """
+        endpoints = getattr(self, "_serial_qwen4_endpoints", None)
+        self._serial_qwen4_endpoints = None
+        self._serial_qwen4_endpoint_retained_bytes = 0
+        if fed_positions is None or endpoints is None:
+            return None
+        count = int(fed_positions)
+        if not 1 <= count <= len(endpoints):
+            raise ValueError(
+                f"retained Qwen4 endpoint {count} is outside "
+                f"[1, {len(endpoints)}]")
+        return endpoints[count - 1]
+
     def forward_tokens_serial_positions(
         self, tokens: list[int], kv, tap_layers=None, *,
         capture_kda_endpoints: bool = False,
         capture_kda_factors: bool = False,
+        capture_qwen4_endpoints: bool = False,
     ) -> mx.array:
         """Exact dense verification with one weight sweep for many positions.
 
@@ -7901,12 +7971,14 @@ class StreamingEngine:
         # A successful caller must consume the desired endpoint immediately.
         self.consume_serial_kda_endpoint(None)
         self.consume_serial_kda_factors()
+        self.consume_serial_qwen4_endpoint(None)
         if capture_kda_endpoints and capture_kda_factors:
             raise ValueError(
                 "capture either dense KDA endpoints or compact factors, not both")
 
         glm_family = self.cfg.model_type in ("glm_moe_dsa", "kimi_k25", "glm4_moe_lite")
         qwen_family = self.cfg.model_type in ("qwen3_5", "qwen3_5_moe")
+        qwen4_family = self.cfg.model_type == "qwen4_exp"
         kimi_family = self.cfg.model_type == "kimi_linear"
         # F128: kimi_k3 gets its OWN branch below (kimi_k3_family), not
         # folded into kimi_family -- block_residual's per-layer boundary
@@ -7917,7 +7989,7 @@ class StreamingEngine:
         # dispatch.
         kimi_k3_family = self.cfg.model_type == "kimi_k3"
         lfm2_family = self.cfg.model_type == "lfm2"
-        if not glm_family and not qwen_family and not kimi_family and not kimi_k3_family and (
+        if not glm_family and not qwen_family and not qwen4_family and not kimi_family and not kimi_k3_family and (
                 self.cfg.num_experts or self.cfg.model_type == "gpt_oss"):
             # F94: layer_runner.run_block (this function's per-layer call
             # below) is a plain dense-transformer block with no awareness of
@@ -7984,6 +8056,7 @@ class StreamingEngine:
         positions = [embedded[:, i:i + 1, :] for i in range(len(tokens))]
         n = self.cfg.num_hidden_layers
         serial_kda_endpoints = None
+        serial_qwen4_endpoints = None
         factor_source = None
         if capture_kda_endpoints:
             source_kda = getattr(kv, "kda_cache", None)
@@ -8004,10 +8077,26 @@ class StreamingEngine:
                 raise ValueError(
                     "KDA factor capture requires kv.kda_cache")
             factor_source.begin_factor_capture()
+        if capture_qwen4_endpoints:
+            source_qwen4 = getattr(kv, "qwen4_cache", None)
+            if source_qwen4 is None:
+                raise ValueError(
+                    "Qwen4 endpoint capture requires kv.qwen4_cache")
+            from .qwen4_exp_state import Qwen4ExpStateCache
+
+            serial_qwen4_endpoints = [
+                Qwen4ExpStateCache(n) for _ in range(len(tokens) - 1)
+            ]
         if glm_family:
             from .glm import _glm_attention_residual, _glm_mlp_residual
         if qwen_family:
             from .qwen35 import _qwen35_attention_residual, _qwen35_mlp_residual
+        if qwen4_family:
+            from .qwen4_exp import (
+                qwen4_attention_residual,
+                qwen4_mlp_from_groups,
+                qwen4_mlp_route,
+            )
         if kimi_family:
             from .kimi_linear import (
                 _kimi_linear_attention_residual, _kimi_linear_mlp_residual)
@@ -8067,6 +8156,22 @@ class StreamingEngine:
                 endpoint.set_state(layer, state)
             if history is not None:
                 endpoint.set_conv_history(layer, tuple(history))
+
+        def capture_qwen4_position(layer: int, position: int) -> None:
+            """Retain this layer's exact QSA/PLE state for one strict prefix."""
+            if (
+                serial_qwen4_endpoints is None
+                or position >= len(serial_qwen4_endpoints)
+            ):
+                return
+            source = getattr(kv, "qwen4_cache", None)
+            if source is None:
+                return
+            endpoint = serial_qwen4_endpoints[position]
+            if source.ple_conv[layer] is not None:
+                endpoint.ple_conv[layer] = source.ple_conv[layer]
+                endpoint.ple_context[layer] = source.ple_context[layer]
+                endpoint.ple_lengths[layer] = source.ple_lengths[layer]
 
         for layer in range(n):
             self._select_serial_verify_layer_transient(
@@ -8263,6 +8368,66 @@ class StreamingEngine:
                     batched_hidden[:, position:position + 1, :]
                     for position in range(len(positions))
                 ]
+            elif qwen4_family:
+                # The recurrent PLE/QSA/DeltaNet half remains canonical and
+                # position-serial.  Once all rows have been routed, fetch the
+                # immutable union of their exact BF16 expert pages once for
+                # this layer.  Each row still executes its experts separately
+                # in ascending order with the same materialization boundary as
+                # ordinary one-token decode; this only removes duplicate I/O.
+                prefix = f"model.layers.{layer}"
+                attn_positions = []
+                for position, hidden in enumerate(positions):
+                    attn_out = qwen4_attention_residual(
+                        hidden,
+                        (tokens[position],),
+                        weights,
+                        prefix,
+                        self.cfg,
+                        kv,
+                        layer,
+                        offset + position,
+                        row_store=self._qwen4_ple_rows,
+                        compiled_delta_prefill=(
+                            self.rc.qwen_compiled_delta_prefill),
+                        native_fused_delta_prefill=(
+                            self.rc.qwen_native_fused_delta_prefill),
+                    )
+                    capture_kda_position(layer, position)
+                    capture_qwen4_position(layer, position)
+                    attn_positions.append(attn_out)
+
+                routes = [
+                    qwen4_mlp_route(
+                        hidden, weights, prefix, self.cfg, layer)
+                    for hidden in attn_positions
+                ]
+                positions_by_expert: dict[int, list[int]] = {}
+                expert_slots = 0
+                for position, route in enumerate(routes):
+                    groups = route[3]
+                    expert_slots += len(groups)
+                    for expert in groups:
+                        positions_by_expert.setdefault(expert, []).append(
+                            position)
+                expert_ids = sorted(positions_by_expert)
+                union_fetch_t0 = time.perf_counter()
+                experts = self._get_experts(
+                    layer, expert_ids, positions=positions_by_expert)
+                self._qwen4_serial_verify_union_fetch_s += (
+                    time.perf_counter() - union_fetch_t0)
+                self._qwen4_serial_verify_union_layers += 1
+                self._qwen4_serial_verify_expert_slots += expert_slots
+                self._qwen4_serial_verify_union_experts += len(expert_ids)
+                self._qwen4_serial_verify_expert_pages_avoided += max(
+                    0, expert_slots - len(expert_ids))
+                next_positions = [
+                    qwen4_mlp_from_groups(
+                        route, experts, weights, prefix)
+                    for route in routes
+                ]
+                mx.eval(*next_positions)
+                del experts, routes, attn_positions
             else:
                 next_positions = []
                 for position, hidden in enumerate(positions):
@@ -8413,21 +8578,38 @@ class StreamingEngine:
             # each physical LM-head block read across the complete verifier
             # window. A batched matmul is deliberately not substituted here:
             # this method exists because its reduction choice can move logits.
-            if self.cfg.model_type in ("qwen3_5_moe", "qwen3_5"):
+            if self.cfg.model_type == "qwen4_exp":
+                from .qwen4_exp import final_hidden
+
+                normalized = mx.concatenate([
+                    final_hidden(
+                        hidden, self._qwen4_final_mixer_w, self.cfg)
+                    for hidden in positions
+                ], axis=1)
+            elif self.cfg.model_type in ("qwen3_5_moe", "qwen3_5"):
                 from .qwen35 import qwen35_rms_norm
 
                 normalize = qwen35_rms_norm
+                normalized = mx.concatenate(
+                    [
+                        normalize(
+                            hidden, self._norm_w, self.cfg.rms_norm_eps
+                        )
+                        for hidden in positions
+                    ],
+                    axis=1,
+                )
             else:
                 normalize = mx.fast.rms_norm
-            normalized = mx.concatenate(
-                [
-                    normalize(
-                        hidden, self._norm_w, self.cfg.rms_norm_eps
-                    )
-                    for hidden in positions
-                ],
-                axis=1,
-            )
+                normalized = mx.concatenate(
+                    [
+                        normalize(
+                            hidden, self._norm_w, self.cfg.rms_norm_eps
+                        )
+                        for hidden in positions
+                    ],
+                    axis=1,
+                )
             result = head.logits_serial_rows(normalized)[0]
         else:
             logits = []
@@ -8438,14 +8620,21 @@ class StreamingEngine:
             result = mx.stack(logits)
         mx.eval(result)
         if qwen_family:
-            self._qwen35_serial_verify_head_s += (
-                time.perf_counter() - head_t0)
+            self._qwen35_serial_verify_head_s = float(getattr(
+                self, "_qwen35_serial_verify_head_s", 0.0)) + (
+                    time.perf_counter() - head_t0)
         self._h_window = mx.concatenate(positions, axis=1)
         self._h_last = positions[-1]
         self._serial_kda_endpoints = serial_kda_endpoints
         self._serial_kda_endpoint_retained_bytes = (
             sum(endpoint.nbytes() for endpoint in serial_kda_endpoints)
             if serial_kda_endpoints is not None
+            else 0
+        )
+        self._serial_qwen4_endpoints = serial_qwen4_endpoints
+        self._serial_qwen4_endpoint_retained_bytes = (
+            sum(endpoint.nbytes() for endpoint in serial_qwen4_endpoints)
+            if serial_qwen4_endpoints is not None
             else 0
         )
         if factor_source is not None:
@@ -8815,6 +9004,11 @@ class StreamingEngine:
         self.expert_route_overlap_trace = []
         self._expert_route_last_by_layer = {}
         self._expert_route_overlap_totals = {}
+        self._qwen4_serial_verify_union_layers = 0
+        self._qwen4_serial_verify_expert_slots = 0
+        self._qwen4_serial_verify_union_experts = 0
+        self._qwen4_serial_verify_expert_pages_avoided = 0
+        self._qwen4_serial_verify_union_fetch_s = 0.0
         request_cache_before = _cache_io_snapshot(self)
         reranked_head = self._lm_head_w if self.rc.rerank_lm_head else None
         reranked_telemetry_before = (
@@ -10988,6 +11182,16 @@ class StreamingEngine:
             self._expert_batch_prefetch_hidden_s)
         path_stats["expert_shared_overlap_layers"] = (
             self._expert_shared_overlap_layers)
+        path_stats["qwen4_serial_verify_union_layers"] = (
+            self._qwen4_serial_verify_union_layers)
+        path_stats["qwen4_serial_verify_expert_slots"] = (
+            self._qwen4_serial_verify_expert_slots)
+        path_stats["qwen4_serial_verify_union_experts"] = (
+            self._qwen4_serial_verify_union_experts)
+        path_stats["qwen4_serial_verify_expert_pages_avoided"] = (
+            self._qwen4_serial_verify_expert_pages_avoided)
+        path_stats["qwen4_serial_verify_union_fetch_s"] = (
+            self._qwen4_serial_verify_union_fetch_s)
         overlap = self._expert_route_overlap_totals
         for key in (
             "calls",

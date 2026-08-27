@@ -16,13 +16,15 @@ import numpy as np
 
 from . import quant
 from .config import ModelConfig
-from .layer_runner import _linear
+from .layer_runner import _linear, _swiglu
 from .qwen35 import (
     _apply_partial_rope,
     _cache_local_causal_mask,
     _gated_delta_net,
     _moe,
+    _route_experts,
 )
+from .glm import _group_routes
 from .qwen4_exp_ple_rows import Qwen4ExpPLERowStore
 from .qwen4_exp_state import Qwen4ExpStateCache
 from .lm_head_stream import StreamedLMHead
@@ -368,7 +370,7 @@ def qwen4_attention_branch(
     raise ValueError(f"unsupported Qwen4 layer type {layer_type!r}")
 
 
-def run_qwen4_block(
+def qwen4_attention_residual(
     hidden: mx.array,
     input_ids: Sequence[int],
     weights: dict,
@@ -377,14 +379,19 @@ def run_qwen4_block(
     kv,
     layer: int,
     offset: int,
-    get_experts,
     *,
     row_store: Qwen4ExpPLERowStore | None = None,
-    iter_expert_batches=None,
     profile=None,
     compiled_delta_prefill: bool = False,
     native_fused_delta_prefill: bool = False,
 ) -> mx.array:
+    """PLE plus attention half of one released Qwen4 decoder block.
+
+    Keeping this boundary explicit lets an exact speculative verifier advance
+    every recurrent state one position at a time, route each resulting row,
+    and then reuse the union of immutable expert weight pages.  No activation
+    rows are batched through hidden-width reductions here.
+    """
     positions = int(hidden.shape[1])
     if layer in cfg.qwen4_ple_layers:
         if row_store is None:
@@ -409,6 +416,95 @@ def run_qwen4_block(
         profile.finish_substep(
             "attention", layer, attention_started, hidden,
             positions=positions)
+    return hidden
+
+
+def qwen4_mlp_route(
+    hidden: mx.array,
+    weights: dict,
+    prefix: str,
+    cfg: ModelConfig,
+    layer: int,
+) -> tuple[
+    mx.array,
+    mx.array,
+    mx.array,
+    dict[int, list[tuple[int, float]]],
+]:
+    """Return the exact per-row MoE route and HC injection operands."""
+    mixed, hyper_input, injection = hyper_connection_mix(
+        hidden, weights, f"{prefix}.mlp_hyper_connection", cfg)
+    indices, scores = _route_experts(mixed, weights, prefix, cfg, layer)
+    mx.eval(indices, scores)
+    return mixed, hyper_input, injection, _group_routes(indices, scores)
+
+
+def qwen4_mlp_from_groups(
+    route: tuple[
+        mx.array,
+        mx.array,
+        mx.array,
+        dict[int, list[tuple[int, float]]],
+    ],
+    experts: dict[int, dict],
+    weights: dict,
+    prefix: str,
+) -> mx.array:
+    """Evaluate one routed row from already-fetched exact expert pages.
+
+    The accumulation order and materialization boundary mirror ``_moe``:
+    ascending expert id, BF16 route weights, one routed-output evaluation,
+    then the shared expert and hyper-connection injection.  Only storage
+    lifetime changes; each verifier position retains ordinary decode math.
+    """
+    mixed, hyper_input, injection, groups = route
+    routed = mx.zeros_like(mixed)
+    for expert in sorted(groups):
+        if expert not in experts:
+            raise ValueError(f"missing routed Qwen4 expert {expert}")
+        plist = groups[expert]
+        positions = [position for position, _ in plist]
+        route_weights = mx.array(
+            [weight for _, weight in plist], dtype=mixed.dtype)
+        contribution = _swiglu(
+            mixed[:, positions, :],
+            experts[expert],
+            f"{prefix}.mlp.experts.{expert}",
+        )
+        routed = routed.at[:, positions, :].add(
+            contribution * route_weights[None, :, None])
+    mx.eval(routed)
+    shared = _swiglu(mixed, weights, f"{prefix}.mlp.shared_expert")
+    shared_gate = mx.sigmoid(_linear(
+        mixed, weights, f"{prefix}.mlp.shared_expert_gate"))
+    branch = routed + shared_gate * shared
+    return hyper_connection_inject(branch, hyper_input, injection)
+
+
+def run_qwen4_block(
+    hidden: mx.array,
+    input_ids: Sequence[int],
+    weights: dict,
+    prefix: str,
+    cfg: ModelConfig,
+    kv,
+    layer: int,
+    offset: int,
+    get_experts,
+    *,
+    row_store: Qwen4ExpPLERowStore | None = None,
+    iter_expert_batches=None,
+    profile=None,
+    compiled_delta_prefill: bool = False,
+    native_fused_delta_prefill: bool = False,
+) -> mx.array:
+    positions = int(hidden.shape[1])
+    hidden = qwen4_attention_residual(
+        hidden, input_ids, weights, prefix, cfg, kv, layer, offset,
+        row_store=row_store,
+        profile=profile,
+        compiled_delta_prefill=compiled_delta_prefill,
+        native_fused_delta_prefill=native_fused_delta_prefill)
 
     mlp_started = profile.start_substep() if profile is not None else None
     mixed, hyper_input, injection = hyper_connection_mix(

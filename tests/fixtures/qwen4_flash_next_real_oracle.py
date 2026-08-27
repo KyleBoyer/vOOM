@@ -106,6 +106,7 @@ def _run(
     ple_read_workers: int = 1,
     global_expert_rows: bool = False,
     sparse_expert_batch_rows: bool = False,
+    expert_tile_eval_batch: int = 1,
     fast_tier_dir: str = "",
     parallel_storage_reads: bool = False,
     native_fused_delta: bool = False,
@@ -130,6 +131,7 @@ def _run(
         qwen4_ple_read_workers=ple_read_workers,
         qwen4_global_expert_rows=global_expert_rows,
         qwen4_sparse_expert_batch_rows=sparse_expert_batch_rows,
+        qwen4_expert_tile_eval_batch=expert_tile_eval_batch,
         fast_dirs=((fast_tier_dir,) if fast_tier_dir else ()),
         parallel_storage_reads=parallel_storage_reads,
         governor=True,
@@ -156,6 +158,7 @@ def _run(
             "ple_read_workers": ple_read_workers,
             "global_expert_rows": global_expert_rows,
             "sparse_expert_batch_rows": sparse_expert_batch_rows,
+            "expert_tile_eval_batch": expert_tile_eval_batch,
             "fast_tier_dir": fast_tier_dir,
             "parallel_storage_reads": parallel_storage_reads,
             "startup_seconds": round(initialized - started, 6),
@@ -225,6 +228,8 @@ def main() -> int:
     parser.add_argument("--candidate-global-expert-rows", action="store_true")
     parser.add_argument(
         "--candidate-sparse-expert-batch-rows", action="store_true")
+    parser.add_argument(
+        "--candidate-expert-tile-eval-batch", type=int, default=1)
     parser.add_argument("--compare-layer-stationary", action="store_true")
     parser.add_argument("--prompt-repeat", type=int, default=1)
     parser.add_argument("--candidate-fast-tier-dir", default="")
@@ -238,19 +243,22 @@ def main() -> int:
         parser.error("candidate-ple-read-workers must be in [1, 16]")
     if args.prompt_repeat <= 0:
         parser.error("prompt-repeat must be positive")
+    if not 1 <= args.candidate_expert_tile_eval_batch <= 16:
+        parser.error("candidate-expert-tile-eval-batch must be in [1, 16]")
     prompt = "Say hello in one word. " * args.prompt_repeat
     baseline = _run(
         args.model, prompt, args.chunk, args.compare_layer_stationary,
         args.candidate_compiled if args.compare_layer_stationary else False,
         (args.candidate_ple_read_workers
          if args.compare_layer_stationary else 1),
-        False, False, "", False, False)
+        False, False, 1, "", False, False)
     candidate = _run(
         args.model, prompt, args.chunk, True,
         (args.candidate_compiled
          and not args.candidate_native_fused_delta),
         args.candidate_ple_read_workers, args.candidate_global_expert_rows,
         args.candidate_sparse_expert_batch_rows,
+        args.candidate_expert_tile_eval_batch,
         args.candidate_fast_tier_dir,
         args.candidate_parallel_storage_reads,
         args.candidate_native_fused_delta)

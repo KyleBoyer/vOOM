@@ -1,0 +1,446 @@
+from __future__ import annotations
+
+from types import SimpleNamespace
+
+import mlx.core as mx
+import numpy as np
+import pytest
+
+from runtime.config import ModelConfig
+from runtime.qwen4_exp import qwen4_rms_norm
+from runtime.qwen4_mtp import (
+    Qwen4MTPDrafter,
+    Qwen4MTPSpeculativeEngine,
+    _REQUIRED_NON_EXPERT_NAMES,
+)
+from runtime.sampler import SamplingParams
+
+
+def _config() -> ModelConfig:
+    return ModelConfig(
+        model_type="qwen4_exp",
+        hidden_size=2,
+        intermediate_size=3,
+        num_hidden_layers=2,
+        num_attention_heads=1,
+        num_key_value_heads=1,
+        vocab_size=3,
+        rms_norm_eps=1e-6,
+        rope_theta=10_000.0,
+        max_position_embeddings=128,
+        tie_word_embeddings=False,
+        attention_bias=False,
+        head_dim=2,
+        eos_token_ids=(2,),
+        torch_dtype="bfloat16",
+        num_experts=2,
+        num_experts_per_tok=1,
+        moe_intermediate_size=2,
+        layer_types=("linear_attention", "full_attention"),
+        qwen4_hc_count=2,
+        qwen4_hc_lowrank=1,
+        qwen4_ple_layers=(0,),
+        qwen4_indexer_budget=2,
+        qwen4_indexer_compress_ratio=1,
+        qwen4_indexer_head_dim=2,
+        qwen4_indexer_kv_heads=1,
+        qwen4_indexer_n_heads=1,
+    )
+
+
+class _Store:
+    def __init__(self, *, complete: bool = True):
+        names = set(_REQUIRED_NON_EXPERT_NAMES)
+        if not complete:
+            names.remove("mtp.fc_hidden.weight")
+        for expert in range(2):
+            names.update(
+                f"mtp.layers.0.mlp.experts.{expert}.{projection}.weight"
+                for projection in ("gate_proj", "up_proj", "down_proj")
+            )
+        self.names = tuple(sorted(names))
+
+    def names_with_prefix(self, prefix):
+        return [name for name in self.names if name.startswith(prefix)]
+
+    def storage_bytes(self, names):
+        return 2 * len(names)
+
+
+class _Cache:
+    def __init__(self, weights):
+        self.weights = weights
+        self.total_bytes = 0
+        self.discards = []
+
+    def get(self, key, names, *, apply_transform=True):
+        assert key == "qwen4_mtp:released-bf16"
+        assert not apply_transform
+        return {name: self.weights[name] for name in names}
+
+    def get_many(self, items):
+        result = {}
+        for key, names in items:
+            result[key] = {
+                name: mx.zeros((1, 1), dtype=mx.bfloat16)
+                for name in names
+            }
+        self.total_bytes += 2 * sum(len(names) for _, names in items)
+        return result
+
+    def discard(self, key, names=()):
+        self.discards.append((key, tuple(names)))
+        return True
+
+
+def _weights(cfg):
+    values = {
+        name: mx.zeros((1,), dtype=mx.bfloat16)
+        for name in _REQUIRED_NON_EXPERT_NAMES
+    }
+    values.update({
+        "mtp.pre_fc_norm_embedding.weight": mx.zeros(
+            (cfg.hidden_size,), dtype=mx.bfloat16),
+        "mtp.pre_fc_norm_hidden.weight": mx.zeros(
+            (cfg.hidden_size * cfg.qwen4_hc_count,), dtype=mx.bfloat16),
+        "mtp.fc_embedding.weight": mx.array(
+            [[1.0, 0.0], [0.0, 1.0]], dtype=mx.bfloat16),
+        "mtp.fc_hidden.weight": mx.array(
+            [[0.0, 1.0], [1.0, 0.0]], dtype=mx.bfloat16),
+        "mtp.hyper_connection_mixer.hc_norm.weight": mx.zeros(
+            (cfg.hidden_size * cfg.qwen4_hc_count,), dtype=mx.bfloat16),
+        "mtp.hyper_connection_mixer.input_mix_weight_down.weight": mx.zeros(
+            (cfg.qwen4_hc_lowrank,
+             cfg.hidden_size * cfg.qwen4_hc_count), dtype=mx.bfloat16),
+        "mtp.hyper_connection_mixer.input_mix_weight_up.weight": mx.zeros(
+            (cfg.hidden_size * cfg.qwen4_hc_count,
+             cfg.qwen4_hc_lowrank), dtype=mx.bfloat16),
+    })
+    return values
+
+
+def _engine(*, complete=True):
+    cfg = _config()
+    weights = _weights(cfg)
+    embeddings = mx.array(
+        [[0.25, 0.75], [1.0, -0.5], [-0.25, 0.5]],
+        dtype=mx.bfloat16,
+    )
+    cache = _Cache(weights)
+    return SimpleNamespace(
+        cfg=cfg,
+        store=_Store(complete=complete),
+        cache=cache,
+        _embed_rows=SimpleNamespace(
+            lookup=lambda tokens: embeddings[mx.array(tokens)][None]),
+        _embed_weight=lambda: embeddings,
+        _lm_head_weight=lambda: mx.array(
+            [[1.0, 0.0], [0.0, 1.0], [-1.0, 0.5]],
+            dtype=mx.bfloat16,
+        ),
+    ), weights
+
+
+def test_fuse_inputs_projects_each_hidden_stream_with_shared_fc():
+    engine, weights = _engine()
+    drafter = Qwen4MTPDrafter(engine)
+    embedding = engine._embed_rows.lookup([1])
+    hidden = mx.array(
+        [[[1.0, 2.0, 3.0, 4.0]]], dtype=mx.bfloat16)
+
+    actual = drafter.fuse_inputs(embedding, hidden, weights)
+
+    projected_embedding = qwen4_rms_norm(
+        embedding,
+        weights["mtp.pre_fc_norm_embedding.weight"],
+        engine.cfg.rms_norm_eps,
+    )
+    streams = qwen4_rms_norm(
+        hidden,
+        weights["mtp.pre_fc_norm_hidden.weight"],
+        engine.cfg.rms_norm_eps,
+    ).reshape(1, 1, 2, 2)
+    swapped = streams[..., ::-1]
+    expected = (projected_embedding[..., None, :] + swapped).reshape(
+        hidden.shape)
+    np.testing.assert_array_equal(
+        np.asarray(actual.view(mx.uint16)),
+        np.asarray(expected.view(mx.uint16)),
+    )
+
+
+def test_draft_step_uses_qsa_only_mtp_layer_and_sparse_expert_pages(monkeypatch):
+    engine, weights = _engine()
+    drafter = Qwen4MTPDrafter(engine)
+    cache = drafter.new_cache()
+    hidden = mx.array(
+        [[[1.0, 2.0, 3.0, 4.0]]], dtype=mx.bfloat16)
+    seen = {}
+
+    def fake_block(
+        fused, input_ids, _weights, prefix, cfg, actual_cache, layer,
+        offset, _get_experts, **kwargs,
+    ):
+        seen.update({
+            "input_ids": tuple(input_ids),
+            "prefix": prefix,
+            "layer_types": cfg.layer_types,
+            "ple_layers": cfg.qwen4_ple_layers,
+            "cache": actual_cache,
+            "layer": layer,
+            "offset": offset,
+        })
+        batches = list(kwargs["iter_expert_batches"](
+            0, [1], positions={1: [0]}))
+        assert batches[0][0] == [1]
+        assert len(batches[0][1][1]) == 3
+        return fused
+
+    monkeypatch.setattr("runtime.qwen4_mtp.run_qwen4_block", fake_block)
+    logits, post_hidden = drafter.draft_step(
+        hidden, 1, cache, 17, weights=weights)
+
+    assert tuple(logits.shape) == (engine.cfg.vocab_size,)
+    assert tuple(post_hidden.shape) == tuple(hidden.shape)
+    assert seen == {
+        "input_ids": (1,),
+        "prefix": "mtp.layers.0",
+        "layer_types": ("full_attention",),
+        "ple_layers": (),
+        "cache": cache,
+        "layer": 0,
+        "offset": 17,
+    }
+    assert drafter.proposal_steps == 1
+    assert drafter.proposal_expert_pages == 1
+
+    report = drafter.release_round_weights()
+    assert report["released_pages"] == 2
+    assert {key for key, _names in engine.cache.discards} == {
+        "qwen4_mtp.expert.1",
+        "qwen4_mtp:released-bf16",
+    }
+
+
+def test_mtp_adapter_fails_closed_on_incomplete_checkpoint():
+    engine, _weights_value = _engine(complete=False)
+    with pytest.raises(ValueError, match="checkpoint is incomplete"):
+        Qwen4MTPDrafter(engine)
+
+
+class _FakeRecurrent:
+    def __init__(self, marker="full"):
+        self.marker = marker
+
+    def synchronize(self):
+        pass
+
+
+class _FakeAux:
+    def __init__(self):
+        self.restores = []
+        self.trims = []
+
+    def restore_recurrent_prefix(self, endpoint, length):
+        self.restores.append((endpoint.marker, length))
+
+    def trim(self, length):
+        self.trims.append(length)
+
+    def synchronize(self):
+        pass
+
+
+class _FakeKV:
+    def __init__(self, offset):
+        self._lengths = [offset]
+        self.kda_cache = _FakeRecurrent()
+        self.qwen4_cache = _FakeAux()
+
+    @property
+    def offset(self):
+        return self._lengths[0]
+
+    def layer_lengths(self):
+        return tuple(self._lengths)
+
+    def grow(self, count):
+        self._lengths[0] += count
+
+    def trim_layer_lengths(self, lengths):
+        self._lengths = list(lengths)
+
+    def nbytes(self):
+        return 0
+
+
+class _FakeTokenizer:
+    def encode(self, _prompt):
+        return SimpleNamespace(ids=[1, 2])
+
+    def decode(self, tokens):
+        return " ".join(str(token) for token in tokens)
+
+
+class _FakeTarget:
+    def __init__(self, target_rows):
+        self.cfg = SimpleNamespace(
+            model_type="qwen4_exp", eos_token_ids=(255,))
+        self.tokenizer = _FakeTokenizer()
+        self.effective_max_position_embeddings = 128
+        self.target_rows = list(target_rows)
+        self.last_kv = None
+        self._hot_prompt_slots = []
+        self._true_peak_metal_bytes = 0
+        self.governor = None
+        self.cache = SimpleNamespace()
+        self.verify_calls = []
+        self._kda_endpoints = None
+        self._aux_endpoints = None
+
+    def generate(self, _prompt, max_tokens, **_kwargs):
+        assert max_tokens == 1
+        self.last_kv = _FakeKV(2)
+        self._h_last = mx.ones((1, 1, 4), dtype=mx.bfloat16)
+        self._h_window = self._h_last
+        return {
+            "text": "10", "tokens": [10], "prefill_s": 1.0,
+            "first_token_s": 1.0, "termination_reason": "length",
+            "path_stats": {},
+        }
+
+    def forward_tokens_serial_positions(self, tokens, kv, **kwargs):
+        assert kwargs == {
+            "capture_kda_endpoints": True,
+            "capture_qwen4_endpoints": True,
+        }
+        self.verify_calls.append(tuple(tokens))
+        width = len(tokens)
+        kv.grow(width)
+        self._h_window = mx.arange(
+            width * 4, dtype=mx.float32).reshape(1, width, 4).astype(
+                mx.bfloat16)
+        self._h_last = self._h_window[:, -1:]
+        self._kda_endpoints = [
+            _FakeRecurrent(f"kda-{index}") for index in range(1, width)
+        ]
+        self._aux_endpoints = [
+            SimpleNamespace(marker=f"aux-{index}")
+            for index in range(1, width)
+        ]
+        rows = []
+        for token in self.target_rows[:width]:
+            row = mx.full((256,), -100.0)
+            row = row.at[int(token)].add(200.0)
+            rows.append(row)
+        return mx.stack(rows)
+
+    def consume_serial_kda_endpoint(self, count):
+        endpoints, self._kda_endpoints = self._kda_endpoints, None
+        return None if count is None else endpoints[count - 1]
+
+    def consume_serial_qwen4_endpoint(self, count):
+        endpoints, self._aux_endpoints = self._aux_endpoints, None
+        return None if count is None else endpoints[count - 1]
+
+    def _append_hot_prompt_slot(self, _slot):
+        pass
+
+    def close(self):
+        pass
+
+
+class _FakeDraftCache(_FakeKV):
+    def __init__(self):
+        super().__init__(0)
+
+
+class _FakeDrafter:
+    def __init__(self, draft_tokens):
+        self.draft_tokens = list(draft_tokens)
+        self.index = 0
+        self.non_expert_storage_bytes = 181
+        self.proposal_steps = 0
+
+    def new_cache(self):
+        return _FakeDraftCache()
+
+    def _weights(self):
+        return {}
+
+    def draft_step(self, hidden, _token, cache, _offset, *, weights):
+        assert weights == {}
+        token = self.draft_tokens[self.index % len(self.draft_tokens)]
+        self.index += 1
+        self.proposal_steps += 1
+        cache.grow(1)
+        row = mx.full((256,), -100.0)
+        row = row.at[token].add(200.0)
+        return row, hidden + 1
+
+    def release_round_weights(self):
+        return {
+            "proposal_expert_pages": self.proposal_steps,
+            "proposal_expert_bytes": self.proposal_steps * 98,
+        }
+
+
+@pytest.fixture
+def _cache_io_noop(monkeypatch):
+    monkeypatch.setattr("runtime.engine._cache_io_snapshot", lambda _target: {})
+    monkeypatch.setattr(
+        "runtime.engine._record_cache_io_delta", lambda *_args, **_kwargs: None)
+
+
+def test_speculative_controller_full_accept_emits_bonus_in_one_target_sweep(
+        _cache_io_noop):
+    target = _FakeTarget([11, 12, 13])
+    engine = Qwen4MTPSpeculativeEngine(
+        target, depth=2, drafter=_FakeDrafter([11, 12]))
+
+    result = engine.generate(
+        "prompt", max_tokens=4,
+        sampling=SamplingParams(temperature=0.0))
+
+    assert result["tokens"] == [10, 11, 12, 13]
+    assert target.verify_calls == [(10, 11, 12)]
+    assert result["path_stats"]["qwen4_mtp_target_sweeps"] == 1
+    assert result["path_stats"]["qwen4_mtp_target_sweeps_avoided"] == 2
+    assert result["path_stats"]["qwen4_mtp_round_outcomes"] == "A2"
+    assert target.last_kv.offset == 5
+
+
+def test_speculative_controller_partial_reject_restores_all_target_state(
+        _cache_io_noop):
+    target = _FakeTarget([11, 99, 13])
+    engine = Qwen4MTPSpeculativeEngine(
+        target, depth=2, drafter=_FakeDrafter([11, 12]))
+
+    result = engine.generate(
+        "prompt", max_tokens=3,
+        sampling=SamplingParams(temperature=0.0))
+
+    assert result["tokens"] == [10, 11, 99]
+    assert result["path_stats"]["qwen4_mtp_round_outcomes"] == "A1R"
+    assert target.last_kv.offset == 4
+    assert target.last_kv.kda_cache.marker == "kda-2"
+    assert target.last_kv.qwen4_cache.restores == [("aux-2", 4)]
+    assert result["path_stats"]["qwen4_mtp_aux_endpoint_restores"] == 1
+
+
+def test_speculative_controller_all_reject_keeps_final_token_unfed(
+        _cache_io_noop):
+    target = _FakeTarget([77, 12])
+    engine = Qwen4MTPSpeculativeEngine(
+        target, depth=2, drafter=_FakeDrafter([11, 12]))
+
+    result = engine.generate(
+        "prompt", max_tokens=2,
+        sampling=SamplingParams(temperature=0.0))
+
+    assert result["tokens"] == [10, 77]
+    assert target.verify_calls == [(10, 11)]
+    assert target.last_kv.offset == 3
+    assert target.last_kv.kda_cache.marker == "kda-1"
+    assert target.last_kv.qwen4_cache.restores == [("aux-1", 3)]
+    assert result["path_stats"]["qwen4_mtp_round_outcomes"] == "R"
