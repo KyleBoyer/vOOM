@@ -8663,6 +8663,7 @@ def _vision_protocol_timing(result: dict) -> dict:
         "qwen_lossy_suffix_prefill_prefix_tokens",
         "qwen_lossy_suffix_prefill_tokens",
         "hot_prompt_kv_disk_hit",
+        "hot_prompt_kv_preloaded_disk_hit",
         "hot_prompt_hybrid_prefix_snapshot_tokens",
         "hot_prompt_endpoint_snapshot_tokens",
         "hot_prompt_admission_positions",

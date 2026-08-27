@@ -453,6 +453,7 @@ def test_protocol_timing_exposes_qwen_delta_arithmetic_mode():
             "qwen_lossy_suffix_prefill_prefix_tokens": 0,
             "qwen_lossy_suffix_prefill_tokens": 256,
             "hot_prompt_kv_disk_hit": 1,
+            "hot_prompt_kv_preloaded_disk_hit": 1,
             "hot_prompt_hybrid_prefix_snapshot_tokens": 6332,
             "hot_prompt_admission_positions": 7,
             "disk_prompt_lookup_s": 0.42,
@@ -469,6 +470,7 @@ def test_protocol_timing_exposes_qwen_delta_arithmetic_mode():
     assert timing["qwen_lossy_suffix_prefill_prefix_tokens"] == 0
     assert timing["qwen_lossy_suffix_prefill_tokens"] == 256
     assert timing["hot_prompt_kv_disk_hit"] == 1
+    assert timing["hot_prompt_kv_preloaded_disk_hit"] == 1
     assert timing["hot_prompt_hybrid_prefix_snapshot_tokens"] == 6332
     assert timing["hot_prompt_admission_positions"] == 7
     assert timing["disk_prompt_lookup_s"] == 0.42

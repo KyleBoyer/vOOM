@@ -401,6 +401,7 @@ def test_hot_prompt_kv_persists_across_engine_restart():
         assert stats["prompt_cache_source"] == "memory", (
             "a restarted engine should hit the RELOADED slot, not recompute cold"
         )
+        assert stats["hot_prompt_kv_preloaded_disk_hit"] == 1
         assert stats["prompt_cache_exact_hit"] == 1
         assert hot["tokens"] == cold["tokens"]
     finally:

@@ -1453,6 +1453,11 @@ class _HotPromptSlot:
     # logical cache. Exact token equality within a namespace remains the final
     # correctness condition for reuse.
     cache_namespace: str = "default"
+    # True only for slots reconstructed from the durable journal during
+    # engine startup.  They are resident by the time lookup runs, so the
+    # ordinary source remains ``memory``; this provenance bit lets production
+    # telemetry prove that the first post-restart hit really crossed disk.
+    persisted_preload: bool = False
 
 
 # Trunk weights MLX's fused MXFP8 kernel can read directly, so the dequant
@@ -2733,6 +2738,7 @@ class StreamingEngine:
                         tool_capsules=tool_capsules,
                         segment_chain=segment_chain,
                         cache_namespace=persisted_namespace,
+                        persisted_preload=True,
                     ))
             else:
                 print(
@@ -9154,6 +9160,7 @@ class StreamingEngine:
             "hot_prompt_kv_gc_s": 0.0,
             "hot_prompt_kv_gc_removed": 0,
             "hot_prompt_kv_disk_hit": 0,
+            "hot_prompt_kv_preloaded_disk_hit": 0,
             "prompt_cache_namespace": cache_namespace,
             "hot_prompt_admission_evicted_slots": 0,
             "hot_prompt_admission_evicted_bytes": 0,
@@ -9960,6 +9967,8 @@ class StreamingEngine:
                 reusable_watermark = best_reusable_watermark
                 path_stats["hot_prompt_lcp_tokens"] = best_lcp
                 path_stats["prompt_cache_source"] = "memory"
+                path_stats["hot_prompt_kv_preloaded_disk_hit"] = int(
+                    bool(getattr(slot, "persisted_preload", False)))
             elif (self._hot_kv_persist is not None
                   and self._persisted_kv_restore_allowed()):
                 # Total in-memory miss. Before falling all the way back to
