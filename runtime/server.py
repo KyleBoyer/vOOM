@@ -1290,9 +1290,9 @@ class EngineManager:
         if qwen_mtp_proposal_replay_top_k < 0:
             raise RequestValidationError(
                 "VMODEL_QWEN_MTP_PROPOSAL_REPLAY_TOP_K must be non-negative")
-        if not 1 <= qwen_mtp_depth <= 5:
+        if not 1 <= qwen_mtp_depth <= 7:
             raise RequestValidationError(
-                "VMODEL_QWEN_MTP_DEPTH must be in [1, 5]")
+                "VMODEL_QWEN_MTP_DEPTH must be in [1, 7]")
         if qwen_mtp_tree_width not in (0, 2, 3, 4):
             raise RequestValidationError(
                 "VMODEL_QWEN_MTP_TREE_WIDTH must be 0 or in [2, 4]")

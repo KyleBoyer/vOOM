@@ -510,24 +510,25 @@ attempt also remains a STOP: prefill completed, but decode hit the memory floor
 and swap growth reached 706MB. The released model advertises 262,144 context;
 this work validates 30K on this machine, not the advertised maximum.
 
-## Quantized native-MTP depth 5 (2026-08-26)
+## Quantized native-MTP depth 7 (2026-08-26)
 
-The exact target verifier now admits five repeated native-MTP draft steps.  A
-six-position exhaustive oracle covers all accepted prefixes 0..5, including
+The exact target verifier now admits seven repeated native-MTP draft steps.  An
+eight-position exhaustive oracle covers all accepted prefixes 0..7, including
 target K/V and DeltaNet endpoint selection, hidden-row recovery, and MTP-KV
-rollback.  The fifth step is default-off globally and enabled only in the
+rollback.  The extra steps are default-off globally and enabled only in the
 child profile `huihui-qwen38-27b-fast-long-context-mtpquant`; the established
 long-context profile remains at its pressure-qualified depth four.
 
 Using the explicit 225.660MB quantized-MTP model alias, the fixed 16K/64 gate
-accepted 53/55 drafts (fifth step 9/11) and reduced target sweeps 14 -> 11.  It
-preserved the established output SHA and all content/pressure checks while
-cutting wall **221.8704s -> 196.5540s**, decode **117.4621s -> 91.2450s**, and
-streamed bytes 218.375GB -> 170.762GB.  Peak Metal was 2.724GB and swap growth
-5.439MB.
+accepted 54/70 drafts and reduced target sweeps to ten.  It preserved the
+established output SHA and all content/pressure checks while improving a
+same-revision paired depth-five control from **198.3312s -> 176.2819s wall**
+and **88.9782s -> 76.0915s decode**; sweeps fell 11 -> 10. Peak Metal was
+2.764GB and swap growth 9.470MB.
 
 The untouched captured 134-tool request also retained its known output SHA and
-returned in **74.6620s** with three target sweeps.  This replay changed only the
+returned in **79.0191s** with three target sweeps, 2.759GB peak Metal, and
+5.259MB swap-out growth. This replay changed only the
 request model alias to
 `lossy-Huihui-Qwen3.8-27B-abliterated-mlx-all-mxfp4-mtpquant`; its prompt, tools,
 messages, and streaming shape remained capture-derived.  The ordinary model
@@ -536,13 +537,23 @@ also preserved that SHA and stayed below 90 seconds at 84.9447s, but failed the
 pressure gate because swap allocation grew 295.895MB (actual swap-out 7.242MB).
 It is not promoted into the parent profile.
 
+Depth six was measured but not promoted: it retained eleven target sweeps
+while widening verifier positions and reads. A second run recorded confidence
+buckets, but the rejected seventh proposal overlapped accepted buckets, so no
+capture-specific confidence threshold was enabled. Depth seven earned
+promotion only after removing a complete target sweep and passing both the
+sustained and untouched-request gates.
+
 The adjacent page-native attention experiment is retained as an explicit
 research path, not a profile default.  It removes adjacent-page concatenation
 and is bit-identical to the existing concatenated 8K kernel, but two exact-output
 16K/64 cold runs took 227.2242s and 237.5807s versus 221.8704s for the 4K winner.
 
-Evidence: `logs/qwen38_suffix12_tile4096_mtpquant_depth5_large16k_out64_20260826.json`,
-`logs/qwen38_suffix12_tile4096_mtpquant_depth5_unmodified_capture16_20260826.json`,
+Evidence: `logs/qwen38_suffix12_tile4096_mtpquant_depth7_large16k_out64_20260826.json`,
+`logs/qwen38_suffix12_tile4096_mtpquant_depth7_unmodified_capture16_20260826.json`,
+`logs/qwen38_suffix12_tile4096_mtpquant_depth5_paired_large16k_out64_20260826.json`,
+`logs/qwen38_suffix12_tile4096_mtpquant_depth6_large16k_out64_20260826.json`,
+`logs/qwen38_suffix12_tile4096_mtpquant_depth6_margin2_large16k_out64_20260826.json`,
 `logs/qwen38_suffix12_tile4096_mtpbf16_depth5_unmodified_capture16_20260826.json`,
 `logs/qwen38_suffix12_page_native8x1024_large16k_out64_20260826.json`, and
 `logs/qwen38_suffix12_page_native8x1024_large16k_out64_rerun_20260826.json`.

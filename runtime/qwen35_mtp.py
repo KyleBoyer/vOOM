@@ -1433,8 +1433,8 @@ class QwenMTPSpeculativeEngine:
         if isinstance(proposal_replay_top_k, bool) or proposal_replay_top_k < 0:
             raise ValueError("proposal_replay_top_k must be non-negative")
         if (isinstance(depth, bool) or not isinstance(depth, int)
-                or not 1 <= depth <= 5):
-            raise ValueError("Qwen MTP depth must be in [1, 5]")
+                or not 1 <= depth <= 7):
+            raise ValueError("Qwen MTP depth must be in [1, 7]")
         if not isinstance(ngram_first, bool):
             raise TypeError("Qwen MTP ngram_first must be bool")
         if (isinstance(ngram_min_ngram, bool)

@@ -153,7 +153,7 @@ def test_builtin_profiles_resolve_complete_agent_group():
         "huihui-qwen38-27b-fast-long-context",
         "huihui-qwen38-27b-fast-long-context-mtpquant",
     )
-    assert mtpquant_settings["VMODEL_QWEN_MTP_DEPTH"] == "5"
+    assert mtpquant_settings["VMODEL_QWEN_MTP_DEPTH"] == "7"
     assert mtpquant_settings[
         "VMODEL_QWEN35_PAGED_ONLINE_TILE_POSITIONS"] == "4096"
 
