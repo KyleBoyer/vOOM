@@ -134,7 +134,8 @@ seconds of initialization that is not decode work.
 | Native MTP depth 3, pipeline off | 117.935s | 99.795s | 6 | 18 / 9 | matched control |
 | Native MTP depth 3, expert-page pipeline | 115.551s | 97.457s | 6 | 18 / 9 | keep opt-in; 2.0% wall gain, below 10% promotion gate |
 | Native MTP depth 5 | 142.649s | 124.543s | 6 | 29 / 10 | STOP; no sweep removed and 176.0GB streamed |
-| Depth 3 + exact BF16 GEMV + exact disk endpoint | **76.057s** | **73.307s** | 6 | 18 / 9 | scoped promotion; full 49,255-token prompt hit, peak 5.729GB |
+| Depth 3 + exact BF16 GEMV + exact disk endpoint | **76.057s** | **73.307s** | 6 | 18 / 9 | prior uniform mirror; steady server, full 49,255-token prompt hit |
+| Trace-balanced mirror, untouched max-16 | **85.634s cold** | **67.424s** | 6 | 18 / 9 | promote in explicit profile; paired cold control 92.209s, identical output SHA |
 
 The pipeline/control output SHA-256 is identical
 (`411b96d6...bf2fd85`). Both repeat-2 runs violated the memory-pressure gate,
@@ -142,7 +143,7 @@ so neither is eligible as a default. The max-16 Plex score is 15/100 because
 the response is deliberately truncated before it can complete the task; it is
 a latency/instrumentation rung, not a model-quality score.
 
-The exact endpoint row uses the 20.499GB trace-balanced two-device mirror, a
+The 76.057-second exact endpoint row used the prior 20.499GB uniform two-device mirror, a
 400MB scan cache with one-position prefetch, released Lightning-MTP depth
 three, exact BF16 serial-verifier GEMV, and phase-scoped head suspension.  The
 journal additionally authenticates the Qwen4 hyper-connection hidden carrier;
@@ -150,11 +151,45 @@ an older endpoint without it is not eligible for a zero-sweep hit.  The first
 migration request rebuilt the five-token suffix, while the steady request
 loaded all 49,255 prompt positions and preserved the established output hash.
 
-At max-64, the same untouched request completed its output budget in 298.2957s
-versus the earlier 501.1384s. It accepted 41/68 proposals in 23 target sweeps
-(40 fewer than plain autoregression), peaked at 4.248GB Metal, and stayed under
-the 16MB swap-out-growth gate. Its 15/100 Plex result is again an incomplete
-output-cap result, not evidence of poor completed-answer quality.
+The trace-balanced replacement is selected from privacy-safe decode-only route
+IDs, never prompt text, token IDs, tools, logits, or activations. Each request
+has equal primary heat per layer so a long output cannot dominate the corpus;
+request support and raw occurrences break exact heat ties. Eight hot experts
+per layer are mirrored; remaining capacity is filled
+from the cold end of each ranking because blindly mirroring every hot expert
+would overload the internal device after the always-touched target trunk.
+All 4,690 mirrored tensor ranges (20,499,121,920 bytes) were re-read and matched
+the pinned BF16 source before serving.
+
+On a paired cold-server replay of the untouched capture, that layout preserved
+SHA-256 `411b96d6...bf2fd85`, target sweeps, proposal outcomes, and the 136.35GB
+logical read set while reducing wall 92.2089s to **85.6337s**, decode 74.2508s
+to **67.4242s**, verifier 71.5327s to **64.6969s**, and union fetch 55.9376s to
+**49.1099s**. Peak Metal was unchanged at 4.248GB and swap-out growth was
+5.849MB. This is the clean sub-90-second cold-server result.
+
+The anti-overfit gates deliberately changed request shape. A developer-action
+prompt with two tools and non-streaming output preserved output SHA-256 while
+reducing decode 53.7110s to 47.6310s and verifier 51.6067s to 45.5577s; its
+candidate memory gate passed where the uniform control did not. A greedy,
+non-streaming 134-tool request also preserved output SHA-256 and improved wall
+98.6276s to 96.5906s, but exceeded the swap gate by about 34MB, so it is not a
+clean promotion result. Cross-validation of the two trace documents found
+27.4--27.5% route hits when either request alone trained the placement and the
+other was held out.
+
+At max-64, the prior uniform layout completed the untouched request in
+298.2957s versus the earlier 501.1384s. The new trace-balanced layout preserved
+all 64 output tokens and output SHA-256 `5278e54a...6cf0700`, the
+same 41/68 accepted proposals, all 23 target sweeps, and the same 517.303GB
+logical read set. Exact engine time fell 283.6450s to **267.3735s**, verifier
+271.1396s to **254.9062s**, and union fetch 212.6227s to **196.5681s**. That
+candidate used non-streaming transport while the historical control streamed,
+so the engine/verifier comparison is the defensible compute result; its
+282.3099s wall is not presented as a perfectly paired transport A/B. Peak Metal
+was unchanged at 4.248GB and the pressure gate passed. The 15/100 Plex result
+is again an incomplete output-cap result, not evidence of poor completed-answer
+quality.
 
 Other bounded exact candidates were stopped before promotion:
 
@@ -168,6 +203,13 @@ Other bounded exact candidates were stopped before promotion:
   below the measured 1.62GB/s raw NVMe floor. Byte shuffle improved ratio but
   reduced end-to-end decode/unshuffle throughput to 0.73--0.76GB/s. CPU
   decompression is therefore a STOP on this machine.
+- Reusing exact normalized/RoPE'd QSA pooled keys within each immutable
+  four-token compression block produced 180 hits over six max-16 verifier
+  sweeps and preserved the established output SHA-256, but full-attention
+  compute moved only 18.318s to 18.112s. Engine time regressed 75.669s to
+  76.446s within run variance. The capability remains default-off and is a
+  STOP at 49K; reconsider only at a substantially longer context where the
+  avoided pooling work can clear the 10% wall gate.
 
 The instrumented profile now reports verifier page admission, weight wait,
 reserve time, linear/full-attention compute, head time, exact expert-pipeline

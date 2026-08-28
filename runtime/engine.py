@@ -737,6 +737,11 @@ class RuntimeConfig:
     # Qwen4 verifier MLP/router rows. Default-off until real checkpoint state,
     # token, and heterogeneous-request gates clear.
     qwen4_serial_verify_exact_bf16_gemv: bool = False
+    # Reuse immutable normalized/RoPE'd QSA pooled index keys while serial
+    # verifier positions remain inside the same four-token compression block.
+    # Raw released-BF16 QSA keys remain authoritative; trims invalidate the
+    # derived cache. Default-off pending real long-context equality/timing.
+    qwen4_qsa_pool_cache: bool = False
     # Opt-in request-local attribution. "" disables it; "layers" records the
     # runtime's existing materialization boundaries; "ops" adds diagnostic
     # attention/router/MLP barriers for supported Qwen/Kimi/GLM hybrid blocks.
@@ -2462,6 +2467,10 @@ class StreamingEngine:
         self.expert_hits = 0
         self.expert_misses = 0
         self.expert_trace: list[tuple[int, tuple[int, ...]]] = []  # (layer, routed ids) per fetch, in sweep order
+        # Kept parallel to ``expert_trace`` so an explicit offline trace sink
+        # can discard prompt-prefill routes and optimize decode placement
+        # without changing the long-standing public trace tuple schema.
+        self.expert_trace_phases: list[str] = []
         self.expert_route_overlap_trace: list[dict] = []
         self._expert_route_last_by_layer: dict[int, tuple[int, ...]] = {}
         self._expert_route_overlap_totals: dict[str, int] = {}
@@ -3606,6 +3615,14 @@ class StreamingEngine:
             if provisional is None:
                 self.expert_usage[(layer, e)] = self.expert_usage.get((layer, e), 0) + 1
         self.expert_trace.append((layer, tuple(expert_ids)))
+        profiler = getattr(self, "_request_profiler", None)
+        trace_phases = getattr(self, "expert_trace_phases", None)
+        if trace_phases is None:
+            trace_phases = self.expert_trace_phases = []
+        trace_phases.append(str(
+            getattr(profiler, "phase", "unattributed")
+            if profiler is not None else "unattributed"
+        ))
         if (
             self.rc.expert_route_overlap_telemetry
             and provisional is None
@@ -9140,6 +9157,8 @@ class StreamingEngine:
 
             kv.qwen4_cache = Qwen4ExpStateCache(
                 self.cfg.num_hidden_layers)
+            kv.qwen4_cache.configure_qsa_pool_cache(
+                self.rc.qwen4_qsa_pool_cache)
         return kv
 
     def _configure_restored_k3_spill(self, kv: KVCache) -> KVCache:
@@ -10305,6 +10324,13 @@ class StreamingEngine:
                     self.rc.hot_prompt_kv_chunk_size = fresh_chunk
                 kv = self.new_kv(stepped=use_stepped_kv)
         self.last_kv = kv
+        qwen4_state = getattr(kv, "qwen4_cache", None)
+        if qwen4_state is not None:
+            # Covers cold state, RAM endpoints, and disk-restored endpoints.
+            # Preserve an exact derived cache on a RAM hit, but reset request
+            # attribution. Durable state intentionally rebuilds from raw keys.
+            qwen4_state.configure_qsa_pool_cache(
+                self.rc.qwen4_qsa_pool_cache, reset_stats=True)
         if self.cfg.model_type in ("qwen3_5", "qwen3_5_moe"):
             self.rc.prefill_chunk_size = (
                 self._apply_qwen35_prefill_chunk_ceiling(
@@ -11536,6 +11562,9 @@ class StreamingEngine:
             self._qwen4_serial_verify_exact_bf16_rows)
         path_stats["qwen4_serial_verify_exact_bf16_fallback_calls"] = int(
             self._qwen4_serial_verify_exact_bf16_fallback_calls)
+        qwen4_state = getattr(kv, "qwen4_cache", None)
+        if qwen4_state is not None:
+            path_stats.update(qwen4_state.qsa_pool_cache_stats())
         overlap = self._expert_route_overlap_totals
         for key in (
             "calls",

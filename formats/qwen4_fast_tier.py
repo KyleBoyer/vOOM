@@ -15,7 +15,8 @@ import shutil
 import struct
 import sys
 import uuid
-from collections import defaultdict
+from collections import Counter, defaultdict
+from fractions import Fraction
 from pathlib import Path
 
 from .kimi_k3_fast_tier import (
@@ -255,27 +256,166 @@ def _select(groups: list[dict], budget: int, layers: int, experts: int):
     return selected
 
 
+def _trace_rankings(
+    trace_paths: list[str | Path], *, model_name: str, layers: int,
+    experts: int,
+) -> tuple[dict[int, list[int]], dict]:
+    """Rank experts per layer from an equal-request-weighted trace corpus.
+
+    Every request contributes at most one unit of primary heat per layer,
+    divided over its own target sweeps. Request support and raw occurrence
+    count break exact heat ties before the content-independent spread order.
+    A long-output trace therefore cannot outweigh a genuinely hotter expert
+    merely because it contains more decode rounds.
+    """
+    from runtime.expert_plan import load_trace
+
+    paths = [Path(path).expanduser().resolve() for path in trace_paths]
+    if not paths:
+        raise ValueError("trace-balanced placement requires at least one trace")
+    score: dict[tuple[int, int], Fraction] = defaultdict(Fraction)
+    support: Counter[tuple[int, int]] = Counter()
+    hits: Counter[tuple[int, int]] = Counter()
+    digests = []
+    shapes = []
+    total_sweeps = 0
+    for path in paths:
+        raw = path.read_bytes()
+        document, sweeps = load_trace(path)
+        declared_model = str(document.get("model", "") or "")
+        if declared_model and declared_model != model_name:
+            raise ValueError(
+                f"expert trace model mismatch: {declared_model} != {model_name}")
+        if int(document.get("num_experts", 0) or 0) != experts:
+            raise ValueError("expert trace num_experts mismatch")
+        per_layer_sweeps: Counter[int] = Counter()
+        per_request_hits: Counter[tuple[int, int]] = Counter()
+        for sweep in sweeps:
+            for layer, routed in sweep.items():
+                if not 0 <= layer < layers:
+                    raise ValueError("expert trace layer exceeds checkpoint")
+                per_layer_sweeps[layer] += 1
+                per_request_hits.update((layer, expert) for expert in routed)
+        if set(per_layer_sweeps) != set(range(layers)):
+            raise ValueError("expert trace does not cover every target layer")
+        for pair, count in per_request_hits.items():
+            layer, _expert = pair
+            score[pair] += Fraction(count, per_layer_sweeps[layer])
+            support[pair] += 1
+            hits[pair] += count
+        total_sweeps += len(sweeps)
+        digests.append({
+            "file": path.name,
+            "sha256": hashlib.sha256(raw).hexdigest(),
+            "sweeps": len(sweeps),
+        })
+        shape = document.get("request_shape")
+        if isinstance(shape, dict):
+            shapes.append({
+                key: shape.get(key) for key in (
+                    "prompt_tokens", "requested_output_tokens",
+                    "actual_output_tokens", "system_chars", "tool_count",
+                    "message_count", "developer", "streaming",
+                    "temperature_class",
+                )
+            })
+
+    # Reuse the old coprime spread only as the final tie-break for pages that
+    # were unseen in the bounded corpus; do not collapse ties toward id zero.
+    step = 25 if experts % 5 else 17
+    while __import__("math").gcd(step, experts) != 1:
+        step += 2
+    spread_rank = {(rank * step) % experts: rank for rank in range(experts)}
+    rankings = {
+        layer: sorted(
+            range(experts),
+            key=lambda expert: (
+                -score[(layer, expert)],
+                -support[(layer, expert)],
+                -hits[(layer, expert)],
+                spread_rank[expert],
+            ),
+        )
+        for layer in range(layers)
+    }
+    return rankings, {
+        "selection_policy": "equal-request-trace-heat-v1",
+        "trace_requests": len(paths),
+        "trace_sweeps": total_sweeps,
+        "trace_documents": digests,
+        "trace_request_shapes": shapes,
+    }
+
+
+def _select_trace_balanced(
+    groups: list[dict], budget: int, layers: int, experts: int,
+    rankings: dict[int, list[int]], hot_experts_per_layer: int = 0,
+):
+    """Spend the expert budget evenly without overloading the fast device.
+
+    ``hot_experts_per_layer=0`` ranks the complete capacity by heat. A positive
+    cap places only that many hot pages per layer, then fills otherwise unused
+    storage from the cold end of the ranking. The latter is useful when exact
+    always-touched trunk traffic already consumes most of the fast device's
+    balanced per-sweep share.
+    """
+    if not 0 <= hot_experts_per_layer <= experts:
+        raise ValueError("trace hot experts per layer must be in [0, experts]")
+    by_pair = {(item["layer"], item["expert"]): item for item in groups}
+    placement_order = {}
+    for layer, ranking in rankings.items():
+        if hot_experts_per_layer:
+            hot = ranking[:hot_experts_per_layer]
+            cold = list(reversed(ranking[hot_experts_per_layer:]))
+            placement_order[layer] = [*hot, *cold]
+        else:
+            placement_order[layer] = ranking
+    selected = []
+    used = 0
+    for rank in range(experts):
+        for layer in range(layers):
+            item = by_pair[(layer, placement_order[layer][rank])]
+            if used + item["nbytes"] <= budget:
+                selected.append(item)
+                used += item["nbytes"]
+    return selected
+
+
 def build_qwen4_fast_tier(
     model_dir: str | Path, fast_root: str | Path, *, dry_run: bool = False,
     max_bytes: int = MAX_INTERNAL_FAST_TIER_BYTES,
     min_free_bytes: int = MIN_INTERNAL_FREE_BYTES,
     placement: str = "experts",
+    trace_paths: list[str | Path] | None = None,
+    trace_hot_experts_per_layer: int = 0,
+    candidate_max_bytes: int = 0,
+    target_name: str = "",
 ) -> dict:
     model_dir = Path(model_dir).resolve()
     fast_root = Path(fast_root).expanduser().resolve()
     max_bytes = int(max_bytes)
     min_free_bytes = int(min_free_bytes)
-    if max_bytes <= 0 or min_free_bytes < 0:
+    candidate_max_bytes = int(candidate_max_bytes)
+    trace_hot_experts_per_layer = int(trace_hot_experts_per_layer)
+    if (max_bytes <= 0 or min_free_bytes < 0 or candidate_max_bytes < 0
+            or trace_hot_experts_per_layer < 0):
         raise ValueError("invalid fast-tier byte budget")
     if placement not in ("experts", "trunk-first"):
         raise ValueError("Qwen4 fast-tier placement must be experts or trunk-first")
     internal = _is_internal_root(fast_root)
     if internal and max_bytes > MAX_INTERNAL_FAST_TIER_BYTES:
         raise ValueError("internal fast-tier budget exceeds 90 GB policy")
-    target = fast_root / model_dir.name
+    target_name = str(target_name or model_dir.name)
+    if (not target_name or target_name in (".", "..")
+            or Path(target_name).name != target_name):
+        raise ValueError(
+            "Qwen4 fast-tier target name must be one path component")
+    target = fast_root / target_name
     reclaimable_target_bytes = _tree_file_bytes(target) if target.exists() else 0
     other = _tree_file_bytes(fast_root, exclude=target) if internal else 0
     available = max(0, max_bytes - other - MANIFEST_RESERVE_BYTES)
+    if candidate_max_bytes:
+        available = min(available, candidate_max_bytes)
     groups, identity = _catalog(model_dir)
     trunk = (
         _trunk_catalog(model_dir, identity["layers"])
@@ -285,9 +425,21 @@ def build_qwen4_fast_tier(
     if trunk_bytes > available:
         raise ValueError(
             "complete Qwen4 target trunk does not fit the fast-tier budget")
-    selected = _select(
-        groups, available - trunk_bytes,
-        identity["layers"], identity["experts"])
+    trace_metadata = {"selection_policy": "uniform-coprime-v1"}
+    if trace_paths:
+        rankings, trace_metadata = _trace_rankings(
+            list(trace_paths), model_name=model_dir.name,
+            layers=identity["layers"], experts=identity["experts"])
+        selected = _select_trace_balanced(
+            groups, available - trunk_bytes,
+            identity["layers"], identity["experts"], rankings,
+            trace_hot_experts_per_layer)
+        trace_metadata["trace_hot_experts_per_layer"] = (
+            trace_hot_experts_per_layer)
+    else:
+        selected = _select(
+            groups, available - trunk_bytes,
+            identity["layers"], identity["experts"])
     if not selected:
         raise ValueError("no complete Qwen4 expert group fits the budget")
     selected_bytes = trunk_bytes + sum(item["nbytes"] for item in selected)
@@ -369,6 +521,7 @@ def build_qwen4_fast_tier(
                 "target_model": model_dir.name,
                 **identity,
                 "placement": placement,
+                **trace_metadata,
                 "selected_trunk_tensors": len(trunk),
                 "selected_trunk_bytes": trunk_bytes,
                 "selected_experts": len(selected),
@@ -395,6 +548,7 @@ def build_qwen4_fast_tier(
         "schema": (
             TRUNK_FIRST_SCHEMA if placement == "trunk-first" else SCHEMA),
         "placement": placement,
+        **trace_metadata,
         "source_revision": identity["source_revision"],
         "candidate_experts": len(groups),
         "candidate_bytes": sum(item["nbytes"] for item in groups),
@@ -413,6 +567,7 @@ def build_qwen4_fast_tier(
             other + selected_bytes + MANIFEST_RESERVE_BYTES),
         "projected_free_bytes": projected_free,
         "max_bytes": max_bytes,
+        "candidate_max_bytes": candidate_max_bytes,
         "min_free_bytes": min_free_bytes,
         "internal_root": internal,
         "target": str(target),
@@ -513,16 +668,33 @@ def main() -> None:
     parser.add_argument("--max-bytes", type=int, default=58_000_000_000)
     parser.add_argument(
         "--min-free-bytes", type=int, default=MIN_INTERNAL_FREE_BYTES)
+    parser.add_argument(
+        "--trace", action="append", default=[],
+        help="decode-only expert trace; repeat for an equal-weighted corpus")
+    parser.add_argument(
+        "--trace-hot-experts-per-layer", type=int, default=0,
+        help="rank only this many hot pages per layer, then fill from cold")
+    parser.add_argument(
+        "--candidate-max-bytes", type=int, default=0,
+        help="cap this candidate while retaining the global --max-bytes cap")
+    parser.add_argument(
+        "--target-name", default="",
+        help="publish under a distinct one-component candidate directory")
     args = parser.parse_args()
+    target_name = args.target_name or Path(args.model_dir).name
     report = (
         validate_qwen4_fast_tier(
             args.model_dir,
-            Path(args.fast_root).expanduser() / Path(args.model_dir).name)
+            Path(args.fast_root).expanduser() / target_name)
         if args.validate_only else
         build_qwen4_fast_tier(
             args.model_dir, args.fast_root, dry_run=args.dry_run,
             max_bytes=args.max_bytes, min_free_bytes=args.min_free_bytes,
-            placement=args.placement)
+            placement=args.placement, trace_paths=args.trace,
+            trace_hot_experts_per_layer=(
+                args.trace_hot_experts_per_layer),
+            candidate_max_bytes=args.candidate_max_bytes,
+            target_name=args.target_name)
     )
     print(json.dumps(report, indent=2, sort_keys=True))
 

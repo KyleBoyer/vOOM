@@ -298,16 +298,25 @@ def _qsa_selection_mask(
         return None
     query = _apply_rope_positions(query, positions, cfg)
     complete_key_len = complete_blocks * ratio
-    pooled = raw_keys[:, :complete_key_len].reshape(
-        batch, complete_blocks, ratio, dim)
-    pooled = mx.mean(pooled.astype(mx.float32), axis=2).astype(raw_keys.dtype)
-    pooled = qwen4_rms_norm(
-        pooled,
-        weights[f"{prefix}.self_attn.indexer.k_layernorm.weight"],
-        cfg.rms_norm_eps)[:, None]
-    starts = mx.arange(complete_blocks, dtype=mx.int32) * ratio
-    block_positions = full_positions[..., starts]
-    pooled = _apply_rope_positions(pooled, block_positions, cfg)
+    pooled = state.qsa_pooled_key(
+        layer,
+        batch=batch,
+        complete_blocks=complete_blocks,
+        dim=dim,
+    )
+    if pooled is None:
+        pooled = raw_keys[:, :complete_key_len].reshape(
+            batch, complete_blocks, ratio, dim)
+        pooled = mx.mean(
+            pooled.astype(mx.float32), axis=2).astype(raw_keys.dtype)
+        pooled = qwen4_rms_norm(
+            pooled,
+            weights[f"{prefix}.self_attn.indexer.k_layernorm.weight"],
+            cfg.rms_norm_eps)[:, None]
+        starts = mx.arange(complete_blocks, dtype=mx.int32) * ratio
+        block_positions = full_positions[..., starts]
+        pooled = _apply_rope_positions(pooled, block_positions, cfg)
+        state.remember_qsa_pooled_key(layer, pooled)
     scores = query.astype(mx.float32) @ pooled.astype(mx.float32).transpose(
         0, 1, 3, 2)
     scores = mx.sum(mx.maximum(scores, 0), axis=1) / math.sqrt(dim)

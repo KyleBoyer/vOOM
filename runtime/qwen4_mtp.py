@@ -1200,6 +1200,13 @@ class Qwen4MTPSpeculativeEngine:
             "expert_shared_overlap_layers": int(getattr(
                 target, "_expert_shared_overlap_layers", 0)),
         })
+        # Bootstrap telemetry predates every speculative verifier position.
+        # Refresh the derived QSA cache counters from the authoritative target
+        # endpoint after all accept/reject trims have completed.
+        qwen4_state = getattr(kv, "qwen4_cache", None)
+        qsa_pool_stats = getattr(qwen4_state, "qsa_pool_cache_stats", None)
+        if callable(qsa_pool_stats):
+            path_stats.update(qsa_pool_stats())
         request_cache_after = _cache_io_snapshot(target)
         _record_cache_io_delta(
             target, request_cache_before, path_stats,

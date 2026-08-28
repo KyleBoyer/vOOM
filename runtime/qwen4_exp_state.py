@@ -13,6 +13,17 @@ class Qwen4ExpStateCache:
             raise ValueError("Qwen4-Exp state cache needs decoder layers")
         self.qsa_keys: list[mx.array | None] = [None] * num_layers
         self.qsa_positions: list[mx.array | None] = [None] * num_layers
+        # Exact derived QSA index keys.  A complete compression block is
+        # immutable once appended, so verifier positions that remain inside
+        # the same block can reuse the already-normalized/RoPE'd BF16 keys.
+        # This cache is deliberately absent from durable checkpoints: it is
+        # derived from authenticated raw QSA keys and rebuilt on demand after
+        # restore.  Default-off until enabled by an explicit runtime profile.
+        self.qsa_pooled_keys: list[mx.array | None] = [None] * num_layers
+        self.qsa_pool_cache_enabled = False
+        self.qsa_pool_cache_hits = 0
+        self.qsa_pool_cache_rebuilds = 0
+        self.qsa_pool_cache_invalidations = 0
         self.ple_conv: list[mx.array | None] = [None] * num_layers
         self.ple_context: list[tuple[int, ...] | None] = [None] * num_layers
         self.ple_lengths: list[int] = [0] * num_layers
@@ -30,10 +41,74 @@ class Qwen4ExpStateCache:
                 [self.qsa_positions[layer], positions], axis=-1)
         return self.qsa_keys[layer], self.qsa_positions[layer]
 
+    def configure_qsa_pool_cache(
+        self, enabled: bool, *, reset_stats: bool = False,
+    ) -> None:
+        """Set the request-local derived-key policy without changing state."""
+        enabled = bool(enabled)
+        if not enabled and self.qsa_pool_cache_enabled:
+            self.invalidate_qsa_pool_cache()
+        self.qsa_pool_cache_enabled = enabled
+        if reset_stats:
+            self.qsa_pool_cache_hits = 0
+            self.qsa_pool_cache_rebuilds = 0
+            self.qsa_pool_cache_invalidations = 0
+
+    def qsa_pooled_key(
+        self,
+        layer: int,
+        *,
+        batch: int,
+        complete_blocks: int,
+        dim: int,
+    ) -> mx.array | None:
+        """Return an exact derived-key hit for this immutable raw prefix."""
+        if not self.qsa_pool_cache_enabled:
+            return None
+        value = self.qsa_pooled_keys[layer]
+        if value is None or tuple(value.shape) != (
+                int(batch), 1, int(complete_blocks), int(dim)):
+            return None
+        self.qsa_pool_cache_hits += 1
+        return value
+
+    def remember_qsa_pooled_key(self, layer: int, value: mx.array) -> None:
+        if not self.qsa_pool_cache_enabled:
+            return
+        self.qsa_pooled_keys[layer] = value
+        self.qsa_pool_cache_rebuilds += 1
+
+    def invalidate_qsa_pool_cache(self, layer: int | None = None) -> None:
+        layers = range(len(self.qsa_pooled_keys)) if layer is None else (layer,)
+        for index in layers:
+            if self.qsa_pooled_keys[index] is not None:
+                self.qsa_pooled_keys[index] = None
+                self.qsa_pool_cache_invalidations += 1
+
+    def qsa_pool_cache_stats(self) -> dict[str, int]:
+        return {
+            "qwen4_qsa_pool_cache_enabled": int(
+                self.qsa_pool_cache_enabled),
+            "qwen4_qsa_pool_cache_hits": int(self.qsa_pool_cache_hits),
+            "qwen4_qsa_pool_cache_rebuilds": int(
+                self.qsa_pool_cache_rebuilds),
+            "qwen4_qsa_pool_cache_invalidations": int(
+                self.qsa_pool_cache_invalidations),
+            "qwen4_qsa_pool_cache_bytes": sum(
+                value.nbytes for value in self.qsa_pooled_keys
+                if value is not None),
+        }
+
     def fork(self) -> "Qwen4ExpStateCache":
         branch = Qwen4ExpStateCache(len(self.qsa_keys))
         branch.qsa_keys = list(self.qsa_keys)
         branch.qsa_positions = list(self.qsa_positions)
+        branch.qsa_pooled_keys = list(self.qsa_pooled_keys)
+        branch.qsa_pool_cache_enabled = self.qsa_pool_cache_enabled
+        branch.qsa_pool_cache_hits = self.qsa_pool_cache_hits
+        branch.qsa_pool_cache_rebuilds = self.qsa_pool_cache_rebuilds
+        branch.qsa_pool_cache_invalidations = (
+            self.qsa_pool_cache_invalidations)
         branch.ple_conv = list(self.ple_conv)
         branch.ple_context = list(self.ple_context)
         branch.ple_lengths = list(self.ple_lengths)
@@ -55,6 +130,10 @@ class Qwen4ExpStateCache:
             if keys.shape[1] > length:
                 self.qsa_keys[layer] = keys[:, :length]
                 self.qsa_positions[layer] = self.qsa_positions[layer][..., :length]
+                # A trim may remove only an incomplete raw block and leave the
+                # pooled shape unchanged.  Shape checks alone therefore cannot
+                # prove the old derived array belongs to the retained prefix.
+                self.invalidate_qsa_pool_cache(layer)
                 pending.extend((
                     self.qsa_keys[layer], self.qsa_positions[layer]))
         if pending:
@@ -103,7 +182,8 @@ class Qwen4ExpStateCache:
         return sum(
             value.nbytes
             for values in (
-                self.qsa_keys, self.qsa_positions, self.ple_conv)
+                self.qsa_keys, self.qsa_positions, self.qsa_pooled_keys,
+                self.ple_conv)
             for value in values
             if value is not None
         )
@@ -112,7 +192,8 @@ class Qwen4ExpStateCache:
         arrays = [
             value
             for values in (
-                self.qsa_keys, self.qsa_positions, self.ple_conv)
+                self.qsa_keys, self.qsa_positions, self.qsa_pooled_keys,
+                self.ple_conv)
             for value in values
             if value is not None
         ]

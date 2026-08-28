@@ -243,6 +243,73 @@ def test_qsa_mask_is_causal_and_switches_to_bounded_blocks():
     assert state.qsa_positions[0].shape == (1, length)
 
 
+def test_qsa_pooled_key_cache_is_bit_exact_across_hits_rebuild_and_trim():
+    cfg = _cfg()
+    rng = np.random.default_rng(23)
+    hidden = mx.array(
+        rng.normal(size=(1, 11, 4)).astype(np.float32)).astype(mx.bfloat16)
+    prefix = "model.layers.0"
+    weights = {
+        f"{prefix}.self_attn.indexer.index_qk_proj.weight": mx.array(
+            rng.normal(scale=.2, size=(12, 4)).astype(np.float32)
+        ).astype(mx.bfloat16),
+        f"{prefix}.self_attn.indexer.q_layernorm.weight": mx.array(
+            rng.normal(scale=.05, size=(4,)).astype(np.float32)
+        ).astype(mx.bfloat16),
+        f"{prefix}.self_attn.indexer.k_layernorm.weight": mx.array(
+            rng.normal(scale=.05, size=(4,)).astype(np.float32)
+        ).astype(mx.bfloat16),
+    }
+    baseline = Qwen4ExpStateCache(1)
+    cached = Qwen4ExpStateCache(1)
+    cached.configure_qsa_pool_cache(True, reset_stats=True)
+
+    for start, end in ((0, 9), (9, 10), (10, 11)):
+        expected = _qsa_selection_mask(
+            hidden[:, start:end], weights, prefix, cfg, 0, start, baseline)
+        actual = _qsa_selection_mask(
+            hidden[:, start:end], weights, prefix, cfg, 0, start, cached)
+        mx.eval(expected, actual)
+        np.testing.assert_array_equal(np.asarray(actual), np.asarray(expected))
+
+    np.testing.assert_array_equal(
+        np.asarray(cached.qsa_keys[0].view(mx.uint16)),
+        np.asarray(baseline.qsa_keys[0].view(mx.uint16)),
+    )
+    assert cached.qsa_pool_cache_rebuilds == 2
+    assert cached.qsa_pool_cache_hits == 1
+    assert cached.qsa_pool_cache_stats()["qwen4_qsa_pool_cache_bytes"] > 0
+
+    # Removing only an incomplete raw block leaves the pooled shape at five
+    # blocks, so correctness requires explicit invalidation rather than a
+    # shape-only cache hit.
+    cached.trim(10)
+    baseline.trim(10)
+    assert cached.qsa_pooled_keys[0] is None
+    assert cached.qsa_pool_cache_invalidations == 1
+    expected = _qsa_selection_mask(
+        hidden[:, 10:11], weights, prefix, cfg, 0, 10, baseline)
+    actual = _qsa_selection_mask(
+        hidden[:, 10:11], weights, prefix, cfg, 0, 10, cached)
+    mx.eval(expected, actual)
+    np.testing.assert_array_equal(np.asarray(actual), np.asarray(expected))
+    assert cached.qsa_pool_cache_rebuilds == 3
+
+
+def test_qsa_pool_cache_fork_shares_immutable_derived_keys_but_not_policy():
+    state = Qwen4ExpStateCache(2)
+    state.configure_qsa_pool_cache(True)
+    derived = mx.zeros((1, 1, 3, 4), dtype=mx.bfloat16)
+    state.remember_qsa_pooled_key(1, derived)
+    branch = state.fork()
+
+    assert branch.qsa_pooled_keys[1] is derived
+    assert branch.nbytes() == derived.nbytes
+    branch.configure_qsa_pool_cache(False)
+    assert branch.qsa_pooled_keys[1] is None
+    assert state.qsa_pooled_keys[1] is derived
+
+
 def test_recurrent_prefix_restore_keeps_only_small_ple_endpoint_and_trims_qsa():
     state = Qwen4ExpStateCache(2)
     state.qsa_keys[1] = mx.arange(24, dtype=mx.float32).reshape(1, 6, 4)

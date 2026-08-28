@@ -18,8 +18,8 @@ notes:
   - The exact 1.271 GB BF16 output head is absent during host-spooled prefill, loaded once at the first endpoint projection, and retained through MTP verification. It is released before the next prompt sweep. This phase lease reduced the real MTP oracle to 110.79 seconds generation / 93.44 seconds decode without widening the ordinary 96 MB scan cache.
   - The phase head is released again immediately after response state and logits are committed, so an idle server does not sacrifice the admission headroom needed by its next request.
   - The exact Qwen4 hybrid prefix journal is enabled only in this named profile. It fingerprints released weights/runtime/tokenizer state, persists full QSA/DeltaNet/PLE/KV boundaries, and must miss rather than reuse when a perturbed prompt does not share the exact token prefix.
-  - Durable exact endpoints also carry the Qwen4 hyper-connection hidden row consumed by Lightning-MTP. Older endpoints without it fail closed to their verified stable boundary. The 49,255-token unmodified capture then reached 76.0569 seconds at max-16 and 298.2957 seconds at max-64; this remains an explicit profile rather than an automatic route pending the full heterogeneous live corpus.
-  - The current machine's 20.499 GB trace-balanced mirror is decode-only. Exact pages remain released BF16 and are divided by measured target-trunk traffic across the internal and workspace NVMe devices; PLE, prompt prefill, and the complete source checkpoint remain external.
+  - Durable exact endpoints also carry the Qwen4 hyper-connection hidden row consumed by Lightning-MTP. Older endpoints without it fail closed to their verified stable boundary. The prior uniform 20.499 GB mirror reached 76.0569 seconds at max-16 on a steady server and 298.2957 seconds at max-64; this remains an explicit profile rather than an automatic route.
+  - The current machine's 20.499 GB trace-balanced mirror is decode-only. It gives each trace request equal weight, selects eight hot routed experts per layer, and fills unused capacity from cold pages so the internal device is not overloaded by the always-touched trunk. Exact pages remain released BF16 and are divided across the internal and workspace NVMe devices; PLE, prompt prefill, and the complete source checkpoint remain external. On the paired untouched max-16 capture it preserved output SHA-256 and cut cold-server wall 92.2089s to 85.6337s. It also preserved a distinct developer/two-tool output while reducing decode 53.7110s to 47.6310s, and preserved all 64 sustained output tokens while reducing exact engine time 283.6450s to 267.3735s. One greedy/non-streaming held-out run improved wall only 2.1% and exceeded the swap-out gate by about 34 MB, so this profile remains explicit pending a larger corpus.
 settings:
   VMODEL_RESIDENT_BACKEND: voom
   VMODEL_EXECUTION_PROFILE: layers
@@ -37,7 +37,7 @@ settings:
   VMODEL_QWEN4_GLOBAL_EXPERT_ROWS: false
   VMODEL_QWEN4_EXPERT_TILE_EVAL_BATCH: 4
   VMODEL_QWEN4_COMPILED_DELTA: true
-  VMODEL_QWEN4_FAST_TIER_DIR: /Users/kyleboyer/vmodel_fast_tier/Qwen3.8-Flash-Next
+  VMODEL_QWEN4_FAST_TIER_DIR: /Users/kyleboyer/vmodel_fast_tier/Qwen3.8-Flash-Next-trace-v1
   VMODEL_QWEN4_PARALLEL_STORAGE_READS: true
   VMODEL_QWEN4_FAST_TIER_DECODE_ONLY: true
   VMODEL_QWEN4_PHASE_LM_HEAD: true

@@ -292,6 +292,43 @@ def test_qwen4_trunk_first_fast_tier_serves_all_target_trunk_exactly(tmp_path):
     assert store.archive_bytes == 0
 
 
+def test_qwen4_trace_balanced_fast_tier_selects_observed_expert(tmp_path):
+    from formats.qwen4_fast_tier import build_qwen4_fast_tier
+    from runtime.expert_plan import write_trace
+
+    root, _expected = _fixture(tmp_path)
+    trace = write_trace(
+        tmp_path / "decode-trace.json",
+        [(0, (1,)), (0, (1,))],
+        model=root.name,
+        num_experts=2,
+        expert_page_bytes=72,
+    )
+    fast_root = tmp_path / "fast"
+    trunk_bytes = 296
+    report = build_qwen4_fast_tier(
+        root,
+        fast_root,
+        max_bytes=2_000_000 + trunk_bytes + 72,
+        candidate_max_bytes=trunk_bytes + 72,
+        target_name="trace-candidate",
+        placement="trunk-first",
+        trace_paths=[trace],
+        trace_hot_experts_per_layer=1,
+    )
+
+    assert report["selection_policy"] == "equal-request-trace-heat-v1"
+    assert report["trace_requests"] == 1
+    assert report["trace_hot_experts_per_layer"] == 1
+    target = fast_root / "trace-candidate"
+    manifest = json.loads((target / "fast_tier_manifest.json").read_text())
+    assert "model.layers.0.mlp.experts.1.gate_proj.weight" in manifest
+    assert "model.layers.0.mlp.experts.0.gate_proj.weight" not in manifest
+    binding = json.loads(
+        (target / "qwen4_fused_expert_fast_tier.json").read_text())
+    assert binding["trace_documents"][0]["file"] == trace.name
+
+
 def test_qwen4_virtual_fast_and_archive_experts_overlap(tmp_path, monkeypatch):
     from formats.qwen4_fast_tier import build_qwen4_fast_tier
 

@@ -251,6 +251,11 @@ def test_vision_protocol_timing_exposes_qwen4_verifier_pipeline_and_q_calibratio
             "qwen4_serial_verify_exact_bf16_calls": 120,
             "qwen4_serial_verify_exact_bf16_rows": 480,
             "qwen4_serial_verify_exact_bf16_fallback_calls": 24,
+            "qwen4_qsa_pool_cache_enabled": 1,
+            "qwen4_qsa_pool_cache_hits": 36,
+            "qwen4_qsa_pool_cache_rebuilds": 12,
+            "qwen4_qsa_pool_cache_invalidations": 3,
+            "qwen4_qsa_pool_cache_bytes": 37_800_000,
             "expert_batch_prefetch": 1,
             "expert_batch_prefetch_submitted": 96,
             "expert_batch_prefetch_wait_s": 7.25,
@@ -275,6 +280,11 @@ def test_vision_protocol_timing_exposes_qwen4_verifier_pipeline_and_q_calibratio
     assert timing["qwen4_serial_verify_exact_bf16_calls"] == 120
     assert timing["qwen4_serial_verify_exact_bf16_rows"] == 480
     assert timing["qwen4_serial_verify_exact_bf16_fallback_calls"] == 24
+    assert timing["qwen4_qsa_pool_cache_enabled"] == 1
+    assert timing["qwen4_qsa_pool_cache_hits"] == 36
+    assert timing["qwen4_qsa_pool_cache_rebuilds"] == 12
+    assert timing["qwen4_qsa_pool_cache_invalidations"] == 3
+    assert timing["qwen4_qsa_pool_cache_bytes"] == 37_800_000
     assert timing["expert_batch_prefetch"] == 1
     assert timing["expert_batch_prefetch_submitted"] == 96
     assert timing["expert_batch_prefetch_wait_s"] == 7.25
@@ -2839,6 +2849,7 @@ def test_qwen4_instrumented_profile_is_exact_bounded_and_in_engine_identity():
         assert rc.qwen4_expert_tile_eval_batch == 1
         assert not rc.qwen4_fast_tier_decode_only
         assert not rc.qwen4_phase_lm_head
+        assert not rc.qwen4_qsa_pool_cache
         assert not rc.pin_lm_head
         assert rc.stream_lm_head
         assert not rc.pin_embeddings
@@ -2895,6 +2906,29 @@ def test_qwen4_expert_tile_eval_batch_is_strictly_bounded():
         with pytest.raises(
             RequestValidationError,
             match="VMODEL_QWEN4_EXPERT_TILE_EVAL_BATCH must be in",
+        ):
+            EngineManager().get(Path("/tmp/fake-qwen4"), "lossless")
+
+
+@pytest.mark.parametrize("value", ["2", "true", "bad"])
+def test_qwen4_qsa_pool_cache_is_strict_boolean(value):
+    from unittest.mock import patch
+
+    from runtime.server import EngineManager
+
+    cfg = SimpleNamespace(
+        model_type="qwen4_exp", tie_word_embeddings=False,
+        vision_config={"model_type": "qwen4_exp_vision"},
+        num_hidden_layers=48, num_experts=512,
+    )
+    with patch.dict(os.environ, {
+        "VMODEL_QWEN4_QSA_POOL_CACHE": value,
+    }, clear=False), \
+         patch("runtime.config.ModelConfig.from_dir", return_value=cfg), \
+         patch("runtime.path_resolver.resolve_model_dir", side_effect=lambda path: path):
+        with pytest.raises(
+            RequestValidationError,
+            match="VMODEL_QWEN4_QSA_POOL_CACHE",
         ):
             EngineManager().get(Path("/tmp/fake-qwen4"), "lossless")
 
@@ -3026,6 +3060,7 @@ def test_qwen4_phase_head_and_mtp_are_explicitly_wired():
         "VMODEL_QWEN4_MTP_Q_CALIBRATION_SCALES": "0.7,1,1.3",
         "VMODEL_QWEN4_SERIAL_VERIFY_SUSPEND_LM_HEAD": "1",
         "VMODEL_QWEN4_SERIAL_VERIFY_EXACT_BF16_GEMV": "1",
+        "VMODEL_QWEN4_QSA_POOL_CACHE": "1",
     }, clear=False), \
          patch("runtime.config.ModelConfig.from_dir", return_value=cfg), \
          patch("runtime.path_resolver.resolve_model_dir", side_effect=lambda path: path), \
@@ -3042,6 +3077,7 @@ def test_qwen4_phase_head_and_mtp_are_explicitly_wired():
     assert captured["rc"].qwen4_phase_lm_head
     assert captured["rc"].qwen4_serial_verify_suspend_lm_head
     assert captured["rc"].qwen4_serial_verify_exact_bf16_gemv
+    assert captured["rc"].qwen4_qsa_pool_cache
     assert captured["rc"].pin_lm_head
     assert not captured["rc"].stream_lm_head
 
@@ -6237,6 +6273,67 @@ def test_engine_generate_uses_plain_targets_own_retry_method():
     assert result == {"via": "target-retry"}
     assert target.retry_calls == 1
     assert target.plain_calls == 0
+
+
+def test_engine_generate_writes_private_decode_only_expert_trace(
+        tmp_path, monkeypatch):
+    class Target:
+        def __init__(self):
+            self.expert_trace = [(0, (7,))]
+            self.expert_trace_phases = ["decode"]
+            self._model_dir = tmp_path / "Qwen3.8-Flash-Next"
+            self._expert_storage_page_bytes = 72
+            self.cfg = SimpleNamespace(
+                model_type="qwen4_exp", num_experts=8,
+                expert_top_k_by_layer=())
+            self.rc = SimpleNamespace(expert_top_k_by_layer=())
+
+        def generate_with_memory_retry(self, *_args, **_kwargs):
+            self.expert_trace.extend(((0, (1, 2)), (0, (2, 3))))
+            self.expert_trace_phases.extend(("prefill", "decode"))
+            return {
+                "prompt_tokens": 900,
+                "tokens": [4, 5],
+                "path_stats": {"qwen4_mtp_target_sweeps": 1},
+            }
+
+    trace_dir = tmp_path / "traces"
+    monkeypatch.setenv("VMODEL_EXPERT_TRACE_DIR", str(trace_dir))
+    prompt = PreparedPrompt(
+        "rendered", range(900), rerank_capture_shape={
+            "prompt_tokens": 900,
+            "system_chars": 2000,
+            "tool_count": 2,
+            "message_count": 3,
+            "developer": True,
+        })
+    result = _engine_generate(
+        Target(), prompt, 16,
+        sampling=SimpleNamespace(is_greedy=True),
+        on_token=lambda _token: None,
+    )
+
+    assert result["tokens"] == [4, 5]
+    files = list(trace_dir.glob("*.json"))
+    assert len(files) == 1
+    document = json.loads(files[0].read_text())
+    assert document["scope"] == "decode-physical-routed-unions"
+    assert document["request_shape"] == {
+        "prompt_tokens": 900,
+        "requested_output_tokens": 16,
+        "actual_output_tokens": 2,
+        "system_chars": 2000,
+        "tool_count": 2,
+        "message_count": 3,
+        "developer": True,
+        "streaming": True,
+        "temperature_class": "greedy",
+    }
+    assert document["sweeps"] == [{
+        "index": 0,
+        "routes": [{"layer": 0, "experts": [2, 3]}],
+    }]
+    assert files[0].stat().st_mode & 0o777 == 0o600
 
 
 def test_engine_generate_scopes_privacy_safe_authoritative_rank_capture():

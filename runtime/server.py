@@ -1227,6 +1227,7 @@ class EngineManager:
                 ("VMODEL_QWEN4_MTP_Q_CALIBRATION_SCALES", ""),
                 ("VMODEL_QWEN4_SERIAL_VERIFY_SUSPEND_LM_HEAD", "0"),
                 ("VMODEL_QWEN4_SERIAL_VERIFY_EXACT_BF16_GEMV", "0"),
+                ("VMODEL_QWEN4_QSA_POOL_CACHE", "0"),
             )
         )
         dspark_request_identity = tuple(
@@ -2898,6 +2899,11 @@ class EngineManager:
                         "0 or 1")
                 rc.qwen4_serial_verify_exact_bf16_gemv = (
                     qwen4_request_identity[29] == "1")
+                if qwen4_request_identity[30] not in ("0", "1"):
+                    raise RequestValidationError(
+                        "VMODEL_QWEN4_QSA_POOL_CACHE must be 0 or 1")
+                rc.qwen4_qsa_pool_cache = (
+                    qwen4_request_identity[30] == "1")
                 rc.hot_prompt_kv_persist_dir = qwen4_request_identity[18]
                 if rc.hot_prompt_kv_persist_dir and not rc.hot_prompt_kv:
                     raise RequestValidationError(
@@ -6630,6 +6636,127 @@ def _has_own_method(obj, name: str) -> bool:
     return any(name in cls.__dict__ for cls in type(obj).__mro__)
 
 
+def _request_expert_trace_target(engine):
+    """Return the authoritative target that owns routed-expert telemetry."""
+    seen = set()
+    current = engine
+    while id(current) not in seen:
+        seen.add(id(current))
+        if isinstance(getattr(current, "expert_trace", None), list):
+            return current
+        target = getattr(current, "target", None)
+        if target is None or target is current:
+            break
+        current = target
+    return None
+
+
+def _persist_request_expert_trace(
+    engine, start: int, prompt, max_tokens: int, sampling, streaming: bool,
+    result: dict,
+) -> Path | None:
+    """Atomically persist a privacy-safe, decode-only routed-page trace.
+
+    This is explicit instrumentation selected only by
+    ``VMODEL_EXPERT_TRACE_DIR``. It records model route ids and coarse request
+    shape, never prompt text, token ids, tool schemas, logits, or activations.
+    The trace is observational: every route was already selected and fetched
+    by the authoritative target.
+    """
+    raw_dir = os.environ.get("VMODEL_EXPERT_TRACE_DIR", "").strip()
+    if not raw_dir:
+        return None
+    target = _request_expert_trace_target(engine)
+    if target is None:
+        return None
+    routes = list(target.expert_trace[start:])
+    phases = list(getattr(target, "expert_trace_phases", ())[start:])
+    if len(phases) != len(routes):
+        raise RuntimeError("expert trace phase alignment is incomplete")
+    decode_routes = [
+        route for route, phase in zip(routes, phases, strict=True)
+        if phase == "decode"
+    ]
+    if not decode_routes:
+        print("[server] expert trace skipped: no decode routes", flush=True)
+        return None
+
+    from .expert_plan import trace_document
+
+    shape = dict(getattr(prompt, "rerank_capture_shape", {}) or {})
+    document = trace_document(
+        decode_routes,
+        model=Path(str(getattr(target, "_model_dir", ""))).name,
+        num_experts=int(getattr(target.cfg, "num_experts", 0) or 0),
+        expert_page_bytes=int(getattr(
+            target, "_expert_storage_page_bytes", 0) or 0),
+    )
+    stats = result.get("path_stats") or {}
+    document.update({
+        "scope": "decode-physical-routed-unions",
+        "request_shape": {
+            "prompt_tokens": int(
+                result.get("prompt_tokens", shape.get("prompt_tokens", 0))
+                or 0),
+            "requested_output_tokens": int(max_tokens),
+            "actual_output_tokens": len(result.get("tokens", ())),
+            "system_chars": int(shape.get("system_chars", 0) or 0),
+            "tool_count": int(shape.get("tool_count", 0) or 0),
+            "message_count": int(shape.get("message_count", 0) or 0),
+            "developer": bool(shape.get("developer", False)),
+            "streaming": bool(streaming),
+            "temperature_class": (
+                "greedy" if bool(getattr(sampling, "is_greedy", True))
+                else "stochastic"),
+        },
+        "target_sweeps": int(
+            stats.get(
+                "qwen4_mtp_target_sweeps", len(document["sweeps"]))
+            or 0),
+        "baseline_io": {
+            key: int(stats.get(key, 0) or 0)
+            for key in (
+                "weight_store_bytes_read",
+                "prefill_weight_store_bytes_read",
+                "weight_fast_tier_bytes",
+                "weight_archive_bytes",
+                "parallel_tier_fast_bytes",
+                "parallel_tier_archive_bytes",
+                "parallel_tier_wall_ns",
+                "parallel_tier_fast_service_ns",
+                "parallel_tier_archive_service_ns",
+                "parallel_tier_hidden_ns",
+            )
+        },
+    })
+    destination_dir = Path(raw_dir).expanduser().resolve()
+    destination_dir.mkdir(parents=True, exist_ok=True)
+    destination = destination_dir / (
+        f"qwen4-expert-{time.time_ns()}-{uuid.uuid4().hex[:8]}.json")
+    temporary = destination.with_name(f".{destination.name}.tmp")
+    encoded = (json.dumps(document, indent=2, sort_keys=True) + "\n").encode()
+    descriptor = os.open(
+        temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        with os.fdopen(descriptor, "wb") as output:
+            output.write(encoded)
+            output.flush()
+            os.fsync(output.fileno())
+        os.replace(temporary, destination)
+    except BaseException:
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
+        raise
+    print(
+        f"[server] expert trace: {destination} "
+        f"({len(decode_routes)} routes/{len(document['sweeps'])} sweeps)",
+        flush=True,
+    )
+    return destination
+
+
 def _engine_generate(engine, *args, expert_top_k: int = 0, **kwargs):
     """Use fail-slow prefill retry when the concrete engine supports it.
 
@@ -6655,6 +6782,9 @@ def _engine_generate(engine, *args, expert_top_k: int = 0, **kwargs):
     generate = (engine.generate_with_memory_retry
                 if _has_own_method(engine, "generate_with_memory_retry")
                 else engine.generate)
+    trace_target = _request_expert_trace_target(engine)
+    trace_start = (
+        len(trace_target.expert_trace) if trace_target is not None else 0)
     cfg = getattr(engine, "cfg", None)
     rc = getattr(engine, "rc", None)
     old_cfg_schedule = getattr(cfg, "expert_top_k_by_layer", ())
@@ -6722,6 +6852,17 @@ def _engine_generate(engine, *args, expert_top_k: int = 0, **kwargs):
                 rc.expert_top_k_by_layer = old_rc_schedule
     if os.environ.get("VMODEL_DEBUG_ENGINE_REPORT", "0") == "1":
         print("[debug] engine.report():\n" + engine.report(), flush=True)
+    prompt = args[0] if args else ""
+    max_tokens = int(args[1] if len(args) > 1 else kwargs.get("max_tokens", 64))
+    _persist_request_expert_trace(
+        engine,
+        trace_start,
+        prompt,
+        max_tokens,
+        kwargs.get("sampling"),
+        callable(kwargs.get("on_token")),
+        result,
+    )
     return result
 
 _GATEWAY_CONFIRMATION_RE = re.compile(
@@ -9112,6 +9253,11 @@ def _vision_protocol_timing(result: dict) -> dict:
         "qwen4_serial_verify_exact_bf16_calls",
         "qwen4_serial_verify_exact_bf16_rows",
         "qwen4_serial_verify_exact_bf16_fallback_calls",
+        "qwen4_qsa_pool_cache_enabled",
+        "qwen4_qsa_pool_cache_hits",
+        "qwen4_qsa_pool_cache_rebuilds",
+        "qwen4_qsa_pool_cache_invalidations",
+        "qwen4_qsa_pool_cache_bytes",
     )
     for key in optional_integer_fields:
         if key in stats or key in result:
