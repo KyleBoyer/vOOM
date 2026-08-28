@@ -481,6 +481,73 @@ def qwen4_mlp_from_groups(
     return hyper_connection_inject(branch, hyper_input, injection)
 
 
+def qwen4_mlp_from_group_batches(
+    routes: Sequence[tuple[
+        mx.array,
+        mx.array,
+        mx.array,
+        dict[int, list[tuple[int, float]]],
+    ]],
+    expert_batches,
+    weights: dict,
+    prefix: str,
+) -> list[mx.array]:
+    """Evaluate verifier rows while releasing each exact expert batch.
+
+    Expert IDs are consumed in ascending order, so every row retains the same
+    routed accumulation order as :func:`qwen4_mlp_from_groups`.  The explicit
+    batch barrier is the lifetime boundary that permits the next immutable
+    expert-page read to overlap current Metal compute without retaining the
+    complete routed union.  This path is selected only by the existing
+    explicit expert-batch-prefetch option and is bitwise-gated against the
+    ordinary whole-union implementation.
+    """
+    routed = [mx.zeros_like(route[0]) for route in routes]
+    previous_expert = -1
+    for expert_ids, experts in expert_batches:
+        ordered = tuple(int(expert) for expert in expert_ids)
+        if tuple(sorted(ordered)) != ordered:
+            raise ValueError("Qwen4 verifier expert batches must be sorted")
+        if ordered and ordered[0] <= previous_expert:
+            raise ValueError(
+                "Qwen4 verifier expert batches must be globally ordered")
+        for expert in ordered:
+            if expert not in experts:
+                raise ValueError(f"missing routed Qwen4 expert {expert}")
+            for route_index, route in enumerate(routes):
+                mixed, _hyper_input, _injection, groups = route
+                plist = groups.get(expert)
+                if not plist:
+                    continue
+                positions = [position for position, _ in plist]
+                route_weights = mx.array(
+                    [weight for _, weight in plist], dtype=mixed.dtype)
+                contribution = _swiglu(
+                    mixed[:, positions, :],
+                    experts[expert],
+                    f"{prefix}.mlp.experts.{expert}",
+                )
+                routed[route_index] = routed[route_index].at[
+                    :, positions, :
+                ].add(contribution * route_weights[None, :, None])
+            previous_expert = expert
+        # This is both the proof boundary and the ownership boundary: after it
+        # returns, no lazy graph retains the current batch's weight arrays.
+        mx.eval(*routed)
+        del experts
+
+    outputs = []
+    for route, routed_output in zip(routes, routed, strict=True):
+        mixed, hyper_input, injection, _groups = route
+        shared = _swiglu(mixed, weights, f"{prefix}.mlp.shared_expert")
+        shared_gate = mx.sigmoid(_linear(
+            mixed, weights, f"{prefix}.mlp.shared_expert_gate"))
+        branch = routed_output + shared_gate * shared
+        outputs.append(hyper_connection_inject(
+            branch, hyper_input, injection))
+    return outputs
+
+
 def run_qwen4_block(
     hidden: mx.array,
     input_ids: Sequence[int],

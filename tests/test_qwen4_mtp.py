@@ -8,7 +8,11 @@ import numpy as np
 import pytest
 
 from runtime.config import ModelConfig
-from runtime.qwen4_exp import qwen4_rms_norm
+from runtime.qwen4_exp import (
+    qwen4_mlp_from_group_batches,
+    qwen4_mlp_from_groups,
+    qwen4_rms_norm,
+)
 from runtime.qwen4_mtp import (
     Qwen4MTPDrafter,
     Qwen4MTPSpeculativeEngine,
@@ -169,6 +173,69 @@ def test_fuse_inputs_projects_each_hidden_stream_with_shared_fc():
         np.asarray(actual.view(mx.uint16)),
         np.asarray(expected.view(mx.uint16)),
     )
+
+
+def test_batched_expert_lifetime_keeps_per_row_bf16_accumulation_exact():
+    mx.random.seed(73)
+    hidden = 8
+    intermediate = 5
+    routes = []
+    group_sets = ((0, 2, 4), (1, 2, 5), (0, 3, 5), (1, 3, 4))
+    for row, groups in enumerate(group_sets):
+        mixed = mx.random.normal((1, 1, hidden)).astype(mx.bfloat16)
+        hyper_input = mx.random.normal((1, 1, hidden)).astype(mx.bfloat16)
+        injection = mx.random.normal((1, 1, 1)).astype(mx.bfloat16)
+        routes.append((
+            mixed,
+            hyper_input,
+            injection,
+            {
+                expert: [(0, 0.125 * (row + expert + 1))]
+                for expert in groups
+            },
+        ))
+    experts = {
+        expert: {
+            f"model.layers.0.mlp.experts.{expert}.gate_proj.weight":
+                mx.random.normal((intermediate, hidden)).astype(mx.bfloat16),
+            f"model.layers.0.mlp.experts.{expert}.up_proj.weight":
+                mx.random.normal((intermediate, hidden)).astype(mx.bfloat16),
+            f"model.layers.0.mlp.experts.{expert}.down_proj.weight":
+                mx.random.normal((hidden, intermediate)).astype(mx.bfloat16),
+        }
+        for expert in range(6)
+    }
+    weights = {
+        "model.layers.0.mlp.shared_expert.gate_proj.weight":
+            mx.random.normal((intermediate, hidden)).astype(mx.bfloat16),
+        "model.layers.0.mlp.shared_expert.up_proj.weight":
+            mx.random.normal((intermediate, hidden)).astype(mx.bfloat16),
+        "model.layers.0.mlp.shared_expert.down_proj.weight":
+            mx.random.normal((hidden, intermediate)).astype(mx.bfloat16),
+        "model.layers.0.mlp.shared_expert_gate.weight":
+            mx.random.normal((1, hidden)).astype(mx.bfloat16),
+    }
+    expected = [
+        qwen4_mlp_from_groups(
+            route, experts, weights, "model.layers.0")
+        for route in routes
+    ]
+    mx.eval(*expected)
+
+    batches = iter((
+        ([0, 1], {expert: experts[expert] for expert in (0, 1)}),
+        ([2, 3], {expert: experts[expert] for expert in (2, 3)}),
+        ([4, 5], {expert: experts[expert] for expert in (4, 5)}),
+    ))
+    actual = qwen4_mlp_from_group_batches(
+        routes, batches, weights, "model.layers.0")
+    mx.eval(*actual)
+
+    for expected_row, actual_row in zip(expected, actual, strict=True):
+        np.testing.assert_array_equal(
+            np.asarray(expected_row.view(mx.uint16)),
+            np.asarray(actual_row.view(mx.uint16)),
+        )
 
 
 def test_draft_step_uses_qsa_only_mtp_layer_and_sparse_expert_pages(monkeypatch):

@@ -2437,6 +2437,7 @@ class StreamingEngine:
         self._qwen4_serial_verify_linear_layers = 0
         self._qwen4_serial_verify_full_layers = 0
         self._qwen4_serial_verify_head_s = 0.0
+        self._qwen4_serial_verify_pipelined_expert_layers = 0
         self._expert_compute_batches = 0
         self._max_experts_per_compute_batch = 0
         self._adaptive_expert_batch_clamps = 0
@@ -8218,6 +8219,7 @@ class StreamingEngine:
         if qwen4_family:
             from .qwen4_exp import (
                 qwen4_attention_residual,
+                qwen4_mlp_from_group_batches,
                 qwen4_mlp_from_groups,
                 qwen4_mlp_route,
             )
@@ -8546,23 +8548,44 @@ class StreamingEngine:
                         positions_by_expert.setdefault(expert, []).append(
                             position)
                 expert_ids = sorted(positions_by_expert)
-                union_fetch_t0 = time.perf_counter()
-                experts = self._get_experts(
-                    layer, expert_ids, positions=positions_by_expert)
-                self._qwen4_serial_verify_union_fetch_s += (
-                    time.perf_counter() - union_fetch_t0)
+                if self._expert_batch_executor is not None:
+                    expert_wait_before = float(
+                        self.timer.totals.get("expert_wait", 0.0))
+                    next_positions = qwen4_mlp_from_group_batches(
+                        routes,
+                        self._iter_expert_batches(
+                            layer, expert_ids,
+                            positions=positions_by_expert,
+                        ),
+                        weights,
+                        prefix,
+                    )
+                    self._qwen4_serial_verify_union_fetch_s += max(
+                        0.0,
+                        float(self.timer.totals.get("expert_wait", 0.0))
+                        - expert_wait_before,
+                    )
+                    self._qwen4_serial_verify_pipelined_expert_layers += 1
+                else:
+                    union_fetch_t0 = time.perf_counter()
+                    experts = self._get_experts(
+                        layer, expert_ids, positions=positions_by_expert)
+                    self._qwen4_serial_verify_union_fetch_s += (
+                        time.perf_counter() - union_fetch_t0)
+                    next_positions = [
+                        qwen4_mlp_from_groups(
+                            route, experts, weights, prefix)
+                        for route in routes
+                    ]
                 self._qwen4_serial_verify_union_layers += 1
                 self._qwen4_serial_verify_expert_slots += expert_slots
                 self._qwen4_serial_verify_union_experts += len(expert_ids)
                 self._qwen4_serial_verify_expert_pages_avoided += max(
                     0, expert_slots - len(expert_ids))
-                next_positions = [
-                    qwen4_mlp_from_groups(
-                        route, experts, weights, prefix)
-                    for route in routes
-                ]
                 mx.eval(*next_positions)
-                del experts, routes, attn_positions
+                if self._expert_batch_executor is None:
+                    del experts
+                del routes, attn_positions
             else:
                 next_positions = []
                 for position, hidden in enumerate(positions):
@@ -9179,6 +9202,7 @@ class StreamingEngine:
         self._qwen4_serial_verify_linear_layers = 0
         self._qwen4_serial_verify_full_layers = 0
         self._qwen4_serial_verify_head_s = 0.0
+        self._qwen4_serial_verify_pipelined_expert_layers = 0
         request_cache_before = _cache_io_snapshot(self)
         reranked_head = self._lm_head_w if self.rc.rerank_lm_head else None
         reranked_telemetry_before = (
@@ -11387,6 +11411,8 @@ class StreamingEngine:
             self._qwen4_serial_verify_full_layers)
         path_stats["qwen4_serial_verify_head_s"] = (
             self._qwen4_serial_verify_head_s)
+        path_stats["qwen4_serial_verify_pipelined_expert_layers"] = (
+            self._qwen4_serial_verify_pipelined_expert_layers)
         overlap = self._expert_route_overlap_totals
         for key in (
             "calls",

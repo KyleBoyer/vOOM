@@ -1029,6 +1029,11 @@ class Qwen4MTPSpeculativeEngine:
                 target, "_qwen4_serial_verify_full_layers", 0)),
             "qwen4_serial_verify_head_s": float(getattr(
                 target, "_qwen4_serial_verify_head_s", 0.0)),
+            "qwen4_serial_verify_pipelined_expert_layers": int(getattr(
+                target,
+                "_qwen4_serial_verify_pipelined_expert_layers",
+                0,
+            )),
         })
         request_cache_after = _cache_io_snapshot(target)
         _record_cache_io_delta(
