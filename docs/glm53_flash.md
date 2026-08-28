@@ -62,6 +62,18 @@ greedy tokens match two ordinary sequential target sweeps, all 146 checked
 KDA/conv/MLA/DSA endpoints match, and compact KDA factor commit reduces the
 two-position wall from 38.96 to 28.27 seconds.
 
+A sustained max-16 repeat also preserves all 16 token IDs across cold and hot
+runs. The hot adaptive-depth path took 146.57 seconds, used six target sweeps,
+and accepted 9/13 proposals (69.2%) at 3.33 GB peak. This is a correctness and
+rollback gate, not a latency success: it remains above 90 seconds. It exposed
+and fixed one fail-closed bookkeeping bug—an ordinary width-one controller
+round has no rejected KDA suffix and therefore must not demand speculative
+rollback factors. A forced depth-five arm reduced sweeps to five but widened
+routed unions, regressing hot wall to 177.66 seconds and reads from 201.71 to
+219.90 GB; it was removed. Expert storage batch 16 likewise regressed the
+four-token hot gate from 23.05 to 23.65 seconds and raised peak memory, so the
+measured ceiling remains eight.
+
 ## Explicit controls
 
 All new narrow speed paths remain opt-in pending the heterogeneous real-request
@@ -70,7 +82,7 @@ corpus required by the anti-overfit policy:
 - `VMODEL_GLM53_MTP=1`
 - `VMODEL_GLM53_MTP_DEPTH=1..5` (measured at 3)
 - `VMODEL_GLM53_MTP_MAX_PROMPT_TOKENS=1..2048`
-- `VMODEL_GLM53_EXPERT_FETCH_BATCH=1..8` (measured at 8)
+- `VMODEL_GLM53_EXPERT_FETCH_BATCH=1..8` (measured at 8; 16 regressed)
 - `VMODEL_GLM53_EXPERT_BATCH_PREFETCH=1`
 - `VMODEL_GLM53_TRUNK_PREFETCH_DEPTH=0..2` (measured at 1)
 - `VMODEL_GLM53_TRUNK_PREFETCH_WORKERS=1..2` (measured at 1)
@@ -91,9 +103,9 @@ batch 1, both prefetch paths off, native MTP off, and generic hot prompt KV off.
 - Native MTP is deliberately limited to 2,048 prompt tokens until the long
   draft-context/index-sharing oracle passes. Larger prompts fall back to the
   exact target rather than silently using an unproved draft path.
-- The 32K -> 128K -> 256K -> 512K -> 1M context ladder and sustained larger
-  output-token gates remain outstanding.
+- The 32K -> 128K -> 256K -> 512K -> 1M context ladder and max-64-or-larger
+  sustained output gates remain outstanding. Max-16 is correct but above the
+  latency target as described above.
 - No new GLM-5.3 behavior becomes automatic until token/hash/state gates pass a
   heterogeneous corpus spanning tool counts, system/developer shapes,
   streaming modes, sampling modes, and output lengths.
-

@@ -27,9 +27,17 @@ was 3.006GB. The internal tier remains within policy at 53.93GB total and
 This clears 90 seconds for an exact repeated short request, not yet for the
 unmodified 46,849-token/134-tool captured Plex request. All MTP, grouped expert,
 trunk prefetch, and generic hot-KV controls remain explicit opt-ins pending the
-required heterogeneous corpus. The final affected regression suite is 360
+required heterogeneous corpus. The final affected regression suite is 361
 passing and two real-K3 tests skipped. Full details and limitations are in
 `docs/glm53_flash.md`.
+
+The subsequent max-16 exact-repeat gate emitted the same 16 IDs across cold and
+hot runs after fixing width-one controller rounds to retain their canonical KDA
+update without demanding nonexistent speculative rollback factors. Hot wall was
+146.570s with 9/13 proposals accepted in six target sweeps and 3.327GB peak, so
+the sustained path remains above 90 seconds. Forced depth five reduced sweeps
+to five but regressed hot wall to 177.663s; expert storage batch 16 similarly
+regressed the four-token hot wall to 23.652s. Both candidates were stopped.
 
 ## 2026-08-28: trace-balanced exact expert placement reaches 76.8 seconds cold
 

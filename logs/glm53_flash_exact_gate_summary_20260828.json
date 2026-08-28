@@ -98,6 +98,41 @@
       "accepted": 2,
       "target_sweeps": 1,
       "true_peak_metal_bytes": 3005719692
+    },
+    {
+      "name": "native-mtp-two-device-adaptive-depth5-max16-repeat",
+      "total_s": 146.56969129201025,
+      "prefill_s": 0.00000004237517714500427,
+      "decode_s": 146.56878804182634,
+      "prompt_cache_exact_hit": 1,
+      "weight_store_bytes_read": 201709935168,
+      "weight_fast_tier_bytes": 75774579264,
+      "weight_archive_bytes": 125935355904,
+      "proposed": 13,
+      "accepted": 9,
+      "target_sweeps": 6,
+      "true_peak_metal_bytes": 3327085720,
+      "tokens": [3411, 1172, 279, 21595, 13, 154842, 27283, 1378, 4734, 15580, 36578, 1393, 46607, 1449, 5880, 28147]
+    }
+  ],
+  "stopped_candidates": [
+    {
+      "name": "expert-fetch-batch16",
+      "reason": "hot wall regressed and peak increased",
+      "control_total_s": 23.04578695911914,
+      "candidate_total_s": 23.651802042033523,
+      "candidate_true_peak_metal_bytes": 3206845692
+    },
+    {
+      "name": "fixed-mtp-depth5-max16",
+      "reason": "one fewer sweep did not offset wider routed-expert unions",
+      "control_total_s": 146.56969129201025,
+      "candidate_total_s": 177.66287687513977,
+      "control_weight_store_bytes_read": 201709935168,
+      "candidate_weight_store_bytes_read": 219896150816,
+      "candidate_target_sweeps": 5,
+      "candidate_proposed": 23,
+      "candidate_accepted": 10
     }
   ],
   "fast_tier": {
@@ -112,10 +147,10 @@
     "target_tokens_identical_across_all_arms": true,
     "native_mtp_target_authoritative": true,
     "affected_tests": {
-      "passed": 360,
+      "passed": 361,
       "skipped_real_k3": 2
     },
-    "final_preflight": "logs/memory_preflight_glm53_final_regression_20260828.json",
+    "final_preflight": "logs/memory_preflight_glm53_sustained_fix_final_20260828.json",
     "final_preflight_passed": true,
     "final_preflight_swap_growth_bytes": 0,
     "final_preflight_swap_out_growth_bytes": 0

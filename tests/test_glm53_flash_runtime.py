@@ -257,3 +257,14 @@ def test_glm53_mtp_block_is_plain_residual_not_hyperconnected(monkeypatch):
     assert seen["mlp_shape"] == x.shape
     expected = (x + mx.array(0.125, dtype=mx.bfloat16)).astype(mx.bfloat16)
     assert bool(mx.all(got == expected))
+
+
+def test_glm53_plain_controller_round_needs_no_speculative_kda_factors():
+    from runtime.speculative import _glm5_kda_rollback_factors_required
+
+    cfg = SimpleNamespace(model_type="glm5_next")
+    assert not _glm5_kda_rollback_factors_required(cfg, 1)
+    assert _glm5_kda_rollback_factors_required(cfg, 2)
+    assert _glm5_kda_rollback_factors_required(cfg, 6)
+    assert not _glm5_kda_rollback_factors_required(
+        SimpleNamespace(model_type="qwen3_5"), 2)

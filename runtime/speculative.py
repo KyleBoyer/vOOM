@@ -114,6 +114,19 @@ def serial_position_verifier_supported(cfg) -> bool:
     )
 
 
+def _glm5_kda_rollback_factors_required(cfg, verify_width: int) -> bool:
+    """Only a speculative suffix needs a fork/factor rollback boundary.
+
+    Width one is the controller's ordinary autoregressive fallback. Its one
+    canonical KDA update is retained directly and has no rejected lane to
+    reconstruct.
+    """
+    return (
+        getattr(cfg, "model_type", None) == "glm5_next"
+        and int(verify_width) > 1
+    )
+
+
 class SpeculativeDecoder:
     def __init__(self, target: StreamingEngine, draft: StreamingEngine | None, k: int = 6,
                  min_tokens_per_sweep: float | None = None,
@@ -610,8 +623,11 @@ class SpeculativeDecoder:
             tgt.begin_provisional()  # F55: routing stats commit post-acceptance
             verify_tokens = [all_tokens[-1]] + proposals
             glm5_recurrent = tgt.cfg.model_type == "glm5_next"
+            glm5_factor_commit = _glm5_kda_rollback_factors_required(
+                tgt.cfg, len(verify_tokens))
             glm5_kda_base = (
-                t_kv.kda_cache.fork() if glm5_recurrent else None)
+                t_kv.kda_cache.fork()
+                if glm5_factor_commit else None)
             try:
                 # F113 (2026-07-25): glm_moe_dsa/kimi_k25/glm4_moe_lite now
                 # have real MoE-aware serial-position support (see
@@ -658,7 +674,7 @@ class SpeculativeDecoder:
 
             # --- rollback speculative KV entries past the accepted prefix ---
             t_kv.trim(base + 1 + m)
-            if glm5_recurrent:
+            if glm5_factor_commit:
                 factors = tgt.consume_serial_kda_factors()
                 if factors is None or glm5_kda_base is None:
                     raise RuntimeError(

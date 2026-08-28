@@ -1,0 +1,42 @@
+{
+  "admission_path": "stable_stale_swap",
+  "clean_swap": false,
+  "end": {
+    "monotonic_s": 2821210.673144,
+    "root_free_bytes": 15590621184,
+    "swap_free_bytes": 730398720,
+    "swap_in_bytes": 315279762227200,
+    "swap_out_bytes": 173066698752,
+    "swap_total_bytes": 4294967296,
+    "swap_used_bytes": 3564568576,
+    "system_available_bytes": 7662157824,
+    "workspace_free_bytes": 462819368960
+  },
+  "passed": true,
+  "reasons": [],
+  "root_ok": true,
+  "sample_seconds": 30.01036429218948,
+  "schema": "voom.memory-preflight.v1",
+  "stable_stale_swap": true,
+  "start": {
+    "monotonic_s": 2821180.662779708,
+    "root_free_bytes": 15590989824,
+    "swap_free_bytes": 730398720,
+    "swap_in_bytes": 315279745269760,
+    "swap_out_bytes": 173066698752,
+    "swap_total_bytes": 4294967296,
+    "swap_used_bytes": 3564568576,
+    "system_available_bytes": 7669776384,
+    "workspace_free_bytes": 462819319808
+  },
+  "swap_growth_bytes": 0,
+  "swap_out_growth_bytes": 0,
+  "thresholds": {
+    "max_swap_growth_bytes": 16000000,
+    "max_swap_out_growth_bytes": 16000000,
+    "min_clean_swap_free_bytes": 2000000000,
+    "min_root_free_bytes": 5000000000,
+    "min_stable_available_bytes": 6000000000
+  },
+  "verdict": "PASS"
+}
