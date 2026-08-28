@@ -2429,6 +2429,14 @@ class StreamingEngine:
         self._qwen4_serial_verify_union_experts = 0
         self._qwen4_serial_verify_expert_pages_avoided = 0
         self._qwen4_serial_verify_union_fetch_s = 0.0
+        self._qwen4_serial_verify_page_prepare_s = 0.0
+        self._qwen4_serial_verify_weight_wait_s = 0.0
+        self._qwen4_serial_verify_reserve_s = 0.0
+        self._qwen4_serial_verify_linear_compute_s = 0.0
+        self._qwen4_serial_verify_full_compute_s = 0.0
+        self._qwen4_serial_verify_linear_layers = 0
+        self._qwen4_serial_verify_full_layers = 0
+        self._qwen4_serial_verify_head_s = 0.0
         self._expert_compute_batches = 0
         self._max_experts_per_compute_batch = 0
         self._adaptive_expert_batch_clamps = 0
@@ -8154,6 +8162,10 @@ class StreamingEngine:
 
         offset = kv.offset
         verifier_positions = len(tokens)
+        profiler = self._request_profiler
+        if profiler is not None:
+            profiler.begin_sweep(
+                verifier_positions, path="serial_positions")
         self._tap_hidden = {}
         # Every block invocation below has the ordinary one-position decode
         # shape even though several positions are retained across the
@@ -8286,6 +8298,9 @@ class StreamingEngine:
                 endpoint.ple_lengths[layer] = source.ple_lengths[layer]
 
         for layer in range(n):
+            cache_before = (
+                profiler.cache_snapshot(self.cache)
+                if profiler is not None else None)
             self._select_serial_verify_layer_transient(
                 verifier_positions, layer
             )
@@ -8303,6 +8318,9 @@ class StreamingEngine:
             if qwen_family:
                 self._qwen35_serial_verify_page_prepare_s += (
                     time.perf_counter() - page_prepare_t0)
+            elif qwen4_family:
+                self._qwen4_serial_verify_page_prepare_s += (
+                    time.perf_counter() - page_prepare_t0)
             t0 = time.perf_counter()
             weights = self.cache.get(
                 self._layer_key(layer), self._layer_names(layer))
@@ -8310,6 +8328,8 @@ class StreamingEngine:
             self.timer.add("weights_wait", weight_wait_s)
             if qwen_family:
                 self._qwen35_serial_verify_weight_wait_s += weight_wait_s
+            elif qwen4_family:
+                self._qwen4_serial_verify_weight_wait_s += weight_wait_s
             if self.governor is not None and self._layer_transient:
                 reserve_t0 = time.perf_counter()
                 self.governor.reserve(
@@ -8318,6 +8338,9 @@ class StreamingEngine:
                     reason="serial-verify-transient")
                 if qwen_family:
                     self._qwen35_serial_verify_reserve_s += (
+                        time.perf_counter() - reserve_t0)
+                elif qwen4_family:
+                    self._qwen4_serial_verify_reserve_s += (
                         time.perf_counter() - reserve_t0)
             # Schedule future I/O only after the current demand page and its
             # compute transient have passed live admission.  Scheduling two
@@ -8633,14 +8656,31 @@ class StreamingEngine:
             # single layer barrier for the position outputs. The lazy KV chain
             # still orders position N before N+1.
             mx.eval(*next_positions)
+            compute_s = time.perf_counter() - layer_compute_t0
             if qwen_family:
-                compute_s = time.perf_counter() - layer_compute_t0
                 if self.cfg.layer_types[layer] == "linear_attention":
                     self._qwen35_serial_verify_linear_layer_compute_s += (
                         compute_s)
                 else:
                     self._qwen35_serial_verify_full_layer_compute_s += (
                         compute_s)
+            elif qwen4_family:
+                if self.cfg.layer_types[layer] == "linear_attention":
+                    self._qwen4_serial_verify_linear_compute_s += compute_s
+                    self._qwen4_serial_verify_linear_layers += 1
+                else:
+                    self._qwen4_serial_verify_full_compute_s += compute_s
+                    self._qwen4_serial_verify_full_layers += 1
+            if profiler is not None:
+                profiler.record_layer(
+                    layer,
+                    positions=verifier_positions,
+                    weight_wait_s=weight_wait_s,
+                    compute_s=compute_s,
+                    cache_before=cache_before,
+                    cache_after=profiler.cache_snapshot(self.cache),
+                    layer_type=self._profile_layer_type(layer),
+                )
             positions = next_positions
             if tapset is not None and layer in tapset:
                 # Preserve the same post-layer residual stream exposed by
@@ -8735,6 +8775,9 @@ class StreamingEngine:
             self._qwen35_serial_verify_head_s = float(getattr(
                 self, "_qwen35_serial_verify_head_s", 0.0)) + (
                     time.perf_counter() - head_t0)
+        elif qwen4_family:
+            self._qwen4_serial_verify_head_s += (
+                time.perf_counter() - head_t0)
         self._h_window = mx.concatenate(positions, axis=1)
         self._h_last = positions[-1]
         self._serial_kda_endpoints = serial_kda_endpoints
@@ -9128,6 +9171,14 @@ class StreamingEngine:
         self._qwen4_serial_verify_union_experts = 0
         self._qwen4_serial_verify_expert_pages_avoided = 0
         self._qwen4_serial_verify_union_fetch_s = 0.0
+        self._qwen4_serial_verify_page_prepare_s = 0.0
+        self._qwen4_serial_verify_weight_wait_s = 0.0
+        self._qwen4_serial_verify_reserve_s = 0.0
+        self._qwen4_serial_verify_linear_compute_s = 0.0
+        self._qwen4_serial_verify_full_compute_s = 0.0
+        self._qwen4_serial_verify_linear_layers = 0
+        self._qwen4_serial_verify_full_layers = 0
+        self._qwen4_serial_verify_head_s = 0.0
         request_cache_before = _cache_io_snapshot(self)
         reranked_head = self._lm_head_w if self.rc.rerank_lm_head else None
         reranked_telemetry_before = (
@@ -11320,6 +11371,22 @@ class StreamingEngine:
             self._qwen4_serial_verify_expert_pages_avoided)
         path_stats["qwen4_serial_verify_union_fetch_s"] = (
             self._qwen4_serial_verify_union_fetch_s)
+        path_stats["qwen4_serial_verify_page_prepare_s"] = (
+            self._qwen4_serial_verify_page_prepare_s)
+        path_stats["qwen4_serial_verify_weight_wait_s"] = (
+            self._qwen4_serial_verify_weight_wait_s)
+        path_stats["qwen4_serial_verify_reserve_s"] = (
+            self._qwen4_serial_verify_reserve_s)
+        path_stats["qwen4_serial_verify_linear_compute_s"] = (
+            self._qwen4_serial_verify_linear_compute_s)
+        path_stats["qwen4_serial_verify_full_compute_s"] = (
+            self._qwen4_serial_verify_full_compute_s)
+        path_stats["qwen4_serial_verify_linear_layers"] = (
+            self._qwen4_serial_verify_linear_layers)
+        path_stats["qwen4_serial_verify_full_layers"] = (
+            self._qwen4_serial_verify_full_layers)
+        path_stats["qwen4_serial_verify_head_s"] = (
+            self._qwen4_serial_verify_head_s)
         overlap = self._expert_route_overlap_totals
         for key in (
             "calls",

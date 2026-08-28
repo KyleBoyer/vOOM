@@ -1013,6 +1013,22 @@ class Qwen4MTPSpeculativeEngine:
                 target, "_qwen4_serial_verify_expert_pages_avoided", 0)),
             "qwen4_serial_verify_union_fetch_s": float(getattr(
                 target, "_qwen4_serial_verify_union_fetch_s", 0.0)),
+            "qwen4_serial_verify_page_prepare_s": float(getattr(
+                target, "_qwen4_serial_verify_page_prepare_s", 0.0)),
+            "qwen4_serial_verify_weight_wait_s": float(getattr(
+                target, "_qwen4_serial_verify_weight_wait_s", 0.0)),
+            "qwen4_serial_verify_reserve_s": float(getattr(
+                target, "_qwen4_serial_verify_reserve_s", 0.0)),
+            "qwen4_serial_verify_linear_compute_s": float(getattr(
+                target, "_qwen4_serial_verify_linear_compute_s", 0.0)),
+            "qwen4_serial_verify_full_compute_s": float(getattr(
+                target, "_qwen4_serial_verify_full_compute_s", 0.0)),
+            "qwen4_serial_verify_linear_layers": int(getattr(
+                target, "_qwen4_serial_verify_linear_layers", 0)),
+            "qwen4_serial_verify_full_layers": int(getattr(
+                target, "_qwen4_serial_verify_full_layers", 0)),
+            "qwen4_serial_verify_head_s": float(getattr(
+                target, "_qwen4_serial_verify_head_s", 0.0)),
         })
         request_cache_after = _cache_io_snapshot(target)
         _record_cache_io_delta(
@@ -1062,5 +1078,10 @@ class Qwen4MTPSpeculativeEngine:
             "path_stats": path_stats,
             "prompt_tokens": len(ids),
         }
+        profiler = getattr(target, "_request_profiler", None)
+        execution_profile = (
+            profiler.result(total_s) if profiler is not None else None)
+        if execution_profile is not None:
+            result["execution_profile"] = execution_profile
         self._release_idle_phase_head(result)
         return result

@@ -303,6 +303,7 @@ class _FakeTarget:
         self._kda_endpoints = None
         self._aux_endpoints = None
         self.idle_head_releases = 0
+        self._request_profiler = None
 
     def generate(self, _prompt, max_tokens, **_kwargs):
         assert max_tokens == 1
@@ -440,6 +441,32 @@ def test_speculative_controller_full_accept_emits_bonus_in_one_target_sweep(
     assert result["path_stats"]["qwen4_mtp_idle_head_release_bytes"] == 123
     assert target.idle_head_releases == 1
     assert target.last_kv.offset == 5
+
+
+def test_speculative_controller_returns_request_profiler_result(
+        _cache_io_noop):
+    class _Profiler:
+        def __init__(self):
+            self.calls = []
+
+        def result(self, wall_s):
+            self.calls.append(wall_s)
+            return {"schema_version": 1, "level": "layers"}
+
+    target = _FakeTarget([11, 12, 13])
+    profiler = _Profiler()
+    target._request_profiler = profiler
+    engine = Qwen4MTPSpeculativeEngine(
+        target, depth=2, drafter=_FakeDrafter([11, 12]))
+
+    result = engine.generate(
+        "prompt", max_tokens=4,
+        sampling=SamplingParams(temperature=0.0))
+
+    assert result["execution_profile"] == {
+        "schema_version": 1, "level": "layers"}
+    assert len(profiler.calls) == 1
+    assert profiler.calls[0] == pytest.approx(result["total_s"])
 
 
 def test_confidence_adaptive_width_keeps_low_confidence_token_and_verifies_it(
