@@ -211,6 +211,14 @@ Other bounded exact candidates were stopped before promotion:
   76.446s within run variance. The capability remains default-off and is a
   STOP at 49K; reconsider only at a substantially longer context where the
   avoided pooling work can clear the 10% wall gate.
+- Adaptive Lightning-MTP depth four with a 0.625 draft-confidence floor did
+  produce variable widths (`4,1,2,4,4,1,2`), but it increased target sweeps
+  from six to seven, logical reads from 136.353GB to 151.368GB, and wall from
+  76.766s to 93.070s. It also failed the swap-growth gate. The exact-target
+  distribution remains authoritative, but categorical speculative sampling
+  consumes a different valid RNG path, so this run's different output hash is
+  not a greedy equality witness. Keep depth three; do not threshold-fit this
+  single captured request.
 
 The instrumented profile now reports verifier page admission, weight wait,
 reserve time, linear/full-attention compute, head time, exact expert-pipeline
