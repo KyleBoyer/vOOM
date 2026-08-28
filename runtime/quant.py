@@ -849,6 +849,41 @@ def dequantize_deepseek_v4_fp8(packed: mx.array, scale: mx.array) -> mx.array:
         decoded, values.shape)).astype(mx.bfloat16)
 
 
+def dequantize_finegrained_fp8(
+        packed: mx.array, weight_scale_inv: mx.array) -> mx.array:
+    """Dequantize HF fine-grained E4M3 weights with float32 block scales.
+
+    GLM-5.3-Flash stores every converted matrix as ``weight`` plus
+    ``weight_scale_inv``.  Despite the historical name, the sibling contains
+    the *dequantization multiplier*: the official Transformers conversion is
+    ``float8(weight) * weight_scale_inv`` over the released 128x128 grid.
+    This is distinct from DeepSeek-V4's E8M0 exponent-byte ``.scale`` format.
+    Keeping separate entry points makes mixing those two plausible-looking
+    encodings a hard error instead of silent numerical corruption.
+    """
+    if packed.dtype != mx.uint8:
+        raise ValueError(
+            f"fine-grained FP8 weights must load as uint8, got {packed.dtype}")
+    if weight_scale_inv.dtype != mx.float32:
+        raise ValueError(
+            "fine-grained FP8 weight_scale_inv must be float32, got "
+            f"{weight_scale_inv.dtype}")
+    values = mx.from_fp8(packed, mx.float32)
+    if weight_scale_inv.ndim == 2 and values.ndim == 2:
+        rows, cols = values.shape
+        scale_rows, scale_cols = weight_scale_inv.shape
+        if (scale_rows > 0 and scale_cols > 0
+                and rows % scale_rows == 0 and cols % scale_cols == 0):
+            block_rows = rows // scale_rows
+            block_cols = cols // scale_cols
+            blocked = values.reshape(
+                scale_rows, block_rows, scale_cols, block_cols)
+            return (blocked * weight_scale_inv[:, None, :, None]).reshape(
+                rows, cols).astype(mx.bfloat16)
+    return (values * _broadcast_block_scale(
+        weight_scale_inv, values.shape)).astype(mx.bfloat16)
+
+
 def dequantize_deepseek_v4_fp4(packed: mx.array, scale: mx.array
                                ) -> mx.array:
     """Dequantize a routed expert: E2M1 FP4 packed two per byte, E8M0 scales.

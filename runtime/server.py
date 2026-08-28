@@ -1968,6 +1968,68 @@ class EngineManager:
             raise RequestValidationError(
                 "VMODEL_K3_HOT_KV_PERSIST_DIR requires "
                 "VMODEL_K3_HOT_PROMPT_KV=1")
+        glm53_hot_prompt_kv_request = os.environ.get(
+            "VMODEL_GLM53_HOT_PROMPT_KV", "0").strip()
+        if glm53_hot_prompt_kv_request not in ("0", "1"):
+            raise RequestValidationError(
+                "VMODEL_GLM53_HOT_PROMPT_KV must be 0 or 1")
+        try:
+            glm53_hot_kv_slots = int(os.environ.get(
+                "VMODEL_GLM53_HOT_KV_SLOTS", "1"))
+            glm53_hot_kv_min_tokens = int(os.environ.get(
+                "VMODEL_GLM53_HOT_KV_MIN_TOKENS", "16"))
+        except ValueError as error:
+            raise RequestValidationError(
+                "VMODEL_GLM53_HOT_KV settings must be integers") from error
+        if not 1 <= glm53_hot_kv_slots <= 4:
+            raise RequestValidationError(
+                "VMODEL_GLM53_HOT_KV_SLOTS must be in [1, 4]")
+        if glm53_hot_kv_min_tokens < 0:
+            raise RequestValidationError(
+                "VMODEL_GLM53_HOT_KV_MIN_TOKENS must be non-negative")
+        glm53_mtp_request = os.environ.get(
+            "VMODEL_GLM53_MTP", "0").strip()
+        if glm53_mtp_request not in ("0", "1"):
+            raise RequestValidationError(
+                "VMODEL_GLM53_MTP must be 0 or 1")
+        try:
+            glm53_mtp_depth = int(os.environ.get(
+                "VMODEL_GLM53_MTP_DEPTH", "3"))
+            glm53_mtp_max_prompt_tokens = int(os.environ.get(
+                "VMODEL_GLM53_MTP_MAX_PROMPT_TOKENS", "2048"))
+        except ValueError as error:
+            raise RequestValidationError(
+                "VMODEL_GLM53_MTP settings must be integers") from error
+        if not 1 <= glm53_mtp_depth <= 5:
+            raise RequestValidationError(
+                "VMODEL_GLM53_MTP_DEPTH must be in [1, 5]")
+        if not 1 <= glm53_mtp_max_prompt_tokens <= 2048:
+            raise RequestValidationError(
+                "VMODEL_GLM53_MTP_MAX_PROMPT_TOKENS must be in [1, 2048]")
+        glm53_expert_batch_prefetch_request = os.environ.get(
+            "VMODEL_GLM53_EXPERT_BATCH_PREFETCH", "0").strip()
+        if glm53_expert_batch_prefetch_request not in ("0", "1"):
+            raise RequestValidationError(
+                "VMODEL_GLM53_EXPERT_BATCH_PREFETCH must be 0 or 1")
+        try:
+            glm53_expert_fetch_batch = int(os.environ.get(
+                "VMODEL_GLM53_EXPERT_FETCH_BATCH", "1"))
+            glm53_trunk_prefetch_depth = int(os.environ.get(
+                "VMODEL_GLM53_TRUNK_PREFETCH_DEPTH", "0"))
+            glm53_trunk_prefetch_workers = int(os.environ.get(
+                "VMODEL_GLM53_TRUNK_PREFETCH_WORKERS", "1"))
+        except ValueError as error:
+            raise RequestValidationError(
+                "VMODEL_GLM53 expert/prefetch settings must be integers") from error
+        if not 1 <= glm53_expert_fetch_batch <= 8:
+            raise RequestValidationError(
+                "VMODEL_GLM53_EXPERT_FETCH_BATCH must be in [1, 8]")
+        if not 0 <= glm53_trunk_prefetch_depth <= 2:
+            raise RequestValidationError(
+                "VMODEL_GLM53_TRUNK_PREFETCH_DEPTH must be in [0, 2]")
+        if not 1 <= glm53_trunk_prefetch_workers <= 2:
+            raise RequestValidationError(
+                "VMODEL_GLM53_TRUNK_PREFETCH_WORKERS must be in [1, 2]")
         key = (
             str(model_dir), mode, yarn_factor.hex(),
             bool(requires_vision), resident_backend_request,
@@ -2068,6 +2130,16 @@ class EngineManager:
             k3_decode_expert_fetch_batch,
             k3_expert_top_k_request,
             k3_expert_prune_manifest,
+            glm53_hot_prompt_kv_request,
+            glm53_hot_kv_slots,
+            glm53_hot_kv_min_tokens,
+            glm53_mtp_request,
+            glm53_mtp_depth,
+            glm53_mtp_max_prompt_tokens,
+            glm53_expert_fetch_batch,
+            glm53_expert_batch_prefetch_request,
+            glm53_trunk_prefetch_depth,
+            glm53_trunk_prefetch_workers,
         )
         # A healthy resident engine owns all state it needs. Return before
         # touching model storage so a transient NAS disconnect cannot stall or
@@ -2177,6 +2249,16 @@ class EngineManager:
             k3_decode_expert_fetch_batch,
             k3_expert_top_k_request,
             k3_expert_prune_manifest,
+            glm53_hot_prompt_kv_request,
+            glm53_hot_kv_slots,
+            glm53_hot_kv_min_tokens,
+            glm53_mtp_request,
+            glm53_mtp_depth,
+            glm53_mtp_max_prompt_tokens,
+            glm53_expert_fetch_batch,
+            glm53_expert_batch_prefetch_request,
+            glm53_trunk_prefetch_depth,
+            glm53_trunk_prefetch_workers,
         )
         # Validate the requested profile before evicting a healthy resident
         # engine. ModelConfig.from_dir is read-only and has the same remount
@@ -2483,6 +2565,48 @@ class EngineManager:
                 # fingerprint can't certify) -- every other adaptive_chunk_size
                 # branch already clears this same default.
                 rc.prompt_kv_dir = ""
+            elif mtype == "glm5_next":
+                # GLM-5.3-Flash ships its routed experts in released FP8 with
+                # float32 block multipliers. WeightStore expands one bounded
+                # expert page to BF16 for the unchanged target matmul; it does
+                # not apply an additional vOOM quantizer. Keep the 1.27-GB
+                # embedding and untied head row/block streamed so the model's
+                # hybrid KDA/MLA state and layer scratch retain headroom.
+                rc.pin_embeddings = False
+                rc.embed_rows = True
+                rc.pin_lm_head = False
+                rc.stream_lm_head = True
+                rc.prompt_kv_dir = ""
+                rc.max_weight_cache_mb = 1500
+                rc.min_weight_cache_mb = 150
+                rc.mlx_cache_limit_mb = 512
+                rc.metal_limit_mb = 8500
+                rc.prefetch_depth = glm53_trunk_prefetch_depth
+                rc.prefetch_workers = glm53_trunk_prefetch_workers
+                rc.expert_compute_batch = 1
+                rc.decode_expert_fetch_batch = int(
+                    cfg_probe.num_experts_per_tok)
+                # Default preserves the first real gate. An explicit arm may
+                # coalesce up to eight exact FP8 expert pages per storage fetch
+                # while retaining the one-expert arithmetic/materialization
+                # order; the optional single-future pipeline overlaps the next
+                # authoritative batch with current expert compute.
+                rc.expert_fetch_batch = glm53_expert_fetch_batch
+                rc.expert_batch_prefetch = (
+                    glm53_expert_batch_prefetch_request == "1")
+                rc.prefill_chunk_size = 32
+                rc.layer_stationary_prefill = True
+                rc.adaptive_chunk_size = False
+                # Exact request-to-request prefix reuse is deliberately
+                # opt-in until it clears the heterogeneous real-request
+                # corpus.  GLM-5.3's layer-stationary prefill uses a fixed
+                # tile, so its KDA, compressed-MLA, and DSA endpoints are
+                # eligible for the generic immutable hot-prefix cache.
+                rc.hot_prompt_kv = glm53_hot_prompt_kv_request == "1"
+                if rc.hot_prompt_kv:
+                    rc.hot_prompt_kv_chunk_size = rc.prefill_chunk_size
+                    rc.hot_prompt_kv_slots = glm53_hot_kv_slots
+                    rc.hot_prompt_kv_min_tokens = glm53_hot_kv_min_tokens
             elif mtype == "glm_moe_dsa":
                 rc.max_weight_cache_mb = 5000
                 if mode in ("fast", "fast-long"):
@@ -4917,6 +5041,27 @@ class EngineManager:
                     self._engine = None
                     raise RequestValidationError(
                         "could not initialize explicit Qwen4 Lightning-MTP: "
+                        f"{error}") from error
+            elif mtype == "glm5_next" and glm53_mtp_request == "1":
+                from .speculative import NativeMTPEngine
+
+                try:
+                    self._engine = NativeMTPEngine(
+                        target_engine,
+                        k=glm53_mtp_depth,
+                        max_prompt_tokens=glm53_mtp_max_prompt_tokens,
+                    )
+                    print(
+                        "[server] exact GLM-5.3 native-MTP speculation: "
+                        f"target={model_dir.name} depth={glm53_mtp_depth} "
+                        f"prompt_limit={glm53_mtp_max_prompt_tokens}",
+                        flush=True,
+                    )
+                except Exception as error:
+                    target_engine.close()
+                    self._engine = None
+                    raise RequestValidationError(
+                        "could not initialize explicit GLM-5.3 native MTP: "
                         f"{error}") from error
             elif dflash2_dir is not None:
                 from .dflash2_adapter import DFlash2SpeculativeEngine
@@ -8020,6 +8165,7 @@ def _hidden_gateway_catalogs(tools, raw_tools, messages, query: str | None = Non
 
 _HYBRID_RECURRENT_MODEL_TYPES = (
     "qwen3_5", "qwen3_5_moe", "qwen4_exp", "kimi_linear", "kimi_k3",
+    "glm5_next",
 )
 
 

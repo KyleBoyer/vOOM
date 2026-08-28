@@ -105,6 +105,7 @@ def serial_position_verifier_supported(cfg) -> bool:
         not int(getattr(cfg, "num_experts", 0) or 0)
         or getattr(cfg, "model_type", None) in (
             "glm_moe_dsa",
+            "glm5_next",
             "kimi_k25",
             "glm4_moe_lite",
             "kimi_linear",
@@ -155,7 +156,7 @@ class SpeculativeDecoder:
                 f"KVCache.trim() cannot roll back kda_cache on partial "
                 f"rejection. Use QwenMTPSpeculativeEngine instead.")
         target_glm_family = getattr(target.cfg, "model_type", None) in (
-            "glm_moe_dsa", "kimi_k25", "glm4_moe_lite")
+            "glm_moe_dsa", "glm5_next", "kimi_k25", "glm4_moe_lite")
         # F128: kimi_k3 gets the SAME exemption treatment as glm_family
         # below -- forward_tokens_serial_positions gained a real kimi_k3_
         # family per-position dispatch (AttnRes-aware, batching only the
@@ -225,6 +226,12 @@ class SpeculativeDecoder:
             raise ValueError("prompt_cache_min_tokens must be >= 0")
         self.prompt_cache_min_tokens = prompt_cache_min_tokens
         self._prompt_cache = None
+        # Native-MTP prompt reuse needs two immutable boundaries: the target's
+        # hybrid KV/KDA/DSA state and the appended draft block's dense MLA
+        # state. It cannot reuse ``_prompt_cache`` above: that cache transfers
+        # mutable ownership and later trims the target KV, while a recurrent
+        # GLM target cannot reconstruct an earlier KDA state by slicing.
+        self._mtp_prompt_cache = None
         cfg = target.cfg
         # MoE verify cost grows with drafted positions. Aggregate post-fix runs
         # motivated the rough ~0.7 increment, but F01 per-round physical-byte
@@ -248,21 +255,30 @@ class SpeculativeDecoder:
         self.mtp = None
         if draft == "mtp":  # F23: the target's own MTP block is the draft source
             from .glm_mtp import MTPDrafter
-            from .kv_cache import KVCache
 
             self.mtp = MTPDrafter(target)
-            # F65: MTP layer index comes from the drafter (derived from config,
-            # not hardcoded), so this also works on architecture-faithful fixtures
-            self._mtp_kv = KVCache(self.mtp.mtp_layer + 1)
-            self._mtp_kv.compressed_mla = True
+            self._mtp_kv = self._new_mtp_kv()
             self.draft = draft = None
         if draft is not None:
             probe = "The quick brown fox, 123!"
             if target.tokenizer.encode(probe).ids != draft.tokenizer.encode(probe).ids:
                 raise ValueError("target and draft tokenizers disagree — incompatible pair")
 
+    def _new_mtp_kv(self):
+        from .kv_cache import KVCache
+
+        if self.mtp is None:
+            return None
+        # F65: the appended draft block sits one past the target trunk.  Its
+        # GLM-5.3 attention is dense MLA and intentionally does not allocate a
+        # second DSA indexer; target verification still uses released DSA.
+        kv = KVCache(self.mtp.mtp_layer + 1)
+        kv.compressed_mla = True
+        return kv
+
     def clear_prompt_cache(self) -> None:
         self._prompt_cache = None
+        self._mtp_prompt_cache = None
 
     def _choose_k(self) -> int:
         """F48 (MoE-SpeQ-derived local heuristic): adaptive draft length.
@@ -302,6 +318,26 @@ class SpeculativeDecoder:
         eos = set(tgt.cfg.eos_token_ids)
         stop = stop or []
 
+        # StreamingEngine.generate normally owns request profiling, but this
+        # decoder intentionally calls the target's lower-level sweeps. Create
+        # the same bounded profiler here so speculative verification is not an
+        # observability blind spot.
+        from . import telemetry
+
+        tgt._request_profiler = (
+            telemetry.RequestProfiler(tgt.rc.execution_profile)
+            if tgt.rc.execution_profile else None)
+        if tgt._request_profiler is not None:
+            tgt._request_profiler.set_phase("prefill")
+        from .engine import _cache_io_snapshot, _record_cache_io_delta
+
+        request_cache_before = _cache_io_snapshot(tgt)
+        expert_pipeline_before = (
+            int(getattr(tgt, "_expert_batch_prefetch_submitted", 0) or 0),
+            float(getattr(tgt, "_expert_batch_prefetch_wait_s", 0.0) or 0.0),
+            float(getattr(tgt, "_expert_batch_prefetch_hidden_s", 0.0) or 0.0),
+        )
+
         if isinstance(max_tokens, bool) or not isinstance(max_tokens, int) or max_tokens <= 0:
             raise ValueError("max_tokens must be a positive integer")
         request_t0 = time.perf_counter()
@@ -322,7 +358,9 @@ class SpeculativeDecoder:
             raise ValueError(
                 f"context_bound={tgt.rc.context_bound} but prompt({len(ids)})"
                 f"+max_tokens({max_tokens}) exceeds it")
-        if (self.mtp is not None and tgt.cfg.index_topk
+        if (self.mtp is not None
+                and tgt.cfg.model_type != "glm5_next"
+                and tgt.cfg.index_topk
                 and len(ids) + max_tokens > tgt.cfg.index_topk):
             raise RuntimeError(
                 "MTP above index_topk is quarantined until its released dynamic "
@@ -336,6 +374,9 @@ class SpeculativeDecoder:
         if drf is not None:
             drf.release_request_state()
         tgt._provisional = None
+        if self.mtp is not None:
+            self._mtp_kv = self._new_mtp_kv()
+            self._mtp_h = None
         tgt._true_peak_metal_bytes = mx.get_active_memory()
         if tgt.governor is not None:
             tgt.governor.reset_request_peak(tgt._true_peak_metal_bytes)
@@ -354,6 +395,9 @@ class SpeculativeDecoder:
         cache_eligible = bool(
             drf is not None and self.prompt_cache_min_tokens
             and len(ids) >= self.prompt_cache_min_tokens)
+        mtp_cache_eligible = bool(
+            self.mtp is not None and self.prompt_cache_min_tokens
+            and len(ids) >= self.prompt_cache_min_tokens)
         lookup_t0 = time.perf_counter()
         cached = (
             self._prompt_cache
@@ -361,18 +405,43 @@ class SpeculativeDecoder:
             and self._prompt_cache[0] == prompt_cache_key
             else None
         )
+        mtp_cached = (
+            self._mtp_prompt_cache
+            if mtp_cache_eligible and self._mtp_prompt_cache is not None
+            and self._mtp_prompt_cache[0] == prompt_cache_key
+            else None
+        )
         prompt_cache_lookup_s = time.perf_counter() - lookup_t0
-        prompt_cache_hit = cached is not None
+        prompt_cache_hit = cached is not None or mtp_cached is not None
         prompt_cache_matched = len(ids) if prompt_cache_hit else 0
         prompt_cache_exact_hit = prompt_cache_hit
+        mtp_target_prompt_snapshot = None
+        mtp_draft_prompt_snapshot = None
+        mtp_prompt_h_last = None
         if prompt_cache_hit:
-            _, t_kv, d_kv, prompt_last_logits = cached
-            # Transfer ownership into this request. A failure must not leave a
-            # partially advanced cache eligible for the next request.
-            self._prompt_cache = None
+            if cached is not None:
+                _, t_kv, d_kv, prompt_last_logits = cached
+                # Transfer ownership into this request. A failure must not leave a
+                # partially advanced cache eligible for the next request.
+                self._prompt_cache = None
+            else:
+                (_key, mtp_target_prompt_snapshot,
+                 mtp_draft_prompt_snapshot, prompt_last_logits,
+                 mtp_prompt_h_last) = mtp_cached
+                # The saved boundaries remain immutable. Each request advances
+                # independent COW branches, so an exception or rejected suffix
+                # cannot poison the next exact hit.
+                t_kv = mtp_target_prompt_snapshot.fork()
+                d_kv = None
+                self._mtp_kv = mtp_draft_prompt_snapshot.fork()
+                self._mtp_h = mtp_prompt_h_last
+                tgt._h_last = mtp_prompt_h_last
+                tgt._h_window = None
         else:
             if cache_eligible:
                 self._prompt_cache = None
+            if mtp_cache_eligible:
+                self._mtp_prompt_cache = None
             t_kv = tgt.new_kv(stepped=target_stepped)
             d_kv = (drf.new_kv(stepped=draft_stepped)
                     if drf is not None else None)
@@ -389,11 +458,27 @@ class SpeculativeDecoder:
         if prompt_cache_hit:
             prefill_s = time.perf_counter() - prefill_t0
         else:
-            logits = tgt.forward_tokens(ids, t_kv)  # cold prompt sweep
-            prompt_last_logits = logits[-1]
+            if tgt.cfg.model_type == "glm5_next":
+                hidden = tgt._embed(ids)
+                hidden = tgt._layer_stationary_glm5_next_sweep(
+                    hidden, t_kv, offset=0,
+                    tile_width=tgt.rc.prefill_chunk_size)
+                tgt._h_window = hidden
+                tgt._h_last = hidden[:, -1:, :]
+                prompt_last_logits = tgt._final_logits(hidden)
+            else:
+                logits = tgt.forward_tokens(ids, t_kv)  # cold prompt sweep
+                prompt_last_logits = logits[-1]
             mx.eval(prompt_last_logits)
             prefill_s = time.perf_counter() - prefill_t0
+            if mtp_cache_eligible:
+                # Capture the exact prompt endpoint before verification advances
+                # any target recurrence. Tensor storage is shared COW; only the
+                # small Python/cache-state shells are copied here.
+                mtp_target_prompt_snapshot = t_kv.fork()
+                mtp_prompt_h_last = tgt._h_last
         stats.verify_s += prefill_s
+        prefill_cache_after = _cache_io_snapshot(tgt)
         # Keep the historical synthetic prefill sweep in this counter even on
         # a cache hit so ``sweeps - 1`` remains decode-target sweeps.
         stats.sweeps += 1
@@ -436,6 +521,8 @@ class SpeculativeDecoder:
         draft_fed = prompt_cache_matched
         # Number of all_tokens already absorbed by the draft KV.
         decode_t0 = time.perf_counter()
+        if tgt._request_profiler is not None:
+            tgt._request_profiler.set_phase("decode")
 
         while (len(emitted) < max_tokens and all_tokens[-1] not in eos
                and stop_text is None):
@@ -465,6 +552,11 @@ class SpeculativeDecoder:
                     P = tgt._h_window.shape[1]
                     assert P == len(all_tokens) - 1, "MTP prefill needs the full trunk window"
                     self.mtp.prefill(all_tokens[:P], tgt._h_window, self._mtp_kv)
+                if (mtp_cache_eligible and mtp_draft_prompt_snapshot is None
+                        and not prompt_cache_hit):
+                    # Snapshot immediately after prompt synchronization and
+                    # before draft_tokens feeds the pending first output.
+                    mtp_draft_prompt_snapshot = self._mtp_kv.fork()
                 # invariant: MTP inputs fed so far = all_tokens[1:-1] (the last
                 # committed token becomes an input only when drafting begins)
                 assert self._mtp_kv.offset == len(all_tokens) - 2, \
@@ -517,6 +609,9 @@ class SpeculativeDecoder:
             b_verify0 = tgt.cache.stats.bytes_read  # F01 telemetry
             tgt.begin_provisional()  # F55: routing stats commit post-acceptance
             verify_tokens = [all_tokens[-1]] + proposals
+            glm5_recurrent = tgt.cfg.model_type == "glm5_next"
+            glm5_kda_base = (
+                t_kv.kda_cache.fork() if glm5_recurrent else None)
             try:
                 # F113 (2026-07-25): glm_moe_dsa/kimi_k25/glm4_moe_lite now
                 # have real MoE-aware serial-position support (see
@@ -530,7 +625,8 @@ class SpeculativeDecoder:
                     and len(verify_tokens) > 1
                 ):
                     logits = tgt.forward_tokens_serial_positions(
-                        verify_tokens, t_kv)
+                        verify_tokens, t_kv,
+                        capture_kda_factors=glm5_recurrent)
                 else:
                     logits = tgt.forward_tokens(verify_tokens, t_kv)
             except BaseException:
@@ -562,6 +658,14 @@ class SpeculativeDecoder:
 
             # --- rollback speculative KV entries past the accepted prefix ---
             t_kv.trim(base + 1 + m)
+            if glm5_recurrent:
+                factors = tgt.consume_serial_kda_factors()
+                if factors is None or glm5_kda_base is None:
+                    raise RuntimeError(
+                        "GLM-5.3 verifier did not retain KDA rollback factors")
+                if m + 1 < len(verify_tokens):
+                    t_kv.kda_cache = factors.commit_prefix(
+                        glm5_kda_base, m + 1)
             valid = len(all_tokens) + m  # fed-and-valid positions incl. all_tokens[-1]
             if d_kv is not None:
                 if d_kv.offset > valid:
@@ -650,6 +754,18 @@ class SpeculativeDecoder:
             self._prompt_cache = (
                 prompt_cache_key, t_kv, d_kv, prompt_last_logits)
             prompt_cache_stored = True
+        elif (mtp_cache_eligible and not prompt_cache_hit
+                and mtp_target_prompt_snapshot is not None
+                and mtp_draft_prompt_snapshot is not None
+                and mtp_prompt_h_last is not None):
+            self._mtp_prompt_cache = (
+                prompt_cache_key,
+                mtp_target_prompt_snapshot,
+                mtp_draft_prompt_snapshot,
+                prompt_last_logits,
+                mtp_prompt_h_last,
+            )
+            prompt_cache_stored = True
         total_s = time.perf_counter() - request_t0
         tgt._note_true_peak()
         if drf is not None:
@@ -673,9 +789,19 @@ class SpeculativeDecoder:
             "prompt_cache_source": (
                 "speculative-memory" if prompt_cache_hit
                 else "speculative-cold"),
+            "prompt_cache_kind": (
+                "native-mtp" if mtp_cache_eligible else
+                "draft-model" if cache_eligible else "disabled"),
             "prompt_cache_lookup_s": prompt_cache_lookup_s,
             "prompt_cache_write_tokens": (
                 len(ids) if prompt_cache_stored else 0),
+            "prompt_cache_resident_bytes": (
+                mtp_target_prompt_snapshot.nbytes()
+                + mtp_draft_prompt_snapshot.nbytes()
+                if mtp_cache_eligible
+                and mtp_target_prompt_snapshot is not None
+                and mtp_draft_prompt_snapshot is not None
+                else 0),
             "prompt_tokenize_s": tokenize_s,
             "prompt_snapshot_write_s": 0.0,
             "postgen_snapshot_write_s": 0.0,
@@ -686,6 +812,14 @@ class SpeculativeDecoder:
             "speculative_target_sweeps": max(0, stats.sweeps - 1),
             "speculative_proposed": stats.proposed,
             "speculative_accepted": stats.accepted,
+            "speculative_acceptance_rate": (
+                stats.accepted / stats.proposed if stats.proposed else 0.0),
+            "speculative_draft_s": stats.draft_s,
+            "speculative_verify_s": stats.verify_s,
+            "speculative_verify_decode_s": max(
+                0.0, stats.verify_s - prefill_s),
+            "speculative_draft_bytes": stats.draft_bytes,
+            "speculative_rounds": [list(values) for values in stats.rounds],
             "speculative_draft_oov_fallbacks": stats.draft_oov_fallbacks,
             "speculative_resident_draft_rounds": stats.resident_draft_rounds,
             "speculative_resident_draft_tokens": stats.resident_draft_tokens,
@@ -701,7 +835,31 @@ class SpeculativeDecoder:
             # inspection could show that.
             "speculative_controller_disabled_rounds": self.controller_disabled_rounds,
         }
-        return {
+        request_cache_after = _cache_io_snapshot(tgt)
+        _record_cache_io_delta(
+            tgt, request_cache_before, path_stats,
+            after=request_cache_after)
+        _record_cache_io_delta(
+            tgt, request_cache_before, path_stats,
+            prefix="prefill_", after=prefill_cache_after)
+        _record_cache_io_delta(
+            tgt, prefill_cache_after, path_stats,
+            prefix="decode_", after=request_cache_after)
+        expert_pipeline_after = (
+            int(getattr(tgt, "_expert_batch_prefetch_submitted", 0) or 0),
+            float(getattr(tgt, "_expert_batch_prefetch_wait_s", 0.0) or 0.0),
+            float(getattr(tgt, "_expert_batch_prefetch_hidden_s", 0.0) or 0.0),
+        )
+        path_stats["expert_batch_prefetch_submitted"] = max(
+            0, expert_pipeline_after[0] - expert_pipeline_before[0])
+        path_stats["expert_batch_prefetch_wait_s"] = max(
+            0.0, expert_pipeline_after[1] - expert_pipeline_before[1])
+        path_stats["expert_batch_prefetch_hidden_s"] = max(
+            0.0, expert_pipeline_after[2] - expert_pipeline_before[2])
+        execution_profile = (
+            tgt._request_profiler.result(total_s)
+            if tgt._request_profiler is not None else None)
+        result = {
             "text": final_text,
             "tokens": emitted,
             "prefill_s": prefill_s,
@@ -721,6 +879,9 @@ class SpeculativeDecoder:
             "prompt_tokens": len(ids),
             "stats": stats,
         }
+        if execution_profile is not None:
+            result["execution_profile"] = execution_profile
+        return result
 
 
 class SpeculativeEngine:
@@ -842,3 +1003,98 @@ class SpeculativeEngine:
             self.draft.close()
         finally:
             self.target.close()
+
+
+class NativeMTPEngine:
+    """Explicit target-verified adapter for an appended native NextN block."""
+
+    def __init__(self, target: StreamingEngine, *, k: int = 3,
+                 max_prompt_tokens: int = 2048):
+        if not 1 <= k <= 5:
+            raise ValueError("native MTP depth must be in [1, 5]")
+        if not 1 <= max_prompt_tokens <= 2048:
+            raise ValueError(
+                "native MTP prompt limit must be in [1, 2048] until the "
+                "long-context draft index-share gate passes")
+        if target.cfg.model_type != "glm5_next":
+            raise ValueError("NativeMTPEngine currently requires GLM-5.3")
+        self.target = target
+        self.decoder = SpeculativeDecoder(
+            target, "mtp", k=k, prompt_cache_min_tokens=1)
+        self.max_prompt_tokens = int(max_prompt_tokens)
+        self._speculative_k = int(k)
+        self._closed = False
+
+    def __getattr__(self, name):
+        return getattr(self.target, name)
+
+    def _target_generate(self, reason: str, prompt, max_tokens: int,
+                         on_token=None, stop=None, on_progress=None,
+                         sampling: SamplingParams | None = None,
+                         constraint=None) -> dict:
+        kwargs = {
+            "on_token": on_token,
+            "stop": stop,
+            "on_progress": on_progress,
+        }
+        if sampling is not None:
+            kwargs["sampling"] = sampling
+        if constraint is not None:
+            kwargs["constraint"] = constraint
+        generate = getattr(
+            self.target, "generate_with_memory_retry", self.target.generate)
+        result = generate(prompt, max_tokens, **kwargs)
+        result.setdefault("path_stats", {}).update({
+            "glm53_mtp_enabled": 1,
+            "glm53_mtp_used": 0,
+            "glm53_mtp_fallback_reason": reason,
+            "glm53_mtp_depth": self._speculative_k,
+        })
+        return result
+
+    def generate(self, prompt, max_tokens: int = 64, on_token=None,
+                 stop=None, on_progress=None,
+                 sampling: SamplingParams | None = None,
+                 constraint=None) -> dict:
+        if constraint is not None:
+            return self._target_generate(
+                "constrained-decoding", prompt, max_tokens, on_token, stop,
+                on_progress, sampling, constraint)
+        if sampling is not None and not sampling.is_greedy:
+            return self._target_generate(
+                "stochastic-sampling", prompt, max_tokens, on_token, stop,
+                on_progress, sampling, constraint)
+        if max_tokens <= 1:
+            return self._target_generate(
+                "output-budget", prompt, max_tokens, on_token, stop,
+                on_progress, sampling, constraint)
+        prepared_ids = getattr(prompt, "token_ids", None)
+        ids = (
+            list(prepared_ids) if prepared_ids is not None
+            else list(self.target.tokenizer.encode(prompt).ids))
+        if len(ids) > self.max_prompt_tokens:
+            return self._target_generate(
+                "prompt-limit", prompt, max_tokens, on_token, stop,
+                on_progress, sampling, constraint)
+
+        result = self.decoder.generate(
+            prompt, max_tokens, on_token=on_token, stop=stop,
+            on_progress=on_progress, encoded_ids=ids)
+        result.setdefault("path_stats", {}).update({
+            "glm53_mtp_enabled": 1,
+            "glm53_mtp_used": 1,
+            "glm53_mtp_fallback_reason": "",
+            "glm53_mtp_depth": self._speculative_k,
+        })
+        return result
+
+    def release_request_state(self):
+        self.decoder.clear_prompt_cache()
+        self.target.release_request_state()
+
+    def close(self):
+        if self._closed:
+            return
+        self._closed = True
+        self.decoder.clear_prompt_cache()
+        self.target.close()

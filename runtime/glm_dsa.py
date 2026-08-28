@@ -51,6 +51,17 @@ class DSAState:
         # own chunking path while its docstring called chunking "tested").
         self.stats = {"observations": 0, "sparse_selects": 0, "shared_reuses": 0}
 
+    def nbytes(self) -> int:
+        return sum(value.nbytes for value in self.k_idx.values())
+
+    def fork(self) -> "DSAState":
+        branch = DSAState(self.cfg)
+        branch.k_idx = dict(self.k_idx)
+        branch.selection = self.selection
+        branch.sel_layer = self.sel_layer
+        branch.stats = dict(self.stats)
+        return branch
+
     def _rope_idx(self, x: mx.array, offset: int) -> mx.array:
         """F33 (2026-07-14 correction): confirmed against the actual official
         `GlmMoeDsaIndexer.forward()` source (transformers==5.13.0) that the

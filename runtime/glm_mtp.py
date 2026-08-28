@@ -66,12 +66,30 @@ class MTPDrafter:
             # position even though its token value is tokens[1].
             e = mx.concatenate([mx.zeros_like(e[:, :1, :]), e[:, 1:, :]], axis=1)
         e = mx.fast.rms_norm(e, w[f"{p}.enorm.weight"], cfg.rms_norm_eps)
-        hn = mx.fast.rms_norm(h_window[:, :-1, :], w[f"{p}.hnorm.weight"], cfg.rms_norm_eps)
+        h_source = h_window[:, :-1, :]
+        if cfg.model_type == "glm5_next":
+            # GLM-5.3 exports the trunk's post-final-norm ``h_nextn`` to the
+            # draft graph.  The ordinary target keeps its pre-norm window for
+            # target rollback, so apply that released boundary explicitly.
+            h_source = mx.fast.rms_norm(
+                h_source, eng._norm_w, cfg.rms_norm_eps)
+        hn = mx.fast.rms_norm(
+            h_source, w[f"{p}.hnorm.weight"], cfg.rms_norm_eps)
         x = _linear(mx.concatenate([e, hn], axis=-1), w, f"{p}.eh_proj")
-        h = run_glm_block(
-            x, w, p, cfg, mtp_kv, self.mtp_layer, 0, eng._get_experts,
-            iter_expert_batches=eng._iter_expert_batches,
-        )
+        if cfg.model_type == "glm5_next":
+            from .glm5_next import run_glm5_next_mtp_block
+
+            h = run_glm5_next_mtp_block(
+                x, w, p, cfg, mtp_kv, self.mtp_layer, 0,
+                eng._get_experts,
+                iter_expert_batches=eng._iter_expert_batches,
+            )
+        else:
+            h = run_glm_block(
+                x, w, p, cfg, mtp_kv, self.mtp_layer, 0,
+                eng._get_experts,
+                iter_expert_batches=eng._iter_expert_batches,
+            )
         mx.eval(h)
 
     def draft_tokens(self, h_last: mx.array, last_token: int, k: int, mtp_kv, offset: int) -> list[int]:
@@ -84,6 +102,8 @@ class MTPDrafter:
         p = f"model.layers.{self.mtp_layer}"
         drafts: list[int] = []
         h = h_last
+        if cfg.model_type == "glm5_next":
+            h = mx.fast.rms_norm(h, eng._norm_w, cfg.rms_norm_eps)
         tok = last_token
         for i in range(k):
             e = eng._embed([tok])  # (1,1,hidden) — row-paged when enabled
@@ -92,12 +112,28 @@ class MTPDrafter:
             e = mx.fast.rms_norm(e, w[f"{p}.enorm.weight"], cfg.rms_norm_eps)
             hn = mx.fast.rms_norm(h, w[f"{p}.hnorm.weight"], cfg.rms_norm_eps)
             x = _linear(mx.concatenate([e, hn], axis=-1), w, f"{p}.eh_proj")
-            h = run_glm_block(
-                x, w, p, cfg, mtp_kv, self.mtp_layer, offset + i, eng._get_experts,
-                iter_expert_batches=eng._iter_expert_batches,
-            )
+            if cfg.model_type == "glm5_next":
+                from .glm5_next import run_glm5_next_mtp_block
+
+                h = run_glm5_next_mtp_block(
+                    x, w, p, cfg, mtp_kv, self.mtp_layer, offset + i,
+                    eng._get_experts,
+                    iter_expert_batches=eng._iter_expert_batches,
+                )
+            else:
+                h = run_glm_block(
+                    x, w, p, cfg, mtp_kv, self.mtp_layer, offset + i,
+                    eng._get_experts,
+                    iter_expert_batches=eng._iter_expert_batches,
+                )
             g = mx.fast.rms_norm(h, w[f"{p}.shared_head.norm.weight"], cfg.rms_norm_eps)
-            logits = quant.matmul(g, eng._lm_head_weight())[0, -1]
+            head = eng._lm_head_weight()
+            from .lm_head_stream import StreamedLMHead
+
+            logits = (
+                head.logits(g)[0, -1]
+                if isinstance(head, StreamedLMHead)
+                else quant.matmul(g, head)[0, -1])
             mx.eval(logits)
             tok = int(mx.argmax(logits))
             drafts.append(tok)

@@ -88,6 +88,9 @@ class KVCache:
 
     def nbytes(self) -> int:
         total = sum(a.nbytes for a in (*self.keys, *self.values) if a is not None)
+        dsa = getattr(self, "dsa", None)
+        if dsa is not None:
+            total += dsa.nbytes()
         recurrent = getattr(self, "kda_cache", None)
         if recurrent is not None:
             total += recurrent.nbytes()
@@ -110,6 +113,7 @@ class KVCache:
         branch = KVCache(len(self.keys))
         branch.keys = list(self.keys)
         branch.values = list(self.values)
+        branch.compressed_mla = self.compressed_mla
         branch._windows = list(self._windows)
         branch._starts = list(self._starts)
         recurrent = getattr(self, "kda_cache", None)
@@ -118,6 +122,12 @@ class KVCache:
             if not callable(fork_recurrent):
                 raise TypeError("recurrent KV companion cannot be forked")
             branch.kda_cache = fork_recurrent()
+        dsa = getattr(self, "dsa", None)
+        if dsa is not None:
+            fork_dsa = getattr(dsa, "fork", None)
+            if not callable(fork_dsa):
+                raise TypeError("DSA KV companion cannot be forked")
+            branch.dsa = fork_dsa()
         qwen4 = getattr(self, "qwen4_cache", None)
         if qwen4 is not None:
             fork_qwen4 = getattr(qwen4, "fork", None)
@@ -275,6 +285,12 @@ def fork_hybrid_kv_endpoint(kv: "KVCache") -> "KVCache":
     snapshot.values = list(kv.values)
     snapshot.compressed_mla = kv.compressed_mla
     snapshot.kda_cache = recurrent.fork()
+    dsa = getattr(kv, "dsa", None)
+    if dsa is not None:
+        fork_dsa = getattr(dsa, "fork", None)
+        if not callable(fork_dsa):
+            raise TypeError("hybrid DSA companion cannot be forked")
+        snapshot.dsa = fork_dsa()
     qwen4 = getattr(kv, "qwen4_cache", None)
     if qwen4 is not None:
         snapshot.qwen4_cache = qwen4.fork()

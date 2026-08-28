@@ -90,6 +90,13 @@ class ModelConfig:
     index_topk_freq: int = 1
     index_skip_topk_offset: int = 2
     index_share_for_mtp_iteration: bool = False
+    # GLM-5.3-Flash compresses its DSA index candidates into fixed-size
+    # contiguous pools before selecting them.  These are checkpoint semantics,
+    # not tuning knobs: omitting the pool changes which tokens can be attended.
+    index_kpool: int = 1
+    index_kpool_compress: bool = False
+    index_kpool_always_select_tail: bool = False
+    indexer_rope_interleave: bool = False
     # Qwen3-VL vision extras (None/0 for text-only models)
     vision_config: dict | None = None
     # The checkpoint's vision architecture is not interchangeable with the
@@ -465,6 +472,24 @@ class ModelConfig:
                 if k in outer:
                     t[k] = outer[k]
             raw = t
+        elif ("text_config" in raw
+              and raw.get("model_type", "") == "glm5_next"):
+            # GLM-5.3-Flash is a multimodal wrapper around a glm5_next_text
+            # trunk.  Preserve the outer family for dispatch while lifting the
+            # text geometry, just as the Qwen/Kimi wrappers above do.  Its
+            # checkpoint stores text tensors below model.language_model.*, a
+            # layout WeightStore already canonicalizes to model.*.
+            outer = raw
+            t = dict(outer["text_config"])
+            t["model_type"] = outer["model_type"]
+            t.setdefault("tie_word_embeddings", outer.get(
+                "tie_word_embeddings", False))
+            for k in ("image_token_id", "video_token_id",
+                      "vision_start_token_id", "vision_end_token_id",
+                      "media_placeholder_token_id"):
+                if k in outer and outer[k] is not None:
+                    t[k] = outer[k]
+            raw = t
 
         vocab_size = raw["vocab_size"]
         eos = list(_validated_token_ids(
@@ -491,12 +516,17 @@ class ModelConfig:
         kda_use_full_rank_gate = False
         kda_gate_lower_bound = 0.0
         if linear_attn_config is not None:
-            # F92: config.json lists are 1-indexed layer numbers; the rest of
-            # this codebase (mlp_layer_types, indexer_types, ...) is 0-indexed.
+            # Kimi's released config lists are 1-indexed. GLM-5.3's are
+            # explicitly 0-indexed (layer 0 is KDA and layer 3 is the first
+            # DSA layer), so normalize by family instead of applying the Kimi
+            # offset to every architecture that happens to use this field.
+            layer_base = 0 if raw.get("model_type") == "glm5_next" else 1
             kda_layers = tuple(sorted(
-                entry - 1 for entry in linear_attn_config.get("kda_layers", ())))
+                entry - layer_base
+                for entry in linear_attn_config.get("kda_layers", ())))
             full_attn_layers = tuple(sorted(
-                entry - 1 for entry in linear_attn_config.get("full_attn_layers", ())))
+                entry - layer_base
+                for entry in linear_attn_config.get("full_attn_layers", ())))
             kda_head_dim = linear_attn_config.get("head_dim", 0)
             kda_num_heads = linear_attn_config.get("num_heads", 0)
             kda_conv_kernel_size = linear_attn_config.get("short_conv_kernel_size", 4)
@@ -612,7 +642,13 @@ class ModelConfig:
             # 0.81 against the real modeling_deepseek.py, True gave 9.5e-7.
             rope_interleave=raw.get(
                 "rope_interleave", raw.get("model_type") == "kimi_k25"),
-            mla_latent_norm_eps=raw.get("mla_latent_norm_eps", 1e-6),
+            # GLM-5.3 constructs both q_a/kv_a RMSNorm with the decoder's
+            # released rms_norm_eps. Earlier GLM/Kimi families use the
+            # historical 1e-6 latent default unless explicitly overridden.
+            mla_latent_norm_eps=raw.get(
+                "mla_latent_norm_eps",
+                raw.get("rms_norm_eps", 1e-6)
+                if raw.get("model_type") == "glm5_next" else 1e-6),
             vision_config=vision_config,
             vision_backend=vision_backend,
             architectures=architectures,
@@ -630,6 +666,12 @@ class ModelConfig:
             index_topk_freq=raw.get("index_topk_freq", 1),
             index_skip_topk_offset=raw.get("index_skip_topk_offset", 2),
             index_share_for_mtp_iteration=raw.get("index_share_for_mtp_iteration", False),
+            index_kpool=raw.get("index_kpool", 1),
+            index_kpool_compress=raw.get("index_kpool_compress", False),
+            index_kpool_always_select_tail=raw.get(
+                "index_kpool_always_select_tail", False),
+            indexer_rope_interleave=raw.get(
+                "indexer_rope_interleave", False),
             kda_layers=kda_layers,
             full_attn_layers=full_attn_layers,
             kda_head_dim=kda_head_dim,
@@ -762,6 +804,59 @@ class ModelConfig:
             if any(layer not in {"linear_attention", "full_attention"}
                    for layer in config.layer_types):
                 raise ValueError("unknown Qwen4-Exp layer type")
+        if config.model_type == "glm5_next":
+            expected_arch = "Glm5NextForConditionalGeneration"
+            if expected_arch not in config.architectures:
+                raise ValueError(
+                    "GLM-5.3 requires the released conditional-generation "
+                    "architecture declaration")
+            if len(config.layer_types) != config.num_hidden_layers:
+                raise ValueError(
+                    "GLM-5.3 layer_types must cover every decoder layer")
+            if any(layer not in {
+                    "linear_attention", "deepseek_sparse_attention"}
+                   for layer in config.layer_types):
+                raise ValueError("unknown GLM-5.3 layer type")
+            expected_kda = tuple(
+                i for i, layer in enumerate(config.layer_types)
+                if layer == "linear_attention")
+            expected_full = tuple(
+                i for i, layer in enumerate(config.layer_types)
+                if layer == "deepseek_sparse_attention")
+            if (config.kda_layers != expected_kda
+                    or config.full_attn_layers != expected_full):
+                raise ValueError(
+                    "GLM-5.3 linear_attn_config does not match layer_types")
+            if (config.hc_mult != 4
+                    or config.hc_sinkhorn_iters <= 0
+                    or config.hc_eps <= 0):
+                raise ValueError(
+                    "invalid GLM-5.3 hyper-connection geometry")
+            if (config.kda_head_dim <= 0
+                    or config.kda_num_heads <= 0
+                    or config.kda_conv_kernel_size <= 0
+                    or config.kda_gate_lower_bound >= 0):
+                raise ValueError("invalid GLM-5.3 KDA geometry")
+            if (config.qk_rope_head_dim != 0
+                    or not config.mla_use_nope
+                    or config.qk_nope_head_dim <= 0
+                    or config.v_head_dim <= 0
+                    or config.q_lora_rank <= 0
+                    or config.kv_lora_rank <= 0):
+                raise ValueError("invalid GLM-5.3 NoPE MLA geometry")
+            if (len(config.indexer_types) != config.num_hidden_layers
+                    or any(kind != "full" for kind in config.indexer_types)):
+                raise ValueError(
+                    "GLM-5.3 indexer_types must be full for every layer")
+            if (config.index_topk <= 0
+                    or config.index_kpool <= 0
+                    or config.index_topk % config.index_kpool
+                    or not config.index_kpool_compress
+                    or not config.index_kpool_always_select_tail):
+                raise ValueError("invalid GLM-5.3 pooled indexer geometry")
+            if (config.n_group != 1 or config.topk_group != 1):
+                raise ValueError(
+                    "GLM-5.3 group-restricted expert routing is unsupported")
         if config.model_type == "kimi_k3":
             manifest_path = os.environ.get(
                 "VMODEL_K3_EXPERT_PRUNE_MANIFEST", "")

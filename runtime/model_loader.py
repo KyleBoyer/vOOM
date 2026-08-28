@@ -74,6 +74,14 @@ class _DSV4Aux:
 
 
 @dataclass(frozen=True)
+class _FineGrainedFP8Aux:
+    """HF fine-grained FP8 ``weight`` + float32 ``weight_scale_inv`` pair."""
+
+    weight: str
+    scale: str
+
+
+@dataclass(frozen=True)
 class _CTMXFP4Aux:
     """F128: Kimi K3's real "mxfp4-pack-quantized" compressed-tensors pair
     (.weight_packed/.weight_scale, no .weight_shape -- confirmed by directly
@@ -717,6 +725,22 @@ class WeightStore:
                 self._dsv4_aux[name] = _DSV4Aux(name, scale)
                 quant_aux_names.add(scale)
 
+        # GLM-5.3-Flash uses Hugging Face's fine-grained FP8 layout.  Its
+        # float32 ``weight_scale_inv`` is a dequant multiplier over 128x128
+        # blocks, not DeepSeek-V4's E8M0 exponent-byte ``.scale``. Register a
+        # separate pair type so the two encodings can never be conflated.
+        self._glm53_fp8_aux: dict[str, _FineGrainedFP8Aux] = {}
+        if (not self.packed
+                and str(self.config.model_type) == "glm5_next"):
+            for name in list(self.weight_map):
+                if not name.endswith(".weight") or name in quant_aux_names:
+                    continue
+                scale = name[:-len(".weight")] + ".weight_scale_inv"
+                if scale not in self.weight_map:
+                    continue
+                self._glm53_fp8_aux[name] = _FineGrainedFP8Aux(name, scale)
+                quant_aux_names.add(scale)
+
         self.on_disk_quantized = bool(self._quant_aux)
         if self.on_disk_quantized:
             identity = {
@@ -803,6 +827,19 @@ class WeightStore:
             # Released MXFP4 blocks plus scales/metadata. Match the existing
             # conservative resident/admission estimate used by engine.py.
             self.expert_storage_bytes_per_weight = 0.6
+        elif self._glm53_fp8_aux:
+            # One E4M3 byte per value plus one float32 multiplier per 128x128
+            # block. The runtime widens selected matrices to BF16 on fetch,
+            # so this describes storage only, not the resident page.
+            block = self.quantization.get("weight_block_size", (128, 128))
+            if (not isinstance(block, (list, tuple)) or len(block) != 2
+                    or any(not isinstance(v, int) or isinstance(v, bool)
+                           or v <= 0 for v in block)):
+                raise ValueError(
+                    "GLM-5.3 fine-grained FP8 requires a positive 2-D "
+                    "weight_block_size")
+            self.expert_storage_bytes_per_weight = (
+                1.0 + 4.0 / (int(block[0]) * int(block[1])))
         elif (self.quantization and self.config.model_type != "gpt_oss"
                 and not (self.quantization.get("quant_method") == "compressed-tensors"
                          and self.quantization.get("format") == "pack-quantized"
@@ -828,8 +865,8 @@ class WeightStore:
                 "scale_inv" in name or name.endswith(".weight_scale")
                 for name in self.weight_map
             )
-            if self._dsv4_aux:
-                # Recognized: handled by the F213 weight/scale pair path.
+            if self._dsv4_aux or self._glm53_fp8_aux:
+                # Recognized released block-FP8 pair layouts.
                 pass
             elif standard_declared or method != "unknown" or suspicious_scales:
                 raise NotImplementedError(
@@ -870,6 +907,52 @@ class WeightStore:
             and n not in self._qwen4_fused_physical_names)
 
     # ---- name queries -------------------------------------------------
+
+    def _released_block_fp8_aux(self, name: str):
+        return self._dsv4_aux.get(name) or self._glm53_fp8_aux.get(name)
+
+    def _join_released_block_fp8(self, names, out: dict) -> dict:
+        """Join and decode registered released block-FP8 physical pairs."""
+        from .deepseek_v4 import PackedExpert, PackedFP8
+        from .quant import (dequantize_deepseek_v4_fp4,
+                            dequantize_deepseek_v4_fp8,
+                            dequantize_finegrained_fp8)
+
+        joined: dict = {}
+        for name in names:
+            dsv4 = self._dsv4_aux.get(name)
+            glm53 = self._glm53_fp8_aux.get(name)
+            aux = dsv4 or glm53
+            if aux is None:
+                joined[name] = out[name]
+                continue
+            weight, scale = out[aux.weight], out[aux.scale]
+            if glm53 is not None:
+                # The released GLM checkpoint contains no packed FP4 expert
+                # payloads; accepting int8 here would double the logical width
+                # and quietly execute a different model.
+                if weight.dtype != mx.uint8 or scale.dtype != mx.float32:
+                    raise ValueError(
+                        "GLM-5.3 FP8 pair has unexpected dtypes: "
+                        f"weight={weight.dtype}, scale={scale.dtype}")
+                joined[name] = dequantize_finegrained_fp8(weight, scale)
+                mx.eval(joined[name])
+                continue
+            # Dtype, not config, decides for DeepSeek V4: routed experts are
+            # packed FP4 in int8 containers while trunk/shared weights are FP8.
+            if weight.dtype == mx.int8:
+                if self.dsv4_native_mxfp4:
+                    joined[name] = PackedExpert(
+                        weight.view(mx.uint8).view(mx.uint32), scale)
+                    continue
+                joined[name] = dequantize_deepseek_v4_fp4(weight, scale)
+            elif self.dsv4_packed_trunk:
+                joined[name] = PackedFP8(weight, scale)
+                continue
+            else:
+                joined[name] = dequantize_deepseek_v4_fp8(weight, scale)
+            mx.eval(joined[name])
+        return joined
 
     def _record_ct_mxfp4_transform(
         self, *, elapsed_ns: int, input_bytes: int, resident_bytes: int,
@@ -1471,6 +1554,41 @@ class WeightStore:
             total += end - start
         return total
 
+    def finegrained_fp8_resident_bytes(self, names: Sequence[str]) -> int:
+        """Exact BF16 cache payload after GLM fine-grained FP8 widening.
+
+        Registered FP8 matrices retain their logical checkpoint shape and
+        widen to two bytes/value. Unconverted controls/norms remain in their
+        released dtype, so their physical safetensors extent is already the
+        resident payload. Return zero on incomplete metadata so admission can
+        fail closed rather than planning from a partial layer.
+        """
+        if not self._glm53_fp8_aux:
+            return 0
+        total = 0
+        for name in names:
+            aux = self._glm53_fp8_aux.get(name)
+            if aux is None:
+                entry = self._safetensors_entry(name)
+                if entry is None:
+                    return 0
+                start, end = (int(v) for v in entry["data_offsets"])
+                total += end - start
+                continue
+            entry = self._safetensors_entry(aux.weight)
+            scale_entry = self._safetensors_entry(aux.scale)
+            if entry is None or scale_entry is None:
+                return 0
+            shape = entry.get("shape")
+            if (not isinstance(shape, list) or not shape
+                    or any(not isinstance(v, int) or v <= 0 for v in shape)):
+                return 0
+            elements = 1
+            for extent in shape:
+                elements *= extent
+            total += elements * 2
+        return total
+
     def mlx_quantized_resident_bytes(self, names: Sequence[str]) -> int:
         """Exact payload bytes of standard MLX-quantized logical tensors.
 
@@ -1958,13 +2076,15 @@ class WeightStore:
                         raise IOError(
                             f"fast-tier container {path} is missing {name}"
                         ) from error
+                    expected_dtype = str(entry["dtype"]).upper()
+                    observed_dtype = dtype_names.get(
+                        str(array.dtype).split(".")[-1])
+                    if expected_dtype == "F8_E4M3" and observed_dtype == "U8":
+                        observed_dtype = "F8_E4M3"
                     if (
                         tuple(int(value) for value in array.shape)
                         != tuple(int(value) for value in entry["shape"])
-                        or dtype_names.get(
-                            str(array.dtype).split(".")[-1]
-                        )
-                        != str(entry["dtype"]).upper()
+                        or observed_dtype != expected_dtype
                     ):
                         raise IOError(
                             f"fast-tier tensor metadata mismatch: {name}"
@@ -2211,14 +2331,12 @@ class WeightStore:
                     seen: set[str] = set()
                     for name in names:
                         aux = self._quant_aux.get(name)
-                        dsv4 = self._dsv4_aux.get(name)
+                        released_fp8 = self._released_block_fp8_aux(name)
                         if aux is not None:
                             expanded = (name, aux.scales, aux.biases)
-                        elif dsv4 is not None:
-                            # F213: the sibling .scale must be read alongside
-                            # its .weight or the join below has nothing to
-                            # apply.
-                            expanded = (dsv4.weight, dsv4.scale)
+                        elif released_fp8 is not None:
+                            expanded = (
+                                released_fp8.weight, released_fp8.scale)
                         else:
                             expanded = (name,)
                         for physical_name in expanded:
@@ -2317,6 +2435,8 @@ class WeightStore:
                                 aux.bits, aux.group_size, aux.mode,
                             )
                         out = logical
+                    if self._dsv4_aux or self._glm53_fp8_aux:
+                        out = self._join_released_block_fp8(names, out)
                     return out, time.perf_counter() - t0, nbytes
                 except (OSError, RuntimeError, EOFError):
                     mx.clear_cache()
@@ -2345,13 +2465,11 @@ class WeightStore:
                 # F128: same reasoning as the INT4 case above, minus the
                 # shape sidecar (K3's MXFP4 pairs ship none).
                 expanded = (ct_mxfp4_aux.packed, ct_mxfp4_aux.scale)
-            elif self._dsv4_aux.get(n) is not None:
-                # F213: DeepSeek V4's sibling .scale must be read alongside
-                # its .weight. Unlike the compressed-tensors cases above the
-                # logical name IS the physical weight tensor, so both are
-                # listed rather than substituted.
-                dsv4 = self._dsv4_aux[n]
-                expanded = (dsv4.weight, dsv4.scale)
+            elif self._released_block_fp8_aux(n) is not None:
+                # The logical name is the physical weight tensor; its sibling
+                # scale must be fetched in the same transaction.
+                released_fp8 = self._released_block_fp8_aux(n)
+                expanded = (released_fp8.weight, released_fp8.scale)
             else:
                 aux = self._quant_aux.get(n)
                 expanded = ((n, aux.scales, aux.biases) if aux is not None else (n,))
@@ -2565,45 +2683,8 @@ class WeightStore:
                     nbytes += sidecar_bytes
                     sidecar_pool.shutdown(wait=True)
                     sidecar_pool = None
-                if self._dsv4_aux:
-                    from .deepseek_v4 import PackedExpert, PackedFP8
-                    from .quant import (dequantize_deepseek_v4_fp4,
-                                        dequantize_deepseek_v4_fp8)
-
-                    joined: dict = {}
-                    for name in names:
-                        aux = self._dsv4_aux.get(name)
-                        if aux is None:
-                            joined[name] = out[name]
-                            continue
-                        weight, scale = out[aux.weight], out[aux.scale]
-                        # Dtype, not config, decides: the released config
-                        # declares "fp8" for everything while the 35,328
-                        # routed expert tensors are actually INT8.
-                        if weight.dtype == mx.int8:
-                            if self.dsv4_native_mxfp4:
-                                # Leave the released MXFP4 bytes alone. The
-                                # E2M1 codes and E8M0 group scales already ARE
-                                # what mx.quantized_matmul(mode="mxfp4")
-                                # consumes; only the uint8 -> uint32 view is
-                                # needed, and it is shape-only. Dequantizing
-                                # here is the decode bottleneck (0.85GB/s
-                                # against 1.55GB/s of read) and inflates the
-                                # resident page 4x.
-                                joined[name] = PackedExpert(
-                                    weight.view(mx.uint8).view(mx.uint32),
-                                    scale)
-                                continue
-                            joined[name] = dequantize_deepseek_v4_fp4(
-                                weight, scale)
-                        elif self.dsv4_packed_trunk:
-                            joined[name] = PackedFP8(weight, scale)
-                            continue
-                        else:
-                            joined[name] = dequantize_deepseek_v4_fp8(
-                                weight, scale)
-                        mx.eval(joined[name])
-                    out = joined
+                if self._dsv4_aux or self._glm53_fp8_aux:
+                    out = self._join_released_block_fp8(names, out)
                 elif self._quant_aux or self._ct_int4_aux or self._ct_mxfp4_aux:
                     from .quant import (
                         QTensor, dequantize_compressed_tensors_int4,

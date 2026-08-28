@@ -130,6 +130,7 @@ def _mla_absorbed_attention(
         "bhld,hdc->bhlc", q_nope, w_uk
     )
     q_latent = mx.concatenate([q_nope_abs, q_rope], axis=-1)
+    c_latent = lat_all[..., :-dr] if dr else lat_all
     scale = (dn + dr) ** -0.5 * softmax_scale_mult
 
     def score_tile(start: int, end: int) -> mx.array:
@@ -160,7 +161,7 @@ def _mla_absorbed_attention(
             scores, axis=-1
         ).astype(q_nope.dtype)
         weighted_c = mx.matmul(
-            attn_weights, lat_all[:, None, :, :-dr]
+            attn_weights, c_latent[:, None, :, :]
         )
     else:
         running_max = mx.full(
@@ -183,8 +184,8 @@ def _mla_absorbed_attention(
                 running_sum * old_scale
                 + mx.sum(tile_weights, axis=-1, keepdims=True)
             )
-            c_tile = lat_all[
-                :, None, start:end, :-dr
+            c_tile = c_latent[
+                :, None, start:end, :
             ].astype(mx.float32)
             running_c = (
                 running_c * old_scale
@@ -234,7 +235,15 @@ def _mla_attention(
     q_nope, q_rope = q[..., :dn], q[..., dn:]
 
     kv_a = _linear(h, w, f"{prefix}.self_attn.kv_a_proj_with_mqa")
-    c_kv, k_rope = kv_a[..., : -dr], kv_a[..., -dr:]
+    if dr:
+        c_kv, k_rope = kv_a[..., :-dr], kv_a[..., -dr:]
+    else:
+        # GLM-5.3's released MLA is entirely NoPE. Python's ``:-0`` is an
+        # empty slice and ``-0:`` is the whole tensor, the exact opposite of
+        # the intended [kv_lora | zero rotary dims] split, so handle the
+        # zero-width rotary partition explicitly.
+        c_kv = kv_a
+        k_rope = mx.zeros((*kv_a.shape[:-1], 0), dtype=kv_a.dtype)
     c_kv = mx.fast.rms_norm(
         c_kv,
         w[f"{prefix}.self_attn.kv_a_layernorm.weight"],
@@ -288,7 +297,11 @@ def _mla_attention(
                 lat_all = mx.take(lat_all[0], sel[0, 0], axis=0)[None]
                 S = lat_all.shape[1]
 
-        c_all, kr_all = lat_all[..., :-dr], lat_all[..., -dr:]
+        if dr:
+            c_all, kr_all = lat_all[..., :-dr], lat_all[..., -dr:]
+        else:
+            c_all = lat_all
+            kr_all = mx.zeros((*lat_all.shape[:-1], 0), dtype=lat_all.dtype)
 
         absorbed = (
             getattr(kv, "mla_absorbed_prefill", False)

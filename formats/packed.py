@@ -388,6 +388,12 @@ def to_mx(head: dict, raw: "bytes | np.ndarray"):
 
     buf = raw if isinstance(raw, np.ndarray) else np.frombuffer(raw, dtype=np.uint8)
     dt = head["dtype"]
+    if dt == "F8_E4M3":
+        # MLX's safetensors loader exposes E4M3 payload codes as uint8 and the
+        # model-specific dequantizer later interprets those exact bits with
+        # ``mx.from_fp8``. Keep the raw fast-tier path representation-identical
+        # instead of attempting a host-side float conversion.
+        return mx.array(buf.reshape(head["shape"]), dtype=mx.uint8)
     if dt in ("BF16", "F16"):
         u16 = buf.view(np.uint16).reshape(head["shape"])
         target = mx.bfloat16 if dt == "BF16" else mx.float16

@@ -37,7 +37,7 @@ from .weight_cache import WeightCache
 
 _HYBRID_RECURRENT_MODEL_TYPES = frozenset({
     "kimi_linear", "kimi_k3", "qwen3_5_moe", "qwen3_5",
-    "qwen4_exp", "jet_nemotron", "lfm2",
+    "qwen4_exp", "jet_nemotron", "lfm2", "glm5_next",
 })
 
 # Deliberately sparse: these are the already-supported Qwen hybrid prefill
@@ -1808,7 +1808,7 @@ class StreamingEngine:
                 f"checkpoint, got {self.cfg.model_type!r}")
         if (self.cfg.model_type in (
                 "kimi_linear", "kimi_k3", "qwen3_5_moe", "qwen3_5",
-                "qwen4_exp")
+                "qwen4_exp", "glm5_next")
                 and self.rc.prompt_kv_dir):
             raise ValueError(
                 f"{self.cfg.model_type} recurrent attention state is not "
@@ -1863,7 +1863,8 @@ class StreamingEngine:
         # the engine lifetime instead of rebuilding every segment index on each
         # request. It is initialized lazily only after the admission threshold.
         self._prompt_kv_store = None
-        if self.cfg.model_type in ("glm_moe_dsa", "kimi_k25", "glm4_moe_lite"):
+        if self.cfg.model_type in (
+                "glm_moe_dsa", "kimi_k25", "glm4_moe_lite", "glm5_next"):
             # This runtime currently implements the released target's n_group=1
             # router. Silently ignoring group-restricted routing on another GLM
             # checkpoint would change the discontinuous expert choice. Kimi
@@ -1881,7 +1882,7 @@ class StreamingEngine:
                 )
         if (self.cfg.model_type in (
                 "glm_moe_dsa", "kimi_linear", "kimi_k3", "kimi_k25",
-                "qwen3_5_moe", "qwen4_exp")
+                "qwen3_5_moe", "qwen4_exp", "glm5_next")
                 and self.rc.expert_fetch_batch <= 0):
             # F74-v2 is a safety default for every construction path, including
             # direct experiments and YAML. Leaving zero as "unbounded" silently
@@ -2216,7 +2217,8 @@ class StreamingEngine:
         # F43: a declared context bound <= index_topk means the DSA indexer can
         # never deselect anything — elide its weights and state entirely.
         self._dsa_elided = bool(
-            self.cfg.model_type == "glm_moe_dsa" and self.cfg.index_topk
+            self.cfg.model_type in ("glm_moe_dsa", "glm5_next")
+            and self.cfg.index_topk
             and self.rc.context_bound and self.rc.context_bound <= self.cfg.index_topk
         )
 
@@ -3391,6 +3393,16 @@ class StreamingEngine:
                 # Payload bytes are exact for the retained QTensor arrays;
                 # keep a small pad for container/alignment accounting.
                 return math.ceil(resident_bytes * 1.05)
+        if self.cfg.model_type == "glm5_next":
+            logical_names = (
+                self._layer_names(layer) if names is None else names)
+            resident_bytes = store.finegrained_fp8_resident_bytes(
+                logical_names)
+            if resident_bytes <= 0:
+                raise ValueError(
+                    f"GLM-5.3 layer {layer} has incomplete FP8 resident "
+                    "metadata")
+            return math.ceil(resident_bytes * 1.05)
         if self.cfg.model_type != "kimi_k25":
             return 0
         c = self.cfg
@@ -5545,6 +5557,13 @@ class StreamingEngine:
             hc_stream = mx.broadcast_to(
                 x[:, :, None, :],
                 (x.shape[0], x.shape[1], self.cfg.hc_mult, x.shape[2]))
+        elif self.cfg.model_type == "glm5_next":
+            # GLM-5.3 starts every forward over the current positions by
+            # expanding embeddings into four identical mHC streams, then
+            # reduces them with an unweighted mean after the final block.
+            hc_stream = mx.broadcast_to(
+                x[:, :, None, :],
+                (x.shape[0], x.shape[1], self.cfg.hc_mult, x.shape[2]))
         block_residual = (
             (
                 []
@@ -5663,6 +5682,23 @@ class StreamingEngine:
                 # 124MB at a 300-position prompt -- and left lazy every
                 # layer's copy stays live, reaching >12GB across 43 layers
                 # while each individual reservation looked small.
+                mx.eval(hc_stream)
+            elif self.cfg.model_type == "glm5_next":
+                from .glm5_next import run_glm5_next_block
+
+                hc_stream = run_glm5_next_block(
+                    hc_stream, w, f"model.layers.{i}", self.cfg, kv, i,
+                    offset, self._get_experts,
+                    mlp_last_only=last_only,
+                    iter_expert_batches=self._iter_expert_batches,
+                    native_fused_kda_decode=(
+                        self.rc.native_fused_deltanet_decode),
+                    native_fused_kda_prefill=(
+                        self.rc.kimi_k3_native_fused_kda_prefill),
+                    compiled_kda_prefill=(
+                        self.rc.kimi_k3_compiled_kda_prefill),
+                    profile=profiler,
+                )
                 mx.eval(hc_stream)
             elif self.cfg.model_type == "lfm2":
                 # F202: 22 gated short-conv + 8 full-attention layers. The conv
@@ -5854,6 +5890,13 @@ class StreamingEngine:
                 hc_stream, self._hc_head_fn, self._hc_head_scale,
                 self._hc_head_base, norm_eps=self.cfg.rms_norm_eps,
                 eps=self.cfg.hc_eps)
+            if final_mlp_last_only and x.shape[1] > 1:
+                x = x[:, -1:, :]
+            return x
+        if self.cfg.model_type == "glm5_next" and hc_stream is not None:
+            # The released Glm5NextTextHyperHead has no learned parameters:
+            # it is exactly the mean over four streams before model.norm.
+            x = mx.mean(hc_stream, axis=2).astype(hc_stream.dtype)
             if final_mlp_last_only and x.shape[1] > 1:
                 x = x[:, -1:, :]
             return x
@@ -7463,6 +7506,208 @@ class StreamingEngine:
         self._restore_aggregate_layer_transient(total)
         return x
 
+    def _layer_stationary_glm5_next_sweep(
+            self, x: mx.array, kv, offset: int, tile_width: int,
+            on_progress=None) -> mx.array:
+        """Layer-major exact prefill for GLM-5.3's mHC/KDA/DSA stack.
+
+        The released block is separable by position around its two stateful
+        attention families: mHC maps and the MLP/router are row functions,
+        while KDA and cached MLA consume rows causally.  Keep the carrier as
+        bounded tiles, advance attention in chronological order, then evaluate
+        the layer's MLP once over the concatenated reduced rows.  Consequently
+        a routed expert is fetched at most once for this layer instead of once
+        per prompt tile, without changing router inputs, expert accumulation
+        order, target weights, or recurrent endpoints.
+        """
+        from .deepseek_v4 import (deepseek_v4_attention_residual, hc_post,
+                                  hc_pre)
+        from .glm5_next import (
+            glm5_next_mla_attention,
+            glm5_next_mlp_layer_stationary_tiles,
+        )
+        from .kimi_linear import _kda_attention
+
+        if tile_width <= 0:
+            raise ValueError("tile_width must be positive")
+        if self.cfg.model_type != "glm5_next":
+            raise ValueError("GLM-5.3 layer-stationary path needs glm5_next")
+        total = int(x.shape[1])
+        if total <= 0:
+            return x
+        spans = [
+            (start, min(start + tile_width, total))
+            for start in range(0, total, tile_width)
+        ]
+        expanded = mx.broadcast_to(
+            x[:, :, None, :],
+            (x.shape[0], total, self.cfg.hc_mult, x.shape[2]))
+        tiles = [expanded[:, start:end] for start, end in spans]
+        del expanded, x
+
+        probe_positions = min(total, tile_width)
+        (self._layer_transient,
+         self._layer_transient_margin) = _layer_transient_for_positions(
+             probe_positions,
+             getattr(self, "_prefill_layer_transient_by_positions", {}).get(
+                 probe_positions, 0),
+             getattr(self, "_decode_layer_transient", 0))
+        profiler = self._request_profiler
+        if profiler is not None:
+            profiler.begin_sweep(
+                total, path="layer_stationary_glm5_next")
+
+        for layer in range(self.cfg.num_hidden_layers):
+            self._select_layer_transient(probe_positions, layer)
+            if self.prefetcher:
+                for nxt in range(
+                        layer + 1,
+                        min(layer + 1 + self.rc.prefetch_depth,
+                            self.cfg.num_hidden_layers)):
+                    self.prefetcher.schedule(
+                        self._layer_key(nxt), self._layer_names(nxt))
+            cache_before = (
+                profiler.cache_snapshot(self.cache)
+                if profiler is not None else None)
+            wait_started = time.perf_counter()
+            layer_key = self._layer_key(layer)
+            layer_names = self._layer_names(layer)
+            if not self.cache.contains(layer_key):
+                incoming_page = self._layer_fetch_bytes_estimate(layer)
+                if incoming_page:
+                    self.cache.prepare_for(incoming_page)
+                    if self.governor is not None:
+                        self.governor.reserve(incoming_page)
+            w = self.cache.get(layer_key, layer_names)
+            weight_wait_s = time.perf_counter() - wait_started
+            self.timer.add("weights_wait", weight_wait_s)
+
+            prefix = f"model.layers.{layer}"
+            hc = {
+                name: w[f"{prefix}.hc_{name}"]
+                for name in (
+                    "attn_fn", "attn_scale", "attn_base",
+                    "ffn_fn", "ffn_scale", "ffn_base")
+            }
+            norms = {
+                "attn": w[f"{prefix}.input_layernorm.weight"],
+                "ffn": w[f"{prefix}.post_attention_layernorm.weight"],
+            }
+            common = dict(
+                hc_mult=self.cfg.hc_mult,
+                norm_eps=self.cfg.rms_norm_eps,
+                sinkhorn_iters=self.cfg.hc_sinkhorn_iters,
+                hc_eps=self.cfg.hc_eps,
+            )
+            active_before = mx.get_active_memory()
+            mx.reset_peak_memory()
+            compute_started = time.perf_counter()
+
+            for index, (start, end) in enumerate(spans):
+                if self.governor is not None and self._layer_transient:
+                    self.governor.reserve(
+                        self._layer_transient,
+                        margin=self._layer_transient_margin)
+                here = offset + start
+
+                def attention(hidden, *, _here=here):
+                    if layer in self.cfg.kda_layers:
+                        return _kda_attention(
+                            hidden, w, prefix, self.cfg,
+                            getattr(kv, "kda_cache", None), layer,
+                            native_fused_decode=(
+                                self.rc.native_fused_deltanet_decode),
+                            native_fused_prefill=(
+                                self.rc.kimi_k3_native_fused_kda_prefill),
+                            compiled_prefill=(
+                                self.rc.kimi_k3_compiled_kda_prefill),
+                            released_output_dtype=True,
+                            profile=profiler,
+                        )
+                    if layer in self.cfg.full_attn_layers:
+                        return glm5_next_mla_attention(
+                            hidden, w, prefix, self.cfg, kv, layer, _here)
+                    raise ValueError(
+                        f"GLM-5.3 layer {layer} has no attention type")
+
+                tile = deepseek_v4_attention_residual(
+                    tiles[index], hc, norms, attention, **common)
+                tile = tile.astype(mx.bfloat16)
+                mx.eval(tile)
+                tiles[index] = tile
+
+            # Bound the float32 mHC mapping by tile and retain each normalized
+            # row group separately. The MLP helper preserves those exact GEMM
+            # shapes while sharing each routed expert page across the tiles.
+            hidden_tiles, posts, combs = [], [], []
+            for tile in tiles:
+                reduced, post, comb = hc_pre(
+                    tile, hc["ffn_fn"], hc["ffn_scale"], hc["ffn_base"],
+                    hc_mult=self.cfg.hc_mult,
+                    norm_eps=self.cfg.rms_norm_eps,
+                    sinkhorn_iters=self.cfg.hc_sinkhorn_iters,
+                    eps=self.cfg.hc_eps)
+                hidden_tiles.append(mx.fast.rms_norm(
+                    reduced, norms["ffn"], self.cfg.rms_norm_eps))
+                posts.append(post)
+                combs.append(comb)
+            mx.eval(*hidden_tiles)
+
+            if self.governor is not None and self._layer_transient:
+                self.governor.reserve(
+                    self._layer_transient,
+                    margin=self._layer_transient_margin)
+            step_before = mx.get_active_memory()
+            mx.reset_peak_memory()
+            mlp_tiles = glm5_next_mlp_layer_stationary_tiles(
+                hidden_tiles, w, prefix, self.cfg, layer, self._get_experts,
+                iter_expert_batches=self._iter_expert_batches,
+                profile=profiler)
+            step_peak = _resident_adjusted_transient(
+                step_before, mx.get_active_memory(), mx.get_peak_memory())
+            del hidden_tiles
+
+            for index, (start, end) in enumerate(spans):
+                merged = hc_post(
+                    mlp_tiles[index], tiles[index],
+                    posts[index], combs[index]).astype(mx.bfloat16)
+                mx.eval(merged)
+                tiles[index] = merged
+            del mlp_tiles, posts, combs
+
+            compute_s = time.perf_counter() - compute_started
+            self.timer.add("layer_compute", compute_s)
+            if profiler is not None:
+                profiler.record_layer(
+                    layer, positions=total,
+                    weight_wait_s=weight_wait_s, compute_s=compute_s,
+                    cache_before=cache_before,
+                    cache_after=profiler.cache_snapshot(self.cache),
+                    layer_type=self._profile_layer_type(layer))
+            if on_progress is not None:
+                on_progress({
+                    "phase": "prefill_layer",
+                    "completed_layers": layer + 1,
+                    "total_layers": self.cfg.num_hidden_layers,
+                    "total_tokens": total,
+                    "cache_source": "cold",
+                })
+            self._record_layer_transient(probe_positions, layer, step_peak)
+            self._note_true_peak()
+            del w
+
+        # The released hyper head is an unweighted mean. Collapse each tile
+        # before joining so the temporary is one quarter of the carrier.
+        for index, tile in enumerate(tiles):
+            tiles[index] = mx.mean(tile, axis=2).astype(mx.bfloat16)
+            mx.eval(tiles[index])
+        result = (
+            tiles[0] if len(tiles) == 1
+            else mx.concatenate(tiles, axis=1))
+        mx.eval(result)
+        self._restore_aggregate_layer_transient(total)
+        return result
+
     def _layer_stationary_kimi_k3_sweep(
             self, x: mx.array, kv, offset: int, tile_width: int,
             on_progress=None) -> mx.array:
@@ -8179,6 +8424,7 @@ class StreamingEngine:
                 "capture either dense KDA endpoints or compact factors, not both")
 
         glm_family = self.cfg.model_type in ("glm_moe_dsa", "kimi_k25", "glm4_moe_lite")
+        glm5_family = self.cfg.model_type == "glm5_next"
         qwen_family = self.cfg.model_type in ("qwen3_5", "qwen3_5_moe")
         qwen4_family = self.cfg.model_type == "qwen4_exp"
         kimi_family = self.cfg.model_type == "kimi_linear"
@@ -8191,7 +8437,7 @@ class StreamingEngine:
         # dispatch.
         kimi_k3_family = self.cfg.model_type == "kimi_k3"
         lfm2_family = self.cfg.model_type == "lfm2"
-        if not glm_family and not qwen_family and not qwen4_family and not kimi_family and not kimi_k3_family and (
+        if not glm_family and not glm5_family and not qwen_family and not qwen4_family and not kimi_family and not kimi_k3_family and (
                 self.cfg.num_experts or self.cfg.model_type == "gpt_oss"):
             # F94: layer_runner.run_block (this function's per-layer call
             # below) is a plain dense-transformer block with no awareness of
@@ -8289,6 +8535,47 @@ class StreamingEngine:
                 raise ValueError(
                     "KDA factor capture requires kv.kda_cache")
             factor_source.begin_factor_capture()
+        if glm5_family:
+            if capture_kda_endpoints:
+                raise ValueError(
+                    "GLM-5.3 verifier uses compact KDA factors, not dense "
+                    "per-position endpoints")
+            if tap_layers is not None:
+                raise ValueError(
+                    "GLM-5.3 serial verification does not expose draft taps")
+            x_all = self._layer_stationary_glm5_next_sweep(
+                embedded, kv, offset, tile_width=1)
+            positions = [
+                x_all[:, position:position + 1, :]
+                for position in range(x_all.shape[1])
+            ]
+            head = self._lm_head_weight()
+            from .lm_head_stream import StreamedLMHead
+
+            if isinstance(head, StreamedLMHead):
+                normalized = mx.concatenate([
+                    mx.fast.rms_norm(
+                        hidden, self._norm_w, self.cfg.rms_norm_eps)
+                    for hidden in positions
+                ], axis=1)
+                result = head.logits_serial_rows(normalized)[0]
+            else:
+                logits = []
+                for hidden in positions:
+                    value = self._final_logits(hidden, head=head)
+                    mx.eval(value)
+                    logits.append(value)
+                result = mx.stack(logits)
+            mx.eval(result)
+            self._h_window = x_all
+            self._h_last = positions[-1]
+            if factor_source is not None:
+                self._serial_kda_factors = factor_source.finish_factor_capture(
+                    len(tokens))
+                self._serial_kda_factor_retained_bytes = (
+                    self._serial_kda_factors.nbytes()
+                    if self._serial_kda_factors is not None else 0)
+            return result
         if capture_qwen4_endpoints:
             source_qwen4 = getattr(kv, "qwen4_cache", None)
             if source_qwen4 is None:
@@ -9115,13 +9402,19 @@ class StreamingEngine:
                 print(f"[engine] gpt-oss sliding KV window: {bounded} layers "
                       f"bounded to {int(self.cfg.sliding_window)} positions",
                       flush=True)
-        if self.rc.mla_compressed_kv and self.cfg.model_type == "glm_moe_dsa":
+        if (self.rc.mla_compressed_kv
+                and self.cfg.model_type in ("glm_moe_dsa", "glm5_next")):
             kv.compressed_mla = True
             kv.mla_absorbed = self.rc.mla_absorbed_decode
             if not self._dsa_elided:  # F43 bounded mode provably never selects
-                from .glm_dsa import DSAState
+                if self.cfg.model_type == "glm5_next":
+                    from .glm5_next_dsa import GLM5NextDSAState
 
-                kv.dsa = DSAState(self.cfg)
+                    kv.dsa = GLM5NextDSAState(self.cfg)
+                else:
+                    from .glm_dsa import DSAState
+
+                    kv.dsa = DSAState(self.cfg)
         if k3_compressed_mla:
             # Explicit K3 candidate: retain only Moonshot's released
             # [c_kv | k_rope] latent, and use the capacity-stepped axis-1
@@ -9642,7 +9935,7 @@ class StreamingEngine:
         # limits hybrid models to those two no-trim cases.
         recurrent_exact_only = self.cfg.model_type in (
             "kimi_linear", "kimi_k3", "qwen3_5_moe", "qwen3_5",
-            "qwen4_exp", "jet_nemotron")
+            "qwen4_exp", "jet_nemotron", "glm5_next")
         hot_eligible = bool(
             self.rc.hot_prompt_kv
             and (not self.rc.max_kv_mb or self.rc.paged_kv_persist)
@@ -10531,7 +10824,8 @@ class StreamingEngine:
                         and self.cfg.model_type in (
                             "qwen3_5", "qwen3_5_moe", "qwen4_exp", "gpt_oss",
                             "kimi_linear", "kimi_k3",
-                            "glm_moe_dsa", "kimi_k25", "glm4_moe_lite")
+                            "glm_moe_dsa", "kimi_k25", "glm4_moe_lite",
+                            "glm5_next")
                         and not self.rc.adaptive_chunk_size
                         and not (
                             self.rc.prefill_checkpoint_every
@@ -10587,6 +10881,11 @@ class StreamingEngine:
                                 on_progress=on_progress)
                         elif self.cfg.model_type == "qwen4_exp":
                             bx = self._layer_stationary_qwen4_sweep(
+                                bx, kv, offset=pos,
+                                tile_width=boundary_chunk,
+                                on_progress=on_progress)
+                        elif self.cfg.model_type == "glm5_next":
+                            bx = self._layer_stationary_glm5_next_sweep(
                                 bx, kv, offset=pos,
                                 tile_width=boundary_chunk,
                                 on_progress=on_progress)
@@ -10735,7 +11034,8 @@ class StreamingEngine:
                 and self.cfg.model_type in (
                     "qwen3_5", "qwen3_5_moe", "qwen4_exp", "gpt_oss",
                     "kimi_linear", "kimi_k3", "deepseek_v4",
-                    "glm_moe_dsa", "kimi_k25", "glm4_moe_lite")
+                    "glm_moe_dsa", "kimi_k25", "glm4_moe_lite",
+                    "glm5_next")
                 and adaptive is None
                 and not (ckpt and kv_store is not None)
                 and not force_adaptive_paged
@@ -10749,7 +11049,8 @@ class StreamingEngine:
                 if self.cfg.model_type not in (
                         "qwen3_5", "qwen3_5_moe", "qwen4_exp", "gpt_oss",
                         "kimi_linear", "kimi_k3", "deepseek_v4",
-                        "glm_moe_dsa", "kimi_k25", "glm4_moe_lite"):
+                        "glm_moe_dsa", "kimi_k25", "glm4_moe_lite",
+                        "glm5_next"):
                     blockers.append("architecture")
                 if adaptive is not None:
                     blockers.append("adaptive_chunk")
@@ -10814,6 +11115,10 @@ class StreamingEngine:
                             on_progress=on_progress)
                     elif self.cfg.model_type == "qwen4_exp":
                         xc = self._layer_stationary_qwen4_sweep(
+                            xc, kv, offset=pos, tile_width=chunk,
+                            on_progress=on_progress)
+                    elif self.cfg.model_type == "glm5_next":
+                        xc = self._layer_stationary_glm5_next_sweep(
                             xc, kv, offset=pos, tile_width=chunk,
                             on_progress=on_progress)
                     elif self.cfg.model_type in (

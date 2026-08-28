@@ -713,6 +713,7 @@ def _kda_attention(
     native_fused_decode: bool = False,
     native_fused_prefill: bool = False,
     compiled_prefill: bool = False,
+    released_output_dtype: bool = False,
     profile=None,
 ) -> mx.array:
     B, L, _ = h.shape
@@ -745,6 +746,7 @@ def _kda_attention(
     q, q_hist_new = conv_fn(q, w[f"{prefix}.self_attn.q_conv1d.weight"], q_hist, K)
     k, k_hist_new = conv_fn(k, w[f"{prefix}.self_attn.k_conv1d.weight"], k_hist, K)
     v, v_hist_new = conv_fn(v, w[f"{prefix}.self_attn.v_conv1d.weight"], v_hist, K)
+    projection_dtype = q.dtype
     if profile is not None:
         profile.finish_substep(
             "kda_qkv_conv", layer, projection_t0, q, k, v,
@@ -854,6 +856,13 @@ def _kda_attention(
     # present -- true -- on the real checkpoint; absent/false for the
     # original Kimi Linear 48B, which only ever ships g_a_proj/g_b_proj).
     output_t0 = profile.start_substep() if profile is not None else None
+    # GLM-5.3's released recurrent/chunk kernels explicitly return the core
+    # attention in the Q/K/V projection dtype while retaining the recurrent
+    # endpoint in FP32.  The shared Kimi implementation historically kept the
+    # core output FP32, so make this behavior explicit and opt-in at the GLM
+    # call site instead of silently changing established Kimi profiles.
+    if released_output_dtype:
+        o = o.astype(projection_dtype)
     if cfg.kda_use_full_rank_gate:
         g_out = _linear(h, w, f"{prefix}.self_attn.g_proj")
     else:

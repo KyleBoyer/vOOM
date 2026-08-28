@@ -92,6 +92,28 @@ def test_fast_tier_excludes_qwen4_direct_ple_rows():
         "model.layers.1.self_attn.q_proj.weight") == "keep"
 
 
+def test_fast_tier_excludes_glm53_routed_experts_but_keeps_shared_trunk():
+    from formats.kimi_k3_fast_tier import _category
+
+    assert _category(
+        "model.layers.4.mlp.experts.17.gate_proj.weight") is None
+    assert _category(
+        "model.layers.4.mlp.shared_experts.gate_proj.weight") == "keep"
+    assert _category(
+        "model.layers.4.self_attn.q_proj.weight") == "keep"
+
+
+def test_raw_fast_tier_preserves_glm53_e4m3_codes_as_uint8():
+    from formats.packed import to_mx
+
+    raw = bytes((0x00, 0x38, 0xB8, 0x7E))
+    got = to_mx({"dtype": "F8_E4M3", "shape": [2, 2]}, raw)
+    mx.eval(got)
+
+    assert got.dtype == mx.uint8
+    assert bytes(memoryview(__import__("numpy").array(got))) == raw
+
+
 def test_budgeted_selection_balances_qwen_multimodal_wrapper_layers():
     """Qwen uses model.language_model.layers, unlike K3's older fixture."""
     from formats.kimi_k3_fast_tier import _select_budgeted

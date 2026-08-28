@@ -1,0 +1,124 @@
+{
+  "schema": "voom.glm53-flash-exact-gate-summary.v1",
+  "date": "2026-08-28",
+  "model": {
+    "hub_id": "zai-org/GLM-5.3-Flash",
+    "revision": "04c4e9e95c5da8862dced7e5056455116f83a7e0",
+    "path": "models/GLM-5.3-Flash",
+    "released_tensor_bytes": 328326771576
+  },
+  "request": {
+    "kind": "real-short-bringup-not-plex-capture",
+    "prompt_tokens": 28,
+    "max_output_tokens": 4,
+    "expected_tokens": [3411, 1172, 279, 21595],
+    "expected_text": " Return only the clause"
+  },
+  "gates": [
+    {
+      "name": "plain-target-cold",
+      "total_s": 183.514,
+      "prefill_s": 125.06,
+      "decode_s": 58.452,
+      "true_peak_metal_bytes": 2113000000
+    },
+    {
+      "name": "native-mtp-original-storage-cold",
+      "total_s": 162.18878158321604,
+      "prefill_s": 124.71993870800361,
+      "decode_s": 37.466791042126715,
+      "proposed": 2,
+      "accepted": 2,
+      "target_sweeps": 1,
+      "true_peak_metal_bytes": 2558225620
+    },
+    {
+      "name": "native-mtp-exact-prompt-repeat-original-storage",
+      "total_s": 33.526898874901235,
+      "prefill_s": 0.00000020815059542655945,
+      "decode_s": 33.525926041882485,
+      "prompt_cache_exact_hit": 1,
+      "prompt_cache_resident_bytes": 148121192,
+      "proposed": 2,
+      "accepted": 2,
+      "target_sweeps": 1,
+      "true_peak_metal_bytes": 2184972150
+    },
+    {
+      "name": "native-mtp-group8-expert-pipeline-cold",
+      "total_s": 145.7816803753376,
+      "prefill_s": 111.16943029221147,
+      "decode_s": 34.61030666716397,
+      "proposed": 2,
+      "accepted": 2,
+      "true_peak_metal_bytes": 3027590860
+    },
+    {
+      "name": "native-mtp-group8-expert-pipeline-repeat",
+      "total_s": 31.017972541041672,
+      "prefill_s": 0.0000001671724021434784,
+      "decode_s": 31.01734425034374,
+      "prompt_cache_exact_hit": 1,
+      "proposed": 2,
+      "accepted": 2,
+      "true_peak_metal_bytes": 2601226584
+    },
+    {
+      "name": "native-mtp-two-device-pipeline-cold",
+      "total_s": 128.53906483389437,
+      "prefill_s": 102.06071533309296,
+      "decode_s": 26.4763687918894,
+      "weight_store_bytes_read": 150911097200,
+      "weight_fast_tier_bytes": 26108479856,
+      "weight_archive_bytes": 124802617344,
+      "weight_prefetch_useful_pages": 88,
+      "weight_prefetch_hidden_lower_bound_s": 13.619924128,
+      "proposed": 2,
+      "accepted": 2,
+      "true_peak_metal_bytes": 3072110404
+    },
+    {
+      "name": "native-mtp-two-device-pipeline-repeat",
+      "total_s": 23.04578695911914,
+      "prefill_s": 0.00000016624107956886292,
+      "decode_s": 23.045001375023276,
+      "prompt_cache_exact_hit": 1,
+      "prompt_cache_resident_bytes": 148121192,
+      "weight_store_bytes_read": 32539158560,
+      "weight_fast_tier_bytes": 12753991712,
+      "weight_archive_bytes": 19785166848,
+      "weight_prefetch_useful_pages": 43,
+      "weight_prefetch_useful_bytes": 12082016968,
+      "weight_prefetch_wait_s": 0.198407416,
+      "weight_prefetch_hidden_lower_bound_s": 6.511026251,
+      "expert_batch_prefetch_submitted": 115,
+      "expert_batch_prefetch_wait_s": 18.076250748243183,
+      "expert_batch_prefetch_hidden_s": 0.9049482559785247,
+      "proposed": 2,
+      "accepted": 2,
+      "target_sweeps": 1,
+      "true_peak_metal_bytes": 3005719692
+    }
+  ],
+  "fast_tier": {
+    "path": "/Users/kyleboyer/vmodel_fast_tier/GLM-5.3-Flash",
+    "selected_tensors": 1455,
+    "selected_bytes": 12932311928,
+    "projected_global_fast_tier_bytes": 53934591821,
+    "post_build_internal_free_bytes": 15610593280,
+    "routed_experts_mirrored": false
+  },
+  "validation": {
+    "target_tokens_identical_across_all_arms": true,
+    "native_mtp_target_authoritative": true,
+    "affected_tests": {
+      "passed": 360,
+      "skipped_real_k3": 2
+    },
+    "final_preflight": "logs/memory_preflight_glm53_final_regression_20260828.json",
+    "final_preflight_passed": true,
+    "final_preflight_swap_growth_bytes": 0,
+    "final_preflight_swap_out_growth_bytes": 0
+  },
+  "scope_warning": "These timing gates use the real 28-token bring-up prompt, not the unmodified 46,849-token/134-tool captured Plex request."
+}

@@ -150,6 +150,44 @@ def test_mtp_layer_derives_from_config():
     eng.close()
 
 
+def test_native_mtp_exact_repeat_reuses_both_prompt_boundaries():
+    """A repeat must branch exact target + MTP prompt state, not re-prefill.
+
+    The tiny released-shape fixture is intentionally used here so this stays a
+    sub-second regression. GLM-5.3's recurrent COW fork itself is covered by
+    ``test_glm53_hybrid_kv_fork_preserves_compressed_and_dsa_state`` and the
+    real-weight repeat gate exercises the combined path.
+    """
+    _ensure_fixture()
+    from runtime.engine import RuntimeConfig, StreamingEngine
+    from runtime.speculative import SpeculativeDecoder
+
+    eng = StreamingEngine(str(FIXTURE), RuntimeConfig(
+        max_weight_cache_mb=200, pin_lm_head=True, mla_compressed_kv=True))
+    dec = SpeculativeDecoder(
+        eng, "mtp", k=2, prompt_cache_min_tokens=1,
+        _unsafe_allow_moe_verify=True)
+    cold = dec.generate("Hi", max_tokens=4)
+    warm = dec.generate("Hi", max_tokens=4)
+
+    assert cold["tokens"] == warm["tokens"]
+    assert not cold["path_stats"]["prompt_cache_exact_hit"]
+    assert cold["path_stats"]["prompt_cache_write_tokens"] > 0
+    assert warm["path_stats"]["prompt_cache_exact_hit"]
+    assert warm["path_stats"]["prompt_cache_kind"] == "native-mtp"
+    assert warm["path_stats"]["prompt_cache_prefix_tokens"] == cold["prompt_tokens"]
+    assert warm["path_stats"]["prompt_cache_resident_bytes"] > 0
+    assert cold["path_stats"]["weight_store_bytes_read"] > 0
+    assert cold["path_stats"]["prefill_weight_store_bytes_read"] > 0
+    assert warm["path_stats"]["prefill_weight_store_bytes_read"] == 0
+    assert (warm["path_stats"]["decode_weight_store_bytes_read"]
+            == warm["path_stats"]["weight_store_bytes_read"])
+    assert "expert_batch_prefetch_hidden_s" in warm["path_stats"]
+    dec.clear_prompt_cache()
+    assert dec._mtp_prompt_cache is None
+    eng.close()
+
+
 def _run_all():
     fns = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
     passed = 0

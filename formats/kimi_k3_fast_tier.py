@@ -32,7 +32,7 @@ import uuid
 from collections import defaultdict
 from pathlib import Path
 
-_EXPERT_RE = re.compile(r"block_sparse_moe\.experts\.")
+_EXPERT_RE = re.compile(r"(?:block_sparse_moe|mlp)\.experts\.")
 _LAYER_RE = re.compile(
     r"(?:^|\.)(?:model\.language_model|language_model\.model|model)"
     r"\.layers\.(\d+)\."
@@ -256,7 +256,7 @@ def build_fast_tier(
     selected_bytes = sum(int(item["nbytes"]) for item in selected)
     if not selected:
         raise ValueError(
-            "no eligible Kimi K3 tensor fits the available fast-tier budget; "
+            "no eligible deterministic tensor fits the available fast-tier budget; "
             "no files were written")
     projected_free = (
         shutil.disk_usage(_existing_parent(fast_root)).free
@@ -265,7 +265,7 @@ def build_fast_tier(
     )
     if not dry_run and internal_root and projected_free < min_free_bytes:
         raise ValueError(
-            "Kimi K3 fast-tier plan would leave only "
+            "fast-tier plan would leave only "
             f"{projected_free} free bytes, below min_free_bytes="
             f"{min_free_bytes}; no files were written")
     if not dry_run and target.exists():

@@ -2461,6 +2461,183 @@ def test_k25_lossless_uses_demand_paging_without_speculative_prefetch():
     assert rc.quant_bits == 0
 
 
+def test_glm53_hot_prompt_kv_is_opt_in_exact_and_in_engine_identity():
+    from unittest.mock import patch
+
+    from runtime.server import EngineManager
+
+    captured = []
+
+    class FakeEngine:
+        def __init__(self, _path, rc):
+            captured.append(rc)
+
+        def close(self):
+            pass
+
+    cfg = SimpleNamespace(
+        model_type="glm5_next", tie_word_embeddings=False,
+        index_topk=2048, vision_config=None, num_experts_per_tok=8,
+    )
+    settings = {
+        "VMODEL_GLM53_HOT_PROMPT_KV": "0",
+        "VMODEL_GLM53_HOT_KV_SLOTS": "2",
+        "VMODEL_GLM53_HOT_KV_MIN_TOKENS": "32",
+    }
+    with patch.dict("os.environ", settings, clear=False), \
+         patch("runtime.config.ModelConfig.from_dir", return_value=cfg), \
+         patch("runtime.path_resolver.resolve_model_dir",
+               side_effect=lambda path: path), \
+         patch("runtime.engine.StreamingEngine", FakeEngine):
+        manager = EngineManager()
+        manager.get(Path("/tmp/fake-glm53"), "lossless")
+        os.environ["VMODEL_GLM53_HOT_PROMPT_KV"] = "1"
+        manager.get(Path("/tmp/fake-glm53"), "lossless")
+
+    assert len(captured) == 2
+    baseline, enabled = captured
+    assert not baseline.hot_prompt_kv
+    assert enabled.hot_prompt_kv
+    assert enabled.hot_prompt_kv_chunk_size == enabled.prefill_chunk_size == 32
+    assert enabled.hot_prompt_kv_slots == 2
+    assert enabled.hot_prompt_kv_min_tokens == 32
+    assert enabled.layer_stationary_prefill
+    assert not enabled.adaptive_chunk_size
+
+
+@pytest.mark.parametrize(
+    ("variable", "value", "message"),
+    [
+        ("VMODEL_GLM53_HOT_PROMPT_KV", "auto", "must be 0 or 1"),
+        ("VMODEL_GLM53_HOT_KV_SLOTS", "0", "must be in \\[1, 4\\]"),
+        ("VMODEL_GLM53_HOT_KV_MIN_TOKENS", "-1", "non-negative"),
+        ("VMODEL_GLM53_MTP", "auto", "must be 0 or 1"),
+        ("VMODEL_GLM53_MTP_DEPTH", "6", "must be in \\[1, 5\\]"),
+        ("VMODEL_GLM53_MTP_MAX_PROMPT_TOKENS", "2049", "in \\[1, 2048\\]"),
+        ("VMODEL_GLM53_EXPERT_BATCH_PREFETCH", "auto", "must be 0 or 1"),
+        ("VMODEL_GLM53_EXPERT_FETCH_BATCH", "9", "must be in \\[1, 8\\]"),
+        ("VMODEL_GLM53_TRUNK_PREFETCH_DEPTH", "3", "must be in \\[0, 2\\]"),
+        ("VMODEL_GLM53_TRUNK_PREFETCH_WORKERS", "0", "must be in \\[1, 2\\]"),
+    ],
+)
+def test_glm53_hot_prompt_kv_settings_fail_closed(variable, value, message):
+    from unittest.mock import patch
+
+    from runtime.server import EngineManager, RequestValidationError
+
+    with patch.dict("os.environ", {variable: value}, clear=False):
+        with pytest.raises(RequestValidationError, match=message):
+            EngineManager().get(Path("/tmp/not-opened-glm53"), "lossless")
+
+
+def test_glm53_native_mtp_is_explicit_and_in_engine_identity():
+    from unittest.mock import patch
+
+    from runtime.server import EngineManager
+
+    targets = []
+    wrappers = []
+
+    class FakeEngine:
+        def __init__(self, _path, rc):
+            self.rc = rc
+            self.store = SimpleNamespace(names_with_prefix=lambda _prefix: ["ok"])
+            targets.append(self)
+
+        def close(self):
+            pass
+
+    class FakeMTP:
+        def __init__(self, target, *, k, max_prompt_tokens):
+            self.target = target
+            self.k = k
+            self.max_prompt_tokens = max_prompt_tokens
+            wrappers.append(self)
+
+        def close(self):
+            self.target.close()
+
+    cfg = SimpleNamespace(
+        model_type="glm5_next", tie_word_embeddings=False,
+        index_topk=2048, vision_config=None, num_experts_per_tok=8,
+    )
+    settings = {
+        "VMODEL_GLM53_MTP": "0",
+        "VMODEL_GLM53_MTP_DEPTH": "3",
+        "VMODEL_GLM53_MTP_MAX_PROMPT_TOKENS": "512",
+    }
+    with patch.dict("os.environ", settings, clear=False), \
+         patch("runtime.config.ModelConfig.from_dir", return_value=cfg), \
+         patch("runtime.path_resolver.resolve_model_dir",
+               side_effect=lambda path: path), \
+         patch("runtime.engine.StreamingEngine", FakeEngine), \
+         patch("runtime.speculative.NativeMTPEngine", FakeMTP):
+        manager = EngineManager()
+        plain = manager.get(Path("/tmp/fake-glm53-mtp"), "lossless")
+        os.environ["VMODEL_GLM53_MTP"] = "1"
+        mtp = manager.get(Path("/tmp/fake-glm53-mtp"), "lossless")
+
+    assert plain is targets[0]
+    assert mtp is wrappers[0]
+    assert mtp.k == 3
+    assert mtp.max_prompt_tokens == 512
+    assert len(targets) == 2
+
+
+def test_glm53_expert_storage_batch_and_pipeline_are_explicit_identity():
+    from unittest.mock import patch
+
+    from runtime.server import EngineManager
+
+    captured = []
+
+    class FakeEngine:
+        def __init__(self, _path, rc):
+            self.rc = rc
+            captured.append(rc)
+
+        def close(self):
+            pass
+
+    cfg = SimpleNamespace(
+        model_type="glm5_next", tie_word_embeddings=False,
+        index_topk=2048, vision_config=None, num_experts_per_tok=8,
+    )
+    settings = {
+        "VMODEL_GLM53_MTP": "0",
+        "VMODEL_GLM53_EXPERT_FETCH_BATCH": "1",
+        "VMODEL_GLM53_EXPERT_BATCH_PREFETCH": "0",
+        "VMODEL_GLM53_TRUNK_PREFETCH_DEPTH": "0",
+        "VMODEL_GLM53_TRUNK_PREFETCH_WORKERS": "1",
+    }
+    with patch.dict("os.environ", settings, clear=False), \
+         patch("runtime.config.ModelConfig.from_dir", return_value=cfg), \
+         patch("runtime.path_resolver.resolve_model_dir",
+               side_effect=lambda path: path), \
+         patch("runtime.engine.StreamingEngine", FakeEngine):
+        manager = EngineManager()
+        manager.get(Path("/tmp/fake-glm53-expert-pipeline"), "lossless")
+        os.environ["VMODEL_GLM53_EXPERT_FETCH_BATCH"] = "8"
+        os.environ["VMODEL_GLM53_EXPERT_BATCH_PREFETCH"] = "1"
+        os.environ["VMODEL_GLM53_TRUNK_PREFETCH_DEPTH"] = "1"
+        os.environ["VMODEL_GLM53_TRUNK_PREFETCH_WORKERS"] = "2"
+        manager.get(Path("/tmp/fake-glm53-expert-pipeline"), "lossless")
+
+    assert len(captured) == 2
+    baseline, candidate = captured
+    assert baseline.expert_fetch_batch == 1
+    assert not baseline.expert_batch_prefetch
+    assert baseline.expert_compute_batch == 1
+    assert baseline.prefetch_depth == 0
+    assert baseline.prefetch_workers == 1
+    assert candidate.expert_fetch_batch == 8
+    assert candidate.expert_batch_prefetch
+    assert candidate.prefetch_depth == 1
+    assert candidate.prefetch_workers == 2
+    # Storage grouping never changes the verified arithmetic grouping.
+    assert candidate.expert_compute_batch == 1
+
+
 def test_k3_native_profile_uses_proven_layer_stationary_prefetch_schedule():
     from unittest.mock import patch
 
