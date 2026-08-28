@@ -1,9 +1,9 @@
 schema: voom.runtime-profile.v1
 name: qwen38-flash-next-instrumented-lossless
-description: Exact released-BF16 Qwen3.8-Flash-Next baseline with content-blind paging telemetry.
+description: Exact released-BF16 Qwen3.8-Flash-Next measured profile with content-blind paging telemetry.
 notes:
   - The model, routed experts, QSA/DeltaNet state, PLE rows, embeddings, and output head remain at their released BF16 precision; no pruning, quantization, approximate attention, speculative draft, or host-authored answer path is enabled.
-  - "The 96 MB weight-cache ceiling follows measured zero-hit scans at 300 MB: 24.97GB was read with 1841 misses and zero hits while 249MB remained resident. Pass-through pages are still held for their immediate exact compute batch, but dead scan residency no longer competes with the 49K prompt state."
+  - "The original 96 MB prefill scan ceiling followed measured zero-hit scans at 300 MB. The measured restart/decode profile now permits 400 MB because the complete prompt endpoint is already resident and a one-page prefetch produces useful verifier hits; pass-through pages remain bounded and the 49K max-16/max-64 gates stayed below the Metal and swap-growth ceilings."
   - Exact layer-stationary prefill retains one layer trunk while PLE/QSA/DeltaNet and MoE arithmetic preserve fixed 1024-position tile shapes. The union of physical routed-expert pages is loaded once per layer, avoiding both the measured 12.8 GB whole-prompt transient and repeated reads of the 241.6 GB expert body. The first instrumented 8192-position DeltaNet tile peaked at 28.14 GB despite compiled 32-position segments, so 1024 is the conservative content-blind bound pending a measured ladder.
   - The DeltaNet recurrence uses the exact same-operator compiled 32-position segments. This preserves the released FP32 state/update order while bounding the lazy recurrence graph; the real greedy/state oracle must remain bit-identical before this candidate is used.
   - Evaluated BF16 hidden, mixed, and injection tiles are copied bit-for-bit to a bounded host spool between phases. This prevents prompt-length many Metal graphs from remaining live; copy bytes, copy time, and peak host bytes are reported explicitly.
@@ -18,16 +18,18 @@ notes:
   - The exact 1.271 GB BF16 output head is absent during host-spooled prefill, loaded once at the first endpoint projection, and retained through MTP verification. It is released before the next prompt sweep. This phase lease reduced the real MTP oracle to 110.79 seconds generation / 93.44 seconds decode without widening the ordinary 96 MB scan cache.
   - The phase head is released again immediately after response state and logits are committed, so an idle server does not sacrifice the admission headroom needed by its next request.
   - The exact Qwen4 hybrid prefix journal is enabled only in this named profile. It fingerprints released weights/runtime/tokenizer state, persists full QSA/DeltaNet/PLE/KV boundaries, and must miss rather than reuse when a perturbed prompt does not share the exact token prefix.
+  - Durable exact endpoints also carry the Qwen4 hyper-connection hidden row consumed by Lightning-MTP. Older endpoints without it fail closed to their verified stable boundary. The 49,255-token unmodified capture then reached 76.0569 seconds at max-16 and 298.2957 seconds at max-64; this remains an explicit profile rather than an automatic route pending the full heterogeneous live corpus.
+  - The current machine's 20.499 GB trace-balanced mirror is decode-only. Exact pages remain released BF16 and are divided by measured target-trunk traffic across the internal and workspace NVMe devices; PLE, prompt prefill, and the complete source checkpoint remain external.
 settings:
   VMODEL_RESIDENT_BACKEND: voom
   VMODEL_EXECUTION_PROFILE: layers
-  VMODEL_QWEN4_WEIGHT_CACHE_MB: 96
+  VMODEL_QWEN4_WEIGHT_CACHE_MB: 400
   VMODEL_QWEN4_MIN_WEIGHT_CACHE_MB: 64
   VMODEL_QWEN4_MLX_CACHE_MB: 128
   VMODEL_QWEN4_PREFILL_CHUNK: 1024
   VMODEL_QWEN4_EXPERT_FETCH_BATCH: 16
   VMODEL_QWEN4_DECODE_EXPERT_FETCH_BATCH: 16
-  VMODEL_QWEN4_PREFETCH_DEPTH: 0
+  VMODEL_QWEN4_PREFETCH_DEPTH: 1
   VMODEL_QWEN4_PREFETCH_WORKERS: 1
   VMODEL_QWEN4_PLE_READ_WORKERS: 8
   VMODEL_QWEN4_MAX_METAL_MB: 8500
@@ -35,11 +37,13 @@ settings:
   VMODEL_QWEN4_GLOBAL_EXPERT_ROWS: false
   VMODEL_QWEN4_EXPERT_TILE_EVAL_BATCH: 4
   VMODEL_QWEN4_COMPILED_DELTA: true
-  VMODEL_QWEN4_FAST_TIER_DIR: ""
-  VMODEL_QWEN4_PARALLEL_STORAGE_READS: false
-  VMODEL_QWEN4_FAST_TIER_DECODE_ONLY: false
+  VMODEL_QWEN4_FAST_TIER_DIR: /Users/kyleboyer/vmodel_fast_tier/Qwen3.8-Flash-Next
+  VMODEL_QWEN4_PARALLEL_STORAGE_READS: true
+  VMODEL_QWEN4_FAST_TIER_DECODE_ONLY: true
   VMODEL_QWEN4_PHASE_LM_HEAD: true
-  VMODEL_QWEN4_MTP_DEPTH: 4
+  VMODEL_QWEN4_MTP_DEPTH: 3
+  VMODEL_QWEN4_SERIAL_VERIFY_SUSPEND_LM_HEAD: true
+  VMODEL_QWEN4_SERIAL_VERIFY_EXACT_BF16_GEMV: true
   VMODEL_QWEN4_MTP_Q_CALIBRATION_SCALES: "0.5,0.7,0.85,1,1.15,1.3,1.5"
   VMODEL_QWEN4_HOT_PROMPT_KV: true
   VMODEL_QWEN4_HOT_KV_SLOTS: 1

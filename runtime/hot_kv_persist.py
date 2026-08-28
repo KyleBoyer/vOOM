@@ -360,12 +360,15 @@ class HotPromptKVPersistence:
     def _checkpoint_arrays(
         self, kv: KVCache, logits: mx.array | None,
         prompt_logits: mx.array | None,
+        exact_hidden: mx.array | None = None,
     ) -> dict[str, mx.array]:
         arrays = {}
         if logits is not None:
             arrays["logits"] = logits
         if prompt_logits is not None:
             arrays["prompt_logits"] = prompt_logits
+        if exact_hidden is not None:
+            arrays["hidden"] = exact_hidden
         recurrent = getattr(kv, "kda_cache", None)
         if recurrent is not None:
             arrays.update(recurrent.export_arrays())
@@ -730,6 +733,7 @@ class HotPromptKVPersistence:
              approximate: bool = False,
              tool_capsules=(), cache_namespace: str = "default",
              checkpoint_kind: str = "endpoint",
+             exact_hidden: mx.array | None = None,
              ) -> tuple[str, ...]:
         # Hold a shared journal lock from parent validation through checkpoint
         # publication. GC's exclusive lock cannot retire a just-written segment
@@ -738,7 +742,8 @@ class HotPromptKVPersistence:
             return self._save_locked(
                 parent_chain, parent_covered, tokens, kv, logits,
                 prompt_logits, prompt_length, reusable_prefix, approximate,
-                tool_capsules, cache_namespace, checkpoint_kind)
+                tool_capsules, cache_namespace, checkpoint_kind,
+                exact_hidden)
 
     def _save_locked(self, parent_chain: tuple[str, ...], parent_covered: int,
                      tokens, kv: KVCache, logits: mx.array | None,
@@ -747,6 +752,7 @@ class HotPromptKVPersistence:
                      approximate: bool = False,
                      tool_capsules=(), cache_namespace: str = "default",
                      checkpoint_kind: str = "endpoint",
+                     exact_hidden: mx.array | None = None,
                      ) -> tuple[str, ...]:
         """Persist a slot as new segments on top of `parent_chain` (which the
         caller has already validated as a true prefix of `tokens`, covering
@@ -781,6 +787,20 @@ class HotPromptKVPersistence:
             if logits is None or prompt_logits is None:
                 raise ValueError(
                     "endpoint checkpoint requires logits and prompt logits")
+            if getattr(self.config, "model_type", "") == "qwen4_exp":
+                if exact_hidden is None:
+                    raise ValueError(
+                        "Qwen4 endpoint checkpoint requires exact hidden")
+                expected_hidden = (
+                    int(getattr(self.config, "qwen4_hc_count", 1))
+                    * int(getattr(self.config, "hidden_size", 0)))
+                if (len(exact_hidden.shape) != 3
+                        or tuple(map(int, exact_hidden.shape[:2])) != (1, 1)
+                        or int(exact_hidden.shape[-1]) != expected_hidden):
+                    raise ValueError(
+                        "Qwen4 endpoint exact hidden has invalid shape: "
+                        f"{tuple(map(int, exact_hidden.shape))} != "
+                        f"(1, 1, {expected_hidden})")
         else:
             if not self.require_recurrent:
                 raise ValueError(
@@ -788,6 +808,9 @@ class HotPromptKVPersistence:
             if logits is not None or prompt_logits is not None:
                 raise ValueError(
                     "stable-prefix checkpoint must not carry endpoint logits")
+            if exact_hidden is not None:
+                raise ValueError(
+                    "stable-prefix checkpoint must not carry exact hidden")
             if (int(prompt_length) != len(tokens)
                     or int(reusable_prefix) != len(tokens)):
                 raise ValueError(
@@ -836,7 +859,7 @@ class HotPromptKVPersistence:
             # there is no leaf to checkpoint.
             return tuple(chain)
         checkpoint_arrays = self._checkpoint_arrays(
-            kv, logits, prompt_logits)
+            kv, logits, prompt_logits, exact_hidden)
         has_recurrent = any(
             name.startswith("kda_state_") for name in checkpoint_arrays)
         tmp_payload, payload_sha256, payload_bytes = _write_safetensors_temp(
@@ -851,6 +874,7 @@ class HotPromptKVPersistence:
             "cache_namespace": cache_namespace,
             "tool_capsules": [list(span) for span in tool_capsules],
             "recurrent_state": bool(has_recurrent),
+            "exact_hidden": bool(exact_hidden is not None),
             "payload_sha256": payload_sha256,
             "payload_bytes": payload_bytes,
         }
@@ -988,6 +1012,15 @@ class HotPromptKVPersistence:
             if self.require_recurrent and (
                     not meta.get("recurrent_state", False)
                     or case not in ("endpoint", "extension")):
+                continue
+            if (getattr(self.config, "model_type", "") == "qwen4_exp"
+                    and checkpoint_kind == "endpoint"
+                    and case == "endpoint"
+                    and not meta.get("exact_hidden", False)):
+                # Qwen4 Lightning-MTP consumes the prompt endpoint's trunk
+                # hidden row before it feeds any new target token. Older
+                # endpoint generations did not retain that row; prefer the
+                # stable-prefix extension that can rebuild it exactly.
                 continue
             try:
                 mtime = j.stat().st_mtime
@@ -1227,6 +1260,7 @@ class HotPromptKVPersistence:
                 release()
             return None
         exact_logits = None
+        exact_hidden = None
         ck = None
         checkpoint_kind = _normalize_checkpoint_kind(
             match.get("checkpoint_kind", "endpoint"), strict=False)
@@ -1254,6 +1288,10 @@ class HotPromptKVPersistence:
                             and ("logits" not in ck
                                  or "prompt_logits" not in ck)):
                         raise KeyError("missing logits/prompt_logits")
+                    if (checkpoint_kind == "endpoint"
+                            and meta.get("exact_hidden", False)
+                            and "hidden" not in ck):
+                        raise KeyError("missing exact hidden")
                     mx.eval(list(ck.values()))
             except Exception as e:
                 print(f"[hot-kv-persist] disk match leaf={match['leaf']}: "
@@ -1271,6 +1309,18 @@ class HotPromptKVPersistence:
         if (checkpoint_kind == "endpoint"
                 and match["case"] in ("repeat", "endpoint")):
             exact_logits = ck["prompt_logits"] if match["case"] == "repeat" else ck["logits"]
+            if ck.get("hidden") is not None:
+                exact_hidden = ck["hidden"]
+                expected_hidden = (
+                    int(getattr(self.config, "qwen4_hc_count", 1))
+                    * int(getattr(self.config, "hidden_size", 0)))
+                if (len(exact_hidden.shape) != 3
+                        or tuple(map(int, exact_hidden.shape[:2])) != (1, 1)
+                        or int(exact_hidden.shape[-1]) != expected_hidden):
+                    release = getattr(kv, "release", None)
+                    if release is not None:
+                        release()
+                    return None
         checkpoint_id = match["checkpoint_id"]
         with self._locked(exclusive=False):
             for path in (
@@ -1280,12 +1330,14 @@ class HotPromptKVPersistence:
                     os.utime(path, None)
                 except OSError:
                     pass
+        if exact_hidden is not None:
+            return tuple(tokens), kv, exact_logits, exact_hidden
         return tuple(tokens), kv, exact_logits
 
     def load_all(self, num_layers: int, limit: int) -> list[tuple]:
         """Return up to `limit` (tokens, kv, logits, prompt_length,
         prompt_logits, reusable_prefix, approximate, tool_capsules,
-        segment_chain, cache_namespace) tuples, oldest-mtime
+        segment_chain, cache_namespace, exact_hidden) tuples, oldest-mtime
         first -- ready to append straight into `_hot_prompt_slots` in LRU
         order. Corrupt, fingerprint-mismatched, or broken-chain checkpoints
         are skipped, never fatal (same posture as F37)."""
@@ -1345,6 +1397,10 @@ class HotPromptKVPersistence:
                             and ("logits" not in ck
                                  or "prompt_logits" not in ck)):
                         raise KeyError("missing logits/prompt_logits")
+                    if (checkpoint_kind == "endpoint"
+                            and meta.get("exact_hidden", False)
+                            and "hidden" not in ck):
+                        raise KeyError("missing exact hidden")
                     mx.eval(list(ck.values()))
             except Exception as e:
                 print(f"[hot-kv-persist] skip corrupt/unreadable checkpoint "
@@ -1376,6 +1432,8 @@ class HotPromptKVPersistence:
                 int(meta["reusable_prefix"]),
                 bool(meta.get("approximate", False)), tool_capsules,
                 tuple(chain), cache_namespace,
+                (ck.get("hidden")
+                 if checkpoint_kind == "endpoint" else None),
             ))
         return out
 

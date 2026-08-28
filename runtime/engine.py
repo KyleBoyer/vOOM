@@ -119,6 +119,22 @@ def _stable_boundary_persistence_allowed(persistence, *, approximate: bool) -> b
     )
 
 
+def _prefer_longer_persisted_hybrid_prefix(
+    *, model_type: str, best_case: str,
+) -> bool:
+    """Whether disk may replace a shorter resident recurrent extension.
+
+    Recurrent state cannot be trimmed to an arbitrary longer common prefix.
+    These Qwen families persist every auxiliary recurrent component required
+    to restore a checksum- and fingerprint-validated exact endpoint, so a
+    strictly longer disk match is preferable to replaying the resident
+    boundary's suffix.  Ordinary repeats/branches keep the resident path.
+    """
+    return bool(
+        best_case == "extension"
+        and model_type in ("qwen3_5", "qwen3_5_moe", "qwen4_exp"))
+
+
 def hybrid_prefill_chunk_size(available_bytes: int, model_scale: int = 0) -> int:
     """F94/F95: descending chunk-size ladder for qwen3_5/qwen3_5_moe's fixed,
     hot_prompt_kv-compatible prefill chunk (GLM's live adaptive_chunk_size
@@ -1444,6 +1460,7 @@ class _HotPromptSlot:
     # construction site must decide this explicitly rather than risk a
     # stale/wrong value slipping through unnoticed.
     chunk_size: int
+    exact_hidden: mx.array | None = None
     # K3's prompt-length policy also changes the dense-MLP tile. A content-
     # blind bucket id prevents an endpoint built by the short schedule from
     # being reused after a continuation crosses into the long schedule (or
@@ -2754,7 +2771,7 @@ class StreamingEngine:
             if not self._defer_persisted_kv_until_bootstrap:
                 for (tokens, kv, logits, prompt_length, prompt_logits,
                      reusable_prefix, approximate, tool_capsules,
-                     segment_chain, persisted_namespace
+                     segment_chain, persisted_namespace, exact_hidden
                      ) in self._hot_kv_persist.load_all(
                         self.cfg.num_hidden_layers, self.rc.hot_prompt_kv_slots):
                     self._hot_prompt_slots.append(_HotPromptSlot(
@@ -2767,6 +2784,7 @@ class StreamingEngine:
                         # always use that fixed, engine-wide value, never
                         # the per-conversation adaptive pick.
                         chunk_size=self.rc.hot_prompt_kv_chunk_size,
+                        exact_hidden=exact_hidden,
                         approximate=approximate,
                         tool_capsules=tool_capsules,
                         segment_chain=segment_chain,
@@ -9756,6 +9774,7 @@ class StreamingEngine:
             best_idx = None
             best_matched = 0
             best_exact_logits = None
+            best_exact_hidden = None
             best_reusable_watermark = 0
             best_lcp = 0
             best_needs_trim_to: int | None = None  # None = don't trim, else trim(N)
@@ -9794,9 +9813,12 @@ class StreamingEngine:
                     # fold and is therefore deliberately ineligible.
                     if (len(tokens) == len(slot.tokens)
                             and lcp == len(tokens)
-                            and slot.logits is not None):
+                            and slot.logits is not None
+                            and (self.cfg.model_type != "qwen4_exp"
+                                 or slot.exact_hidden is not None)):
                         candidate_matched = len(tokens)
                         candidate_exact_logits = slot.logits
+                        candidate_exact_hidden = slot.exact_hidden
                         candidate_watermark = 0
                         candidate_trim_to = None
                         candidate_case = "endpoint"
@@ -9804,6 +9826,7 @@ class StreamingEngine:
                           and lcp == len(slot.tokens)):
                         candidate_matched = len(slot.tokens)
                         candidate_exact_logits = None
+                        candidate_exact_hidden = None
                         candidate_watermark = 0
                         candidate_trim_to = None
                         candidate_case = "extension"
@@ -9813,6 +9836,7 @@ class StreamingEngine:
                         best_idx = idx
                         best_matched = candidate_matched
                         best_exact_logits = candidate_exact_logits
+                        best_exact_hidden = candidate_exact_hidden
                         best_reusable_watermark = candidate_watermark
                         best_lcp = lcp
                         best_needs_trim_to = candidate_trim_to
@@ -10051,8 +10075,9 @@ class StreamingEngine:
             preferred_disk_match = None
             if (kv is None
                     and best_idx is not None
-                    and best_case == "extension"
-                    and self.cfg.model_type in ("qwen3_5", "qwen3_5_moe")
+                    and _prefer_longer_persisted_hybrid_prefix(
+                        model_type=self.cfg.model_type,
+                        best_case=best_case)
                     and self._hot_kv_persist is not None
                     and self._persisted_kv_restore_allowed()):
                 # A recently used shorter boundary can coexist in RAM with a
@@ -10128,6 +10153,7 @@ class StreamingEngine:
                 kv = slot.kv
                 matched = best_matched
                 exact_logits = best_exact_logits
+                exact_hidden = best_exact_hidden
                 reusable_watermark = best_reusable_watermark
                 path_stats["hot_prompt_lcp_tokens"] = best_lcp
                 path_stats["prompt_cache_source"] = "memory"
@@ -11690,6 +11716,9 @@ class StreamingEngine:
                     kv=kv,
                     logits=logits,
                     prompt_logits=prompt_endpoint_logits,
+                    exact_hidden=(
+                        self._h_last
+                        if self.cfg.model_type == "qwen4_exp" else None),
                     prompt_length=len(tokens),
                     reusable_prefix=reusable_watermark,
                     approximate=prompt_state_approximate,
@@ -12184,6 +12213,7 @@ class StreamingEngine:
                 prompt_logits=None,
                 reusable_prefix=0,
                 chunk_size=self.rc.prefill_chunk_size,
+                exact_hidden=None,
                 kimi_k3_prefill_schedule=getattr(
                     self, "_active_k3_prefill_schedule", ""),
                 approximate=prompt_state_approximate,
@@ -12203,6 +12233,10 @@ class StreamingEngine:
             # per-conversation pick (new), set earlier in this same
             # generate() call.
             chunk_size=self.rc.prefill_chunk_size,
+            exact_hidden=(
+                getattr(self, "_h_last", None)
+                if getattr(getattr(self, "cfg", None), "model_type", "")
+                == "qwen4_exp" else None),
             kimi_k3_prefill_schedule=getattr(
                 self, "_active_k3_prefill_schedule", ""),
             approximate=prompt_state_approximate,

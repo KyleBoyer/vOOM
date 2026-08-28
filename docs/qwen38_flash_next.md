@@ -3,8 +3,10 @@
 Status: the pinned checkpoint download and checksum gate completed on
 2026-08-27. Exact released-BF16 text serving, the PLE direct-row provider,
 hybrid prompt-state persistence, and target-authoritative Lightning-MTP are
-implemented and real-checkpoint tested. Optimization candidates remain
-profile-scoped until their memory and heterogeneous-replay gates pass.
+implemented and real-checkpoint tested. On 2026-08-28 the unchanged 49,255-
+token harness cleared the sub-90-second max-16 goal at 76.0569s after a durable
+exact endpoint restart. Optimization candidates remain profile-scoped until
+their memory and heterogeneous-replay gates pass.
 
 ## Source and storage
 
@@ -132,12 +134,27 @@ seconds of initialization that is not decode work.
 | Native MTP depth 3, pipeline off | 117.935s | 99.795s | 6 | 18 / 9 | matched control |
 | Native MTP depth 3, expert-page pipeline | 115.551s | 97.457s | 6 | 18 / 9 | keep opt-in; 2.0% wall gain, below 10% promotion gate |
 | Native MTP depth 5 | 142.649s | 124.543s | 6 | 29 / 10 | STOP; no sweep removed and 176.0GB streamed |
+| Depth 3 + exact BF16 GEMV + exact disk endpoint | **76.057s** | **73.307s** | 6 | 18 / 9 | scoped promotion; full 49,255-token prompt hit, peak 5.729GB |
 
 The pipeline/control output SHA-256 is identical
 (`411b96d6...bf2fd85`). Both repeat-2 runs violated the memory-pressure gate,
 so neither is eligible as a default. The max-16 Plex score is 15/100 because
 the response is deliberately truncated before it can complete the task; it is
 a latency/instrumentation rung, not a model-quality score.
+
+The exact endpoint row uses the 20.499GB trace-balanced two-device mirror, a
+400MB scan cache with one-position prefetch, released Lightning-MTP depth
+three, exact BF16 serial-verifier GEMV, and phase-scoped head suspension.  The
+journal additionally authenticates the Qwen4 hyper-connection hidden carrier;
+an older endpoint without it is not eligible for a zero-sweep hit.  The first
+migration request rebuilt the five-token suffix, while the steady request
+loaded all 49,255 prompt positions and preserved the established output hash.
+
+At max-64, the same untouched request completed its output budget in 298.2957s
+versus the earlier 501.1384s. It accepted 41/68 proposals in 23 target sweeps
+(40 fewer than plain autoregression), peaked at 4.248GB Metal, and stayed under
+the 16MB swap-out-growth gate. Its 15/100 Plex result is again an incomplete
+output-cap result, not evidence of poor completed-answer quality.
 
 Other bounded exact candidates were stopped before promotion:
 

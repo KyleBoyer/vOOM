@@ -169,6 +169,28 @@ def test_mixed_depth_disk_boundary_is_skipped_for_exact_short_prompt():
         None, approximate=True)
 
 
+@pytest.mark.parametrize("model_type", ("qwen3_5", "qwen3_5_moe", "qwen4_exp"))
+def test_exact_qwen_hybrids_prefer_strictly_longer_persisted_extension(
+    model_type,
+):
+    from runtime.engine import _prefer_longer_persisted_hybrid_prefix
+
+    assert _prefer_longer_persisted_hybrid_prefix(
+        model_type=model_type, best_case="extension")
+    for best_case in ("repeat", "branch", "endpoint", ""):
+        assert not _prefer_longer_persisted_hybrid_prefix(
+            model_type=model_type, best_case=best_case)
+
+
+@pytest.mark.parametrize(
+    "model_type", ("kimi_linear", "kimi_k3", "jet_nemotron", "gpt_oss"))
+def test_other_models_do_not_replace_resident_state_from_disk(model_type):
+    from runtime.engine import _prefer_longer_persisted_hybrid_prefix
+
+    assert not _prefer_longer_persisted_hybrid_prefix(
+        model_type=model_type, best_case="extension")
+
+
 def test_non_recurrent_model_always_uses_full_endpoint_even_with_a_fork():
     """A boundary fork should never even be produced for an ordinary
     attention-KV model (the fork site in generate() is itself gated on

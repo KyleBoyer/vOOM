@@ -145,3 +145,96 @@ def test_qwen4_incomplete_or_noncanonical_auxiliary_state_fails_closed(tmp_path)
             (), 0, list(range(33)), broken, None, None,
             prompt_length=33, reusable_prefix=33,
             checkpoint_kind="stable_prefix")
+
+
+def test_qwen4_endpoint_round_trip_retains_exact_hidden_for_mtp(tmp_path):
+    journal = _journal(tmp_path)
+    tokens = list(range(33))
+    expected = _state(len(tokens))
+    logits = mx.array([[1.0, 2.0, 3.0]], dtype=mx.float32)
+    hidden = mx.arange(8, dtype=mx.float32).reshape(
+        1, 1, 8).astype(mx.bfloat16)
+    journal.save(
+        (), 0, tokens, expected, logits, logits,
+        prompt_length=len(tokens), reusable_prefix=0,
+        exact_hidden=hidden)
+
+    match = journal.find_best_match(tokens, 32)
+    assert match is not None and match["case"] == "endpoint"
+    loaded = _journal(tmp_path).load_matched_chain(
+        match, len(_LAYER_TYPES))
+    assert loaded is not None and len(loaded) == 4
+    restored_tokens, restored, restored_logits, restored_hidden = loaded
+    assert restored_tokens == tuple(tokens)
+    _assert_equal(restored, expected)
+    assert np.array_equal(np.asarray(restored_logits), np.asarray(logits))
+    assert np.array_equal(
+        np.asarray(restored_hidden.view(mx.uint16)),
+        np.asarray(hidden.view(mx.uint16)),
+    )
+
+    preloaded = _journal(tmp_path).load_all(
+        len(_LAYER_TYPES), limit=1)
+    assert len(preloaded) == 1
+    assert np.array_equal(
+        np.asarray(preloaded[0][10].view(mx.uint16)),
+        np.asarray(hidden.view(mx.uint16)),
+    )
+
+
+def test_qwen4_endpoint_without_exact_hidden_fails_closed(tmp_path):
+    journal = _journal(tmp_path)
+    tokens = list(range(33))
+    logits = mx.array([[1.0, 2.0, 3.0]], dtype=mx.float32)
+    with pytest.raises(ValueError, match="requires exact hidden"):
+        journal.save(
+            (), 0, tokens, _state(len(tokens)), logits, logits,
+            prompt_length=len(tokens), reusable_prefix=0)
+
+    with pytest.raises(ValueError, match="must not carry exact hidden"):
+        journal.save(
+            (), 0, tokens, _state(len(tokens)), None, None,
+            prompt_length=len(tokens), reusable_prefix=len(tokens),
+            checkpoint_kind="stable_prefix",
+            exact_hidden=mx.zeros((1, 1, 8), dtype=mx.bfloat16))
+
+
+def test_qwen4_endpoint_selection_is_content_addressed_not_capture_pinned(
+    tmp_path,
+):
+    journal = _journal(tmp_path)
+    boundary_tokens = list(range(32))
+    boundary_chain = journal.save(
+        (), 0, boundary_tokens, _state(32), None, None,
+        prompt_length=32, reusable_prefix=32,
+        checkpoint_kind="stable_prefix")
+    prompt_tokens = boundary_tokens + [32]
+    logits = mx.array([[1.0, 2.0, 3.0]], dtype=mx.float32)
+    hidden = mx.arange(8, dtype=mx.float32).reshape(
+        1, 1, 8).astype(mx.bfloat16)
+    journal.save(
+        boundary_chain, 32, prompt_tokens, _state(33), logits, logits,
+        prompt_length=33, reusable_prefix=32, exact_hidden=hidden)
+
+    exact = journal.find_best_match(prompt_tokens, 32)
+    assert exact is not None
+    assert (exact["checkpoint_kind"], exact["case"], exact["matched"]) == (
+        "endpoint", "endpoint", 33)
+
+    # A changed final user/tool-schema token cannot inherit endpoint logits or
+    # hidden state. It may reuse only the independently verified stable prefix.
+    modified = boundary_tokens + [9_999]
+    fallback = journal.find_best_match(modified, 32)
+    assert fallback is not None
+    assert (
+        fallback["checkpoint_kind"], fallback["case"], fallback["matched"]
+    ) == ("stable_prefix", "extension", 32)
+
+    strict_extension = journal.find_best_match(prompt_tokens + [33], 32)
+    assert strict_extension is not None
+    assert (
+        strict_extension["checkpoint_kind"],
+        strict_extension["case"],
+        strict_extension["matched"],
+    ) == ("endpoint", "extension", 33)
+    assert journal.find_best_match([50_000, 50_001], 32) is None

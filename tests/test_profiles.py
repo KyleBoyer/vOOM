@@ -122,6 +122,19 @@ def test_builtin_profiles_resolve_complete_agent_group():
     assert huihui_settings[
         "VMODEL_QWEN35_REUSABLE_USER_PREFIX"] == "1"
 
+    flash_order, flash_settings = resolve_runtime_profiles(
+        ("qwen38-flash-next-instrumented-lossless",), catalog)
+    assert flash_order == ("qwen38-flash-next-instrumented-lossless",)
+    assert flash_settings["VMODEL_QWEN4_WEIGHT_CACHE_MB"] == "400"
+    assert flash_settings["VMODEL_QWEN4_PREFETCH_DEPTH"] == "1"
+    assert flash_settings["VMODEL_QWEN4_MTP_DEPTH"] == "3"
+    assert flash_settings[
+        "VMODEL_QWEN4_SERIAL_VERIFY_SUSPEND_LM_HEAD"] == "1"
+    assert flash_settings[
+        "VMODEL_QWEN4_SERIAL_VERIFY_EXACT_BF16_GEMV"] == "1"
+    assert flash_settings["VMODEL_QWEN4_PARALLEL_STORAGE_READS"] == "1"
+    assert flash_settings["VMODEL_QWEN4_FAST_TIER_DECODE_ONLY"] == "1"
+
     long_order, long_settings = resolve_runtime_profiles(
         ("huihui-qwen38-27b-fast-long-context",), catalog)
     assert long_order == (
