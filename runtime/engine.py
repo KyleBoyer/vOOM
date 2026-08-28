@@ -717,6 +717,10 @@ class RuntimeConfig:
     # exact.  Keep it separate from qwen4_phase_lm_head until the live pressure
     # and heterogeneous-replay gates clear.
     qwen4_serial_verify_suspend_lm_head: bool = False
+    # Use the released-BF16 singleton-equivalent Metal GEMV for independent
+    # Qwen4 verifier MLP/router rows. Default-off until real checkpoint state,
+    # token, and heterogeneous-request gates clear.
+    qwen4_serial_verify_exact_bf16_gemv: bool = False
     # Opt-in request-local attribution. "" disables it; "layers" records the
     # runtime's existing materialization boundaries; "ops" adds diagnostic
     # attention/router/MLP barriers for supported Qwen/Kimi/GLM hybrid blocks.
@@ -2147,6 +2151,9 @@ class StreamingEngine:
         self._qwen4_serial_verify_head_suspend_calls = 0
         self._qwen4_serial_verify_head_suspend_bytes = 0
         self._qwen4_serial_verify_head_restore_trim_bytes = 0
+        self._qwen4_serial_verify_exact_bf16_calls = 0
+        self._qwen4_serial_verify_exact_bf16_rows = 0
+        self._qwen4_serial_verify_exact_bf16_fallback_calls = 0
         self._layer_transient_margin = 400_000_000
         self._token_transient = 0  # F42: whole-token transient (greedy sync point)
         # 2026-07-13: F42's own per-layer/per-token mx.reset_peak_memory() calls
@@ -8267,6 +8274,7 @@ class StreamingEngine:
                 qwen4_mlp_from_group_batches,
                 qwen4_mlp_from_groups,
                 qwen4_mlp_route,
+                qwen4_mlp_route_window_exact,
             )
         if kimi_family:
             from .kimi_linear import (
@@ -8579,11 +8587,22 @@ class StreamingEngine:
                     capture_qwen4_position(layer, position)
                     attn_positions.append(attn_out)
 
-                routes = [
-                    qwen4_mlp_route(
-                        hidden, weights, prefix, self.cfg, layer)
-                    for hidden in attn_positions
-                ]
+                exact_bf16_stats: dict[str, int] = {}
+                if self.rc.qwen4_serial_verify_exact_bf16_gemv:
+                    routes = qwen4_mlp_route_window_exact(
+                        attn_positions,
+                        weights,
+                        prefix,
+                        self.cfg,
+                        layer,
+                        stats=exact_bf16_stats,
+                    )
+                else:
+                    routes = [
+                        qwen4_mlp_route(
+                            hidden, weights, prefix, self.cfg, layer)
+                        for hidden in attn_positions
+                    ]
                 positions_by_expert: dict[int, list[int]] = {}
                 expert_slots = 0
                 for position, route in enumerate(routes):
@@ -8604,6 +8623,9 @@ class StreamingEngine:
                         ),
                         weights,
                         prefix,
+                        exact_bf16=(
+                            self.rc.qwen4_serial_verify_exact_bf16_gemv),
+                        exact_stats=exact_bf16_stats,
                     )
                     self._qwen4_serial_verify_union_fetch_s += max(
                         0.0,
@@ -8617,16 +8639,32 @@ class StreamingEngine:
                         layer, expert_ids, positions=positions_by_expert)
                     self._qwen4_serial_verify_union_fetch_s += (
                         time.perf_counter() - union_fetch_t0)
-                    next_positions = [
-                        qwen4_mlp_from_groups(
-                            route, experts, weights, prefix)
-                        for route in routes
-                    ]
+                    if self.rc.qwen4_serial_verify_exact_bf16_gemv:
+                        next_positions = qwen4_mlp_from_group_batches(
+                            routes,
+                            iter(((expert_ids, experts),)),
+                            weights,
+                            prefix,
+                            exact_bf16=True,
+                            exact_stats=exact_bf16_stats,
+                        )
+                    else:
+                        next_positions = [
+                            qwen4_mlp_from_groups(
+                                route, experts, weights, prefix)
+                            for route in routes
+                        ]
                 self._qwen4_serial_verify_union_layers += 1
                 self._qwen4_serial_verify_expert_slots += expert_slots
                 self._qwen4_serial_verify_union_experts += len(expert_ids)
                 self._qwen4_serial_verify_expert_pages_avoided += max(
                     0, expert_slots - len(expert_ids))
+                self._qwen4_serial_verify_exact_bf16_calls += int(
+                    exact_bf16_stats.get("calls", 0))
+                self._qwen4_serial_verify_exact_bf16_rows += int(
+                    exact_bf16_stats.get("rows", 0))
+                self._qwen4_serial_verify_exact_bf16_fallback_calls += int(
+                    exact_bf16_stats.get("fallback_calls", 0))
                 mx.eval(*next_positions)
                 if self._expert_batch_executor is None:
                     del experts
@@ -9223,6 +9261,9 @@ class StreamingEngine:
         self._qwen4_serial_verify_head_suspend_calls = 0
         self._qwen4_serial_verify_head_suspend_bytes = 0
         self._qwen4_serial_verify_head_restore_trim_bytes = 0
+        self._qwen4_serial_verify_exact_bf16_calls = 0
+        self._qwen4_serial_verify_exact_bf16_rows = 0
+        self._qwen4_serial_verify_exact_bf16_fallback_calls = 0
         self._true_peak_metal_bytes = mx.get_active_memory()  # see _note_true_peak
         if self.governor is not None:
             self.governor.reset_request_peak(self._true_peak_metal_bytes)
@@ -11461,6 +11502,14 @@ class StreamingEngine:
             self._qwen4_serial_verify_head_s)
         path_stats["qwen4_serial_verify_pipelined_expert_layers"] = (
             self._qwen4_serial_verify_pipelined_expert_layers)
+        path_stats["qwen4_serial_verify_exact_bf16_gemv"] = int(
+            self.rc.qwen4_serial_verify_exact_bf16_gemv)
+        path_stats["qwen4_serial_verify_exact_bf16_calls"] = int(
+            self._qwen4_serial_verify_exact_bf16_calls)
+        path_stats["qwen4_serial_verify_exact_bf16_rows"] = int(
+            self._qwen4_serial_verify_exact_bf16_rows)
+        path_stats["qwen4_serial_verify_exact_bf16_fallback_calls"] = int(
+            self._qwen4_serial_verify_exact_bf16_fallback_calls)
         overlap = self._expert_route_overlap_totals
         for key in (
             "calls",

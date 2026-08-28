@@ -101,6 +101,14 @@ def _fixture(
         f"{prefix}.experts.gate_up_proj": (gate_bits, "BF16"),
         f"{prefix}.experts.down_proj": (down_bits, "BF16"),
         f"{prefix}.gate.weight": (router_bits, "BF16"),
+        "model.language_model.layers.0.input_layernorm.weight": (
+            np.arange(hidden, dtype=np.uint16) + 2500, "BF16"),
+        "model.language_model.hyper_connection_mixer.hc_norm.weight": (
+            np.arange(2 * hidden, dtype=np.uint16) + 2600, "BF16"),
+        "language_model.lm_head.weight": (
+            np.arange(32 * hidden, dtype=np.uint16).reshape(32, hidden) + 2700,
+            "BF16",
+        ),
     }
     mtp_gate_bits = gate_bits + 3000
     mtp_down_bits = down_bits + 3000
@@ -241,6 +249,46 @@ def test_qwen4_virtual_fast_tier_is_byte_exact_and_source_bound(tmp_path):
     np.testing.assert_array_equal(_bits(values[names[2]]), expected["down"][0])
     assert nbytes == 72
     assert store.fast_tier_bytes == 72
+    assert store.archive_bytes == 0
+
+
+def test_qwen4_trunk_first_fast_tier_serves_all_target_trunk_exactly(tmp_path):
+    from formats.qwen4_fast_tier import (
+        build_qwen4_fast_tier,
+        validate_qwen4_fast_tier,
+    )
+
+    root, expected = _fixture(tmp_path)
+    fast_root = tmp_path / "fast"
+    # Target trunk: router 16 + norm 8 + final mixer 16 + head 256 bytes.
+    trunk_bytes = 296
+    report = build_qwen4_fast_tier(
+        root,
+        fast_root,
+        max_bytes=2_000_000 + trunk_bytes + 72,
+        placement="trunk-first",
+    )
+    assert report["selected_trunk_bytes"] == trunk_bytes
+    assert report["selected_experts"] == 1
+    target = fast_root / root.name
+    binding = json.loads(
+        (target / "qwen4_fused_expert_fast_tier.json").read_text())
+    assert binding["schema"] == "voom.qwen4-trunk-first-fast-tier.v2"
+    assert binding["placement"] == "trunk-first"
+    assert validate_qwen4_fast_tier(root, target)["verdict"] == "PASS"
+
+    store = WeightStore(root, fast_dirs=[fast_root])
+    names = [
+        "model.layers.0.mlp.gate.weight",
+        "model.layers.0.input_layernorm.weight",
+        "model.hyper_connection_mixer.hc_norm.weight",
+        "lm_head.weight",
+    ]
+    values, _seconds, nbytes = store.fetch(names)
+    np.testing.assert_array_equal(
+        _bits(values[names[0]]), expected["router"])
+    assert nbytes == trunk_bytes
+    assert store.fast_tier_bytes == trunk_bytes
     assert store.archive_bytes == 0
 
 

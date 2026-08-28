@@ -1750,8 +1750,10 @@ class WeightStore:
                     ) from error
                 if not (
                     isinstance(binding, dict)
-                    and binding.get("schema")
-                    == "voom.qwen4-fused-expert-fast-tier.v1"
+                    and binding.get("schema") in (
+                        "voom.qwen4-fused-expert-fast-tier.v1",
+                        "voom.qwen4-trunk-first-fast-tier.v2",
+                    )
                     and binding.get("target_model") == self.dir.name
                     and binding.get("source_index_sha256")
                     == hashlib.sha256(index_bytes).hexdigest()
@@ -1784,6 +1786,59 @@ class WeightStore:
                     if offset < 0 or offset + spec.nbytes > file_size:
                         raise ValueError(
                             f"Qwen4 virtual fast-tier extent mismatch: {name}")
+                if (
+                    binding.get("schema")
+                    == "voom.qwen4-trunk-first-fast-tier.v2"
+                ):
+                    if binding.get("placement") != "trunk-first":
+                        raise ValueError(
+                            "Qwen4 trunk-first fast tier has invalid placement")
+                    for name, entry in manifest.items():
+                        if name in qwen4_slices:
+                            continue
+                        if not isinstance(entry, dict):
+                            raise ValueError(
+                                f"Qwen4 trunk fast-tier entry is invalid: {name}")
+                        metadata = self._safetensors_entry(name)
+                        shard = self.weight_map.get(name)
+                        filename = entry.get("file")
+                        if metadata is None or shard is None:
+                            raise ValueError(
+                                f"Qwen4 trunk fast-tier tensor is unknown: {name}")
+                        shape = tuple(
+                            int(value) for value in metadata.get("shape", ()))
+                        start, end = (
+                            int(value) for value in metadata["data_offsets"])
+                        with (self.dir / shard).open("rb") as source:
+                            header_length_raw = source.read(8)
+                        if len(header_length_raw) != 8:
+                            raise EOFError(
+                                f"truncated safetensors shard {shard}")
+                        source_offset = (
+                            8 + struct.unpack("<Q", header_length_raw)[0]
+                            + start
+                        )
+                        if not (
+                            isinstance(filename, str)
+                            and Path(filename).name == filename
+                            and (candidate / filename).is_file()
+                            and str(entry.get("dtype", "")).upper()
+                            == str(metadata.get("dtype", "")).upper()
+                            and tuple(int(value) for value in entry.get(
+                                "shape", ())) == shape
+                            and int(entry.get("nbytes", -1)) == end - start
+                            and entry.get("source_file") == shard
+                            and int(entry.get("source_offset", -1))
+                            == source_offset
+                        ):
+                            raise ValueError(
+                                f"Qwen4 trunk fast-tier metadata mismatch: "
+                                f"{name}")
+                        file_size = (candidate / filename).stat().st_size
+                        offset = int(entry.get("offset", -1))
+                        if offset < 0 or offset + end - start > file_size:
+                            raise ValueError(
+                                f"Qwen4 trunk fast-tier extent mismatch: {name}")
             if getattr(self, "mtp_proposal_representation", None) is not None:
                 alias_path = candidate / "mtp-quant-fast-alias.manifest.json"
                 try:

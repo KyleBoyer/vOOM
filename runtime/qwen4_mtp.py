@@ -1167,6 +1167,20 @@ class Qwen4MTPSpeculativeEngine:
                 "_qwen4_serial_verify_pipelined_expert_layers",
                 0,
             )),
+            "qwen4_serial_verify_exact_bf16_gemv": int(getattr(
+                getattr(target, "rc", None),
+                "qwen4_serial_verify_exact_bf16_gemv",
+                False,
+            )),
+            "qwen4_serial_verify_exact_bf16_calls": int(getattr(
+                target, "_qwen4_serial_verify_exact_bf16_calls", 0)),
+            "qwen4_serial_verify_exact_bf16_rows": int(getattr(
+                target, "_qwen4_serial_verify_exact_bf16_rows", 0)),
+            "qwen4_serial_verify_exact_bf16_fallback_calls": int(getattr(
+                target,
+                "_qwen4_serial_verify_exact_bf16_fallback_calls",
+                0,
+            )),
             "expert_compute_batches": int(getattr(
                 target, "_expert_compute_batches", 0)),
             "max_experts_per_compute_batch": int(getattr(

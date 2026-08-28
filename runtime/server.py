@@ -1226,6 +1226,7 @@ class EngineManager:
                 ("VMODEL_QWEN4_MTP_NGRAM_FIRST", "0"),
                 ("VMODEL_QWEN4_MTP_Q_CALIBRATION_SCALES", ""),
                 ("VMODEL_QWEN4_SERIAL_VERIFY_SUSPEND_LM_HEAD", "0"),
+                ("VMODEL_QWEN4_SERIAL_VERIFY_EXACT_BF16_GEMV", "0"),
             )
         )
         dspark_request_identity = tuple(
@@ -2891,6 +2892,12 @@ class EngineManager:
                     raise RequestValidationError(
                         "VMODEL_QWEN4_SERIAL_VERIFY_SUSPEND_LM_HEAD requires "
                         "VMODEL_QWEN4_PHASE_LM_HEAD=1")
+                if qwen4_request_identity[29] not in ("0", "1"):
+                    raise RequestValidationError(
+                        "VMODEL_QWEN4_SERIAL_VERIFY_EXACT_BF16_GEMV must be "
+                        "0 or 1")
+                rc.qwen4_serial_verify_exact_bf16_gemv = (
+                    qwen4_request_identity[29] == "1")
                 rc.hot_prompt_kv_persist_dir = qwen4_request_identity[18]
                 if rc.hot_prompt_kv_persist_dir and not rc.hot_prompt_kv:
                     raise RequestValidationError(
@@ -9101,6 +9108,10 @@ def _vision_protocol_timing(result: dict) -> dict:
         "qwen4_serial_verify_head_suspend_calls",
         "qwen4_serial_verify_head_suspend_bytes",
         "qwen4_serial_verify_head_restore_trim_bytes",
+        "qwen4_serial_verify_exact_bf16_gemv",
+        "qwen4_serial_verify_exact_bf16_calls",
+        "qwen4_serial_verify_exact_bf16_rows",
+        "qwen4_serial_verify_exact_bf16_fallback_calls",
     )
     for key in optional_integer_fields:
         if key in stats or key in result:

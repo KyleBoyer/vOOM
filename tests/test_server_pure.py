@@ -247,6 +247,10 @@ def test_vision_protocol_timing_exposes_qwen4_verifier_pipeline_and_q_calibratio
             "qwen4_serial_verify_linear_layers": 36,
             "qwen4_serial_verify_full_layers": 12,
             "qwen4_serial_verify_pipelined_expert_layers": 48,
+            "qwen4_serial_verify_exact_bf16_gemv": 1,
+            "qwen4_serial_verify_exact_bf16_calls": 120,
+            "qwen4_serial_verify_exact_bf16_rows": 480,
+            "qwen4_serial_verify_exact_bf16_fallback_calls": 24,
             "expert_batch_prefetch": 1,
             "expert_batch_prefetch_submitted": 96,
             "expert_batch_prefetch_wait_s": 7.25,
@@ -267,6 +271,10 @@ def test_vision_protocol_timing_exposes_qwen4_verifier_pipeline_and_q_calibratio
     assert timing["qwen4_serial_verify_linear_layers"] == 36
     assert timing["qwen4_serial_verify_full_layers"] == 12
     assert timing["qwen4_serial_verify_pipelined_expert_layers"] == 48
+    assert timing["qwen4_serial_verify_exact_bf16_gemv"] == 1
+    assert timing["qwen4_serial_verify_exact_bf16_calls"] == 120
+    assert timing["qwen4_serial_verify_exact_bf16_rows"] == 480
+    assert timing["qwen4_serial_verify_exact_bf16_fallback_calls"] == 24
     assert timing["expert_batch_prefetch"] == 1
     assert timing["expert_batch_prefetch_submitted"] == 96
     assert timing["expert_batch_prefetch_wait_s"] == 7.25
@@ -3017,6 +3025,7 @@ def test_qwen4_phase_head_and_mtp_are_explicitly_wired():
         "VMODEL_QWEN4_MTP_NGRAM_FIRST": "0",
         "VMODEL_QWEN4_MTP_Q_CALIBRATION_SCALES": "0.7,1,1.3",
         "VMODEL_QWEN4_SERIAL_VERIFY_SUSPEND_LM_HEAD": "1",
+        "VMODEL_QWEN4_SERIAL_VERIFY_EXACT_BF16_GEMV": "1",
     }, clear=False), \
          patch("runtime.config.ModelConfig.from_dir", return_value=cfg), \
          patch("runtime.path_resolver.resolve_model_dir", side_effect=lambda path: path), \
@@ -3032,6 +3041,7 @@ def test_qwen4_phase_head_and_mtp_are_explicitly_wired():
     assert captured["q_calibration_scales"] == [0.7, 1.0, 1.3]
     assert captured["rc"].qwen4_phase_lm_head
     assert captured["rc"].qwen4_serial_verify_suspend_lm_head
+    assert captured["rc"].qwen4_serial_verify_exact_bf16_gemv
     assert captured["rc"].pin_lm_head
     assert not captured["rc"].stream_lm_head
 

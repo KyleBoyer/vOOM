@@ -13,6 +13,8 @@ from runtime.qwen4_exp import (
     qwen4_mlp_from_group_batches,
     qwen4_mlp_from_groups,
     qwen4_rms_norm,
+    qwen4_mlp_route,
+    qwen4_mlp_route_window_exact,
 )
 from runtime.qwen4_mtp import (
     Qwen4MTPDrafter,
@@ -237,6 +239,111 @@ def test_batched_expert_lifetime_keeps_per_row_bf16_accumulation_exact():
             np.asarray(expected_row.view(mx.uint16)),
             np.asarray(actual_row.view(mx.uint16)),
         )
+
+
+def test_exact_bf16_mlp_window_matches_singleton_routes_and_experts():
+    cfg = ModelConfig(
+        model_type="qwen4_exp",
+        hidden_size=8,
+        intermediate_size=4,
+        num_hidden_layers=1,
+        num_attention_heads=1,
+        num_key_value_heads=1,
+        vocab_size=32,
+        rms_norm_eps=1e-6,
+        rope_theta=10_000.0,
+        max_position_embeddings=128,
+        tie_word_embeddings=False,
+        attention_bias=False,
+        head_dim=8,
+        eos_token_ids=(2,),
+        torch_dtype="bfloat16",
+        num_experts=8,
+        num_experts_per_tok=2,
+        moe_intermediate_size=4,
+        layer_types=("linear_attention",),
+        qwen4_hc_count=4,
+        qwen4_hc_lowrank=4,
+    )
+    mx.random.seed(113)
+    prefix = "model.layers.0"
+    width = cfg.hidden_size * cfg.qwen4_hc_count
+    weights = {
+        f"{prefix}.mlp_hyper_connection.hc_norm.weight":
+            mx.random.normal((width,)).astype(mx.bfloat16),
+        f"{prefix}.mlp_hyper_connection.input_mix_weight_down.weight":
+            mx.random.normal((cfg.qwen4_hc_lowrank, width)).astype(
+                mx.bfloat16),
+        f"{prefix}.mlp_hyper_connection.input_mix_weight_up.weight":
+            mx.random.normal((width, cfg.qwen4_hc_lowrank)).astype(
+                mx.bfloat16),
+        f"{prefix}.mlp_hyper_connection.block_inject_weight.weight":
+            mx.random.normal((cfg.qwen4_hc_count, width)).astype(mx.bfloat16),
+        f"{prefix}.mlp.gate.weight":
+            mx.random.normal((cfg.num_experts, cfg.hidden_size)).astype(
+                mx.bfloat16),
+        f"{prefix}.mlp.shared_expert.gate_proj.weight":
+            mx.random.normal((cfg.moe_intermediate_size, cfg.hidden_size)).astype(
+                mx.bfloat16),
+        f"{prefix}.mlp.shared_expert.up_proj.weight":
+            mx.random.normal((cfg.moe_intermediate_size, cfg.hidden_size)).astype(
+                mx.bfloat16),
+        f"{prefix}.mlp.shared_expert.down_proj.weight":
+            mx.random.normal((cfg.hidden_size, cfg.moe_intermediate_size)).astype(
+                mx.bfloat16),
+        f"{prefix}.mlp.shared_expert_gate.weight":
+            mx.random.normal((1, cfg.hidden_size)).astype(mx.bfloat16),
+    }
+    experts = {}
+    for expert in range(cfg.num_experts):
+        page = {
+            f"{prefix}.mlp.experts.{expert}.gate_proj.weight":
+                mx.random.normal((
+                    cfg.moe_intermediate_size, cfg.hidden_size)).astype(
+                        mx.bfloat16),
+            f"{prefix}.mlp.experts.{expert}.up_proj.weight":
+                mx.random.normal((
+                    cfg.moe_intermediate_size, cfg.hidden_size)).astype(
+                        mx.bfloat16),
+            f"{prefix}.mlp.experts.{expert}.down_proj.weight":
+                mx.random.normal((
+                    cfg.hidden_size, cfg.moe_intermediate_size)).astype(
+                        mx.bfloat16),
+        }
+        experts[expert] = page
+    hidden_rows = [
+        mx.random.normal((1, 1, width)).astype(mx.bfloat16)
+        for _ in range(4)
+    ]
+    singleton_routes = [
+        qwen4_mlp_route(row, weights, prefix, cfg, 0)
+        for row in hidden_rows
+    ]
+    expected = [
+        qwen4_mlp_from_groups(route, experts, weights, prefix)
+        for route in singleton_routes
+    ]
+    stats = {}
+    exact_routes = qwen4_mlp_route_window_exact(
+        hidden_rows, weights, prefix, cfg, 0, stats=stats)
+    actual = qwen4_mlp_from_group_batches(
+        exact_routes,
+        iter(((list(range(cfg.num_experts)), experts),)),
+        weights,
+        prefix,
+        exact_bf16=True,
+        exact_stats=stats,
+    )
+    mx.eval(*expected, *actual)
+    assert [route[3] for route in exact_routes] == [
+        route[3] for route in singleton_routes]
+    for expected_row, actual_row in zip(expected, actual, strict=True):
+        np.testing.assert_array_equal(
+            np.asarray(expected_row.view(mx.uint16)),
+            np.asarray(actual_row.view(mx.uint16)),
+        )
+    assert stats["calls"] > 0
+    assert stats["rows"] >= 4
 
 
 def test_draft_step_uses_qsa_only_mtp_layer_and_sparse_expert_pages(monkeypatch):

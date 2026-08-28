@@ -29,6 +29,7 @@ from .kimi_k3_fast_tier import (
 
 
 SCHEMA = "voom.qwen4-fused-expert-fast-tier.v1"
+TRUNK_FIRST_SCHEMA = "voom.qwen4-trunk-first-fast-tier.v2"
 BINDING_NAME = "qwen4_fused_expert_fast_tier.json"
 MANIFEST_NAME = "fast_tier_manifest.json"
 
@@ -147,6 +148,94 @@ def _catalog(model_dir: Path) -> tuple[list[dict], dict]:
     }
 
 
+def _canonical_name(name: str) -> str:
+    if name.startswith("model.language_model."):
+        return "model." + name[len("model.language_model."):]
+    if name.startswith("language_model.model."):
+        return "model." + name[len("language_model.model."):]
+    if name.startswith("language_model."):
+        return name[len("language_model."):]
+    return name
+
+
+def _trunk_catalog(model_dir: Path, layers: int) -> list[dict]:
+    """Catalog exact, always-touched target-body tensors.
+
+    The 51B PLE embedding and ordinary token embedding use dedicated direct-row
+    stores, routed experts have their own balanced selector below, and MTP is a
+    proposal phase.  Everything else in the released target layers plus its
+    final hyper mixer and untied head is prompt-independent trunk traffic.
+    """
+
+    index = json.loads(
+        (model_dir / "model.safetensors.index.json").read_text())
+    weight_map = index["weight_map"]
+    headers: dict[str, tuple[dict, int]] = {}
+    entries = []
+    seen = set()
+    for physical_name, shard in sorted(weight_map.items()):
+        name = _canonical_name(physical_name)
+        layer_member = False
+        if name.startswith("model.layers."):
+            pieces = name.split(".", 3)
+            try:
+                layer = int(pieces[2])
+            except (IndexError, ValueError):
+                layer = -1
+            layer_member = 0 <= layer < layers
+        include = (
+            layer_member
+            or name.startswith("model.hyper_connection_mixer.")
+            or name == "lm_head.weight"
+        )
+        if not include:
+            continue
+        if (
+            ".mlp.experts." in name
+            or ".ple.ple_embedding." in name
+        ):
+            continue
+        if name in seen:
+            raise ValueError(f"duplicate canonical Qwen4 trunk tensor {name}")
+        if shard not in headers:
+            headers[shard] = _header(model_dir / shard)
+        header, payload_base = headers[shard]
+        metadata = header.get(physical_name)
+        if not isinstance(metadata, dict):
+            raise ValueError(
+                f"Qwen4 trunk tensor {physical_name} missing from {shard}")
+        if metadata.get("dtype") != "BF16":
+            raise ValueError(
+                f"Qwen4 trunk tensor is not released BF16: {physical_name}")
+        shape = [int(value) for value in metadata.get("shape", ())]
+        start, end = (int(value) for value in metadata["data_offsets"])
+        expected = 2
+        for value in shape:
+            expected *= value
+        if end - start != expected:
+            raise ValueError(f"unexpected Qwen4 trunk bytes: {physical_name}")
+        entries.append({
+            "name": name,
+            "source_file": shard,
+            "source_offset": payload_base + start,
+            "nbytes": expected,
+            "dtype": "BF16",
+            "shape": shape,
+            "kind": "target_trunk",
+        })
+        seen.add(name)
+    if not entries or "lm_head.weight" not in seen:
+        raise ValueError("Qwen4 trunk catalog is incomplete")
+    represented_layers = {
+        int(entry["name"].split(".")[2])
+        for entry in entries
+        if entry["name"].startswith("model.layers.")
+    }
+    if represented_layers != set(range(layers)):
+        raise ValueError("Qwen4 trunk catalog does not cover every target layer")
+    return entries
+
+
 def _select(groups: list[dict], budget: int, layers: int, experts: int):
     by_pair = {(item["layer"], item["expert"]): item for item in groups}
     selected = []
@@ -170,6 +259,7 @@ def build_qwen4_fast_tier(
     model_dir: str | Path, fast_root: str | Path, *, dry_run: bool = False,
     max_bytes: int = MAX_INTERNAL_FAST_TIER_BYTES,
     min_free_bytes: int = MIN_INTERNAL_FREE_BYTES,
+    placement: str = "experts",
 ) -> dict:
     model_dir = Path(model_dir).resolve()
     fast_root = Path(fast_root).expanduser().resolve()
@@ -177,20 +267,33 @@ def build_qwen4_fast_tier(
     min_free_bytes = int(min_free_bytes)
     if max_bytes <= 0 or min_free_bytes < 0:
         raise ValueError("invalid fast-tier byte budget")
+    if placement not in ("experts", "trunk-first"):
+        raise ValueError("Qwen4 fast-tier placement must be experts or trunk-first")
     internal = _is_internal_root(fast_root)
     if internal and max_bytes > MAX_INTERNAL_FAST_TIER_BYTES:
         raise ValueError("internal fast-tier budget exceeds 90 GB policy")
     target = fast_root / model_dir.name
+    reclaimable_target_bytes = _tree_file_bytes(target) if target.exists() else 0
     other = _tree_file_bytes(fast_root, exclude=target) if internal else 0
     available = max(0, max_bytes - other - MANIFEST_RESERVE_BYTES)
     groups, identity = _catalog(model_dir)
+    trunk = (
+        _trunk_catalog(model_dir, identity["layers"])
+        if placement == "trunk-first" else []
+    )
+    trunk_bytes = sum(item["nbytes"] for item in trunk)
+    if trunk_bytes > available:
+        raise ValueError(
+            "complete Qwen4 target trunk does not fit the fast-tier budget")
     selected = _select(
-        groups, available, identity["layers"], identity["experts"])
+        groups, available - trunk_bytes,
+        identity["layers"], identity["experts"])
     if not selected:
         raise ValueError("no complete Qwen4 expert group fits the budget")
-    selected_bytes = sum(item["nbytes"] for item in selected)
+    selected_bytes = trunk_bytes + sum(item["nbytes"] for item in selected)
     projected_free = (
         shutil.disk_usage(_existing_parent(fast_root)).free
+        + reclaimable_target_bytes
         - selected_bytes - MANIFEST_RESERVE_BYTES)
     if not dry_run and internal and projected_free < min_free_bytes:
         raise ValueError(
@@ -204,6 +307,8 @@ def build_qwen4_fast_tier(
         layer_counts[group["layer"]] += 1
         for entry in group["entries"]:
             by_source[entry["source_file"]].append(entry)
+    for entry in trunk:
+        by_source[entry["source_file"]].append(entry)
 
     staging = fast_root / f".{model_dir.name}.building-{uuid.uuid4().hex}"
     manifest: dict[str, dict] = {}
@@ -258,9 +363,14 @@ def build_qwen4_fast_tier(
                 output.flush()
                 os.fsync(output.fileno())
             binding = {
-                "schema": SCHEMA,
+                "schema": (
+                    TRUNK_FIRST_SCHEMA
+                    if placement == "trunk-first" else SCHEMA),
                 "target_model": model_dir.name,
                 **identity,
+                "placement": placement,
+                "selected_trunk_tensors": len(trunk),
+                "selected_trunk_bytes": trunk_bytes,
                 "selected_experts": len(selected),
                 "selected_tensors": len(manifest),
                 "selected_bytes": selected_bytes,
@@ -282,18 +392,23 @@ def build_qwen4_fast_tier(
         raise
 
     return {
-        "schema": SCHEMA,
+        "schema": (
+            TRUNK_FIRST_SCHEMA if placement == "trunk-first" else SCHEMA),
+        "placement": placement,
         "source_revision": identity["source_revision"],
         "candidate_experts": len(groups),
         "candidate_bytes": sum(item["nbytes"] for item in groups),
         "selected_experts": len(selected),
-        "selected_tensors": 3 * len(selected),
+        "selected_trunk_tensors": len(trunk),
+        "selected_trunk_bytes": trunk_bytes,
+        "selected_tensors": len(trunk) + 3 * len(selected),
         "selected_bytes": selected_bytes,
         "selected_experts_per_layer": {
             str(layer): layer_counts.get(layer, 0)
             for layer in range(identity["layers"])
         },
         "other_fast_tier_bytes": other,
+        "reclaimable_target_bytes": reclaimable_target_bytes,
         "projected_global_fast_tier_bytes": (
             other + selected_bytes + MANIFEST_RESERVE_BYTES),
         "projected_free_bytes": projected_free,
@@ -314,15 +429,24 @@ def validate_qwen4_fast_tier(
     manifest = json.loads(manifest_bytes)
     binding = json.loads((target / BINDING_NAME).read_text())
     groups, identity = _catalog(model_dir)
+    schema = binding.get("schema")
+    placement = binding.get("placement", "experts")
+    if schema == TRUNK_FIRST_SCHEMA and placement == "trunk-first":
+        trunk = _trunk_catalog(model_dir, identity["layers"])
+    elif schema == SCHEMA and placement == "experts":
+        trunk = []
+    else:
+        raise ValueError("Qwen4 fast-tier schema/placement mismatch")
     specs = {
         entry["name"]: entry
         for group in groups
         for entry in group["entries"]
     }
+    specs.update({entry["name"]: entry for entry in trunk})
     index_bytes = (model_dir / "model.safetensors.index.json").read_bytes()
     config_bytes = (model_dir / "config.json").read_bytes()
     if not (
-        binding.get("schema") == SCHEMA
+        binding.get("schema") in (SCHEMA, TRUNK_FIRST_SCHEMA)
         and binding.get("target_model") == model_dir.name
         and binding.get("source_index_sha256") == _sha256(index_bytes)
         and binding.get("source_config_sha256") == _sha256(config_bytes)
@@ -366,7 +490,8 @@ def validate_qwen4_fast_tier(
         checked += 1
         checked_bytes += spec["nbytes"]
     return {
-        "schema": "voom.qwen4-fused-expert-fast-tier-validation.v1",
+        "schema": "voom.qwen4-fast-tier-validation.v2",
+        "placement": placement,
         "source_revision": identity["source_revision"],
         "checked_tensors": checked,
         "checked_bytes": checked_bytes,
@@ -382,6 +507,9 @@ def main() -> None:
     parser.add_argument("--fast-root", default="~/vmodel_fast_tier")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--validate-only", action="store_true")
+    parser.add_argument(
+        "--placement", choices=("experts", "trunk-first"),
+        default="experts")
     parser.add_argument("--max-bytes", type=int, default=58_000_000_000)
     parser.add_argument(
         "--min-free-bytes", type=int, default=MIN_INTERNAL_FREE_BYTES)
@@ -393,7 +521,8 @@ def main() -> None:
         if args.validate_only else
         build_qwen4_fast_tier(
             args.model_dir, args.fast_root, dry_run=args.dry_run,
-            max_bytes=args.max_bytes, min_free_bytes=args.min_free_bytes)
+            max_bytes=args.max_bytes, min_free_bytes=args.min_free_bytes,
+            placement=args.placement)
     )
     print(json.dumps(report, indent=2, sort_keys=True))
 

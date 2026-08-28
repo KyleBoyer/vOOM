@@ -15,7 +15,7 @@ import mlx.core as mx
 import numpy as np
 
 from . import quant
-from .config import ModelConfig
+from .config import ModelConfig, effective_expert_top_k
 from .layer_runner import _linear, _swiglu
 from .qwen35 import (
     _apply_partial_rope,
@@ -28,6 +28,52 @@ from .glm import _group_routes
 from .qwen4_exp_ple_rows import Qwen4ExpPLERowStore
 from .qwen4_exp_state import Qwen4ExpStateCache
 from .lm_head_stream import StreamedLMHead
+
+
+def _exact_verify_linear_window(
+    x: mx.array,
+    weights: dict,
+    name: str,
+    *,
+    stats: dict[str, int] | None = None,
+) -> mx.array:
+    """Batch independent verifier rows without changing GEMV reduction order."""
+
+    from .exact_verify_bf16 import exact_verify_bf16_matmul
+
+    weight = weights[f"{name}.weight"]
+    out = exact_verify_bf16_matmul(x, weight)
+    if out is None:
+        if stats is not None:
+            stats["fallback_calls"] = stats.get("fallback_calls", 0) + 1
+        rows = [
+            _linear(x[:, row:row + 1], weights, name)
+            for row in range(int(x.shape[1]))
+        ]
+        return mx.concatenate(rows, axis=1)
+    bias = weights.get(f"{name}.bias")
+    if bias is not None:
+        out = out + bias
+    if stats is not None:
+        stats["calls"] = stats.get("calls", 0) + 1
+        stats["rows"] = stats.get("rows", 0) + int(x.shape[1])
+    return out
+
+
+def _exact_verify_swiglu_window(
+    hidden: mx.array,
+    weights: dict,
+    prefix: str,
+    *,
+    stats: dict[str, int] | None = None,
+) -> mx.array:
+    gate = _exact_verify_linear_window(
+        hidden, weights, f"{prefix}.gate_proj", stats=stats)
+    up = _exact_verify_linear_window(
+        hidden, weights, f"{prefix}.up_proj", stats=stats)
+    activated = mx.sigmoid(gate) * gate * up
+    return _exact_verify_linear_window(
+        activated, weights, f"{prefix}.down_proj", stats=stats)
 
 
 def qwen4_rms_norm(
@@ -439,6 +485,93 @@ def qwen4_mlp_route(
     return mixed, hyper_input, injection, _group_routes(indices, scores)
 
 
+def qwen4_mlp_route_window_exact(
+    hidden_rows: Sequence[mx.array],
+    weights: dict,
+    prefix: str,
+    cfg: ModelConfig,
+    layer: int,
+    *,
+    stats: dict[str, int] | None = None,
+) -> list[tuple[
+    mx.array,
+    mx.array,
+    mx.array,
+    dict[int, list[tuple[int, float]]],
+]]:
+    """Route independent verifier rows with singleton-equivalent BF16 GEMVs.
+
+    Recurrent attention has already advanced each row in canonical order.
+    Qwen4's MLP half has no cross-position dependency, so its immutable dense
+    projections can share one Metal dispatch while each row keeps ordinary
+    one-token accumulation.  RMS normalization is intentionally invoked on
+    singleton slices before concatenation.
+    """
+
+    if not 2 <= len(hidden_rows) <= 8:
+        raise ValueError("exact Qwen4 MLP window requires 2..8 verifier rows")
+    if any(tuple(row.shape[:2]) != (1, 1) for row in hidden_rows):
+        raise ValueError("exact Qwen4 MLP window requires singleton rows")
+    hidden = mx.concatenate(tuple(hidden_rows), axis=1)
+    module = f"{prefix}.mlp_hyper_connection"
+    normalized = mx.concatenate(tuple(
+        qwen4_rms_norm(
+            row,
+            weights[f"{module}.hc_norm.weight"],
+            cfg.rms_norm_eps,
+            group_size=cfg.hidden_size,
+        )
+        for row in hidden_rows
+    ), axis=1)
+    count = int(cfg.qwen4_hc_count)
+    down = _exact_verify_linear_window(
+        normalized, weights, f"{module}.input_mix_weight_down", stats=stats)
+    down = (down / count).astype(hidden.dtype)
+    mixed_gate = mx.sigmoid(_exact_verify_linear_window(
+        down * mx.sigmoid(down),
+        weights,
+        f"{module}.input_mix_weight_up",
+        stats=stats,
+    ))
+    mixed_gate = mixed_gate.reshape(
+        *hidden.shape[:-1], count, cfg.hidden_size)
+    streams = normalized.reshape(
+        *hidden.shape[:-1], count, cfg.hidden_size)
+    mixed = mx.mean(mixed_gate * streams, axis=-2)
+    injection_input = (_exact_verify_linear_window(
+        normalized,
+        weights,
+        f"{module}.block_inject_weight",
+        stats=stats,
+    ) / count).astype(hidden.dtype)
+    injection = (2 * mx.sigmoid(injection_input)).astype(hidden.dtype)
+
+    router_logits = _exact_verify_linear_window(
+        mixed, weights, f"{prefix}.mlp.gate", stats=stats)
+    probabilities = mx.softmax(
+        router_logits.astype(mx.float32), axis=-1, precise=True)
+    top_k = effective_expert_top_k(cfg, layer)
+    indices = mx.argpartition(
+        -probabilities, kth=top_k - 1, axis=-1)[..., :top_k]
+    scores = mx.take_along_axis(probabilities, indices, axis=-1)
+    scores = scores / scores.sum(axis=-1, keepdims=True)
+    scores = scores.astype(router_logits.dtype)
+    mx.eval(indices, scores)
+
+    routes = []
+    for position in range(len(hidden_rows)):
+        routes.append((
+            mixed[:, position:position + 1],
+            hidden[:, position:position + 1],
+            injection[:, position:position + 1],
+            _group_routes(
+                indices[:, position:position + 1],
+                scores[:, position:position + 1],
+            ),
+        ))
+    return routes
+
+
 def qwen4_mlp_from_groups(
     route: tuple[
         mx.array,
@@ -491,6 +624,9 @@ def qwen4_mlp_from_group_batches(
     expert_batches,
     weights: dict,
     prefix: str,
+    *,
+    exact_bf16: bool = False,
+    exact_stats: dict[str, int] | None = None,
 ) -> list[mx.array]:
     """Evaluate verifier rows while releasing each exact expert batch.
 
@@ -514,6 +650,8 @@ def qwen4_mlp_from_group_batches(
         for expert in ordered:
             if expert not in experts:
                 raise ValueError(f"missing routed Qwen4 expert {expert}")
+            exact_inputs = []
+            exact_segments = []
             for route_index, route in enumerate(routes):
                 mixed, _hyper_input, _injection, groups = route
                 plist = groups.get(expert)
@@ -522,24 +660,62 @@ def qwen4_mlp_from_group_batches(
                 positions = [position for position, _ in plist]
                 route_weights = mx.array(
                     [weight for _, weight in plist], dtype=mixed.dtype)
-                contribution = _swiglu(
-                    mixed[:, positions, :],
+                if exact_bf16:
+                    exact_inputs.append(mixed[:, positions, :])
+                    exact_segments.append((
+                        route_index, positions, route_weights,
+                        len(positions),
+                    ))
+                else:
+                    contribution = _swiglu(
+                        mixed[:, positions, :],
+                        experts[expert],
+                        f"{prefix}.mlp.experts.{expert}",
+                    )
+                    routed[route_index] = routed[route_index].at[
+                        :, positions, :
+                    ].add(contribution * route_weights[None, :, None])
+            if exact_inputs:
+                combined = mx.concatenate(tuple(exact_inputs), axis=1)
+                contributions = _exact_verify_swiglu_window(
+                    combined,
                     experts[expert],
                     f"{prefix}.mlp.experts.{expert}",
+                    stats=exact_stats,
                 )
-                routed[route_index] = routed[route_index].at[
-                    :, positions, :
-                ].add(contribution * route_weights[None, :, None])
+                cursor = 0
+                for route_index, positions, route_weights, length in (
+                    exact_segments
+                ):
+                    contribution = contributions[:, cursor:cursor + length]
+                    cursor += length
+                    routed[route_index] = routed[route_index].at[
+                        :, positions, :
+                    ].add(contribution * route_weights[None, :, None])
             previous_expert = expert
         # This is both the proof boundary and the ownership boundary: after it
         # returns, no lazy graph retains the current batch's weight arrays.
         mx.eval(*routed)
         del experts
 
+    shared_rows = None
+    if exact_bf16:
+        shared_rows = _exact_verify_swiglu_window(
+            mx.concatenate(tuple(route[0] for route in routes), axis=1),
+            weights,
+            f"{prefix}.mlp.shared_expert",
+            stats=exact_stats,
+        )
     outputs = []
-    for route, routed_output in zip(routes, routed, strict=True):
+    for route_index, (route, routed_output) in enumerate(zip(
+        routes, routed, strict=True
+    )):
         mixed, hyper_input, injection, _groups = route
-        shared = _swiglu(mixed, weights, f"{prefix}.mlp.shared_expert")
+        shared = (
+            shared_rows[:, route_index:route_index + 1]
+            if shared_rows is not None else
+            _swiglu(mixed, weights, f"{prefix}.mlp.shared_expert")
+        )
         shared_gate = mx.sigmoid(_linear(
             mixed, weights, f"{prefix}.mlp.shared_expert_gate"))
         branch = routed_output + shared_gate * shared
