@@ -1224,6 +1224,7 @@ class EngineManager:
                 ("VMODEL_QWEN4_MTP_DEPTH", "0"),
                 ("VMODEL_QWEN4_MTP_MIN_DRAFT_PROBABILITY", "0"),
                 ("VMODEL_QWEN4_MTP_NGRAM_FIRST", "0"),
+                ("VMODEL_QWEN4_MTP_Q_CALIBRATION_SCALES", ""),
             )
         )
         dspark_request_identity = tuple(
@@ -2854,6 +2855,30 @@ class EngineManager:
                     raise RequestValidationError(
                         "VMODEL_QWEN4_MTP_NGRAM_FIRST cannot be combined "
                         "with VMODEL_QWEN4_MTP_MIN_DRAFT_PROBABILITY")
+                qwen4_mtp_q_calibration_scales = []
+                for item in qwen4_request_identity[27].split(","):
+                    item = item.strip()
+                    if not item:
+                        continue
+                    try:
+                        scale = float(item)
+                    except ValueError as error:
+                        raise RequestValidationError(
+                            "VMODEL_QWEN4_MTP_Q_CALIBRATION_SCALES must be "
+                            "a comma-separated list of numbers") from error
+                    if not math.isfinite(scale) or not 0.25 <= scale <= 4.0:
+                        raise RequestValidationError(
+                            "VMODEL_QWEN4_MTP_Q_CALIBRATION_SCALES values "
+                            "must be in [0.25, 4]")
+                    if scale in qwen4_mtp_q_calibration_scales:
+                        raise RequestValidationError(
+                            "VMODEL_QWEN4_MTP_Q_CALIBRATION_SCALES values "
+                            "must be unique")
+                    qwen4_mtp_q_calibration_scales.append(scale)
+                if len(qwen4_mtp_q_calibration_scales) > 9:
+                    raise RequestValidationError(
+                        "VMODEL_QWEN4_MTP_Q_CALIBRATION_SCALES accepts at "
+                        "most 9 values")
                 rc.hot_prompt_kv_persist_dir = qwen4_request_identity[18]
                 if rc.hot_prompt_kv_persist_dir and not rc.hot_prompt_kv:
                     raise RequestValidationError(
@@ -4848,6 +4873,8 @@ class EngineManager:
                         min_draft_probability=(
                             qwen4_mtp_min_draft_probability),
                         ngram_first=qwen4_mtp_ngram_first,
+                        q_calibration_scales=(
+                            qwen4_mtp_q_calibration_scales),
                     )
                     print(
                         "[server] exact Qwen4 Lightning-MTP speculation: "
@@ -4855,6 +4882,8 @@ class EngineManager:
                         "min_draft_probability="
                         f"{qwen4_mtp_min_draft_probability:g} "
                         f"ngram_first={int(qwen4_mtp_ngram_first)} "
+                        "q_calibration_scales="
+                        f"{qwen4_mtp_q_calibration_scales} "
                         f"phase_head={int(rc.qwen4_phase_lm_head)}",
                         flush=True,
                     )
@@ -8739,6 +8768,13 @@ def _vision_protocol_timing(result: dict) -> dict:
         "qwen_mtp_draft_reranked_lm_head_candidate_rank_capture_positions",
         "expert_cache_hits",
         "expert_cache_misses",
+        "expert_compute_batches",
+        "max_experts_per_compute_batch",
+        "adaptive_expert_batch_clamps",
+        "min_adaptive_expert_batch",
+        "expert_batch_prefetch",
+        "expert_batch_prefetch_submitted",
+        "expert_shared_overlap_layers",
         "speculative_enabled",
         "speculative_used",
         "speculative_k",
@@ -9032,12 +9068,16 @@ def _vision_protocol_timing(result: dict) -> dict:
         "qwen4_mtp_constraint_verified",
         "qwen4_mtp_stochastic",
         "qwen4_mtp_stochastic_verified",
+        "qwen4_mtp_q_calibration_rows",
         "qwen4_mtp_idle_head_release_calls",
         "qwen4_mtp_idle_head_release_bytes",
         "qwen4_serial_verify_union_layers",
         "qwen4_serial_verify_expert_slots",
         "qwen4_serial_verify_union_experts",
         "qwen4_serial_verify_expert_pages_avoided",
+        "qwen4_serial_verify_linear_layers",
+        "qwen4_serial_verify_full_layers",
+        "qwen4_serial_verify_pipelined_expert_layers",
         "qwen4_phase_lm_head",
         "qwen4_phase_lm_head_bytes",
         "qwen4_phase_lm_head_suspend_calls",
@@ -9057,6 +9097,8 @@ def _vision_protocol_timing(result: dict) -> dict:
         "weight_prefetch_useful_load_s",
         "weight_prefetch_wasted_load_s",
         "weight_prefetch_hidden_lower_bound_s",
+        "expert_batch_prefetch_wait_s",
+        "expert_batch_prefetch_hidden_s",
         "parallel_tier_wall_s",
         "parallel_tier_fast_service_s",
         "parallel_tier_archive_service_s",
@@ -9141,6 +9183,12 @@ def _vision_protocol_timing(result: dict) -> dict:
         "qwen4_mtp_selected_probability_mean",
         "qwen4_mtp_selected_probability_max",
         "qwen4_serial_verify_union_fetch_s",
+        "qwen4_serial_verify_page_prepare_s",
+        "qwen4_serial_verify_weight_wait_s",
+        "qwen4_serial_verify_reserve_s",
+        "qwen4_serial_verify_linear_compute_s",
+        "qwen4_serial_verify_full_compute_s",
+        "qwen4_serial_verify_head_s",
         "qwen4_phase_lm_head_suspend_s",
         "qwen4_phase_lm_head_restore_s",
     )
@@ -9165,6 +9213,7 @@ def _vision_protocol_timing(result: dict) -> dict:
         "qwen4_mtp_round_widths",
         "qwen4_mtp_truncation_probabilities",
         "qwen4_mtp_proposal_sources",
+        "qwen4_mtp_q_calibration",
     ):
         if key in stats or key in result:
             value[key] = str(metric(key) or "")

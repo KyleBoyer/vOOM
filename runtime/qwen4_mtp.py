@@ -17,6 +17,7 @@ the MTP hyper-connection mixer and the target's shared output head.
 from __future__ import annotations
 
 from dataclasses import replace
+import json
 import math
 import time
 from typing import Sequence
@@ -370,6 +371,7 @@ class Qwen4MTPSpeculativeEngine:
         ngram_min_ngram: int = 2,
         ngram_max_ngram: int = 6,
         ngram_max_draft_tokens: int = 7,
+        q_calibration_scales: Sequence[float] = (),
         drafter=None,
     ):
         if target.cfg.model_type != "qwen4_exp":
@@ -409,6 +411,29 @@ class Qwen4MTPSpeculativeEngine:
             raise ValueError(
                 "Qwen4 MTP n-gram-first and adaptive width are mutually "
                 "exclusive experiments")
+        normalized_calibration_scales = []
+        for value in q_calibration_scales:
+            if isinstance(value, bool):
+                raise ValueError(
+                    "Qwen4 MTP q-calibration scales must be finite values "
+                    "in [0.25, 4]")
+            try:
+                scale = float(value)
+            except (TypeError, ValueError) as error:
+                raise ValueError(
+                    "Qwen4 MTP q-calibration scales must be finite values "
+                    "in [0.25, 4]") from error
+            if not math.isfinite(scale) or not 0.25 <= scale <= 4.0:
+                raise ValueError(
+                    "Qwen4 MTP q-calibration scales must be finite values "
+                    "in [0.25, 4]")
+            if scale in normalized_calibration_scales:
+                raise ValueError(
+                    "Qwen4 MTP q-calibration scales must be unique")
+            normalized_calibration_scales.append(scale)
+        if len(normalized_calibration_scales) > 9:
+            raise ValueError(
+                "Qwen4 MTP q-calibration accepts at most 9 scales")
         self.target = target
         self.depth = depth
         self.min_draft_probability = min_draft_probability
@@ -416,11 +441,15 @@ class Qwen4MTPSpeculativeEngine:
         self.ngram_min_ngram = ngram_min_ngram
         self.ngram_max_ngram = ngram_max_ngram
         self.ngram_max_draft_tokens = ngram_max_draft_tokens
+        self.q_calibration_scales = tuple(normalized_calibration_scales)
         self.drafter = drafter or Qwen4MTPDrafter(target)
         self.mtp_engine_identity = (
             f"qwen4-mtp-depth{depth}-qmin{min_draft_probability:g}"
             + (f"-ngram-first-k{ngram_max_draft_tokens}"
                if ngram_first else "")
+            + ("-qcal-" + "_".join(
+                f"{scale:g}" for scale in self.q_calibration_scales)
+               if self.q_calibration_scales else "")
             + "-exact-target")
 
     def __getattr__(self, name):
@@ -616,6 +645,16 @@ class Qwen4MTPSpeculativeEngine:
         verifier_s = 0.0
         stochastic_overlap_sum = 0.0
         stochastic_verified = 0
+        q_calibration_sums = [0.0] * len(self.q_calibration_scales)
+        q_calibration_counts = [0] * len(self.q_calibration_scales)
+        q_calibration_step_sums = [
+            [0.0] * len(self.q_calibration_scales)
+            for _ in range(self.depth)
+        ]
+        q_calibration_step_counts = [
+            [0] * len(self.q_calibration_scales)
+            for _ in range(self.depth)
+        ]
         selected_probabilities = []
         truncation_probabilities = []
         round_widths = []
@@ -645,6 +684,7 @@ class Qwen4MTPSpeculativeEngine:
             draft_constraint = constraint.fork() if constraint is not None else None
             draft_tokens = []
             draft_probabilities = []
+            draft_calibration_probabilities = []
             draft_hidden = h_last
             current = catchup_token
             weights = None
@@ -715,11 +755,31 @@ class Qwen4MTPSpeculativeEngine:
                                 sampling,
                                 all_tokens + draft_tokens,
                             )
+                            step_calibration_probabilities = []
+                            for scale in self.q_calibration_scales:
+                                if scale == 1.0:
+                                    calibrated = step_probabilities
+                                else:
+                                    calibrated = _detached_probabilities(
+                                        logits,
+                                        replace(
+                                            sampling,
+                                            temperature=(
+                                                float(sampling.temperature)
+                                                * scale),
+                                        ),
+                                        all_tokens + draft_tokens,
+                                    )
+                                step_calibration_probabilities.append(
+                                    calibrated)
                             token = sample_probabilities(step_probabilities)
                             selected_probability = float(
                                 step_probabilities.reshape(-1)[token].item())
                         draft_tokens.append(token)
                         draft_probabilities.append(step_probabilities)
+                        draft_calibration_probabilities.append(
+                            tuple(step_calibration_probabilities)
+                            if not sampling.is_greedy else ())
                         proposed += 1
                         if selected_probability is not None:
                             selected_probabilities.append(selected_probability)
@@ -805,6 +865,17 @@ class Qwen4MTPSpeculativeEngine:
                     )
                     stochastic_overlap_sum += overlap
                     stochastic_verified += 1
+                    if proposal_source == "M":
+                        for scale_index, calibrated in enumerate(
+                                draft_calibration_probabilities[index]):
+                            calibrated_overlap = mx.sum(mx.minimum(
+                                _target_probabilities, calibrated))
+                            mx.eval(calibrated_overlap)
+                            value = float(calibrated_overlap.item())
+                            q_calibration_sums[scale_index] += value
+                            q_calibration_counts[scale_index] += 1
+                            q_calibration_step_sums[index][scale_index] += value
+                            q_calibration_step_counts[index][scale_index] += 1
                 if not draft_accepted:
                     if proposal_source == "N":
                         ngram_rejected += 1
@@ -983,6 +1054,38 @@ class Qwen4MTPSpeculativeEngine:
             "qwen4_mtp_expected_acceptance": (
                 stochastic_overlap_sum / stochastic_verified
                 if stochastic_verified else 0.0),
+            "qwen4_mtp_q_calibration_rows": max(
+                q_calibration_counts, default=0),
+            "qwen4_mtp_q_calibration": json.dumps({
+                "schema": "voom.qwen4-mtp-q-calibration.v1",
+                "scope": "observed-native-draft-path",
+                "scales": list(self.q_calibration_scales),
+                "overall": [
+                    (total / count if count else None)
+                    for total, count in zip(
+                        q_calibration_sums,
+                        q_calibration_counts,
+                        strict=True,
+                    )
+                ],
+                "counts": q_calibration_counts,
+                "by_step": [
+                    [
+                        (total / count if count else None)
+                        for total, count in zip(
+                            step_sums,
+                            step_counts,
+                            strict=True,
+                        )
+                    ]
+                    for step_sums, step_counts in zip(
+                        q_calibration_step_sums,
+                        q_calibration_step_counts,
+                        strict=True,
+                    )
+                ],
+                "by_step_counts": q_calibration_step_counts,
+            }, separators=(",", ":"), sort_keys=True),
             "qwen4_mtp_target_sweeps": target_sweeps,
             "qwen4_mtp_plain_equivalent_target_sweeps": max(
                 0, len(emitted) - 1),
@@ -1034,6 +1137,24 @@ class Qwen4MTPSpeculativeEngine:
                 "_qwen4_serial_verify_pipelined_expert_layers",
                 0,
             )),
+            "expert_compute_batches": int(getattr(
+                target, "_expert_compute_batches", 0)),
+            "max_experts_per_compute_batch": int(getattr(
+                target, "_max_experts_per_compute_batch", 0)),
+            "adaptive_expert_batch_clamps": int(getattr(
+                target, "_adaptive_expert_batch_clamps", 0)),
+            "min_adaptive_expert_batch": int(getattr(
+                target, "_min_adaptive_expert_batch", 0)),
+            "expert_batch_prefetch": int(getattr(
+                target, "_expert_batch_executor", None) is not None),
+            "expert_batch_prefetch_submitted": int(getattr(
+                target, "_expert_batch_prefetch_submitted", 0)),
+            "expert_batch_prefetch_wait_s": float(getattr(
+                target, "_expert_batch_prefetch_wait_s", 0.0)),
+            "expert_batch_prefetch_hidden_s": float(getattr(
+                target, "_expert_batch_prefetch_hidden_s", 0.0)),
+            "expert_shared_overlap_layers": int(getattr(
+                target, "_expert_shared_overlap_layers", 0)),
         })
         request_cache_after = _cache_io_snapshot(target)
         _record_cache_io_delta(

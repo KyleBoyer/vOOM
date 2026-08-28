@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import math
 from types import SimpleNamespace
 
@@ -748,6 +749,47 @@ def test_stochastic_controller_full_accept_uses_exact_target_verifier(
     assert stats["qwen4_mtp_stochastic"] == 1
     assert stats["qwen4_mtp_stochastic_verified"] == 2
     assert stats["qwen4_mtp_expected_acceptance"] == pytest.approx(1.0)
+
+
+def test_stochastic_controller_reports_observed_path_q_calibration(
+        _cache_io_noop):
+    target = _FakeTarget([11, 12, 13])
+    engine = Qwen4MTPSpeculativeEngine(
+        target,
+        depth=2,
+        q_calibration_scales=(0.5, 1.0, 1.5),
+        drafter=_FakeDrafter([11, 12]),
+    )
+
+    result = engine.generate(
+        "prompt", max_tokens=4,
+        sampling=SamplingParams(temperature=1.0, seed=29))
+
+    stats = result["path_stats"]
+    calibration = json.loads(stats["qwen4_mtp_q_calibration"])
+    assert stats["qwen4_mtp_q_calibration_rows"] == 2
+    assert calibration["schema"] == "voom.qwen4-mtp-q-calibration.v1"
+    assert calibration["scope"] == "observed-native-draft-path"
+    assert calibration["scales"] == [0.5, 1.0, 1.5]
+    assert calibration["counts"] == [2, 2, 2]
+    assert calibration["by_step_counts"] == [[1, 1, 1], [1, 1, 1]]
+    assert calibration["overall"][1] == pytest.approx(
+        stats["qwen4_mtp_expected_acceptance"])
+
+
+@pytest.mark.parametrize(
+    "scales",
+    [(-1,), (0.2,), (4.1,), (float("nan"),), (True,), (1, 1), range(10)],
+)
+def test_q_calibration_scales_are_strictly_bounded(scales):
+    target = _FakeTarget([11])
+    with pytest.raises(ValueError, match="q-calibration"):
+        Qwen4MTPSpeculativeEngine(
+            target,
+            depth=1,
+            q_calibration_scales=scales,
+            drafter=_FakeDrafter([11]),
+        )
 
 
 def test_stochastic_controller_all_reject_restores_exact_target_state(

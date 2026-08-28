@@ -1,8 +1,10 @@
 # Qwen3.8-Flash-Next local bring-up
 
 Status: the pinned checkpoint download and checksum gate completed on
-2026-08-27. The PLE address oracle and authenticated direct-row provider are
-implemented and real-checkpoint tested. This is not yet a serving claim.
+2026-08-27. Exact released-BF16 text serving, the PLE direct-row provider,
+hybrid prompt-state persistence, and target-authoritative Lightning-MTP are
+implemented and real-checkpoint tested. Optimization candidates remain
+profile-scoped until their memory and heterogeneous-replay gates pass.
 
 ## Source and storage
 
@@ -115,3 +117,45 @@ Every live rung requires a fresh 30-second memory preflight, one Metal job at a
 time, peak Metal at or below 8.5GB, at least 10GB workspace free, and exact
 released-model tokens against the pinned reference. New routing or lossy paths
 remain explicit opt-ins until the multi-shape replay corpus passes.
+
+## Untouched 49K agent capture: measured optimization decisions
+
+The current real-traffic gate is the byte-for-byte captured 134-tool request
+`logs/captured_requests/1784574315421_94161f5f.json` (SHA-256 prefix
+`8ac18b8e`). It renders to 49,255 tokens without replacing tools, messages,
+temperature, or streaming mode. The table below uses repeat 2 from the same
+server process where available, because a fresh Qwen4 engine adds about 15
+seconds of initialization that is not decode work.
+
+| Exact target candidate | Warm wall | Decode | Target sweeps | Proposed / accepted | Decision |
+| --- | ---: | ---: | ---: | ---: | --- |
+| Native MTP depth 3, pipeline off | 117.935s | 99.795s | 6 | 18 / 9 | matched control |
+| Native MTP depth 3, expert-page pipeline | 115.551s | 97.457s | 6 | 18 / 9 | keep opt-in; 2.0% wall gain, below 10% promotion gate |
+| Native MTP depth 5 | 142.649s | 124.543s | 6 | 29 / 10 | STOP; no sweep removed and 176.0GB streamed |
+
+The pipeline/control output SHA-256 is identical
+(`411b96d6...bf2fd85`). Both repeat-2 runs violated the memory-pressure gate,
+so neither is eligible as a default. The max-16 Plex score is 15/100 because
+the response is deliberately truncated before it can complete the task; it is
+a latency/instrumentation rung, not a model-quality score.
+
+Other bounded exact candidates were stopped before promotion:
+
+- Splitting decode pages across the two independent SSDs improved a
+  fresh-process sample only 3.4%, a comparison confounded by initialization;
+  its memory gate failed. Physical placement remains trace-balanced rather
+  than a blind half-and-half split.
+- Prompt lookup found one seven-token repeated suffix in the real capture, but
+  its first proposal was rejected and added a target sweep: 137.786s warm.
+- Zstd level-1 over released BF16 expert pages decoded at 1.41--1.53GB/s,
+  below the measured 1.62GB/s raw NVMe floor. Byte shuffle improved ratio but
+  reduced end-to-end decode/unshuffle throughput to 0.73--0.76GB/s. CPU
+  decompression is therefore a STOP on this machine.
+
+The instrumented profile now reports verifier page admission, weight wait,
+reserve time, linear/full-attention compute, head time, exact expert-pipeline
+submission/wait/hidden time, and per-layer counts. For stochastic traffic it
+can also measure expected p/q overlap for several draft-temperature scales on
+the observed native-draft path. That measurement never changes the sampled
+proposal or the authoritative target distribution; selection and promotion
+still require a heterogeneous held-out replay corpus.

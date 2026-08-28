@@ -232,6 +232,49 @@ def test_vision_protocol_timing_exposes_qwen4_spool_phases():
     assert timing["qwen4_fused_expert_bytes"] == 16
 
 
+def test_vision_protocol_timing_exposes_qwen4_verifier_pipeline_and_q_calibration():
+    q_calibration = '{"scales":[0.7,1,1.3]}'
+    timing = _vision_protocol_timing({
+        "path_stats": {
+            "qwen4_mtp_q_calibration_rows": 18,
+            "qwen4_mtp_q_calibration": q_calibration,
+            "qwen4_serial_verify_page_prepare_s": 1.25,
+            "qwen4_serial_verify_weight_wait_s": 2.25,
+            "qwen4_serial_verify_reserve_s": 3.25,
+            "qwen4_serial_verify_linear_compute_s": 4.25,
+            "qwen4_serial_verify_full_compute_s": 5.25,
+            "qwen4_serial_verify_head_s": 6.25,
+            "qwen4_serial_verify_linear_layers": 36,
+            "qwen4_serial_verify_full_layers": 12,
+            "qwen4_serial_verify_pipelined_expert_layers": 48,
+            "expert_batch_prefetch": 1,
+            "expert_batch_prefetch_submitted": 96,
+            "expert_batch_prefetch_wait_s": 7.25,
+            "expert_batch_prefetch_hidden_s": 8.25,
+            "expert_compute_batches": 144,
+            "max_experts_per_compute_batch": 4,
+        },
+    })
+
+    assert timing["qwen4_mtp_q_calibration_rows"] == 18
+    assert timing["qwen4_mtp_q_calibration"] == q_calibration
+    assert timing["qwen4_serial_verify_page_prepare_s"] == 1.25
+    assert timing["qwen4_serial_verify_weight_wait_s"] == 2.25
+    assert timing["qwen4_serial_verify_reserve_s"] == 3.25
+    assert timing["qwen4_serial_verify_linear_compute_s"] == 4.25
+    assert timing["qwen4_serial_verify_full_compute_s"] == 5.25
+    assert timing["qwen4_serial_verify_head_s"] == 6.25
+    assert timing["qwen4_serial_verify_linear_layers"] == 36
+    assert timing["qwen4_serial_verify_full_layers"] == 12
+    assert timing["qwen4_serial_verify_pipelined_expert_layers"] == 48
+    assert timing["expert_batch_prefetch"] == 1
+    assert timing["expert_batch_prefetch_submitted"] == 96
+    assert timing["expert_batch_prefetch_wait_s"] == 7.25
+    assert timing["expert_batch_prefetch_hidden_s"] == 8.25
+    assert timing["expert_compute_batches"] == 144
+    assert timing["max_experts_per_compute_batch"] == 4
+
+
 def test_vision_protocol_timing_exposes_qwen_mtp_round_trace():
     replay = [{"depth": 1, "draft_token_ids": [7, 9]}]
     timing = _vision_protocol_timing({
@@ -2758,6 +2801,7 @@ def test_qwen4_instrumented_profile_is_exact_bounded_and_in_engine_identity():
         "VMODEL_QWEN4_MTP_DEPTH": "0",
         "VMODEL_QWEN4_MTP_MIN_DRAFT_PROBABILITY": "0",
         "VMODEL_QWEN4_MTP_NGRAM_FIRST": "0",
+        "VMODEL_QWEN4_MTP_Q_CALIBRATION_SCALES": "",
     }
     with patch.dict(os.environ, settings, clear=False), \
          patch("runtime.config.ModelConfig.from_dir", return_value=cfg), \
@@ -2950,11 +2994,13 @@ def test_qwen4_phase_head_and_mtp_are_explicitly_wired():
     class FakeMTP:
         def __init__(
             self, target, *, depth, min_draft_probability, ngram_first,
+            q_calibration_scales,
         ):
             captured["target"] = target
             captured["depth"] = depth
             captured["min_draft_probability"] = min_draft_probability
             captured["ngram_first"] = ngram_first
+            captured["q_calibration_scales"] = q_calibration_scales
 
         def close(self):
             captured["target"].close()
@@ -2969,6 +3015,7 @@ def test_qwen4_phase_head_and_mtp_are_explicitly_wired():
         "VMODEL_QWEN4_MTP_DEPTH": "4",
         "VMODEL_QWEN4_MTP_MIN_DRAFT_PROBABILITY": "0.625",
         "VMODEL_QWEN4_MTP_NGRAM_FIRST": "0",
+        "VMODEL_QWEN4_MTP_Q_CALIBRATION_SCALES": "0.7,1,1.3",
     }, clear=False), \
          patch("runtime.config.ModelConfig.from_dir", return_value=cfg), \
          patch("runtime.path_resolver.resolve_model_dir", side_effect=lambda path: path), \
@@ -2981,6 +3028,7 @@ def test_qwen4_phase_head_and_mtp_are_explicitly_wired():
     assert captured["depth"] == 4
     assert captured["min_draft_probability"] == pytest.approx(0.625)
     assert not captured["ngram_first"]
+    assert captured["q_calibration_scales"] == [0.7, 1.0, 1.3]
     assert captured["rc"].qwen4_phase_lm_head
     assert captured["rc"].pin_lm_head
     assert not captured["rc"].stream_lm_head
