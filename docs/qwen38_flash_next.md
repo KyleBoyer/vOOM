@@ -135,7 +135,8 @@ seconds of initialization that is not decode work.
 | Native MTP depth 3, expert-page pipeline | 115.551s | 97.457s | 6 | 18 / 9 | keep opt-in; 2.0% wall gain, below 10% promotion gate |
 | Native MTP depth 5 | 142.649s | 124.543s | 6 | 29 / 10 | STOP; no sweep removed and 176.0GB streamed |
 | Depth 3 + exact BF16 GEMV + exact disk endpoint | **76.057s** | **73.307s** | 6 | 18 / 9 | prior uniform mirror; steady server, full 49,255-token prompt hit |
-| Trace-balanced mirror, untouched max-16 | **85.634s cold** | **67.424s** | 6 | 18 / 9 | promote in explicit profile; paired cold control 92.209s, identical output SHA |
+| Trace-balanced hot-8, untouched max-16 | **85.634s cold** | **67.424s** | 6 | 18 / 9 | first explicit promotion; identical output SHA |
+| Trace-balanced hot-24, untouched max-16 | **76.766s cold** | **59.140s** | 6 | 18 / 9 | current explicit profile; paired cold control 92.209s, identical output SHA |
 
 The pipeline/control output SHA-256 is identical
 (`411b96d6...bf2fd85`). Both repeat-2 runs violated the memory-pressure gate,
@@ -154,42 +155,42 @@ loaded all 49,255 prompt positions and preserved the established output hash.
 The trace-balanced replacement is selected from privacy-safe decode-only route
 IDs, never prompt text, token IDs, tools, logits, or activations. Each request
 has equal primary heat per layer so a long output cannot dominate the corpus;
-request support and raw occurrences break exact heat ties. Eight hot experts
-per layer are mirrored; remaining capacity is filled
+request support and raw occurrences break exact heat ties. The measured ladder
+tested eight, 16, and 24 hot experts per layer; remaining capacity is filled
 from the cold end of each ranking because blindly mirroring every hot expert
 would overload the internal device after the always-touched target trunk.
 All 4,690 mirrored tensor ranges (20,499,121,920 bytes) were re-read and matched
 the pinned BF16 source before serving.
 
-On a paired cold-server replay of the untouched capture, that layout preserved
-SHA-256 `411b96d6...bf2fd85`, target sweeps, proposal outcomes, and the 136.35GB
-logical read set while reducing wall 92.2089s to **85.6337s**, decode 74.2508s
-to **67.4242s**, verifier 71.5327s to **64.6969s**, and union fetch 55.9376s to
-**49.1099s**. Peak Metal was unchanged at 4.248GB and swap-out growth was
-5.849MB. This is the clean sub-90-second cold-server result.
+On paired cold-server replays of the untouched capture, hot-8 first reduced
+wall 92.2089s to 85.6337s. Hot-16 then reached 79.6104s, and hot-24 reached
+**76.7660s**. Every rung preserved SHA-256 `411b96d6...bf2fd85`, target sweeps,
+proposal outcomes, and the 136.353GB logical read set. Relative to uniform,
+hot-24 reduced decode **74.2508s -> 59.1397s (-20.4%)**, verifier
+**71.5327s -> 56.4420s (-21.1%)**, and union fetch
+**55.9376s -> 40.9737s (-26.8%)**. Peak Metal was unchanged at 4.248GB and
+swap-out growth was 6.324MB. This is the clean sub-90-second cold-server result.
 
-The anti-overfit gates deliberately changed request shape. A developer-action
-prompt with two tools and non-streaming output preserved output SHA-256 while
-reducing decode 53.7110s to 47.6310s and verifier 51.6067s to 45.5577s; its
-candidate memory gate passed where the uniform control did not. A greedy,
-non-streaming 134-tool request also preserved output SHA-256 and improved wall
-98.6276s to 96.5906s, but exceeded the swap gate by about 34MB, so it is not a
-clean promotion result. Cross-validation of the two trace documents found
+The anti-overfit gates deliberately changed request shape. Hot-24 preserved a
+developer-action prompt with two tools and non-streaming output while reducing
+wall **284.4592s -> 273.2498s** and decode **53.7110s -> 43.8724s**; its
+candidate memory gate passed where the uniform control did not. A conservative
+hot-16 rung separately preserved a held-out greedy, non-streaming 134-tool
+output while reducing wall **98.6276s -> 85.1951s** and passed the memory gate;
+the earlier hot-8 attempt took 96.5906s and failed pressure. Cross-validation
+of the two trace documents found
 27.4--27.5% route hits when either request alone trained the placement and the
 other was held out.
 
-At max-64, the prior uniform layout completed the untouched request in
-298.2957s versus the earlier 501.1384s. The new trace-balanced layout preserved
-all 64 output tokens and output SHA-256 `5278e54a...6cf0700`, the
+At max-64, the prior uniform layout completed the untouched streamed request in
+298.2957s versus the earlier 501.1384s. The paired streamed hot-24 layout
+preserved all 64 output tokens and output SHA-256 `5278e54a...6cf0700`, the
 same 41/68 accepted proposals, all 23 target sweeps, and the same 517.303GB
-logical read set. Exact engine time fell 283.6450s to **267.3735s**, verifier
-271.1396s to **254.9062s**, and union fetch 212.6227s to **196.5681s**. That
-candidate used non-streaming transport while the historical control streamed,
-so the engine/verifier comparison is the defensible compute result; its
-282.3099s wall is not presented as a perfectly paired transport A/B. Peak Metal
-was unchanged at 4.248GB and the pressure gate passed. The 15/100 Plex result
-is again an incomplete output-cap result, not evidence of poor completed-answer
-quality.
+logical read set. Wall fell to **261.9988s (-12.2%)**, exact engine time to
+**247.0330s (-12.9%)**, verifier to **234.4611s (-13.5%)**, and union fetch to
+**175.4018s (-17.5%)**. Peak Metal was unchanged at 4.248GB and the pressure
+gate passed. The 15/100 Plex result is again an incomplete output-cap result,
+not evidence of poor completed-answer quality.
 
 Other bounded exact candidates were stopped before promotion:
 
