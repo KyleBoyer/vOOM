@@ -708,6 +708,15 @@ class RuntimeConfig:
     # the 1.27 GB released BF16 head out of the 49K prompt high-water while
     # avoiding repeated row streaming during target-verified MTP decode.
     qwen4_phase_lm_head: bool = False
+    # Exact, default-off extension of the phase-scoped Qwen4 head lifetime.
+    # Native MTP has already materialized every draft probability before its
+    # authoritative multi-position target sweep starts, so the 1.27-GB BF16
+    # head can be released for that trunk sweep and demand-loaded exactly once
+    # at the verifier's final projection.  This changes storage lifetime only;
+    # the target weights, operator order, and logits remain released-model
+    # exact.  Keep it separate from qwen4_phase_lm_head until the live pressure
+    # and heterogeneous-replay gates clear.
+    qwen4_serial_verify_suspend_lm_head: bool = False
     # Opt-in request-local attribution. "" disables it; "layers" records the
     # runtime's existing materialization boundaries; "ops" adds diagnostic
     # attention/router/MLP barriers for supported Qwen/Kimi/GLM hybrid blocks.
@@ -2135,6 +2144,9 @@ class StreamingEngine:
         self._qwen4_phase_head_restore_successes = 0
         self._qwen4_phase_head_restore_refusals = 0
         self._qwen4_phase_head_restore_s = 0.0
+        self._qwen4_serial_verify_head_suspend_calls = 0
+        self._qwen4_serial_verify_head_suspend_bytes = 0
+        self._qwen4_serial_verify_head_restore_trim_bytes = 0
         self._layer_transient_margin = 400_000_000
         self._token_transient = 0  # F42: whole-token transient (greedy sync point)
         # 2026-07-13: F42's own per-layer/per-token mx.reset_peak_memory() calls
@@ -2225,6 +2237,11 @@ class StreamingEngine:
             raise ValueError(
                 "qwen4_phase_lm_head requires an untied, non-streamed, "
                 "non-reranked pinned Qwen4 LM head")
+        if (self.rc.qwen4_serial_verify_suspend_lm_head
+                and not phase_scoped_qwen4_head):
+            raise ValueError(
+                "qwen4_serial_verify_suspend_lm_head requires "
+                "qwen4_phase_lm_head")
         if phase_scoped_qwen35_head and phase_scoped_qwen4_head:
             raise ValueError("Qwen phase-scoped LM-head modes conflict")
         phase_scoped_qwen_head = bool(
@@ -5036,6 +5053,16 @@ class StreamingEngine:
             return self._streamed_lm_head
         if self._lm_head_w is not None:
             return self._lm_head_w
+        if (self._qwen4_lm_head_pin_suspended and bool(getattr(
+                self.rc,
+                "qwen4_serial_verify_suspend_lm_head",
+                False))):
+            # The verifier has consumed its last trunk page before asking for
+            # logits.  Do not overlap that now-cold LRU tail with the 1.27-GB
+            # exact head reload; this is a lifetime trim, not a cache-budget
+            # mutation, so the next round may prefetch normally again.
+            self._qwen4_serial_verify_head_restore_trim_bytes += int(
+                self.cache.trim_to(0))
         head = self.cache.get(
             "lm_head", ["lm_head.weight"])["lm_head.weight"]
         if self._qwen35_lm_head_pin_suspended:
@@ -5083,6 +5110,18 @@ class StreamingEngine:
             self._qwen4_phase_head_restore_refusals += 1
         self._qwen4_phase_head_restore_s += time.perf_counter() - started
         return restored
+
+    def _suspend_qwen4_serial_verify_lm_head(self) -> int:
+        """Release the exact Qwen4 head for one target-body verifier sweep."""
+        if not bool(getattr(
+                getattr(self, "rc", None),
+                "qwen4_serial_verify_suspend_lm_head",
+                False)):
+            return 0
+        self._qwen4_serial_verify_head_suspend_calls += 1
+        released = self._suspend_qwen4_phase_lm_head()
+        self._qwen4_serial_verify_head_suspend_bytes += int(released)
+        return int(released)
 
     def _suspend_qwen35_serial_verify_lm_head(self) -> int:
         """Drop the phase-scoped head before a streamed verifier trunk.
@@ -8160,6 +8199,12 @@ class StreamingEngine:
             return self.forward_tokens(tokens, kv, tap_layers=tap_layers)
         if qwen_family:
             self._suspend_qwen35_serial_verify_lm_head()
+        elif qwen4_family:
+            # The draft path synchronizes/detaches q before entering this
+            # target-authoritative sweep.  Drop only the output-head lease;
+            # _final_logits restores the same BF16 page after all target trunk
+            # layers have completed.
+            self._suspend_qwen4_serial_verify_lm_head()
 
         offset = kv.offset
         verifier_positions = len(tokens)
@@ -9175,6 +9220,9 @@ class StreamingEngine:
         self._qwen4_phase_head_restore_successes = 0
         self._qwen4_phase_head_restore_refusals = 0
         self._qwen4_phase_head_restore_s = 0.0
+        self._qwen4_serial_verify_head_suspend_calls = 0
+        self._qwen4_serial_verify_head_suspend_bytes = 0
+        self._qwen4_serial_verify_head_restore_trim_bytes = 0
         self._true_peak_metal_bytes = mx.get_active_memory()  # see _note_true_peak
         if self.governor is not None:
             self.governor.reset_request_peak(self._true_peak_metal_bytes)
@@ -11727,6 +11775,15 @@ class StreamingEngine:
                 self._qwen4_phase_head_restore_refusals)
             path_stats["qwen4_phase_lm_head_restore_s"] = float(
                 self._qwen4_phase_head_restore_s)
+            path_stats["qwen4_serial_verify_suspend_lm_head"] = int(
+                self.rc.qwen4_serial_verify_suspend_lm_head)
+            path_stats["qwen4_serial_verify_head_suspend_calls"] = int(
+                self._qwen4_serial_verify_head_suspend_calls)
+            path_stats["qwen4_serial_verify_head_suspend_bytes"] = int(
+                self._qwen4_serial_verify_head_suspend_bytes)
+            path_stats[
+                "qwen4_serial_verify_head_restore_trim_bytes"
+            ] = int(self._qwen4_serial_verify_head_restore_trim_bytes)
         if reranked_telemetry_before:
             reranked_after = reranked_head.telemetry_snapshot()
             for key, value in reranked_after.items():

@@ -1225,6 +1225,7 @@ class EngineManager:
                 ("VMODEL_QWEN4_MTP_MIN_DRAFT_PROBABILITY", "0"),
                 ("VMODEL_QWEN4_MTP_NGRAM_FIRST", "0"),
                 ("VMODEL_QWEN4_MTP_Q_CALIBRATION_SCALES", ""),
+                ("VMODEL_QWEN4_SERIAL_VERIFY_SUSPEND_LM_HEAD", "0"),
             )
         )
         dspark_request_identity = tuple(
@@ -2879,6 +2880,17 @@ class EngineManager:
                     raise RequestValidationError(
                         "VMODEL_QWEN4_MTP_Q_CALIBRATION_SCALES accepts at "
                         "most 9 values")
+                if qwen4_request_identity[28] not in ("0", "1"):
+                    raise RequestValidationError(
+                        "VMODEL_QWEN4_SERIAL_VERIFY_SUSPEND_LM_HEAD must be "
+                        "0 or 1")
+                rc.qwen4_serial_verify_suspend_lm_head = (
+                    qwen4_request_identity[28] == "1")
+                if (rc.qwen4_serial_verify_suspend_lm_head
+                        and not rc.qwen4_phase_lm_head):
+                    raise RequestValidationError(
+                        "VMODEL_QWEN4_SERIAL_VERIFY_SUSPEND_LM_HEAD requires "
+                        "VMODEL_QWEN4_PHASE_LM_HEAD=1")
                 rc.hot_prompt_kv_persist_dir = qwen4_request_identity[18]
                 if rc.hot_prompt_kv_persist_dir and not rc.hot_prompt_kv:
                     raise RequestValidationError(
@@ -9085,6 +9097,10 @@ def _vision_protocol_timing(result: dict) -> dict:
         "qwen4_phase_lm_head_restore_calls",
         "qwen4_phase_lm_head_restore_successes",
         "qwen4_phase_lm_head_restore_refusals",
+        "qwen4_serial_verify_suspend_lm_head",
+        "qwen4_serial_verify_head_suspend_calls",
+        "qwen4_serial_verify_head_suspend_bytes",
+        "qwen4_serial_verify_head_restore_trim_bytes",
     )
     for key in optional_integer_fields:
         if key in stats or key in result:
@@ -9333,6 +9349,9 @@ def _execution_profile_fields(engine) -> dict[str, object]:
         ))
     if rc is not None and getattr(rc, "qwen4_phase_lm_head", False):
         fields["vmodel_qwen4_phase_lm_head"] = 1
+    if rc is not None and getattr(
+            rc, "qwen4_serial_verify_suspend_lm_head", False):
+        fields["vmodel_qwen4_serial_verify_suspend_lm_head"] = 1
     qwen4_mtp_identity = str(getattr(
         engine, "mtp_engine_identity", "") or "")
     if qwen4_mtp_identity.startswith("qwen4-mtp-"):

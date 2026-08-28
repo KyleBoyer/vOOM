@@ -3016,6 +3016,7 @@ def test_qwen4_phase_head_and_mtp_are_explicitly_wired():
         "VMODEL_QWEN4_MTP_MIN_DRAFT_PROBABILITY": "0.625",
         "VMODEL_QWEN4_MTP_NGRAM_FIRST": "0",
         "VMODEL_QWEN4_MTP_Q_CALIBRATION_SCALES": "0.7,1,1.3",
+        "VMODEL_QWEN4_SERIAL_VERIFY_SUSPEND_LM_HEAD": "1",
     }, clear=False), \
          patch("runtime.config.ModelConfig.from_dir", return_value=cfg), \
          patch("runtime.path_resolver.resolve_model_dir", side_effect=lambda path: path), \
@@ -3030,6 +3031,7 @@ def test_qwen4_phase_head_and_mtp_are_explicitly_wired():
     assert not captured["ngram_first"]
     assert captured["q_calibration_scales"] == [0.7, 1.0, 1.3]
     assert captured["rc"].qwen4_phase_lm_head
+    assert captured["rc"].qwen4_serial_verify_suspend_lm_head
     assert captured["rc"].pin_lm_head
     assert not captured["rc"].stream_lm_head
 

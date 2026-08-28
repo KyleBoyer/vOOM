@@ -1132,6 +1132,36 @@ class Qwen4MTPSpeculativeEngine:
                 target, "_qwen4_serial_verify_full_layers", 0)),
             "qwen4_serial_verify_head_s": float(getattr(
                 target, "_qwen4_serial_verify_head_s", 0.0)),
+            "qwen4_serial_verify_suspend_lm_head": int(getattr(
+                getattr(target, "rc", None),
+                "qwen4_serial_verify_suspend_lm_head",
+                False,
+            )),
+            "qwen4_serial_verify_head_suspend_calls": int(getattr(
+                target, "_qwen4_serial_verify_head_suspend_calls", 0)),
+            "qwen4_serial_verify_head_suspend_bytes": int(getattr(
+                target, "_qwen4_serial_verify_head_suspend_bytes", 0)),
+            "qwen4_serial_verify_head_restore_trim_bytes": int(getattr(
+                target,
+                "_qwen4_serial_verify_head_restore_trim_bytes",
+                0,
+            )),
+            # Refresh the phase counters after all verifier rounds.  The
+            # bootstrap path_stats snapshot predates those releases/restores.
+            "qwen4_phase_lm_head_suspend_calls": int(getattr(
+                target, "_qwen4_phase_head_suspend_calls", 0)),
+            "qwen4_phase_lm_head_suspend_bytes": int(getattr(
+                target, "_qwen4_phase_head_suspend_bytes", 0)),
+            "qwen4_phase_lm_head_suspend_s": float(getattr(
+                target, "_qwen4_phase_head_suspend_s", 0.0)),
+            "qwen4_phase_lm_head_restore_calls": int(getattr(
+                target, "_qwen4_phase_head_restore_calls", 0)),
+            "qwen4_phase_lm_head_restore_successes": int(getattr(
+                target, "_qwen4_phase_head_restore_successes", 0)),
+            "qwen4_phase_lm_head_restore_refusals": int(getattr(
+                target, "_qwen4_phase_head_restore_refusals", 0)),
+            "qwen4_phase_lm_head_restore_s": float(getattr(
+                target, "_qwen4_phase_head_restore_s", 0.0)),
             "qwen4_serial_verify_pipelined_expert_layers": int(getattr(
                 target,
                 "_qwen4_serial_verify_pipelined_expert_layers",
