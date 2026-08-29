@@ -9143,6 +9143,7 @@ def _vision_protocol_timing(result: dict) -> dict:
         "governor_reservation_budget_restored_bytes",
         "governor_reservation_cache_released_bytes",
         "governor_reservation_unproductive_shrinks",
+        "governor_reservation_zero_release_short_circuits",
         "governor_reservation_failures",
         "governor_swap_pressure_events",
         "governor_swap_used_growth_bytes",

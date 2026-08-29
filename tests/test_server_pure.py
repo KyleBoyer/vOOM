@@ -649,6 +649,7 @@ def test_protocol_timing_exposes_governor_admission_measurements():
             "governor_reservation_budget_restored_bytes": 200_000_000,
             "governor_reservation_cache_released_bytes": 200_000_000,
             "governor_reservation_unproductive_shrinks": 5,
+            "governor_reservation_zero_release_short_circuits": 4,
             "governor_reservation_failures": 0,
         },
     })
@@ -663,6 +664,8 @@ def test_protocol_timing_exposes_governor_admission_measurements():
     assert timing["governor_reservation_budget_restored_bytes"] == 200_000_000
     assert timing["governor_reservation_cache_released_bytes"] == 200_000_000
     assert timing["governor_reservation_unproductive_shrinks"] == 5
+    assert timing[
+        "governor_reservation_zero_release_short_circuits"] == 4
 
 
 def test_protocol_timing_exposes_row_paged_head_recall_measurements():
@@ -6501,6 +6504,7 @@ def test_cache_io_delta_reports_only_current_request():
             reservation_budget_restored_bytes=50,
             reservation_cache_released_bytes=150,
             reservation_unproductive_shrinks=1,
+            reservation_zero_release_short_circuits=2,
             reservation_failures=1,
         ),
         expert_hits=4, expert_misses=5,
@@ -6536,6 +6540,7 @@ def test_cache_io_delta_reports_only_current_request():
     engine.governor.reservation_budget_restored_bytes += 18
     engine.governor.reservation_cache_released_bytes += 19
     engine.governor.reservation_unproductive_shrinks += 20
+    engine.governor.reservation_zero_release_short_circuits += 21
     engine.store.fast_tier_bytes += 9
     engine.store.archive_bytes += 10
     store_stages[0] += 11
@@ -6570,6 +6575,8 @@ def test_cache_io_delta_reports_only_current_request():
     assert stats["governor_reservation_budget_restored_bytes"] == 18
     assert stats["governor_reservation_cache_released_bytes"] == 19
     assert stats["governor_reservation_unproductive_shrinks"] == 20
+    assert stats[
+        "governor_reservation_zero_release_short_circuits"] == 21
     assert stats["weight_fast_tier_bytes"] == 9
     assert stats["weight_archive_bytes"] == 10
     assert stats["ct_mxfp4_transform_ns"] == 11

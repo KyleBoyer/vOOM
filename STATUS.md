@@ -50,6 +50,24 @@ unbounded); it executed 14,640 coalesced GEMMs, split 1,271 expert calls, and
 never exceeded 512 positions. Client swap-out growth was 38.14MB, so this is a
 capacity fix, not a pressure/profile promotion.
 
+The committed bounded-512 path then completed the untouched 46,849-token /
+134-tool replay on its first attempt. Wall fell 7,845.622 -> 4,156.344 seconds
+(-47.0%), prefill was 4,150.574 seconds, and peak Metal fell 7.524 -> 7.259GB.
+MLP/expert time fell 5,364.407 -> 1,710.744 seconds (-68.1%); attention moved
+only 2,358.732 -> 2,287.530 seconds (-3.0%). It executed 37,803 coalesced
+GEMMs, split 6,315 hot experts, observed max width 512, and never retried. The
+capture-derived stochastic sampler remained intact, so native MTP correctly
+fell back. Client swap-out growth improved 354.14 -> 177.08MB but still fails
+pressure, and max-1's 15-point Plex slice is not an intelligence result.
+
+That real trace exposed 626 zero-release reservation shrinks: once no cache
+page was evictable, each attention tile still walked the entire budget ladder
+and repeatedly cleared MLX before restoring 57.24GB of ineffective cumulative
+cuts. Named reversible admissions now stop after the first zero-release step
+and use the existing bounded settle/refusal samples (including allocator-cache
+clears). Lowering an empty cache cap cannot reclaim memory; live ceilings,
+settle count, and fail-closed refusal are unchanged.
+
 Direct Plex quality also blocks promotion. The focused real-schema run with
 BF16 expanded K/V scored 66.25/100 in 3,260.091 seconds. Int8 expanded K/V
 raised the score to 79/100 but regressed wall to 4,432.907 seconds; calls still

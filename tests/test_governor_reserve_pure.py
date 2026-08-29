@@ -102,6 +102,7 @@ def make_governor(module, fake_mx, *, cache_max: int, floor: int,
     gov.reservation_budget_restored_bytes = 0
     gov.reservation_cache_released_bytes = 0
     gov.reservation_unproductive_shrinks = 0
+    gov.reservation_zero_release_short_circuits = 0
     gov.reservation_reason_counts = {}
     gov.phase_budget_restore_calls = 0
     gov.phase_budget_restore_bytes = 0
@@ -178,6 +179,8 @@ def test_zero_release_shrinks_do_not_persist_after_memory_resettles():
     assert gov.cache.max_bytes == int(2.2e9)
     assert gov.reservation_calls == 1
     assert gov.reservation_unproductive_shrinks > 0
+    assert gov.reservation_zero_release_short_circuits == 1
+    assert gov.reservations == 1
     assert gov.reservation_cache_released_bytes == 0
     assert gov.reservation_budget_reduced_bytes > 0
     assert gov.reservation_budget_restored_bytes == (
@@ -200,6 +203,8 @@ def test_qwen_prefill_page_zero_release_shrinks_do_not_persist():
 
     assert gov.cache.max_bytes == int(2.2e9)
     assert gov.reservation_cache_released_bytes == 0
+    assert gov.reservation_zero_release_short_circuits == 1
+    assert gov.reservations == 1
     assert gov.reservation_budget_restored_bytes == (
         gov.reservation_budget_reduced_bytes)
     assert gov.reservation_reason_counts == {
@@ -220,6 +225,8 @@ def test_glm53_zero_release_shrinks_do_not_persist():
 
     assert gov.cache.max_bytes == int(1.5e9)
     assert gov.reservation_cache_released_bytes == 0
+    assert gov.reservation_zero_release_short_circuits == 1
+    assert gov.reservations == 1
     assert gov.reservation_budget_restored_bytes == (
         gov.reservation_budget_reduced_bytes)
     assert gov.reservation_reason_counts == {"glm53-expert-page": 1}

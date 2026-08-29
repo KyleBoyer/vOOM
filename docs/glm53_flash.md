@@ -160,6 +160,25 @@ retry in 720.616 seconds, and reduced true peak from 3.785 to 3.673GB. It was
 3.9% slower than unbounded, split 1,271 experts across 14,640 GEMMs, and grew
 swap-outs by 38.14MB. This remains a default-off capacity candidate.
 
+The subsequent committed bounded-512 run completed the untouched 46,849-token
+/ 134-tool capture on its first attempt. Wall was 4,156.344 seconds versus
+7,845.622 for the non-coalesced capacity baseline (-47.0%); prefill was
+4,150.574 seconds and true peak was 7.259GB versus 7.524GB. MLP/expert time
+fell 5,364.407 -> 1,710.744 seconds (-68.1%), while attention changed only
+2,358.732 -> 2,287.530 seconds (-3.0%). The trace executed 37,803 coalesced
+GEMMs, split 6,315 experts, observed maximum width 512, and never retried. The
+capture's stochastic sampler was preserved, so native MTP correctly fell back.
+Client swap-out growth improved 354.14 -> 177.08MB but still fails pressure;
+max-1's 15-point Plex score is not an intelligence result.
+
+The same trace identified a host-side governor cost: 626 shrink steps released
+zero cache bytes. Named reversible reservations were repeatedly lowering an
+already-empty cache limit, clearing MLX, then restoring the ineffective cut.
+The governor now exits that shrink loop at the first zero-release step and
+uses its existing bounded settle/refusal samples, clearing allocator cache
+during those samples. The Metal/system ceilings and fail-closed refusal rule
+are unchanged.
+
 The untouched captured request has now completed one cold 46,849-input/max-1
 run with all 134 tools and capture-derived streaming/sampling intact. Only the
 model alias and explicit one-token output cap differed. Wall was 7,845.622

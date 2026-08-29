@@ -121,6 +121,7 @@ class MemoryGovernor:
         self.reservation_budget_restored_bytes = 0
         self.reservation_cache_released_bytes = 0
         self.reservation_unproductive_shrinks = 0
+        self.reservation_zero_release_short_circuits = 0
         self.reservation_reason_counts: dict[str, int] = {}
         self.phase_budget_restore_calls = 0
         self.phase_budget_restore_bytes = 0
@@ -259,6 +260,11 @@ class MemoryGovernor:
 
         starting_cache_max = int(self.cache.max_bytes)
         starting_pressure_shrinks = int(getattr(self, "shrinks", 0) or 0)
+        reversible_admission = (
+            reason.startswith("serial-verify-")
+            or reason == "qwen-prefill-layer-page"
+            or reason.startswith("glm53-")
+        )
         active, available, ceiling, projected = sample()
         if projected <= ceiling:
             self.reservation_fast_path_calls += 1
@@ -283,6 +289,7 @@ class MemoryGovernor:
         # configured floor proves that the allocation is genuinely unsafe.
         released_this_call = 0
         reduced_this_call = 0
+        zero_release_short_circuit = False
         while projected > ceiling and self.cache.max_bytes > self.floor:
             overshoot = projected - ceiling
             step = max(
@@ -307,6 +314,20 @@ class MemoryGovernor:
                   flush=True)
             mx.clear_cache()
             active, available, ceiling, projected = sample()
+            # Once a named/reversible admission finds no evictable cache bytes,
+            # lowering the cache limit again cannot free any memory. The real
+            # 46.8K GLM trace repeated the remaining 14 budget steps for each
+            # attention tile (626 zero-release shrinks total), only to restore
+            # them. Stop mutating the empty limit and use the existing bounded
+            # settle/refusal samples instead. Continue clearing allocator cache
+            # during those samples because that can independently release a
+            # short-lived high-water; safety thresholds and fail-closed refusal
+            # remain unchanged.
+            if (released == 0 and reversible_admission
+                    and projected > ceiling):
+                self.reservation_zero_release_short_circuits += 1
+                zero_release_short_circuit = True
+                break
 
         # psutil's instantaneous "available" reading has been measured swinging
         # several GB within a fraction of a second on this hardware (unrelated
@@ -321,6 +342,8 @@ class MemoryGovernor:
             and resample_attempts < _RESERVE_SETTLE_ATTEMPTS
         ):
             time.sleep(_RESERVE_SETTLE_SECONDS)
+            if zero_release_short_circuit:
+                mx.clear_cache()
             active, available, ceiling, projected = sample()
             resample_attempts += 1
 
@@ -372,11 +395,6 @@ class MemoryGovernor:
         pressure_shrank_concurrently = (
             int(getattr(self, "shrinks", 0) or 0)
             > starting_pressure_shrinks
-        )
-        reversible_admission = (
-            reason.startswith("serial-verify-")
-            or reason == "qwen-prefill-layer-page"
-            or reason.startswith("glm53-")
         )
         if (reversible_admission
                 and self.cache.max_bytes < target_max
@@ -544,6 +562,7 @@ class MemoryGovernor:
                 f"+{self.reservation_budget_restored_bytes / 1e6:.0f}MB, "
                 f"cache released {self.reservation_cache_released_bytes / 1e6:.0f}MB, "
                 f"{self.reservation_unproductive_shrinks} zero-release shrinks, "
+                f"{self.reservation_zero_release_short_circuits} zero-release exits, "
                 f"{self.swap_pressure_events} swap-pressure events "
                 f"(+{self.swap_pressure_used_growth_bytes / 1e6:.0f}MB used/"
                 f"{self.swap_pressure_out_growth_bytes / 1e6:.0f}MB out), "

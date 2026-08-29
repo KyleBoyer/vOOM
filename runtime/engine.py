@@ -448,6 +448,8 @@ def _cache_io_snapshot(engine) -> tuple[int, ...]:
             governor, "reservation_cache_released_bytes", 0) or 0),
         int(getattr(
             governor, "reservation_unproductive_shrinks", 0) or 0),
+        int(getattr(
+            governor, "reservation_zero_release_short_circuits", 0) or 0),
         int(getattr(governor, "reservation_failures", 0) or 0),
         int(getattr(governor, "swap_pressure_events", 0) or 0),
         int(getattr(
@@ -494,6 +496,7 @@ def _record_cache_io_delta(
         "governor_reservation_budget_restored_bytes",
         "governor_reservation_cache_released_bytes",
         "governor_reservation_unproductive_shrinks",
+        "governor_reservation_zero_release_short_circuits",
         "governor_reservation_failures",
         "governor_swap_pressure_events",
         "governor_swap_used_growth_bytes",
