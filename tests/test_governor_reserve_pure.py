@@ -206,6 +206,25 @@ def test_qwen_prefill_page_zero_release_shrinks_do_not_persist():
         "qwen-prefill-layer-page": 1}
 
 
+def test_glm53_zero_release_shrinks_do_not_persist():
+    module, mx = load_pressure(int(4.995e9))
+    gov = make_governor(
+        module, mx, cache_max=int(1.5e9), floor=int(0.1e9))
+    gov.metal_limit = int(5e9)
+    gov.cache.total_bytes = int(0.1e9)
+    mx.clear_release_after = 4
+    mx.clear_release_bytes = int(0.08e9)
+
+    gov.reserve(
+        int(0.07e9), margin=0, reason="glm53-expert-page")
+
+    assert gov.cache.max_bytes == int(1.5e9)
+    assert gov.reservation_cache_released_bytes == 0
+    assert gov.reservation_budget_restored_bytes == (
+        gov.reservation_budget_reduced_bytes)
+    assert gov.reservation_reason_counts == {"glm53-expert-page": 1}
+
+
 def test_productive_reclaim_keeps_reduced_budget_and_reason_telemetry():
     module, mx = load_pressure(int(9.8e9))
     gov = make_governor(

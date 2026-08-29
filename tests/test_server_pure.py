@@ -187,6 +187,25 @@ def test_vision_protocol_timing_uses_generic_path_stats():
     }
 
 
+def test_protocol_timing_exposes_glm53_phase_active_peaks():
+    phases = {
+        "glm53_layer_stationary_initial_carrier_active_peak_bytes": 101,
+        "glm53_layer_stationary_attention_active_peak_bytes": 102,
+        "glm53_layer_stationary_ffn_hc_pre_active_peak_bytes": 103,
+        "glm53_layer_stationary_mlp_active_peak_bytes": 104,
+        "glm53_layer_stationary_ffn_hc_post_active_peak_bytes": 105,
+        "memory_prefill_retry_cleanup": [{
+            "chunk": 8, "released_bytes": 700_000_000}],
+        "memory_prefill_retry_failures": [
+            "phase=attention_tile observed=8500000001"],
+    }
+
+    timing = _vision_protocol_timing({"path_stats": phases})
+
+    for key, value in phases.items():
+        assert timing[key] == value
+
+
 def test_vision_protocol_timing_exposes_qwen4_spool_phases():
     timing = _vision_protocol_timing({
         "path_stats": {
@@ -2513,7 +2532,11 @@ def test_glm53_hot_prompt_kv_is_opt_in_exact_and_in_engine_identity():
         ("VMODEL_GLM53_HOT_KV_MIN_TOKENS", "-1", "non-negative"),
         ("VMODEL_GLM53_MTP", "auto", "must be 0 or 1"),
         ("VMODEL_GLM53_MTP_DEPTH", "6", "must be in \\[1, 5\\]"),
-        ("VMODEL_GLM53_MTP_MAX_PROMPT_TOKENS", "2049", "in \\[1, 2048\\]"),
+        ("VMODEL_GLM53_MTP_MAX_PROMPT_TOKENS", "65537", "in \\[1, 65536\\]"),
+        ("VMODEL_GLM53_SPARSE_ABSORBED_MLA", "auto", "must be 0 or 1"),
+        ("VMODEL_GLM53_SPARSE_FUSED_KV_INT8", "auto", "must be 0 or 1"),
+        ("VMODEL_GLM53_COALESCED_EXPERT_POSITIONS", "auto",
+         "must be 0 or 1"),
         ("VMODEL_GLM53_EXPERT_BATCH_PREFETCH", "auto", "must be 0 or 1"),
         ("VMODEL_GLM53_EXPERT_FETCH_BATCH", "9", "must be in \\[1, 8\\]"),
         ("VMODEL_GLM53_TRUNK_PREFETCH_DEPTH", "3", "must be in \\[0, 2\\]"),
@@ -2564,7 +2587,7 @@ def test_glm53_native_mtp_is_explicit_and_in_engine_identity():
     settings = {
         "VMODEL_GLM53_MTP": "0",
         "VMODEL_GLM53_MTP_DEPTH": "3",
-        "VMODEL_GLM53_MTP_MAX_PROMPT_TOKENS": "512",
+        "VMODEL_GLM53_MTP_MAX_PROMPT_TOKENS": "8192",
     }
     with patch.dict("os.environ", settings, clear=False), \
          patch("runtime.config.ModelConfig.from_dir", return_value=cfg), \
@@ -2580,7 +2603,7 @@ def test_glm53_native_mtp_is_explicit_and_in_engine_identity():
     assert plain is targets[0]
     assert mtp is wrappers[0]
     assert mtp.k == 3
-    assert mtp.max_prompt_tokens == 512
+    assert mtp.max_prompt_tokens == 8192
     assert len(targets) == 2
 
 
@@ -2636,6 +2659,154 @@ def test_glm53_expert_storage_batch_and_pipeline_are_explicit_identity():
     assert candidate.prefetch_workers == 2
     # Storage grouping never changes the verified arithmetic grouping.
     assert candidate.expert_compute_batch == 1
+
+
+def test_glm53_sparse_absorbed_mla_is_explicit_and_in_engine_identity():
+    from unittest.mock import patch
+
+    from runtime.server import EngineManager
+
+    captured = []
+
+    class FakeEngine:
+        def __init__(self, _path, rc):
+            self.rc = rc
+            captured.append(rc)
+
+        def close(self):
+            pass
+
+    cfg = SimpleNamespace(
+        model_type="glm5_next", tie_word_embeddings=False,
+        index_topk=2048, vision_config=None, num_experts_per_tok=8,
+    )
+    settings = {
+        "VMODEL_GLM53_MTP": "0",
+        "VMODEL_GLM53_SPARSE_ABSORBED_MLA": "0",
+        "VMODEL_GLM53_SPARSE_FUSED_ATTENTION": "0",
+        "VMODEL_GLM53_SPARSE_FUSED_KV_INT8": "0",
+        "VMODEL_GLM53_COALESCED_EXPERT_POSITIONS": "0",
+        "VMODEL_GLM53_INCREMENTAL_DSA_POOL": "0",
+    }
+    with patch.dict("os.environ", settings, clear=False), \
+         patch("runtime.config.ModelConfig.from_dir", return_value=cfg), \
+         patch("runtime.path_resolver.resolve_model_dir",
+               side_effect=lambda path: path), \
+         patch("runtime.engine.StreamingEngine", FakeEngine):
+        manager = EngineManager()
+        manager.get(Path("/tmp/fake-glm53-sparse-absorbed"), "lossless")
+        os.environ["VMODEL_GLM53_SPARSE_ABSORBED_MLA"] = "1"
+        manager.get(Path("/tmp/fake-glm53-sparse-absorbed"), "lossless")
+        os.environ["VMODEL_GLM53_SPARSE_ABSORBED_MLA"] = "0"
+        os.environ["VMODEL_GLM53_SPARSE_FUSED_ATTENTION"] = "1"
+        manager.get(Path("/tmp/fake-glm53-sparse-absorbed"), "lossless")
+        os.environ["VMODEL_GLM53_SPARSE_FUSED_KV_INT8"] = "1"
+        manager.get(Path("/tmp/fake-glm53-sparse-absorbed"), "lossless")
+        os.environ["VMODEL_GLM53_INCREMENTAL_DSA_POOL"] = "1"
+        manager.get(Path("/tmp/fake-glm53-sparse-absorbed"), "lossless")
+        os.environ["VMODEL_GLM53_COALESCED_EXPERT_POSITIONS"] = "1"
+        manager.get(Path("/tmp/fake-glm53-sparse-absorbed"), "lossless")
+
+    assert len(captured) == 6
+    assert captured[0].glm53_sparse_absorbed_mla is False
+    assert captured[1].glm53_sparse_absorbed_mla is True
+    assert captured[2].glm53_sparse_absorbed_mla is False
+    assert captured[2].glm53_sparse_fused_attention is True
+    assert captured[2].glm53_sparse_fused_kv_int8 is False
+    assert captured[2].glm53_incremental_dsa_pool is False
+    assert captured[3].glm53_sparse_fused_attention is True
+    assert captured[3].glm53_sparse_fused_kv_int8 is True
+    assert captured[4].glm53_sparse_fused_attention is True
+    assert captured[4].glm53_sparse_fused_kv_int8 is True
+    assert captured[4].glm53_incremental_dsa_pool is True
+    assert captured[4].glm53_coalesced_expert_positions is False
+    assert captured[5].glm53_coalesced_expert_positions is True
+
+
+def test_glm53_sparse_attention_candidates_are_mutually_exclusive():
+    from unittest.mock import patch
+
+    from runtime.server import EngineManager, RequestValidationError
+
+    with patch.dict("os.environ", {
+        "VMODEL_GLM53_SPARSE_ABSORBED_MLA": "1",
+        "VMODEL_GLM53_SPARSE_FUSED_ATTENTION": "1",
+    }, clear=False):
+        with pytest.raises(RequestValidationError, match="mutually exclusive"):
+            EngineManager().get(Path("/tmp/unused-glm53"), "lossless")
+
+
+def test_glm53_sparse_int8_kv_requires_fused_attention():
+    from unittest.mock import patch
+
+    from runtime.server import EngineManager, RequestValidationError
+
+    with patch.dict("os.environ", {
+        "VMODEL_GLM53_SPARSE_FUSED_ATTENTION": "0",
+        "VMODEL_GLM53_SPARSE_FUSED_KV_INT8": "1",
+    }, clear=False):
+        with pytest.raises(RequestValidationError, match="requires"):
+            EngineManager().get(Path("/tmp/unused-glm53"), "lossless")
+
+
+def test_glm53_incremental_dsa_pool_rejects_untyped_env():
+    from unittest.mock import patch
+
+    from runtime.server import EngineManager, RequestValidationError
+
+    with patch.dict("os.environ", {
+        "VMODEL_GLM53_INCREMENTAL_DSA_POOL": "auto",
+    }, clear=False):
+        with pytest.raises(RequestValidationError, match="must be 0 or 1"):
+            EngineManager().get(Path("/tmp/unused-glm53"), "lossless")
+
+
+def test_glm53_prefill_tile_width_is_explicit_and_in_engine_identity():
+    from unittest.mock import patch
+
+    from runtime.server import EngineManager
+
+    captured = []
+
+    class FakeEngine:
+        def __init__(self, _path, rc):
+            captured.append(rc)
+
+        def close(self):
+            pass
+
+    cfg = SimpleNamespace(
+        model_type="glm5_next", tie_word_embeddings=False,
+        index_topk=2048, vision_config=None, num_experts_per_tok=8,
+    )
+    settings = {
+        "VMODEL_GLM53_MTP": "0",
+        "VMODEL_GLM53_PREFILL_TILE_WIDTH": "32",
+    }
+    with patch.dict("os.environ", settings, clear=False), \
+         patch("runtime.config.ModelConfig.from_dir", return_value=cfg), \
+         patch("runtime.path_resolver.resolve_model_dir",
+               side_effect=lambda path: path), \
+         patch("runtime.engine.StreamingEngine", FakeEngine):
+        manager = EngineManager()
+        manager.get(Path("/tmp/fake-glm53-tile"), "lossless")
+        os.environ["VMODEL_GLM53_PREFILL_TILE_WIDTH"] = "64"
+        manager.get(Path("/tmp/fake-glm53-tile"), "lossless")
+
+    assert [rc.prefill_chunk_size for rc in captured] == [32, 64]
+
+
+@pytest.mark.parametrize("value", ["auto", "1", "63", "256"])
+def test_glm53_prefill_tile_width_rejects_ungated_values(value):
+    from unittest.mock import patch
+
+    from runtime.server import EngineManager, RequestValidationError
+
+    with patch.dict("os.environ", {
+        "VMODEL_GLM53_PREFILL_TILE_WIDTH": value,
+    }, clear=False):
+        with pytest.raises(RequestValidationError, match="PREFILL_TILE_WIDTH"):
+            EngineManager().get(Path("/tmp/unused-glm53"), "lossless")
 
 
 def test_k3_native_profile_uses_proven_layer_stationary_prefetch_schedule():
@@ -6302,6 +6473,9 @@ def test_cache_io_delta_reports_only_current_request():
                 "serial-verify-transient": 3,
                 "qwen-prefill-layer-page": 4,
                 "qwen-prefill-transient": 5,
+                "glm53-expert-page": 6,
+                "glm53-attention-transient": 7,
+                "glm53-mlp-transient": 8,
             },
             reservation_requested_bytes=100,
             reservation_budget_reduced_bytes=200,
@@ -6332,6 +6506,12 @@ def test_cache_io_delta_reports_only_current_request():
         "qwen-prefill-layer-page"] += 14
     engine.governor.reservation_reason_counts[
         "qwen-prefill-transient"] += 15
+    engine.governor.reservation_reason_counts[
+        "glm53-expert-page"] += 16
+    engine.governor.reservation_reason_counts[
+        "glm53-attention-transient"] += 17
+    engine.governor.reservation_reason_counts[
+        "glm53-mlp-transient"] += 18
     engine.governor.reservation_requested_bytes += 16
     engine.governor.reservation_budget_reduced_bytes += 17
     engine.governor.reservation_budget_restored_bytes += 18
@@ -6364,6 +6544,8 @@ def test_cache_io_delta_reports_only_current_request():
     assert stats["governor_serial_verify_transient_reservation_calls"] == 13
     assert stats["governor_qwen_prefill_page_reservation_calls"] == 14
     assert stats["governor_qwen_prefill_transient_reservation_calls"] == 15
+    assert stats["governor_glm53_expert_page_reservation_calls"] == 16
+    assert stats["governor_glm53_transient_reservation_calls"] == 35
     assert stats["governor_reservation_requested_bytes"] == 16
     assert stats["governor_reservation_budget_reduced_bytes"] == 17
     assert stats["governor_reservation_budget_restored_bytes"] == 18
@@ -6779,6 +6961,29 @@ def test_harmony_split_channels_reports_no_reasoning_without_a_final_channel():
     visible, analysis = _harmony_split_channels(raw, "gpt_oss")
     assert visible == raw
     assert analysis == ""
+
+
+def test_glm5_think_channel_is_split_from_visible_answer():
+    visible, analysis = _harmony_split_channels(
+        "checking the pixels</think>green", "glm5_next")
+    assert visible == "green"
+    assert analysis == "checking the pixels"
+
+
+def test_glm5_think_channel_fails_safe_when_output_is_truncated():
+    raw = "checking the pixels"
+    visible, analysis = _harmony_split_channels(raw, "glm5_next")
+    assert visible == raw
+    assert analysis == ""
+
+
+def test_glm5_think_gate_handles_a_split_closing_marker():
+    gate = _HarmonyChannelGate("glm5_next")
+    assert gate.feed("checking") == ""
+    assert gate.feed("</thi") == ""
+    assert gate.feed("nk>gr") == "gr"
+    assert gate.feed("een") == "een"
+    assert gate.remainder("green") == ""
 
 
 def _run_all():

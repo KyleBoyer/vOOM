@@ -122,6 +122,48 @@ def test_glm53_pooled_dsa_rejects_misaligned_append():
         state.observe(3, "full", hidden[:, :1], weights, prefix, offset=1)
 
 
+def test_glm53_incremental_pool_cache_matches_full_rebuild_across_tail():
+    import mlx.core as mx
+
+    from runtime.glm5_next_dsa import GLM5NextDSAState
+
+    cfg = _dsa_cfg()
+    prefix = "model.layers.3"
+    weights = _dsa_weights(prefix)
+    hidden = mx.arange(40, dtype=mx.float32).reshape(1, 10, 4) / 17
+    q_resid = mx.arange(20, dtype=mx.float32).reshape(1, 10, 2) / 19
+
+    rebuilt = GLM5NextDSAState(cfg)
+    rebuilt.observe(3, "full", hidden, weights, prefix, offset=0)
+    expected = rebuilt.update_and_select(
+        3, "full", hidden[:, 7:], q_resid[:, 7:], weights, prefix,
+        offset=7)
+    expected_pools, _indices, _valid = rebuilt._pooled_states_reference(
+        rebuilt.k_idx[3], weights, prefix)
+
+    cached = GLM5NextDSAState(cfg, incremental_pool_cache=True)
+    cached.observe(3, "full", hidden[:, :7], weights, prefix, offset=0)
+    cached.update_and_select(
+        3, "full", hidden[:, :7], q_resid[:, :7], weights, prefix,
+        offset=0)
+    cached.observe(3, "full", hidden[:, 7:], weights, prefix, offset=7)
+    got = cached.update_and_select(
+        3, "full", hidden[:, 7:], q_resid[:, 7:], weights, prefix,
+        offset=7)
+    mx.eval(expected, expected_pools, got, cached.pool_keys[3])
+
+    assert np.array_equal(np.array(got), np.array(expected))
+    assert np.array_equal(
+        np.array(cached.pool_keys[3]), np.array(expected_pools))
+    assert cached.stats["pool_rows_reused"] == 3
+    assert cached.stats["pool_rows_computed"] == 6
+
+    branch = cached.fork()
+    cached.trim(5)
+    assert cached.pool_keys[3].shape[1] == 2
+    assert branch.pool_keys[3].shape[1] == 5
+
+
 def test_glm53_hybrid_kv_fork_preserves_compressed_and_dsa_state():
     import mlx.core as mx
 
@@ -145,6 +187,69 @@ def test_glm53_hybrid_kv_fork_preserves_compressed_and_dsa_state():
     assert branch.dsa.k_idx[3].shape[1] == 2
     assert kv.keys[3].shape[1] == 3
     assert kv.dsa.k_idx[3].shape[1] == 3
+
+
+def test_glm53_compressed_mla_factory_uses_exact_stepped_cache():
+    from runtime.engine import RuntimeConfig, StreamingEngine
+    from runtime.kv_cache import SteppedKVCache
+
+    engine = StreamingEngine.__new__(StreamingEngine)
+    engine.rc = RuntimeConfig(mla_compressed_kv=True)
+    engine.cfg = SimpleNamespace(
+        model_type="glm5_next",
+        num_hidden_layers=6,
+    )
+    engine._position_free_pool = None
+    engine._dsa_elided = False
+
+    kv = engine.new_kv()
+
+    assert isinstance(kv, SteppedKVCache)
+    assert kv.compressed_mla is True
+    assert kv.mla_absorbed is False
+    assert kv.glm53_sparse_absorbed_mla is False
+    assert kv.glm53_sparse_fused_attention is False
+    assert kv.glm53_sparse_fused_kv_int8 is False
+    assert kv.dsa.incremental_pool_cache is False
+    assert hasattr(kv, "dsa")
+    assert hasattr(kv, "kda_cache")
+
+    engine.rc.glm53_sparse_absorbed_mla = True
+    absorbed = engine.new_kv()
+    assert absorbed.glm53_sparse_absorbed_mla is True
+
+    engine.rc.glm53_sparse_absorbed_mla = False
+    engine.rc.glm53_sparse_fused_attention = True
+    engine.rc.glm53_sparse_fused_kv_int8 = True
+    fused = engine.new_kv()
+    assert fused.glm53_sparse_fused_attention is True
+    assert fused.glm53_sparse_fused_kv_int8 is True
+
+    engine.rc.glm53_incremental_dsa_pool = True
+    pooled = engine.new_kv()
+    assert pooled.dsa.incremental_pool_cache is True
+
+
+def test_glm53_stepped_latents_equal_plain_cache_across_tiles():
+    import mlx.core as mx
+
+    from runtime.kv_cache import KVCache, SteppedKVCache
+
+    plain = KVCache(1)
+    plain.compressed_mla = True
+    stepped = SteppedKVCache(1)
+    stepped.compressed_mla = True
+    expected = actual = None
+    for length in (31, 32, 33, 128, 1):
+        tile = mx.arange(length * 7, dtype=mx.float32).reshape(
+            1, length, 7).astype(mx.bfloat16)
+        expected = plain.update_latent(0, tile)
+        actual = stepped.update_latent(0, tile)
+        mx.eval(expected, actual)
+        assert expected.shape == actual.shape
+        assert bool(mx.all(expected == actual))
+    assert plain.offset == stepped.offset == 225
+    assert stepped.allocated_nbytes() < plain.nbytes() * 2
 
 
 def test_glm53_layer_stationary_moe_preserves_tile_shapes_and_expert_order():
@@ -213,13 +318,382 @@ def test_glm53_layer_stationary_moe_preserves_tile_shapes_and_expert_order():
     candidate = glm5_next_mlp_layer_stationary_tiles(
         tiles, w, prefix, cfg, 0,
         lambda *_args, **_kwargs: {}, iter_expert_batches=batches)
-    mx.eval(*reference, *candidate)
+    reference_order = list(requested)
+    requested.clear()
+    coalesced = glm5_next_mlp_layer_stationary_tiles(
+        tiles, w, prefix, cfg, 0,
+        lambda *_args, **_kwargs: {}, iter_expert_batches=batches,
+        coalesce_expert_positions=True)
+    mx.eval(*reference, *candidate, *coalesced)
 
-    assert requested == sorted(set(requested))
+    assert reference_order == sorted(set(reference_order))
+    assert requested == reference_order
     assert len(requested) <= 4
     for expected, actual in zip(reference, candidate):
         assert expected.shape == actual.shape
         assert bool(mx.all(expected == actual))
+    for expected, actual in zip(reference, coalesced):
+        assert expected.shape == actual.shape
+        assert bool(mx.allclose(expected, actual, atol=1e-5, rtol=1e-5))
+
+@pytest.mark.parametrize("tile_size", [1, 2, 4])
+def test_glm53_sparse_mla_query_tiling_is_byte_exact(tile_size):
+    import mlx.core as mx
+
+    from runtime.glm5_next import _glm5_next_sparse_mla_attention
+
+    prefix = "model.layers.3"
+    heads, queries, width = 2, 5, 7
+    key_dim, value_dim, latent_dim = 3, 2, 4
+    query = (mx.arange(
+        heads * queries * key_dim, dtype=mx.float32).reshape(
+            1, heads, queries, key_dim) / 17).astype(mx.bfloat16)
+    latent = (mx.arange(
+        13 * latent_dim, dtype=mx.float32).reshape(
+            1, 13, latent_dim) / 23).astype(mx.bfloat16)
+    selection = mx.array([[list(range(row, row + width))
+                           for row in range(queries)]], dtype=mx.int32)
+    weights = {
+        f"{prefix}.self_attn.kv_b_proj.weight": (
+            mx.arange(
+                heads * (key_dim + value_dim) * latent_dim,
+                dtype=mx.float32).reshape(
+                    heads * (key_dim + value_dim), latent_dim) / 31
+        ).astype(mx.bfloat16),
+    }
+    reference = _glm5_next_sparse_mla_attention(
+        query, latent, selection, weights, prefix,
+        heads=heads, key_dim=key_dim, value_dim=value_dim,
+        query_tile_size=queries)
+    candidate = _glm5_next_sparse_mla_attention(
+        query, latent, selection, weights, prefix,
+        heads=heads, key_dim=key_dim, value_dim=value_dim,
+        query_tile_size=tile_size)
+    mx.eval(reference, candidate)
+
+    assert reference.shape == candidate.shape == (
+        1, heads, queries, value_dim)
+    assert bool(mx.all(reference == candidate))
+
+
+@pytest.mark.parametrize("tile_size", [1, 2, 5])
+def test_glm53_sparse_absorbed_mla_matches_eager_and_tiles(tile_size):
+    import mlx.core as mx
+
+    from runtime.glm5_next import (
+        _glm5_next_sparse_absorbed_mla_attention,
+        _glm5_next_sparse_mla_attention,
+    )
+
+    prefix = "model.layers.3"
+    heads, queries, width = 2, 5, 7
+    key_dim, value_dim, latent_dim = 3, 2, 4
+    query = (mx.arange(
+        heads * queries * key_dim, dtype=mx.float32).reshape(
+            1, heads, queries, key_dim) / 17).astype(mx.bfloat16)
+    latent = (mx.arange(
+        13 * latent_dim, dtype=mx.float32).reshape(
+            1, 13, latent_dim) / 23).astype(mx.bfloat16)
+    selection = mx.array([[
+        [-1, *range(row, row + width - 1)]
+        for row in range(queries)
+    ]], dtype=mx.int32)
+    weights = {
+        f"{prefix}.self_attn.kv_b_proj.weight": (
+            mx.arange(
+                heads * (key_dim + value_dim) * latent_dim,
+                dtype=mx.float32).reshape(
+                    heads * (key_dim + value_dim), latent_dim) / 31
+        ).astype(mx.bfloat16),
+    }
+    eager = _glm5_next_sparse_mla_attention(
+        query, latent, selection, weights, prefix,
+        heads=heads, key_dim=key_dim, value_dim=value_dim,
+        query_tile_size=queries)
+    reference = _glm5_next_sparse_absorbed_mla_attention(
+        query, latent, selection, weights, prefix,
+        heads=heads, key_dim=key_dim, value_dim=value_dim,
+        query_tile_size=queries)
+    candidate = _glm5_next_sparse_absorbed_mla_attention(
+        query, latent, selection, weights, prefix,
+        heads=heads, key_dim=key_dim, value_dim=value_dim,
+        query_tile_size=tile_size)
+    mx.eval(eager, reference, candidate)
+
+    assert bool(mx.all(reference == candidate))
+    np.testing.assert_allclose(
+        np.asarray(reference.astype(mx.float32)),
+        np.asarray(eager.astype(mx.float32)), rtol=8e-3, atol=2e-2)
+
+
+def test_glm53_dense_absorbed_mla_matches_row_selected_eager():
+    import mlx.core as mx
+
+    from runtime.glm5_next import (
+        _glm5_next_dense_absorbed_mla_attention,
+        _glm5_next_sparse_mla_attention,
+    )
+
+    prefix = "model.layers.3"
+    heads, queries, key_length = 2, 5, 13
+    key_dim, value_dim, latent_dim = 3, 2, 4
+    offset = key_length - queries
+    query = (mx.arange(
+        heads * queries * key_dim, dtype=mx.float32).reshape(
+            1, heads, queries, key_dim) / 17).astype(mx.bfloat16)
+    latent = (mx.arange(
+        key_length * latent_dim, dtype=mx.float32).reshape(
+            1, key_length, latent_dim) / 23).astype(mx.bfloat16)
+    key_positions = mx.arange(key_length, dtype=mx.int32)[None, None, :]
+    query_positions = mx.arange(
+        offset, offset + queries, dtype=mx.int32)[None, :, None]
+    selection = mx.where(
+        key_positions <= query_positions, key_positions, -1)
+    weights = {
+        f"{prefix}.self_attn.kv_b_proj.weight": (
+            mx.arange(
+                heads * (key_dim + value_dim) * latent_dim,
+                dtype=mx.float32).reshape(
+                    heads * (key_dim + value_dim), latent_dim) / 31
+        ).astype(mx.bfloat16),
+    }
+    eager = _glm5_next_sparse_mla_attention(
+        query, latent, selection, weights, prefix,
+        heads=heads, key_dim=key_dim, value_dim=value_dim,
+        query_tile_size=queries)
+    absorbed = _glm5_next_dense_absorbed_mla_attention(
+        query, latent, weights, prefix,
+        heads=heads, key_dim=key_dim, value_dim=value_dim, offset=offset)
+    mx.eval(eager, absorbed)
+
+    np.testing.assert_allclose(
+        np.asarray(absorbed.astype(mx.float32)),
+        np.asarray(eager.astype(mx.float32)), rtol=2e-2, atol=1.3e-1)
+
+
+def test_glm53_exact_prefill_kv_projects_each_row_once_byte_exact():
+    import mlx.core as mx
+
+    from runtime.glm5_next import _glm5_next_update_expanded_prefill_kv
+    from runtime.layer_runner import _linear
+
+    prefix = "model.layers.3"
+    heads, key_dim, value_dim, latent_dim = 2, 3, 2, 4
+    weights = {
+        f"{prefix}.self_attn.kv_b_proj.weight": (
+            mx.arange(
+                heads * (key_dim + value_dim) * latent_dim,
+                dtype=mx.float32).reshape(
+                    heads * (key_dim + value_dim), latent_dim) / 31
+        ).astype(mx.bfloat16),
+    }
+    tiles = [
+        (mx.arange(length * latent_dim, dtype=mx.float32).reshape(
+            1, length, latent_dim) + shift).astype(mx.bfloat16)
+        for length, shift in ((31, 0), (32, 100), (33, 300))
+    ]
+    cache = {}
+    keys = values = None
+    for tile in tiles:
+        keys, values = _glm5_next_update_expanded_prefill_kv(
+            tile, weights, prefix, layer=3, cache=cache,
+            heads=heads, key_dim=key_dim, value_dim=value_dim)
+    latent = mx.concatenate(tiles, axis=1)
+    full = _linear(
+        latent, weights, f"{prefix}.self_attn.kv_b_proj").reshape(
+            1, latent.shape[1], heads, key_dim + value_dim).transpose(
+                0, 2, 1, 3)
+    mx.eval(keys, values, full)
+
+    assert bool(mx.all(keys == full[..., :key_dim]))
+    assert bool(mx.all(values == full[..., key_dim:]))
+    assert cache[3][0].shape[2] == 256
+
+
+def test_glm53_int8_prefill_kv_is_bounded_and_row_scaled():
+    import mlx.core as mx
+    import numpy as np
+
+    from runtime.glm5_next import (
+        _glm5_next_update_expanded_prefill_kv_int8)
+
+    prefix = "model.layers.3"
+    heads, key_dim, value_dim, latent_dim = 2, 32, 32, 4
+    weights = {
+        f"{prefix}.self_attn.kv_b_proj.weight": (
+            mx.arange(
+                heads * (key_dim + value_dim) * latent_dim,
+                dtype=mx.float32).reshape(
+                    heads * (key_dim + value_dim), latent_dim) / 257
+        ).astype(mx.bfloat16),
+    }
+    cache = {}
+    keys = values = key_scales = value_scales = None
+    for shift in (0, 11):
+        latent = (mx.arange(12, dtype=mx.float32).reshape(1, 3, 4)
+                  + shift).astype(mx.bfloat16)
+        keys, values, key_scales, value_scales = (
+            _glm5_next_update_expanded_prefill_kv_int8(
+                latent, weights, prefix, layer=3, cache=cache,
+                heads=heads, key_dim=key_dim, value_dim=value_dim))
+    mx.eval(keys, values, key_scales, value_scales)
+
+    assert keys.dtype == mx.int8
+    assert values.dtype == mx.int8
+    assert key_scales.dtype == mx.float32
+    assert value_scales.dtype == mx.float32
+    assert keys.shape == (1, heads, 6, key_dim)
+    assert cache[3][0].shape[2] == 256
+    assert cache[3][0].nbytes * 2 < (
+        1 * heads * 256 * key_dim * 2 * 2)
+    dequant = keys.astype(mx.float32) * key_scales
+    mx.eval(dequant)
+    assert np.isfinite(np.asarray(dequant)).all()
+
+
+@pytest.mark.parametrize("tile_size", [1, 2, 4])
+def test_glm53_sparse_expanded_attention_matches_reprojection(tile_size):
+    import mlx.core as mx
+
+    from runtime.glm5_next import (
+        _glm5_next_sparse_expanded_attention,
+        _glm5_next_sparse_mla_attention,
+    )
+    from runtime.layer_runner import _linear
+
+    prefix = "model.layers.3"
+    heads, queries, width = 2, 5, 7
+    key_dim, value_dim, latent_dim = 3, 2, 4
+    query = (mx.arange(
+        heads * queries * key_dim, dtype=mx.float32).reshape(
+            1, heads, queries, key_dim) / 17).astype(mx.bfloat16)
+    latent = (mx.arange(
+        13 * latent_dim, dtype=mx.float32).reshape(
+            1, 13, latent_dim) / 23).astype(mx.bfloat16)
+    selection = mx.array([[
+        [-1, *range(row, row + width - 1)]
+        for row in range(queries)
+    ]], dtype=mx.int32)
+    weights = {
+        f"{prefix}.self_attn.kv_b_proj.weight": (
+            mx.arange(
+                heads * (key_dim + value_dim) * latent_dim,
+                dtype=mx.float32).reshape(
+                    heads * (key_dim + value_dim), latent_dim) / 31
+        ).astype(mx.bfloat16),
+    }
+    expanded = _linear(
+        latent, weights, f"{prefix}.self_attn.kv_b_proj").reshape(
+            1, latent.shape[1], heads, key_dim + value_dim).transpose(
+                0, 2, 1, 3)
+    reference = _glm5_next_sparse_mla_attention(
+        query, latent, selection, weights, prefix,
+        heads=heads, key_dim=key_dim, value_dim=value_dim,
+        query_tile_size=queries)
+    candidate = _glm5_next_sparse_expanded_attention(
+        query, expanded[..., :key_dim], expanded[..., key_dim:], selection,
+        key_dim=key_dim, query_tile_size=tile_size)
+    mx.eval(reference, candidate)
+
+    assert bool(mx.all(reference == candidate))
+
+
+def test_glm53_mtp_prompt_prefill_keeps_exact_cache_latent_and_skips_dead_block():
+    import mlx.core as mx
+
+    from runtime.glm_mtp import MTPDrafter
+    from runtime.kv_cache import KVCache
+    from runtime.layer_runner import _linear
+
+    hidden, latent_width, positions = 4, 3, 5
+    layer = 1
+    prefix = f"model.layers.{layer}"
+    weights = {
+        f"{prefix}.enorm.weight": mx.ones((hidden,), dtype=mx.bfloat16),
+        f"{prefix}.hnorm.weight": mx.ones((hidden,), dtype=mx.bfloat16),
+        f"{prefix}.eh_proj.weight": (
+            mx.arange(hidden * hidden * 2, dtype=mx.float32).reshape(
+                hidden, hidden * 2) / 31).astype(mx.bfloat16),
+        f"{prefix}.input_layernorm.weight": mx.ones(
+            (hidden,), dtype=mx.bfloat16),
+        f"{prefix}.self_attn.kv_a_proj_with_mqa.weight": (
+            mx.arange(latent_width * hidden, dtype=mx.float32).reshape(
+                latent_width, hidden) / 17).astype(mx.bfloat16),
+        f"{prefix}.self_attn.kv_a_layernorm.weight": mx.ones(
+            (latent_width,), dtype=mx.bfloat16),
+    }
+
+    class _Store:
+        @staticmethod
+        def names_with_prefix(_prefix):
+            return tuple(weights)
+
+    class _Cache:
+        @staticmethod
+        def get(_key, _names):
+            return weights
+
+    embeddings = (
+        mx.arange(20 * hidden, dtype=mx.float32).reshape(20, hidden) / 13
+    ).astype(mx.bfloat16)
+    cfg = SimpleNamespace(
+        model_type="glm5_next",
+        num_hidden_layers=layer,
+        rms_norm_eps=1e-6,
+        mla_latent_norm_eps=1e-6,
+    )
+    engine = SimpleNamespace(
+        cfg=cfg,
+        store=_Store(),
+        cache=_Cache(),
+        _norm_w=mx.ones((hidden,), dtype=mx.bfloat16),
+        _embed=lambda ids: embeddings[mx.array(ids, dtype=mx.int32)][None],
+    )
+    tokens = [1, 2, 3, 4, 5]
+    h_window = (
+        mx.arange(positions * hidden, dtype=mx.float32).reshape(
+            1, positions, hidden) / 19).astype(mx.bfloat16)
+
+    drafter = MTPDrafter(engine)
+    cache = KVCache(layer + 1)
+    cache.compressed_mla = True
+    drafter.prefill(tokens, h_window, cache)
+
+    e = engine._embed(tokens[1:])
+    e = mx.concatenate([mx.zeros_like(e[:, :1]), e[:, 1:]], axis=1)
+    e = mx.fast.rms_norm(e, weights[f"{prefix}.enorm.weight"], 1e-6)
+    target_hidden = mx.fast.rms_norm(h_window[:, :-1], engine._norm_w, 1e-6)
+    target_hidden = mx.fast.rms_norm(
+        target_hidden, weights[f"{prefix}.hnorm.weight"], 1e-6)
+    x = _linear(
+        mx.concatenate([e, target_hidden], axis=-1), weights,
+        f"{prefix}.eh_proj")
+    attention_input = mx.fast.rms_norm(
+        x, weights[f"{prefix}.input_layernorm.weight"], 1e-6)
+    expected = _linear(
+        attention_input, weights,
+        f"{prefix}.self_attn.kv_a_proj_with_mqa")
+    expected = mx.fast.rms_norm(
+        expected,
+        weights[f"{prefix}.self_attn.kv_a_layernorm.weight"], 1e-6)
+    mx.eval(expected, cache.keys[layer])
+
+    assert cache.offset == positions - 1
+    assert mx.array_equal(cache.keys[layer], expected).item()
+    assert engine._glm53_mtp_state_only_prefill_tokens == positions - 1
+
+    # A strict prompt extension must append precisely the missing token/hidden
+    # pairs and reproduce the one-shot prompt boundary byte-for-byte.
+    engine._glm53_mtp_state_only_prefill_tokens = 0
+    split_cache = KVCache(layer + 1)
+    split_cache.compressed_mla = True
+    drafter.prefill(tokens[:3], h_window[:, :3], split_cache)
+    drafter.prefill_extension(
+        tokens[3:], h_window[:, 2:4], split_cache)
+    mx.eval(split_cache.keys[layer])
+    assert split_cache.offset == positions - 1
+    assert mx.array_equal(split_cache.keys[layer], expected).item()
+    assert engine._glm53_mtp_state_only_prefill_tokens == positions - 1
 
 
 def test_glm53_mtp_block_is_plain_residual_not_hyperconnected(monkeypatch):
@@ -268,3 +742,21 @@ def test_glm53_plain_controller_round_needs_no_speculative_kda_factors():
     assert _glm5_kda_rollback_factors_required(cfg, 6)
     assert not _glm5_kda_rollback_factors_required(
         SimpleNamespace(model_type="qwen3_5"), 2)
+
+
+def test_glm53_native_mtp_prefix_cache_is_strict_and_layout_bound():
+    from runtime.speculative import _native_mtp_strict_prefix_cache
+
+    cache = (((11, 12, 13), False, False), "target", "draft", "logits", "h")
+    assert _native_mtp_strict_prefix_cache(
+        cache, [11, 12, 13, 14], target_stepped=False,
+        draft_stepped=False) is cache
+    assert _native_mtp_strict_prefix_cache(
+        cache, [11, 12, 13], target_stepped=False,
+        draft_stepped=False) is None
+    assert _native_mtp_strict_prefix_cache(
+        cache, [11, 99, 13, 14], target_stepped=False,
+        draft_stepped=False) is None
+    assert _native_mtp_strict_prefix_cache(
+        cache, [11, 12, 13, 14], target_stepped=True,
+        draft_stepped=False) is None

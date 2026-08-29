@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import mlx.core as mx
 
+from . import quant
 from .config import ModelConfig
 from .deepseek_v4 import run_deepseek_v4_block
 from .expert_batching import consume_expert_batches
@@ -92,7 +93,8 @@ def glm5_next_mlp(
 def glm5_next_mlp_layer_stationary_tiles(
         hidden_tiles: list[mx.array], w: dict, prefix: str,
         cfg: ModelConfig, layer: int, get_experts, *,
-        iter_expert_batches=None, profile=None) -> list[mx.array]:
+        iter_expert_batches=None, profile=None, memory_guard=None,
+        coalesce_expert_positions: bool = False) -> list[mx.array]:
     """Run GLM-5.3 MLPs at their original tile GEMM shapes.
 
     For MoE layers, routing is still evaluated independently per tile. The
@@ -115,6 +117,8 @@ def glm5_next_mlp_layer_stationary_tiles(
                 tile, w, f"{prefix}.mlp", cfg)
             mx.eval(value)
             outputs.append(value)
+            if memory_guard is not None:
+                memory_guard("dense_mlp_tile")
         return outputs
 
     groups_by_tile = []
@@ -127,6 +131,8 @@ def glm5_next_mlp_layer_stationary_tiles(
                 "router", layer, router_t0, idx, route_weights,
                 positions=int(tile.shape[1]))):
             mx.eval(idx, route_weights)
+        if memory_guard is not None:
+            memory_guard("router_tile")
         groups = _group_routes(idx, route_weights)
         groups_by_tile.append(groups)
         for expert, placements in groups.items():
@@ -136,14 +142,6 @@ def glm5_next_mlp_layer_stationary_tiles(
 
     expert_ids = sorted(global_positions)
     routed = [mx.zeros_like(tile) for tile in hidden_tiles]
-    # Shared outputs use precisely the same per-tile GEMM shapes as the
-    # chunk-major reference and are evaluated before routed page streaming.
-    shared = []
-    for tile in hidden_tiles:
-        value = glm5_next_swiglu(
-            tile, w, f"{prefix}.mlp.shared_experts", cfg)
-        mx.eval(value)
-        shared.append(value)
 
     if iter_expert_batches is None:
         experts = get_experts(
@@ -156,6 +154,41 @@ def glm5_next_mlp_layer_stationary_tiles(
     def consume_batch(batch_ids, experts):
         touched = []
         for expert in batch_ids:
+            if coalesce_expert_positions:
+                inputs = []
+                destinations = []
+                for tile_index, (tile, groups) in enumerate(zip(
+                        hidden_tiles, groups_by_tile)):
+                    placements = groups.get(expert)
+                    if not placements:
+                        continue
+                    positions = [position for position, _ in placements]
+                    weights = mx.array(
+                        [weight for _, weight in placements]
+                    ).astype(mx.float32)
+                    inputs.append(tile[:, positions, :])
+                    destinations.append(
+                        (tile_index, positions, weights, len(positions)))
+                if not inputs:
+                    continue
+                expert_input = (
+                    inputs[0] if len(inputs) == 1
+                    else mx.concatenate(inputs, axis=1))
+                value = glm5_next_swiglu(
+                    expert_input, experts[expert],
+                    f"{prefix}.mlp.experts.{expert}", cfg)
+                mx.eval(value)
+                cursor = 0
+                for tile_index, positions, weights, width in destinations:
+                    contribution = (
+                        value[:, cursor:cursor + width]
+                        * weights[None, :, None]).astype(
+                            hidden_tiles[tile_index].dtype)
+                    routed[tile_index] = routed[tile_index].at[
+                        :, positions, :].add(contribution)
+                    touched.append(tile_index)
+                    cursor += width
+                continue
             for tile_index, (tile, groups) in enumerate(zip(
                     hidden_tiles, groups_by_tile)):
                 placements = groups.get(expert)
@@ -176,14 +209,344 @@ def glm5_next_mlp_layer_stationary_tiles(
         # batch. Preserve that boundary independently for each affected tile.
         for tile_index in sorted(set(touched)):
             mx.eval(routed[tile_index])
+        if memory_guard is not None:
+            memory_guard("routed_expert_batch")
 
     consume_expert_batches(batches, consume_batch)
-    outputs = []
-    for routed_value, shared_value in zip(routed, shared):
+    for tile_index, (routed_value, tile) in enumerate(zip(
+            routed, hidden_tiles)):
+        # Compute the independent shared expert only when this tile's routed
+        # accumulation is complete.  The released result is still exactly
+        # ``routed + shared`` with the same GEMM shapes and addition order, but
+        # a 46,849-token prompt no longer retains every shared output at once
+        # (about 384 MB of avoidable BF16 Metal storage on GLM-5.3-Flash).
+        shared_value = glm5_next_swiglu(
+            tile, w, f"{prefix}.mlp.shared_experts", cfg)
+        mx.eval(shared_value)
+        if memory_guard is not None:
+            memory_guard("shared_mlp_tile")
         value = routed_value + shared_value
         mx.eval(value)
-        outputs.append(value)
-    return outputs
+        # Replace the completed routed buffer immediately. Keeping a separate
+        # output list would retain both full-context tensors until return,
+        # another ~384 MB peak on the real 46,849-token harness capture.
+        routed[tile_index] = value
+    return routed
+
+
+def _glm5_next_sparse_mla_attention(
+        query: mx.array, latent_all: mx.array, selection: mx.array,
+        w: dict, prefix: str, *, heads: int, key_dim: int, value_dim: int,
+        query_tile_size: int = 4) -> mx.array:
+    """Evaluate the released row-specific DSA gather in bounded query tiles.
+
+    GLM-5.3 selects 2,048 different latent rows for every query. Expanding a
+    32-query prefill tile in one expression materializes roughly 4.3 GB of
+    per-head K/V before scores/probabilities and crossed 12.7 GB peak Metal on
+    the 16 GB host. Query rows are independent after their indices are fixed;
+    slicing only that outer batch axis preserves each row's operations and
+    selected-key order while bounding the live gather. Materialize every
+    result tile so MLX cannot retain all sparse expansion graphs until the
+    caller's later synchronization point.
+    """
+    batch, query_heads, length, query_dim = query.shape
+    if query_heads != heads or query_dim != key_dim:
+        raise ValueError("GLM-5.3 sparse MLA query shape is inconsistent")
+    if selection.shape[:2] != (batch, length):
+        raise ValueError(
+            "GLM-5.3 DSA selection is not query-position aligned")
+    tile_size = max(1, int(query_tile_size))
+    outputs = []
+    scale = key_dim ** -0.5
+    for start in range(0, length, tile_size):
+        end = min(start + tile_size, length)
+        selected = selection[:, start:end]
+        safe = mx.where(selected >= 0, selected, 0)
+        # B=1 is the serving shape, but retain a correct bounded batch path;
+        # each row's index set is inherently different and cannot be expressed
+        # as one shared axis-1 take.
+        gathered = mx.stack([
+            mx.take(latent_all[b], safe[b], axis=0)
+            for b in range(batch)
+        ], axis=0)
+        width = int(gathered.shape[2])
+        expanded = _linear(
+            gathered, w, f"{prefix}.self_attn.kv_b_proj").reshape(
+                batch, end - start, width, heads,
+                key_dim + value_dim).transpose(0, 3, 1, 2, 4)
+        keys, values = expanded[..., :key_dim], expanded[..., key_dim:]
+        scores = mx.sum(
+            query[:, :, start:end, None, :].astype(mx.float32)
+            * keys.astype(mx.float32), axis=-1) * scale
+        scores = mx.where(
+            (selected >= 0)[:, None, :, :], scores, float("-inf"))
+        probabilities = mx.softmax(scores, axis=-1).astype(values.dtype)
+        output = mx.sum(probabilities[..., None] * values, axis=-2)
+        mx.eval(output)
+        outputs.append(output)
+    result = (
+        outputs[0] if len(outputs) == 1
+        else mx.concatenate(outputs, axis=2))
+    mx.eval(result)
+    return result
+
+
+def _glm5_next_sparse_absorbed_mla_attention(
+        query: mx.array, latent_all: mx.array, selection: mx.array,
+        w: dict, prefix: str, *, heads: int, key_dim: int, value_dim: int,
+        query_tile_size: int = 32) -> mx.array:
+    """Official serving-layout sparse MLA without per-key K/V expansion.
+
+    Weight absorption applies the two exact real-arithmetic identities
+    ``q @ (c @ Wk.T).T = (q @ Wk) @ c.T`` and
+    ``p @ (c @ Wv.T) = (p @ c) @ Wv.T``. The official GLM sparse serving
+    layout uses the compact latent as K/V for precisely this reason. Floating
+    association differs from eager expand-then-attend, so this remains an
+    explicit runtime candidate until real greedy/state gates clear it.
+    """
+    batch, query_heads, length, query_dim = query.shape
+    if query_heads != heads or query_dim != key_dim:
+        raise ValueError("GLM-5.3 absorbed MLA query shape is inconsistent")
+    if selection.shape[:2] != (batch, length):
+        raise ValueError(
+            "GLM-5.3 DSA selection is not query-position aligned")
+    kv_b = w[f"{prefix}.self_attn.kv_b_proj.weight"]
+    if isinstance(kv_b, quant.QTensor):
+        raise ValueError(
+            "GLM-5.3 absorbed MLA requires a dense kv_b_proj weight")
+    latent_dim = int(latent_all.shape[-1])
+    kv_b = kv_b.reshape(heads, key_dim + value_dim, latent_dim)
+    w_key = kv_b[:, :key_dim, :]
+    w_value = kv_b[:, key_dim:, :]
+    # Project Q into the compact latent space only once per query/head.
+    query_latent = mx.einsum("bhqd,hdc->bhqc", query, w_key)
+    scale = key_dim ** -0.5
+    tile_size = max(1, int(query_tile_size))
+    outputs = []
+    for start in range(0, length, tile_size):
+        end = min(start + tile_size, length)
+        selected = selection[:, start:end]
+        safe = mx.where(selected >= 0, selected, 0)
+        gathered = mx.stack([
+            mx.take(latent_all[b], safe[b], axis=0)
+            for b in range(batch)
+        ], axis=0)
+        # [B,H,Q,1,C] @ [B,1,Q,C,K] keeps C out of the score working set.
+        scores = mx.matmul(
+            query_latent[:, :, start:end, None, :].astype(mx.float32),
+            gathered[:, None].swapaxes(-1, -2).astype(mx.float32),
+        ).squeeze(-2) * scale
+        scores = mx.where(
+            (selected >= 0)[:, None, :, :], scores, float("-inf"))
+        probabilities = mx.softmax(scores, axis=-1).astype(gathered.dtype)
+        weighted_latent = mx.matmul(
+            probabilities[..., None, :], gathered[:, None]
+        ).squeeze(-2)
+        output = mx.einsum(
+            "bhqc,hdc->bhqd", weighted_latent, w_value)
+        mx.eval(output)
+        outputs.append(output)
+    result = (
+        outputs[0] if len(outputs) == 1
+        else mx.concatenate(outputs, axis=2))
+    mx.eval(result)
+    return result
+
+
+def _glm5_next_dense_absorbed_mla_attention(
+        query: mx.array, latent_all: mx.array, w: dict, prefix: str, *,
+        heads: int, key_dim: int, value_dim: int, offset: int) -> mx.array:
+    """Absorbed MLA for the causal dense prefix before DSA activates."""
+    batch, query_heads, length, query_dim = query.shape
+    if query_heads != heads or query_dim != key_dim:
+        raise ValueError("GLM-5.3 dense absorbed MLA query shape is inconsistent")
+    kv_b = w[f"{prefix}.self_attn.kv_b_proj.weight"]
+    if isinstance(kv_b, quant.QTensor):
+        raise ValueError(
+            "GLM-5.3 absorbed MLA requires a dense kv_b_proj weight")
+    latent_dim = int(latent_all.shape[-1])
+    kv_b = kv_b.reshape(heads, key_dim + value_dim, latent_dim)
+    w_key = kv_b[:, :key_dim, :]
+    w_value = kv_b[:, key_dim:, :]
+    query_latent = mx.einsum("bhqd,hdc->bhqc", query, w_key)
+    scores = mx.matmul(
+        query_latent.astype(mx.float32),
+        latent_all[:, None].swapaxes(-1, -2).astype(mx.float32),
+    ) * (key_dim ** -0.5)
+    if length > 1:
+        query_positions = mx.arange(
+            offset, offset + length, dtype=mx.int32)[:, None]
+        key_positions = mx.arange(
+            latent_all.shape[1], dtype=mx.int32)[None, :]
+        scores = mx.where(
+            (key_positions <= query_positions)[None, None],
+            scores, float("-inf"))
+    probabilities = mx.softmax(scores, axis=-1).astype(latent_all.dtype)
+    weighted_latent = mx.matmul(probabilities, latent_all[:, None])
+    output = mx.einsum("bhqc,hdc->bhqd", weighted_latent, w_value)
+    mx.eval(output)
+    return output
+
+
+def _glm5_next_update_expanded_prefill_kv(
+        latent: mx.array, w: dict, prefix: str, *, layer: int,
+        cache: dict, heads: int, key_dim: int, value_dim: int,
+        step: int = 256) -> tuple[mx.array, mx.array]:
+    """Project each released latent row once into exact prefill K/V.
+
+    This is a request-local, single-active-layer cache. It exists only while
+    layer-stationary prefill is processing one DSA layer and is discarded
+    before that layer's MLP. The durable cache remains compact MLA latents.
+    """
+    batch, incoming, _ = latent.shape
+    expanded = _linear(
+        latent, w, f"{prefix}.self_attn.kv_b_proj").reshape(
+            batch, incoming, heads, key_dim + value_dim).transpose(0, 2, 1, 3)
+    new_keys = expanded[..., :key_dim]
+    new_values = expanded[..., key_dim:]
+    mx.eval(new_keys, new_values)
+    entry = cache.get(layer)
+    previous = 0 if entry is None else int(entry[2])
+    end = previous + incoming
+    if entry is None:
+        capacity = max(step, ((incoming + step - 1) // step) * step)
+        keys = mx.zeros(
+            (batch, heads, capacity, key_dim), dtype=new_keys.dtype)
+        values = mx.zeros(
+            (batch, heads, capacity, value_dim), dtype=new_values.dtype)
+    else:
+        keys, values, _ = entry
+        capacity = int(keys.shape[2])
+        if end > capacity:
+            added = ((end - capacity + step - 1) // step) * step
+            keys = mx.concatenate([
+                keys, mx.zeros(
+                    (batch, heads, added, key_dim), dtype=keys.dtype)
+            ], axis=2)
+            values = mx.concatenate([
+                values, mx.zeros(
+                    (batch, heads, added, value_dim), dtype=values.dtype)
+            ], axis=2)
+    keys[..., previous:end, :] = new_keys
+    values[..., previous:end, :] = new_values
+    mx.eval(keys, values)
+    cache[layer] = [keys, values, end]
+    return keys[..., :end, :], values[..., :end, :]
+
+
+def _glm5_next_quantize_expanded_rows_int8(
+        value: mx.array) -> tuple[mx.array, mx.array]:
+    """Symmetric per-row int8 storage for explicitly lossy fused DSA K/V."""
+    wide = value.astype(mx.float32)
+    scale = mx.max(mx.abs(wide), axis=-1, keepdims=True) / 127.0
+    safe_scale = mx.where(scale > 0, scale, 1.0)
+    quantized = mx.round(wide / safe_scale)
+    quantized = mx.minimum(mx.maximum(quantized, -127), 127).astype(mx.int8)
+    # Keep scales in FP32: they are only one scalar per head/row (<1% of the
+    # compact payload) and avoid compounding the deliberate int8 error.
+    return quantized, scale.astype(mx.float32)
+
+
+def _glm5_next_update_expanded_prefill_kv_int8(
+        latent: mx.array, w: dict, prefix: str, *, layer: int,
+        cache: dict, heads: int, key_dim: int, value_dim: int,
+        step: int = 256,
+        ) -> tuple[mx.array, mx.array, mx.array, mx.array]:
+    """Project once, then retain per-head/per-row scaled int8 K/V."""
+    batch, incoming, _ = latent.shape
+    expanded = _linear(
+        latent, w, f"{prefix}.self_attn.kv_b_proj").reshape(
+            batch, incoming, heads, key_dim + value_dim).transpose(0, 2, 1, 3)
+    new_keys, new_key_scales = _glm5_next_quantize_expanded_rows_int8(
+        expanded[..., :key_dim])
+    new_values, new_value_scales = _glm5_next_quantize_expanded_rows_int8(
+        expanded[..., key_dim:])
+    mx.eval(new_keys, new_values, new_key_scales, new_value_scales)
+    entry = cache.get(layer)
+    previous = 0 if entry is None else int(entry[4])
+    end = previous + incoming
+    if entry is None:
+        capacity = max(step, ((incoming + step - 1) // step) * step)
+        keys = mx.zeros(
+            (batch, heads, capacity, key_dim), dtype=mx.int8)
+        values = mx.zeros(
+            (batch, heads, capacity, value_dim), dtype=mx.int8)
+        key_scales = mx.zeros(
+            (batch, heads, capacity, 1), dtype=mx.float32)
+        value_scales = mx.zeros(
+            (batch, heads, capacity, 1), dtype=mx.float32)
+    else:
+        keys, values, key_scales, value_scales, _ = entry
+        capacity = int(keys.shape[2])
+        if end > capacity:
+            added = ((end - capacity + step - 1) // step) * step
+            keys = mx.concatenate([
+                keys, mx.zeros(
+                    (batch, heads, added, key_dim), dtype=mx.int8)
+            ], axis=2)
+            values = mx.concatenate([
+                values, mx.zeros(
+                    (batch, heads, added, value_dim), dtype=mx.int8)
+            ], axis=2)
+            key_scales = mx.concatenate([
+                key_scales, mx.zeros(
+                    (batch, heads, added, 1), dtype=mx.float32)
+            ], axis=2)
+            value_scales = mx.concatenate([
+                value_scales, mx.zeros(
+                    (batch, heads, added, 1), dtype=mx.float32)
+            ], axis=2)
+    keys[..., previous:end, :] = new_keys
+    values[..., previous:end, :] = new_values
+    key_scales[..., previous:end, :] = new_key_scales
+    value_scales[..., previous:end, :] = new_value_scales
+    mx.eval(keys, values, key_scales, value_scales)
+    cache[layer] = [keys, values, key_scales, value_scales, end]
+    return (
+        keys[..., :end, :], values[..., :end, :],
+        key_scales[..., :end, :], value_scales[..., :end, :])
+
+
+def _glm5_next_sparse_expanded_attention(
+        query: mx.array, keys_all: mx.array, values_all: mx.array,
+        selection: mx.array, *, key_dim: int,
+        query_tile_size: int = 4) -> mx.array:
+    """Row-specific exact attention over already projected K/V."""
+    batch, _heads, length, _ = query.shape
+    if selection.shape[:2] != (batch, length):
+        raise ValueError(
+            "GLM-5.3 DSA selection is not query-position aligned")
+    outputs = []
+    tile_size = max(1, int(query_tile_size))
+    scale = key_dim ** -0.5
+    for start in range(0, length, tile_size):
+        end = min(start + tile_size, length)
+        selected = selection[:, start:end]
+        safe = mx.where(selected >= 0, selected, 0)
+        gathered_keys = mx.stack([
+            mx.take(keys_all[b], safe[b], axis=1)
+            for b in range(batch)
+        ], axis=0)
+        gathered_values = mx.stack([
+            mx.take(values_all[b], safe[b], axis=1)
+            for b in range(batch)
+        ], axis=0)
+        scores = mx.sum(
+            query[:, :, start:end, None, :].astype(mx.float32)
+            * gathered_keys.astype(mx.float32), axis=-1) * scale
+        scores = mx.where(
+            (selected >= 0)[:, None, :, :], scores, float("-inf"))
+        probabilities = mx.softmax(scores, axis=-1).astype(
+            gathered_values.dtype)
+        output = mx.sum(
+            probabilities[..., None] * gathered_values, axis=-2)
+        mx.eval(output)
+        outputs.append(output)
+    result = (
+        outputs[0] if len(outputs) == 1
+        else mx.concatenate(outputs, axis=2))
+    mx.eval(result)
+    return result
 
 
 def glm5_next_mla_attention(
@@ -213,6 +576,34 @@ def glm5_next_mla_attention(
         cfg.mla_latent_norm_eps)
     latent_all = kv.update_latent(layer, latent)
     key_length = int(latent_all.shape[1])
+    expanded_prefill = getattr(kv, "_glm53_expanded_prefill", None)
+    expanded_keys = expanded_values = None
+    expanded_key_scales = expanded_value_scales = None
+    if expanded_prefill is not None:
+        # A stable-boundary/hot-prefix continuation begins with an already
+        # populated compact latent cache but a new request-local expanded
+        # cache. Seed it from the complete exact prefix once; later tiles append
+        # only their new rows. Without this arm, suffix attention would expose
+        # only the new K/V rows while constructing a mask for the full history.
+        expanded_input = (
+            latent_all
+            if layer not in expanded_prefill and int(offset) > 0
+            else latent
+        )
+        if getattr(kv, "glm53_sparse_fused_kv_int8", False):
+            (expanded_keys, expanded_values,
+             expanded_key_scales,
+             expanded_value_scales) = (
+                _glm5_next_update_expanded_prefill_kv_int8(
+                    expanded_input, w, prefix, layer=layer,
+                    cache=expanded_prefill, heads=heads,
+                    key_dim=key_dim, value_dim=value_dim))
+        else:
+            expanded_keys, expanded_values = (
+                _glm5_next_update_expanded_prefill_kv(
+                    expanded_input, w, prefix, layer=layer,
+                    cache=expanded_prefill, heads=heads,
+                    key_dim=key_dim, value_dim=value_dim))
 
     selection = None
     dsa = getattr(kv, "dsa", None)
@@ -227,47 +618,88 @@ def glm5_next_mla_attention(
                 layer, indexer_type, hidden, q_resid, w, prefix, offset)
 
     if selection is None:
-        expanded = _linear(
-            latent_all, w, f"{prefix}.self_attn.kv_b_proj").reshape(
-                batch, key_length, heads, key_dim + value_dim).transpose(
-                    0, 2, 1, 3)
-        keys, values = expanded[..., :key_dim], expanded[..., key_dim:]
-        mask = None
-        if length > 1:
-            query_positions = mx.arange(
-                offset, offset + length, dtype=mx.int32)[:, None]
-            key_positions = mx.arange(
-                key_length, dtype=mx.int32)[None, :]
-            mask = mx.where(
-                key_positions <= query_positions,
-                0.0, float("-inf")).astype(query.dtype)
-        output = mx.fast.scaled_dot_product_attention(
-            query, keys, values, scale=key_dim ** -0.5, mask=mask)
+        if getattr(kv, "glm53_sparse_absorbed_mla", False):
+            output = _glm5_next_dense_absorbed_mla_attention(
+                query, latent_all, w, prefix,
+                heads=heads, key_dim=key_dim, value_dim=value_dim,
+                offset=offset)
+        elif expanded_keys is not None:
+            keys, values = expanded_keys, expanded_values
+            if expanded_key_scales is not None:
+                keys = keys.astype(query.dtype) * expanded_key_scales.astype(
+                    query.dtype)
+                values = (
+                    values.astype(query.dtype)
+                    * expanded_value_scales.astype(query.dtype))
+            mask = None
+            if length > 1:
+                query_positions = mx.arange(
+                    offset, offset + length, dtype=mx.int32)[:, None]
+                key_positions = mx.arange(
+                    key_length, dtype=mx.int32)[None, :]
+                mask = mx.where(
+                    key_positions <= query_positions,
+                    0.0, float("-inf")).astype(query.dtype)
+            output = mx.fast.scaled_dot_product_attention(
+                query, keys, values, scale=key_dim ** -0.5, mask=mask)
+        else:
+            expanded = _linear(
+                latent_all, w, f"{prefix}.self_attn.kv_b_proj").reshape(
+                    batch, key_length, heads,
+                    key_dim + value_dim).transpose(0, 2, 1, 3)
+            keys, values = expanded[..., :key_dim], expanded[..., key_dim:]
+            mask = None
+            if length > 1:
+                query_positions = mx.arange(
+                    offset, offset + length, dtype=mx.int32)[:, None]
+                key_positions = mx.arange(
+                    key_length, dtype=mx.int32)[None, :]
+                mask = mx.where(
+                    key_positions <= query_positions,
+                    0.0, float("-inf")).astype(query.dtype)
+            output = mx.fast.scaled_dot_product_attention(
+                query, keys, values, scale=key_dim ** -0.5, mask=mask)
     else:
-        if selection.shape[:2] != (batch, length):
-            raise ValueError(
-                "GLM-5.3 DSA selection is not query-position aligned")
-        safe = mx.where(selection >= 0, selection, 0)
-        # B=1 is the serving shape, but retain a correct bounded batch path;
-        # each row's index set is inherently different and cannot be expressed
-        # as one shared axis-1 take.
-        gathered = mx.stack([
-            mx.take(latent_all[b], safe[b], axis=0)
-            for b in range(batch)
-        ], axis=0)
-        width = int(gathered.shape[2])
-        expanded = _linear(
-            gathered, w, f"{prefix}.self_attn.kv_b_proj").reshape(
-                batch, length, width, heads, key_dim + value_dim).transpose(
-                    0, 3, 1, 2, 4)
-        keys, values = expanded[..., :key_dim], expanded[..., key_dim:]
-        scores = mx.sum(
-            query[..., None, :].astype(mx.float32)
-            * keys.astype(mx.float32), axis=-1) * (key_dim ** -0.5)
-        scores = mx.where(
-            (selection >= 0)[:, None, :, :], scores, float("-inf"))
-        probabilities = mx.softmax(scores, axis=-1).astype(values.dtype)
-        output = mx.sum(probabilities[..., None] * values, axis=-2)
+        if getattr(kv, "glm53_sparse_absorbed_mla", False):
+            output = _glm5_next_sparse_absorbed_mla_attention(
+                query, latent_all, selection, w, prefix,
+                heads=heads, key_dim=key_dim, value_dim=value_dim,
+                query_tile_size=32)
+        elif (expanded_keys is not None
+              and getattr(kv, "glm53_sparse_fused_attention", False)):
+            from .glm5_next_sparse_fused import (
+                glm5_next_sparse_fused_attention,
+                glm5_next_sparse_fused_attention_int8,
+            )
+
+            if expanded_key_scales is not None:
+                output = glm5_next_sparse_fused_attention_int8(
+                    query, expanded_keys, expanded_values,
+                    expanded_key_scales, expanded_value_scales,
+                    selection, key_dim=key_dim)
+            else:
+                output = glm5_next_sparse_fused_attention(
+                    query, expanded_keys, expanded_values, selection,
+                    key_dim=key_dim)
+            kv._glm53_sparse_fused_calls = int(getattr(
+                kv, "_glm53_sparse_fused_calls", 0)) + 1
+            kv._glm53_sparse_fused_positions = int(getattr(
+                kv, "_glm53_sparse_fused_positions", 0)) + int(length)
+            kv._glm53_sparse_fused_selected_rows = int(getattr(
+                kv, "_glm53_sparse_fused_selected_rows", 0)) + (
+                    int(length) * int(selection.shape[-1]))
+        elif expanded_keys is not None:
+            if expanded_key_scales is not None:
+                raise ValueError(
+                    "GLM-5.3 int8 expanded K/V requires fused sparse attention")
+            output = _glm5_next_sparse_expanded_attention(
+                query, expanded_keys, expanded_values, selection,
+                key_dim=key_dim, query_tile_size=4)
+        else:
+            output = _glm5_next_sparse_mla_attention(
+                query, latent_all, selection, w, prefix,
+                heads=heads, key_dim=key_dim, value_dim=value_dim,
+                query_tile_size=4)
 
     output = output.transpose(0, 2, 1, 3).reshape(
         batch, length, heads * value_dim)

@@ -77,13 +77,27 @@ class MTPDrafter:
             h_source, w[f"{p}.hnorm.weight"], cfg.rms_norm_eps)
         x = _linear(mx.concatenate([e, hn], axis=-1), w, f"{p}.eh_proj")
         if cfg.model_type == "glm5_next":
-            from .glm5_next import run_glm5_next_mtp_block
-
-            h = run_glm5_next_mtp_block(
-                x, w, p, cfg, mtp_kv, self.mtp_layer, 0,
-                eng._get_experts,
-                iter_expert_batches=eng._iter_expert_batches,
-            )
+            # Only the MTP attention cache crosses the prompt/decode boundary.
+            # The prompt rows' Q/O projections and MoE outputs are dead: the
+            # first proposal is conditioned on the target's released h_last,
+            # while later proposal rows are computed normally by draft_tokens.
+            # Populate precisely the compressed latent that the full block's
+            # attention would install, byte-for-byte, without allocating a
+            # quadratic dense prompt attention matrix or streaming 288 expert
+            # pages whose outputs have no consumer.
+            attn_input = mx.fast.rms_norm(
+                x, w[f"{p}.input_layernorm.weight"], cfg.rms_norm_eps)
+            latent = _linear(
+                attn_input, w, f"{p}.self_attn.kv_a_proj_with_mqa")
+            latent = mx.fast.rms_norm(
+                latent, w[f"{p}.self_attn.kv_a_layernorm.weight"],
+                cfg.mla_latent_norm_eps)
+            mtp_kv.update_latent(self.mtp_layer, latent)
+            mx.eval(mtp_kv.keys[self.mtp_layer])
+            eng._glm53_mtp_state_only_prefill_tokens = int(getattr(
+                eng, "_glm53_mtp_state_only_prefill_tokens", 0)) + int(
+                    latent.shape[1])
+            h = latent
         else:
             h = run_glm_block(
                 x, w, p, cfg, mtp_kv, self.mtp_layer, 0,
@@ -92,7 +106,52 @@ class MTPDrafter:
             )
         mx.eval(h)
 
-    def draft_tokens(self, h_last: mx.array, last_token: int, k: int, mtp_kv, offset: int) -> list[int]:
+    def prefill_extension(
+            self, tokens: list[int], h_source: mx.array, mtp_kv) -> None:
+        """Append exact GLM-5.3 MTP prompt state for a strict extension.
+
+        A cached prompt of length ``P`` already owns draft positions
+        ``0..P-2``. New target tokens ``tokens[P:N]`` pair with trunk hidden
+        rows ``h[P-1:N-1]`` and therefore append exactly ``N-P`` draft-cache
+        rows. Unlike the checkpoint's absolute position-zero pair, none of
+        these extension embeddings is masked to zero.
+        """
+        eng = self.engine
+        cfg = eng.cfg
+        if cfg.model_type != "glm5_next":
+            raise ValueError(
+                "MTP strict-extension prefill currently requires GLM-5.3")
+        if len(tokens) != int(h_source.shape[1]):
+            raise ValueError(
+                "MTP extension tokens and target hidden rows must align")
+        if not tokens:
+            return
+        w = self._weights()
+        p = f"model.layers.{self.mtp_layer}"
+        e = eng._embed(list(tokens))
+        e = mx.fast.rms_norm(
+            e, w[f"{p}.enorm.weight"], cfg.rms_norm_eps)
+        h_source = mx.fast.rms_norm(
+            h_source, eng._norm_w, cfg.rms_norm_eps)
+        hn = mx.fast.rms_norm(
+            h_source, w[f"{p}.hnorm.weight"], cfg.rms_norm_eps)
+        x = _linear(mx.concatenate([e, hn], axis=-1), w, f"{p}.eh_proj")
+        attn_input = mx.fast.rms_norm(
+            x, w[f"{p}.input_layernorm.weight"], cfg.rms_norm_eps)
+        latent = _linear(
+            attn_input, w, f"{p}.self_attn.kv_a_proj_with_mqa")
+        latent = mx.fast.rms_norm(
+            latent, w[f"{p}.self_attn.kv_a_layernorm.weight"],
+            cfg.mla_latent_norm_eps)
+        mtp_kv.update_latent(self.mtp_layer, latent)
+        mx.eval(mtp_kv.keys[self.mtp_layer])
+        eng._glm53_mtp_state_only_prefill_tokens = int(getattr(
+            eng, "_glm53_mtp_state_only_prefill_tokens", 0)) + int(
+                latent.shape[1])
+
+    def draft_tokens(
+            self, h_last: mx.array, last_token: int, k: int, mtp_kv,
+            offset: int, *, constraint=None) -> list[int]:
         """h_last: (1, 1, hidden) trunk hidden (pre final-norm) at the last position.
         Returns up to k draft tokens; mtp_kv accumulates the MTP block's KV (caller
         trims on rollback, mirroring target-KV rollback)."""
@@ -134,13 +193,18 @@ class MTPDrafter:
                 head.logits(g)[0, -1]
                 if isinstance(head, StreamedLMHead)
                 else quant.matmul(g, head)[0, -1])
+            if constraint is not None:
+                logits = constraint.mask_logits(logits)
             mx.eval(logits)
             tok = int(mx.argmax(logits))
             drafts.append(tok)
+            if constraint is not None:
+                constraint.accept_token(tok)
             # Released deepseek_mtp recycles the post-final-norm hidden state.
             # Reusing pre-norm h (the old code) makes proposal 2+ follow a
             # different recurrence even if proposal 1 happens to match.
             h = g
-            if tok in cfg.eos_token_ids:
+            if (tok in cfg.eos_token_ids
+                    or bool(constraint is not None and constraint.completed)):
                 break
         return drafts

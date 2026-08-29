@@ -1,6 +1,6 @@
 # GLM-5.3-Flash on the 16 GB M4
 
-Status date: 2026-08-28
+Status date: 2026-08-29
 
 ## Checkpoint and storage
 
@@ -36,6 +36,16 @@ The MTP implementation follows the released graph: target post-final-norm
 hidden state feeds `hnorm`; MTP uses a plain pre-norm residual block (no mHC),
 dense NoPE MLA, the released shared/routed MoE, and the shared-head norm. Every
 proposal remains subject to the authoritative target verifier and correction.
+
+The released vision tower and multimodal projector are also wired through the
+Responses image protocol. Official preprocessing is byte-identical to the
+checkpoint processor, the complete MLX tower agrees with the CPU reference at
+cosine 0.99958676, and a real 64x64 green-image request answered `green`. That
+cold gate took 137.949 seconds, of which 0.773 seconds was the vision tower;
+the tower read 1,127,254,016 bytes. Video remains deliberately fail-closed.
+With the explicit int8 request-local K/V candidate, the same real green-image
+gate again answered `green` in 152.694 seconds versus its paired 158.680-second
+BF16 expanded-K/V run. The 3.8% gain is below the 10% promotion threshold.
 
 ## Measured exact gates
 
@@ -74,6 +84,86 @@ routed unions, regressing hot wall to 177.66 seconds and reads from 201.71 to
 four-token hot gate from 23.05 to 23.65 seconds and raised peak memory, so the
 measured ceiling remains eight.
 
+## Long-context measurements and candidates
+
+The exact expanded-K/V prefill cache removes repeated projection of every old
+compressed MLA row. At 2,121 prompt tokens it reduced exact cold prefill from
+754.239 to 445.758 seconds while preserving the greedy token hash. Repeating
+the same request through the immutable hybrid prefix endpoint reused
+2,121/2,123 tokens and reduced suffix prefill to 15.656 seconds, a 28.5x
+first-token/prefill improvement with the same output.
+
+The selected-row Metal attention kernel is a separate, explicitly lossy
+candidate because its online softmax changes floating reduction order. At the
+real 8K/Q32/2,048-selected-row geometry it is 53.63x faster than the bounded
+gather reference and saves 1.616GB peak, but is not BF16-byte-identical
+(cosine 0.99994886). On a real 8,215-input/one-output request it completed in
+1,276.755 seconds versus the exact path timing out above 1,800 seconds, with a
+3.715GB peak and the same one-token hash. A hot-prefix 64-output control then
+took 699.032 seconds: prefill was 17.152 seconds and target-only decode was
+681.879 seconds. It retained both long-context canaries and all 64 tokens, but
+produced only two of the four requested consecutive validation integers; that
+quality miss is recorded as a failure, not adjusted away.
+
+The next exact candidate, still default-off, caches immutable completed DSA
+pool keys instead of rebuilding the entire prefix for every 32-position tile.
+The runtime exposes computed/reused pool rows and phase-attributed weight,
+attention, mHC, and MLP time. A gated 16/32/64/128 tile-width ladder is also
+available for the already-lossy fused path; neither candidate becomes a
+default from a single prompt.
+
+Native MTP on the same 8,215-input/64-output gate completed in 1,783.844
+seconds cold. Its state-only draft prefill covered 8,214 rows, it accepted
+46/49 proposals (93.9%), and 17 target sweeps reduced decode from the
+target-only 681.879 seconds to 544.641 seconds (-20.1%). Both canaries, the
+exact required prefix, and all 64 tokens survived. The run still failed the
+same four-integer quality condition and its 103.4MB swap-out growth exceeded
+the pressure gate, so it is evidence for the sidecar speed lever, not a
+promoted profile.
+
+At the released 8K/pool-4/index-dim-128 geometry, a weights-free incremental
+pool gate preserved final pooled keys byte-for-byte, took 0.0962 versus
+0.2274 seconds across 192 updates (2.36x), and reduced peak by 20.65MB. That
+isolated result is promising but small relative to the full request and still
+requires a real token/state A/B.
+
+The real 2,123-input/max-1 tile ladder retained output SHA-256
+`58bb119c...8909cb5` at every rung. Tile 64 reduced engine wall from the
+445.758-second tile-32 result to 371.094 seconds (-16.8%); tile 128 reached
+359.127 seconds (-19.4%) at a 3.293GB peak. Phase attribution at tile 128 was
+290 seconds MLP/expert work, 58 seconds attention (53 KDA, 5 MLA), 4 seconds
+weight wait, and roughly 2 seconds mHC bookkeeping. Swap-out grew 165MB, so
+the wider tile is a latency result but has not cleared the pressure gate.
+
+Coalescing all positions for each expert into one larger GEMM was tested and
+removed from the short/default path. The first implementation improved
+tile-128 wall only 1.2% (359.127 to 354.791 seconds) while useful
+expert-prefetch overlap collapsed from 147.8 to 35.7 seconds and wait rose from
+135.2 to 246.6 seconds. A later explicitly lossy implementation is now retained
+default-off for long prompts only: one real expert's 1,465 one-row calls became
+36.15x faster when coalesced, and the real 8,215-input/max-1 gate preserved its
+known output hash while wall fell 1,279.311 to 693.561 seconds (-45.8%). The
+same candidate regressed the 2,123-input gate by 4.2%, and the 8K run grew
+swap-outs by 28.64MB, so no automatic length threshold is enabled.
+
+The untouched captured request has now completed one cold 46,849-input/max-1
+run with all 134 tools and capture-derived streaming/sampling intact. Only the
+model alias and explicit one-token output cap differed. Wall was 7,845.622
+seconds, prefill 7,839.678 seconds, peak Metal 7.524GB, and swap-out growth
+354.14MB. Phase timing assigns 5,364.407 seconds to MLP/expert work and
+2,358.732 seconds to attention, versus 1.351 seconds waiting for layer weights.
+The response completion proves capacity but the pressure gate fails; max-1 is
+not a Plex intelligence score.
+
+The focused Plex fixture uses the captured intent but substitutes only one
+full real Plex schema, forces non-streaming/temperature zero, allows four turns,
+and caps each turn at 128 tokens. Under that explicitly modified scope, BF16
+expanded K/V scored 66.25/100 in 3,260.091 seconds. Int8 expanded K/V scored
+79/100 but regressed to 4,432.907 seconds, omitted the required rating operator,
+listed rejected titles in the visible answer, and truncated. It is rejected as
+a quality/speed profile. The generic deterministic Plex policy renderer's
+100/100 score is not counted as model intelligence.
+
 ## Explicit controls
 
 All new narrow speed paths remain opt-in pending the heterogeneous real-request
@@ -81,7 +171,18 @@ corpus required by the anti-overfit policy:
 
 - `VMODEL_GLM53_MTP=1`
 - `VMODEL_GLM53_MTP_DEPTH=1..5` (measured at 3)
-- `VMODEL_GLM53_MTP_MAX_PROMPT_TOKENS=1..2048`
+- `VMODEL_GLM53_MTP_MAX_PROMPT_TOKENS=1..65536`
+- `VMODEL_GLM53_SPARSE_FUSED_ATTENTION=1` enables the explicitly lossy
+  online-softmax selected-row kernel.
+- `VMODEL_GLM53_SPARSE_FUSED_KV_INT8=1` halves the expanded request-local
+  prompt K/V for that already-lossy fused kernel; it requires the fused kernel.
+- `VMODEL_GLM53_COALESCED_EXPERT_POSITIONS=1` uses one GEMM outer shape per
+  expert across all layer-stationary tiles. It is lossy, regresses the measured
+  short gate, and remains a long-context experiment.
+- `VMODEL_GLM53_INCREMENTAL_DSA_POOL=1` enables the candidate exact immutable
+  pool-key cache.
+- `VMODEL_GLM53_PREFILL_TILE_WIDTH=16|32|64|128` selects a gated,
+  content-blind layer-stationary tile (default 32).
 - `VMODEL_GLM53_EXPERT_FETCH_BATCH=1..8` (measured at 8; 16 regressed)
 - `VMODEL_GLM53_EXPERT_BATCH_PREFETCH=1`
 - `VMODEL_GLM53_TRUNK_PREFETCH_DEPTH=0..2` (measured at 1)
@@ -96,16 +197,14 @@ batch 1, both prefetch paths off, native MTP off, and generic hot prompt KV off.
 ## Scope still to prove
 
 - The unmodified captured request renders to 46,849 input tokens and all 134
-  real tools. It has not yet completed a GLM-5.3 response/quality score. A cold
-  prompt necessarily streams most of the 328 GB checkpoint, so its first-call
-  floor is materially above 90 seconds. It must be reported separately from
-  exact repeat/state-cache latency.
-- Native MTP is deliberately limited to 2,048 prompt tokens until the long
-  draft-context/index-sharing oracle passes. Larger prompts fall back to the
-  exact target rather than silently using an unproved draft path.
-- The 32K -> 128K -> 256K -> 512K -> 1M context ladder and max-64-or-larger
-  sustained output gates remain outstanding. Max-16 is correct but above the
-  latency target as described above.
+  real tools. Its one-token capacity gate now completes, but takes 130.76
+  minutes of prefill and fails pressure; a full tool/Plex workflow is still
+  outstanding and cannot be inferred from max-1.
+- Native MTP now has an explicit 65,536-token ceiling and a state-only draft
+  prompt prefill that computes exactly the compressed latent retained by
+  draft decode, skipping dead prompt Q/O/MLP work. The 8K/64-token real gate is
+  the first long admission test; larger context-ladder rungs remain pending.
+- The 32K -> 128K -> 256K -> 512K -> 1M context ladder remains outstanding.
 - No new GLM-5.3 behavior becomes automatic until token/hash/state gates pass a
   heterogeneous corpus spanning tool counts, system/developer shapes,
   streaming modes, sampling modes, and output lengths.

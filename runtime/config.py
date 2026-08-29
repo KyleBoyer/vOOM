@@ -335,6 +335,33 @@ class ModelConfig:
         vision_config = raw.get("vision_config")
         if vision_config is not None and not isinstance(vision_config, dict):
             raise ValueError("config.json vision_config must contain an object")
+        if vision_config is not None:
+            # Keep processor geometry beside the tower geometry.  GLM-5.3
+            # ships the former in processor_config.json rather than config.json;
+            # the native vision path must not guess its released CLIP
+            # normalization or 16..8000 merged-token resize bounds.
+            vision_config = dict(vision_config)
+            processor_path = model_dir / "processor_config.json"
+            if processor_path.exists():
+                processor = json.loads(processor_path.read_text())
+                if not isinstance(processor, dict):
+                    raise ValueError(
+                        "processor_config.json must contain an object")
+                image_processor = processor.get("image_processor", processor)
+                if not isinstance(image_processor, dict):
+                    raise ValueError(
+                        "processor_config image_processor must contain an object")
+                for processor_key, vision_key in (
+                    ("patch_size", "patch_size"),
+                    ("temporal_patch_size", "temporal_patch_size"),
+                    ("merge_size", "spatial_merge_size"),
+                    ("min_image_tokens", "min_image_tokens"),
+                    ("max_image_tokens", "max_image_tokens"),
+                    ("image_mean", "image_mean"),
+                    ("image_std", "image_std"),
+                ):
+                    if processor_key in image_processor:
+                        vision_config[vision_key] = image_processor[processor_key]
         if vision_config is None:
             vision_backend = ""
         elif (outer_model_type.startswith("qwen3_vl")
@@ -489,6 +516,12 @@ class ModelConfig:
                       "media_placeholder_token_id"):
                 if k in outer and outer[k] is not None:
                     t[k] = outer[k]
+            # GLM names the same image boundary fields explicitly rather than
+            # using Qwen's generic vision_* spelling.
+            t.setdefault(
+                "vision_start_token_id", outer.get("image_start_token_id", 0))
+            t.setdefault(
+                "vision_end_token_id", outer.get("image_end_token_id", 0))
             raw = t
 
         vocab_size = raw["vocab_size"]
@@ -654,8 +687,10 @@ class ModelConfig:
             architectures=architectures,
             image_token_id=raw.get("image_token_id", 0),
             video_token_id=raw.get("video_token_id", 0),
-            vision_start_token_id=raw.get("vision_start_token_id", 0),
-            vision_end_token_id=raw.get("vision_end_token_id", 0),
+            vision_start_token_id=raw.get(
+                "vision_start_token_id", raw.get("image_start_token_id", 0)),
+            vision_end_token_id=raw.get(
+                "vision_end_token_id", raw.get("image_end_token_id", 0)),
             media_placeholder_token_id=media_placeholder_token_id,
             video_min_pixels=video_min_pixels,
             video_max_pixels=video_max_pixels,

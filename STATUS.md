@@ -1,4 +1,90 @@
-# STATUS — 2026-08-28 (current corrections first; dated chronology below is history)
+# STATUS — 2026-08-29 (current corrections first; dated chronology below is history)
+
+## 2026-08-29: GLM-5.3 clears 46.8K admission; coalesced experts halve 8K prefill
+
+The untouched 178,616-byte / 134-tool captured request now completes a real
+46,849-token cold prefill and emits one token. The explicit lossy path combines
+the selected-row fused attention kernel with per-head/per-row int8 request-local
+expanded K/V; target weights remain the released FP8 checkpoint. Cold wall was
+7,845.622 seconds, prefill was 7,839.678 seconds, and peak Metal was 7.524GB.
+This is a functional capacity result, not a pressure pass: client-observed
+swap-outs grew 354.14MB. Native MTP correctly fell back for the capture's
+stochastic sampling shape. MLP/expert work consumed 5,364.407 seconds and
+attention 2,358.732 seconds, while layer weight wait was only 1.351 seconds.
+
+That trace exposed two concrete improvements. GLM reservations now carry
+separate layer-page, attention/MLP-transient, and expert-page reason codes;
+zero-release synchronous cuts restore only their ineffective budget reduction,
+while real evictions and concurrent pressure shrinks remain. The pre-fix run
+recorded 16 unproductive shrinks and repeated 1.3GB -> 0.1GB cache-budget
+ratchets. The focused post-fix regression set is 386 passing.
+
+An explicit/default-off expert-row coalescer keeps routing, route weights, and
+ascending expert accumulation order but evaluates each expert's rows from all
+prefill tiles in one GEMM shape. It is lossy because the changed outer shape is
+not BF16-bit-identical. On one real expert, 1,465 fragmented one-row calls took
+0.76369 seconds versus 0.02112 seconds coalesced (36.15x; max output error
+0.0078125). Stacking eight experts into `gather_mm` was separately rejected:
+it was 2.72x slower before stack cost and also non-bit-identical.
+
+The real 8,215-input/max-1 crossover gate preserved output SHA
+`58bb119c...8909cb5` and cut wall 1,279.311 -> 693.561 seconds (-45.8%) and
+engine time 1,276.756 -> 690.814 seconds (-45.9%). Peak Metal was 3.785GB;
+swap-outs grew 28.64MB, so the strict 16MB pressure comparison still fails.
+At 2,123 inputs the same coalescer regressed engine time 346.384 -> 360.991
+seconds (+4.2%) while preserving the hash, proving it cannot be a blanket
+short-context default.
+
+Direct Plex quality also blocks promotion. The focused real-schema run with
+BF16 expanded K/V scored 66.25/100 in 3,260.091 seconds. Int8 expanded K/V
+raised the score to 79/100 but regressed wall to 4,432.907 seconds; calls still
+omitted `ratingOperator`, and the visible final included rejected titles and
+truncated at 128 tokens. These are direct model scores, not the separate
+deterministic policy renderer's 100/100 result.
+
+## 2026-08-29: GLM-5.3 vision, long-prefix reuse, and bounded sparse attention
+
+GLM-5.3 now accepts released image inputs through the Responses protocol. Its
+official preprocessing is byte-identical, the full MLX vision tower agrees
+with the CPU oracle at cosine 0.99958676, and a real 64x64 green-image request
+answered `green` in 137.949 seconds cold. Video remains fail-closed.
+
+An exact expanded-K/V prefill cache reduced the real 2.1K cold prompt from
+754.239 to 445.758 seconds without changing its greedy token hash. Exact
+hybrid-prefix reuse then matched 2,121/2,123 tokens and cut the repeat suffix
+prefill to 15.656 seconds. At 8K, the strict exact path still exceeded the
+1,800-second gate.
+
+An explicit lossy selected-row Metal kernel removes the 2,048-row K/V gather.
+At released 8K/Q32 geometry it measured 53.63x faster with 1.616GB less peak,
+but its reassociated online softmax is not BF16-byte-identical. The real
+8,215-input/one-output run completed in 1,276.755 seconds with the same token
+hash and a 3.715GB peak. Exact hot-prefix reuse plus 64 target-only output
+tokens took 699.032 seconds; both canaries and all tokens survived, but only
+two of four requested validation integers were consecutive, so the intelligence
+gate failed rather than being weakened.
+
+Native MTP prompt admission now reaches 65,536 tokens and computes only the
+exact compressed draft latent that survives prompt prefill. Immutable DSA pool
+reuse, full GLM phase timers, and a gated 16/32/64/128 prefill-tile ladder are
+implemented as default-off candidates pending byte-equality plus real short
+and long A/B gates. Full details are in `docs/glm53_flash.md`.
+
+The first 8K/64 native-MTP run completed in 1,783.844 seconds cold. It accepted
+46/49 proposals (93.9%) and used 17 target sweeps, reducing decode from the
+target-only 681.879 seconds to 544.641 seconds (-20.1%). It preserved both
+canaries, the required prefix, and 64 tokens, but retained the same two-of-four
+integer quality failure and exceeded the swap-out gate at 103.4MB. A separate
+weights-free 8K DSA pool gate was byte-identical and 2.36x faster for the pool
+substep alone, with 20.65MB less peak; real token/state promotion is pending.
+
+On the real 2,123-input/max-1 gate, the content-blind tile ladder preserved the
+known output hash and improved prefill from 445.758 seconds at tile 32 to
+371.094 seconds at tile 64 and 359.127 seconds at tile 128 (-19.4%). Tile 128
+peaked at 3.293GB; its phase trace attributes 290 seconds to MLP/experts and 58
+seconds to attention. It did not clear pressure (165MB swap-out). A coalesced
+expert-GEMM follow-up was removed after yielding only 1.2% while making I/O
+overlap substantially worse.
 
 ## 2026-08-28: GLM-5.3-Flash exact repeat reaches 23.05 seconds
 

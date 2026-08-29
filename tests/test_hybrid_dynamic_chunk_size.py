@@ -34,7 +34,10 @@ def _bare_engine(model_type: str, hot_kv_persist,
         hot_prompt_kv_chunk_size=hot_prompt_kv_chunk_size,
         prefill_chunk_size=hot_prompt_kv_chunk_size,
         qwen35_prefill_chunk_ceiling=qwen35_prefill_chunk_ceiling,
-        adaptive_chunk_size=False)
+        adaptive_chunk_size=False,
+        layer_stationary_prefill=False,
+        hot_prompt_kv=False,
+        quant_bits=0)
     return engine
 
 
@@ -204,13 +207,17 @@ def test_memory_retry_replays_unsampled_prefill_on_lower_rungs():
 
     engine.generate = generate
     engine.discard_failed_request_state = lambda: discards.append(True)
-    with patch("runtime.engine.mx.clear_cache"):
+    with (patch("runtime.engine.mx.clear_cache"),
+          patch("runtime.engine.mx.reset_peak_memory")):
         result = StreamingEngine.generate_with_memory_retry(engine, "prompt")
 
     assert attempts == [512, 128, 32]
     assert len(discards) == 2
     assert result["path_stats"]["memory_prefill_retries"] == 2
     assert result["path_stats"]["memory_prefill_retry_chunks"] == [128, 32]
+    cleanup = result["path_stats"]["memory_prefill_retry_cleanup"]
+    assert [entry["chunk"] for entry in cleanup] == [128, 32]
+    assert all(entry["released_bytes"] >= 0 for entry in cleanup)
     assert result["total_s"] >= 2.0
     assert engine._hybrid_retry_chunk_ceiling == 0
 
@@ -237,6 +244,48 @@ def test_memory_retry_never_replays_after_sampling_started():
     else:
         raise AssertionError("decode MemoryError must propagate")
     assert len(calls) == 1
+
+
+def test_glm53_long_prefill_retries_at_intermediate_64_tile():
+    from runtime.engine import StreamingEngine
+
+    engine = _bare_engine(
+        "glm5_next", hot_kv_persist=None,
+        hot_prompt_kv_chunk_size=128)
+    engine.rc.layer_stationary_prefill = True
+    attempts = []
+
+    def generate(*_args, **_kwargs):
+        attempts.append(engine.rc.prefill_chunk_size)
+        engine._generation_sampled_tokens = 0
+        if len(attempts) == 1:
+            raise MemoryError("synthetic 8.5GB GLM prefill cap")
+        return {
+            "prefill_s": 1.0, "first_token_s": 1.5, "total_s": 2.0,
+            "path_stats": {},
+        }
+
+    engine.generate = generate
+    engine.discard_failed_request_state = lambda: None
+    with (patch("runtime.engine.mx.clear_cache"),
+          patch("runtime.engine.mx.reset_peak_memory")):
+        result = StreamingEngine.generate_with_memory_retry(engine, "prompt")
+
+    assert attempts == [128, 64]
+    assert result["path_stats"]["memory_prefill_retry_chunks"] == [64]
+    assert engine._hybrid_retry_chunk_ceiling == 0
+
+
+def test_glm53_retry_requires_layer_stationary_prefill_and_no_persistence():
+    engine = _bare_engine("glm5_next", hot_kv_persist=None)
+    engine.rc.layer_stationary_prefill = True
+    assert engine._memory_prefill_retry_applies()
+
+    engine.rc.layer_stationary_prefill = False
+    assert not engine._memory_prefill_retry_applies()
+    engine.rc.layer_stationary_prefill = True
+    engine._hot_kv_persist = object()
+    assert not engine._memory_prefill_retry_applies()
 
 
 def test_memory_retry_also_applies_to_lossy_dense_qwen_without_persistence():
@@ -318,7 +367,8 @@ def test_memory_retry_pins_non_adaptive_chunk_after_expert_fetch_failure():
 
     engine.generate = generate
     engine.discard_failed_request_state = lambda: None
-    with patch("runtime.engine.mx.clear_cache"):
+    with (patch("runtime.engine.mx.clear_cache"),
+          patch("runtime.engine.mx.reset_peak_memory")):
         result = StreamingEngine.generate_with_memory_retry(engine, "prompt")
 
     assert attempts == [64, 32]
@@ -359,7 +409,8 @@ def test_memory_retry_continues_ladder_after_pinned_chunk_also_fails():
 
     engine.generate = generate
     engine.discard_failed_request_state = lambda: None
-    with patch("runtime.engine.mx.clear_cache"):
+    with (patch("runtime.engine.mx.clear_cache"),
+          patch("runtime.engine.mx.reset_peak_memory")):
         result = StreamingEngine.generate_with_memory_retry(engine, "prompt")
 
     assert attempts == [64, 32, 8], (

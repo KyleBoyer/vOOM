@@ -28,7 +28,7 @@ from tokenizers import Tokenizer
 
 from . import layer_runner, telemetry
 from .config import validate_expert_top_k_by_layer
-from .kv_cache import KVCache, fork_hybrid_kv_endpoint
+from .kv_cache import KVCache, SteppedKVCache, fork_hybrid_kv_endpoint
 from .model_loader import WeightStore
 from .prefetcher import Prefetcher
 from .sampler import SamplingParams, sample
@@ -101,7 +101,7 @@ def _fork_matched_hybrid_stable_boundary(
     matched = int(matched_tokens)
     stable = int(stable_boundary_tokens)
     total = int(prompt_tokens)
-    if (type(kv) is KVCache
+    if (type(kv) in (KVCache, SteppedKVCache)
             and matched == stable
             and 0 < stable < total):
         return fork_hybrid_kv_endpoint(kv)
@@ -428,6 +428,17 @@ def _cache_io_snapshot(engine) -> tuple[int, ...]:
             governor, "reservation_reason_counts", {}
         ).get("qwen-prefill-transient", 0) or 0),
         int(getattr(
+            governor, "reservation_reason_counts", {}
+        ).get("glm53-expert-page", 0) or 0),
+        int(sum(
+            int(count or 0)
+            for reason, count in getattr(
+                governor, "reservation_reason_counts", {}
+            ).items()
+            if str(reason).startswith("glm53-")
+            and str(reason) != "glm53-expert-page"
+        )),
+        int(getattr(
             governor, "reservation_requested_bytes", 0) or 0),
         int(getattr(
             governor, "reservation_budget_reduced_bytes", 0) or 0),
@@ -476,6 +487,8 @@ def _record_cache_io_delta(
         "governor_serial_verify_transient_reservation_calls",
         "governor_qwen_prefill_page_reservation_calls",
         "governor_qwen_prefill_transient_reservation_calls",
+        "governor_glm53_expert_page_reservation_calls",
+        "governor_glm53_transient_reservation_calls",
         "governor_reservation_requested_bytes",
         "governor_reservation_budget_reduced_bytes",
         "governor_reservation_budget_restored_bytes",
@@ -1142,6 +1155,30 @@ class RuntimeConfig:
     # long-context gates clear.  The implementation itself is generic MLA
     # algebra: no prompt, tool, subject, route, or request-shape branch enters
     # either decision.
+    glm53_sparse_absorbed_mla: bool = False
+    # Fused selected-row K/V attention removes the gather but uses online
+    # softmax/SIMD reductions, so it is an explicit lossy Metal candidate.
+    glm53_sparse_fused_attention: bool = False
+    # Optional compact prefill-only K/V for the already-lossy fused sparse
+    # attention candidate. Per-head/per-row symmetric int8 scales halve the
+    # expanded DSA cache; the released target weights and recurrent state stay
+    # unchanged. Never enabled by a lossless/default profile.
+    glm53_sparse_fused_kv_int8: bool = False
+    # Gather every row routed to one expert across layer-stationary prefill
+    # tiles before that expert's three GEMMs. Routing and ascending expert
+    # accumulation stay unchanged, but the GEMM outer shape changes, so this
+    # remains an explicit lossy candidate.
+    glm53_coalesced_expert_positions: bool = False
+    # Reuse immutable completed GLM-5.3 DSA pool keys instead of rebuilding
+    # the whole prefix for every 32-position tile. Explicit until the real
+    # Metal greedy/state oracle confirms that outer-shape changes do not alter
+    # any released BF16 result.
+    glm53_incremental_dsa_pool: bool = False
+    # Official sparse-MLA serving layout for GLM-5.3. Algebraically folds the
+    # released kv_b projection around attention instead of expanding 2,048
+    # selected latents into 64-head K/V separately for every query. Explicit
+    # opt-in because the reassociated floating reductions need real greedy
+    # corpus gates even though the target weights and selected rows are exact.
     kimi_k3_compressed_mla: bool = False
     kimi_k3_absorbed_mla: bool = False
     # Maximum cached latent rows in one online-softmax score tile.  This value
@@ -1378,6 +1415,16 @@ class RuntimeConfig:
             warm_start=run.get("warm_start", 0),
             mla_compressed_kv=run.get("mla_compressed_kv", True),
             mla_absorbed_decode=run.get("mla_absorbed_decode", False),
+            glm53_sparse_absorbed_mla=run.get(
+                "glm53_sparse_absorbed_mla", False),
+            glm53_sparse_fused_attention=run.get(
+                "glm53_sparse_fused_attention", False),
+            glm53_sparse_fused_kv_int8=run.get(
+                "glm53_sparse_fused_kv_int8", False),
+            glm53_coalesced_expert_positions=run.get(
+                "glm53_coalesced_expert_positions", False),
+            glm53_incremental_dsa_pool=run.get(
+                "glm53_incremental_dsa_pool", False),
             kimi_k3_compressed_mla=run.get(
                 "kimi_k3_compressed_mla", False),
             kimi_k3_absorbed_mla=run.get(
@@ -4840,7 +4887,12 @@ class StreamingEngine:
             # even when fetch and compute lifetimes are correctly bounded.
             self.governor.reserve(
                 n_missing * self._expert_fetch_page_bytes + self._layer_transient,
-                margin=self._layer_transient_margin)
+                margin=self._layer_transient_margin,
+                reason=(
+                    "glm53-expert-page"
+                    if self.cfg.model_type == "glm5_next"
+                    else ""
+                ))
 
         t0 = time.perf_counter()
         pages = self.cache.get_many(items)
@@ -7544,6 +7596,11 @@ class StreamingEngine:
             (x.shape[0], total, self.cfg.hc_mult, x.shape[2]))
         tiles = [expanded[:, start:end] for start, end in spans]
         del expanded, x
+        # Exact eager GLM projects each latent row into K/V once before cache
+        # append. Keep that projection only for the currently active DSA
+        # layer; the durable endpoint remains the released compact latent.
+        # This removes quadratic re-projection without MLA reassociation.
+        kv._glm53_expanded_prefill = {}
 
         probe_positions = min(total, tile_width)
         (self._layer_transient,
@@ -7553,6 +7610,78 @@ class StreamingEngine:
                  probe_positions, 0),
              getattr(self, "_decode_layer_transient", 0))
         profiler = self._request_profiler
+        metal_limit_bytes = max(0, int(self.rc.metal_limit_mb)) * 1_000_000
+        memory_samples = 0
+        memory_peak = 0
+        memory_phase_active = {
+            "initial_carrier": 0,
+            "attention": 0,
+            "ffn_hc_pre": 0,
+            "mlp": 0,
+            "ffn_hc_post": 0,
+        }
+        fused_calls_before = int(getattr(
+            kv, "_glm53_sparse_fused_calls", 0))
+        fused_positions_before = int(getattr(
+            kv, "_glm53_sparse_fused_positions", 0))
+        fused_rows_before = int(getattr(
+            kv, "_glm53_sparse_fused_selected_rows", 0))
+        layer_weight_wait_s = 0.0
+        attention_residual_s = 0.0
+        kda_attention_s = 0.0
+        mla_attention_s = 0.0
+        ffn_hc_pre_s = 0.0
+        mlp_s = 0.0
+        ffn_hc_post_s = 0.0
+
+        def note_memory(
+                phase: str, layer: int, completed_tokens: int = 0,
+                *, publish: bool = False) -> None:
+            """Content-blind long-prefill attribution plus a synchronous cap."""
+            nonlocal memory_samples, memory_peak
+            active = int(mx.get_active_memory())
+            peak = int(mx.get_peak_memory())
+            observed = max(active, peak)
+            if phase.startswith("attention"):
+                phase_group = "attention"
+            elif phase.startswith("ffn_hc_pre"):
+                phase_group = "ffn_hc_pre"
+            elif phase.startswith("ffn_hc_post"):
+                phase_group = "ffn_hc_post"
+            elif phase in (
+                    "dense_mlp_tile", "router_tile", "shared_mlp_tile",
+                    "routed_expert_batch"):
+                phase_group = "mlp"
+            else:
+                phase_group = "initial_carrier"
+            memory_phase_active[phase_group] = max(
+                memory_phase_active[phase_group], active)
+            memory_samples += 1
+            memory_peak = max(memory_peak, observed)
+            self._note_true_peak()
+            if publish and on_progress is not None:
+                on_progress({
+                    "phase": "prefill_layer",
+                    "diagnostic": "glm53_layer_stationary",
+                    "subphase": phase,
+                    "layer": int(layer),
+                    "completed_layers": max(0, int(layer)),
+                    "total_layers": self.cfg.num_hidden_layers,
+                    "completed_tokens": int(completed_tokens),
+                    "total_tokens": total,
+                    "active_metal_bytes": active,
+                    "peak_metal_bytes": peak,
+                    "metal_limit_bytes": metal_limit_bytes,
+                    "cache_source": "cold",
+                })
+            if metal_limit_bytes and observed > metal_limit_bytes:
+                raise MemoryError(
+                    "GLM-5.3 layer-stationary prefill crossed its hard Metal "
+                    f"cap: phase={phase} layer={layer} "
+                    f"tokens={completed_tokens} observed={observed} "
+                    f"limit={metal_limit_bytes}")
+
+        note_memory("initial_carrier", 0, total, publish=True)
         if profiler is not None:
             profiler.begin_sweep(
                 total, path="layer_stationary_glm5_next")
@@ -7577,9 +7706,11 @@ class StreamingEngine:
                 if incoming_page:
                     self.cache.prepare_for(incoming_page)
                     if self.governor is not None:
-                        self.governor.reserve(incoming_page)
+                        self.governor.reserve(
+                            incoming_page, reason="glm53-layer-page")
             w = self.cache.get(layer_key, layer_names)
             weight_wait_s = time.perf_counter() - wait_started
+            layer_weight_wait_s += weight_wait_s
             self.timer.add("weights_wait", weight_wait_s)
 
             prefix = f"model.layers.{layer}"
@@ -7607,7 +7738,8 @@ class StreamingEngine:
                 if self.governor is not None and self._layer_transient:
                     self.governor.reserve(
                         self._layer_transient,
-                        margin=self._layer_transient_margin)
+                        margin=self._layer_transient_margin,
+                        reason="glm53-attention-transient")
                 here = offset + start
 
                 def attention(hidden, *, _here=here):
@@ -7630,49 +7762,92 @@ class StreamingEngine:
                     raise ValueError(
                         f"GLM-5.3 layer {layer} has no attention type")
 
+                attention_tile_started = time.perf_counter()
                 tile = deepseek_v4_attention_residual(
                     tiles[index], hc, norms, attention, **common)
                 tile = tile.astype(mx.bfloat16)
                 mx.eval(tile)
+                attention_tile_s = (
+                    time.perf_counter() - attention_tile_started)
+                attention_residual_s += attention_tile_s
+                if layer in self.cfg.kda_layers:
+                    kda_attention_s += attention_tile_s
+                else:
+                    mla_attention_s += attention_tile_s
                 tiles[index] = tile
+                note_memory(
+                    "attention_tile", layer, end,
+                    publish=(index == 0 or end == total
+                             or index % 64 == 0))
+
+            if layer in self.cfg.full_attn_layers:
+                kv._glm53_expanded_prefill.pop(layer, None)
+                mx.clear_cache()
 
             # Bound the float32 mHC mapping by tile and retain each normalized
             # row group separately. The MLP helper preserves those exact GEMM
             # shapes while sharing each routed expert page across the tiles.
             hidden_tiles, posts, combs = [], [], []
-            for tile in tiles:
+            for index, (tile, (_start, end)) in enumerate(zip(tiles, spans)):
+                hc_pre_started = time.perf_counter()
                 reduced, post, comb = hc_pre(
                     tile, hc["ffn_fn"], hc["ffn_scale"], hc["ffn_base"],
                     hc_mult=self.cfg.hc_mult,
                     norm_eps=self.cfg.rms_norm_eps,
                     sinkhorn_iters=self.cfg.hc_sinkhorn_iters,
                     eps=self.cfg.hc_eps)
-                hidden_tiles.append(mx.fast.rms_norm(
-                    reduced, norms["ffn"], self.cfg.rms_norm_eps))
+                hidden = mx.fast.rms_norm(
+                    reduced, norms["ffn"], self.cfg.rms_norm_eps)
+                # Long GLM prompts contain thousands of small tiles. Passing
+                # every lazy hc_pre output to one giant mx.eval() retains the
+                # float32 flattened mHC carrier and 20-iteration Sinkhorn graph
+                # for the whole context at once (46,849 positions measured a
+                # 14.0-GB active Metal peak). Materialize and sever each tile's
+                # graph here; arithmetic and per-tile operator order are
+                # unchanged, while live scratch is O(tile_width), not O(S).
+                mx.eval(hidden, post, comb)
+                ffn_hc_pre_s += time.perf_counter() - hc_pre_started
+                hidden_tiles.append(hidden)
                 posts.append(post)
                 combs.append(comb)
-            mx.eval(*hidden_tiles)
+                note_memory(
+                    "ffn_hc_pre_tile", layer, end,
+                    publish=(index == 0 or end == total
+                             or index % 64 == 0))
 
             if self.governor is not None and self._layer_transient:
                 self.governor.reserve(
                     self._layer_transient,
-                    margin=self._layer_transient_margin)
+                    margin=self._layer_transient_margin,
+                    reason="glm53-mlp-transient")
             step_before = mx.get_active_memory()
             mx.reset_peak_memory()
+            mlp_started = time.perf_counter()
             mlp_tiles = glm5_next_mlp_layer_stationary_tiles(
                 hidden_tiles, w, prefix, self.cfg, layer, self._get_experts,
                 iter_expert_batches=self._iter_expert_batches,
-                profile=profiler)
+                profile=profiler,
+                coalesce_expert_positions=(
+                    self.rc.glm53_coalesced_expert_positions),
+                memory_guard=lambda phase, _layer=layer: note_memory(
+                    phase, _layer, total, publish=False))
+            mlp_s += time.perf_counter() - mlp_started
             step_peak = _resident_adjusted_transient(
                 step_before, mx.get_active_memory(), mx.get_peak_memory())
             del hidden_tiles
 
             for index, (start, end) in enumerate(spans):
+                hc_post_started = time.perf_counter()
                 merged = hc_post(
                     mlp_tiles[index], tiles[index],
                     posts[index], combs[index]).astype(mx.bfloat16)
                 mx.eval(merged)
+                ffn_hc_post_s += time.perf_counter() - hc_post_started
                 tiles[index] = merged
+                note_memory(
+                    "ffn_hc_post_tile", layer, end,
+                    publish=(index == 0 or end == total
+                             or index % 64 == 0))
             del mlp_tiles, posts, combs
 
             compute_s = time.perf_counter() - compute_started
@@ -7705,6 +7880,51 @@ class StreamingEngine:
             tiles[0] if len(tiles) == 1
             else mx.concatenate(tiles, axis=1))
         mx.eval(result)
+        previous_stats = dict(getattr(
+            self, "_glm53_layer_stationary_stats", {}) or {})
+        self._glm53_layer_stationary_stats = {
+            "memory_samples": int(previous_stats.get(
+                "memory_samples", 0)) + memory_samples,
+            "peak_metal_bytes": max(
+                int(previous_stats.get("peak_metal_bytes", 0)),
+                memory_peak),
+            **{
+                f"{phase}_active_peak_bytes": max(
+                    int(previous_stats.get(
+                        f"{phase}_active_peak_bytes", 0)), value)
+                for phase, value in memory_phase_active.items()
+            },
+            "tile_width": int(tile_width),
+            "positions": max(
+                int(previous_stats.get("positions", 0)), total),
+            "sweep_positions": int(previous_stats.get(
+                "sweep_positions", 0)) + total,
+            "sweeps": int(previous_stats.get("sweeps", 0)) + 1,
+            "sparse_fused_calls": int(previous_stats.get(
+                "sparse_fused_calls", 0)) + int(getattr(
+                    kv, "_glm53_sparse_fused_calls", 0)) - fused_calls_before,
+            "sparse_fused_positions": int(previous_stats.get(
+                "sparse_fused_positions", 0)) + int(getattr(
+                    kv, "_glm53_sparse_fused_positions", 0)) - fused_positions_before,
+            "sparse_fused_selected_rows": int(previous_stats.get(
+                "sparse_fused_selected_rows", 0)) + int(getattr(
+                    kv, "_glm53_sparse_fused_selected_rows", 0)) - fused_rows_before,
+            "weight_wait_s": float(previous_stats.get(
+                "weight_wait_s", 0.0)) + layer_weight_wait_s,
+            "attention_residual_s": float(previous_stats.get(
+                "attention_residual_s", 0.0)) + attention_residual_s,
+            "kda_attention_s": float(previous_stats.get(
+                "kda_attention_s", 0.0)) + kda_attention_s,
+            "mla_attention_s": float(previous_stats.get(
+                "mla_attention_s", 0.0)) + mla_attention_s,
+            "ffn_hc_pre_s": float(previous_stats.get(
+                "ffn_hc_pre_s", 0.0)) + ffn_hc_pre_s,
+            "mlp_s": float(previous_stats.get(
+                "mlp_s", 0.0)) + mlp_s,
+            "ffn_hc_post_s": float(previous_stats.get(
+                "ffn_hc_post_s", 0.0)) + ffn_hc_post_s,
+        }
+        del kv._glm53_expanded_prefill
         self._restore_aggregate_layer_transient(total)
         return result
 
@@ -9292,6 +9512,12 @@ class StreamingEngine:
             )
             arithmetic = (
                 f"abs{int(self.rc.mla_absorbed_decode)}"
+                f"glm53sparseabs{int(self.rc.glm53_sparse_absorbed_mla)}"
+                f"glm53sparsefused{int(self.rc.glm53_sparse_fused_attention)}"
+                f"glm53sparsekvint8{int(self.rc.glm53_sparse_fused_kv_int8)}"
+                f"glm53coalexpert{int(
+                    self.rc.glm53_coalesced_expert_positions)}"
+                f"glm53poolcache{int(self.rc.glm53_incremental_dsa_pool)}"
                 f"k3cmla{int(self.rc.kimi_k3_compressed_mla)}"
                 f"k3abs{int(self.rc.kimi_k3_absorbed_mla)}"
                 f"k3mlakt{self.rc.kimi_k3_mla_key_tile_size}"
@@ -9382,7 +9608,11 @@ class StreamingEngine:
             self.rc.kimi_k3_compressed_mla
             and self.cfg.model_type == "kimi_k3"
         )
-        if stepped or k3_compressed_mla:
+        glm53_compressed_mla = bool(
+            self.rc.mla_compressed_kv
+            and self.cfg.model_type == "glm5_next"
+        )
+        if stepped or k3_compressed_mla or glm53_compressed_mla:
             from .kv_cache import SteppedKVCache
 
             kv = SteppedKVCache(self.cfg.num_hidden_layers)
@@ -9406,11 +9636,22 @@ class StreamingEngine:
                 and self.cfg.model_type in ("glm_moe_dsa", "glm5_next")):
             kv.compressed_mla = True
             kv.mla_absorbed = self.rc.mla_absorbed_decode
+            if self.cfg.model_type == "glm5_next":
+                kv.glm53_sparse_absorbed_mla = bool(
+                    self.rc.glm53_sparse_absorbed_mla)
+                kv.glm53_sparse_fused_attention = bool(
+                    self.rc.glm53_sparse_fused_attention)
+                kv.glm53_sparse_fused_kv_int8 = bool(
+                    self.rc.glm53_sparse_fused_kv_int8)
             if not self._dsa_elided:  # F43 bounded mode provably never selects
                 if self.cfg.model_type == "glm5_next":
                     from .glm5_next_dsa import GLM5NextDSAState
 
-                    kv.dsa = GLM5NextDSAState(self.cfg)
+                    kv.dsa = GLM5NextDSAState(
+                        self.cfg,
+                        incremental_pool_cache=bool(
+                            self.rc.glm53_incremental_dsa_pool),
+                    )
                 else:
                     from .glm_dsa import DSAState
 
@@ -9540,6 +9781,8 @@ class StreamingEngine:
         self._request_profiler = (
             telemetry.RequestProfiler(self.rc.execution_profile)
             if self.rc.execution_profile else None)
+        if self.cfg.model_type == "glm5_next":
+            self._glm53_layer_stationary_stats = {}
         if self._dspark_tap_collector is not None:
             self._dspark_tap_collector.begin_attempt()
         if self._request_profiler is not None:
@@ -9551,6 +9794,7 @@ class StreamingEngine:
         # vision-capable engine invalidates the retained multimodal prefix before
         # allocating its own state; image embeddings remain separately bounded.
         self._vision_prompt_cache = None
+        self._glm53_vision_prompt_cache = None
         self._provisional = None  # F55 safety: a crashed spec round must not leave buffering on
         self._resident_fast_decode_sweeps = 0
         self._resident_fast_prefill_sweeps = 0
@@ -10681,8 +10925,6 @@ class StreamingEngine:
                 path_stats["disk_prompt_lookup_s"] = disk_elapsed
                 path_stats["prompt_cache_lookup_s"] += disk_elapsed
         if use_stepped_kv and isinstance(kv, KVCache):
-            from .kv_cache import SteppedKVCache
-
             kv = SteppedKVCache.from_cache(kv)
             self.last_kv = kv
         path_stats["prompt_cache_prefix_tokens"] = matched
@@ -10762,7 +11004,8 @@ class StreamingEngine:
             # tokens are exactly what ANY future continuation of this same
             # conversation is guaranteed to re-render byte-identically.
             if (recurrent_exact_only and hot_eligible
-                    and (type(kv) is KVCache or self.rc.paged_kv_persist)):
+                    and (type(kv) in (KVCache, SteppedKVCache)
+                         or self.rc.paged_kv_persist)):
                 stable_boundary = int(
                     getattr(prompt, "stable_boundary_tokens", 0) or 0)
                 matched_boundary_fork = _fork_matched_hybrid_stable_boundary(
@@ -11817,6 +12060,67 @@ class StreamingEngine:
             path_stats["dsa_observations"] = dsa_state.stats["observations"]
             path_stats["dsa_sparse_selects"] = dsa_state.stats["sparse_selects"]
             path_stats["dsa_shared_reuses"] = dsa_state.stats["shared_reuses"]
+        if self.cfg.model_type == "glm5_next":
+            glm53_memory = getattr(
+                self, "_glm53_layer_stationary_stats", {}) or {}
+            path_stats["glm53_sparse_absorbed_mla"] = int(
+                self.rc.glm53_sparse_absorbed_mla)
+            path_stats["glm53_sparse_fused_attention"] = int(
+                self.rc.glm53_sparse_fused_attention)
+            path_stats["glm53_sparse_fused_kv_int8"] = int(
+                self.rc.glm53_sparse_fused_kv_int8)
+            path_stats["glm53_coalesced_expert_positions"] = int(
+                self.rc.glm53_coalesced_expert_positions)
+            path_stats["glm53_incremental_dsa_pool"] = int(
+                self.rc.glm53_incremental_dsa_pool)
+            path_stats["glm53_layer_stationary_memory_samples"] = int(
+                glm53_memory.get("memory_samples", 0))
+            path_stats["glm53_layer_stationary_peak_metal_bytes"] = int(
+                glm53_memory.get("peak_metal_bytes", 0))
+            for phase in (
+                    "initial_carrier", "attention", "ffn_hc_pre", "mlp",
+                    "ffn_hc_post"):
+                path_stats[
+                    f"glm53_layer_stationary_{phase}_active_peak_bytes"
+                ] = int(glm53_memory.get(
+                    f"{phase}_active_peak_bytes", 0))
+            path_stats["glm53_layer_stationary_tile_width"] = int(
+                glm53_memory.get("tile_width", 0))
+            path_stats["glm53_layer_stationary_positions"] = int(
+                glm53_memory.get("positions", 0))
+            path_stats["glm53_layer_stationary_sweep_positions"] = int(
+                glm53_memory.get("sweep_positions", 0))
+            path_stats["glm53_layer_stationary_sweeps"] = int(
+                glm53_memory.get("sweeps", 0))
+            path_stats["glm53_sparse_fused_calls"] = int(
+                glm53_memory.get("sparse_fused_calls", 0))
+            path_stats["glm53_sparse_fused_positions"] = int(
+                glm53_memory.get("sparse_fused_positions", 0))
+            path_stats["glm53_sparse_fused_selected_rows"] = int(
+                glm53_memory.get("sparse_fused_selected_rows", 0))
+            path_stats["glm53_layer_stationary_weight_wait_s"] = float(
+                glm53_memory.get("weight_wait_s", 0.0))
+            path_stats["glm53_layer_stationary_attention_s"] = float(
+                glm53_memory.get("attention_residual_s", 0.0))
+            path_stats["glm53_layer_stationary_kda_attention_s"] = float(
+                glm53_memory.get("kda_attention_s", 0.0))
+            path_stats["glm53_layer_stationary_mla_attention_s"] = float(
+                glm53_memory.get("mla_attention_s", 0.0))
+            path_stats["glm53_layer_stationary_ffn_hc_pre_s"] = float(
+                glm53_memory.get("ffn_hc_pre_s", 0.0))
+            path_stats["glm53_layer_stationary_mlp_s"] = float(
+                glm53_memory.get("mlp_s", 0.0))
+            path_stats["glm53_layer_stationary_ffn_hc_post_s"] = float(
+                glm53_memory.get("ffn_hc_post_s", 0.0))
+            if dsa_state is not None:
+                path_stats["glm53_dsa_pool_rows_computed"] = int(
+                    dsa_state.stats.get("pool_rows_computed", 0))
+                path_stats["glm53_dsa_pool_rows_reused"] = int(
+                    dsa_state.stats.get("pool_rows_reused", 0))
+                path_stats["glm53_dsa_pool_build_s"] = float(
+                    dsa_state.stats.get("pool_build_s", 0.0))
+                path_stats["glm53_dsa_selection_s"] = float(
+                    dsa_state.stats.get("selection_s", 0.0))
         path_stats["expert_compute_batches"] = self._expert_compute_batches
         path_stats["max_experts_per_compute_batch"] = self._max_experts_per_compute_batch
         path_stats["adaptive_expert_batch_clamps"] = self._adaptive_expert_batch_clamps
@@ -12260,6 +12564,8 @@ class StreamingEngine:
         """
         failed_seconds = 0.0
         retry_chunks: list[int] = []
+        retry_cleanup: list[dict[str, int]] = []
+        retry_failures: list[str] = []
         self._hybrid_retry_chunk_ceiling = 0
         try:
             while True:
@@ -12277,23 +12583,29 @@ class StreamingEngine:
                         stats["memory_prefill_retries"] = len(retry_chunks)
                         stats["memory_prefill_retry_chunks"] = retry_chunks
                         stats["memory_prefill_retry_seconds"] = failed_seconds
+                        stats["memory_prefill_retry_cleanup"] = retry_cleanup
+                        stats["memory_prefill_retry_failures"] = retry_failures
                     return result
-                except MemoryError:
+                except MemoryError as error:
                     failed_seconds += time.perf_counter() - attempt_t0
                     if (getattr(self, "_generation_sampled_tokens", 0)
                             or not self._memory_prefill_retry_applies()):
                         raise
                     current = max(1, int(self.rc.prefill_chunk_size or 1))
+                    retry_ladder = (
+                        (128, 64, 32, 8, 1)
+                        if self.cfg.model_type == "glm5_next"
+                        else (128, 32, 8, 1))
                     next_chunk = next(
-                        (candidate for candidate in (128, 32, 8, 1)
+                        (candidate for candidate in retry_ladder
                          if candidate < current),
                         0,
                     )
                     if not next_chunk:
                         raise
                     retry_chunks.append(next_chunk)
+                    retry_failures.append(str(error))
                     self.discard_failed_request_state()
-                    mx.clear_cache()
                     self._hybrid_retry_chunk_ceiling = next_chunk
                     self.rc.prefill_chunk_size = next_chunk
                     self.rc.hot_prompt_kv_chunk_size = next_chunk
@@ -12327,10 +12639,33 @@ class StreamingEngine:
                         # the config field eligibility depends on.
                         self._adaptive_chunk_pinned_after_retry = True
                     print(
-                        f"[prefill] governor refusal before first sample; "
-                        f"retrying from scratch at chunk={next_chunk}",
+                        "[prefill] memory refusal before first sample: "
+                        f"{error}; retrying from scratch at "
+                        f"chunk={next_chunk}",
                         flush=True,
                     )
+                # Run allocator cleanup only after leaving the ``except``
+                # suite. While an exception is being handled, its traceback
+                # still owns the failed generate() frame and every carrier
+                # tensor in that frame. Clearing MLX inside the handler cannot
+                # release those live references, so the next attempt inherits
+                # both the old allocations and their historical peak.
+                active_before = int(mx.get_active_memory())
+                failed_peak = int(mx.get_peak_memory())
+                mx.clear_cache()
+                active_after = int(mx.get_active_memory())
+                # ``_note_true_peak`` recorded the process-wide peak before
+                # the MemoryError. Reset only MLX's per-attempt high-water
+                # mark so the next attempt's hard guard is not poisoned by a
+                # failed 64/32-token tile.
+                mx.reset_peak_memory()
+                retry_cleanup.append({
+                    "chunk": int(self.rc.prefill_chunk_size),
+                    "active_before_bytes": active_before,
+                    "active_after_bytes": active_after,
+                    "released_bytes": max(0, active_before - active_after),
+                    "failed_peak_bytes": failed_peak,
+                })
         finally:
             self._hybrid_retry_chunk_ceiling = 0
 
@@ -12377,9 +12712,13 @@ class StreamingEngine:
 
         release_generation_state(self)
         self._vision_prompt_cache = None
+        self._glm53_vision_prompt_cache = None
         vision_embeddings = getattr(self, "_vision_embedding_cache", None)
         if vision_embeddings is not None:
             vision_embeddings.clear()
+        glm53_embeddings = getattr(self, "_glm53_vision_embedding_cache", None)
+        if glm53_embeddings is not None:
+            glm53_embeddings.clear()
 
     def discard_failed_request_state(self):
         """Drop only state owned by the request that just failed.
@@ -12421,6 +12760,17 @@ class StreamingEngine:
             and self.cfg.model_type == "kimi_k3"
             and self.rc.kimi_k3_prefill_tile_policy == "prompt-length"
         ):
+            return True
+        if (
+            self._hot_kv_persist is None
+            and self.cfg.model_type == "glm5_next"
+            and self.rc.layer_stationary_prefill
+        ):
+            # A real 46,849-token GLM-5.3 harness prompt reached 8.518GB
+            # during a 128-position attention tile and correctly tripped the
+            # hard 8.5GB cap before sampling. Replaying at 64/32 bounds the
+            # tile scratch while preserving the released operator order and
+            # is safer than failing a request that can run more slowly.
             return True
         if self._hot_kv_persist is None and self.rc.adaptive_chunk_size:
             # Any F68 adaptive-chunk model (gpt_oss, GLM, Kimi K3, ...) can

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import time
+
 import mlx.core as mx
 
 from . import quant
@@ -12,12 +14,20 @@ from .layer_runner import _linear
 class GLM5NextDSAState:
     """Per-layer cached k-pool inputs and chronological sparse selections."""
 
-    def __init__(self, cfg: ModelConfig):
+    def __init__(
+            self, cfg: ModelConfig, *, incremental_pool_cache: bool = False):
         self.cfg = cfg
+        self.incremental_pool_cache = bool(incremental_pool_cache)
         # Compatibility name used by generic KV diagnostics/persistence.
         # Values are [key, compression-gate, valid] packed states, not the
         # older GLM-5.2 index key alone.
         self.k_idx: dict[int, mx.array] = {}
+        # Complete k-pools never change after their final raw row is appended.
+        # The released reference rebuilds every prior pool for each prefill
+        # tile; this opt-in cache retains only those immutable derived keys.
+        # An incomplete tail is still rebuilt from the current raw rows so its
+        # causal behavior and eventual completed value remain authoritative.
+        self.pool_keys: dict[int, mx.array] = {}
         self.selection: mx.array | None = None
         self.sel_layer = -1
         self.stats = {
@@ -29,14 +39,23 @@ class GLM5NextDSAState:
             "shared_reuses": 0,
             "pools_scored": 0,
             "raw_indices_selected": 0,
+            "pool_rows_computed": 0,
+            "pool_rows_reused": 0,
+            "pool_build_s": 0.0,
+            "selection_s": 0.0,
         }
 
     def nbytes(self) -> int:
-        return sum(value.nbytes for value in self.k_idx.values())
+        return (
+            sum(value.nbytes for value in self.k_idx.values())
+            + sum(value.nbytes for value in self.pool_keys.values())
+        )
 
     def fork(self) -> "GLM5NextDSAState":
-        branch = GLM5NextDSAState(self.cfg)
+        branch = GLM5NextDSAState(
+            self.cfg, incremental_pool_cache=self.incremental_pool_cache)
         branch.k_idx = dict(self.k_idx)
+        branch.pool_keys = dict(self.pool_keys)
         branch.selection = self.selection
         branch.sel_layer = self.sel_layer
         branch.stats = dict(self.stats)
@@ -48,6 +67,14 @@ class GLM5NextDSAState:
             if packed.shape[1] > length:
                 self.k_idx[layer] = packed[:, :length, :]
                 mx.eval(self.k_idx[layer])
+            cached = self.pool_keys.get(layer)
+            complete = length // self.cfg.index_kpool
+            if cached is not None and int(cached.shape[1]) > complete:
+                if complete:
+                    self.pool_keys[layer] = cached[:, :complete, :]
+                    mx.eval(self.pool_keys[layer])
+                else:
+                    self.pool_keys.pop(layer, None)
         self.selection = None
         self.sel_layer = -1
 
@@ -84,7 +111,7 @@ class GLM5NextDSAState:
         mx.eval(self.k_idx[layer])
         self.stats["observations"] += 1
 
-    def _pooled_states(
+    def _pooled_states_reference(
             self, packed: mx.array, w: dict, prefix: str,
     ) -> tuple[mx.array, mx.array, mx.array]:
         cfg = self.cfg
@@ -125,12 +152,92 @@ class GLM5NextDSAState:
         pool_keys = mx.sum(probabilities * grouped_keys, axis=2)
         return pool_keys, indices, pool_valid
 
+    def _pooled_states(
+            self, packed: mx.array, w: dict, prefix: str, *, layer: int,
+    ) -> tuple[mx.array, mx.array, mx.array]:
+        """Return released pooled keys, reusing only immutable full pools.
+
+        Pool compression reduces solely along the fixed ``index_kpool`` axis;
+        complete pools are independent of later rows.  The metadata and any
+        incomplete tail are still rebuilt at the full current length.  This
+        makes the cache a scheduling optimization rather than a change to the
+        selected candidate set.  It remains explicit until real-model greedy
+        and endpoint gates establish byte-identical behavior on Metal.
+        """
+        if not self.incremental_pool_cache:
+            return self._pooled_states_reference(packed, w, prefix)
+
+        pool = self.cfg.index_kpool
+        length = int(packed.shape[1])
+        complete = length // pool
+        cached = self.pool_keys.get(layer)
+        cached_count = 0 if cached is None else int(cached.shape[1])
+        if cached_count > complete:
+            cached = cached[:, :complete, :]
+            cached_count = complete
+
+        if cached_count < complete:
+            build_started = time.perf_counter()
+            start = cached_count * pool
+            end = complete * pool
+            derived, _indices, _valid = self._pooled_states_reference(
+                packed[:, start:end, :], w, prefix)
+            mx.eval(derived)
+            cached = (
+                derived if cached is None
+                else mx.concatenate([cached, derived], axis=1))
+            mx.eval(cached)
+            self.pool_keys[layer] = cached
+            self.stats["pool_rows_computed"] += complete - cached_count
+            self.stats["pool_build_s"] += time.perf_counter() - build_started
+        elif cached is not None:
+            self.pool_keys[layer] = cached
+        self.stats["pool_rows_reused"] += cached_count
+
+        # Recreate current chronological indices/validity exactly as the
+        # released full calculation does.  This metadata is tiny and avoids a
+        # separate candidate-order implementation.
+        if length % pool:
+            build_started = time.perf_counter()
+            tail_keys, _indices, _valid = self._pooled_states_reference(
+                packed[:, complete * pool:, :], w, prefix)
+            mx.eval(tail_keys)
+            self.stats["pool_build_s"] += time.perf_counter() - build_started
+            self.stats["pool_rows_computed"] += 1
+            pool_keys = (
+                tail_keys if cached is None
+                else mx.concatenate([cached, tail_keys], axis=1))
+            # Tail-local metadata has relative indices; use the full reference
+            # metadata while discarding its recomputed keys.  Computing that
+            # full key tensor would defeat the optimization, so construct the
+            # equivalent integer/valid arrays directly below.
+        else:
+            pool_keys = cached
+
+        batch = int(packed.shape[0])
+        pool_count = (length + pool - 1) // pool
+        padded = pool_count * pool
+        valid = packed[..., 2 * self.cfg.index_head_dim] > 0
+        if padded != length:
+            valid = mx.concatenate([
+                valid,
+                mx.zeros((batch, padded - length), dtype=mx.bool_),
+            ], axis=1)
+        grouped_valid = valid.reshape(batch, pool_count, pool)
+        offsets = mx.arange(padded, dtype=mx.int32).reshape(pool_count, pool)
+        indices = mx.broadcast_to(
+            offsets[None], (batch, pool_count, pool))
+        indices = mx.where(grouped_valid, indices, -1)
+        pool_valid = mx.all(grouped_valid, axis=-1)
+        return pool_keys, indices, pool_valid
+
     def update_and_select(
             self, layer: int, indexer_type: str, hidden: mx.array,
             q_resid: mx.array, w: dict, prefix: str, offset: int,
     ) -> mx.array | None:
         if indexer_type != "full":
             raise ValueError("GLM-5.3 only supports full per-layer indexers")
+        selection_started = time.perf_counter()
         packed = self.k_idx.get(layer)
         if packed is None or packed.shape[1] <= self.cfg.index_topk:
             self.selection = None
@@ -144,7 +251,7 @@ class GLM5NextDSAState:
             q_resid, w, f"{prefix}.self_attn.indexer.wq_b").reshape(
                 batch, query_length, heads, dim)
         pool_keys, pool_indices, pool_valid = self._pooled_states(
-            packed, w, prefix)
+            packed, w, prefix, layer=layer)
         pool_count = int(pool_keys.shape[1])
         scores = mx.einsum(
             "blhd,bpd->blhp", query.astype(mx.float32),
@@ -215,4 +322,5 @@ class GLM5NextDSAState:
         self.stats["pools_scored"] += pool_count * query_length
         self.stats["raw_indices_selected"] += int(
             mx.sum(ordered >= 0).item())
+        self.stats["selection_s"] += time.perf_counter() - selection_started
         return ordered

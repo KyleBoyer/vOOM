@@ -376,6 +376,7 @@ class MemoryGovernor:
         reversible_admission = (
             reason.startswith("serial-verify-")
             or reason == "qwen-prefill-layer-page"
+            or reason.startswith("glm53-")
         )
         if (reversible_admission
                 and self.cache.max_bytes < target_max

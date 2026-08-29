@@ -152,6 +152,33 @@ def test_matched_stable_boundary_is_forked_before_suffix_mutates_source():
         ) is None
 
 
+def test_matched_stepped_stable_boundary_forks_before_suffix_mutation():
+    import mlx.core as mx
+
+    from runtime.engine import _fork_matched_hybrid_stable_boundary
+    from runtime.kda_state import KDAStateCache
+    from runtime.kv_cache import SteppedKVCache
+
+    source = SteppedKVCache(1)
+    source.compressed_mla = True
+    source.kda_cache = KDAStateCache(1)
+    source.update_latent(0, mx.arange(12).reshape(1, 4, 3))
+
+    retained = _fork_matched_hybrid_stable_boundary(
+        source,
+        matched_tokens=4,
+        stable_boundary_tokens=4,
+        prompt_tokens=7,
+    )
+    assert retained is not None
+    assert retained.keys[0] is source.keys[0]
+
+    source.update_latent(0, mx.array([[[12, 13, 14]]]))
+    assert source.offset == 5
+    assert retained.offset == 4
+    assert retained.keys[0][:, :4, :].reshape(-1).tolist() == list(range(12))
+
+
 def test_mixed_depth_disk_boundary_is_skipped_for_exact_short_prompt():
     from runtime.engine import _stable_boundary_persistence_allowed
 

@@ -188,6 +188,50 @@ def test_native_mtp_exact_repeat_reuses_both_prompt_boundaries():
     eng.close()
 
 
+def test_native_mtp_constraint_masks_draft_and_authoritative_target():
+    """Grammar state advances sequentially while the target verifies in one sweep."""
+    _ensure_fixture()
+    import mlx.core as mx
+
+    from runtime.engine import RuntimeConfig, StreamingEngine
+    from runtime.speculative import SpeculativeDecoder
+
+    class ScriptedConstraint:
+        profile = "scripted-test"
+
+        def __init__(self, tokens, position=0):
+            self.tokens = tuple(tokens)
+            self.position = int(position)
+            self.completed = self.position >= len(self.tokens)
+
+        def fork(self):
+            return ScriptedConstraint(self.tokens, self.position)
+
+        def mask_logits(self, logits):
+            token = self.tokens[self.position]
+            indices = mx.arange(logits.size)
+            return mx.where(
+                indices == token, logits.reshape(-1), float("-inf"))
+
+        def accept_token(self, token):
+            assert int(token) == self.tokens[self.position]
+            self.position += 1
+            self.completed = self.position >= len(self.tokens)
+
+    eng = StreamingEngine(str(FIXTURE), RuntimeConfig(
+        max_weight_cache_mb=200, pin_lm_head=True, mla_compressed_kv=True))
+    dec = SpeculativeDecoder(
+        eng, "mtp", k=3, _unsafe_allow_moe_verify=True)
+    constraint = ScriptedConstraint((100, 101, 102))
+    result = dec.generate("Hi", max_tokens=6, constraint=constraint)
+
+    assert result["tokens"] == [100, 101, 102]
+    assert constraint.completed
+    assert result["path_stats"]["speculative_constraint_verified"] == 1
+    assert result["path_stats"]["speculative_used"] == 1
+    eng.close()
+
+
 def _run_all():
     fns = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
     passed = 0

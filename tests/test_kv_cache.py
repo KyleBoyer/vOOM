@@ -11,6 +11,7 @@ from runtime.kv_cache import (
     PositionFreeKVCache,
     PositionFreePagePool,
     SteppedKVCache,
+    fork_hybrid_kv_endpoint,
 )
 from runtime.tool_capsules import ReusedRange, ToolPICPlan
 
@@ -170,6 +171,89 @@ def test_stepped_compressed_mla_reuses_capacity_and_trims_axis_one():
     assert cache.keys[0].shape == (1, 3, 3)
     assert cache.values[0] is None
     assert cache.keys[0].reshape(-1).tolist() == list(range(9))
+
+
+class _ForkableCompanion:
+    def __init__(self, identity: str):
+        self.identity = identity
+        self.synchronized = 0
+
+    def fork(self):
+        return _ForkableCompanion(self.identity)
+
+    def synchronize(self):
+        self.synchronized += 1
+
+
+def test_stepped_compressed_mla_fork_detaches_each_owner_exactly():
+    source = SteppedKVCache(2)
+    source.compressed_mla = True
+    source.kda_cache = _ForkableCompanion("recurrent-7")
+    source.dsa = _ForkableCompanion("dsa-7")
+    source.update_latent(
+        0, mx.arange(18, dtype=mx.bfloat16).reshape(1, 6, 3))
+    original = source.keys[0]
+
+    branch = fork_hybrid_kv_endpoint(source)
+    assert isinstance(branch, SteppedKVCache)
+    assert branch.keys[0] is original
+    assert branch.kda_cache is not source.kda_cache
+    assert branch.kda_cache.identity == "recurrent-7"
+    assert branch.kda_cache.synchronized == 1
+    assert branch.dsa is not source.dsa
+    assert branch.dsa.identity == "dsa-7"
+
+    branch.update_latent(
+        0, mx.array([[[101, 102, 103]]], dtype=mx.bfloat16))
+    mx.eval(source.keys[0], branch.keys[0])
+    assert branch.keys[0] is not original
+    assert source.offset == 6
+    assert branch.offset == 7
+    assert mx.array_equal(
+        source.keys[0][:, :6, :],
+        mx.arange(18, dtype=mx.bfloat16).reshape(1, 6, 3),
+    ).item()
+    assert branch.keys[0][:, 6:7, :].tolist() == [[[101, 102, 103]]]
+
+    source.update_latent(
+        0, mx.array([[[201, 202, 203]]], dtype=mx.bfloat16))
+    mx.eval(source.keys[0], branch.keys[0])
+    assert source.keys[0] is not original
+    assert source.keys[0][:, 6:7, :].tolist() == [[[201, 202, 203]]]
+    assert branch.keys[0][:, 6:7, :].tolist() == [[[101, 102, 103]]]
+
+
+def test_stepped_dense_fork_detaches_keys_and_values_exactly():
+    source = SteppedKVCache(1)
+    source.kda_cache = _ForkableCompanion("dense")
+    source.update(0, *_kv([1, 2, 3]))
+    original_key = source.keys[0]
+    original_value = source.values[0]
+
+    branch = fork_hybrid_kv_endpoint(source)
+    keys, values = branch.update(0, *_kv([4]))
+    mx.eval(keys, values, source.keys[0], source.values[0])
+
+    assert source.keys[0] is original_key
+    assert source.values[0] is original_value
+    assert source.offset == 3
+    assert branch.offset == 4
+    assert source.keys[0][..., :3, :].flatten().tolist() == [1, 2, 3]
+    assert source.values[0][..., :3, :].flatten().tolist() == [1001, 1002, 1003]
+    assert keys.flatten().tolist() == [1, 2, 3, 4]
+    assert values.flatten().tolist() == [1001, 1002, 1003, 1004]
+
+
+def test_stepped_trim_layer_lengths_updates_capacity_side_table():
+    cache = SteppedKVCache(2)
+    cache.update(0, *_kv(range(9)))
+    cache.update(1, *_kv(range(5)))
+    cache.trim_layer_lengths((7, 3))
+
+    assert cache.layer_lengths() == (7, 3)
+    assert cache.offset == 7
+    assert cache.keys[0].flatten().tolist() == list(range(7))
+    assert cache.keys[1].flatten().tolist() == list(range(3))
 
 
 def test_from_cache_converts_compressed_mla_and_preserves_policy():

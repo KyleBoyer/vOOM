@@ -2003,9 +2003,54 @@ class EngineManager:
         if not 1 <= glm53_mtp_depth <= 5:
             raise RequestValidationError(
                 "VMODEL_GLM53_MTP_DEPTH must be in [1, 5]")
-        if not 1 <= glm53_mtp_max_prompt_tokens <= 2048:
+        if not 1 <= glm53_mtp_max_prompt_tokens <= 65_536:
             raise RequestValidationError(
-                "VMODEL_GLM53_MTP_MAX_PROMPT_TOKENS must be in [1, 2048]")
+                "VMODEL_GLM53_MTP_MAX_PROMPT_TOKENS must be in [1, 65536]")
+        glm53_sparse_absorbed_mla_request = os.environ.get(
+            "VMODEL_GLM53_SPARSE_ABSORBED_MLA", "0").strip()
+        if glm53_sparse_absorbed_mla_request not in ("0", "1"):
+            raise RequestValidationError(
+                "VMODEL_GLM53_SPARSE_ABSORBED_MLA must be 0 or 1")
+        glm53_sparse_fused_attention_request = os.environ.get(
+            "VMODEL_GLM53_SPARSE_FUSED_ATTENTION", "0").strip()
+        if glm53_sparse_fused_attention_request not in ("0", "1"):
+            raise RequestValidationError(
+                "VMODEL_GLM53_SPARSE_FUSED_ATTENTION must be 0 or 1")
+        glm53_sparse_fused_kv_int8_request = os.environ.get(
+            "VMODEL_GLM53_SPARSE_FUSED_KV_INT8", "0").strip()
+        if glm53_sparse_fused_kv_int8_request not in ("0", "1"):
+            raise RequestValidationError(
+                "VMODEL_GLM53_SPARSE_FUSED_KV_INT8 must be 0 or 1")
+        if (glm53_sparse_fused_kv_int8_request == "1"
+                and glm53_sparse_fused_attention_request != "1"):
+            raise RequestValidationError(
+                "VMODEL_GLM53_SPARSE_FUSED_KV_INT8 requires "
+                "VMODEL_GLM53_SPARSE_FUSED_ATTENTION=1")
+        glm53_coalesced_expert_positions_request = os.environ.get(
+            "VMODEL_GLM53_COALESCED_EXPERT_POSITIONS", "0").strip()
+        if glm53_coalesced_expert_positions_request not in ("0", "1"):
+            raise RequestValidationError(
+                "VMODEL_GLM53_COALESCED_EXPERT_POSITIONS must be 0 or 1")
+        glm53_incremental_dsa_pool_request = os.environ.get(
+            "VMODEL_GLM53_INCREMENTAL_DSA_POOL", "0").strip()
+        if glm53_incremental_dsa_pool_request not in ("0", "1"):
+            raise RequestValidationError(
+                "VMODEL_GLM53_INCREMENTAL_DSA_POOL must be 0 or 1")
+        if (glm53_sparse_absorbed_mla_request == "1"
+                and glm53_sparse_fused_attention_request == "1"):
+            raise RequestValidationError(
+                "GLM-5.3 absorbed and fused sparse attention candidates "
+                "are mutually exclusive")
+        try:
+            glm53_prefill_tile_width = int(os.environ.get(
+                "VMODEL_GLM53_PREFILL_TILE_WIDTH", "32"))
+        except ValueError as error:
+            raise RequestValidationError(
+                "VMODEL_GLM53_PREFILL_TILE_WIDTH must be an integer") from error
+        if glm53_prefill_tile_width not in (16, 32, 64, 128):
+            raise RequestValidationError(
+                "VMODEL_GLM53_PREFILL_TILE_WIDTH must be one of "
+                "16, 32, 64, 128")
         glm53_expert_batch_prefetch_request = os.environ.get(
             "VMODEL_GLM53_EXPERT_BATCH_PREFETCH", "0").strip()
         if glm53_expert_batch_prefetch_request not in ("0", "1"):
@@ -2136,6 +2181,12 @@ class EngineManager:
             glm53_mtp_request,
             glm53_mtp_depth,
             glm53_mtp_max_prompt_tokens,
+            glm53_sparse_absorbed_mla_request,
+            glm53_sparse_fused_attention_request,
+            glm53_sparse_fused_kv_int8_request,
+            glm53_coalesced_expert_positions_request,
+            glm53_incremental_dsa_pool_request,
+            glm53_prefill_tile_width,
             glm53_expert_fetch_batch,
             glm53_expert_batch_prefetch_request,
             glm53_trunk_prefetch_depth,
@@ -2255,6 +2306,12 @@ class EngineManager:
             glm53_mtp_request,
             glm53_mtp_depth,
             glm53_mtp_max_prompt_tokens,
+            glm53_sparse_absorbed_mla_request,
+            glm53_sparse_fused_attention_request,
+            glm53_sparse_fused_kv_int8_request,
+            glm53_coalesced_expert_positions_request,
+            glm53_incremental_dsa_pool_request,
+            glm53_prefill_tile_width,
             glm53_expert_fetch_batch,
             glm53_expert_batch_prefetch_request,
             glm53_trunk_prefetch_depth,
@@ -2594,9 +2651,19 @@ class EngineManager:
                 rc.expert_fetch_batch = glm53_expert_fetch_batch
                 rc.expert_batch_prefetch = (
                     glm53_expert_batch_prefetch_request == "1")
-                rc.prefill_chunk_size = 32
+                rc.prefill_chunk_size = glm53_prefill_tile_width
                 rc.layer_stationary_prefill = True
                 rc.adaptive_chunk_size = False
+                rc.glm53_sparse_absorbed_mla = (
+                    glm53_sparse_absorbed_mla_request == "1")
+                rc.glm53_sparse_fused_attention = (
+                    glm53_sparse_fused_attention_request == "1")
+                rc.glm53_sparse_fused_kv_int8 = (
+                    glm53_sparse_fused_kv_int8_request == "1")
+                rc.glm53_coalesced_expert_positions = (
+                    glm53_coalesced_expert_positions_request == "1")
+                rc.glm53_incremental_dsa_pool = (
+                    glm53_incremental_dsa_pool_request == "1")
                 # Exact request-to-request prefix reuse is deliberately
                 # opt-in until it clears the heterogeneous real-request
                 # corpus.  GLM-5.3's layer-stationary prefill uses a fixed
@@ -6500,7 +6567,14 @@ def _validate_context_budget(engine, prompt_tokens: int, max_output_tokens: int,
 
 def _prepare_vision_prompt(engine, prompt: str, images):
     """Run allocation-free vision preflight and expose failures as HTTP 400."""
-    from .qwen3vl import prepare_vl_prompt
+    backend = getattr(engine.cfg, "vision_backend", "")
+    if backend == "qwen3vl":
+        from .qwen3vl import prepare_vl_prompt
+    elif backend == "glm5_next":
+        from .glm5_next_vision import prepare_vl_prompt
+    else:
+        raise RequestValidationError(
+            f"unsupported vision backend {backend or 'unknown'!r}")
 
     try:
         return prepare_vl_prompt(engine, prompt, images)
@@ -6524,13 +6598,26 @@ def _vision_request_error(cfg, model_id: str) -> str | None:
             "(e.g. Qwen3-VL-8B-Instruct) for image input"
         )
     backend = getattr(cfg, "vision_backend", "")
-    if backend != "qwen3vl":
+    if backend not in ("qwen3vl", "glm5_next"):
         family = backend or getattr(cfg, "model_type", "unknown")
         return (
             f"model '{model_id}' has a {family} vision tower, but vOOM does "
             "not yet implement that vision backend; text requests remain supported"
         )
     return None
+
+
+def _generate_vision(engine, *args, **kwargs):
+    """Dispatch only to a backend whose released vision math is implemented."""
+    backend = getattr(engine.cfg, "vision_backend", "")
+    if backend == "qwen3vl":
+        from .qwen3vl import generate_vl
+    elif backend == "glm5_next":
+        from .glm5_next_vision import generate_vl
+    else:
+        raise RequestValidationError(
+            f"unsupported vision backend {backend or 'unknown'!r}")
+    return generate_vl(engine, *args, **kwargs)
 
 
 def _load_vision_images(sources):
@@ -8263,10 +8350,26 @@ def _prepare_chat_prompt(engine, model_dir: Path, messages: list[dict], reasonin
     The original response schemas remain available even when their prompt copy
     is compacted. Any tool shortlist is reported rather than silently hidden.
     """
-    from .toolcalls import (canonical_tool_indices, canonicalize_tool_history,
+    from .toolcalls import (VISION_SPAN, canonical_tool_indices,
+                            canonicalize_tool_history,
                             compact_tool_schema, effective_tool_prompt_schema,
                             pinned_tool_indices, rank_tool_indices,
                             relevant_tool_interface)
+
+    # normalize_messages uses Qwen's neutral internal image sentinel so one
+    # protocol parser can serve every backend.  Convert it before the released
+    # GLM chat template tokenizes the transcript; leaving the Qwen sentinel in
+    # place produces ordinary punctuation tokens and silently drops the image.
+    if (getattr(engine.cfg, "vision_backend", "") == "glm5_next"
+            and any(VISION_SPAN in str(message.get("content", ""))
+                    for message in messages)):
+        glm_image_span = "<|begin_of_image|><|image|><|end_of_image|>"
+        messages = [
+            ({**message, "content": message["content"].replace(
+                VISION_SPAN, glm_image_span)}
+             if isinstance(message.get("content"), str) else message)
+            for message in messages
+        ]
 
     try:
         messages = canonicalize_tool_history(messages)
@@ -8739,6 +8842,12 @@ def _log_path_stats(result: dict, prompt_tokens: int) -> None:
             f"{stats.get('speculative_fallback_reason', 'unknown')}",
             flush=True,
         )
+    elif stats.get("glm53_mtp_enabled"):
+        print(
+            f"[server] GLM-5.3 MTP fallback: "
+            f"{stats.get('glm53_mtp_fallback_reason', 'unknown')}",
+            flush=True,
+        )
     elif stats.get("qwen_mtp_used"):
         proposed = int(stats.get("qwen_mtp_proposed", 0) or 0)
         accepted = int(stats.get("qwen_mtp_accepted", 0) or 0)
@@ -8969,6 +9078,8 @@ def _vision_protocol_timing(result: dict) -> dict:
     # counters on real results that actually carry request I/O/speculation
     # telemetry.
     optional_integer_fields = (
+        "vision_weight_read_bytes",
+        "vision_active_max_image_tokens",
         "weight_store_bytes_read",
         "prefill_weight_store_bytes_read",
         "decode_weight_store_bytes_read",
@@ -9009,6 +9120,8 @@ def _vision_protocol_timing(result: dict) -> dict:
         "governor_serial_verify_transient_reservation_calls",
         "governor_qwen_prefill_page_reservation_calls",
         "governor_qwen_prefill_transient_reservation_calls",
+        "governor_glm53_expert_page_reservation_calls",
+        "governor_glm53_transient_reservation_calls",
         "governor_reservation_requested_bytes",
         "governor_reservation_budget_reduced_bytes",
         "governor_reservation_budget_restored_bytes",
@@ -9020,6 +9133,34 @@ def _vision_protocol_timing(result: dict) -> dict:
         "governor_swap_out_growth_bytes",
         "planned_trunk_pin_layers",
         "planned_trunk_pin_bytes",
+        "glm53_sparse_absorbed_mla",
+        "glm53_sparse_fused_attention",
+        "glm53_sparse_fused_kv_int8",
+        "glm53_coalesced_expert_positions",
+        "glm53_incremental_dsa_pool",
+        "glm53_layer_stationary_memory_samples",
+        "glm53_layer_stationary_peak_metal_bytes",
+        "glm53_layer_stationary_initial_carrier_active_peak_bytes",
+        "glm53_layer_stationary_attention_active_peak_bytes",
+        "glm53_layer_stationary_ffn_hc_pre_active_peak_bytes",
+        "glm53_layer_stationary_mlp_active_peak_bytes",
+        "glm53_layer_stationary_ffn_hc_post_active_peak_bytes",
+        "glm53_layer_stationary_tile_width",
+        "glm53_layer_stationary_positions",
+        "glm53_layer_stationary_sweep_positions",
+        "glm53_layer_stationary_sweeps",
+        "glm53_sparse_fused_calls",
+        "glm53_sparse_fused_positions",
+        "glm53_sparse_fused_selected_rows",
+        "glm53_dsa_pool_rows_computed",
+        "glm53_dsa_pool_rows_reused",
+        "glm53_mtp_enabled",
+        "glm53_mtp_used",
+        "glm53_mtp_depth",
+        "glm53_mtp_max_prompt_tokens",
+        "glm53_mtp_constraint_verified",
+        "glm53_mtp_state_only_prefill_tokens",
+        "prompt_cache_extension_tokens",
         "qwen_compiled_delta_prefill",
         "qwen_native_fused_delta_prefill",
         "qwen_chunked_delta_prefill",
@@ -9087,6 +9228,7 @@ def _vision_protocol_timing(result: dict) -> dict:
         "speculative_target_sweeps",
         "speculative_proposed",
         "speculative_accepted",
+        "speculative_constraint_verified",
         "dflash2_checkpoint_block_size",
         "dflash2_effective_block_size",
         "dflash2_selector_top_k",
@@ -9409,6 +9551,7 @@ def _vision_protocol_timing(result: dict) -> dict:
         if key in stats or key in result:
             value[key] = int(metric(key) or 0)
     optional_float_fields = (
+        "vision_weight_load_s",
         "qwen_mtp_accept_rate",
         "qwen_mtp_stochastic_expected_acceptance",
         "weight_prefetch_wait_s",
@@ -9418,6 +9561,15 @@ def _vision_protocol_timing(result: dict) -> dict:
         "weight_prefetch_hidden_lower_bound_s",
         "expert_batch_prefetch_wait_s",
         "expert_batch_prefetch_hidden_s",
+        "glm53_dsa_pool_build_s",
+        "glm53_dsa_selection_s",
+        "glm53_layer_stationary_weight_wait_s",
+        "glm53_layer_stationary_attention_s",
+        "glm53_layer_stationary_kda_attention_s",
+        "glm53_layer_stationary_mla_attention_s",
+        "glm53_layer_stationary_ffn_hc_pre_s",
+        "glm53_layer_stationary_mlp_s",
+        "glm53_layer_stationary_ffn_hc_post_s",
         "parallel_tier_wall_s",
         "parallel_tier_fast_service_s",
         "parallel_tier_archive_service_s",
@@ -9533,6 +9685,7 @@ def _vision_protocol_timing(result: dict) -> dict:
         "qwen4_mtp_truncation_probabilities",
         "qwen4_mtp_proposal_sources",
         "qwen4_mtp_q_calibration",
+        "glm53_mtp_fallback_reason",
     ):
         if key in stats or key in result:
             value[key] = str(metric(key) or "")
@@ -9562,6 +9715,8 @@ def _vision_protocol_timing(result: dict) -> dict:
         "speculative_round_draft_s",
         "speculative_round_verify_s",
         "speculative_round_context_s",
+        "memory_prefill_retry_cleanup",
+        "memory_prefill_retry_failures",
     ):
         if key in stats or key in result:
             value[key] = metric(key)
@@ -9759,7 +9914,22 @@ def _harmony_split_channels(text: str, model_type: str) -> tuple[str, str]:
     text is all the client has -- the text is returned unchanged as the
     visible part rather than emptied, and the analysis is reported empty.
     """
-    if model_type != "gpt_oss" or not isinstance(text, str) or not text:
+    if not isinstance(text, str) or not text:
+        return text, ""
+    if model_type == "glm5_next":
+        # The released GLM template ends the generation scaffold with
+        # ``<think>``.  Generated bytes therefore begin *inside* reasoning and
+        # contain only the closing marker before the visible answer.  As with
+        # Harmony below, fail safe when a short output never reaches a final
+        # channel instead of silently discarding the only text available.
+        marker = "</think>"
+        if marker not in text:
+            return text, ""
+        analysis, visible = text.split(marker, 1)
+        if analysis.startswith("<think>"):
+            analysis = analysis[len("<think>"):]
+        return visible, analysis.strip()
+    if model_type != "gpt_oss":
         return text, ""
     span = _harmony_visible_span(text)
     if span is None:
@@ -9785,7 +9955,8 @@ class _HarmonyChannelGate:
     """
 
     def __init__(self, model_type: str):
-        self.enabled = model_type == "gpt_oss"
+        self.model_type = model_type
+        self.enabled = model_type in ("gpt_oss", "glm5_next")
         self.raw = ""
         self.start = -1
         self.emitted = 0
@@ -9795,11 +9966,20 @@ class _HarmonyChannelGate:
         if not self.enabled:
             return text
         self.raw += text
-        span = _harmony_visible_span(self.raw, self.start)
-        if span is None:
-            return ""
-        self.start = span[0]
-        visible = self.raw[span[0]:span[1]]
+        if self.model_type == "glm5_next":
+            if self.start < 0:
+                marker = "</think>"
+                marker_start = self.raw.find(marker)
+                if marker_start < 0:
+                    return ""
+                self.start = marker_start + len(marker)
+            visible = self.raw[self.start:]
+        else:
+            span = _harmony_visible_span(self.raw, self.start)
+            if span is None:
+                return ""
+            self.start = span[0]
+            visible = self.raw[span[0]:span[1]]
         if len(visible) <= self.emitted:
             return ""
         released = visible[self.emitted:]
@@ -10459,7 +10639,7 @@ class Handler(BaseHTTPRequestHandler):
                     # client asked for an SSE stream — generate_vl already accepts
                     # an on_token callback (same as the text path), so there was no
                     # engine-side reason for the gap, only missing server wiring.
-                    from .qwen3vl import generate_vl
+                    generate_vl = _generate_vision
                     images = self._preloaded_images
                     prepared_vl = _prepare_vision_prompt(engine, prompt, images)
                     rendered_prompt_tokens = len(prepared_vl["tokens"])
@@ -10480,6 +10660,7 @@ class Handler(BaseHTTPRequestHandler):
                             engine.cfg.model_type, _DEFAULT_HOLDBACK_MARKERS)
                             if buffer_for_tools else ())
                         holdback = _MarkerHoldback(markers) if buffer_for_tools else None
+                        channel_gate = _HarmonyChannelGate(engine.cfg.model_type)
 
                         def write_vision_chunk(delta, finish_reason=None):
                             chunk = {"id": rid, "object": kind + ".chunk",
@@ -10493,10 +10674,15 @@ class Handler(BaseHTTPRequestHandler):
                             self.wfile.flush()
 
                         def emit(tok: str):
+                            tok = channel_gate.feed(tok)
                             if holdback is None:
-                                write_vision_chunk({"content": tok})
+                                if tok:
+                                    write_vision_chunk({"content": tok})
+                                else:
+                                    self.wfile.write(b": keepalive\n\n")
+                                    self.wfile.flush()
                                 return
-                            safe = holdback.feed(tok)
+                            safe = holdback.feed(tok) if tok else ""
                             if safe:
                                 write_vision_chunk({"content": safe})
                             else:
@@ -10525,6 +10711,8 @@ class Handler(BaseHTTPRequestHandler):
                             content, calls = _parse_request_tool_calls(
                                 result["text"], tools, engine.cfg.model_type,
                                 allow_parallel_tool_calls)
+                            content = _harmony_visible_text(
+                                content, engine.cfg.model_type)
                             remainder = holdback.final_remainder(content)
                             if remainder:
                                 write_vision_chunk({"content": remainder})
@@ -10534,6 +10722,11 @@ class Handler(BaseHTTPRequestHandler):
                                     for index, call in enumerate(calls)]})
                                 finish_reason = _openai_finish_reason(
                                     result, has_tool_calls=True)
+                        else:
+                            tail = channel_gate.remainder(_harmony_visible_text(
+                                result["text"], engine.cfg.model_type))
+                            if tail:
+                                write_vision_chunk({"content": tail})
                         write_vision_chunk({}, finish_reason)
                         if include_stream_usage:
                             prompt_count = int(result.get(
@@ -10566,21 +10759,27 @@ class Handler(BaseHTTPRequestHandler):
                         prepared=prepared_vl, sampling=self._sampling,
                         constraint=self._constraint)
                     _log_path_stats(result, result.get("prompt_tokens", 0))
-                    message = {"role": "assistant", "content": result["text"]}
+                    message = {"role": "assistant", "content": _harmony_visible_text(
+                        result["text"], engine.cfg.model_type)}
                     finish = _openai_finish_reason(result)
                     if tools:
                         content, calls = _parse_request_tool_calls(
                             result["text"], tools, engine.cfg.model_type,
                             allow_parallel_tool_calls)
+                        content = _harmony_visible_text(
+                            content, engine.cfg.model_type)
                         if calls:
                             message = {"role": "assistant", "content": content or None,
                                        "tool_calls": calls}
                             finish = _openai_finish_reason(result, has_tool_calls=True)
+                    _visible, harmony_analysis = _harmony_split_channels(
+                        result["text"], engine.cfg.model_type)
                     prompt_tokens = result.get("prompt_tokens", 0)
                     completion_tokens = len(result["tokens"])
                     return self._json(200, {
                         "id": rid, "object": kind, "created": int(t0), "model": model_id,
                         "choices": [{"index": 0, "message": message, "finish_reason": finish}],
+                        "vmodel_reasoning": harmony_analysis or None,
                         "vmodel_timing": {
                             "vision_seconds": round(float(
                                 result.get("vision_s", 0.0)), 4),
@@ -11755,7 +11954,7 @@ class Handler(BaseHTTPRequestHandler):
             return result
 
         if image_srcs:
-            from .qwen3vl import generate_vl
+            generate_vl = _generate_vision
 
             images = self._preloaded_images
             prepared_vl = _prepare_vision_prompt(engine, prompt, images)
@@ -12117,7 +12316,7 @@ class Handler(BaseHTTPRequestHandler):
             return blocks, stop_reason
 
         if image_srcs:
-            from .qwen3vl import generate_vl
+            generate_vl = _generate_vision
 
             images = self._preloaded_images
             prepared_vl = _prepare_vision_prompt(engine, prompt, images)

@@ -269,31 +269,17 @@ def fork_hybrid_kv_endpoint(kv: "KVCache") -> "KVCache":
     Plain KVCache updates replace attention arrays with concatenations, and
     KDAStateCache updates replace recurrent arrays, so the evaluated prompt
     buffers are immutable under subsequent decode/prefill of the ORIGINAL
-    cache -- a fork can share them without copying until either branch
-    advances, at which point MLX's functional array semantics naturally
-    separate them. SteppedKVCache writes into spare capacity in place and is
-    deliberately rejected until it has a dedicated copy-on-write snapshot
-    operation.
+    cache. SteppedKVCache has an explicit per-layer copy-on-write fork: spare
+    capacity remains shared until one owner appends, then that owner performs
+    a bit-preserving gather into a private backing buffer before its update.
     """
-    if type(kv) is not KVCache:
-        raise TypeError("hybrid endpoint snapshots require plain KVCache")
+    if type(kv) not in (KVCache, SteppedKVCache):
+        raise TypeError(
+            "hybrid endpoint snapshots require plain or stepped KVCache")
     recurrent = getattr(kv, "kda_cache", None)
     if recurrent is None:
         raise ValueError("hybrid endpoint is missing recurrent state")
-    snapshot = KVCache(len(kv.keys))
-    snapshot.keys = list(kv.keys)
-    snapshot.values = list(kv.values)
-    snapshot.compressed_mla = kv.compressed_mla
-    snapshot.kda_cache = recurrent.fork()
-    dsa = getattr(kv, "dsa", None)
-    if dsa is not None:
-        fork_dsa = getattr(dsa, "fork", None)
-        if not callable(fork_dsa):
-            raise TypeError("hybrid DSA companion cannot be forked")
-        snapshot.dsa = fork_dsa()
-    qwen4 = getattr(kv, "qwen4_cache", None)
-    if qwen4 is not None:
-        snapshot.qwen4_cache = qwen4.fork()
+    snapshot = kv.fork()
     arrays = [
         value for value in (*snapshot.keys, *snapshot.values)
         if value is not None
@@ -883,6 +869,10 @@ class SteppedKVCache(KVCache):
         self.latent_spill_layers = 0
         self.latent_spill_reloads = 0
         self.latent_spill_uncached_descriptors = 0
+        # A fork shares already-evaluated capacity buffers. MLX slice updates
+        # replace bytes inside that capacity, so unlike plain KVCache's concat
+        # path they require an explicit detach before the next append.
+        self._shared_layers: set[int] = set()
 
     def enable_latent_disk_spill(self, root: str | Path) -> None:
         """Tier exact compressed-MLA arrays and reload them on demand."""
@@ -1008,11 +998,86 @@ class SteppedKVCache(KVCache):
             "mla_absorbed",
             "mla_absorbed_prefill",
             "mla_absorbed_key_tile_size",
+            "glm53_sparse_absorbed_mla",
+            "glm53_sparse_fused_attention",
             "kda_cache",
         ):
             if hasattr(cache, attribute):
                 setattr(result, attribute, getattr(cache, attribute))
         return result
+
+    def fork(self) -> "SteppedKVCache":
+        """Share an exact endpoint and detach each layer on first mutation.
+
+        Temporary latent-spill files have one cleanup owner and therefore
+        cannot safely be shared. GLM-5.3's resident compressed-latent cache is
+        the intended path; K3 spill continues to fail closed until its disk
+        payload has reference-counted ownership.
+        """
+        if self.latent_spill_enabled or self._latent_spill_meta:
+            raise TypeError(
+                "stepped KV snapshots do not support temporary latent spill")
+        branch = SteppedKVCache(len(self.keys))
+        branch.keys = list(self.keys)
+        branch.values = list(self.values)
+        branch.compressed_mla = self.compressed_mla
+        branch._windows = list(self._windows)
+        branch._starts = list(self._starts)
+        branch._lengths = list(self._lengths)
+        for attribute in (
+            "mla_absorbed",
+            "mla_absorbed_prefill",
+            "mla_absorbed_key_tile_size",
+            "glm53_sparse_absorbed_mla",
+            "glm53_sparse_fused_attention",
+        ):
+            if hasattr(self, attribute):
+                setattr(branch, attribute, getattr(self, attribute))
+        for attribute, label in (
+            ("kda_cache", "recurrent KV"),
+            ("dsa", "DSA KV"),
+            ("qwen4_cache", "Qwen4 auxiliary KV"),
+        ):
+            companion = getattr(self, attribute, None)
+            if companion is None:
+                continue
+            fork_companion = getattr(companion, "fork", None)
+            if not callable(fork_companion):
+                raise TypeError(f"{label} companion cannot be forked")
+            setattr(branch, attribute, fork_companion())
+        shared = {
+            layer for layer, value in enumerate(self.keys)
+            if value is not None
+        }
+        self._shared_layers.update(shared)
+        branch._shared_layers.update(shared)
+        arrays = [
+            value for value in (*branch.keys, *branch.values)
+            if value is not None
+        ]
+        if arrays:
+            mx.eval(*arrays)
+        return branch
+
+    @staticmethod
+    def _exact_buffer_copy(value: mx.array, axis: int) -> mx.array:
+        """Allocate a byte-identical MLX buffer without floating arithmetic."""
+        indices = mx.arange(int(value.shape[axis]), dtype=mx.int32)
+        copied = mx.take(value, indices, axis=axis)
+        mx.eval(copied)
+        return copied
+
+    def _detach_shared_layer(self, layer: int) -> None:
+        if layer not in self._shared_layers:
+            return
+        key = self.keys[layer]
+        if key is not None:
+            axis = 1 if self.compressed_mla else 2
+            self.keys[layer] = self._exact_buffer_copy(key, axis)
+            value = self.values[layer]
+            if value is not None:
+                self.values[layer] = self._exact_buffer_copy(value, axis)
+        self._shared_layers.discard(layer)
 
     def _layer_length(self, layer: int) -> int:
         length = self._lengths[layer]
@@ -1023,6 +1088,7 @@ class SteppedKVCache(KVCache):
         return length
 
     def update(self, layer: int, k: mx.array, v: mx.array) -> tuple[mx.array, mx.array]:
+        self._detach_shared_layer(layer)
         previous = self._layer_length(layer)
         end = previous + k.shape[2]
         current = self.keys[layer]
@@ -1064,6 +1130,7 @@ class SteppedKVCache(KVCache):
                 "update_latent requires compressed_mla=True"
             )
         self._reload_latent_layer(layer)
+        self._detach_shared_layer(layer)
         previous = self._layer_length(layer)
         incoming = int(lat.shape[1])
         end = previous + incoming
@@ -1081,6 +1148,10 @@ class SteppedKVCache(KVCache):
                 grown = mx.concatenate([old, grown], axis=1)
             self.keys[layer] = grown
         self.keys[layer][:, previous:end, :] = lat
+        # MLX updates are functional graphs. Materialize the capacity buffer
+        # now so thousands of long-prefill appends cannot retain a chain of
+        # prior update expressions even though the logical bytes are bounded.
+        mx.eval(self.keys[layer])
         self._lengths[layer] = end
         return self.keys[layer][:, :end, :]
 
@@ -1109,6 +1180,12 @@ class SteppedKVCache(KVCache):
         recurrent = getattr(self, "kda_cache", None)
         if recurrent is not None:
             total += recurrent.nbytes()
+        dsa = getattr(self, "dsa", None)
+        if dsa is not None:
+            total += dsa.nbytes()
+        qwen4 = getattr(self, "qwen4_cache", None)
+        if qwen4 is not None:
+            total += qwen4.nbytes()
         return total
 
     def allocated_nbytes(self) -> int:
@@ -1116,6 +1193,12 @@ class SteppedKVCache(KVCache):
         recurrent = getattr(self, "kda_cache", None)
         if recurrent is not None:
             total += recurrent.nbytes()
+        dsa = getattr(self, "dsa", None)
+        if dsa is not None:
+            total += dsa.nbytes()
+        qwen4 = getattr(self, "qwen4_cache", None)
+        if qwen4 is not None:
+            total += qwen4.nbytes()
         return total
 
     def trim(self, length: int):
@@ -1134,11 +1217,42 @@ class SteppedKVCache(KVCache):
                 self.values[layer] = self.values[layer][..., :length, :]
                 pending.extend((self.keys[layer], self.values[layer]))
             self._lengths[layer] = length
+            self._shared_layers.discard(layer)
         if pending:
             mx.eval(*pending)
         dsa = getattr(self, "dsa", None)
         if dsa is not None:
             dsa.trim(length)
+
+    def trim_layer_lengths(self, lengths) -> None:
+        """Restore mixed-depth lengths and keep stepped side tables exact."""
+        targets = tuple(int(value) for value in lengths)
+        if len(targets) != len(self.keys) or any(value < 0 for value in targets):
+            raise ValueError("invalid per-layer KV rollback lengths")
+        pending = []
+        for layer, target in enumerate(targets):
+            current = self._layer_length(layer)
+            if target > current:
+                raise ValueError("cannot grow KV during rollback")
+            if target == current:
+                continue
+            key = self.keys[layer]
+            if key is None:
+                if target:
+                    raise ValueError("cannot restore a missing KV layer")
+                self._lengths[layer] = 0
+                continue
+            if self.compressed_mla:
+                self.keys[layer] = key[:, :target, :]
+                pending.append(self.keys[layer])
+            else:
+                self.keys[layer] = key[..., :target, :]
+                self.values[layer] = self.values[layer][..., :target, :]
+                pending.extend((self.keys[layer], self.values[layer]))
+            self._lengths[layer] = target
+            self._shared_layers.discard(layer)
+        if pending:
+            mx.eval(*pending)
 
     def close_latent_spill(self) -> None:
         self._latent_spill_meta.clear()

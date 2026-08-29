@@ -109,6 +109,30 @@ def test_glm53_lifts_released_text_geometry_without_reindexing_layers(tmp_path):
     assert loaded.swiglu_limit == 10.0
 
 
+def test_glm53_lifts_released_image_processor_and_boundary_ids(tmp_path):
+    config = _config()
+    config.update({"image_start_token_id": 58, "image_end_token_id": 59})
+    (tmp_path / "processor_config.json").write_text(json.dumps({
+        "image_processor": {
+            "patch_size": 14,
+            "temporal_patch_size": 2,
+            "merge_size": 2,
+            "min_image_tokens": 16,
+            "max_image_tokens": 8000,
+            "image_mean": [0.1, 0.2, 0.3],
+            "image_std": [0.4, 0.5, 0.6],
+        },
+    }))
+    loaded = _load(tmp_path, config)
+
+    assert loaded.vision_start_token_id == 58
+    assert loaded.vision_end_token_id == 59
+    assert loaded.vision_config["spatial_merge_size"] == 2
+    assert loaded.vision_config["min_image_tokens"] == 16
+    assert loaded.vision_config["max_image_tokens"] == 8000
+    assert loaded.vision_config["image_mean"] == [0.1, 0.2, 0.3]
+
+
 @pytest.mark.parametrize(
     ("path", "value", "match"),
     [

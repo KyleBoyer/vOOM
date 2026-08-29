@@ -19,6 +19,7 @@ def main() -> None:
     parser.add_argument("--prompt", default=DEFAULT_PROMPT)
     parser.add_argument("--max-tokens", type=int, default=4)
     parser.add_argument("--depth", type=int, default=3)
+    parser.add_argument("--mtp-max-prompt-tokens", type=int, default=2048)
     parser.add_argument("--plain", action="store_true")
     parser.add_argument("--runs", type=int, default=1)
     parser.add_argument(
@@ -28,11 +29,13 @@ def main() -> None:
     parser.add_argument("--trunk-prefetch-depth", type=int, default=0)
     parser.add_argument("--trunk-prefetch-workers", type=int, default=1)
     parser.add_argument("--expected-tokens", default="")
+    parser.add_argument("--result", type=Path)
     args = parser.parse_args()
 
     os.environ["VMODEL_GLM53_MTP"] = "0" if args.plain else "1"
     os.environ["VMODEL_GLM53_MTP_DEPTH"] = str(args.depth)
-    os.environ["VMODEL_GLM53_MTP_MAX_PROMPT_TOKENS"] = "2048"
+    os.environ["VMODEL_GLM53_MTP_MAX_PROMPT_TOKENS"] = str(
+        args.mtp_max_prompt_tokens)
     os.environ["VMODEL_GLM53_HOT_PROMPT_KV"] = "0"
     os.environ["VMODEL_EXECUTION_PROFILE"] = args.execution_profile
     os.environ["VMODEL_GLM53_EXPERT_FETCH_BATCH"] = str(
@@ -81,6 +84,8 @@ def main() -> None:
                 "accepted": stats.get("speculative_accepted", 0),
                 "target_sweeps": stats.get(
                     "speculative_target_sweeps", 0),
+                "mtp_state_only_prefill_tokens": stats.get(
+                    "glm53_mtp_state_only_prefill_tokens", 0),
                 "draft_s": stats.get("speculative_draft_s", 0.0),
                 "verify_s": stats.get(
                     "speculative_verify_decode_s", 0.0),
@@ -139,7 +144,13 @@ def main() -> None:
             "weight_store_bytes_read": stats.get(
                 "weight_store_bytes_read", 0),
         }
-        print(json.dumps(document, indent=2, sort_keys=True))
+        rendered = json.dumps(document, indent=2, sort_keys=True)
+        print(rendered)
+        if args.result is not None:
+            if args.result.exists():
+                raise SystemExit(f"result already exists: {args.result}")
+            args.result.parent.mkdir(parents=True, exist_ok=True)
+            args.result.write_text(rendered + "\n")
         if args.expected_tokens:
             expected = [
                 int(value) for value in args.expected_tokens.split(",")
