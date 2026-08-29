@@ -146,6 +146,20 @@ known output hash while wall fell 1,279.311 to 693.561 seconds (-45.8%). The
 same candidate regressed the 2,123-input gate by 4.2%, and the 8K run grew
 swap-outs by 28.64MB, so no automatic length threshold is enabled.
 
+An untouched 46,849-token coalesced attempt exposed why the first form could
+not scale safely. After about 45 minutes, a hot expert's full-context gathered
+operand produced a learned 2.5+GB transient; a 2.91GB expert-page reservation
+was correctly refused at 4.15GB active / 7.33GB live ceiling. The generic
+chunk retry proposed tile eight, but that tile did not bound an expert gathered
+across all tiles, so the retry was stopped. The replacement keeps each expert
+page resident once while splitting only its gathered rows at a configurable
+position ceiling. A real layer-3/1,465-row sweep measured 34.99x at ceiling 512
+versus 36.71x unbounded (95.3% of the speedup). On the repeated 8,215-input
+gate, ceiling 512 preserved the established one-token hash, completed without
+retry in 720.616 seconds, and reduced true peak from 3.785 to 3.673GB. It was
+3.9% slower than unbounded, split 1,271 experts across 14,640 GEMMs, and grew
+swap-outs by 38.14MB. This remains a default-off capacity candidate.
+
 The untouched captured request has now completed one cold 46,849-input/max-1
 run with all 134 tools and capture-derived streaming/sampling intact. Only the
 model alias and explicit one-token output cap differed. Wall was 7,845.622
@@ -177,8 +191,11 @@ corpus required by the anti-overfit policy:
 - `VMODEL_GLM53_SPARSE_FUSED_KV_INT8=1` halves the expanded request-local
   prompt K/V for that already-lossy fused kernel; it requires the fused kernel.
 - `VMODEL_GLM53_COALESCED_EXPERT_POSITIONS=1` uses one GEMM outer shape per
-  expert across all layer-stationary tiles. It is lossy, regresses the measured
+  expert across layer-stationary tiles. It is lossy, regresses the measured
   short gate, and remains a long-context experiment.
+- `VMODEL_GLM53_COALESCED_EXPERT_MAX_POSITIONS=128|256|512|1024|2048|4096`
+  bounds the gathered operand while retaining the expert page; default 512.
+  A prefill memory retry lowers this ceiling before shrinking tile width.
 - `VMODEL_GLM53_INCREMENTAL_DSA_POOL=1` enables the candidate exact immutable
   pool-key cache.
 - `VMODEL_GLM53_PREFILL_TILE_WIDTH=16|32|64|128` selects a gated,

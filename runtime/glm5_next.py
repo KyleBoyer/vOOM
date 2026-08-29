@@ -94,7 +94,9 @@ def glm5_next_mlp_layer_stationary_tiles(
         hidden_tiles: list[mx.array], w: dict, prefix: str,
         cfg: ModelConfig, layer: int, get_experts, *,
         iter_expert_batches=None, profile=None, memory_guard=None,
-        coalesce_expert_positions: bool = False) -> list[mx.array]:
+        coalesce_expert_positions: bool = False,
+        coalesced_expert_max_positions: int = 512,
+        coalesced_stats: dict | None = None) -> list[mx.array]:
     """Run GLM-5.3 MLPs at their original tile GEMM shapes.
 
     For MoE layers, routing is still evaluated independently per tile. The
@@ -105,6 +107,12 @@ def glm5_next_mlp_layer_stationary_tiles(
     """
     if not hidden_tiles:
         return []
+    coalesced_expert_max_positions = int(
+        coalesced_expert_max_positions)
+    if (coalesce_expert_positions
+            and coalesced_expert_max_positions <= 0):
+        raise ValueError(
+            "coalesced_expert_max_positions must be positive")
     is_dense = (
         cfg.mlp_layer_types[layer] == "dense"
         if layer < len(cfg.mlp_layer_types)
@@ -163,31 +171,89 @@ def glm5_next_mlp_layer_stationary_tiles(
                     if not placements:
                         continue
                     positions = [position for position, _ in placements]
-                    weights = mx.array(
-                        [weight for _, weight in placements]
-                    ).astype(mx.float32)
-                    inputs.append(tile[:, positions, :])
-                    destinations.append(
-                        (tile_index, positions, weights, len(positions)))
+                    placement_weights = [
+                        weight for _, weight in placements]
+                    for placement_start in range(
+                            0, len(positions),
+                            coalesced_expert_max_positions):
+                        placement_end = min(
+                            placement_start
+                            + coalesced_expert_max_positions,
+                            len(positions))
+                        bounded_positions = positions[
+                            placement_start:placement_end]
+                        weights = mx.array(placement_weights[
+                            placement_start:placement_end]).astype(mx.float32)
+                        inputs.append(tile[:, bounded_positions, :])
+                        destinations.append((
+                            tile_index, bounded_positions, weights,
+                            len(bounded_positions)))
                 if not inputs:
                     continue
-                expert_input = (
-                    inputs[0] if len(inputs) == 1
-                    else mx.concatenate(inputs, axis=1))
-                value = glm5_next_swiglu(
-                    expert_input, experts[expert],
-                    f"{prefix}.mlp.experts.{expert}", cfg)
-                mx.eval(value)
-                cursor = 0
-                for tile_index, positions, weights, width in destinations:
-                    contribution = (
-                        value[:, cursor:cursor + width]
-                        * weights[None, :, None]).astype(
-                            hidden_tiles[tile_index].dtype)
-                    routed[tile_index] = routed[tile_index].at[
-                        :, positions, :].add(contribution)
-                    touched.append(tile_index)
-                    cursor += width
+                # A full 46.8K prompt can route many thousands of rows to one
+                # hot expert. One all-context GEMM was fast at 8K but learned a
+                # 2.5+ GB transient and was correctly refused at 46.8K. Keep
+                # the expert page resident while bounding only its gathered
+                # operand. Oversized tile placements are split contiguously;
+                # scatter order and per-position routing weights remain
+                # unchanged.
+                chunks = []
+                chunk_inputs = []
+                chunk_destinations = []
+                chunk_width = 0
+                for input_value, destination in zip(inputs, destinations):
+                    width = int(destination[3])
+                    if (chunk_destinations
+                            and chunk_width + width
+                            > coalesced_expert_max_positions):
+                        chunks.append((
+                            chunk_inputs, chunk_destinations, chunk_width))
+                        chunk_inputs = []
+                        chunk_destinations = []
+                        chunk_width = 0
+                    chunk_inputs.append(input_value)
+                    chunk_destinations.append(destination)
+                    chunk_width += width
+                if chunk_destinations:
+                    chunks.append((
+                        chunk_inputs, chunk_destinations, chunk_width))
+
+                if coalesced_stats is not None:
+                    coalesced_stats["gemm_calls"] = int(
+                        coalesced_stats.get("gemm_calls", 0)) + len(chunks)
+                    coalesced_stats["max_positions"] = max(
+                        int(coalesced_stats.get("max_positions", 0)),
+                        max(width for _inputs, _destinations, width in chunks))
+                    if len(chunks) > 1:
+                        coalesced_stats["split_experts"] = int(
+                            coalesced_stats.get("split_experts", 0)) + 1
+
+                for chunk_inputs, chunk_destinations, _width in chunks:
+                    expert_input = (
+                        chunk_inputs[0] if len(chunk_inputs) == 1
+                        else mx.concatenate(chunk_inputs, axis=1))
+                    value = glm5_next_swiglu(
+                        expert_input, experts[expert],
+                        f"{prefix}.mlp.experts.{expert}", cfg)
+                    mx.eval(value)
+                    cursor = 0
+                    chunk_touched = []
+                    for (tile_index, positions, weights,
+                         width) in chunk_destinations:
+                        contribution = (
+                            value[:, cursor:cursor + width]
+                            * weights[None, :, None]).astype(
+                                hidden_tiles[tile_index].dtype)
+                        routed[tile_index] = routed[tile_index].at[
+                            :, positions, :].add(contribution)
+                        touched.append(tile_index)
+                        chunk_touched.append(tile_index)
+                        cursor += width
+                    # Materialize before constructing the next bounded chunk;
+                    # otherwise MLX retains every prior expert intermediate
+                    # in one lazy graph and defeats the position ceiling.
+                    for tile_index in sorted(set(chunk_touched)):
+                        mx.eval(routed[tile_index])
                 continue
             for tile_index, (tile, groups) in enumerate(zip(
                     hidden_tiles, groups_by_tile)):

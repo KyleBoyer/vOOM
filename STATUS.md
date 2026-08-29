@@ -35,6 +35,21 @@ At 2,123 inputs the same coalescer regressed engine time 346.384 -> 360.991
 seconds (+4.2%) while preserving the hash, proving it cannot be a blanket
 short-context default.
 
+The first untouched 46,849-token coalesced attempt was stopped rather than
+allowing an unproductive retry: after about 45 minutes, its unbounded hot-
+expert operand learned a 2.5+GB transient and a 2.91GB expert-page reservation
+was correctly refused (4.15GB active, 7.33GB live ceiling). Reducing the
+32-position prefill tile to eight would not bound an expert gathered across
+all tiles. The coalescer now keeps the expert page resident but splits only
+its gathered operand at an explicit position ceiling (default 512), and a
+memory retry lowers that ceiling before changing tile width. A real layer-3
+expert sweep retained a 34.99x speedup at 512 positions versus 36.71x
+unbounded. The repeated 8,215-input gate preserved the established output SHA,
+completed without retry at 3.673GB peak, and took 720.616 seconds (+3.9% versus
+unbounded); it executed 14,640 coalesced GEMMs, split 1,271 expert calls, and
+never exceeded 512 positions. Client swap-out growth was 38.14MB, so this is a
+capacity fix, not a pressure/profile promotion.
+
 Direct Plex quality also blocks promotion. The focused real-schema run with
 BF16 expanded K/V scored 66.25/100 in 3,260.091 seconds. Int8 expanded K/V
 raised the score to 79/100 but regressed wall to 4,432.907 seconds; calls still

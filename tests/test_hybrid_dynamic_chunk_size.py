@@ -276,6 +276,43 @@ def test_glm53_long_prefill_retries_at_intermediate_64_tile():
     assert engine._hybrid_retry_chunk_ceiling == 0
 
 
+def test_glm53_coalesced_prefill_retries_position_limit_before_tile_width():
+    from runtime.engine import StreamingEngine
+
+    engine = _bare_engine(
+        "glm5_next", hot_kv_persist=None,
+        hot_prompt_kv_chunk_size=32)
+    engine.rc.layer_stationary_prefill = True
+    engine.rc.glm53_coalesced_expert_positions = True
+    engine.rc.glm53_coalesced_expert_max_positions = 512
+    attempts = []
+
+    def generate(*_args, **_kwargs):
+        attempts.append((
+            engine.rc.prefill_chunk_size,
+            engine.rc.glm53_coalesced_expert_max_positions))
+        engine._generation_sampled_tokens = 0
+        if len(attempts) == 1:
+            raise MemoryError("synthetic coalesced expert operand refusal")
+        return {
+            "prefill_s": 1.0, "first_token_s": 1.5, "total_s": 2.0,
+            "path_stats": {},
+        }
+
+    engine.generate = generate
+    engine.discard_failed_request_state = lambda: None
+    with (patch("runtime.engine.mx.clear_cache"),
+          patch("runtime.engine.mx.reset_peak_memory")):
+        result = StreamingEngine.generate_with_memory_retry(engine, "prompt")
+
+    assert attempts == [(32, 512), (32, 256)]
+    assert result["path_stats"]["memory_prefill_retry_chunks"] == []
+    assert result["path_stats"][
+        "memory_prefill_retry_coalesced_limits"] == [256]
+    assert result["path_stats"]["memory_prefill_retries"] == 1
+    assert engine._hybrid_retry_chunk_ceiling == 0
+
+
 def test_glm53_retry_requires_layer_stationary_prefill_and_no_persistence():
     engine = _bare_engine("glm5_next", hot_kv_persist=None)
     engine.rc.layer_stationary_prefill = True

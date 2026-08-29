@@ -320,10 +320,13 @@ def test_glm53_layer_stationary_moe_preserves_tile_shapes_and_expert_order():
         lambda *_args, **_kwargs: {}, iter_expert_batches=batches)
     reference_order = list(requested)
     requested.clear()
+    coalesced_stats = {}
     coalesced = glm5_next_mlp_layer_stationary_tiles(
         tiles, w, prefix, cfg, 0,
         lambda *_args, **_kwargs: {}, iter_expert_batches=batches,
-        coalesce_expert_positions=True)
+        coalesce_expert_positions=True,
+        coalesced_expert_max_positions=1,
+        coalesced_stats=coalesced_stats)
     mx.eval(*reference, *candidate, *coalesced)
 
     assert reference_order == sorted(set(reference_order))
@@ -335,6 +338,24 @@ def test_glm53_layer_stationary_moe_preserves_tile_shapes_and_expert_order():
     for expected, actual in zip(reference, coalesced):
         assert expected.shape == actual.shape
         assert bool(mx.allclose(expected, actual, atol=1e-5, rtol=1e-5))
+    assert coalesced_stats["max_positions"] <= 1
+    assert coalesced_stats["gemm_calls"] >= len(requested)
+    assert coalesced_stats["split_experts"] >= 1
+
+
+def test_glm53_coalesced_expert_position_limit_must_be_positive():
+    import mlx.core as mx
+
+    from runtime.glm5_next import glm5_next_mlp_layer_stationary_tiles
+
+    cfg = SimpleNamespace(
+        mlp_layer_types=("moe",), first_k_dense_replace=0)
+    with pytest.raises(ValueError, match="must be positive"):
+        glm5_next_mlp_layer_stationary_tiles(
+            [mx.zeros((1, 1, 4))], {}, "model.layers.0", cfg, 0,
+            lambda *_args, **_kwargs: {},
+            coalesce_expert_positions=True,
+            coalesced_expert_max_positions=0)
 
 @pytest.mark.parametrize("tile_size", [1, 2, 4])
 def test_glm53_sparse_mla_query_tiling_is_byte_exact(tile_size):

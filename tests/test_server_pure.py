@@ -2686,6 +2686,7 @@ def test_glm53_sparse_absorbed_mla_is_explicit_and_in_engine_identity():
         "VMODEL_GLM53_SPARSE_FUSED_ATTENTION": "0",
         "VMODEL_GLM53_SPARSE_FUSED_KV_INT8": "0",
         "VMODEL_GLM53_COALESCED_EXPERT_POSITIONS": "0",
+        "VMODEL_GLM53_COALESCED_EXPERT_MAX_POSITIONS": "512",
         "VMODEL_GLM53_INCREMENTAL_DSA_POOL": "0",
     }
     with patch.dict("os.environ", settings, clear=False), \
@@ -2706,8 +2707,10 @@ def test_glm53_sparse_absorbed_mla_is_explicit_and_in_engine_identity():
         manager.get(Path("/tmp/fake-glm53-sparse-absorbed"), "lossless")
         os.environ["VMODEL_GLM53_COALESCED_EXPERT_POSITIONS"] = "1"
         manager.get(Path("/tmp/fake-glm53-sparse-absorbed"), "lossless")
+        os.environ["VMODEL_GLM53_COALESCED_EXPERT_MAX_POSITIONS"] = "256"
+        manager.get(Path("/tmp/fake-glm53-sparse-absorbed"), "lossless")
 
-    assert len(captured) == 6
+    assert len(captured) == 7
     assert captured[0].glm53_sparse_absorbed_mla is False
     assert captured[1].glm53_sparse_absorbed_mla is True
     assert captured[2].glm53_sparse_absorbed_mla is False
@@ -2721,6 +2724,9 @@ def test_glm53_sparse_absorbed_mla_is_explicit_and_in_engine_identity():
     assert captured[4].glm53_incremental_dsa_pool is True
     assert captured[4].glm53_coalesced_expert_positions is False
     assert captured[5].glm53_coalesced_expert_positions is True
+    assert captured[5].glm53_coalesced_expert_max_positions == 512
+    assert captured[6].glm53_coalesced_expert_positions is True
+    assert captured[6].glm53_coalesced_expert_max_positions == 256
 
 
 def test_glm53_sparse_attention_candidates_are_mutually_exclusive():
@@ -2758,6 +2764,19 @@ def test_glm53_incremental_dsa_pool_rejects_untyped_env():
         "VMODEL_GLM53_INCREMENTAL_DSA_POOL": "auto",
     }, clear=False):
         with pytest.raises(RequestValidationError, match="must be 0 or 1"):
+            EngineManager().get(Path("/tmp/unused-glm53"), "lossless")
+
+
+@pytest.mark.parametrize("value", ["auto", "0", "64", "513", "8192"])
+def test_glm53_coalesced_expert_position_limit_rejects_invalid_env(value):
+    from unittest.mock import patch
+
+    from runtime.server import EngineManager, RequestValidationError
+
+    with patch.dict("os.environ", {
+        "VMODEL_GLM53_COALESCED_EXPERT_MAX_POSITIONS": value,
+    }, clear=False):
+        with pytest.raises(RequestValidationError, match="MAX_POSITIONS"):
             EngineManager().get(Path("/tmp/unused-glm53"), "lossless")
 
 

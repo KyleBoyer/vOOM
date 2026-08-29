@@ -1169,6 +1169,10 @@ class RuntimeConfig:
     # accumulation stay unchanged, but the GEMM outer shape changes, so this
     # remains an explicit lossy candidate.
     glm53_coalesced_expert_positions: bool = False
+    # Bound the gathered outer dimension for one coalesced expert GEMM. The
+    # expert page remains resident across chunks, so this limits Metal scratch
+    # without re-reading weights. Only used by the explicit lossy candidate.
+    glm53_coalesced_expert_max_positions: int = 512
     # Reuse immutable completed GLM-5.3 DSA pool keys instead of rebuilding
     # the whole prefix for every 32-position tile. Explicit until the real
     # Metal greedy/state oracle confirms that outer-shape changes do not alter
@@ -1423,6 +1427,8 @@ class RuntimeConfig:
                 "glm53_sparse_fused_kv_int8", False),
             glm53_coalesced_expert_positions=run.get(
                 "glm53_coalesced_expert_positions", False),
+            glm53_coalesced_expert_max_positions=run.get(
+                "glm53_coalesced_expert_max_positions", 512),
             glm53_incremental_dsa_pool=run.get(
                 "glm53_incremental_dsa_pool", False),
             kimi_k3_compressed_mla=run.get(
@@ -7633,6 +7639,11 @@ class StreamingEngine:
         ffn_hc_pre_s = 0.0
         mlp_s = 0.0
         ffn_hc_post_s = 0.0
+        coalesced_stats = {
+            "gemm_calls": 0,
+            "max_positions": 0,
+            "split_experts": 0,
+        }
 
         def note_memory(
                 phase: str, layer: int, completed_tokens: int = 0,
@@ -7829,6 +7840,9 @@ class StreamingEngine:
                 profile=profiler,
                 coalesce_expert_positions=(
                     self.rc.glm53_coalesced_expert_positions),
+                coalesced_expert_max_positions=(
+                    self.rc.glm53_coalesced_expert_max_positions),
+                coalesced_stats=coalesced_stats,
                 memory_guard=lambda phase, _layer=layer: note_memory(
                     phase, _layer, total, publish=False))
             mlp_s += time.perf_counter() - mlp_started
@@ -7923,6 +7937,16 @@ class StreamingEngine:
                 "mlp_s", 0.0)) + mlp_s,
             "ffn_hc_post_s": float(previous_stats.get(
                 "ffn_hc_post_s", 0.0)) + ffn_hc_post_s,
+            "coalesced_expert_gemm_calls": int(previous_stats.get(
+                "coalesced_expert_gemm_calls", 0)) + int(
+                    coalesced_stats["gemm_calls"]),
+            "coalesced_expert_max_positions": max(
+                int(previous_stats.get(
+                    "coalesced_expert_max_positions", 0)),
+                int(coalesced_stats["max_positions"])),
+            "coalesced_expert_split_experts": int(previous_stats.get(
+                "coalesced_expert_split_experts", 0)) + int(
+                    coalesced_stats["split_experts"]),
         }
         del kv._glm53_expanded_prefill
         self._restore_aggregate_layer_transient(total)
@@ -9517,6 +9541,8 @@ class StreamingEngine:
                 f"glm53sparsekvint8{int(self.rc.glm53_sparse_fused_kv_int8)}"
                 f"glm53coalexpert{int(
                     self.rc.glm53_coalesced_expert_positions)}"
+                f"glm53coalexpertmax{
+                    self.rc.glm53_coalesced_expert_max_positions}"
                 f"glm53poolcache{int(self.rc.glm53_incremental_dsa_pool)}"
                 f"k3cmla{int(self.rc.kimi_k3_compressed_mla)}"
                 f"k3abs{int(self.rc.kimi_k3_absorbed_mla)}"
@@ -12071,6 +12097,14 @@ class StreamingEngine:
                 self.rc.glm53_sparse_fused_kv_int8)
             path_stats["glm53_coalesced_expert_positions"] = int(
                 self.rc.glm53_coalesced_expert_positions)
+            path_stats["glm53_coalesced_expert_position_limit"] = int(
+                self.rc.glm53_coalesced_expert_max_positions)
+            path_stats["glm53_coalesced_expert_gemm_calls"] = int(
+                glm53_memory.get("coalesced_expert_gemm_calls", 0))
+            path_stats["glm53_coalesced_expert_max_positions"] = int(
+                glm53_memory.get("coalesced_expert_max_positions", 0))
+            path_stats["glm53_coalesced_expert_split_experts"] = int(
+                glm53_memory.get("coalesced_expert_split_experts", 0))
             path_stats["glm53_incremental_dsa_pool"] = int(
                 self.rc.glm53_incremental_dsa_pool)
             path_stats["glm53_layer_stationary_memory_samples"] = int(
@@ -12558,12 +12592,16 @@ class StreamingEngine:
         headroom observed at request start.  When
         the governor refuses an allocation *before the first token is sampled*,
         discard the partial recurrent/KV state and replay from the original
-        prompt at the next rung: 512 -> 128 -> 32 -> 8 -> 1.  This preserves
-        model math and favors arbitrarily slow token-at-a-time prefill over a
-        hard error.  No retry is allowed after sampling begins.
+        prompt at the next rung: 512 -> 128 -> 32 -> 8 -> 1. GLM's explicit
+        coalesced-expert candidate first reduces its gathered-position ceiling
+        because changing the underlying tile width does not bound an expert
+        gathered across all tiles. This preserves the configured arithmetic
+        class and favors arbitrarily slow bounded prefill over a hard error.
+        No retry is allowed after sampling begins.
         """
         failed_seconds = 0.0
         retry_chunks: list[int] = []
+        retry_coalesced_limits: list[int] = []
         retry_cleanup: list[dict[str, int]] = []
         retry_failures: list[str] = []
         self._hybrid_retry_chunk_ceiling = 0
@@ -12575,13 +12613,16 @@ class StreamingEngine:
                         prompt, max_tokens, on_token=on_token, stop=stop,
                         on_progress=on_progress, sampling=sampling,
                         constraint=constraint)
-                    if retry_chunks:
+                    if retry_chunks or retry_coalesced_limits:
                         result["prefill_s"] += failed_seconds
                         result["first_token_s"] += failed_seconds
                         result["total_s"] += failed_seconds
                         stats = result.setdefault("path_stats", {})
-                        stats["memory_prefill_retries"] = len(retry_chunks)
+                        stats["memory_prefill_retries"] = (
+                            len(retry_chunks) + len(retry_coalesced_limits))
                         stats["memory_prefill_retry_chunks"] = retry_chunks
+                        stats["memory_prefill_retry_coalesced_limits"] = (
+                            retry_coalesced_limits)
                         stats["memory_prefill_retry_seconds"] = failed_seconds
                         stats["memory_prefill_retry_cleanup"] = retry_cleanup
                         stats["memory_prefill_retry_failures"] = retry_failures
@@ -12592,24 +12633,48 @@ class StreamingEngine:
                             or not self._memory_prefill_retry_applies()):
                         raise
                     current = max(1, int(self.rc.prefill_chunk_size or 1))
+                    current_coalesced_limit = int(getattr(
+                        self.rc, "glm53_coalesced_expert_max_positions",
+                        512) or 512)
+                    next_coalesced_limit = 0
+                    if (self.cfg.model_type == "glm5_next"
+                            and bool(getattr(
+                                self.rc,
+                                "glm53_coalesced_expert_positions", False))
+                            and current_coalesced_limit > 128):
+                        next_coalesced_limit = next(
+                            (candidate for candidate in (
+                                2048, 1024, 512, 256, 128)
+                             if candidate < current_coalesced_limit),
+                            0,
+                        )
                     retry_ladder = (
                         (128, 64, 32, 8, 1)
                         if self.cfg.model_type == "glm5_next"
                         else (128, 32, 8, 1))
-                    next_chunk = next(
-                        (candidate for candidate in retry_ladder
-                         if candidate < current),
-                        0,
-                    )
-                    if not next_chunk:
-                        raise
-                    retry_chunks.append(next_chunk)
+                    next_chunk = 0
+                    if not next_coalesced_limit:
+                        next_chunk = next(
+                            (candidate for candidate in retry_ladder
+                             if candidate < current),
+                            0,
+                        )
+                        if not next_chunk:
+                            raise
+                        retry_chunks.append(next_chunk)
+                    else:
+                        retry_coalesced_limits.append(
+                            next_coalesced_limit)
                     retry_failures.append(str(error))
                     self.discard_failed_request_state()
-                    self._hybrid_retry_chunk_ceiling = next_chunk
-                    self.rc.prefill_chunk_size = next_chunk
-                    self.rc.hot_prompt_kv_chunk_size = next_chunk
-                    if self.rc.adaptive_chunk_size:
+                    if next_coalesced_limit:
+                        self.rc.glm53_coalesced_expert_max_positions = (
+                            next_coalesced_limit)
+                    else:
+                        self._hybrid_retry_chunk_ceiling = next_chunk
+                        self.rc.prefill_chunk_size = next_chunk
+                        self.rc.hot_prompt_kv_chunk_size = next_chunk
+                    if self.rc.adaptive_chunk_size and next_chunk:
                         # F68's AdaptiveChunkController only bounds the
                         # sweep's own compute-scratch peak -- it has no
                         # visibility into _fetch_experts' separate
@@ -12640,8 +12705,11 @@ class StreamingEngine:
                         self._adaptive_chunk_pinned_after_retry = True
                     print(
                         "[prefill] memory refusal before first sample: "
-                        f"{error}; retrying from scratch at "
-                        f"chunk={next_chunk}",
+                        f"{error}; retrying from scratch at " + (
+                            f"coalesced_expert_max_positions="
+                            f"{next_coalesced_limit}"
+                            if next_coalesced_limit
+                            else f"chunk={next_chunk}"),
                         flush=True,
                     )
                 # Run allocator cleanup only after leaving the ``except``
@@ -12661,6 +12729,9 @@ class StreamingEngine:
                 mx.reset_peak_memory()
                 retry_cleanup.append({
                     "chunk": int(self.rc.prefill_chunk_size),
+                    "coalesced_expert_max_positions": int(getattr(
+                        self.rc, "glm53_coalesced_expert_max_positions",
+                        0) or 0),
                     "active_before_bytes": active_before,
                     "active_after_bytes": active_after,
                     "released_bytes": max(0, active_before - active_after),

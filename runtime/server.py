@@ -2031,6 +2031,18 @@ class EngineManager:
         if glm53_coalesced_expert_positions_request not in ("0", "1"):
             raise RequestValidationError(
                 "VMODEL_GLM53_COALESCED_EXPERT_POSITIONS must be 0 or 1")
+        try:
+            glm53_coalesced_expert_max_positions = int(os.environ.get(
+                "VMODEL_GLM53_COALESCED_EXPERT_MAX_POSITIONS", "512"))
+        except ValueError as error:
+            raise RequestValidationError(
+                "VMODEL_GLM53_COALESCED_EXPERT_MAX_POSITIONS must be an "
+                "integer") from error
+        if glm53_coalesced_expert_max_positions not in (
+                128, 256, 512, 1024, 2048, 4096):
+            raise RequestValidationError(
+                "VMODEL_GLM53_COALESCED_EXPERT_MAX_POSITIONS must be one of "
+                "128, 256, 512, 1024, 2048, 4096")
         glm53_incremental_dsa_pool_request = os.environ.get(
             "VMODEL_GLM53_INCREMENTAL_DSA_POOL", "0").strip()
         if glm53_incremental_dsa_pool_request not in ("0", "1"):
@@ -2185,6 +2197,7 @@ class EngineManager:
             glm53_sparse_fused_attention_request,
             glm53_sparse_fused_kv_int8_request,
             glm53_coalesced_expert_positions_request,
+            glm53_coalesced_expert_max_positions,
             glm53_incremental_dsa_pool_request,
             glm53_prefill_tile_width,
             glm53_expert_fetch_batch,
@@ -2310,6 +2323,7 @@ class EngineManager:
             glm53_sparse_fused_attention_request,
             glm53_sparse_fused_kv_int8_request,
             glm53_coalesced_expert_positions_request,
+            glm53_coalesced_expert_max_positions,
             glm53_incremental_dsa_pool_request,
             glm53_prefill_tile_width,
             glm53_expert_fetch_batch,
@@ -2662,6 +2676,8 @@ class EngineManager:
                     glm53_sparse_fused_kv_int8_request == "1")
                 rc.glm53_coalesced_expert_positions = (
                     glm53_coalesced_expert_positions_request == "1")
+                rc.glm53_coalesced_expert_max_positions = (
+                    glm53_coalesced_expert_max_positions)
                 rc.glm53_incremental_dsa_pool = (
                     glm53_incremental_dsa_pool_request == "1")
                 # Exact request-to-request prefix reuse is deliberately
@@ -9137,6 +9153,10 @@ def _vision_protocol_timing(result: dict) -> dict:
         "glm53_sparse_fused_attention",
         "glm53_sparse_fused_kv_int8",
         "glm53_coalesced_expert_positions",
+        "glm53_coalesced_expert_position_limit",
+        "glm53_coalesced_expert_gemm_calls",
+        "glm53_coalesced_expert_max_positions",
+        "glm53_coalesced_expert_split_experts",
         "glm53_incremental_dsa_pool",
         "glm53_layer_stationary_memory_samples",
         "glm53_layer_stationary_peak_metal_bytes",
@@ -9717,6 +9737,7 @@ def _vision_protocol_timing(result: dict) -> dict:
         "speculative_round_context_s",
         "memory_prefill_retry_cleanup",
         "memory_prefill_retry_failures",
+        "memory_prefill_retry_coalesced_limits",
     ):
         if key in stats or key in result:
             value[key] = metric(key)
