@@ -1,4 +1,36 @@
-# STATUS — 2026-08-29 (current corrections first; dated chronology below is history)
+# STATUS — 2026-08-30 (current corrections first; dated chronology below is history)
+
+## 2026-08-30: full official GLM-5.3 is local and completes real generation
+
+The complete official `zai-org/GLM-5.3` revision
+`e0b07fd2751b42d5efa199cc02c2b271deadc516` is now present at
+`models/GLM-5.3` on Workspace NVMe. The local payload has all 141 indexed
+safetensors shards, no partial downloads, 118,629 tensors, and exactly
+755,617,140,416 tensor bytes. Header inspection found no unknown dtypes. A
+full Hugging Face revision-verification pass read the entire 704-GiB local
+tree without a missing or mismatched repository file; the command's only
+nonzero condition under `--fail-on-extra-files` was Hugging Face's own
+`.cache/huggingface` download metadata.
+
+The runtime loader recognizes the released `glm_moe_dsa` geometry (78 layers,
+256 routed experts, 8 active) and 59,044 fine-grained FP8 weight/scale pairs.
+The focused released-operator suite is 48 passing. A real short-prompt,
+max-one generation then completed through every layer: 7 prompt tokens,
+output token 198 (`"\n"`), 123.529 seconds engine time / 128.614 seconds wall,
+and 117,136,826,432 released weight bytes read. The governor observed about
+3.7 GB Metal. This proves end-to-end functionality, not intelligence or clean
+latency: the one-token cap cannot assess answer quality and swap-out growth was
+19,611,648 bytes, just above the 16-MB comparison gate.
+
+The workspace NVMe disconnected during the first sustained verification read,
+was physically corrected by the user, re-enumerated with verified SMART, and
+then passed an online APFS `fsck` with exit code 0. The repeated full read and
+the real generation both completed with the repaired connection. The three
+superseded raw checkpoints explicitly selected by the user
+(`DeepSeek-V4-Flash-0731`, `Qwen3.6-35B-A3B`, and `Qwythos-27B-v1`) were
+deleted rather than archived; their incomplete NAS staging data was also
+removed. Qwen3.8-Flash-Next, GLM-5.3-Flash, and optimized derivatives were
+left intact. Workspace free space is about 49 GiB after the full download.
 
 ## 2026-08-29: full GLM-5.3 staged and real FP8 layer passes; payload awaits space
 
