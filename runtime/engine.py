@@ -3449,7 +3449,12 @@ class StreamingEngine:
                 # Payload bytes are exact for the retained QTensor arrays;
                 # keep a small pad for container/alignment accounting.
                 return math.ceil(resident_bytes * 1.05)
-        if self.cfg.model_type == "glm5_next":
+        # GLM-5.3-Flash is ``glm5_next`` while full GLM-5.3 intentionally
+        # keeps the GLM-5.2 ``glm_moe_dsa`` architecture id.  Detect the
+        # released fine-grained-FP8 representation from the store rather than
+        # from the architecture name so old BF16 GLM-5.2 retains its existing
+        # path and the full 5.3 page is priced at its widened BF16 lifetime.
+        if getattr(store, "_glm53_fp8_aux", None):
             logical_names = (
                 self._layer_names(layer) if names is None else names)
             resident_bytes = store.finegrained_fp8_resident_bytes(

@@ -1,5 +1,41 @@
 # STATUS — 2026-08-29 (current corrections first; dated chronology below is history)
 
+## 2026-08-29: full GLM-5.3 staged and real FP8 layer passes; payload awaits space
+
+The new primary target is the official `zai-org/GLM-5.3` revision
+`e0b07fd2751b42d5efa199cc02c2b271deadc516`, distinct from the already-working
+GLM-5.3-Flash. Hub metadata reports 154 files, 141 safetensors shards, and
+755,617,140,416 tensor bytes. The full model deliberately keeps
+`model_type=glm_moe_dsa` because it uses the same base architecture as GLM-5.2;
+its gains are post-training. The released storage is fine-grained E4M3 FP8 with
+FP32 128x128 inverse scales, while embeddings and the untied head are BF16.
+
+Metadata and the first 5,363,940,952-byte shard are present under
+`models/GLM-5.3` on Workspace NVMe. Its SHA-256
+`29c537ab...d7d5b6` matches the Hub LFS record. The checkpoint inspector found
+177 real tensors in that shard with no unknown dtypes. WeightStore now applies
+the proven GLM-5.3 FP8 pair path to both `glm5_next` and `glm_moe_dsa`, while a
+BF16 GLM-5.2 fixture remains on its unchanged path. Admission prices the widened
+BF16 page from the detected representation rather than the architecture id.
+
+The real shard caught and fixed a partial-block bug: a released 576x6144
+projection has a 5x48 scale grid, so the fifth 128-row block is only half full.
+The old exact-divisibility helper rejected it. The decoder now validates the
+declared block size, repeats at the authoritative 128-row boundary, and crops
+only the padded tail; exact full blocks retain the allocation-free reshape path.
+The broader affected regression suite is 102 passing. A real complete layer-0
+fetch/forward read
+401,208,448 released bytes, budgeted 801,797,632 resident bytes, produced finite
+BF16 `[1,1,6144]` output with SHA-256 `0a15471a...b78239`, and peaked at
+1,513,012,384 Metal bytes. Fetch was 0.175s and forward 0.018s in that warm-file
+gate; this is format/runtime proof, not an end-to-end model timing.
+
+The remaining download is storage-blocked rather than runtime-blocked. After
+the first shard the Workspace NVMe has about 457.36GB decimal free, versus about
+750.30GB remaining, a roughly 292.94GB decimal shortfall. GLM-5.2 is already
+absent from Workspace, the mounted NAS, and the internal fast tier. No unrelated
+current model was deleted without an explicit archive choice.
+
 ## 2026-08-29: GLM-5.3 clears 46.8K admission; coalesced experts halve 8K prefill
 
 The untouched 178,616-byte / 134-tool captured request now completes a real

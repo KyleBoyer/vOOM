@@ -102,4 +102,5 @@ def test_inspect_lifts_nested_qwen4_exp_text_config(tmp_path):
     assert report["config_layer_types_present"] is True
     assert report["config_ple_layer_ids"] == [2]
     assert report["config_mtp_num_hidden_layers"] == 1
+    assert report["config_num_nextn_predict_layers"] is None
     assert "index_error" in report

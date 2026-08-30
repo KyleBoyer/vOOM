@@ -850,10 +850,12 @@ def dequantize_deepseek_v4_fp8(packed: mx.array, scale: mx.array) -> mx.array:
 
 
 def dequantize_finegrained_fp8(
-        packed: mx.array, weight_scale_inv: mx.array) -> mx.array:
+        packed: mx.array, weight_scale_inv: mx.array, *,
+        block_shape: tuple[int, int] | None = None) -> mx.array:
     """Dequantize HF fine-grained E4M3 weights with float32 block scales.
 
-    GLM-5.3-Flash stores every converted matrix as ``weight`` plus
+    Both released GLM-5.3 checkpoints store every converted matrix as
+    ``weight`` plus
     ``weight_scale_inv``.  Despite the historical name, the sibling contains
     the *dequantization multiplier*: the official Transformers conversion is
     ``float8(weight) * weight_scale_inv`` over the released 128x128 grid.
@@ -869,6 +871,52 @@ def dequantize_finegrained_fp8(
             "fine-grained FP8 weight_scale_inv must be float32, got "
             f"{weight_scale_inv.dtype}")
     values = mx.from_fp8(packed, mx.float32)
+    if block_shape is not None:
+        if (len(block_shape) != values.ndim
+                or any(not isinstance(v, int) or isinstance(v, bool) or v <= 0
+                       for v in block_shape)):
+            raise ValueError(
+                "fine-grained FP8 block_shape must contain one positive "
+                "integer per weight axis")
+        expected = tuple(
+            (int(full) + int(block) - 1) // int(block)
+            for full, block in zip(values.shape, block_shape)
+        )
+        if tuple(weight_scale_inv.shape) != expected:
+            raise ValueError(
+                "fine-grained FP8 scale grid does not match the declared "
+                f"block shape: weight={tuple(values.shape)}, "
+                f"scale={tuple(weight_scale_inv.shape)}, "
+                f"block={tuple(block_shape)}, expected={expected}")
+        if values.ndim == 2:
+            rows, cols = values.shape
+            block_rows, block_cols = block_shape
+            padded_rows = int(weight_scale_inv.shape[0]) * block_rows
+            padded_cols = int(weight_scale_inv.shape[1]) * block_cols
+            padded = values
+            if padded_rows != rows or padded_cols != cols:
+                padded = mx.pad(
+                    padded,
+                    ((0, padded_rows - rows), (0, padded_cols - cols)),
+                )
+            blocked = padded.reshape(
+                weight_scale_inv.shape[0], block_rows,
+                weight_scale_inv.shape[1], block_cols)
+            decoded = (blocked * weight_scale_inv[:, None, :, None]).reshape(
+                padded_rows, padded_cols)
+            return decoded[:rows, :cols].astype(mx.bfloat16)
+        # The Hub format ceil-divides its scale grid.  A dimension such as
+        # 576 therefore owns five 128-row scale blocks, with only 64 rows in
+        # the final block. Repeat by the declared block extent and crop the
+        # padded tail; inferring 576/5 would silently use the wrong 116-row
+        # boundaries. Two-dimensional model weights take the padded blocked
+        # path above, so this full-size scale expansion remains only a generic
+        # fallback for a future higher-rank fine-grained tensor.
+        expanded = weight_scale_inv
+        for axis, block in enumerate(block_shape):
+            expanded = mx.repeat(expanded, int(block), axis=axis)
+        slices = tuple(slice(0, int(full)) for full in values.shape)
+        return (values * expanded[slices]).astype(mx.bfloat16)
     if weight_scale_inv.ndim == 2 and values.ndim == 2:
         rows, cols = values.shape
         scale_rows, scale_cols = weight_scale_inv.shape

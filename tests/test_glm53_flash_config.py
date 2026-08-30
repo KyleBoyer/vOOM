@@ -249,3 +249,37 @@ def test_glm53_fp8_scale_dtype_mismatch_fails_closed():
     with pytest.raises(ValueError, match="weight_scale_inv must be float32"):
         dequantize_finegrained_fp8(
             mx.zeros((4, 4), mx.uint8), mx.ones((2, 2), mx.float16))
+
+
+def test_glm53_fp8_declared_block_grid_crops_partial_tail():
+    import mlx.core as mx
+
+    from runtime.quant import dequantize_finegrained_fp8
+
+    codes = np.arange(20, dtype=np.uint8).reshape(5, 4)
+    scales = np.array([
+        [1.0, 2.0],
+        [3.0, 4.0],
+        [5.0, 6.0],
+    ], dtype=np.float32)
+    values = mx.from_fp8(mx.array(codes), mx.float32)
+    expanded = np.repeat(np.repeat(scales, 2, axis=0), 2, axis=1)[:5, :4]
+    expected = (values * mx.array(expanded)).astype(mx.bfloat16)
+    got = dequantize_finegrained_fp8(
+        mx.array(codes), mx.array(scales), block_shape=(2, 2))
+    mx.eval(expected, got)
+
+    assert bool(mx.all(expected == got))
+
+
+def test_glm53_fp8_declared_block_grid_rejects_wrong_scale_shape():
+    import mlx.core as mx
+
+    from runtime.quant import dequantize_finegrained_fp8
+
+    with pytest.raises(ValueError, match="scale grid"):
+        dequantize_finegrained_fp8(
+            mx.zeros((5, 4), mx.uint8),
+            mx.ones((2, 2), mx.float32),
+            block_shape=(2, 2),
+        )

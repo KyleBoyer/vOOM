@@ -105,6 +105,8 @@ def inspect(model_dir: Path) -> dict:
         report["config_ple_layer_ids"] = text_config.get("ple_layer_ids")
         report["config_mtp_num_hidden_layers"] = text_config.get(
             "mtp_num_hidden_layers")
+        report["config_num_nextn_predict_layers"] = text_config.get(
+            "num_nextn_predict_layers")
         # If the checkpoint documents its own quantization scheme, that is
         # authoritative -- print it in full rather than inferring from
         # dtype strings alone, exactly like K2.5's real

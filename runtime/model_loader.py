@@ -79,6 +79,7 @@ class _FineGrainedFP8Aux:
 
     weight: str
     scale: str
+    block_shape: tuple[int, int]
 
 
 @dataclass(frozen=True)
@@ -725,20 +726,34 @@ class WeightStore:
                 self._dsv4_aux[name] = _DSV4Aux(name, scale)
                 quant_aux_names.add(scale)
 
-        # GLM-5.3-Flash uses Hugging Face's fine-grained FP8 layout.  Its
-        # float32 ``weight_scale_inv`` is a dequant multiplier over 128x128
-        # blocks, not DeepSeek-V4's E8M0 exponent-byte ``.scale``. Register a
-        # separate pair type so the two encodings can never be conflated.
+        # Both released GLM-5.3 checkpoints use Hugging Face's fine-grained
+        # FP8 layout: the hybrid ``glm5_next`` Flash model and the full
+        # ``glm_moe_dsa`` model.  The latter deliberately retains GLM-5.2's
+        # architecture identifier because 5.3 changes only post-training.
+        # Its float32 ``weight_scale_inv`` is a dequant multiplier over
+        # 128x128 blocks, not DeepSeek-V4's E8M0 exponent-byte ``.scale``.
+        # Register a separate pair type so the two encodings can never be
+        # conflated.  A released BF16 GLM-5.2 remains unaffected because it
+        # has no ``weight_scale_inv`` siblings.
         self._glm53_fp8_aux: dict[str, _FineGrainedFP8Aux] = {}
         if (not self.packed
-                and str(self.config.model_type) == "glm5_next"):
+                and str(self.config.model_type) in (
+                    "glm5_next", "glm_moe_dsa")):
+            block = self.quantization.get("weight_block_size")
             for name in list(self.weight_map):
                 if not name.endswith(".weight") or name in quant_aux_names:
                     continue
                 scale = name[:-len(".weight")] + ".weight_scale_inv"
                 if scale not in self.weight_map:
                     continue
-                self._glm53_fp8_aux[name] = _FineGrainedFP8Aux(name, scale)
+                if (not isinstance(block, (list, tuple)) or len(block) != 2
+                        or any(not isinstance(v, int) or isinstance(v, bool)
+                               or v <= 0 for v in block)):
+                    raise ValueError(
+                        "GLM-5.3 fine-grained FP8 requires a positive 2-D "
+                        "weight_block_size")
+                self._glm53_fp8_aux[name] = _FineGrainedFP8Aux(
+                    name, scale, (int(block[0]), int(block[1])))
                 quant_aux_names.add(scale)
 
         self.on_disk_quantized = bool(self._quant_aux)
@@ -935,7 +950,8 @@ class WeightStore:
                     raise ValueError(
                         "GLM-5.3 FP8 pair has unexpected dtypes: "
                         f"weight={weight.dtype}, scale={scale.dtype}")
-                joined[name] = dequantize_finegrained_fp8(weight, scale)
+                joined[name] = dequantize_finegrained_fp8(
+                    weight, scale, block_shape=glm53.block_shape)
                 mx.eval(joined[name])
                 continue
             # Dtype, not config, decides for DeepSeek V4: routed experts are
