@@ -25,6 +25,7 @@ any real GLM-5.2 run that exceeds index_topk=2048 tokens would have
 selected the WRONG top-k positions before this fix.
 """
 import sys
+import tempfile
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -104,7 +105,7 @@ def _runtime_last_row_selection(hf_cfg, indexer, h_torch) -> set:
         w[f"layer0.self_attn.indexer.{name}"] = mx.array(sd[name].numpy())
     # q_a_proj/q_a_layernorm are set by the caller into w before this runs
     cfg = _runtime_config(hf_cfg)
-    dsa = DSAState(cfg)
+    dsa = DSAState(cfg, key_tile_size=2)
     h_mx = mx.array(h_torch.numpy())
     dsa.observe(0, "full", h_mx, w, "layer0", offset=0)
 
@@ -132,9 +133,14 @@ def test_dsa_indexer_topk_selection_matches_hf():
     w["layer0.self_attn.q_a_layernorm.weight"] = mx.array(q_a_layernorm.weight.detach().numpy())
 
     cfg = _runtime_config(hf_cfg)
-    dsa = DSAState(cfg)
+    dsa = DSAState(cfg, key_tile_size=2, index_step_size=4)
     h_mx = mx.array(h_torch.numpy())
-    dsa.observe(0, "full", h_mx, w, "layer0", offset=0)
+    dsa.observe(0, "full", h_mx[:, :4], w, "layer0", offset=0)
+    dsa.observe(0, "full", h_mx[:, 4:], w, "layer0", offset=4)
+    assert dsa.stats["index_capacity_grows"] == 2
+    assert dsa.stats["index_rows_copied"] == 4
+    assert dsa.stats["index_rows_appended"] == S
+    assert dsa.stats["index_capacity_rows_peak"] == 8
     h_last = h_mx[:, -1:, :]
     q_a_last = mx.fast.rms_norm(
         _linear(h_last, w, "layer0.self_attn.q_a_proj"),
@@ -147,6 +153,92 @@ def test_dsa_indexer_topk_selection_matches_hf():
         f"DSA indexer top-k mismatch: HF selected {sorted(hf_selection)}, "
         f"runtime selected {sorted(runtime_selection)}"
     )
+
+
+def test_official_transformers_kth_tie_selects_lower_positions():
+    hf_cfg, indexer, rope, q_a_proj, q_a_layernorm = _build_hf_indexer()
+    with torch.no_grad():
+        for parameter in indexer.parameters():
+            parameter.zero_()
+    torch.manual_seed(25)
+    h_torch = torch.randn(1, S, HIDDEN)
+    hf_selection = _hf_last_row_selection(
+        hf_cfg, indexer, rope, q_a_proj, q_a_layernorm, h_torch)
+    assert hf_selection == set(range(INDEX_TOPK))
+
+    sd = indexer.state_dict()
+    w = {
+        f"layer0.self_attn.indexer.{name}": mx.array(sd[name].numpy())
+        for name in (
+            "wq_b.weight", "wk.weight", "k_norm.weight", "k_norm.bias",
+            "weights_proj.weight",
+        )
+    }
+    w["layer0.self_attn.q_a_proj.weight"] = mx.array(
+        q_a_proj.weight.detach().numpy())
+    w["layer0.self_attn.q_a_layernorm.weight"] = mx.array(
+        q_a_layernorm.weight.detach().numpy())
+    cfg = _runtime_config(hf_cfg)
+    dsa = DSAState(cfg, key_tile_size=2)
+    h_mx = mx.array(h_torch.numpy())
+    dsa.observe(0, "full", h_mx, w, "layer0", offset=0)
+    q_a = mx.fast.rms_norm(
+        _linear(h_mx[:, -1:], w, "layer0.self_attn.q_a_proj"),
+        w["layer0.self_attn.q_a_layernorm.weight"],
+        cfg.mla_latent_norm_eps,
+    )
+    selected = dsa.update_and_select(
+        0, "full", h_mx[:, -1:], q_a, w, "layer0", offset=S - 1)
+    assert selected[0, 0].tolist() == list(range(INDEX_TOPK))
+
+
+def test_indexshare_reuses_matching_query_range_and_fails_closed_otherwise():
+    hf_cfg, indexer, _rope, q_a_proj, q_a_layernorm = _build_hf_indexer()
+    torch.manual_seed(30)
+    h_torch = torch.randn(1, S, HIDDEN)
+    sd = indexer.state_dict()
+    w = {
+        f"layer0.self_attn.indexer.{name}": mx.array(sd[name].numpy())
+        for name in (
+            "wq_b.weight", "wk.weight", "k_norm.weight", "k_norm.bias",
+            "weights_proj.weight",
+        )
+    }
+    w["layer0.self_attn.q_a_proj.weight"] = mx.array(
+        q_a_proj.weight.detach().numpy())
+    w["layer0.self_attn.q_a_layernorm.weight"] = mx.array(
+        q_a_layernorm.weight.detach().numpy())
+    cfg = _runtime_config(hf_cfg)
+    scratch = tempfile.TemporaryDirectory()
+    dsa = DSAState(
+        cfg, key_tile_size=2, selection_spill_dir=scratch.name)
+    h_mx = mx.array(h_torch.numpy())
+    dsa.observe(0, "full", h_mx, w, "layer0", offset=0)
+    tile = h_mx[:, -2:, :]
+    q_a = mx.fast.rms_norm(
+        _linear(tile, w, "layer0.self_attn.q_a_proj"),
+        w["layer0.self_attn.q_a_layernorm.weight"],
+        cfg.mla_latent_norm_eps,
+    )
+    selected = dsa.update_and_select(
+        0, "full", tile, q_a, w, "layer0", offset=S - 2)
+    assert isinstance(dsa.selection_ranges[(S - 2, 2)], tuple)
+    assert dsa.stats["selection_spill_bytes_written"] == 2 * INDEX_TOPK * 4
+    reused = dsa.update_and_select(
+        1, "shared", tile, q_a, {}, "unused", offset=S - 2)
+    assert reused.tolist() == selected.tolist()
+    reused_again = dsa.update_and_select(
+        2, "shared", tile, q_a, {}, "unused", offset=S - 2)
+    assert reused_again.tolist() == selected.tolist()
+    assert dsa.stats["selection_spill_bytes_read"] == 4 * INDEX_TOPK * 4
+    assert dsa.stats["selection_spill_reads"] == 2
+    assert dsa.stats["selection_spill_flushes"] == 1
+    with pytest.raises(RuntimeError, match="missing the full-layer selection"):
+        dsa.update_and_select(
+            1, "shared", tile[:, :1], q_a[:, :1], {}, "unused",
+            offset=S - 1)
+    dsa.close_selection_spill()
+    scratch.cleanup()
 
 
 def _run_all():

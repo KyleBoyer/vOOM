@@ -1,4 +1,73 @@
-# STATUS — 2026-08-30 (current corrections first; dated chronology below is history)
+# STATUS — 2026-08-31 (current corrections first; dated chronology below is history)
+
+## 2026-08-31: full GLM-5.3 clears the real 46.8K harness; Flash is 33% faster
+
+The complete official `zai-org/GLM-5.3` now executes the untouched
+178,616-byte / 134-tool captured request at its real 46,849-token rendered
+size. Only the model alias and an explicit one-token output cap changed;
+streaming, captured sampling, messages, system prompt, and all tool schemas
+remained intact. The exact released FP8/BF16 target completed all 78 layers
+without retry in 3,573.109 seconds wall / 3,567.451 seconds prefill, read
+740,041,298,496 released bytes, and peaked at 6.024GB Metal. The one-token
+response is necessarily incomplete and is a capacity/correctness result, not
+an intelligence score. Client-observed cumulative swap-outs grew 258.26MB
+despite swap usage falling by about 101MB, so the strict 64MB pressure gate
+failed.
+
+That run uses an explicit/default-off exact long-context route: bounded tiled
+DSA scoring and stable chronological merge, query-range selection spill,
+compressed MLA K/V spill to Workspace NVMe, byte-identical absorbed MLA at a
+32-position query tile, and a 512-position dense-MLP tile. Candidate-ID and
+final-ID ordering work avoided 717,654 and 29,421 sorts respectively. The
+selection tier performed 79,857 reads but only 19 durability flushes, wrote
+7.707GB and read 20.920GB; compressed MLA spill wrote 4.233GB. Selection
+scoring cost 481.262 seconds and index observation 16.404 seconds. This is the
+first full released-model execution of the actual harness shape, not a
+synthetic schema substitution.
+
+The full target's newly exposed storage-only expert batching was also tested
+on a deterministic 2,219-token real-weight gate. Batch eight plus one-batch
+prefetch preserved the known one-token output SHA exactly, but regressed wall
+662.133 -> 699.684 seconds (+5.7%) and prefill 659.577 -> 695.778 seconds.
+Although 85.924 seconds of I/O was hidden, 529.797 seconds remained on the
+critical wait path. Peak Metal was 2.278GB and cumulative swap-outs grew
+63.275MB. The candidate is therefore stopped for full GLM-5.3; its defaults
+remain fetch batch one and prefetch off.
+
+On GLM-5.3-Flash, the same preserved capture and one-token cap completed in
+2,778.144 seconds wall / 2,772.693 seconds prefill versus the prior bounded
+tile-32 result's 4,156.344 / 4,150.574 seconds: **33.2% less wall and prefill**.
+This explicit sidequest composition uses tile 128, storage fetch batch eight
+with one-batch prefetch, the exact stepped DSA-pool cache, and the already
+lossy selected-row attention, int8 expanded K/V, and bounded-512 expert
+coalescer. MLP time fell 1,710.744 -> 988.515 seconds (-42.2%), MLA attention
+1,014.799 -> 472.196 seconds (-53.5%), DSA pool construction 9.747 -> 2.626
+seconds (-73.1%), and selection 78.241 -> 60.362 seconds (-22.9%). Peak Metal
+rose 7.259 -> 7.584GB, remaining under the 8.5GB operating ceiling. The host
+still accumulated 98.48MB of swap-outs and failed the strict 64MB gate.
+
+This Flash result is not promoted: the captured sampler is stochastic and the
+one-token hashes differed, so no token-identity claim is made. More
+importantly, the existing direct Plex gates already reject this lossy family:
+its best measured focused score is 79/100 and it omitted required call fields.
+The speed result is retained only as an opt-in sidequest measurement. A new
+privacy-safe harness progress reader records server SSE comments without
+modifying the request body and now deduplicates repeated internal milestones.
+
+An additional exact Flash substep now exposes
+`VMODEL_GLM53_COMPILED_KDA_PREFILL=1`. It compiles the unchanged KDA recurrence
+in bounded 32-position segments, retaining the reference MLX reductions and
+state-evaluation cadence. At released H64/D128/L128 geometry it was
+byte-identical for output and recurrent state and improved the scan 0.07355 ->
+0.06271 seconds (1.173x). A real 2,123-token gate then preserved output SHA
+`58bb119c...8909cb5`; against the immediately preceding otherwise-identical
+unwired arm, wall fell 351.929 -> 343.405 seconds (-2.4%) and KDA attention
+57.706 -> 48.922 seconds (-15.2%), while MLP was flat at 281.49/281.56
+seconds. Peak Metal moved 3.288 -> 3.299GB and swap-outs grew 17.924MB, under
+the 64MB gate. Applied to the 934.812-second KDA scan in the 46.8K trace, the
+measured phase ratio projects roughly 142 seconds additional savings, but that
+projection has not been claimed as a full-capture result. The exact switch
+remains explicit pending heterogeneous request-shape proof.
 
 ## 2026-08-30: full official GLM-5.3 is local and completes real generation
 

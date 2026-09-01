@@ -2048,11 +2048,90 @@ class EngineManager:
         if glm53_incremental_dsa_pool_request not in ("0", "1"):
             raise RequestValidationError(
                 "VMODEL_GLM53_INCREMENTAL_DSA_POOL must be 0 or 1")
+        glm53_compiled_kda_prefill_request = os.environ.get(
+            "VMODEL_GLM53_COMPILED_KDA_PREFILL", "0").strip()
+        if glm53_compiled_kda_prefill_request not in ("0", "1"):
+            raise RequestValidationError(
+                "VMODEL_GLM53_COMPILED_KDA_PREFILL must be 0 or 1")
         if (glm53_sparse_absorbed_mla_request == "1"
                 and glm53_sparse_fused_attention_request == "1"):
             raise RequestValidationError(
                 "GLM-5.3 absorbed and fused sparse attention candidates "
                 "are mutually exclusive")
+        glm_dsa_long_context_request = os.environ.get(
+            "VMODEL_GLM_DSA_LONG_CONTEXT", "0").strip()
+        if glm_dsa_long_context_request not in ("0", "1"):
+            raise RequestValidationError(
+                "VMODEL_GLM_DSA_LONG_CONTEXT must be 0 or 1")
+        glm_dsa_sparse_absorbed_request = os.environ.get(
+            "VMODEL_GLM_DSA_SPARSE_ABSORBED_MLA", "0").strip()
+        if glm_dsa_sparse_absorbed_request not in ("0", "1"):
+            raise RequestValidationError(
+                "VMODEL_GLM_DSA_SPARSE_ABSORBED_MLA must be 0 or 1")
+        if (glm_dsa_sparse_absorbed_request == "1"
+                and glm_dsa_long_context_request != "1"):
+            raise RequestValidationError(
+                "VMODEL_GLM_DSA_SPARSE_ABSORBED_MLA requires "
+                "VMODEL_GLM_DSA_LONG_CONTEXT=1")
+        glm_dsa_mla_kv_spill_request = os.environ.get(
+            "VMODEL_GLM_DSA_MLA_KV_SPILL_DIR", "").strip()
+        try:
+            glm_dsa_key_tile_size = int(os.environ.get(
+                "VMODEL_GLM_DSA_KEY_TILE_SIZE", "1024"))
+            glm_dsa_prefill_tile_width = int(os.environ.get(
+                "VMODEL_GLM_DSA_PREFILL_TILE_WIDTH", "8"))
+            glm_dsa_index_step_size = int(os.environ.get(
+                "VMODEL_GLM_DSA_INDEX_STEP_SIZE", "1024"))
+            glm_dsa_selection_query_tile_size = int(os.environ.get(
+                "VMODEL_GLM_DSA_SELECTION_QUERY_TILE_SIZE", "32"))
+            glm_dsa_dense_mlp_tile_size = int(os.environ.get(
+                "VMODEL_GLM_DSA_DENSE_MLP_TILE_SIZE", "512"))
+        except ValueError as error:
+            raise RequestValidationError(
+                "VMODEL_GLM_DSA tile settings must be integers") from error
+        if glm_dsa_key_tile_size not in (64, 128, 256, 512, 1024):
+            raise RequestValidationError(
+                "VMODEL_GLM_DSA_KEY_TILE_SIZE must be one of "
+                "64, 128, 256, 512, 1024")
+        if glm_dsa_prefill_tile_width not in (1, 2, 4, 8, 16, 32):
+            raise RequestValidationError(
+                "VMODEL_GLM_DSA_PREFILL_TILE_WIDTH must be one of "
+                "1, 2, 4, 8, 16, 32")
+        if (glm_dsa_prefill_tile_width > 8
+                and glm_dsa_sparse_absorbed_request != "1"):
+            raise RequestValidationError(
+                "VMODEL_GLM_DSA_PREFILL_TILE_WIDTH above 8 requires the "
+                "bounded absorbed MLA candidate")
+        if glm_dsa_index_step_size not in (256, 512, 1024, 2048):
+            raise RequestValidationError(
+                "VMODEL_GLM_DSA_INDEX_STEP_SIZE must be one of "
+                "256, 512, 1024, 2048")
+        if glm_dsa_selection_query_tile_size not in (
+                8, 16, 32, 64, 128, 256):
+            raise RequestValidationError(
+                "VMODEL_GLM_DSA_SELECTION_QUERY_TILE_SIZE must be one of "
+                "8, 16, 32, 64, 128, 256")
+        if (glm_dsa_selection_query_tile_size < glm_dsa_prefill_tile_width
+                or glm_dsa_selection_query_tile_size
+                % glm_dsa_prefill_tile_width):
+            raise RequestValidationError(
+                "VMODEL_GLM_DSA_SELECTION_QUERY_TILE_SIZE must be a multiple "
+                "of VMODEL_GLM_DSA_PREFILL_TILE_WIDTH")
+        if glm_dsa_dense_mlp_tile_size not in (128, 256, 512, 1024, 2048):
+            raise RequestValidationError(
+                "VMODEL_GLM_DSA_DENSE_MLP_TILE_SIZE must be one of "
+                "128, 256, 512, 1024, 2048")
+        if glm_dsa_long_context_request == "1":
+            if not glm_dsa_mla_kv_spill_request:
+                raise RequestValidationError(
+                    "VMODEL_GLM_DSA_LONG_CONTEXT=1 requires the exact "
+                    "external spill tier VMODEL_GLM_DSA_MLA_KV_SPILL_DIR")
+            spill_path = Path(glm_dsa_mla_kv_spill_request).expanduser()
+            if not spill_path.is_absolute() or not str(spill_path).startswith(
+                    "/Volumes/"):
+                raise RequestValidationError(
+                    "VMODEL_GLM_DSA_MLA_KV_SPILL_DIR must be an absolute "
+                    "external-volume path under /Volumes")
         try:
             glm53_prefill_tile_width = int(os.environ.get(
                 "VMODEL_GLM53_PREFILL_TILE_WIDTH", "32"))
@@ -2199,6 +2278,15 @@ class EngineManager:
             glm53_coalesced_expert_positions_request,
             glm53_coalesced_expert_max_positions,
             glm53_incremental_dsa_pool_request,
+            glm53_compiled_kda_prefill_request,
+            glm_dsa_long_context_request,
+            glm_dsa_sparse_absorbed_request,
+            glm_dsa_mla_kv_spill_request,
+            glm_dsa_key_tile_size,
+            glm_dsa_prefill_tile_width,
+            glm_dsa_index_step_size,
+            glm_dsa_selection_query_tile_size,
+            glm_dsa_dense_mlp_tile_size,
             glm53_prefill_tile_width,
             glm53_expert_fetch_batch,
             glm53_expert_batch_prefetch_request,
@@ -2325,6 +2413,15 @@ class EngineManager:
             glm53_coalesced_expert_positions_request,
             glm53_coalesced_expert_max_positions,
             glm53_incremental_dsa_pool_request,
+            glm53_compiled_kda_prefill_request,
+            glm_dsa_long_context_request,
+            glm_dsa_sparse_absorbed_request,
+            glm_dsa_mla_kv_spill_request,
+            glm_dsa_key_tile_size,
+            glm_dsa_prefill_tile_width,
+            glm_dsa_index_step_size,
+            glm_dsa_selection_query_tile_size,
+            glm_dsa_dense_mlp_tile_size,
             glm53_prefill_tile_width,
             glm53_expert_fetch_batch,
             glm53_expert_batch_prefetch_request,
@@ -2680,6 +2777,8 @@ class EngineManager:
                     glm53_coalesced_expert_max_positions)
                 rc.glm53_incremental_dsa_pool = (
                     glm53_incremental_dsa_pool_request == "1")
+                rc.glm53_compiled_kda_prefill = (
+                    glm53_compiled_kda_prefill_request == "1")
                 # Exact request-to-request prefix reuse is deliberately
                 # opt-in until it clears the heterogeneous real-request
                 # corpus.  GLM-5.3's layer-stationary prefill uses a fixed
@@ -2751,6 +2850,60 @@ class EngineManager:
                 # fallback. Fast-mode single-position decode has a separately
                 # bounded q=8 path above; lossless keeps q=1 everywhere.
                 rc.expert_fetch_batch = 1
+                rc.glm_dsa_key_tile_size = glm_dsa_key_tile_size
+                rc.glm_dsa_index_step_size = 0
+                rc.glm_dsa_selection_query_tile_size = 0
+                rc.glm_dsa_dense_mlp_tile_size = 0
+                rc.glm_dsa_sparse_absorbed_mla = False
+                rc.glm_dsa_mla_kv_spill_dir = ""
+                if glm_dsa_long_context_request == "1":
+                    # F75 explicit bring-up path. Query-specific DSA top-k is
+                    # scored/merged in bounded key tiles, full/shared
+                    # selections are retained only for their matching query
+                    # ranges, and each completed compressed MLA layer is
+                    # spilled byte-exactly to external NVMe. Keep this opt-in
+                    # until the official 49K capture and heterogeneous corpus
+                    # clear the released-model conformance gate.
+                    rc.context_bound = int(
+                        cfg_probe.max_position_embeddings or 1_048_576)
+                    rc.prefill_chunk_size = glm_dsa_prefill_tile_width
+                    rc.layer_stationary_prefill = True
+                    rc.adaptive_chunk_size = False
+                    rc.pin_embeddings = False
+                    rc.embed_rows = True
+                    rc.pin_lm_head = False
+                    rc.stream_lm_head = True
+                    # A long layer-stationary sweep has no useful cross-layer
+                    # reuse (both released-model gates measured zero resident
+                    # hits).  Even 500 MB triggered swap growth at the 46.8K
+                    # real-harness rung, so start at the already-supported
+                    # 150 MB minimum. Oversized demand pages remain valid and
+                    # are evicted before the following released page arrives.
+                    rc.max_weight_cache_mb = 150
+                    rc.min_weight_cache_mb = 150
+                    rc.mlx_cache_limit_mb = 512
+                    rc.metal_limit_mb = 8500
+                    rc.prefetch_depth = 0
+                    rc.prefetch_workers = 1
+                    rc.expert_compute_batch = 1
+                    rc.decode_expert_fetch_batch = 1
+                    # Storage grouping and a single future read are exact:
+                    # routed experts are still materialized and accumulated
+                    # one at a time in released ascending order. Reuse the
+                    # GLM-5.3 controls already proven by glm5_next, while
+                    # preserving batch=1/prefetch-off as the default.
+                    rc.expert_fetch_batch = glm53_expert_fetch_batch
+                    rc.expert_batch_prefetch = (
+                        glm53_expert_batch_prefetch_request == "1")
+                    rc.glm_dsa_index_step_size = glm_dsa_index_step_size
+                    rc.glm_dsa_selection_query_tile_size = (
+                        glm_dsa_selection_query_tile_size)
+                    rc.glm_dsa_dense_mlp_tile_size = (
+                        glm_dsa_dense_mlp_tile_size)
+                    rc.glm_dsa_sparse_absorbed_mla = (
+                        glm_dsa_sparse_absorbed_request == "1")
+                    rc.glm_dsa_mla_kv_spill_dir = (
+                        glm_dsa_mla_kv_spill_request)
             elif mtype == "kimi_k25":
                 # 2026-07-19: K2.5's vocab_size (163840) x hidden_size (7168)
                 # combination makes its untied lm_head unusually large
@@ -9159,6 +9312,7 @@ def _vision_protocol_timing(result: dict) -> dict:
         "glm53_coalesced_expert_max_positions",
         "glm53_coalesced_expert_split_experts",
         "glm53_incremental_dsa_pool",
+        "glm53_compiled_kda_prefill",
         "glm53_layer_stationary_memory_samples",
         "glm53_layer_stationary_peak_metal_bytes",
         "glm53_layer_stationary_initial_carrier_active_peak_bytes",
@@ -9175,6 +9329,44 @@ def _vision_protocol_timing(result: dict) -> dict:
         "glm53_sparse_fused_selected_rows",
         "glm53_dsa_pool_rows_computed",
         "glm53_dsa_pool_rows_reused",
+        "glm53_dsa_pool_build_s",
+        "glm53_dsa_selection_s",
+        "glm53_dsa_packed_capacity_grows",
+        "glm53_dsa_packed_rows_copied",
+        "glm53_dsa_packed_rows_appended",
+        "glm53_dsa_packed_capacity_rows_peak",
+        "glm53_dsa_pool_capacity_grows",
+        "glm53_dsa_pool_rows_copied",
+        "glm53_dsa_pool_capacity_rows_peak",
+        "glm53_dsa_pool_metadata_rows_avoided",
+        "dsa_observations",
+        "dsa_sparse_selects",
+        "dsa_shared_reuses",
+        "dsa_score_tiles",
+        "dsa_score_syncs",
+        "dsa_score_candidate_id_sorts_avoided",
+        "dsa_score_final_sorts_avoided",
+        "dsa_multi_query_selects",
+        "dsa_selection_ranges_peak",
+        "dsa_selection_bytes_peak",
+        "dsa_preselection_groups",
+        "dsa_preselection_queries",
+        "dsa_preselection_attention_ranges",
+        "glm_dsa_dense_mlp_tile_size",
+        "dsa_index_capacity_grows",
+        "dsa_index_rows_copied",
+        "dsa_index_rows_appended",
+        "dsa_index_capacity_rows_peak",
+        "dsa_selection_spill_bytes_written",
+        "dsa_selection_spill_bytes_read",
+        "dsa_selection_spill_reads",
+        "dsa_selection_spill_flushes",
+        "glm_dsa_mla_kv_spill_layers",
+        "glm_dsa_mla_kv_spill_bytes_written",
+        "glm_dsa_mla_kv_spill_bytes_read",
+        "glm_dsa_mla_kv_spill_reloads",
+        "glm_dsa_mla_kv_spill_resident_bytes",
+        "glm_dsa_mla_kv_spill_uncached_descriptors",
         "glm53_mtp_enabled",
         "glm53_mtp_used",
         "glm53_mtp_depth",
@@ -9591,6 +9783,11 @@ def _vision_protocol_timing(result: dict) -> dict:
         "glm53_layer_stationary_ffn_hc_pre_s",
         "glm53_layer_stationary_mlp_s",
         "glm53_layer_stationary_ffn_hc_post_s",
+        "dsa_selection_spill_write_s",
+        "dsa_selection_spill_read_s",
+        "dsa_selection_score_s",
+        "dsa_preselection_s",
+        "dsa_index_observe_s",
         "parallel_tier_wall_s",
         "parallel_tier_fast_service_s",
         "parallel_tier_archive_service_s",
@@ -9845,7 +10042,10 @@ def _execution_profile_fields(engine) -> dict[str, object]:
             "vmodel_lm_head_source_fingerprint": (
                 rc.rerank_lm_head_source_fingerprint),
         })
-    if rc is not None and getattr(rc, "kimi_k3_compiled_kda_prefill", False):
+    if rc is not None and (
+        getattr(rc, "kimi_k3_compiled_kda_prefill", False)
+        or getattr(rc, "glm53_compiled_kda_prefill", False)
+    ):
         fields["vmodel_kda_prefill"] = "compiled-mlx-byte-identical"
     elif (
         rc is not None

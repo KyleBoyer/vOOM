@@ -206,6 +206,21 @@ def test_protocol_timing_exposes_glm53_phase_active_peaks():
         assert timing[key] == value
 
 
+def test_protocol_timing_preserves_full_glm_dsa_phase_precision():
+    phases = {
+        "dsa_selection_spill_write_s": 0.125,
+        "dsa_selection_spill_read_s": 0.25,
+        "dsa_selection_score_s": 1.5,
+        "dsa_preselection_s": 2.75,
+        "dsa_index_observe_s": 3.125,
+    }
+
+    timing = _vision_protocol_timing({"path_stats": phases})
+
+    for key, value in phases.items():
+        assert timing[key] == value
+
+
 def test_vision_protocol_timing_exposes_qwen4_spool_phases():
     timing = _vision_protocol_timing({
         "path_stats": {
@@ -2453,6 +2468,92 @@ def test_glm_fast_mode_enables_quantized_cache_pages():
     assert captured[0].max_weight_cache_mb == 5000
 
 
+def test_full_glm_long_context_is_explicit_tiled_and_external_spilled():
+    from unittest.mock import patch
+
+    from runtime.server import EngineManager
+
+    captured = []
+
+    class FakeEngine:
+        def __init__(self, _path, rc):
+            captured.append(rc)
+
+        def close(self):
+            pass
+
+    cfg = SimpleNamespace(
+        model_type="glm_moe_dsa", tie_word_embeddings=False,
+        index_topk=2048, max_position_embeddings=1_048_576,
+        vision_config=None, num_experts_per_tok=8,
+    )
+    settings = {
+        "VMODEL_GLM_DSA_LONG_CONTEXT": "1",
+        "VMODEL_GLM_DSA_SPARSE_ABSORBED_MLA": "1",
+        "VMODEL_GLM_DSA_MLA_KV_SPILL_DIR": "/Volumes/Test/glm-dsa-spill",
+        "VMODEL_GLM_DSA_KEY_TILE_SIZE": "128",
+        "VMODEL_GLM_DSA_PREFILL_TILE_WIDTH": "32",
+        "VMODEL_GLM_DSA_INDEX_STEP_SIZE": "512",
+        "VMODEL_GLM_DSA_SELECTION_QUERY_TILE_SIZE": "64",
+        "VMODEL_GLM_DSA_DENSE_MLP_TILE_SIZE": "256",
+        "VMODEL_GLM53_EXPERT_FETCH_BATCH": "8",
+        "VMODEL_GLM53_EXPERT_BATCH_PREFETCH": "1",
+    }
+    with patch.dict(os.environ, settings, clear=False), \
+         patch("runtime.config.ModelConfig.from_dir", return_value=cfg), \
+         patch("runtime.path_resolver.resolve_model_dir", side_effect=lambda path: path), \
+         patch("runtime.engine.StreamingEngine", FakeEngine):
+        EngineManager().get(Path("/tmp/fake-full-glm53"), "lossless")
+
+    rc = captured[0]
+    assert rc.context_bound == 1_048_576
+    assert rc.prefill_chunk_size == 32
+    assert rc.glm_dsa_key_tile_size == 128
+    assert rc.glm_dsa_index_step_size == 512
+    assert rc.glm_dsa_selection_query_tile_size == 64
+    assert rc.glm_dsa_dense_mlp_tile_size == 256
+    assert rc.glm_dsa_sparse_absorbed_mla
+    assert rc.glm_dsa_mla_kv_spill_dir == "/Volumes/Test/glm-dsa-spill"
+    assert rc.layer_stationary_prefill
+    assert not rc.adaptive_chunk_size
+    assert rc.max_weight_cache_mb == 150
+    assert rc.metal_limit_mb == 8500
+    assert rc.expert_fetch_batch == 8
+    assert rc.expert_compute_batch == 1
+    assert rc.expert_batch_prefetch
+    assert rc.embed_rows and rc.stream_lm_head
+
+
+def test_full_glm_long_context_requires_external_spill():
+    from unittest.mock import patch
+
+    from runtime.server import EngineManager
+
+    with patch.dict(os.environ, {
+        "VMODEL_GLM_DSA_LONG_CONTEXT": "1",
+        "VMODEL_GLM_DSA_MLA_KV_SPILL_DIR": "",
+    }, clear=False), pytest.raises(
+        RequestValidationError, match="requires the exact external spill tier"
+    ):
+        EngineManager().get(Path("/tmp/unused-full-glm53"), "lossless")
+
+
+def test_full_glm_wide_prefill_tile_requires_absorbed_mla():
+    from unittest.mock import patch
+
+    from runtime.server import EngineManager
+
+    with patch.dict(os.environ, {
+        "VMODEL_GLM_DSA_LONG_CONTEXT": "1",
+        "VMODEL_GLM_DSA_SPARSE_ABSORBED_MLA": "0",
+        "VMODEL_GLM_DSA_MLA_KV_SPILL_DIR": "/Volumes/Test/glm-dsa-spill",
+        "VMODEL_GLM_DSA_PREFILL_TILE_WIDTH": "16",
+    }, clear=False), pytest.raises(
+        RequestValidationError, match="requires the bounded absorbed MLA"
+    ):
+        EngineManager().get(Path("/tmp/unused-full-glm53"), "lossless")
+
+
 def test_k25_lossless_uses_demand_paging_without_speculative_prefetch():
     from unittest.mock import patch
 
@@ -2691,6 +2792,7 @@ def test_glm53_sparse_absorbed_mla_is_explicit_and_in_engine_identity():
         "VMODEL_GLM53_COALESCED_EXPERT_POSITIONS": "0",
         "VMODEL_GLM53_COALESCED_EXPERT_MAX_POSITIONS": "512",
         "VMODEL_GLM53_INCREMENTAL_DSA_POOL": "0",
+        "VMODEL_GLM53_COMPILED_KDA_PREFILL": "0",
     }
     with patch.dict("os.environ", settings, clear=False), \
          patch("runtime.config.ModelConfig.from_dir", return_value=cfg), \
@@ -2712,8 +2814,10 @@ def test_glm53_sparse_absorbed_mla_is_explicit_and_in_engine_identity():
         manager.get(Path("/tmp/fake-glm53-sparse-absorbed"), "lossless")
         os.environ["VMODEL_GLM53_COALESCED_EXPERT_MAX_POSITIONS"] = "256"
         manager.get(Path("/tmp/fake-glm53-sparse-absorbed"), "lossless")
+        os.environ["VMODEL_GLM53_COMPILED_KDA_PREFILL"] = "1"
+        manager.get(Path("/tmp/fake-glm53-sparse-absorbed"), "lossless")
 
-    assert len(captured) == 7
+    assert len(captured) == 8
     assert captured[0].glm53_sparse_absorbed_mla is False
     assert captured[1].glm53_sparse_absorbed_mla is True
     assert captured[2].glm53_sparse_absorbed_mla is False
@@ -2730,6 +2834,8 @@ def test_glm53_sparse_absorbed_mla_is_explicit_and_in_engine_identity():
     assert captured[5].glm53_coalesced_expert_max_positions == 512
     assert captured[6].glm53_coalesced_expert_positions is True
     assert captured[6].glm53_coalesced_expert_max_positions == 256
+    assert captured[6].glm53_compiled_kda_prefill is False
+    assert captured[7].glm53_compiled_kda_prefill is True
 
 
 def test_glm53_sparse_attention_candidates_are_mutually_exclusive():
@@ -2765,6 +2871,18 @@ def test_glm53_incremental_dsa_pool_rejects_untyped_env():
 
     with patch.dict("os.environ", {
         "VMODEL_GLM53_INCREMENTAL_DSA_POOL": "auto",
+    }, clear=False):
+        with pytest.raises(RequestValidationError, match="must be 0 or 1"):
+            EngineManager().get(Path("/tmp/unused-glm53"), "lossless")
+
+
+def test_glm53_compiled_kda_prefill_rejects_untyped_env():
+    from unittest.mock import patch
+
+    from runtime.server import EngineManager, RequestValidationError
+
+    with patch.dict("os.environ", {
+        "VMODEL_GLM53_COMPILED_KDA_PREFILL": "auto",
     }, clear=False):
         with pytest.raises(RequestValidationError, match="must be 0 or 1"):
             EngineManager().get(Path("/tmp/unused-glm53"), "lossless")

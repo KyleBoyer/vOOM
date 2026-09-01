@@ -211,6 +211,60 @@ def _mla_absorbed_attention(
     return _linear(attn, w, f"{prefix}.self_attn.o_proj")
 
 
+def _mla_selected_absorbed_attention(
+    q_nope: mx.array,
+    q_rope: mx.array,
+    selected_lat: mx.array,
+    selected_valid: mx.array,
+    w: dict,
+    prefix: str,
+    cfg: ModelConfig,
+    h: mx.array,
+    *,
+    softmax_scale_mult: float = 1.0,
+) -> mx.array:
+    """Absorb query-specific DSA K/V projections around attention.
+
+    ``selected_lat`` is ``[B, L, K, c_kv + d_rope]``. Folding the released
+    per-head K/V up-projections changes the floating reduction association but
+    not the selected rows or target weights, so this remains an explicit
+    greedy-gated candidate rather than a structural exactness claim.
+    """
+    B, n_h, L, dn = q_nope.shape
+    dr = int(q_rope.shape[-1])
+    dv = int(cfg.v_head_dim)
+    kv_lora = int(selected_lat.shape[-1]) - dr
+    if kv_lora <= 0:
+        raise ValueError("selected compressed MLA latent has no c_kv component")
+    kv_b = w[f"{prefix}.self_attn.kv_b_proj.weight"]
+    if isinstance(kv_b, quant.QTensor):
+        raise ValueError(
+            "selected absorbed MLA currently requires a dense kv_b_proj weight")
+    w_kvb = kv_b.reshape(n_h, dn + dv, kv_lora)
+    w_uk, w_uv = w_kvb[:, :dn, :], w_kvb[:, dn:, :]
+    q_nope_abs = mx.einsum("bhld,hdc->bhlc", q_nope, w_uk)
+    q_latent = mx.concatenate([q_nope_abs, q_rope], axis=-1)
+    scores = mx.einsum(
+        "bhlc,blkc->bhlk", q_latent, selected_lat
+    ).astype(mx.float32)
+    scores = scores * ((dn + dr) ** -0.5 * softmax_scale_mult)
+    scores = mx.where(
+        selected_valid[:, None, :, :], scores,
+        mx.array(float("-inf"), dtype=mx.float32),
+    )
+    probabilities = mx.softmax(scores, axis=-1).astype(q_nope.dtype)
+    c_selected = (
+        selected_lat[..., :-dr] if dr else selected_lat)
+    weighted_c = mx.einsum(
+        "bhlk,blkc->bhlc", probabilities, c_selected)
+    out = mx.einsum("bhlc,hdc->bhld", weighted_c, w_uv)
+    attn = out.transpose(0, 2, 1, 3).reshape(B, L, n_h * dv)
+    if cfg.mla_use_output_gate:
+        attn = attn * mx.sigmoid(
+            _linear(h, w, f"{prefix}.self_attn.g_proj"))
+    return _linear(attn, w, f"{prefix}.self_attn.o_proj")
+
+
 def _mla_attention(
     h: mx.array, w: dict, prefix: str, cfg: ModelConfig, kv, layer: int, offset: int
 ) -> mx.array:
@@ -283,19 +337,108 @@ def _mla_attention(
         lat_all = kv.update_latent(layer, lat)  # (B, S, 512+dr)
         S = lat_all.shape[1]
 
-        # F22 DSA: beyond index_topk cached positions, the indexer selects which
-        # latents to expand and attend over (decode path, L=1). Below the
-        # threshold every position is selected -> dense path is exact.
+        # F22/F75 DSA: beyond index_topk cached positions, the indexer selects
+        # which latents to expand and attend over. Below the threshold every
+        # position is selected -> dense path is exact. Multi-position prefill
+        # has a different selected row set per query, so it uses the bounded
+        # query-specific compact path below rather than pretending one tile has
+        # a shared K/V sequence.
         dsa = getattr(kv, "dsa", None)
         itype = (cfg.indexer_types[layer] if cfg.indexer_types and layer < len(cfg.indexer_types)
                  else "shared")
-        if dsa is not None and cfg.index_topk:
+        dsa_preselected = bool(
+            dsa is not None
+            and getattr(dsa, "is_preselected", lambda _layer: False)(layer)
+        )
+        if dsa is not None and cfg.index_topk and not dsa_preselected:
             dsa.observe(layer, itype, h, w, prefix, offset)  # k-cache accumulates always, roped at absolute positions
-        if dsa is not None and cfg.index_topk and L == 1 and S > cfg.index_topk:
-            sel = dsa.update_and_select(layer, itype, h, q_a, w, prefix, offset)
-            if sel is not None:  # sel: (B, 1, topk) — gather selected latent rows
-                lat_all = mx.take(lat_all[0], sel[0, 0], axis=0)[None]
-                S = lat_all.shape[1]
+        selected_lat = None
+        selected_valid = None
+        if dsa is not None and cfg.index_topk and S > cfg.index_topk:
+            sel = (
+                dsa.selection_for_range(
+                    layer, offset, L, shared=False)
+                if dsa_preselected else
+                dsa.update_and_select(
+                    layer, itype, h, q_a, w, prefix, offset)
+            )
+            if sel is not None:
+                selected_valid = sel >= 0
+                safe_sel = mx.maximum(sel, 0)
+                if L == 1:
+                    # Decode retains the ordinary compact sequence shape.
+                    lat_all = mx.stack(
+                        [mx.take(lat_all[b], safe_sel[b, 0], axis=0)
+                         for b in range(B)], axis=0)
+                    S = lat_all.shape[1]
+                else:
+                    # mx.take accepts the (L, topk) index matrix directly,
+                    # producing one selected latent sequence per query.
+                    selected_lat = mx.stack(
+                        [mx.take(lat_all[b], safe_sel[b], axis=0)
+                         for b in range(B)], axis=0)
+
+        if selected_lat is not None:
+            if getattr(kv, "mla_absorbed_prefill", False):
+                return _mla_selected_absorbed_attention(
+                    q_nope,
+                    q_rope,
+                    selected_lat,
+                    selected_valid,
+                    w,
+                    prefix,
+                    cfg,
+                    h,
+                    softmax_scale_mult=softmax_scale_mult,
+                )
+            K = int(selected_lat.shape[2])
+            if dr:
+                c_selected = selected_lat[..., :-dr]
+                kr_selected = selected_lat[..., -dr:]
+            else:
+                c_selected = selected_lat
+                kr_selected = mx.zeros(
+                    (*selected_lat.shape[:-1], 0), dtype=selected_lat.dtype)
+            kvb = _linear(
+                c_selected, w, f"{prefix}.self_attn.kv_b_proj"
+            ).reshape(B, L, K, n_h, dn + dv)
+            k_nope, selected_values = kvb[..., :dn], kvb[..., dn:]
+            selected_keys = mx.concatenate(
+                [
+                    k_nope,
+                    mx.broadcast_to(
+                        kr_selected[..., None, :],
+                        (B, L, K, n_h, dr),
+                    ),
+                ],
+                axis=-1,
+            )
+            # Treat every query as a length-one attention batch. Its selected
+            # keys are already causal and chronologically ordered, matching the
+            # official mask/scatter path without allocating BxHxLxS.
+            compact_queries = queries.transpose(0, 2, 1, 3).reshape(
+                B * L, n_h, 1, dn + dr)
+            compact_keys = selected_keys.transpose(0, 1, 3, 2, 4).reshape(
+                B * L, n_h, K, dn + dr)
+            compact_values = selected_values.transpose(0, 1, 3, 2, 4).reshape(
+                B * L, n_h, K, dv)
+            compact_mask = mx.where(
+                selected_valid.reshape(B * L, 1, 1, K),
+                mx.array(0.0, dtype=compact_queries.dtype),
+                mx.array(float("-inf"), dtype=compact_queries.dtype),
+            )
+            attn = mx.fast.scaled_dot_product_attention(
+                compact_queries,
+                compact_keys,
+                compact_values,
+                scale=(dn + dr) ** -0.5 * softmax_scale_mult,
+                mask=compact_mask,
+            )
+            attn = attn.reshape(B, L, n_h, dv).reshape(B, L, n_h * dv)
+            if cfg.mla_use_output_gate:
+                attn = attn * mx.sigmoid(
+                    _linear(h, w, f"{prefix}.self_attn.g_proj"))
+            return _linear(attn, w, f"{prefix}.self_attn.o_proj")
 
         if dr:
             c_all, kr_all = lat_all[..., :-dr], lat_all[..., -dr:]
@@ -354,7 +497,13 @@ def _mla_attention(
         keys, values = kv.update(layer, keys, v)
 
     mask = None
-    if L > 1:
+    if selected_valid is not None:
+        mask = mx.where(
+            selected_valid[:, None, :, :],
+            mx.array(0.0, dtype=queries.dtype),
+            mx.array(float("-inf"), dtype=queries.dtype),
+        )
+    elif L > 1:
         q_pos = mx.arange(offset, offset + L)[:, None]
         k_pos = mx.arange(keys.shape[2])[None, :]
         mask = mx.where(k_pos <= q_pos, 0.0, float("-inf")).astype(queries.dtype)

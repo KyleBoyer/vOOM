@@ -49,6 +49,7 @@ comment's reasoning, not an independent measurement.
 """
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
@@ -58,7 +59,7 @@ import pytest
 import torch
 
 from runtime.config import ModelConfig
-from runtime.glm import _mla_attention
+from runtime.glm import _glm_mlp_residual, _mla_attention
 from runtime.glm_dsa import DSAState
 from runtime.kv_cache import KVCache
 
@@ -86,6 +87,92 @@ INDEXER_WEIGHT_NAMES = [
     "indexer.wq_b.weight", "indexer.wk.weight", "indexer.k_norm.weight",
     "indexer.k_norm.bias", "indexer.weights_proj.weight",
 ]
+
+
+def test_glm_layer_stationary_scheduler_preselects_before_attention(monkeypatch):
+    """Guard the engine integration, not only DSAState's isolated helper."""
+    from runtime.engine import StreamingEngine
+    import runtime.glm as glm_mod
+
+    events = []
+
+    class FakeDSA:
+        selection_query_tile_size = 4
+
+        def preselect_full_layer(
+                self, layer, hidden, weights, prefix, offset,
+                *, attention_tile_width):
+            events.append((
+                "preselect", layer, int(hidden.shape[1]), offset,
+                attention_tile_width))
+
+        def clear_selections(self):
+            events.append(("clear",))
+
+    class FakeCache:
+        def contains(self, _key):
+            return True
+
+        def get(self, _key, _names):
+            return {"sentinel": mx.array([1], dtype=mx.int32)}
+
+    def fake_attention(x, _w, _prefix, _cfg, _kv, layer, offset, **_kwargs):
+        assert events and events[0][0] == "preselect"
+        events.append(("attention", layer, offset, int(x.shape[1])))
+        return x
+
+    def fake_mlp(x, *_args, **_kwargs):
+        events.append(("mlp", int(x.shape[1])))
+        return x
+
+    monkeypatch.setattr(glm_mod, "_glm_attention_residual", fake_attention)
+    monkeypatch.setattr(glm_mod, "_glm_mlp_residual", fake_mlp)
+
+    engine = StreamingEngine.__new__(StreamingEngine)
+    engine.cfg = SimpleNamespace(
+        num_hidden_layers=1,
+        model_type="glm_moe_dsa",
+        indexer_types=["full"],
+        mlp_layer_types=["dense"],
+        first_k_dense_replace=1,
+    )
+    engine.rc = SimpleNamespace(
+        prefetch_depth=0,
+        glm_dsa_mla_kv_spill_dir="",
+        glm_dsa_dense_mlp_tile_size=4,
+    )
+    engine.prefetcher = None
+    engine.cache = FakeCache()
+    engine.governor = None
+    engine._dsv4_packed_trunk = False
+    engine._prefill_layer_transient_by_positions = {}
+    engine._decode_layer_transient = 0
+    engine._request_profiler = None
+    engine.timer = SimpleNamespace(add=lambda *_args: None)
+    engine._get_experts = lambda *_args, **_kwargs: {}
+    engine._iter_expert_batches = lambda *_args, **_kwargs: iter(())
+    engine._layer_key = lambda layer: f"layer.{layer}"
+    engine._layer_names = lambda _layer: []
+    engine._select_layer_transient = lambda *_args: 0
+    engine._record_layer_transient = lambda *_args: 0
+    engine._restore_aggregate_layer_transient = lambda *_args: 0
+    engine._note_true_peak = lambda: None
+
+    kv = SimpleNamespace(dsa=FakeDSA(), latent_spill_enabled=False)
+    x = mx.zeros((1, 6, 3), dtype=mx.float32)
+    out = engine._layer_stationary_glm_sweep(
+        x, kv, offset=7, tile_width=2)
+    mx.eval(out)
+
+    assert events == [
+        ("preselect", 0, 6, 7, 2),
+        ("attention", 0, 7, 2),
+        ("attention", 0, 9, 2),
+        ("mlp", 4),
+        ("attention", 0, 11, 2),
+        ("mlp", 2),
+        ("clear",),
+    ]
 
 
 def _build_hf_attention(seed: int):
@@ -138,11 +225,30 @@ def _weights_from_hf(attn) -> dict:
 def _runtime_last_row_output(w, cfg, h_mx) -> np.ndarray:
     kv = KVCache(num_layers=1)
     kv.compressed_mla = True
-    kv.dsa = DSAState(cfg)
+    kv.dsa = DSAState(cfg, key_tile_size=2)
     _ = _mla_attention(h_mx[:, : S - 1], w, "layer0", cfg, kv, layer=0, offset=0)
     out = _mla_attention(h_mx[:, S - 1 :], w, "layer0", cfg, kv, layer=0, offset=S - 1)
     mx.eval(out)
     return np.array(out)
+
+
+def _runtime_last_tile_output(
+    w, cfg, h_mx, tile_start: int, *, absorbed: bool = False,
+) -> tuple[np.ndarray, DSAState]:
+    kv = KVCache(num_layers=1)
+    kv.compressed_mla = True
+    kv.mla_absorbed_prefill = absorbed
+    kv.dsa = DSAState(cfg, key_tile_size=2)
+    # The caller chooses whether this stops exactly at K or deliberately makes
+    # the next tile straddle the K boundary.
+    _ = _mla_attention(
+        h_mx[:, :tile_start], w, "layer0", cfg, kv,
+        layer=0, offset=0)
+    out = _mla_attention(
+        h_mx[:, tile_start:], w, "layer0", cfg, kv,
+        layer=0, offset=tile_start)
+    mx.eval(out)
+    return np.array(out), kv.dsa
 
 
 def test_compact_sparse_attention_output_matches_hf_masked_dense():
@@ -173,6 +279,164 @@ def test_compact_sparse_attention_output_matches_hf_masked_dense():
     assert max_abs_diff < 1e-4, (
         f"compact sparse attention output mismatch at S={S} > index_topk={INDEX_TOPK}: "
         f"max abs diff {max_abs_diff}"
+    )
+
+
+def test_multi_query_tiled_sparse_attention_matches_hf_masked_dense():
+    """F75: the first real sparse L>1 tile matches official eager output."""
+    hf_cfg, attn, rope = _build_hf_attention(seed=13)
+    torch.manual_seed(14)
+    h_torch = torch.randn(1, S, HIDDEN)
+    position_ids = torch.arange(S)[None, :]
+    cos, sin = rope(h_torch, position_ids)
+    with torch.no_grad():
+        hf_out_all, _, hf_topk_all = attn(
+            h_torch, (cos, sin), None,
+            past_key_values=None, position_ids=position_ids)
+
+    tile_start = INDEX_TOPK
+    w = _weights_from_hf(attn)
+    cfg = _runtime_config(hf_cfg)
+    runtime_np, dsa = _runtime_last_tile_output(
+        w, cfg, mx.array(h_torch.numpy()), tile_start)
+    hf_np = hf_out_all[:, tile_start:, :].detach().numpy()
+
+    assert runtime_np.shape == hf_np.shape == (1, S - tile_start, HIDDEN)
+    max_abs_diff = np.max(np.abs(hf_np - runtime_np))
+    assert max_abs_diff < 1e-4, (
+        f"multi-query compact attention mismatch: max abs diff {max_abs_diff}")
+    runtime_ids = dsa.selection_ranges[(tile_start, S - tile_start)][0].tolist()
+    for row, ids in enumerate(runtime_ids, start=tile_start):
+        assert ids == sorted(ids), "compact selected rows must be chronological"
+        assert set(ids) == set(int(v) for v in hf_topk_all[0, row].tolist())
+    assert dsa.stats["multi_query_selects"] == 1
+    assert dsa.stats["score_tiles"] > 1
+
+
+def test_sparse_tile_straddling_topk_masks_padded_future_rows():
+    hf_cfg, attn, rope = _build_hf_attention(seed=23)
+    torch.manual_seed(24)
+    h_torch = torch.randn(1, S, HIDDEN)
+    position_ids = torch.arange(S)[None, :]
+    cos, sin = rope(h_torch, position_ids)
+    with torch.no_grad():
+        hf_out_all, _, _ = attn(
+            h_torch, (cos, sin), None,
+            past_key_values=None, position_ids=position_ids)
+
+    tile_start = INDEX_TOPK - 2
+    w = _weights_from_hf(attn)
+    cfg = _runtime_config(hf_cfg)
+    runtime_np, dsa = _runtime_last_tile_output(
+        w, cfg, mx.array(h_torch.numpy()), tile_start)
+    hf_np = hf_out_all[:, tile_start:, :].detach().numpy()
+    max_abs_diff = np.max(np.abs(hf_np - runtime_np))
+    assert max_abs_diff < 1e-4, (
+        f"K-boundary compact attention mismatch: max abs diff {max_abs_diff}")
+    ids = np.array(dsa.selection_ranges[(tile_start, S - tile_start)])
+    assert np.sum(ids[0, 0] >= 0) == tile_start + 1
+    assert -1 in ids[0, 0]
+
+
+def test_batched_preselection_matches_hf_with_compact_attention_tiles():
+    """Wide selector batches must not widen the K/V attention allocation."""
+    hf_cfg, attn, rope = _build_hf_attention(seed=33)
+    torch.manual_seed(34)
+    h_torch = torch.randn(1, S, HIDDEN)
+    position_ids = torch.arange(S)[None, :]
+    cos, sin = rope(h_torch, position_ids)
+    with torch.no_grad():
+        hf_out_all, _, _ = attn(
+            h_torch, (cos, sin), None,
+            past_key_values=None, position_ids=position_ids)
+
+    w = _weights_from_hf(attn)
+    cfg = _runtime_config(hf_cfg)
+    h_mx = mx.array(h_torch.numpy())
+    kv = KVCache(num_layers=1)
+    kv.compressed_mla = True
+    kv.dsa = DSAState(
+        cfg, key_tile_size=2, index_step_size=4,
+        selection_query_tile_size=4)
+    kv.dsa.preselect_full_layer(
+        0, h_mx, w, "layer0", 0, attention_tile_width=2)
+    outputs = []
+    for start in range(0, S, 2):
+        outputs.append(_mla_attention(
+            h_mx[:, start:start + 2], w, "layer0", cfg, kv,
+            layer=0, offset=start))
+    runtime = mx.concatenate(outputs, axis=1)
+    mx.eval(runtime)
+    max_abs_diff = np.max(np.abs(
+        hf_out_all.detach().numpy() - np.array(runtime)))
+    assert max_abs_diff < 1e-4, (
+        f"preselected compact attention mismatch: max abs diff {max_abs_diff}")
+    assert kv.dsa.stats["observations"] == (S + 1) // 2
+    assert kv.dsa.stats["preselection_groups"] == 1
+    assert kv.dsa.stats["preselection_queries"] == S - INDEX_TOPK
+    assert kv.dsa.stats["preselection_attention_ranges"] == 2
+    assert kv.dsa.stats["shared_reuses"] == 0
+
+
+def test_query_specific_absorbed_sparse_attention_preserves_selected_rows():
+    hf_cfg, attn, _rope = _build_hf_attention(seed=43)
+    torch.manual_seed(44)
+    h_torch = torch.randn(1, S, HIDDEN)
+    h_mx = mx.array(h_torch.numpy())
+    w = _weights_from_hf(attn)
+    cfg = _runtime_config(hf_cfg)
+    expanded, expanded_dsa = _runtime_last_tile_output(
+        w, cfg, h_mx, INDEX_TOPK)
+    absorbed, absorbed_dsa = _runtime_last_tile_output(
+        w, cfg, h_mx, INDEX_TOPK, absorbed=True)
+    assert np.array_equal(
+        np.array(expanded_dsa.selection), np.array(absorbed_dsa.selection))
+    max_abs_diff = np.max(np.abs(expanded - absorbed))
+    cosine = np.dot(expanded.ravel(), absorbed.ravel()) / (
+        np.linalg.norm(expanded.ravel()) * np.linalg.norm(absorbed.ravel()))
+    assert max_abs_diff < 1e-4
+    assert cosine > 0.999999
+
+
+def test_dense_glm_mlp_position_tiles_match_whole_released_activation_rows():
+    """The released BF16 activation rows remain exact across batch widths."""
+    rng = np.random.default_rng(53)
+    hidden = 8
+    intermediate = 12
+    prefix = "layer0"
+    cfg = SimpleNamespace(
+        rms_norm_eps=1e-6,
+        mlp_layer_types=("dense",),
+        first_k_dense_replace=1,
+    )
+    weights = {
+        f"{prefix}.post_attention_layernorm.weight": mx.array(
+            rng.normal(size=(hidden,)).astype(np.float32)).astype(mx.bfloat16),
+        f"{prefix}.mlp.gate_proj.weight": mx.array(
+            rng.normal(size=(intermediate, hidden)).astype(np.float32)
+        ).astype(mx.bfloat16),
+        f"{prefix}.mlp.up_proj.weight": mx.array(
+            rng.normal(size=(intermediate, hidden)).astype(np.float32)
+        ).astype(mx.bfloat16),
+        f"{prefix}.mlp.down_proj.weight": mx.array(
+            rng.normal(size=(hidden, intermediate)).astype(np.float32)
+        ).astype(mx.bfloat16),
+    }
+    x = mx.array(
+        rng.normal(size=(1, 7, hidden)).astype(np.float32)
+    ).astype(mx.bfloat16)
+    whole = _glm_mlp_residual(
+        x, weights, prefix, cfg, 0, lambda *_args, **_kwargs: {})
+    tiled = mx.concatenate([
+        _glm_mlp_residual(
+            x[:, start:start + 3], weights, prefix, cfg, 0,
+            lambda *_args, **_kwargs: {})
+        for start in range(0, x.shape[1], 3)
+    ], axis=1)
+    mx.eval(whole, tiled)
+    assert np.array_equal(
+        np.asarray(whole.astype(mx.float32)),
+        np.asarray(tiled.astype(mx.float32)),
     )
 
 

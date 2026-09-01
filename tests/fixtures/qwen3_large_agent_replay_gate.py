@@ -69,6 +69,27 @@ KNOWN_CAPTURES = {
     },
 }
 
+
+def _parse_sse_comment_progress(line: str) -> tuple[str, int, int] | None:
+    """Parse the server's privacy-safe ``: phase completed/total`` comment."""
+    if not line.startswith(": "):
+        return None
+    parts = line[2:].split()
+    if len(parts) != 2 or "/" not in parts[1]:
+        return None
+    label = parts[0]
+    if label not in ("prefill", "prefill_layer", "vision"):
+        return None
+    completed_raw, total_raw = parts[1].split("/", 1)
+    try:
+        completed = int(completed_raw)
+        total = int(total_raw)
+    except ValueError:
+        return None
+    if completed < 0 or total <= 0 or completed > total:
+        return None
+    return label, completed, total
+
 DEFERRED_ACTION_TURNS = [
     {"role": "user", "content": "Tell me a joke about Node.js."},
     {"role": "assistant", "content": "Why did the Node.js developer get stuck in the ocean? Because he tried to run a script on a boat."},
@@ -382,13 +403,15 @@ def _post(
         expected_nonempty_function_arguments: tuple[str, ...] = (),
         expected_output_text_terms: tuple[str, ...] = (),
         expected_output_text_any_terms: tuple[str, ...] = (),
-        score_plex_profile: bool = False) -> dict:
+        score_plex_profile: bool = False,
+        print_progress: bool = False) -> dict:
     request = urllib.request.Request(
         url, data=payload, headers={"Content-Type": "application/json"},
         method="POST")
     started = time.perf_counter()
     events: list[str] = []
     progress: list[dict] = []
+    comment_progress_seen: set[tuple[str, int, int]] = set()
     deltas: list[str] = []
     response_value = None
     try:
@@ -398,6 +421,34 @@ def _post(
             else:
                 for raw_line in response:
                     line = raw_line.decode("utf-8").strip()
+                    if line.startswith(": "):
+                        # The server emits privacy-safe SSE comments for long
+                        # prefill even when the captured request did not opt in
+                        # to vmodel vendor events.  Preserve those comments as
+                        # progress evidence without changing the request body.
+                        marker = _parse_sse_comment_progress(line)
+                        if marker is not None \
+                                and marker not in comment_progress_seen:
+                            comment_progress_seen.add(marker)
+                            label, completed, total = marker
+                            item = {
+                                "phase": label,
+                                "completed": completed,
+                                "total": total,
+                                "fraction": completed / total,
+                                "elapsed_s": round(
+                                    time.perf_counter() - started, 4),
+                                "transport": "sse_comment",
+                            }
+                            progress.append(item)
+                            if print_progress:
+                                print(
+                                    "[replay] "
+                                    f"{label} {completed}/{total} "
+                                    f"elapsed={item['elapsed_s']:.4f}s",
+                                    flush=True,
+                                )
+                        continue
                     if not line.startswith("data: "):
                         continue
                     event = json.loads(line[6:])
@@ -596,6 +647,11 @@ def main() -> int:
     parser.add_argument(
         "--preserve-stream", action="store_true",
         help="preserve the captured stream field instead of overriding it")
+    parser.add_argument(
+        "--print-progress", action="store_true",
+        help=(
+            "print privacy-safe prefill progress comments with elapsed time; "
+            "does not alter the captured request body"))
     parser.add_argument("--expected-selected-tools", type=int)
     parser.add_argument("--expected-max-input-tokens", type=int)
     parser.add_argument("--expected-embedding-status")
@@ -883,7 +939,8 @@ def main() -> int:
                 args.expected_output_text_term),
             expected_output_text_any_terms=tuple(
                 args.expected_output_text_any_term),
-            score_plex_profile=args.score_plex_profile)
+            score_plex_profile=args.score_plex_profile,
+            print_progress=args.print_progress)
         after = _pressure()
         row["repeat"] = index + 1
         row["request_label"] = label

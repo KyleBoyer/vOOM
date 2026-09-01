@@ -1181,6 +1181,39 @@ class RuntimeConfig:
     # Metal greedy/state oracle confirms that outer-shape changes do not alter
     # any released BF16 result.
     glm53_incremental_dsa_pool: bool = False
+    # Compile the ordinary GLM-5.3 KDA recurrence in bounded 32-position
+    # segments. The implementation retains the reference MLX operators,
+    # reduction order, and state materialization cadence; explicit until a
+    # real checkpoint timing/token gate proves useful performance.
+    glm53_compiled_kda_prefill: bool = False
+    # Exact F75 query/key tiling for the official glm_moe_dsa indexer. The
+    # score reduction dimension is unchanged; only the bounded candidate merge
+    # schedule differs. It is inert below index_topk and remains explicit at
+    # the server until the real long-context conformance gate passes.
+    glm_dsa_key_tile_size: int = 256
+    # Exact spare-capacity rows for the full GLM index-key history. Zero keeps
+    # the legacy concat path; the explicit long-context route uses 1024.
+    glm_dsa_index_step_size: int = 0
+    # Query rows scored together by the exact full-GLM DSA selector. Compact
+    # attention retains prefill_chunk_size; this independent width amortizes
+    # score/merge launches without expanding more selected MLA rows at once.
+    # Zero preserves the established coupled path.
+    glm_dsa_selection_query_tile_size: int = 0
+    # Position rows per dense-MLP materialization in full GLM's layer-major
+    # prefill. The first three released dense layers otherwise form gate/up
+    # intermediates across the complete prompt (multiple GB at 46.8K). Rows
+    # are independent and retain their hidden-dimension reduction order.
+    # Zero preserves the historical whole-prompt call shape.
+    glm_dsa_dense_mlp_tile_size: int = 0
+    # Algebraically absorb full GLM's released kv_b projection around dense
+    # and query-specific selected-row MLA prefill. This avoids expanding
+    # K selected latents into 64-head K/V per query, but changes floating
+    # association and therefore remains an explicit greedy-gated candidate.
+    glm_dsa_sparse_absorbed_mla: bool = False
+    # External-volume scratch for exact released-dtype compressed MLA rows of
+    # full GLM-5.3. Completed layer state is dead during later prefill layers,
+    # then restored one layer at a time for decode.
+    glm_dsa_mla_kv_spill_dir: str = ""
     # Official sparse-MLA serving layout for GLM-5.3. Algebraically folds the
     # released kv_b projection around attention instead of expanding 2,048
     # selected latents into 64-head K/V separately for every query. Explicit
@@ -1434,6 +1467,20 @@ class RuntimeConfig:
                 "glm53_coalesced_expert_max_positions", 512),
             glm53_incremental_dsa_pool=run.get(
                 "glm53_incremental_dsa_pool", False),
+            glm53_compiled_kda_prefill=run.get(
+                "glm53_compiled_kda_prefill", False),
+            glm_dsa_key_tile_size=run.get(
+                "glm_dsa_key_tile_size", 256),
+            glm_dsa_index_step_size=run.get(
+                "glm_dsa_index_step_size", 0),
+            glm_dsa_selection_query_tile_size=run.get(
+                "glm_dsa_selection_query_tile_size", 0),
+            glm_dsa_dense_mlp_tile_size=run.get(
+                "glm_dsa_dense_mlp_tile_size", 0),
+            glm_dsa_sparse_absorbed_mla=run.get(
+                "glm_dsa_sparse_absorbed_mla", False),
+            glm_dsa_mla_kv_spill_dir=run.get(
+                "glm_dsa_mla_kv_spill_dir", ""),
             kimi_k3_compressed_mla=run.get(
                 "kimi_k3_compressed_mla", False),
             kimi_k3_absorbed_mla=run.get(
@@ -1594,6 +1641,30 @@ class StreamingEngine:
             raise ValueError("stepped_kv_threshold must be >= 0")
         if self.rc.kimi_k3_mla_key_tile_size < 0:
             raise ValueError("kimi_k3_mla_key_tile_size must be >= 0")
+        if self.rc.glm_dsa_key_tile_size <= 0:
+            raise ValueError("glm_dsa_key_tile_size must be positive")
+        if self.rc.glm_dsa_index_step_size < 0:
+            raise ValueError("glm_dsa_index_step_size must be non-negative")
+        if self.rc.glm_dsa_selection_query_tile_size < 0:
+            raise ValueError(
+                "glm_dsa_selection_query_tile_size must be non-negative")
+        if self.rc.glm_dsa_dense_mlp_tile_size < 0:
+            raise ValueError(
+                "glm_dsa_dense_mlp_tile_size must be non-negative")
+        if (
+            self.rc.glm_dsa_mla_kv_spill_dir
+            and not self.rc.mla_compressed_kv
+        ):
+            raise ValueError(
+                "glm_dsa_mla_kv_spill_dir requires compressed MLA"
+            )
+        if (
+            self.rc.glm_dsa_sparse_absorbed_mla
+            and not self.rc.glm_dsa_mla_kv_spill_dir
+        ):
+            raise ValueError(
+                "glm_dsa_sparse_absorbed_mla requires the explicit long-context spill path"
+            )
         if self.rc.kimi_k3_fused_attnres_tile_size < 0:
             raise ValueError(
                 "kimi_k3_fused_attnres_tile_size must be >= 0"
@@ -5762,7 +5833,7 @@ class StreamingEngine:
                     native_fused_kda_prefill=(
                         self.rc.kimi_k3_native_fused_kda_prefill),
                     compiled_kda_prefill=(
-                        self.rc.kimi_k3_compiled_kda_prefill),
+                        self.rc.glm53_compiled_kda_prefill),
                     profile=profiler,
                 )
                 mx.eval(hc_stream)
@@ -5901,7 +5972,9 @@ class StreamingEngine:
             self._record_layer_transient(
                 position_count, i, measured_transient)
             self._note_true_peak()
-            if position_count == 1 and self.cfg.model_type == "kimi_k3":
+            if position_count == 1 and self.cfg.model_type in (
+                "kimi_k3", "glm_moe_dsa"
+            ):
                 # A token's layer-i endpoint is consumed only by layer i of
                 # the *next* token. No later layer in this sweep reads it, so
                 # return exact KDA/MLA state to the configured spill tier as
@@ -5912,13 +5985,21 @@ class StreamingEngine:
                 spilled = False
                 if (
                     self.rc.kimi_k3_kda_spill_dir
+                    and self.cfg.model_type == "kimi_k3"
                     and i in self.cfg.kda_layers
                     and getattr(kv, "kda_cache", None) is not None
                 ):
                     spilled = kv.kda_cache.spill_layer(i) or spilled
                 if (
                     self.rc.kimi_k3_mla_kv_spill_dir
+                    and self.cfg.model_type == "kimi_k3"
                     and i in self.cfg.full_attn_layers
+                    and getattr(kv, "latent_spill_enabled", False)
+                ):
+                    spilled = kv.spill_latent_layer(i) or spilled
+                if (
+                    self.rc.glm_dsa_mla_kv_spill_dir
+                    and self.cfg.model_type == "glm_moe_dsa"
                     and getattr(kv, "latent_spill_enabled", False)
                 ):
                     spilled = kv.spill_latent_layer(i) or spilled
@@ -7110,7 +7191,41 @@ class StreamingEngine:
             active_before = mx.get_active_memory()
             mx.reset_peak_memory()
             t0 = time.perf_counter()
+            dsa = getattr(kv, "dsa", None)
+            indexer_type = (
+                self.cfg.indexer_types[i]
+                if self.cfg.indexer_types
+                and i < len(self.cfg.indexer_types)
+                else "shared"
+            )
+            selection_width = int(
+                getattr(dsa, "selection_query_tile_size", 0) or 0)
+            if (
+                self.cfg.model_type == "glm_moe_dsa"
+                and dsa is not None
+                and indexer_type == "full"
+                and selection_width > tile_width
+            ):
+                dsa.preselect_full_layer(
+                    i, x, w, f"model.layers.{i}", offset,
+                    attention_tile_width=tile_width)
+                # All query-sized selections are now external-spilled; return
+                # score graphs/allocator cache before compact MLA expansion.
+                mx.clear_cache()
+            is_dense_mlp = (
+                self.cfg.mlp_layer_types[i] == "dense"
+                if i < len(self.cfg.mlp_layer_types)
+                else i < self.cfg.first_k_dense_replace
+            )
+            dense_mlp_tile_size = int(
+                self.rc.glm_dsa_dense_mlp_tile_size or 0)
+            tile_dense_mlp = bool(
+                is_dense_mlp and dense_mlp_tile_size > 0
+                and total > dense_mlp_tile_size)
             tiles = []
+            dense_attention_tiles = []
+            dense_attention_positions = 0
+            dense_mlp_s = 0.0
             pos = 0
             while pos < total:
                 end = min(pos + tile_width, total)
@@ -7129,19 +7244,64 @@ class StreamingEngine:
                         "attention", i,
                         time.perf_counter() - attention_t0,
                         positions=end - pos)
-                tiles.append(yt)
+                if tile_dense_mlp:
+                    dense_attention_tiles.append(yt)
+                    dense_attention_positions += end - pos
+                    if (dense_attention_positions >= dense_mlp_tile_size
+                            or end == total):
+                        dense_input = (
+                            dense_attention_tiles[0]
+                            if len(dense_attention_tiles) == 1
+                            else mx.concatenate(
+                                dense_attention_tiles, axis=1))
+                        dense_mlp_t0 = time.perf_counter()
+                        dense_output = _glm_mlp_residual(
+                            dense_input, w, f"model.layers.{i}", self.cfg, i,
+                            self._get_experts,
+                            iter_expert_batches=self._iter_expert_batches,
+                            profile=profiler)
+                        mx.eval(dense_output)
+                        dense_mlp_s += time.perf_counter() - dense_mlp_t0
+                        tiles.append(dense_output)
+                        dense_attention_tiles = []
+                        dense_attention_positions = 0
+                else:
+                    tiles.append(yt)
                 pos = end
-            x_after_attn = tiles[0] if len(tiles) == 1 else mx.concatenate(tiles, axis=1)
             mlp_t0 = time.perf_counter()
-            x = _glm_mlp_residual(
-                x_after_attn, w, f"model.layers.{i}", self.cfg, i,
-                self._get_experts,
-                iter_expert_batches=self._iter_expert_batches,
-                profile=profiler)
+            if tile_dense_mlp:
+                if dense_attention_tiles or dense_attention_positions:
+                    raise AssertionError(
+                        "dense GLM MLP tile buffer was not flushed")
+                x = (
+                    tiles[0]
+                    if len(tiles) == 1
+                    else mx.concatenate(tiles, axis=1))
+            else:
+                x_after_attn = (
+                    tiles[0]
+                    if len(tiles) == 1
+                    else mx.concatenate(tiles, axis=1))
+                x = _glm_mlp_residual(
+                    x_after_attn, w, f"model.layers.{i}", self.cfg, i,
+                    self._get_experts,
+                    iter_expert_batches=self._iter_expert_batches,
+                    profile=profiler)
             mx.eval(x)
+            if (
+                self.cfg.model_type == "glm_moe_dsa"
+                and self.rc.glm_dsa_mla_kv_spill_dir
+                and getattr(kv, "latent_spill_enabled", False)
+                and kv.spill_latent_layer(i)
+            ):
+                # This layer's released-dtype latent is not consumed by any
+                # later prefill layer. Decode restores exactly one layer at a
+                # time; keeping all 78 resident would cost ~4.4 GB at 49K.
+                mx.clear_cache()
             if profiler is not None and profiler.sync_substeps:
                 profiler.record_substep(
-                    "mlp", i, time.perf_counter() - mlp_t0,
+                    "mlp", i,
+                    dense_mlp_s + time.perf_counter() - mlp_t0,
                     positions=total)
             compute_s = time.perf_counter() - t0
             self.timer.add("layer_compute", compute_s)
@@ -7167,6 +7327,14 @@ class StreamingEngine:
                     mx.get_peak_memory()))
             self._note_true_peak()
             del w
+        dsa = getattr(kv, "dsa", None)
+        if dsa is not None:
+            # The final full indexer layer's per-query IndexShare selections
+            # have no remaining prefill consumer. Decode recomputes its own
+            # length-one selection and should not retain ~400 MB of tile state.
+            clear_selections = getattr(dsa, "clear_selections", None)
+            if callable(clear_selections):
+                clear_selections()
         self._restore_aggregate_layer_transient(total)
         return x
 
@@ -7771,7 +7939,7 @@ class StreamingEngine:
                             native_fused_prefill=(
                                 self.rc.kimi_k3_native_fused_kda_prefill),
                             compiled_prefill=(
-                                self.rc.kimi_k3_compiled_kda_prefill),
+                                self.rc.glm53_compiled_kda_prefill),
                             released_output_dtype=True,
                             profile=profiler,
                         )
@@ -9552,6 +9720,13 @@ class StreamingEngine:
                 f"glm53coalexpertmax{
                     self.rc.glm53_coalesced_expert_max_positions}"
                 f"glm53poolcache{int(self.rc.glm53_incremental_dsa_pool)}"
+                f"glm53compiledkda{int(self.rc.glm53_compiled_kda_prefill)}"
+                f"glmdsakeytile{self.rc.glm_dsa_key_tile_size}"
+                f"glmdsaindexstep{self.rc.glm_dsa_index_step_size}"
+                f"glmdsaquerytile{self.rc.glm_dsa_selection_query_tile_size}"
+                f"glmdsadensemlptile{self.rc.glm_dsa_dense_mlp_tile_size}"
+                f"glmdsaabsorbed{int(self.rc.glm_dsa_sparse_absorbed_mla)}"
+                f"glmdsaspill{int(bool(self.rc.glm_dsa_mla_kv_spill_dir))}"
                 f"k3cmla{int(self.rc.kimi_k3_compressed_mla)}"
                 f"k3abs{int(self.rc.kimi_k3_absorbed_mla)}"
                 f"k3mlakt{self.rc.kimi_k3_mla_key_tile_size}"
@@ -9646,7 +9821,13 @@ class StreamingEngine:
             self.rc.mla_compressed_kv
             and self.cfg.model_type == "glm5_next"
         )
-        if stepped or k3_compressed_mla or glm53_compressed_mla:
+        glm_dsa_spilled_mla = bool(
+            self.rc.mla_compressed_kv
+            and self.cfg.model_type == "glm_moe_dsa"
+            and self.rc.glm_dsa_mla_kv_spill_dir
+        )
+        if (stepped or k3_compressed_mla or glm53_compressed_mla
+                or glm_dsa_spilled_mla):
             from .kv_cache import SteppedKVCache
 
             kv = SteppedKVCache(self.cfg.num_hidden_layers)
@@ -9689,7 +9870,20 @@ class StreamingEngine:
                 else:
                     from .glm_dsa import DSAState
 
-                    kv.dsa = DSAState(self.cfg)
+                    kv.dsa = DSAState(
+                        self.cfg,
+                        key_tile_size=self.rc.glm_dsa_key_tile_size,
+                        index_step_size=self.rc.glm_dsa_index_step_size,
+                        selection_query_tile_size=(
+                            self.rc.glm_dsa_selection_query_tile_size),
+                        selection_spill_dir=(
+                            self.rc.glm_dsa_mla_kv_spill_dir),
+                    )
+            if glm_dsa_spilled_mla:
+                kv.enable_latent_disk_spill(
+                    self.rc.glm_dsa_mla_kv_spill_dir)
+                kv.mla_absorbed_prefill = bool(
+                    self.rc.glm_dsa_sparse_absorbed_mla)
         if k3_compressed_mla:
             # Explicit K3 candidate: retain only Moonshot's released
             # [c_kv | k_rope] latent, and use the capacity-stepped axis-1
@@ -12089,11 +12283,61 @@ class StreamingEngine:
         # caller asserting e.g. `dsa_sparse_selects>0` catches a silently
         # no-op long-context run (short prompt, wrong bound, etc.) the same
         # way this exact gap was found in this session's own real-GLM script.
+        if self.cfg.model_type == "glm_moe_dsa":
+            path_stats["glm_dsa_dense_mlp_tile_size"] = int(
+                self.rc.glm_dsa_dense_mlp_tile_size)
         dsa_state = getattr(kv, "dsa", None)
         if dsa_state is not None:
             path_stats["dsa_observations"] = dsa_state.stats["observations"]
             path_stats["dsa_sparse_selects"] = dsa_state.stats["sparse_selects"]
             path_stats["dsa_shared_reuses"] = dsa_state.stats["shared_reuses"]
+            path_stats["dsa_score_tiles"] = int(
+                dsa_state.stats.get("score_tiles", 0))
+            path_stats["dsa_score_syncs"] = int(
+                dsa_state.stats.get("score_syncs", 0))
+            path_stats["dsa_score_candidate_id_sorts_avoided"] = int(
+                dsa_state.stats.get(
+                    "score_candidate_id_sorts_avoided", 0))
+            path_stats["dsa_score_final_sorts_avoided"] = int(
+                dsa_state.stats.get("score_final_sorts_avoided", 0))
+            path_stats["dsa_multi_query_selects"] = int(
+                dsa_state.stats.get("multi_query_selects", 0))
+            path_stats["dsa_selection_ranges_peak"] = int(
+                dsa_state.stats.get("selection_ranges_peak", 0))
+            path_stats["dsa_selection_bytes_peak"] = int(
+                dsa_state.stats.get("selection_bytes_peak", 0))
+            path_stats["dsa_preselection_groups"] = int(
+                dsa_state.stats.get("preselection_groups", 0))
+            path_stats["dsa_preselection_queries"] = int(
+                dsa_state.stats.get("preselection_queries", 0))
+            path_stats["dsa_preselection_attention_ranges"] = int(
+                dsa_state.stats.get("preselection_attention_ranges", 0))
+            path_stats["dsa_index_capacity_grows"] = int(
+                dsa_state.stats.get("index_capacity_grows", 0))
+            path_stats["dsa_index_rows_copied"] = int(
+                dsa_state.stats.get("index_rows_copied", 0))
+            path_stats["dsa_index_rows_appended"] = int(
+                dsa_state.stats.get("index_rows_appended", 0))
+            path_stats["dsa_index_capacity_rows_peak"] = int(
+                dsa_state.stats.get("index_capacity_rows_peak", 0))
+            path_stats["dsa_selection_spill_bytes_written"] = int(
+                dsa_state.stats.get("selection_spill_bytes_written", 0))
+            path_stats["dsa_selection_spill_bytes_read"] = int(
+                dsa_state.stats.get("selection_spill_bytes_read", 0))
+            path_stats["dsa_selection_spill_reads"] = int(
+                dsa_state.stats.get("selection_spill_reads", 0))
+            path_stats["dsa_selection_spill_flushes"] = int(
+                dsa_state.stats.get("selection_spill_flushes", 0))
+            path_stats["dsa_selection_spill_write_s"] = float(
+                dsa_state.stats.get("selection_spill_write_s", 0.0))
+            path_stats["dsa_selection_spill_read_s"] = float(
+                dsa_state.stats.get("selection_spill_read_s", 0.0))
+            path_stats["dsa_selection_score_s"] = float(
+                dsa_state.stats.get("selection_score_s", 0.0))
+            path_stats["dsa_preselection_s"] = float(
+                dsa_state.stats.get("preselection_s", 0.0))
+            path_stats["dsa_index_observe_s"] = float(
+                dsa_state.stats.get("index_observe_s", 0.0))
         if self.cfg.model_type == "glm5_next":
             glm53_memory = getattr(
                 self, "_glm53_layer_stationary_stats", {}) or {}
@@ -12115,6 +12359,8 @@ class StreamingEngine:
                 glm53_memory.get("coalesced_expert_split_experts", 0))
             path_stats["glm53_incremental_dsa_pool"] = int(
                 self.rc.glm53_incremental_dsa_pool)
+            path_stats["glm53_compiled_kda_prefill"] = int(
+                self.rc.glm53_compiled_kda_prefill)
             path_stats["glm53_layer_stationary_memory_samples"] = int(
                 glm53_memory.get("memory_samples", 0))
             path_stats["glm53_layer_stationary_peak_metal_bytes"] = int(
@@ -12163,6 +12409,22 @@ class StreamingEngine:
                     dsa_state.stats.get("pool_build_s", 0.0))
                 path_stats["glm53_dsa_selection_s"] = float(
                     dsa_state.stats.get("selection_s", 0.0))
+                path_stats["glm53_dsa_packed_capacity_grows"] = int(
+                    dsa_state.stats.get("packed_capacity_grows", 0))
+                path_stats["glm53_dsa_packed_rows_copied"] = int(
+                    dsa_state.stats.get("packed_rows_copied", 0))
+                path_stats["glm53_dsa_packed_rows_appended"] = int(
+                    dsa_state.stats.get("packed_rows_appended", 0))
+                path_stats["glm53_dsa_packed_capacity_rows_peak"] = int(
+                    dsa_state.stats.get("packed_capacity_rows_peak", 0))
+                path_stats["glm53_dsa_pool_capacity_grows"] = int(
+                    dsa_state.stats.get("pool_capacity_grows", 0))
+                path_stats["glm53_dsa_pool_rows_copied"] = int(
+                    dsa_state.stats.get("pool_rows_copied", 0))
+                path_stats["glm53_dsa_pool_capacity_rows_peak"] = int(
+                    dsa_state.stats.get("pool_capacity_rows_peak", 0))
+                path_stats["glm53_dsa_pool_metadata_rows_avoided"] = int(
+                    dsa_state.stats.get("pool_metadata_rows_avoided", 0))
         path_stats["expert_compute_batches"] = self._expert_compute_batches
         path_stats["max_experts_per_compute_batch"] = self._max_experts_per_compute_batch
         path_stats["adaptive_expert_batch_clamps"] = self._adaptive_expert_batch_clamps
@@ -12479,9 +12741,15 @@ class StreamingEngine:
             path_stats["k3_kda_spill"] = dict(
                 self._last_k3_kda_spill_stats)
         if getattr(kv, "latent_spill_enabled", False):
-            self._last_k3_mla_kv_spill_stats = kv.latent_spill_stats()
-            path_stats["k3_mla_kv_spill"] = dict(
-                self._last_k3_mla_kv_spill_stats)
+            spill_stats = kv.latent_spill_stats()
+            if self.cfg.model_type == "glm_moe_dsa":
+                self._last_glm_dsa_mla_kv_spill_stats = spill_stats
+                path_stats["glm_dsa_mla_kv_spill"] = dict(spill_stats)
+                for key, value in spill_stats.items():
+                    path_stats[f"glm_dsa_mla_kv_spill_{key}"] = int(value)
+            else:
+                self._last_k3_mla_kv_spill_stats = spill_stats
+                path_stats["k3_mla_kv_spill"] = dict(spill_stats)
         _record_cache_io_delta(
             self, request_cache_before, path_stats, after=request_cache_after)
         _record_cache_io_delta(
@@ -12656,10 +12924,12 @@ class StreamingEngine:
                              if candidate < current_coalesced_limit),
                             0,
                         )
-                    retry_ladder = (
-                        (128, 64, 32, 8, 1)
-                        if self.cfg.model_type == "glm5_next"
-                        else (128, 32, 8, 1))
+                    if self.cfg.model_type == "glm5_next":
+                        retry_ladder = (128, 64, 32, 8, 1)
+                    elif self.cfg.model_type == "glm_moe_dsa":
+                        retry_ladder = (8, 4, 2, 1)
+                    else:
+                        retry_ladder = (128, 32, 8, 1)
                     next_chunk = 0
                     if not next_coalesced_limit:
                         next_chunk = next(
@@ -12850,6 +13120,16 @@ class StreamingEngine:
             # hard 8.5GB cap before sampling. Replaying at 64/32 bounds the
             # tile scratch while preserving the released operator order and
             # is safer than failing a request that can run more slowly.
+            return True
+        if (
+            self._hot_kv_persist is None
+            and self.cfg.model_type == "glm_moe_dsa"
+            and self.rc.layer_stationary_prefill
+            and self.rc.glm_dsa_mla_kv_spill_dir
+        ):
+            # Full GLM's explicit F75 route has query-tile memory proportional
+            # to L*K*heads*value_width. A refusal before sampling can replay
+            # exactly at 8 -> 4 -> 2 -> 1 without changing model state bytes.
             return True
         if self._hot_kv_persist is None and self.rc.adaptive_chunk_size:
             # Any F68 adaptive-chunk model (gpt_oss, GLM, Kimi K3, ...) can

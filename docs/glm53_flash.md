@@ -1,6 +1,6 @@
 # GLM-5.3-Flash on the 16 GB M4
 
-Status date: 2026-08-29
+Status date: 2026-08-31
 
 ## Checkpoint and storage
 
@@ -19,8 +19,40 @@ Status date: 2026-08-29
   globally capped fast tier.
 
 Old local Kimi K2.5, Kimi Linear, GLM-4.7-Flash, and remaining GLM-4 Hugging
-Face cache entries were removed at the user's direction. GLM-5.3 itself and
+Face cache entries were removed at the user's direction. GLM-5.3-Flash and
 its 328 GB source remain on Workspace NVMe, not NAS.
+
+## Full official GLM-5.3 target
+
+The complete official `zai-org/GLM-5.3` revision
+`e0b07fd2751b42d5efa199cc02c2b271deadc516` is separately local on Workspace
+NVMe: 141 shards and 755,617,140,416 released tensor bytes. Its 78-layer
+`glm_moe_dsa` runtime now completes the unmodified 178,616-byte / 134-tool
+captured harness request at 46,849 rendered input tokens. Only the model alias
+and max-output-one capacity cap differ from the capture. Exact released
+FP8/BF16 execution took 3,573.109 seconds wall / 3,567.451 seconds prefill,
+read 740.041GB, peaked at 6.024GB Metal, and completed without retry. The
+one-token response is incomplete by construction and cannot establish answer
+quality. Cumulative host swap-outs grew 258.26MB, so this is a functional
+capacity result rather than a pressure pass.
+
+The full target's explicit long-context route is lossless: exact tiled DSA
+top-k with chronological gather, query-range selection spill, compressed MLA
+K/V spill, byte-identical absorbed attention at query width 32, and dense MLP
+tiling at 512 positions. The run avoided 717,654 candidate-ID sorts and 29,421
+final chronological sorts. Its selection tier made 79,857 reads but only 19
+dirty-boundary flushes, writing 7.707GB and reading 20.920GB; compressed MLA
+spill wrote 4.233GB. Selection scoring accounted for 481.262 seconds. All of
+these controls remain explicit/default-off pending the heterogeneous corpus
+and large-context conformance ladder.
+
+Storage fetch batch eight plus one-batch prefetch is exact but does not help
+the full target's non-coalesced expert loop. On the deterministic 2,219-token
+real-weight gate it preserved the known output SHA but regressed wall 662.133
+-> 699.684 seconds (+5.7%) and prefill 659.577 -> 695.778. It hid 85.924
+seconds of I/O but waited 529.797 seconds, at 2.278GB peak Metal and 63.275MB
+cumulative swap-out growth. Full-target defaults therefore remain batch one
+and prefetch off.
 
 ## Released architecture implemented
 
@@ -105,12 +137,17 @@ took 699.032 seconds: prefill was 17.152 seconds and target-only decode was
 produced only two of the four requested consecutive validation integers; that
 quality miss is recorded as a failure, not adjusted away.
 
-The next exact candidate, still default-off, caches immutable completed DSA
-pool keys instead of rebuilding the entire prefix for every 32-position tile.
-The runtime exposes computed/reused pool rows and phase-attributed weight,
-attention, mHC, and MLP time. A gated 16/32/64/128 tile-width ladder is also
-available for the already-lossy fused path; neither candidate becomes a
-default from a single prompt.
+The exact/default-off DSA pool cache now uses stepped raw and derived backing
+allocations and derives chronological metadata arithmetically instead of
+rebuilding it for the full prefix. At the 46,849-position weights-free shape,
+the old full-prefix rebuild measured 6.64--7.01 seconds versus 0.743 seconds
+for the stepped path (about 9x), with byte-identical final pooled keys and
+60.8MB versus 219.6MB peak. Raw packed append alone improved 1.038 -> 0.765
+seconds (1.36x). The real captured Flash run reduced pool construction from
+9.747 to 2.626 seconds while computing 128,843 rows, reusing 23,592,800, and
+avoiding construction of 23,721,643 metadata rows. A gated 16/32/64/128
+tile-width ladder remains available for the already-lossy fused path; no
+candidate becomes a default from this single prompt.
 
 Native MTP on the same 8,215-input/64-output gate completed in 1,783.844
 seconds cold. Its state-only draft prefill covered 8,214 rows, it accepted
@@ -121,11 +158,11 @@ same four-integer quality condition and its 103.4MB swap-out growth exceeded
 the pressure gate, so it is evidence for the sidecar speed lever, not a
 promoted profile.
 
-At the released 8K/pool-4/index-dim-128 geometry, a weights-free incremental
-pool gate preserved final pooled keys byte-for-byte, took 0.0962 versus
-0.2274 seconds across 192 updates (2.36x), and reduced peak by 20.65MB. That
-isolated result is promising but small relative to the full request and still
-requires a real token/state A/B.
+At the released 8K/pool-4/index-dim-128 geometry, the first incremental-pool
+implementation preserved final pooled keys byte-for-byte, took 0.0962 versus
+0.2274 seconds across 192 updates (2.36x), and reduced peak by 20.65MB. The
+larger 46,849-position gate and real capture above supersede its performance
+scope while retaining the same exactness requirement.
 
 The real 2,123-input/max-1 tile ladder retained output SHA-256
 `58bb119c...8909cb5` at every rung. Tile 64 reduced engine wall from the
@@ -170,6 +207,35 @@ GEMMs, split 6,315 experts, observed maximum width 512, and never retried. The
 capture's stochastic sampler was preserved, so native MTP correctly fell back.
 Client swap-out growth improved 354.14 -> 177.08MB but still fails pressure;
 max-1's 15-point Plex score is not an intelligence result.
+
+The next explicit composition widened the content-blind tile to 128, enabled
+storage fetch batch eight plus one-batch prefetch, and used the exact stepped
+pool cache while retaining the same lossy attention/int8-KV/coalesced-expert
+components. On the same captured request it completed in 2,778.144 seconds
+wall / 2,772.693 seconds prefill, **33.2% faster** than the 4,156.344-second
+bounded-512 control. MLP fell 1,710.744 -> 988.515 seconds, MLA attention
+1,014.799 -> 472.196, pool build 9.747 -> 2.626, and selection 78.241 ->
+60.362. Peak Metal increased 7.259 -> 7.584GB. Cumulative swap-outs grew
+98.48MB and failed the strict 64MB pressure gate. The capture's stochastic
+sampling was preserved, so its different one-token hash is not an identity
+failure or an identity proof. This is a latency result for an already-rejected
+lossy profile: the direct Plex gate remains capped at 79/100 with missing
+required call fields.
+
+The KDA recurrence itself now has a separate exact graph-compiled option.
+`VMODEL_GLM53_COMPILED_KDA_PREFILL=1` preserves the ordinary MLX operators,
+FP32 reduction order, and 32-position state materialization cadence. At the
+released H64/D128/L128 geometry, output and recurrent state were byte-identical
+and median scan time improved 0.07355 -> 0.06271 seconds (1.173x). On a real
+2,123-token gate the greedy output SHA remained
+`58bb119c...8909cb5`. Compared with the immediately preceding otherwise-
+identical arm before the layer-stationary call-site fix, wall improved 351.929
+-> 343.405 seconds (-2.4%) and KDA attention 57.706 -> 48.922 seconds
+(-15.2%); MLP was unchanged at 281.49/281.56 seconds. Peak Metal increased
+3.288 -> 3.299GB and cumulative swap-outs grew 17.924MB. The 46.8K trace spent
+934.812 seconds in KDA scan, so the measured phase ratio projects about 142
+seconds further improvement, but a projected 43.9-minute capture is not an
+achieved timing. The switch remains explicit pending the anti-overfit corpus.
 
 The same trace identified a host-side governor cost: 626 shrink steps released
 zero cache bytes. Named reversible reservations were repeatedly lowering an
@@ -216,7 +282,12 @@ corpus required by the anti-overfit policy:
   bounds the gathered operand while retaining the expert page; default 512.
   A prefill memory retry lowers this ceiling before shrinking tile width.
 - `VMODEL_GLM53_INCREMENTAL_DSA_POOL=1` enables the candidate exact immutable
-  pool-key cache.
+  pool-key cache with stepped raw/derived capacity.
+- `VMODEL_GLM53_COMPILED_KDA_PREFILL=1` selects the exact bounded graph-
+  compiled KDA recurrence; it retains the reference MLX operators and
+  32-position state boundaries. The real 2,123-token A/B improved wall 2.4%
+  and KDA attention 15.2%, but the switch remains explicit pending broader
+  request-shape proof.
 - `VMODEL_GLM53_PREFILL_TILE_WIDTH=16|32|64|128` selects a gated,
   content-blind layer-stationary tile (default 32).
 - `VMODEL_GLM53_EXPERT_FETCH_BATCH=1..8` (measured at 8; 16 regressed)
@@ -230,12 +301,24 @@ corpus required by the anti-overfit policy:
 Defaults preserve the original conservative GLM-5.3 profile: expert fetch
 batch 1, both prefetch paths off, native MTP off, and generic hot prompt KV off.
 
+The full 78-layer target additionally exposes the explicit exact long-context
+controls `VMODEL_GLM_DSA_LONG_CONTEXT=1`,
+`VMODEL_GLM_DSA_SPARSE_ABSORBED_MLA=1`,
+`VMODEL_GLM_DSA_MLA_KV_SPILL_DIR=<external-volume-path>`, and bounded key,
+query, index, and dense-MLP tile settings. Its storage-only expert grouping
+reuses `VMODEL_GLM53_EXPERT_FETCH_BATCH` and
+`VMODEL_GLM53_EXPERT_BATCH_PREFETCH`; arithmetic still executes one expert at
+a time in released ascending order. The batch-eight/prefetch composition
+regressed the measured full-model gate and is not a recommended full-target
+profile.
+
 ## Scope still to prove
 
 - The unmodified captured request renders to 46,849 input tokens and all 134
-  real tools. Its one-token capacity gate now completes, but takes 130.76
-  minutes of prefill and fails pressure; a full tool/Plex workflow is still
-  outstanding and cannot be inferred from max-1.
+  real tools. Full official GLM-5.3 now completes its lossless one-token
+  capacity gate in 59.46 minutes of prefill, while the explicit lossy Flash
+  composition takes 46.21 minutes. Both fail pressure; a complete tool/Plex
+  workflow is still outstanding and cannot be inferred from max-1.
 - Native MTP now has an explicit 65,536-token ceiling and a state-only draft
   prompt prefill that computes exactly the compressed latent retained by
   draft decode, skipping dead prompt Q/O/MLP work. The 8K/64-token real gate is

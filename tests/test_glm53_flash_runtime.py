@@ -157,11 +157,62 @@ def test_glm53_incremental_pool_cache_matches_full_rebuild_across_tail():
         np.array(cached.pool_keys[3]), np.array(expected_pools))
     assert cached.stats["pool_rows_reused"] == 3
     assert cached.stats["pool_rows_computed"] == 6
+    assert cached.stats["packed_capacity_grows"] == 1
+    assert cached.stats["packed_rows_copied"] == 0
+    assert cached.stats["packed_rows_appended"] == 10
+    assert cached.stats["packed_capacity_rows_peak"] == 1024
+    assert cached._packed_capacity[3].shape[1] == 1024
+    assert cached.stats["pool_capacity_grows"] == 1
+    assert cached.stats["pool_rows_copied"] == 0
+    assert cached.stats["pool_capacity_rows_peak"] == 256
+    assert cached.stats["pool_metadata_rows_avoided"] == 9
+    assert cached._pool_capacity[3].shape[1] == 256
 
     branch = cached.fork()
+    branch.observe(
+        3, "full", hidden[:, :1], weights, prefix, offset=10)
+    assert branch.k_idx[3].shape[1] == 11
+    assert cached.k_idx[3].shape[1] == 10
+    assert branch.stats["packed_capacity_grows"] == 2
+    assert branch.stats["packed_rows_copied"] == 10
     cached.trim(5)
     assert cached.pool_keys[3].shape[1] == 2
     assert branch.pool_keys[3].shape[1] == 5
+
+
+def test_glm53_incremental_pool_keys_grow_by_capacity_not_every_tile():
+    import mlx.core as mx
+
+    from runtime.glm5_next_dsa import GLM5NextDSAState
+
+    cfg = _dsa_cfg()
+    prefix = "model.layers.3"
+    weights = _dsa_weights(prefix)
+    hidden = mx.arange(600 * 4, dtype=mx.float32).reshape(1, 600, 4) / 97
+    q_resid = mx.arange(600 * 2, dtype=mx.float32).reshape(1, 600, 2) / 89
+
+    rebuilt = GLM5NextDSAState(cfg)
+    rebuilt.observe(3, "full", hidden, weights, prefix, offset=0)
+    expected = rebuilt.update_and_select(
+        3, "full", hidden[:, -1:], q_resid[:, -1:], weights, prefix,
+        offset=599)
+
+    cached = GLM5NextDSAState(cfg, incremental_pool_cache=True)
+    cached.observe(3, "full", hidden[:, :512], weights, prefix, offset=0)
+    cached.update_and_select(
+        3, "full", hidden[:, 511:512], q_resid[:, 511:512], weights,
+        prefix, offset=511)
+    cached.observe(3, "full", hidden[:, 512:], weights, prefix, offset=512)
+    got = cached.update_and_select(
+        3, "full", hidden[:, -1:], q_resid[:, -1:], weights, prefix,
+        offset=599)
+    mx.eval(expected, got, cached.pool_keys[3])
+
+    assert np.array_equal(np.array(got), np.array(expected))
+    assert cached.pool_keys[3].shape[1] == 300
+    assert cached._pool_capacity[3].shape[1] == 512
+    assert cached.stats["pool_capacity_grows"] == 2
+    assert cached.stats["pool_rows_copied"] == 256
 
 
 def test_glm53_hybrid_kv_fork_preserves_compressed_and_dsa_state():
@@ -228,6 +279,40 @@ def test_glm53_compressed_mla_factory_uses_exact_stepped_cache():
     engine.rc.glm53_incremental_dsa_pool = True
     pooled = engine.new_kv()
     assert pooled.dsa.incremental_pool_cache is True
+
+
+def test_full_glm_long_context_factory_wires_exact_spill_and_tiling(tmp_path):
+    from runtime.engine import RuntimeConfig, StreamingEngine
+    from runtime.kv_cache import SteppedKVCache
+
+    spill = tmp_path / "glm-full-spill"
+    engine = StreamingEngine.__new__(StreamingEngine)
+    engine.rc = RuntimeConfig(
+        mla_compressed_kv=True,
+        glm_dsa_key_tile_size=128,
+        glm_dsa_index_step_size=512,
+        glm_dsa_selection_query_tile_size=64,
+        glm_dsa_sparse_absorbed_mla=True,
+        glm_dsa_mla_kv_spill_dir=str(spill),
+    )
+    engine.cfg = SimpleNamespace(
+        model_type="glm_moe_dsa",
+        num_hidden_layers=3,
+    )
+    engine._position_free_pool = None
+    engine._dsa_elided = False
+
+    kv = engine.new_kv()
+    assert isinstance(kv, SteppedKVCache)
+    assert kv.compressed_mla
+    assert kv.latent_spill_enabled
+    assert kv.dsa.key_tile_size == 128
+    assert kv.dsa.index_step_size == 512
+    assert kv.dsa.selection_query_tile_size == 64
+    assert kv.mla_absorbed_prefill
+    assert kv.dsa.selection_spill_dir == spill.resolve()
+    kv.close_latent_spill()
+    kv.dsa.close_selection_spill()
 
 
 def test_glm53_stepped_latents_equal_plain_cache_across_tiles():

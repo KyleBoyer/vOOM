@@ -880,7 +880,7 @@ class SteppedKVCache(KVCache):
         root.mkdir(parents=True, exist_ok=True)
         self._latent_spill_root = root
         self._latent_spill_temporary = tempfile.TemporaryDirectory(
-            prefix="voom-k3-mla-kv-", dir=root)
+            prefix="voom-mla-kv-", dir=root)
 
     @property
     def latent_spill_enabled(self) -> bool:
