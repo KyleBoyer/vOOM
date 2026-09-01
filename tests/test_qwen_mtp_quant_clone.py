@@ -13,8 +13,10 @@ from runtime.qwen_mtp_quant_clone import (
     MANIFEST_NAME,
     MANIFEST_SCHEMA,
     build,
+    build_direct_fast_binding,
     build_fast_alias,
     plan,
+    plan_direct_fast_binding,
     plan_fast_alias,
 )
 
@@ -248,3 +250,49 @@ def test_fast_alias_rejects_mismatched_mtp_metadata(tmp_path):
     (source / FAST_MANIFEST_NAME).write_text(json.dumps(manifest))
     with pytest.raises(ValueError, match="MTP schema mismatch"):
         plan_fast_alias(source, tmp_path / "fast-clone", target)
+
+
+def test_direct_fast_binding_validates_target_headers_and_writes_identity(
+        tmp_path):
+    target_source = _source(tmp_path)
+    target = tmp_path / "clone"
+    build(target_source, target)
+    fast_dir = tmp_path / "fast-root" / target.name
+    fast_dir.mkdir(parents=True)
+
+    names = (
+        "mtp.layers.0.input_layernorm.weight",
+        "mtp.layers.0.mlp.up_proj.weight",
+        "mtp.layers.0.mlp.gate_proj.weight",
+        "mtp.layers.0.post_attention_layernorm.weight",
+        "mtp.layers.0.mlp.down_proj.weight",
+    )
+    manifest = {}
+    offset = 0
+    for name in names:
+        dtype, shape, nbytes = EXPECTED_MTP_SPECS[name]
+        manifest[name] = {
+            "file": "packed.bin",
+            "offset": offset,
+            "nbytes": nbytes,
+            "dtype": dtype,
+            "shape": list(shape),
+        }
+        offset += nbytes
+    with (fast_dir / "packed.bin").open("wb") as handle:
+        handle.truncate(offset)
+    (fast_dir / FAST_MANIFEST_NAME).write_text(json.dumps(manifest))
+
+    planned = plan_direct_fast_binding(fast_dir, target)
+    assert planned["schema"] == FAST_ALIAS_SCHEMA
+    assert planned["direct_binding"] is True
+    assert planned["target_model"] == target.name
+    assert len(planned["mtp_tensors"]) == 5
+    assert build_direct_fast_binding(fast_dir, target) == planned
+    assert json.loads(
+        (fast_dir / FAST_ALIAS_MANIFEST_NAME).read_text()) == planned
+
+    manifest[names[0]]["shape"] = [1]
+    (fast_dir / FAST_MANIFEST_NAME).write_text(json.dumps(manifest))
+    with pytest.raises(ValueError, match="metadata mismatch"):
+        plan_direct_fast_binding(fast_dir, target)

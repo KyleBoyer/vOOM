@@ -1,4 +1,54 @@
-# STATUS — 2026-08-31 (current corrections first; dated chronology below is history)
+# STATUS — 2026-09-01 (current corrections first; dated chronology below is history)
+
+## 2026-09-01: uncensored Qwen capture reaches 68.54s with exact two-disk balance
+
+The explicit lossy Huihui Qwen3.8 27B route now has a model-specific,
+fail-closed raw fast tier for the packed-native-MTP clone. The binder checks
+the clone and index hashes, canonical tensor names, every target shard header,
+dtype, shape, byte extent, and packed-MTP schema before publishing the alias;
+it never requantizes or changes a target tensor. This closes the former gap in
+which a direct fast tier existed but the MTP clone could not prove that it was
+the intended target and correctly refused to start.
+
+On the unmodified 178,616-byte / 134-tool capture with the established
+streamed temperature-zero, max-16 comparison shape, the current no-fast-tier
+control took 93.6492s wall / 52.0736s prefill / 38.3806s decode. A 7.050GB
+exact tier first reduced that to 73.8679 / 45.5821 / 25.3024 seconds with the
+known output SHA-256 `9b170095...b87b81`. Instrumentation then showed 15.316s
+external service versus 12.629s internal service. Expanding the same exact
+tier to 7,749,975,296 bytes / 193 tensors balanced the devices at 13.614s /
+13.214s and completed in **68.5388s wall / 47.4658s prefill / 17.9744s
+decode**. That is 26.8% below the current no-tier control, 7.2% below the first
+dual-tier build, and 13.3% below the former 79.0191s best. The output SHA,
+three target sweeps, and 13/21 accepted proposals were unchanged. Peak Metal
+was 2.777GB and client-observed swap-out growth was 6.062MB.
+
+The placement stop rule is now met: only 0.4008s separates the two device
+service times, so assigning more bytes internally would merely move the
+bottleneck. The internal fast-tier tree is 48.20GB decimal, leaving 17.74GB
+actually free; both the 90GB global cap and 10GB free-space floor hold. The
+obsolete Qwen Flash `trace-v1` derived mirror was deleted, not archived, to
+make room; the active `trace-v3-hot24` mirror and all released source weights
+remain intact.
+
+The safer general route is explicit as
+`huihui-qwen38-27b-fast-agent-mtpquant`. It retains the heterogeneous-gated
+`16:1024` target schedule and depth four. A depth-seven 1,371-token/two-tool
+probe failed closed at the memory floor, so depth seven remains restricted to
+the long-context profile. Bypassing the hidden gateway for the two-tool case
+also changed the required `list_files` call into `read_file`; the general
+child therefore retains the full small catalog through the gateway. A fresh
+rerun produced the established byte-identical `mastra_workspace_list_files`
+call (`0651db3a...559f`) in 78.7457s, at 2.582GB peak Metal and 3.785MB
+swap-out growth. A separate no-tool, non-streaming, temperature-0.7, seed-29,
+max-64 gate completed a 36-token message in 108.1854s at 2.936GB peak and
+4.882MB swap-out growth. These routes remain explicit; none of the narrow
+behavior becomes an `auto` default.
+
+The mixed-depth persistence writer also accepts and deliberately ignores the
+new generic `exact_hidden` save argument. This fixes an API-drift crash found
+during the varied-shape gate; the format still never persists an approximate
+hidden endpoint.
 
 ## 2026-08-31: full GLM-5.3 clears the real 46.8K harness; Flash is 33% faster
 

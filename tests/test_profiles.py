@@ -122,6 +122,19 @@ def test_builtin_profiles_resolve_complete_agent_group():
     assert huihui_settings[
         "VMODEL_QWEN35_REUSABLE_USER_PREFIX"] == "1"
 
+    huihui_quant_order, huihui_quant_settings = resolve_runtime_profiles(
+        ("huihui-qwen38-27b-fast-agent-mtpquant",), catalog)
+    assert huihui_quant_order == (
+        "agent-tool-gateway",
+        "huihui-qwen38-27b-fast-agent",
+        "huihui-qwen38-27b-fast-agent-mtpquant",
+    )
+    assert huihui_quant_settings["VMODEL_QWEN_MTP_DEPTH"] == "4"
+    assert huihui_quant_settings[
+        "VMODEL_QWEN35_LOSSY_SUFFIX_PREFILL"] == "16:1024"
+    assert huihui_quant_settings[
+        "VMODEL_FAST_TOOL_GATEWAY_MIN_TOOLS"] == "1"
+
     flash_order, flash_settings = resolve_runtime_profiles(
         ("qwen38-flash-next-instrumented-lossless",), catalog)
     assert flash_order == ("qwen38-flash-next-instrumented-lossless",)

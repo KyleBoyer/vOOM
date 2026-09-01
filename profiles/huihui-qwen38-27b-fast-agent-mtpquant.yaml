@@ -1,0 +1,13 @@
+schema: voom.runtime-profile.v1
+name: huihui-qwen38-27b-fast-agent-mtpquant
+description: General Huihui Qwen3.8 27B agent route with the smaller native-MTP proposal page.
+notes:
+  - "This profile keeps the heterogeneous-corpus-gated 16:1024 target schedule from huihui-qwen38-27b-fast-agent; it does not inherit the narrower 12-layer long-context schedule that failed the developer/two-tool response-class gate."
+  - "Pair it with model alias lossy-Huihui-Qwen3.8-27B-abliterated-mlx-all-mxfp4-mtpquant. The target remains the same lossy all-MXFP4 checkpoint and authoritatively verifies every proposal; only the proposal-only native MTP block uses its smaller packed representation."
+  - "Keep the parent profile's heterogeneous-corpus-gated depth four. A fresh 1,371-token developer/tool probe showed that depth seven could retain 2.10 GB immediately before a 210 MB verifier page and correctly fail the 5.3 GB memory floor; depth four is the safe general route. The separate long-context-mtpquant profile remains the explicit depth-seven route."
+  - "Keep the hidden gateway for small catalogs in this quant-sidecar route. Bypassing it for the tracked two-tool request changed the accepted list-files call into read-file; retaining the full two-tool catalog through the gateway restores the established target response class without schema substitution."
+extends:
+  - huihui-qwen38-27b-fast-agent
+settings:
+  VMODEL_QWEN_MTP_DEPTH: 4
+  VMODEL_FAST_TOOL_GATEWAY_MIN_TOOLS: 1

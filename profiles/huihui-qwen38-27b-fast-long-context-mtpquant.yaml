@@ -5,6 +5,7 @@ notes:
   - "This profile inherits the lossy operator-selected long-context target route and raises only the target-authoritative native-MTP proposal depth from four to seven."
   - "Pair it with model alias lossy-Huihui-Qwen3.8-27B-abliterated-mlx-all-mxfp4-mtpquant. Profiles do not select request model aliases, so using the ordinary alias would load the larger released-BF16 proposal sidecar and is not the pressure-qualified path."
   - "The fixed 16,029-input / 64-output gate preserved the established output SHA and improved the paired depth-five route from 198.3312s -> 176.2819s wall, 88.9782s -> 76.0915s decode, and 11 -> 10 target sweeps. The untouched captured max-16 request preserved its known SHA in 79.0191s with three target sweeps."
+  - "With the model-specific packed-MTP fast tier balanced at 7,749,975,296 exact bytes, a fresh untouched captured max-16 replay preserved that SHA and the same three sweeps in 68.5388s wall / 47.4658s prefill / 17.9744s decode. External and internal service were 13.6145s and 13.2137s, meeting the placement stop rule."
   - "Depth six was not promoted: it kept eleven target sweeps while widening verifier work, and its rejected seventh proposal could not be separated safely from accepted proposals by the observed confidence buckets."
   - "An ordinary-alias BF16 control also preserved the captured output and stayed below 90 seconds at 84.9447s, but failed promotion because swap allocation grew 295.895MB; this child profile is therefore not a BF16-sidecar default."
 extends:

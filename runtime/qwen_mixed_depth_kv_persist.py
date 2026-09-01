@@ -237,13 +237,17 @@ class QwenMixedDepthPromptPersistence:
         prompt_logits,
         prompt_length: int,
         reusable_prefix: int,
+        exact_hidden=None,
         approximate: bool = False,
         tool_capsules=(),
         cache_namespace: str = "default",
         checkpoint_kind: str = "endpoint",
     ) -> tuple[str, ...]:
         """Persist stable state only; later generated endpoints are irrelevant."""
-        del parent_covered, logits, prompt_logits, reusable_prefix, tool_capsules
+        del (
+            parent_covered, logits, prompt_logits, exact_hidden,
+            reusable_prefix, tool_capsules,
+        )
         if checkpoint_kind != "stable_prefix":
             return tuple(parent_chain)
         tokens = tuple(map(int, tokens))

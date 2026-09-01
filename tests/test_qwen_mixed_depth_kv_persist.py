@@ -54,6 +54,7 @@ def test_mixed_depth_snapshot_restores_strict_extension_exactly(tmp_path):
     chain = store.save(
         (), 0, tokens, source, None, None,
         prompt_length=7, reusable_prefix=7, approximate=True,
+        exact_hidden=object(),
         cache_namespace="gateway", checkpoint_kind="stable_prefix",
     )
     assert len(chain) == 1

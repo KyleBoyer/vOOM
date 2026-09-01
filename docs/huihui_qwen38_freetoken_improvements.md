@@ -7,6 +7,30 @@ Qwen3.8 27B agent profile. The served MXFP4 target and released-BF16 MTP
 sidecar are unchanged. Any optimization that did not pass exact-output and
 timing gates was reverted.
 
+## 2026-09-01: direct packed-MTP binding and measured device balance
+
+The packed-native-MTP clone now supports its own model-specific raw fast tier.
+`runtime/qwen_mtp_quant_clone.py bind-fast` validates the clone/index identity
+and every raw-manifest tensor against the authoritative target shard header
+before writing a fail-closed binding. This is storage placement only: target
+bytes, dtypes, shapes, and offsets are unchanged.
+
+The current no-tier captured-request control was 93.6492s. A first 7.050GB
+exact tier reached 73.8679s but left the external device critical at 15.316s
+service versus 12.629s internally. The measured-rate balance predicted about
+0.6--0.7GB more internal data. Rebuilding to 7.750GB / 193 tensors produced
+13.614s external and 13.214s internal service and reached **68.5388s wall**.
+The known output SHA, 13/21 accepted proposals, and three target sweeps were
+unchanged; decode improved 25.3024s -> 17.9744s. The devices are now within
+0.401s, so further widening is stopped.
+
+This round also rejected two tempting generalizations. Depth seven failed the
+short developer/two-tool shape at the memory floor, and skipping the gateway
+for its small catalog emitted the wrong tool class. The explicit general child
+keeps depth four and routes even small catalogs through the existing full-schema
+gateway; it reproduced the established exact `list_files` call. A no-tool,
+non-streamed, sampled max-64 shape also completed within the pressure gate.
+
 ## Accepted: exact BF16 MTP split across both SSDs
 
 `runtime/qwen_mtp_bf16_fast_tier.py` copies a selected set of **complete BF16

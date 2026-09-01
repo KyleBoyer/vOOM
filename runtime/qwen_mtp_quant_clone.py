@@ -69,6 +69,16 @@ def _sha256_bytes(value: bytes) -> str:
     return hashlib.sha256(value).hexdigest()
 
 
+def _canonical(name: str) -> str:
+    if name.startswith("model.language_model."):
+        return "model." + name[len("model.language_model."):]
+    if name.startswith("language_model.model."):
+        return "model." + name[len("language_model.model."):]
+    if name.startswith("language_model."):
+        return name[len("language_model."):]
+    return name
+
+
 def _header(path: Path) -> dict:
     with path.open("rb") as handle:
         raw = handle.read(8)
@@ -355,15 +365,171 @@ def build_fast_alias(
     return record
 
 
+def plan_direct_fast_binding(
+    fast_dir: str | Path, target: str | Path,
+) -> dict:
+    """Bind a model-specific raw fast tier directly to an MTP clone.
+
+    ``build_fast_alias`` is the zero-copy path for reusing a parent target's
+    existing mirror.  A freshly built mirror of the quantized-MTP clone is
+    already model-specific and therefore needs no sibling symlink tree, but it
+    must still carry the same fail-closed clone/index identity.  Validate every
+    manifest entry against the target checkpoint header before issuing that
+    binding; an unrelated or stale raw tier is rejected rather than trusted by
+    directory name.
+    """
+    fast_dir = Path(fast_dir).expanduser().resolve()
+    target = Path(target).expanduser().resolve()
+    if fast_dir.name != target.name:
+        raise ValueError(
+            "direct fast-tier directory name must match the target clone")
+
+    manifest_path = fast_dir / FAST_MANIFEST_NAME
+    manifest_bytes = manifest_path.read_bytes()
+    manifest = json.loads(manifest_bytes)
+    if not isinstance(manifest, dict) or not manifest:
+        raise ValueError("fast-tier manifest must be a nonempty tensor map")
+
+    clone_manifest_path = target / MANIFEST_NAME
+    clone_manifest_bytes = clone_manifest_path.read_bytes()
+    clone_manifest = json.loads(clone_manifest_bytes)
+    if not (
+        isinstance(clone_manifest, dict)
+        and clone_manifest.get("schema") in {
+            MANIFEST_SCHEMA, HYBRID_MANIFEST_SCHEMA}
+        and Path(clone_manifest.get("output", "")).expanduser().resolve()
+        == target
+    ):
+        raise ValueError("fast-tier target is not a bound MTP clone")
+
+    target_index_bytes = (target / INDEX_NAME).read_bytes()
+    if _sha256_bytes(target_index_bytes) != clone_manifest.get(
+            "output_index_sha256"):
+        raise ValueError("target clone index does not match its manifest")
+    target_index = json.loads(target_index_bytes)
+    physical_weight_map = target_index.get("weight_map")
+    if not isinstance(physical_weight_map, dict):
+        raise ValueError("target clone index has no weight map")
+    weight_map: dict[str, tuple[str, str]] = {}
+    for physical, shard in physical_weight_map.items():
+        canonical = _canonical(physical)
+        if canonical in weight_map:
+            raise ValueError(f"duplicate canonical target tensor: {canonical}")
+        weight_map[canonical] = (physical, shard)
+
+    headers: dict[str, dict] = {}
+    files: set[str] = set()
+    mtp_names: list[str] = []
+    total_bytes = 0
+    for name, entry in manifest.items():
+        if not isinstance(name, str) or not isinstance(entry, dict):
+            raise ValueError("invalid fast-tier tensor entry")
+        filename = entry.get("file")
+        target_entry = weight_map.get(name)
+        if not (
+            isinstance(filename, str)
+            and Path(filename).name == filename
+            and isinstance(target_entry, tuple)
+            and len(target_entry) == 2
+            and isinstance(target_entry[1], str)
+            and Path(target_entry[1]).name == target_entry[1]
+            and isinstance(entry.get("offset"), int)
+            and isinstance(entry.get("nbytes"), int)
+            and entry["offset"] >= 0
+            and entry["nbytes"] >= 0
+            and isinstance(entry.get("dtype"), str)
+            and isinstance(entry.get("shape"), list)
+        ):
+            raise ValueError(f"invalid fast-tier metadata: {name}")
+        physical, shard = target_entry
+        fast_path = fast_dir / filename
+        if (
+            not fast_path.is_file()
+            or entry["offset"] + entry["nbytes"] > fast_path.stat().st_size
+        ):
+            raise ValueError(f"fast-tier tensor extent is unavailable: {name}")
+
+        if shard not in headers:
+            headers[shard] = _header(target / shard)
+        source_entry = headers[shard].get(physical)
+        if not isinstance(source_entry, dict):
+            raise ValueError(f"target checkpoint is missing tensor: {name}")
+        start, end = source_entry.get("data_offsets", (None, None))
+        actual = (
+            str(source_entry.get("dtype", "")),
+            tuple(source_entry.get("shape", ())),
+            int(end) - int(start) if isinstance(start, int) and isinstance(end, int)
+            else -1,
+        )
+        staged = (
+            entry["dtype"], tuple(entry["shape"]), entry["nbytes"])
+        if staged != actual:
+            raise ValueError(f"target/fast-tier metadata mismatch: {name}")
+
+        files.add(filename)
+        total_bytes += entry["nbytes"]
+        if name.startswith("mtp."):
+            mtp_names.append(name)
+            expected = EXPECTED_MTP_SPECS.get(name)
+            if expected is None or staged != expected:
+                raise ValueError(f"fast-tier MTP schema mismatch: {name}")
+    if not mtp_names:
+        raise ValueError("direct fast-tier binding has no packed MTP tensors")
+
+    return {
+        "schema": FAST_ALIAS_SCHEMA,
+        "source": str(fast_dir),
+        "output": str(fast_dir),
+        "target": str(target),
+        "target_model": target.name,
+        "target_index_sha256": _sha256_bytes(target_index_bytes),
+        "target_clone_manifest_sha256": _sha256_bytes(clone_manifest_bytes),
+        "target_body_mapping_sha256": clone_manifest[
+            "target_body_mapping_sha256"],
+        "source_manifest_sha256": _sha256_bytes(manifest_bytes),
+        "source_index_sha256": _sha256_bytes(target_index_bytes),
+        "mapped_tensors": len(manifest),
+        "mapped_logical_bytes": total_bytes,
+        "files": sorted(files),
+        "mtp_tensors": sorted(mtp_names),
+        "direct_binding": True,
+        "enabled_by_default": False,
+    }
+
+
+def build_direct_fast_binding(
+    fast_dir: str | Path, target: str | Path,
+) -> dict:
+    record = plan_direct_fast_binding(fast_dir, target)
+    fast_dir = Path(record["output"])
+    output = fast_dir / FAST_ALIAS_MANIFEST_NAME
+    temporary = output.with_suffix(output.suffix + ".tmp")
+    temporary.write_bytes(_canonical_json(record))
+    os.replace(temporary, output)
+    return record
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
-        "command", choices=("plan", "build", "plan-fast", "build-fast"))
+        "command", choices=(
+            "plan", "build", "plan-fast", "build-fast", "bind-fast"))
     parser.add_argument("--source", required=True, type=Path)
-    parser.add_argument("--output", required=True, type=Path)
+    parser.add_argument("--output", type=Path)
     parser.add_argument("--target", type=Path)
     parser.add_argument("--result", type=Path)
     args = parser.parse_args()
+    if args.command != "bind-fast" and args.output is None:
+        parser.error("--output is required for this command")
+    if args.command == "bind-fast":
+        if args.target is None:
+            parser.error("--target is required for fast-tier binding")
+        result = build_direct_fast_binding(args.source, args.target)
+        if args.result:
+            args.result.parent.mkdir(parents=True, exist_ok=True)
+            args.result.write_text(json.dumps(result, indent=2, sort_keys=True) + "\n")
+        print(json.dumps(result, indent=2, sort_keys=True))
+        return 0
     operation = {
         "plan": plan,
         "build": build,
