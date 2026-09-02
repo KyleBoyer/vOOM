@@ -2136,10 +2136,11 @@ class EngineManager:
         except ValueError as error:
             raise RequestValidationError(
                 "VMODEL_GLM_DSA tile settings must be integers") from error
-        if glm_dsa_key_tile_size not in (64, 128, 256, 512, 1024):
+        if glm_dsa_key_tile_size not in (
+                64, 128, 256, 512, 1024, 2048, 4096, 8192):
             raise RequestValidationError(
                 "VMODEL_GLM_DSA_KEY_TILE_SIZE must be one of "
-                "64, 128, 256, 512, 1024")
+                "64, 128, 256, 512, 1024, 2048, 4096, 8192")
         if glm_dsa_prefill_tile_width not in (1, 2, 4, 8, 16, 32):
             raise RequestValidationError(
                 "VMODEL_GLM_DSA_PREFILL_TILE_WIDTH must be one of "

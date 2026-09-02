@@ -24,6 +24,17 @@ explicitly retains the baseline's exact bounded absorbed-MLA switch; an early
 retry that omitted this dependency failed closed at request validation before
 model compute.
 
+A follow-on exact key-tile sweep produced a useful real-gate rejection.
+Increasing the DSA key tile 1,024 -> 8,192 returned byte-identical tied-ID
+synthetic selections and reduced real selector scoring **429.936 -> 359.914
+seconds** (-16.3%). It nevertheless regressed the untouched capture wall
+3,541.475 -> **3,568.925 seconds** (+27.450s), increased swap-out growth
+120.81 -> **203.73MiB** (failing the 128MiB gate), and drove minimum system
+availability to 3.04GB. Peak Metal remained exactly 5.829GB, so allocation
+peak alone did not expose the pressure/cache cost. The shipped profile is
+therefore restored to key tile 1,024; 8,192 remains an explicit experimental
+knob, not a default or promoted profile setting.
+
 GLM-5.3-Flash's exact compiled KDA path has now completed the untouched
 46,849-token captured request. Wall time improved 2,778.144 -> **2,489.152
 seconds** (-10.4%) and KDA time improved 1,237.760 -> **958.511 seconds**
@@ -57,6 +68,7 @@ Evidence: `logs/glm53_flash_long_compiled_kda_actual_20260901.json`,
 `logs/glm53_native_kda_h64_l128_20260902.json`,
 `logs/glm53_full_dsa_width{64,128,256}_20260902.json`,
 `logs/glm53_full_width64_tile32_actual_v2_20260902.json`,
+`logs/glm53_full_keytile8192_actual_20260902.json`,
 `logs/glm53_flash_dflash2_reject4_fix2_20260902.json`,
 `logs/glm53_flash_dflash2_spec16_20260902.json`, and
 `logs/glm53_serial_prefix4_diag_20260902.json`.

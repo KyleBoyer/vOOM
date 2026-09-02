@@ -2536,7 +2536,7 @@ def test_full_glm_long_context_is_explicit_tiled_and_external_spilled():
         "VMODEL_GLM_DSA_LONG_CONTEXT": "1",
         "VMODEL_GLM_DSA_SPARSE_ABSORBED_MLA": "1",
         "VMODEL_GLM_DSA_MLA_KV_SPILL_DIR": "/Volumes/Test/glm-dsa-spill",
-        "VMODEL_GLM_DSA_KEY_TILE_SIZE": "128",
+        "VMODEL_GLM_DSA_KEY_TILE_SIZE": "8192",
         "VMODEL_GLM_DSA_PREFILL_TILE_WIDTH": "32",
         "VMODEL_GLM_DSA_INDEX_STEP_SIZE": "512",
         "VMODEL_GLM_DSA_SELECTION_QUERY_TILE_SIZE": "64",
@@ -2553,7 +2553,7 @@ def test_full_glm_long_context_is_explicit_tiled_and_external_spilled():
     rc = captured[0]
     assert rc.context_bound == 1_048_576
     assert rc.prefill_chunk_size == 32
-    assert rc.glm_dsa_key_tile_size == 128
+    assert rc.glm_dsa_key_tile_size == 8192
     assert rc.glm_dsa_index_step_size == 512
     assert rc.glm_dsa_selection_query_tile_size == 64
     assert rc.glm_dsa_dense_mlp_tile_size == 256
