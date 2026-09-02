@@ -1,0 +1,11 @@
+schema: voom.runtime-profile.v1
+name: glm53-flash-lossless-expert-prefetch-batch8
+description: Explicit lossless GLM-5.3-Flash eight-page storage grouping with one-future expert prefetch.
+notes:
+  - "Extends the released-weight expert-prefetch profile and changes only the storage fetch group from one to eight exact FP8 expert pages. The runtime keeps expert_compute_batch=1, so target matmuls and ascending accumulation order remain unchanged."
+  - "The live governor may clamp the storage group downward but cannot enlarge it or change the one-expert arithmetic boundary. At most one successor storage group is in flight."
+  - "Explicit pending released-model greedy/state, long-prompt pressure/timing, captured-harness, and Plex gates."
+extends:
+  - glm53-flash-lossless-expert-prefetch
+settings:
+  VMODEL_GLM53_EXPERT_FETCH_BATCH: 8

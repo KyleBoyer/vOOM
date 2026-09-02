@@ -4,7 +4,8 @@ description: Explicit lossless GLM-5.3-Flash routed-expert I/O overlap experimen
 notes:
   - "Extends the byte-exact compiled-KDA profile and overlaps one exact future routed-expert read with current expert compute. It does not enable the lossy fused-attention, int8 K/V, or coalesced-position switches from the fast sidequest profile."
   - "The released router decisions, FP8 weights, expert compute, and ascending accumulation order are unchanged. Telemetry reports submissions, wait time, and disk time hidden by Metal."
-  - "A fresh same-commit 16-output released-model A/B preserved all greedy tokens, text, aggregate state, and separate attention/DSA/recurrent/convolution/hidden hashes. Wall moved 374.604s to 368.970s and swap-out growth 23.216MB to 14.418MB while 5.877s of disk service was hidden. The small timing win remains provisional pending a second request shape, captured-harness, and Plex gates."
+  - "A fresh same-commit 16-output released-model A/B preserved all greedy tokens, text, aggregate state, and separate attention/DSA/recurrent/convolution/hidden hashes. Wall moved 374.604s to 368.970s and swap-out growth 23.216MB to 14.418MB while 5.877s of disk service was hidden."
+  - "A second deterministic 2,123-input/max-1 HTTP A/B preserved the known output SHA, read count, and Metal peak while reducing wall 753.260s to 583.754s (-22.50%) and swap-out growth 50.348MB to 44.581MB; 215.573s of service was hidden. Preferred explicit lossless Flash prefill route, but still non-default pending real tool/harness and Plex shapes."
 extends:
   - glm53-flash-lossless-compiled-kda
 settings:

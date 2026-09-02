@@ -110,10 +110,18 @@ SHA, aggregate state SHA, and separate attention-KV, DSA-index, recurrent,
 convolution, and hidden-state hashes. Wall moved 374.604 -> **368.970 seconds**
 (-1.50%), while physical swap-out growth fell 23.216 -> 14.418MB. The overlap
 submitted 4,193 exact future-page reads and hid 5.877 seconds of disk service;
-the measured wall delta is close enough to ordinary run variance that the
-profile remains explicit pending a second request shape. The full-model
-prefetch and DSA preallocation profiles also remain unpromoted pending real
-gates.
+the short-request wall delta alone was close to ordinary run variance. A
+second deterministic 2,123-input/max-1 HTTP A/B now confirms the lever. The
+known output SHA `58bb119c...8909cb5`, 300.530GB read count, and 3.936GB peak
+Metal were identical, while wall fell 753.260 -> **583.754 seconds** (-22.50%)
+and engine time fell 750.353 -> **580.818 seconds**. Prefetch submitted 11,435
+future page reads, hid 215.573 seconds of service, and reduced physical
+swap-out growth 50.348 -> 44.581MB. The profile is the preferred explicit
+lossless Flash prefill route, but remains non-default pending real tool/harness
+and Plex shapes. `glm53-flash-lossless-expert-prefetch-batch8` is the next
+explicit rung: it groups eight exact pages per storage fetch while retaining
+one-expert released arithmetic. The full-model prefetch and DSA preallocation
+profiles also remain unpromoted pending real gates.
 
 The compiled GLM-5.3-Flash KDA graph now accepts an identity-bound segment
 length of 16/32/64/128 positions. At released H64/D128/L128 geometry, every

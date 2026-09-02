@@ -250,8 +250,19 @@ compiled-KDA route. A fresh same-commit 16-output A/B preserved tokens, text,
 and complete attention/DSA/recurrent/convolution/hidden state. It hid 5.877
 seconds of future-page disk service, moved wall 374.604 to 368.970 seconds, and
 reduced swap-out growth from 23.216MB to 14.418MB. Because the 1.50% wall delta
-is close to run variance, it remains explicit until a longer or differently
-shaped request confirms the benefit.
+is close to run variance, a second deterministic 2,123-input/max-1 HTTP shape
+was run. It retained the known output SHA, identical 300.530GB reads and
+3.936GB Metal peak, while wall fell 753.260 to 583.754 seconds (-22.50%) and
+engine time fell 750.353 to 580.818 seconds. The pipeline submitted 11,435
+future reads, hid 215.573 seconds of service, and reduced swap-out growth from
+50.348MB to 44.581MB. It is therefore the preferred explicit lossless prefill
+profile, but remains non-default until real tool/harness and Plex shapes pass.
+
+The next explicit exact rung groups eight expert pages per storage fetch while
+keeping `expert_compute_batch=1`. This can amortize storage-call overhead
+without changing released matmuls or ascending accumulation order; the live
+governor may only clamp the storage group downward. It is isolated as
+`glm53-flash-lossless-expert-prefetch-batch8` pending real gates.
 
 The same trace identified a host-side governor cost: 626 shrink steps released
 zero cache bytes. Named reversible reservations were repeatedly lowering an
