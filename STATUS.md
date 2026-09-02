@@ -59,6 +59,20 @@ allows the two queued reads to overlap on two workers while consuming them in
 authoritative order; reject it unless end-to-end wall improves with bounded
 peak/swap, since concurrent same-tier reads can just as easily contend.
 
+The two-worker gate is a strong measured win. On the identical deterministic
+2,123-input/max-1 request, request SHA `dbc7247b...b15ae` and output SHA
+`58bb119c...09cb5` remained unchanged, as did the exact 300.907GB read volume,
+11,550 coalesced GEMMs, 713,328 route assignments, and batch-one expert
+arithmetic. Wall fell **356.628 -> 260.742 seconds (-26.9%)** versus the
+depth-one coalesced parent, and **427.193 -> 260.742 (-39.0%)** versus compact
+MLA + exact batch-eight prefetch before coalescing. Expert-I/O wait fell
+169.195 -> **53.901 seconds (-68.1%)** while hidden service rose 104.997 ->
+294.182 seconds. True peak was 3.013GB, physical swap-out grew only 10.502MB,
+and no retry or adaptive clamp occurred. This proves the lossless scheduling
+composition relative to its E-class parent, not final answer quality: complete
+sustained-output, Plex/tool, vision, varied-shape, and untouched-capture gates
+remain required before any deployment recommendation.
+
 ## 2026-09-02: Qwen Flash abliterated overlay runs; new exact GLM schedules are isolated
 
 The pinned `windowsxp811203/Qwen3.8-Flash-Next-Abliterated` revision

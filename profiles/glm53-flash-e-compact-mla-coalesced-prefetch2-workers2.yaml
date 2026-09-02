@@ -5,6 +5,7 @@ notes:
   - "Extends the depth-two exact expert-I/O queue and allows its two future batches to read concurrently. The consumer still awaits and executes batches in authoritative ascending order; target arithmetic is unchanged relative to the E-class parent."
   - "This is an end-to-end storage experiment, not a bandwidth-microbenchmark promotion. Concurrent reads can contend on one tier and retain two exact page groups, so wall, read volume, Metal peak, swap, and the deterministic output witness are mandatory."
   - "Depth two on one worker was neutral at 2,123 inputs: 356.477 seconds versus 356.628 for depth one, with wait 168.231 versus 169.195 seconds. Two workers must beat that without unsafe pressure or it is rejected."
+  - "The deterministic 2,123-input/max-1 gate passed its finite equality witness: request/output hashes and 300.907GB read volume matched. Wall fell 356.628 -> 260.742 seconds, expert-I/O wait 169.195 -> 53.901 seconds, peak was 3.013GB, swap-out growth 10.502MB, and no retry/clamp occurred. This promotes the scheduling component to broader quality gates, not the E-class parent itself."
 extends:
   - glm53-flash-e-compact-mla-coalesced-prefetch2
 settings:
