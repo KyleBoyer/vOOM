@@ -276,6 +276,16 @@ prefetch. Grouped submissions fell 11,435 to 1,448, hidden service rose to
 swap-out growth improved by 1.77MB. Batch 8 is the preferred explicit lossless
 prefill profile, still non-default pending captured-tool and Plex gates.
 
+The same storage grouping has a separate full GLM-5.3 composition with exact
+DSA index preallocation. On a deterministic 2,123-input/max-1 released-model
+gate, request/output hashes and all 708.060GB of reads matched the conservative
+control. Wall fell 826.026 to 695.088 seconds (-15.85%), index grows fell 63 to
+21, and copied index rows fell 64,512 to zero. Prefetch submitted 2,323 grouped
+reads and hid 83.225 seconds. Peak rose from 1.070GB to 2.246GB but remained
+far below the 8.5GB ceiling; swap-out growth improved from 75.006MB to 49.070MB.
+`glm53-full-lossless-preallocate-prefetch-batch8` is therefore the preferred
+explicit full-model schedule pending an untouched captured-harness replay.
+
 The same trace identified a host-side governor cost: 626 shrink steps released
 zero cache bytes. Named reversible reservations were repeatedly lowering an
 already-empty cache limit, clearing MLX, then restoring the ineffective cut.

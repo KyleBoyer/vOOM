@@ -132,7 +132,17 @@ control. Submissions fell 11,435 -> 1,448, hidden service increased 215.573 ->
 16KB, and swap-out growth improved 1.77MB. Batch 8 is now the preferred
 explicit lossless Flash prefill route; captured-harness and Plex gates remain
 before any default. The full-model prefetch and DSA preallocation profiles
-also remain unpromoted pending real gates.
+also now have a composed deterministic gate. On the official full GLM-5.3
+checkpoint, `glm53-full-lossless-preallocate-prefetch-batch8` preserved the
+2,123-input request hash, greedy output SHA `d12fe7f...68f7c4`, and exact
+708.060GB read count. Wall fell 826.026 -> **695.088 seconds** (-15.85%) and
+engine time fell 822.166 -> 691.316 seconds. DSA index grows fell 63 -> 21 and
+copied rows 64,512 -> zero; 2,323 grouped future reads hid 83.225 seconds of
+service. Peak Metal rose 1.070 -> 2.246GB but remained far below the 8.5GB
+ceiling, while swap-out growth improved 75.006 -> 49.070MB and post-run
+available memory increased by 178MB. The composition is the preferred explicit
+full-model schedule pending an untouched captured-harness replay; no automatic
+default changes.
 
 The compiled GLM-5.3-Flash KDA graph now accepts an identity-bound segment
 length of 16/32/64/128 positions. At released H64/D128/L128 geometry, every
