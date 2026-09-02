@@ -4,7 +4,7 @@ description: Explicit GLM-5.3-Flash E-class absorbed-MLA long-context memory exp
 notes:
   - "Extends exact compiled KDA but enables absorbed MLA only after released DSA selection becomes active above 2,048 keys. Dense-prefix attention keeps the ordinary expanded formulation exactly; the selected sparse phase consumes compact latent rows and immediately releases that layer's now-dead expanded prefix."
   - "Absorbed MLA reassociates floating-point products, so this profile is E-class/lossy even when a finite token gate agrees. It never changes the released target weights, router, or expert arithmetic."
-  - "The rejected v1 applied absorbed arithmetic before DSA selection, changed all 16 short-gate tokens and every state component for only a 0.22% wall change, and was removed. Expert prefetch, fused sparse attention, int8 K/V, and coalesced expert positions remain off to isolate v2. Require real state, captured-harness, Plex/tool, vision, and pressure gates before composition."
+  - "The rejected v1 applied absorbed arithmetic before DSA selection, changed all 16 short-gate tokens and every state component for only a 0.22% wall change, and was removed. V2 preserved every short-gate token/state hash and the deterministic sparse-phase output hash. At 2,123 inputs it reduced MLA time 24.452 -> 9.174 seconds and peak Metal 3.936 -> 2.240GB, while wall was neutral because expert work dominated. Expert prefetch, fused sparse attention, int8 K/V, and coalesced expert positions remain off here to keep this component isolated."
 extends:
   - glm53-flash-lossless-compiled-kda
 settings:

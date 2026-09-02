@@ -1,0 +1,11 @@
+schema: voom.runtime-profile.v1
+name: glm53-flash-e-compact-mla-prefetch-batch8
+description: Explicit GLM-5.3-Flash E-class compact sparse MLA plus exact eight-page expert prefetch.
+notes:
+  - "Composes the E-class absorbed sparse-MLA representation with the exact batch-eight storage fetch and one-future expert prefetch schedule. Expert compute remains batch one, preserving released router choices, FP8 weights, and ascending expert accumulation order."
+  - "Absorbed MLA begins only after released DSA selection activates above 2,048 keys. Its floating-point reassociation makes this profile lossy even when finite output gates agree; it is never selected automatically."
+  - "On the deterministic 2,123-input/max-1 gate, request and output hashes matched the lossless control. Wall was 427.193 seconds versus 441.689 for exact batch-eight and 753.260 without prefetch; true peak fell to 3.165GB from the 3.936GB lossless control. No retry occurred, sparse MLA took 8.869 seconds, and 256.201 seconds of exact expert I/O service was hidden."
+  - "The one-token gate proves scheduling and capacity, not answer quality. Require the untouched captured harness, sustained output, Plex/tool, vision, and varied-shape gates before considering any deployment outside an explicit sidequest endpoint."
+extends:
+  - glm53-flash-e-compact-mla
+  - glm53-flash-lossless-expert-prefetch-batch8

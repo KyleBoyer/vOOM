@@ -205,6 +205,22 @@ remains explicitly E-class/lossy. Expert prefetch, int8 K/V, fused sparse
 attention, and coalesced expert positions are off for isolation. V2 real
 state-hash, captured-harness, Plex/tool, vision, and pressure gates are pending.
 
+The first real sparse-phase gate has now cleared. On the identical deterministic
+2,123-input/max-1 request (request SHA `dbc7247b...b15ae`), V2 preserved the
+lossless output SHA `58bb119c...09cb5` while reducing MLA attention 24.452 ->
+9.174 seconds and true peak Metal 3.936 -> 2.240GB (-43.1%). Isolated wall was
+755.717 versus the 753.260-second control because routed-expert time varied in
+the opposite direction; this is a memory/operator win, not an isolated wall
+win. Composing the headroom with exact batch-eight expert prefetch produced the
+same request/output hashes in **427.193 seconds**, versus 441.689 seconds for
+exact batch eight and 753.260 seconds for no prefetch. It peaked at 3.165GB,
+retried zero times, reduced sparse MLA to 8.869 seconds, and hid 256.201 seconds
+of expert I/O. The named explicit profile is
+`glm53-flash-e-compact-mla-prefetch-batch8`. It remains E-class/default-off:
+the one-token equality witness is not an intelligence gate, and untouched
+captured-harness, sustained-output, Plex/tool, vision, and varied-shape proofs
+remain mandatory.
+
 Focused result: 348 DSA/server/profile/Qwen-MTP tests and six PLE-row witness
 tests pass. Evidence:
 `logs/qwen38_flash_next_abliterated_tensor_diff_20260902.json`,
