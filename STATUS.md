@@ -47,6 +47,19 @@ proves the exact storage path, not candidate quality: the direct-engine oracle
 does not apply a chat template and emitted EOS immediately. HTTP harness and
 varied-shape quality gates remain required before any replacement decision.
 
+The plain candidate fast-tier server completed a separate streamed 64-input /
+64-output, temperature-zero Responses request twice with the same output hash
+`969b418f...ffbe`. Cold/warm-engine walls were **778.001 / 761.438 seconds**;
+prefill was 117.394 / 115.195 seconds and serial decode dominated at 659.241 /
+645.990 seconds. Each request read 845.084GB, including 759.658GB during
+decode; 532.349GB came from the internal tier. Peak Metal was 4.209 / 5.481GB.
+This is an instrumentation result, not a pass: available memory fell below the
+gate floor and physical swap-out grew roughly 40.2MB then 72.4MB. The response
+was intentionally incomplete at the 64-token cap, although streamed text
+matched the final body exactly. `qwen38-flash-next-candidate-fast-tier-mtp`
+now isolates depth-three proposals from the candidate's own published MTP
+block with full candidate-target verification and no borrowed calibration.
+
 The latest full-GLM trace exposed 966 exact DSA index-capacity grows and
 22,256,640 copied rows. `glm53-full-lossless-index-preallocate` now publishes
 the known final absolute request length before the first key tile, allocating

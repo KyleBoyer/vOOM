@@ -1,0 +1,14 @@
+schema: voom.runtime-profile.v1
+name: qwen38-flash-next-candidate-fast-tier-mtp
+description: Candidate-native Lightning-MTP proposals with exact abliterated-target verification.
+notes:
+  - "Extends the candidate-bound exact fast tier. Draft tokens come from the candidate checkpoint's own published MTP block; every emitted greedy token is authoritatively verified by the full candidate target, so rejected proposals cannot alter the answer."
+  - "Depth three is the first isolated rung. Candidate-specific acceptance and q-calibration are measured from scratch; no official-model calibration values, prompt endpoints, or quantized proposal weights are reused."
+  - "The exact BF16 verifier GEMV and phase-scoped head suspension change scheduling only. The full candidate target weights, router, recurrence state, and accepted-token arithmetic remain at their published BF16 representation."
+  - "Explicit until the plain 64-token HTTP output hash, tool-call shape, varied prompts, pressure, and a longer-output gate all match or pass their target-verifier criteria."
+extends:
+  - qwen38-flash-next-candidate-fast-tier
+settings:
+  VMODEL_QWEN4_MTP_DEPTH: 3
+  VMODEL_QWEN4_SERIAL_VERIFY_SUSPEND_LM_HEAD: true
+  VMODEL_QWEN4_SERIAL_VERIFY_EXACT_BF16_GEMV: true

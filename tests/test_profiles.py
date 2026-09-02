@@ -286,6 +286,21 @@ def test_builtin_profiles_resolve_complete_agent_group():
         "VMODEL_QWEN4_FAST_TIER_DECODE_ONLY"] == "0"
     assert candidate_fast_settings["VMODEL_QWEN4_MTP_DEPTH"] == "0"
 
+    candidate_mtp_order, candidate_mtp_settings = resolve_runtime_profiles(
+        ("qwen38-flash-next-candidate-fast-tier-mtp",), catalog)
+    assert candidate_mtp_order == (
+        "qwen38-flash-next-candidate-bf16",
+        "qwen38-flash-next-candidate-fast-tier",
+        "qwen38-flash-next-candidate-fast-tier-mtp",
+    )
+    assert candidate_mtp_settings["VMODEL_QWEN4_MTP_DEPTH"] == "3"
+    assert candidate_mtp_settings[
+        "VMODEL_QWEN4_SERIAL_VERIFY_SUSPEND_LM_HEAD"] == "1"
+    assert candidate_mtp_settings[
+        "VMODEL_QWEN4_SERIAL_VERIFY_EXACT_BF16_GEMV"] == "1"
+    assert "VMODEL_QWEN4_MTP_Q_CALIBRATION_SCALES" not in (
+        candidate_mtp_settings)
+
     long_order, long_settings = resolve_runtime_profiles(
         ("huihui-qwen38-27b-fast-long-context",), catalog)
     assert long_order == (
