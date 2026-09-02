@@ -4,7 +4,7 @@ description: Explicit lower-peak exact compiled-KDA schedule for GLM-5.3-Flash.
 notes:
   - "Extends the released-weight compiled-KDA profile and changes only the bounded graph segment from 32 to 16 positions. The ordinary MLX recurrence operators and per-token FP32 update order remain unchanged."
   - "At released H64/D128/L128 geometry, segment 16 preserved byte-identical output and recurrent state, measured 62.860ms versus 63.018ms for segment 32, and reduced scan peak 850.4MB to 714.6MB. The timing difference is noise-sized; lower peak is the reason for this candidate."
-  - "Explicit until a real checkpoint gate proves overall pressure improves without additional compile/launch wall time."
+  - "A real 16-output checkpoint gate preserved every token plus aggregate and component state hashes, but wall changed only 374.604s to 374.397s, prefill regressed 108.421s to 108.933s, and swap-out growth increased 23.216MB to 25.887MB. Rejected as a speed/pressure promotion; retained only as an explicit synthetic low-peak experiment."
 extends:
   - glm53-flash-lossless-compiled-kda
 settings:

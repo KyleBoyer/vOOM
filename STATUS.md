@@ -104,16 +104,27 @@ reduces two growths/one prefix copy to one growth/zero copies. Separate
 `glm53-full-lossless-expert-prefetch` and
 `glm53-flash-lossless-expert-prefetch` profiles isolate one-page exact routed
 expert I/O overlap without enabling fused attention, int8 K/V, coalesced
-positions, pruning, or changed target weights. All three remain explicit and
-unpromoted pending real timing, pressure, and greedy/state gates.
+positions, pruning, or changed target weights. The Flash profile now has a
+fresh same-commit short-request A/B. It preserved all 16 greedy tokens, text
+SHA, aggregate state SHA, and separate attention-KV, DSA-index, recurrent,
+convolution, and hidden-state hashes. Wall moved 374.604 -> **368.970 seconds**
+(-1.50%), while physical swap-out growth fell 23.216 -> 14.418MB. The overlap
+submitted 4,193 exact future-page reads and hid 5.877 seconds of disk service;
+the measured wall delta is close enough to ordinary run variance that the
+profile remains explicit pending a second request shape. The full-model
+prefetch and DSA preallocation profiles also remain unpromoted pending real
+gates.
 
 The compiled GLM-5.3-Flash KDA graph now accepts an identity-bound segment
 length of 16/32/64/128 positions. At released H64/D128/L128 geometry, every
 segment returned byte-identical output and recurrent state. Segment 16 measured
 62.860ms versus 63.018ms for the segment-32 baseline while reducing scan peak
-850.4MB -> 714.6MB; the timing delta is noise-sized, so
-`glm53-flash-lossless-compiled-kda-segment16` remains an explicit pressure
-candidate pending a real-checkpoint request gate.
+850.4MB -> 714.6MB. The real 16-output checkpoint gate also preserved every
+token and complete/component state hash, but wall changed only 374.604 ->
+374.397 seconds (-0.055%, noise), prefill regressed 108.421 -> 108.933 seconds,
+and swap-out growth increased 23.216 -> 25.887MB. Segment 16 is therefore
+rejected as a speed/pressure promotion and remains only an explicit synthetic
+low-peak experiment.
 
 Focused result: 348 DSA/server/profile/Qwen-MTP tests and six PLE-row witness
 tests pass. Evidence:

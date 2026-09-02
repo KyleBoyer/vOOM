@@ -237,6 +237,22 @@ identical arm before the layer-stationary call-site fix, wall improved 351.929
 seconds further improvement, but a projected 43.9-minute capture is not an
 achieved timing. The switch remains explicit pending the anti-overfit corpus.
 
+The compiled graph's segment length is independently identity-bound and may
+be set to 16/32/64/128. Segment 16 reduced the synthetic released-geometry scan
+peak from 850.4MB to 714.6MB, but the real checkpoint gate rejected it as an
+end-to-end promotion: all 16 greedy tokens and every captured state component
+were exact, while wall changed only 374.604 to 374.397 seconds, prefill grew by
+0.512 seconds, and swap-out growth increased by 2.671MB. It remains an explicit
+low-peak experiment only.
+
+One-page routed-expert prefetch has a separate exact profile layered on the
+compiled-KDA route. A fresh same-commit 16-output A/B preserved tokens, text,
+and complete attention/DSA/recurrent/convolution/hidden state. It hid 5.877
+seconds of future-page disk service, moved wall 374.604 to 368.970 seconds, and
+reduced swap-out growth from 23.216MB to 14.418MB. Because the 1.50% wall delta
+is close to run variance, it remains explicit until a longer or differently
+shaped request confirms the benefit.
+
 The same trace identified a host-side governor cost: 626 shrink steps released
 zero cache bytes. Named reversible reservations were repeatedly lowering an
 already-empty cache limit, clearing MLX, then restoring the ineffective cut.
