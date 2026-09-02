@@ -69,9 +69,16 @@ MLA + exact batch-eight prefetch before coalescing. Expert-I/O wait fell
 169.195 -> **53.901 seconds (-68.1%)** while hidden service rose 104.997 ->
 294.182 seconds. True peak was 3.013GB, physical swap-out grew only 10.502MB,
 and no retry or adaptive clamp occurred. This proves the lossless scheduling
-composition relative to its E-class parent, not final answer quality: complete
-sustained-output, Plex/tool, vision, varied-shape, and untouched-capture gates
-remain required before any deployment recommendation.
+composition relative to its E-class parent. It has now also cleared the
+released 16-output strong state gate: all 16 greedy tokens, the text SHA, the
+aggregate state SHA, every component SHA, and all 159 tensor hashes matched the
+control exactly. Wall improved **374.604 -> 322.649 seconds (-13.9%)**, prefill
+**108.421 -> 66.826 (-38.4%)**, and decode 263.551 -> 253.177 seconds. True peak
+was 2.090GB versus 1.922GB for the control, physical swap-out grew 16.728MB
+versus 23.216MB, and read volume was 419.569GB. This is a substantially stronger
+proof of exact ordered scheduling, but the parent remains E-class; Plex/tool,
+vision, varied-shape, and untouched-capture quality gates remain required before
+any deployment recommendation.
 
 ## 2026-09-02: Qwen Flash abliterated overlay runs; new exact GLM schedules are isolated
 
