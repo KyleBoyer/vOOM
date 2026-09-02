@@ -84,6 +84,17 @@ was 1.674GB and total swap-out growth was 15.139MB, just inside the 16MB oracle
 limit. The same-body 64-output HTTP A/B remains the wall/pressure promotion
 gate.
 
+The paired 64-output compact HTTP rung is rejected despite its exactness and
+much smaller rollback representation. It preserved output SHA
+`969b418f...ffbe` and the identical 38/78 acceptance / 26-sweep path while
+replacing 9.006GB dense endpoint copies with 415.494MB of factors. However,
+factor restoration cost 1.088 seconds, decode regressed 541.058 -> 542.952
+seconds, wall regressed 660.005 -> **661.892 seconds**, and physical swap-out
+grew 54.95MB, failing the 32MB gate. Compact rollback stays available as an
+explicit long-context memory experiment; the noncompact
+`qwen38-flash-next-candidate-fast-tier-mtp` profile remains the measured short
+HTTP winner.
+
 The latest full-GLM trace exposed 966 exact DSA index-capacity grows and
 22,256,640 copied rows. `glm53-full-lossless-index-preallocate` now publishes
 the known final absolute request length before the first key tile, allocating

@@ -4,7 +4,7 @@ description: Exact low-rank KDA rollback for candidate-native Lightning-MTP.
 notes:
   - "Extends the accepted candidate-native depth-three MTP path and changes only speculative recurrent rollback storage: dense per-prefix DeltaNet endpoints are replaced by exact low-rank update factors."
   - "Rejected suffixes replay accepted factors through the ordinary FP32 one-position recurrence boundaries. Every emitted token remains full-candidate-target verified; QSA and PLE retain their exact strict-prefix restoration."
-  - "The baseline 64-output gate copied 9.006GB of dense KDA endpoints across 26 rounds. On a separate eight-output real candidate oracle, compact rollback captured 43.95MB of factors instead of dense endpoints, restored three rejected suffixes in 0.186s, and matched every token plus aggregate/KV/KDA/QSA/PLE state hash. It remains explicit until the same 64-token HTTP output SHA, timing, and pressure pass."
+  - "The baseline 64-output gate copied 9.006GB of dense KDA endpoints across 26 rounds. On a separate eight-output real candidate oracle, compact rollback captured 43.95MB of factors instead of dense endpoints, restored three rejected suffixes in 0.186s, and matched every token plus aggregate/KV/KDA/QSA/PLE state hash. The same 64-output HTTP gate preserved output/acceptance and reduced endpoint bytes to zero, but regressed wall 660.005s -> 661.892s and failed its 32MB swap-out-growth limit. Keep this diagnostic profile explicit; do not compose it into the winning MTP route."
 extends:
   - qwen38-flash-next-candidate-fast-tier-mtp
 settings:
