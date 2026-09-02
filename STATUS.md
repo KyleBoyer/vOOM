@@ -60,6 +60,19 @@ matched the final body exactly. `qwen38-flash-next-candidate-fast-tier-mtp`
 now isolates depth-three proposals from the candidate's own published MTP
 block with full candidate-target verification and no borrowed calibration.
 
+That isolated MTP path has now passed the same one-repeat HTTP gate. Output SHA
+`969b418f...ffbe` exactly matched the plain target. Wall fell 778.001 ->
+**660.005 seconds** (-15.2%) and decode fell 659.241 -> **541.058 seconds**
+(-17.9%). It accepted 38/78 candidate-native proposals (48.7%), reduced target
+sweeps 63 -> 26, and cut reads 845.084 -> 661.306GB. Peak Metal fell 4.209 ->
+1.844GB; the structured pressure/profile gate passed, though physical swap-out
+growth was 31.8MB and therefore close to its 32MB threshold. Verifier time
+still dominated at 501.295 seconds, and dense speculative KDA endpoint capture
+copied 9.006GB. The next explicit rung,
+`qwen38-flash-next-candidate-fast-tier-mtp-compact-kda`, replaces only those
+rollback snapshots with exact recurrence factors; it is not promoted pending
+real state/output/timing gates.
+
 The latest full-GLM trace exposed 966 exact DSA index-capacity grows and
 22,256,640 copied rows. `glm53-full-lossless-index-preallocate` now publishes
 the known final absolute request length before the first key tile, allocating

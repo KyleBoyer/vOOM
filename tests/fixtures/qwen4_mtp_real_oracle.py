@@ -43,6 +43,10 @@ def _pressure() -> dict[str, int]:
 
 def _config(
     cache_mb: int, *, pin_head: bool = False, phase_head: bool = False,
+    fast_tier_dir: str = "", parallel_storage_reads: bool = False,
+    expert_tile_eval_batch: int = 1,
+    serial_verify_suspend_lm_head: bool = False,
+    serial_verify_exact_bf16_gemv: bool = False,
 ) -> RuntimeConfig:
     if pin_head and phase_head:
         raise ValueError("pin_head and phase_head are mutually exclusive")
@@ -56,6 +60,7 @@ def _config(
         decode_expert_fetch_batch=16,
         prefetch_depth=0,
         qwen4_ple_read_workers=8,
+        qwen4_expert_tile_eval_batch=expert_tile_eval_batch,
         pin_embeddings=False,
         pin_lm_head=pin_head or phase_head,
         stream_lm_head=not (pin_head or phase_head),
@@ -63,6 +68,12 @@ def _config(
         embed_rows=True,
         layer_stationary_prefill=True,
         qwen_compiled_delta_prefill=True,
+        fast_dirs=((fast_tier_dir,) if fast_tier_dir else ()),
+        parallel_storage_reads=parallel_storage_reads,
+        qwen4_serial_verify_suspend_lm_head=(
+            serial_verify_suspend_lm_head),
+        qwen4_serial_verify_exact_bf16_gemv=(
+            serial_verify_exact_bf16_gemv),
         expert_route_overlap_telemetry=True,
         governor=True,
     )
@@ -71,15 +82,27 @@ def _config(
 def _run(
     model: Path, prompt: str, max_tokens: int, depth: int | None,
     cache_mb: int, *, pin_head: bool = False, phase_head: bool = False,
+    fast_tier_dir: str = "", parallel_storage_reads: bool = False,
+    expert_tile_eval_batch: int = 1,
+    serial_verify_suspend_lm_head: bool = False,
+    serial_verify_exact_bf16_gemv: bool = False,
+    compact_kda_rollback: bool = False,
 ) -> dict:
     before = _pressure()
     started = time.perf_counter()
     target = StreamingEngine(str(model), _config(
-        cache_mb, pin_head=pin_head, phase_head=phase_head))
+        cache_mb, pin_head=pin_head, phase_head=phase_head,
+        fast_tier_dir=fast_tier_dir,
+        parallel_storage_reads=parallel_storage_reads,
+        expert_tile_eval_batch=expert_tile_eval_batch,
+        serial_verify_suspend_lm_head=serial_verify_suspend_lm_head,
+        serial_verify_exact_bf16_gemv=serial_verify_exact_bf16_gemv))
     initialized = time.perf_counter()
     engine = (
         target if depth is None
-        else Qwen4MTPSpeculativeEngine(target, depth=depth)
+        else Qwen4MTPSpeculativeEngine(
+            target, depth=depth,
+            compact_kda_rollback=compact_kda_rollback)
     )
     try:
         result = engine.generate(
@@ -104,6 +127,10 @@ def _run(
             "mode": "plain" if depth is None else f"mtp-depth{depth}",
             "pin_lm_head": int(pin_head),
             "phase_lm_head": int(phase_head),
+            "fast_tier_dir": fast_tier_dir,
+            "parallel_storage_reads": int(parallel_storage_reads),
+            "expert_tile_eval_batch": expert_tile_eval_batch,
+            "compact_kda_rollback": int(compact_kda_rollback),
             "tokens": list(result["tokens"]),
             "text_sha256": hashlib.sha256(
                 result["text"].encode()).hexdigest(),
@@ -159,6 +186,14 @@ def main() -> int:
     parser.add_argument("--mtp-cache-mb", type=int)
     parser.add_argument("--mtp-pin-head", action="store_true")
     parser.add_argument("--mtp-phase-head", action="store_true")
+    parser.add_argument("--fast-tier-dir", default="")
+    parser.add_argument("--parallel-storage-reads", action="store_true")
+    parser.add_argument("--expert-tile-eval-batch", type=int, default=1)
+    parser.add_argument(
+        "--serial-verify-suspend-lm-head", action="store_true")
+    parser.add_argument(
+        "--serial-verify-exact-bf16-gemv", action="store_true")
+    parser.add_argument("--compact-kda-rollback", action="store_true")
     parser.add_argument("--plain-only", action="store_true")
     args = parser.parse_args()
     if args.max_tokens < 2:
@@ -172,10 +207,17 @@ def main() -> int:
         parser.error("mtp-pin-head requires mtp-cache-mb at least 1400")
     if args.mtp_pin_head and args.mtp_phase_head:
         parser.error("mtp-pin-head and mtp-phase-head are mutually exclusive")
+    if not 1 <= args.expert_tile_eval_batch <= 16:
+        parser.error("expert-tile-eval-batch must be in [1, 16]")
+    if args.serial_verify_suspend_lm_head and not args.mtp_phase_head:
+        parser.error("serial head suspension requires --mtp-phase-head")
 
     initial = _pressure()
     plain = _run(
-        args.model, args.prompt, args.max_tokens, None, args.cache_mb)
+        args.model, args.prompt, args.max_tokens, None, args.cache_mb,
+        fast_tier_dir=args.fast_tier_dir,
+        parallel_storage_reads=args.parallel_storage_reads,
+        expert_tile_eval_batch=args.expert_tile_eval_batch)
     if args.plain_only:
         pressure_after = _pressure()
         swap_out_growth = max(
@@ -199,7 +241,14 @@ def main() -> int:
         return 0 if report["passed"] else 1
     mtp = _run(
         args.model, args.prompt, args.max_tokens, args.depth, mtp_cache_mb,
-        pin_head=args.mtp_pin_head, phase_head=args.mtp_phase_head)
+        pin_head=args.mtp_pin_head, phase_head=args.mtp_phase_head,
+        fast_tier_dir=args.fast_tier_dir,
+        parallel_storage_reads=args.parallel_storage_reads,
+        expert_tile_eval_batch=args.expert_tile_eval_batch,
+        serial_verify_suspend_lm_head=args.serial_verify_suspend_lm_head,
+        serial_verify_exact_bf16_gemv=(
+            args.serial_verify_exact_bf16_gemv),
+        compact_kda_rollback=args.compact_kda_rollback)
     tokens_equal = plain["tokens"] == mtp["tokens"]
     text_equal = plain["text_sha256"] == mtp["text_sha256"]
     state_equal = plain["state_sha256"] == mtp["state_sha256"]
@@ -215,6 +264,10 @@ def main() -> int:
         "max_tokens": args.max_tokens,
         "weight_cache_mb": args.cache_mb,
         "mtp_weight_cache_mb": mtp_cache_mb,
+        "fast_tier_dir": args.fast_tier_dir,
+        "parallel_storage_reads": args.parallel_storage_reads,
+        "expert_tile_eval_batch": args.expert_tile_eval_batch,
+        "compact_kda_rollback": args.compact_kda_rollback,
         "plain": plain,
         "mtp": mtp,
         "tokens_equal": tokens_equal,

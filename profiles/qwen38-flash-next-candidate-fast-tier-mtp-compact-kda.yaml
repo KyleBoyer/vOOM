@@ -1,0 +1,11 @@
+schema: voom.runtime-profile.v1
+name: qwen38-flash-next-candidate-fast-tier-mtp-compact-kda
+description: Exact low-rank KDA rollback for candidate-native Lightning-MTP.
+notes:
+  - "Extends the accepted candidate-native depth-three MTP path and changes only speculative recurrent rollback storage: dense per-prefix DeltaNet endpoints are replaced by exact low-rank update factors."
+  - "Rejected suffixes replay accepted factors through the ordinary FP32 one-position recurrence boundaries. Every emitted token remains full-candidate-target verified; QSA and PLE retain their exact strict-prefix restoration."
+  - "The baseline 64-output gate copied 9.006GB of dense KDA endpoints across 26 rounds. This profile is explicit until real state digests, the same HTTP output SHA, timing, and pressure all pass."
+extends:
+  - qwen38-flash-next-candidate-fast-tier-mtp
+settings:
+  VMODEL_QWEN4_MTP_COMPACT_KDA_ROLLBACK: true

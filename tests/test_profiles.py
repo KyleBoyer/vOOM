@@ -301,6 +301,20 @@ def test_builtin_profiles_resolve_complete_agent_group():
     assert "VMODEL_QWEN4_MTP_Q_CALIBRATION_SCALES" not in (
         candidate_mtp_settings)
 
+    candidate_compact_order, candidate_compact_settings = (
+        resolve_runtime_profiles(
+            ("qwen38-flash-next-candidate-fast-tier-mtp-compact-kda",),
+            catalog))
+    assert candidate_compact_order == (
+        "qwen38-flash-next-candidate-bf16",
+        "qwen38-flash-next-candidate-fast-tier",
+        "qwen38-flash-next-candidate-fast-tier-mtp",
+        "qwen38-flash-next-candidate-fast-tier-mtp-compact-kda",
+    )
+    assert candidate_compact_settings[
+        "VMODEL_QWEN4_MTP_COMPACT_KDA_ROLLBACK"] == "1"
+    assert candidate_compact_settings["VMODEL_QWEN4_MTP_DEPTH"] == "3"
+
     long_order, long_settings = resolve_runtime_profiles(
         ("huihui-qwen38-27b-fast-long-context",), catalog)
     assert long_order == (
