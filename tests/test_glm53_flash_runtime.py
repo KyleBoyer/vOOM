@@ -532,7 +532,7 @@ def test_glm53_sparse_absorbed_mla_matches_eager_and_tiles(tile_size):
         np.asarray(eager.astype(mx.float32)), rtol=8e-3, atol=2e-2)
 
 
-def test_absorbed_mla_does_not_allocate_unused_expanded_prefill_cache():
+def test_absorbed_mla_keeps_dense_prefix_then_releases_expanded_layer():
     from types import SimpleNamespace
 
     from runtime.engine import (
@@ -543,13 +543,14 @@ def test_absorbed_mla_does_not_allocate_unused_expanded_prefill_cache():
     ordinary = SimpleNamespace(glm53_sparse_absorbed_mla=False)
     absorbed = SimpleNamespace(glm53_sparse_absorbed_mla=True)
     assert _glm53_expanded_prefill_cache(ordinary) == {}
-    assert _glm53_expanded_prefill_cache(absorbed) is None
+    assert _glm53_expanded_prefill_cache(absorbed) == {}
 
     ordinary._glm53_expanded_prefill = {3: object(), 7: object()}
-    absorbed._glm53_expanded_prefill = None
+    absorbed._glm53_expanded_prefill = {3: object(), 7: object()}
     _glm53_release_expanded_prefill_layer(ordinary, 3)
     _glm53_release_expanded_prefill_layer(absorbed, 3)
     assert set(ordinary._glm53_expanded_prefill) == {7}
+    assert set(absorbed._glm53_expanded_prefill) == {7}
 
 
 def test_glm53_dense_absorbed_mla_matches_row_selected_eager():

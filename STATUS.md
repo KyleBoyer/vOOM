@@ -194,12 +194,16 @@ low-peak experiment.
 
 The next memory-sidequest candidate is `glm53-flash-e-compact-mla`. A code
 audit found that the explicit absorbed-MLA flag still built the full expanded
-K/V cache and then ignored it; the candidate now consumes only the released
-compact latent. Because absorbed MLA reassociates floating-point products, it
-is explicitly E-class/lossy even if finite greedy tokens agree. Expert
-prefetch, int8 K/V, fused sparse attention, and coalesced expert positions are
-off for isolation. Real state-hash, captured-harness, Plex/tool, vision, and
-pressure gates remain pending.
+K/V cache and then ignored it. The first fix was correctly rejected: applying
+absorbed arithmetic before sparse DSA activated changed all 16 short-gate
+tokens and every retained state component while changing wall only 374.604 ->
+373.779 seconds (-0.22%). V2 keeps ordinary expanded dense attention exactly
+through the released 2,048-key boundary, then releases that layer's dead
+expanded prefix and uses compact absorbed MLA only for selected sparse rows.
+Because the sparse formulation still reassociates floating-point products, it
+remains explicitly E-class/lossy. Expert prefetch, int8 K/V, fused sparse
+attention, and coalesced expert positions are off for isolation. V2 real
+state-hash, captured-harness, Plex/tool, vision, and pressure gates are pending.
 
 Focused result: 348 DSA/server/profile/Qwen-MTP tests and six PLE-row witness
 tests pass. Evidence:

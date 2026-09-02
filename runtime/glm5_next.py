@@ -642,7 +642,31 @@ def glm5_next_mla_attention(
         cfg.mla_latent_norm_eps)
     latent_all = kv.update_latent(layer, latent)
     key_length = int(latent_all.shape[1])
+
+    selection = None
+    dsa = getattr(kv, "dsa", None)
+    if dsa is not None:
+        indexer_type = (
+            indexer_type_override
+            if indexer_type_override is not None
+            else cfg.indexer_types[layer])
+        dsa.observe(layer, indexer_type, hidden, w, prefix, offset)
+        if key_length > cfg.index_topk:
+            selection = dsa.update_and_select(
+                layer, indexer_type, hidden, q_resid, w, prefix, offset)
+
     expanded_prefill = getattr(kv, "_glm53_expanded_prefill", None)
+    absorbed_sparse = bool(
+        getattr(kv, "glm53_sparse_absorbed_mla", False)
+        and selection is not None)
+    if absorbed_sparse and expanded_prefill is not None:
+        # Dense attention through the first released top-k boundary retains
+        # the ordinary expanded formulation exactly. Once DSA selection is
+        # authoritative, absorbed MLA consumes compact latent rows and this
+        # layer's expanded prefix is dead; release it before the long-context
+        # allocation peak rather than building/appending unused K/V.
+        expanded_prefill.pop(layer, None)
+        expanded_prefill = None
     expanded_keys = expanded_values = None
     expanded_key_scales = expanded_value_scales = None
     if expanded_prefill is not None:
@@ -671,25 +695,8 @@ def glm5_next_mla_attention(
                     cache=expanded_prefill, heads=heads,
                     key_dim=key_dim, value_dim=value_dim))
 
-    selection = None
-    dsa = getattr(kv, "dsa", None)
-    if dsa is not None:
-        indexer_type = (
-            indexer_type_override
-            if indexer_type_override is not None
-            else cfg.indexer_types[layer])
-        dsa.observe(layer, indexer_type, hidden, w, prefix, offset)
-        if key_length > cfg.index_topk:
-            selection = dsa.update_and_select(
-                layer, indexer_type, hidden, q_resid, w, prefix, offset)
-
     if selection is None:
-        if getattr(kv, "glm53_sparse_absorbed_mla", False):
-            output = _glm5_next_dense_absorbed_mla_attention(
-                query, latent_all, w, prefix,
-                heads=heads, key_dim=key_dim, value_dim=value_dim,
-                offset=offset)
-        elif expanded_keys is not None:
+        if expanded_keys is not None:
             keys, values = expanded_keys, expanded_values
             if expanded_key_scales is not None:
                 keys = keys.astype(query.dtype) * expanded_key_scales.astype(
@@ -726,7 +733,7 @@ def glm5_next_mla_attention(
             output = mx.fast.scaled_dot_product_attention(
                 query, keys, values, scale=key_dim ** -0.5, mask=mask)
     else:
-        if getattr(kv, "glm53_sparse_absorbed_mla", False):
+        if absorbed_sparse:
             output = _glm5_next_sparse_absorbed_mla_attention(
                 query, latent_all, selection, w, prefix,
                 heads=heads, key_dim=key_dim, value_dim=value_dim,

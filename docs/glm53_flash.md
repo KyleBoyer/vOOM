@@ -289,10 +289,14 @@ remains pending.
 
 `glm53-flash-e-compact-mla` is the next explicit memory-sidequest candidate.
 The absorbed-MLA flag previously built a full expanded K/V cache before
-ignoring it; the fixed route reads only the released compact latent. Absorbed
-MLA reassociates floating-point products, so this is E-class/lossy regardless
-of finite greedy agreement. Its first gates isolate that lever with expert
-prefetch, fused sparse attention, int8 K/V, and coalesced expert positions off.
+ignoring it. V1 removed the cache globally and was rejected: all 16 short-gate
+tokens and every state component changed for only a 374.604 -> 373.779-second
+wall change (-0.22%). V2 keeps ordinary expanded dense attention through the
+released 2,048-key boundary, then releases that layer's dead expanded prefix
+and reads compact latent rows only when DSA selection is active. The sparse
+formulation still reassociates floating-point products, so this remains
+E-class/lossy. Its next gates isolate the lever with expert prefetch, fused
+sparse attention, int8 K/V, and coalesced expert positions off.
 
 The same storage grouping has a separate full GLM-5.3 composition with exact
 DSA index preallocation. On a deterministic 2,123-input/max-1 released-model
