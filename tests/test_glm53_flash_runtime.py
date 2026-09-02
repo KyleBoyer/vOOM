@@ -532,6 +532,17 @@ def test_glm53_sparse_absorbed_mla_matches_eager_and_tiles(tile_size):
         np.asarray(eager.astype(mx.float32)), rtol=8e-3, atol=2e-2)
 
 
+def test_absorbed_mla_does_not_allocate_unused_expanded_prefill_cache():
+    from types import SimpleNamespace
+
+    from runtime.engine import _glm53_expanded_prefill_cache
+
+    ordinary = SimpleNamespace(glm53_sparse_absorbed_mla=False)
+    absorbed = SimpleNamespace(glm53_sparse_absorbed_mla=True)
+    assert _glm53_expanded_prefill_cache(ordinary) == {}
+    assert _glm53_expanded_prefill_cache(absorbed) is None
+
+
 def test_glm53_dense_absorbed_mla_matches_row_selected_eager():
     import mlx.core as mx
 

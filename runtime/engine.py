@@ -79,6 +79,18 @@ def _memory_retry_diagnostic(error: MemoryError) -> dict[str, object]:
     }
 
 
+def _glm53_expanded_prefill_cache(kv):
+    """Create request-local expanded K/V only for paths that consume it.
+
+    Absorbed MLA reads the released compact latent directly. Building the
+    expanded cache in that mode retained multiple unused gigabytes at long
+    context and defeated the purpose of the explicit memory experiment.
+    """
+    if bool(getattr(kv, "glm53_sparse_absorbed_mla", False)):
+        return None
+    return {}
+
+
 def qwen35_phase_head_request_active(
     enabled: bool,
     prompt_tokens: int,
@@ -7856,7 +7868,7 @@ class StreamingEngine:
         # durable endpoint remains the released compact latent.  This removes
         # quadratic re-projection, but the bounded GEMM shape can round
         # differently from ordinary growing-prefix compressed decode.
-        kv._glm53_expanded_prefill = {}
+        kv._glm53_expanded_prefill = _glm53_expanded_prefill_cache(kv)
 
         probe_positions = min(total, tile_width)
         (self._layer_transient,

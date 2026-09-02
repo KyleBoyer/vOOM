@@ -6,7 +6,7 @@ notes:
   - "The live governor may clamp the storage group downward but cannot enlarge it or change the one-expert arithmetic boundary. At most one successor storage group is in flight."
   - "The 16-output released-model gate preserved every token, text SHA, aggregate state, and attention/DSA/recurrent/convolution/hidden component hash. Versus batch 1, wall fell 368.970s to 351.396s (-4.76%); peak rose 167.6MB and swap-out growth rose 14.0MB but stayed below the 32MB short gate."
   - "The deterministic 2,123-input/max-1 HTTP gate preserved request/output hashes and the exact 300.530GB read count. Versus batch 1, wall fell 583.754s to 441.689s (-24.34%), with only 16KB more peak Metal and 1.77MB less swap-out growth. Versus no prefetch, the combined exact gain is 41.36%."
-  - "Rejected for the untouched 46,849-token/134-tool capture: before completing layer 3's attention tile at token 24,160, observed Metal reached 8,501,319,252 bytes against the hard 8.5GB cap and triggered fail-fast retry after 730.041s. Retain only for short/medium context; batch-1 prefetch is the next lower-residency real-capture rung."
+  - "Rejected for the untouched 46,849-token/134-tool capture: before completing layer 3's attention tile at token 24,160, observed Metal reached 8,501,319,252 bytes against the hard 8.5GB cap and triggered fail-fast retry after 730.041s. Batch 1 also failed at token 28,544 after 889.812s, so all exact expert-prefetch widths are short/medium-context only."
 extends:
   - glm53-flash-lossless-expert-prefetch
 settings:

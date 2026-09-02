@@ -6,6 +6,7 @@ notes:
   - "The released router decisions, FP8 weights, expert compute, and ascending accumulation order are unchanged. Telemetry reports submissions, wait time, and disk time hidden by Metal."
   - "A fresh same-commit 16-output released-model A/B preserved all greedy tokens, text, aggregate state, and separate attention/DSA/recurrent/convolution/hidden hashes. Wall moved 374.604s to 368.970s and swap-out growth 23.216MB to 14.418MB while 5.877s of disk service was hidden."
   - "A second deterministic 2,123-input/max-1 HTTP A/B preserved the known output SHA, read count, and Metal peak while reducing wall 753.260s to 583.754s (-22.50%) and swap-out growth 50.348MB to 44.581MB; 215.573s of service was hidden. Preferred explicit lossless Flash prefill route, but still non-default pending real tool/harness and Plex shapes."
+  - "Rejected for the untouched 46,849-token/134-tool capture: layer 3's attention tile reached 8,501,617,500 bytes at token 28,544 and triggered fail-fast retry after 889.812s. Retain for short/medium context only; exact long context disables expert prefetch."
 extends:
   - glm53-flash-lossless-compiled-kda
 settings:

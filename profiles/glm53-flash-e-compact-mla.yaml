@@ -1,0 +1,13 @@
+schema: voom.runtime-profile.v1
+name: glm53-flash-e-compact-mla
+description: Explicit GLM-5.3-Flash E-class absorbed-MLA long-context memory experiment.
+notes:
+  - "Extends exact compiled KDA but enables absorbed sparse MLA, which consumes the released compact latent without building full expanded K/V. The implementation now avoids allocating that unused expanded cache."
+  - "Absorbed MLA reassociates floating-point products, so this profile is E-class/lossy even when a finite token gate agrees. It never changes the released target weights, router, or expert arithmetic."
+  - "Expert prefetch, fused sparse attention, int8 K/V, and coalesced expert positions remain off to isolate the compact-attention lever. Require real state, captured-harness, Plex/tool, vision, and pressure gates before composing any other sidequest switch."
+extends:
+  - glm53-flash-lossless-compiled-kda
+settings:
+  VMODEL_GLM53_SPARSE_ABSORBED_MLA: true
+  VMODEL_GLM53_EXPERT_FETCH_BATCH: 1
+  VMODEL_GLM53_EXPERT_BATCH_PREFETCH: false

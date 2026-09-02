@@ -135,8 +135,14 @@ token 24,160: observed Metal reached 8,501,319,252 bytes against the hard
 8.5GB cap and triggered fail-fast retry after **730.041 seconds**. Post-failure
 availability was 3.32GB and swap-out growth was 34.75MB. Batch 8 remains the
 preferred explicit short/medium-context Flash route, but is rejected for this
-long shape; batch 1 is the next lower-residency exact captured-harness rung.
-Plex remains required before any default. The full-model prefetch and DSA
+long shape. Batch 1 progressed farther but also failed in layer 3 at token
+28,544 after **889.812 seconds**, with 8,501,617,500 observed bytes against the
+8.5GB cap, 3.88GB post-failure availability, and 39.80MB swap-out growth. The
+new inline retry diagnostic recorded reason, subphase, layer, token boundary,
+observed/limit bytes, and retry chunk directly in the private replay artifact.
+All exact Flash expert-prefetch widths are therefore short/medium-context only;
+long context keeps expert prefetch off. Plex remains required before any
+default. The full-model prefetch and DSA
 preallocation profiles
 also now have a composed deterministic gate. On the official full GLM-5.3
 checkpoint, `glm53-full-lossless-preallocate-prefetch-batch8` preserved the
@@ -185,6 +191,15 @@ token and complete/component state hash, but wall changed only 374.604 ->
 and swap-out growth increased 23.216 -> 25.887MB. Segment 16 is therefore
 rejected as a speed/pressure promotion and remains only an explicit synthetic
 low-peak experiment.
+
+The next memory-sidequest candidate is `glm53-flash-e-compact-mla`. A code
+audit found that the explicit absorbed-MLA flag still built the full expanded
+K/V cache and then ignored it; the candidate now consumes only the released
+compact latent. Because absorbed MLA reassociates floating-point products, it
+is explicitly E-class/lossy even if finite greedy tokens agree. Expert
+prefetch, int8 K/V, fused sparse attention, and coalesced expert positions are
+off for isolation. Real state-hash, captured-harness, Plex/tool, vision, and
+pressure gates remain pending.
 
 Focused result: 348 DSA/server/profile/Qwen-MTP tests and six PLE-row witness
 tests pass. Evidence:

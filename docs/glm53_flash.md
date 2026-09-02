@@ -279,8 +279,20 @@ capture rejected it before layer 3's attention tile completed at token 24,160:
 observed Metal reached 8,501,319,252 bytes against the hard 8.5GB cap and
 triggered fail-fast retry after 730.041 seconds. Post-failure availability was
 3.32GB and swap-out growth was 34.75MB. It is therefore not a long-context
-profile; batch-1 prefetch is the next exact lower-residency captured-harness
-rung. Plex remains pending.
+profile. Batch 1 progressed farther but also failed in layer 3 at token 28,544
+after 889.812 seconds, with 8,501,617,500 observed bytes against the 8.5GB cap,
+3.88GB post-failure availability, and 39.80MB swap-out growth. The upgraded
+artifact captured the sanitized reason, subphase, layer, token boundary,
+observed/limit bytes, and retry chunk inline. All exact expert-prefetch widths
+are therefore short/medium-context only; long context disables prefetch. Plex
+remains pending.
+
+`glm53-flash-e-compact-mla` is the next explicit memory-sidequest candidate.
+The absorbed-MLA flag previously built a full expanded K/V cache before
+ignoring it; the fixed route reads only the released compact latent. Absorbed
+MLA reassociates floating-point products, so this is E-class/lossy regardless
+of finite greedy agreement. Its first gates isolate that lever with expert
+prefetch, fused sparse attention, int8 K/V, and coalesced expert positions off.
 
 The same storage grouping has a separate full GLM-5.3 composition with exact
 DSA index preallocation. On a deterministic 2,123-input/max-1 released-model

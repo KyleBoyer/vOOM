@@ -203,6 +203,21 @@ def test_builtin_profiles_resolve_complete_agent_group():
     assert "VMODEL_GLM53_COALESCED_EXPERT_POSITIONS" not in (
         glm_flash_batch8_settings)
 
+    glm_absorbed_order, glm_absorbed_settings = resolve_runtime_profiles(
+        ("glm53-flash-e-compact-mla",), catalog)
+    assert glm_absorbed_order == (
+        "glm53-flash-lossless-compiled-kda",
+        "glm53-flash-e-compact-mla",
+    )
+    assert glm_absorbed_settings[
+        "VMODEL_GLM53_SPARSE_ABSORBED_MLA"] == "1"
+    assert glm_absorbed_settings[
+        "VMODEL_GLM53_EXPERT_BATCH_PREFETCH"] == "0"
+    assert "VMODEL_GLM53_SPARSE_FUSED_ATTENTION" not in (
+        glm_absorbed_settings)
+    assert "VMODEL_GLM53_SPARSE_FUSED_KV_INT8" not in (
+        glm_absorbed_settings)
+
     glm_fast_order, glm_fast_settings = resolve_runtime_profiles(
         ("glm53-flash-long-context-fast",), catalog)
     assert glm_fast_order == (
