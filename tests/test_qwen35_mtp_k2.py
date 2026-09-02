@@ -13,6 +13,8 @@ import pytest
 from runtime.kv_cache import KVCache
 from runtime.qwen35_mtp import (
     _QwenMTPBootstrapPrompt,
+    _greedy_token_and_normalized_entropy,
+    _normalized_probability_entropy,
     ProposalQPolicy, QwenMTPDrafter, QwenMTPSpeculativeEngine)
 from runtime.sampler import SamplingParams
 
@@ -238,6 +240,149 @@ class _WideTarget(_Target):
         for row, token in enumerate(target_tokens):
             logits = logits.at[row, token].add(200.0)
         return logits
+
+
+class _VariableWidthTarget(_Target):
+    """Target oracle that accepts an entropy-shortened proposal chain."""
+
+    draft_tokens = (10, 11, 12, 13)
+
+    def __init__(self):
+        super().__init__(accepted_prefix=4)
+        self.endpoints = {index: _Endpoint(index) for index in range(1, 6)}
+
+    def forward_tokens_serial_positions(
+        self, tokens, kv, *, capture_kda_endpoints=False,
+    ):
+        width = len(tokens)
+        assert tokens == [4, *self.draft_tokens[:width - 1]]
+        assert capture_kda_endpoints
+        self.serial_calls.append(list(tokens))
+        kv.offset += width
+        kv.lengths[0] += width
+        kv.kda_cache = self.endpoints[width]
+        self._h_window = mx.array(
+            [[[40.0 + 10.0 * row] for row in range(width)]])
+        self._h_last = self._h_window[:, -1:, :]
+        winners = [*self.draft_tokens[:width - 1], 8]
+        logits = mx.full((width, 16), -100.0)
+        for row, token in enumerate(winners):
+            logits = logits.at[row, token].add(200.0)
+        return logits
+
+
+class _EntropyDrafter:
+    def __init__(self):
+        self.calls = []
+        self.mtp_kv = None
+
+    def draft_step(self, hidden, token, mtp_kv, offset, _weights=None):
+        step = len(self.calls)
+        self.calls.append((int(token), int(offset)))
+        self.mtp_kv = mtp_kv
+        item = mx.ones((1, 1, 1, 1))
+        mtp_kv.update(0, item, item)
+        if step == 0:
+            logits = mx.full((16,), -100.0).at[10].add(200.0)
+        elif step == 1:
+            # Nearly uniform but with a deterministic token-11 argmax.
+            logits = mx.zeros((16,)).at[11].add(0.01)
+        else:
+            raise AssertionError("entropy stop failed to shorten draft")
+        return logits, hidden + 1
+
+
+class _BudgetDrafter:
+    def __init__(self):
+        self.calls = []
+
+    def draft_step(self, hidden, token, mtp_kv, offset, _weights=None):
+        step = len(self.calls)
+        self.calls.append((int(token), int(offset)))
+        item = mx.ones((1, 1, 1, 1))
+        mtp_kv.update(0, item, item)
+        proposal = (10, 11, 12, 13)[step]
+        logits = mx.full((16,), -100.0).at[proposal].add(200.0)
+        return logits, hidden + 1
+
+
+def test_normalized_entropy_signal_has_expected_extremes():
+    winner, peaked = _greedy_token_and_normalized_entropy(
+        mx.array([-100.0, 100.0, -100.0, -100.0]))
+    _, uniform = _greedy_token_and_normalized_entropy(mx.zeros((4,)))
+
+    assert winner == 1
+    assert peaked == pytest.approx(0.0, abs=1e-6)
+    assert uniform == pytest.approx(1.0, abs=1e-6)
+    assert _normalized_probability_entropy(
+        mx.array([1.0, 0.0, 0.0, 0.0])) == 0.0
+    assert _normalized_probability_entropy(
+        mx.array([0.25, 0.25, 0.25, 0.25])) == pytest.approx(
+            1.0, abs=1e-6)
+
+
+def test_entropy_stop_shortens_draft_but_target_remains_authoritative():
+    target = _VariableWidthTarget()
+    engine = QwenMTPSpeculativeEngine(
+        target,
+        max_prompt_tokens=8,
+        min_output_tokens=2,
+        plain_warmup_tokens=0,
+        adaptive_stop=False,
+        depth=4,
+        entropy_stop_threshold=0.95,
+    )
+    drafter = _EntropyDrafter()
+    engine.drafter = drafter
+
+    result = engine.generate("x", 4)
+    stats = result["path_stats"]
+
+    assert result["tokens"] == [4, 10, 11, 8]
+    assert target.serial_calls == [[4, 10, 11]]
+    assert drafter.calls == [(4, 2), (10, 3)]
+    assert stats["qwen_mtp_max_verify_width_observed"] == 3
+    assert stats["qwen_mtp_entropy_stop_enabled"] == 1
+    assert stats["qwen_mtp_entropy_stop_profiled_tokens"] == 2
+    assert stats["qwen_mtp_entropy_stop_profiled_rounds"] == 1
+    assert stats["qwen_mtp_entropy_stop_events"] == 1
+    assert stats["qwen_mtp_entropy_stop_events_by_step"] == [0, 1, 0, 0]
+    assert stats["qwen_mtp_entropy_stop_mean_width"] == 2.0
+    record = stats["qwen_mtp_entropy_stop_round_records"][0]
+    assert record["normalized_entropies"][0] == pytest.approx(0.0, abs=1e-6)
+    assert record["normalized_entropies"][1] > 0.99
+    assert record["accepted_prefix"] == 2
+    assert record["rejected"] == 0
+
+
+def test_budget_aware_width_uses_bonus_instead_of_overdrafting():
+    target = _VariableWidthTarget()
+    engine = QwenMTPSpeculativeEngine(
+        target,
+        max_prompt_tokens=8,
+        min_output_tokens=2,
+        plain_warmup_tokens=0,
+        adaptive_stop=False,
+        depth=4,
+        budget_aware_width=True,
+    )
+    drafter = _BudgetDrafter()
+    engine.drafter = drafter
+
+    # Bootstrap already emitted one token, leaving three slots. Two drafts
+    # plus the authoritative bonus cover all three without a width-five
+    # verifier or the two unused proposal steps.
+    result = engine.generate("x", 4)
+    stats = result["path_stats"]
+
+    assert result["tokens"] == [4, 10, 11, 8]
+    assert target.serial_calls == [[4, 10, 11]]
+    assert drafter.calls == [(4, 2), (10, 3)]
+    assert stats["qwen_mtp_budget_aware_width_enabled"] == 1
+    assert stats["qwen_mtp_budget_width_clamped_rounds"] == 1
+    assert stats["qwen_mtp_budget_draft_steps_avoided"] == 2
+    assert stats["qwen_mtp_round_draft_widths"] == [2]
+    assert stats["qwen_mtp_max_verify_width_observed"] == 3
 
 
 class _WideRecurrentDrafter(_RecurrentDrafter):
@@ -1809,6 +1954,29 @@ def test_k2_constructor_is_strict_and_opt_in():
         target, depth=4, prompt_history_tokens=128,
         selective_tree_margin=2)
     assert selective.selective_tree_margin == 2.0
+    entropy_stop = QwenMTPSpeculativeEngine(
+        target, depth=4, entropy_stop_threshold=0.75)
+    assert entropy_stop.entropy_stop_threshold == 0.75
+    assert "entropy-stop-0.75" in entropy_stop.mtp_engine_identity
+    for invalid in (-0.01, 1.01, float("nan"), float("inf"), True, "0.5"):
+        with pytest.raises(ValueError, match="entropy-stop threshold"):
+            QwenMTPSpeculativeEngine(
+                target, depth=4, entropy_stop_threshold=invalid)
+    with pytest.raises(ValueError, match="cannot be combined with native"):
+        QwenMTPSpeculativeEngine(
+            target, depth=4, native_tree_width=2,
+            entropy_stop_threshold=0.75)
+    with pytest.raises(ValueError, match="cannot be combined with selective"):
+        QwenMTPSpeculativeEngine(
+            target, depth=4, prompt_history_tokens=128,
+            selective_tree_margin=2, entropy_stop_threshold=0.75)
+    budget_width = QwenMTPSpeculativeEngine(
+        target, depth=4, budget_aware_width=True)
+    assert budget_width.budget_aware_width is True
+    assert "budget-aware-width" in budget_width.mtp_engine_identity
+    with pytest.raises(TypeError, match="budget_aware_width must be bool"):
+        QwenMTPSpeculativeEngine(
+            target, depth=4, budget_aware_width=1)
     with pytest.raises(ValueError, match="native trees"):
         QwenMTPSpeculativeEngine(
             target, depth=4, prompt_history_tokens=128,
@@ -1833,6 +2001,11 @@ def test_server_q_policy_is_strict_and_part_of_engine_cache_identity():
             EngineManager().get(Path("/tmp/not-opened"), "fast")
     with patch.dict(os.environ, {
         "VMODEL_QWEN_MTP_GRAMMAR_AWARE_DRAFT": "auto",
+    }):
+        with pytest.raises(RequestValidationError, match="must be 0 or 1"):
+            EngineManager().get(Path("/tmp/not-opened"), "fast")
+    with patch.dict(os.environ, {
+        "VMODEL_QWEN_MTP_BUDGET_AWARE_WIDTH": "auto",
     }):
         with pytest.raises(RequestValidationError, match="must be 0 or 1"):
             EngineManager().get(Path("/tmp/not-opened"), "fast")
@@ -1874,6 +2047,11 @@ def test_server_q_policy_is_strict_and_part_of_engine_cache_identity():
         "VMODEL_QWEN_MTP_SELECTIVE_TREE_MARGIN": "17",
     }):
         with pytest.raises(RequestValidationError, match=r"in \[0, 16\]"):
+            EngineManager().get(Path("/tmp/not-opened"), "fast")
+    with patch.dict(os.environ, {
+        "VMODEL_QWEN_MTP_ENTROPY_STOP_THRESHOLD": "1.01",
+    }):
+        with pytest.raises(RequestValidationError, match=r"in \[0, 1\]"):
             EngineManager().get(Path("/tmp/not-opened"), "fast")
     with patch.dict(os.environ, {
         "VMODEL_QWEN_MTP_SELECTIVE_TREE_MARGIN": "2",

@@ -558,6 +558,54 @@ Evidence: `logs/qwen38_suffix12_tile4096_mtpquant_depth7_large16k_out64_20260826
 `logs/qwen38_suffix12_page_native8x1024_large16k_out64_20260826.json`, and
 `logs/qwen38_suffix12_page_native8x1024_large16k_out64_rerun_20260826.json`.
 
+## Budget-aware verified MTP and physical-tier attribution (2026-09-01)
+
+The depth-seven child profile now enables
+`VMODEL_QWEN_MTP_BUDGET_AWARE_WIDTH=1`. For greedy decoding only, if `R`
+output slots remain, the runtime proposes at most `max(1, R-1)` tokens: those
+drafts plus the target verifier's bonus cover every remaining slot. Additional
+drafts cannot influence the response but still widen the serial verifier. The
+target remains authoritative and stochastic requests deliberately retain the
+unchanged full-depth path.
+
+The untouched max-16 capture preserved SHA-256
+`9b170095...b87b81` and all 16 tokens while narrowing its final round from
+seven drafts to five. Wall improved **68.5388 -> 64.8992 seconds** and decode
+**17.9744 -> 15.3428 seconds**. A separate developer-message/two-tool/max-32
+pair preserved SHA-256 `a8815ed2...9503c` and its exact
+`mastra_workspace_list_files` call while improving **102.4617 -> 79.8216
+seconds** wall. The latter avoided nine proposals in widths `...,7,7` ->
+`...,4,1`, which also avoided nine verifier positions.
+
+The final cold named-profile-only replay required zero environment overrides
+and improved the same untouched request to **62.7884 seconds wall / 44.8497
+prefill / 15.1986 decode**. It preserved the same SHA and widths, peaked at
+3.712GB Metal, and grew physical swap-out by 1.081MB.
+
+`VMODEL_QWEN_MTP_ENTROPY_STOP_THRESHOLD` is a separate explicit diagnostic
+and experimental policy. It implements vocabulary-normalized entropy capture
+for greedy logits and proposal-support-normalized entropy for stochastic
+proposal distributions, emitting only rounded entropy/acceptance metadata.
+The first real trace showed entropy was not monotonic with acceptance on this
+model, so no threshold is present in a production profile.
+
+`VMODEL_EXECUTION_PROFILE=layers|ops` now records per-layer physical-tier
+fetches and bytes plus internal service, archive service, parallel wall, and
+hidden overlap. On the entropy calibration run, prefill was overwhelmingly
+compute-bound (44.4711s compute / 1.0631s weight wait), while decode remained
+mixed (5.8192s / 8.5131s). Total internal/archive service was 13.4570s /
+13.5546s. This confirms that the 7.75GB model-specific fast tier is already
+balanced and that another placement shuffle is below the experiment stop
+rule.
+
+Artifacts:
+
+- `logs/qwen38_entropy_profile_capture16_20260901.json`
+- `logs/qwen38_budget_width_capture16_20260901.json`
+- `logs/qwen38_budget_width_developer32_20260901.json`
+- `logs/qwen38_budget_width_developer32_control_20260901.json`
+- `logs/qwen38_budget_width_profile_capture16_final_20260901.json`
+
 ## Depth-4 n-gram/MTP cascade and pressure follow-up (2026-08-26)
 
 `VMODEL_QWEN_MTP_NGRAM_FIRST=1` now composes with the existing native-MTP

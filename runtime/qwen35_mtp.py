@@ -80,6 +80,58 @@ from .speculative import ngram_propose
 _GREEDY_DRAFT_MARGIN_THRESHOLDS = (0.25, 0.5, 1.0, 2.0, 4.0, 8.0, 16.0)
 
 
+def _greedy_token_and_normalized_entropy(
+    logits: mx.array,
+) -> tuple[int, float]:
+    """Return argmax plus vocabulary-normalized entropy in one device sync.
+
+    The normalized value is in ``[0, 1]`` over the finite logit support. It is
+    computed on-device and only the winning token, entropy, and support size
+    cross to the host. This is a training-free dynamic-draft stopping signal;
+    it never participates in target acceptance or changes the authoritative
+    distribution.
+    """
+    flat = logits.astype(mx.float32).reshape(-1)
+    finite = mx.isfinite(flat)
+    finite_count = mx.sum(finite)
+    safe_logits = mx.where(finite, flat, -float("inf"))
+    log_normalizer = mx.logsumexp(safe_logits)
+    probability = mx.where(
+        finite, mx.exp(safe_logits - log_normalizer), 0.0)
+    information = mx.where(
+        finite, log_normalizer - safe_logits, 0.0)
+    entropy = mx.sum(probability * information)
+    winner = mx.argmax(safe_logits)
+    mx.eval(winner, entropy, finite_count)
+    support = int(finite_count.item())
+    if support <= 0:
+        raise ValueError("Qwen MTP draft logits have no finite support")
+    normalized = (
+        float(entropy.item()) / math.log(support) if support > 1 else 0.0
+    )
+    return int(winner.item()), min(1.0, max(0.0, normalized))
+
+
+def _normalized_probability_entropy(probabilities: mx.array) -> float:
+    """Return support-normalized entropy for an already-filtered proposal q."""
+    flat = probabilities.astype(mx.float32).reshape(-1)
+    positive = mx.logical_and(mx.isfinite(flat), flat > 0.0)
+    support_count = mx.sum(positive)
+    positive_values = mx.where(positive, flat, 0.0)
+    mass = mx.sum(positive_values)
+    normalized = positive_values / mx.maximum(mass, 1e-30)
+    information = mx.where(
+        positive, -mx.log(mx.maximum(normalized, 1e-30)), 0.0)
+    entropy = mx.sum(normalized * information)
+    mx.eval(entropy, mass, support_count)
+    support = int(support_count.item())
+    total = float(mass.item())
+    if support <= 0 or not math.isfinite(total) or total <= 0.0:
+        raise ValueError("Qwen MTP proposal distribution has no positive support")
+    value = float(entropy.item()) / math.log(support) if support > 1 else 0.0
+    return min(1.0, max(0.0, value))
+
+
 class _QwenMTPBootstrapPrompt(str):
     """Prepared-prompt-compatible view that transfers paged KV to MTP.
 
@@ -1413,6 +1465,8 @@ class QwenMTPSpeculativeEngine:
         prompt_history_tokens: int = 0,
         prompt_history_min_prompt_tokens: int = 0,
         selective_tree_margin: float = 0.0,
+        entropy_stop_threshold: float = 0.0,
+        budget_aware_width: bool = False,
         drafter=None,
         mtp_ablation_direction=None,
         mtp_ablation_strength: float = 1.0,
@@ -1485,6 +1539,21 @@ class QwenMTPSpeculativeEngine:
                 or not 0.0 <= float(selective_tree_margin) <= 16.0):
             raise ValueError(
                 "Qwen MTP selective-tree margin must be in [0, 16]")
+        if (isinstance(entropy_stop_threshold, bool)
+                or not isinstance(entropy_stop_threshold, (int, float))
+                or not math.isfinite(float(entropy_stop_threshold))
+                or not 0.0 <= float(entropy_stop_threshold) <= 1.0):
+            raise ValueError(
+                "Qwen MTP entropy-stop threshold must be in [0, 1]")
+        if entropy_stop_threshold and native_tree_width:
+            raise ValueError(
+                "Qwen MTP entropy-stop cannot be combined with native trees")
+        if entropy_stop_threshold and selective_tree_margin:
+            raise ValueError(
+                "Qwen MTP entropy-stop cannot be combined with selective "
+                "trees")
+        if not isinstance(budget_aware_width, bool):
+            raise TypeError("Qwen MTP budget_aware_width must be bool")
         self.target = target
         self.drafter = drafter if drafter is not None else QwenMTPDrafter(target)
         self.proposal_source = str(getattr(
@@ -1554,6 +1623,8 @@ class QwenMTPSpeculativeEngine:
         self.prompt_history_min_prompt_tokens = int(
             prompt_history_min_prompt_tokens)
         self.selective_tree_margin = float(selective_tree_margin)
+        self.entropy_stop_threshold = float(entropy_stop_threshold)
+        self.budget_aware_width = budget_aware_width
         weight_identity = self.drafter.request_weight_representation
         self.mtp_engine_identity = (
             f"qwen-mtp-depth{self.depth}-{self.proposal_q_policy.name}"
@@ -1579,6 +1650,11 @@ class QwenMTPSpeculativeEngine:
                 f"-selective-tree-margin-{self.selective_tree_margin:g}"
                 if self.selective_tree_margin else ""
             )
+            + (
+                f"-entropy-stop-{self.entropy_stop_threshold:g}"
+                if self.entropy_stop_threshold else ""
+            )
+            + ("-budget-aware-width" if self.budget_aware_width else "")
             + (
                 f"-mtp-ablation-{mtp_ablation_fingerprint[:12]}-"
                 f"s{float(mtp_ablation_strength):g}"
@@ -2123,6 +2199,13 @@ class QwenMTPSpeculativeEngine:
         target_prefix_rollbacks = 0
         round_outcomes: list[str] = []
         proposal_sources: list[str] = []
+        entropy_stop_profiled_tokens = 0
+        entropy_stop_events = 0
+        entropy_stop_events_by_step = [0] * self.depth
+        entropy_stop_round_records: list[dict[str, object]] = []
+        budget_width_clamped_rounds = 0
+        budget_draft_steps_avoided = 0
+        round_draft_widths: list[int] = []
         ngram_first_attempts = 0
         ngram_first_matches = 0
         ngram_first_proposed = 0
@@ -2440,6 +2523,7 @@ class QwenMTPSpeculativeEngine:
                 draft_rank_probabilities: list[mx.array | None] = []
                 draft_ranked_tokens: list[tuple[int, ...] | None] = []
                 draft_margin_buckets: list[int | None] = []
+                round_entropy_values: list[float] = []
                 round_draft_steps_run = 0
                 draft_hidden = h_last
                 draft_input_token = catchup_tok
@@ -2481,9 +2565,9 @@ class QwenMTPSpeculativeEngine:
                     # Stochastic requests deliberately bypass this path: an
                     # n-gram lookup does not define the full proposal q needed
                     # for exact p/q acceptance and residual correction.
+                    remaining_outputs = max_tokens - len(emitted)
                     if self.ngram_first and sampling.is_greedy:
                         ngram_first_attempts += 1
-                        remaining_outputs = max_tokens - len(emitted)
                         # Leave room for the verifier's authoritative bonus
                         # when possible. With one output slot left, one draft
                         # is still useful and its overfed input is rolled back
@@ -2503,6 +2587,27 @@ class QwenMTPSpeculativeEngine:
                             round_proposal_source = "N"
                             ngram_first_matches += 1
                             ngram_first_native_draft_bypasses += 1
+
+                    round_native_draft_depth = self.depth
+                    if (
+                        self.budget_aware_width
+                        and sampling.is_greedy
+                        and not ngram_tokens
+                        and not round_native_tree
+                        and not round_selective_tree_candidate
+                    ):
+                        # A chain of D drafts can return at most D accepted
+                        # drafts plus one authoritative bonus. Once R output
+                        # slots remain, drafts beyond R-1 cannot affect a
+                        # greedy response. Keep one draft for the R=1 edge so
+                        # existing catchup/rollback mechanics stay unchanged.
+                        useful_depth = max(1, remaining_outputs - 1)
+                        round_native_draft_depth = min(
+                            self.depth, useful_depth)
+                        avoided = self.depth - round_native_draft_depth
+                        if avoided:
+                            budget_width_clamped_rounds += 1
+                            budget_draft_steps_avoided += avoided
 
                     prepare_request_weights = getattr(
                         self.drafter, "prepare_request_weights", None)
@@ -2578,7 +2683,9 @@ class QwenMTPSpeculativeEngine:
                                 # simply retain the established unmasked path.
                                 draft_constraint = None
 
-                    for step in range(0 if ngram_tokens else self.depth):
+                    for step in range(
+                        0 if ngram_tokens else round_native_draft_depth
+                    ):
                         # A grammar-aware draft fork may have consumed a stop
                         # token on the previous provisional step.  xgrammar
                         # has no legal next state after termination; end the
@@ -2594,7 +2701,8 @@ class QwenMTPSpeculativeEngine:
                                 if (round_native_tree or (
                                     self.grammar_aware_draft
                                     and constraint is not None
-                                ) or self.proposal_replay_top_k):
+                                ) or self.proposal_replay_top_k
+                                    or self.entropy_stop_threshold):
                                     step_logits = self.drafter.draft_logits(
                                         draft_hidden, draft_input_token, mtp_kv,
                                         round_start_offset - 1,
@@ -2635,6 +2743,7 @@ class QwenMTPSpeculativeEngine:
                         step_ranked_tokens = None
                         step_margin_bucket = None
                         step_margin = None
+                        step_entropy = None
                         if sampling.is_greedy:
                             if draft_tok is None:
                                 # The target already applies this exact grammar
@@ -2688,7 +2797,12 @@ class QwenMTPSpeculativeEngine:
                                             for threshold in
                                             _GREEDY_DRAFT_MARGIN_THRESHOLDS
                                         )
-                                draft_tok = int(mx.argmax(step_logits))
+                                if self.entropy_stop_threshold:
+                                    draft_tok, step_entropy = (
+                                        _greedy_token_and_normalized_entropy(
+                                            step_logits))
+                                else:
+                                    draft_tok = int(mx.argmax(step_logits))
                                 if round_native_tree:
                                     native_tree_logits_rows.append(step_logits)
 
@@ -2784,6 +2898,10 @@ class QwenMTPSpeculativeEngine:
                                 self.proposal_q_policy,
                             )
                             draft_tok = sample_probabilities(step_probabilities)
+                            if self.entropy_stop_threshold:
+                                step_entropy = (
+                                    _normalized_probability_entropy(
+                                        step_probabilities))
 
                         draft_tokens.append(int(draft_tok))
                         draft_probabilities.append(step_probabilities)
@@ -2791,6 +2909,16 @@ class QwenMTPSpeculativeEngine:
                         draft_ranked_tokens.append(step_ranked_tokens)
                         draft_margin_buckets.append(step_margin_bucket)
                         draft_input_token = int(draft_tok)
+                        if step_entropy is not None:
+                            round_entropy_values.append(float(step_entropy))
+                            entropy_stop_profiled_tokens += 1
+                            if (
+                                step_entropy >= self.entropy_stop_threshold
+                                and step + 1 < round_native_draft_depth
+                            ):
+                                entropy_stop_events += 1
+                                entropy_stop_events_by_step[step] += 1
+                                break
                         if (sampling.is_greedy
                                 and draft_constraint is not None):
                             draft_constraint.accept_token(draft_tok)
@@ -2864,6 +2992,7 @@ class QwenMTPSpeculativeEngine:
                 )
 
                 proposed += len(draft_tokens)
+                round_draft_widths.append(len(draft_tokens))
                 proposal_sources.append(round_proposal_source)
                 if round_proposal_source == "N":
                     ngram_first_proposed += len(draft_tokens)
@@ -3208,6 +3337,16 @@ class QwenMTPSpeculativeEngine:
                             else f"A{accepted_prefix}R")
                     else:
                         round_outcomes.append(f"A{accepted_prefix}")
+
+                    if round_entropy_values:
+                        entropy_stop_round_records.append({
+                            "normalized_entropies": [
+                                round(float(value), 6)
+                                for value in round_entropy_values
+                            ],
+                            "accepted_prefix": int(accepted_prefix),
+                            "rejected": int(round_rejected),
+                        })
 
                     if (sampling.is_greedy
                             and self.proposal_replay_top_k >= 2
@@ -3639,6 +3778,29 @@ class QwenMTPSpeculativeEngine:
                 plain_equivalent_sweeps / target_decode_sweeps
                 if target_decode_sweeps else 0.0),
             "qwen_mtp_depth": self.depth,
+            "qwen_mtp_entropy_stop_enabled": int(
+                self.entropy_stop_threshold > 0.0),
+            "qwen_mtp_entropy_stop_threshold": (
+                self.entropy_stop_threshold),
+            "qwen_mtp_entropy_stop_profiled_tokens": (
+                entropy_stop_profiled_tokens),
+            "qwen_mtp_entropy_stop_profiled_rounds": len(
+                entropy_stop_round_records),
+            "qwen_mtp_entropy_stop_events": entropy_stop_events,
+            "qwen_mtp_entropy_stop_events_by_step": list(
+                entropy_stop_events_by_step),
+            "qwen_mtp_entropy_stop_mean_width": (
+                entropy_stop_profiled_tokens / len(entropy_stop_round_records)
+                if entropy_stop_round_records else 0.0),
+            "qwen_mtp_entropy_stop_round_records": list(
+                entropy_stop_round_records),
+            "qwen_mtp_budget_aware_width_enabled": int(
+                self.budget_aware_width),
+            "qwen_mtp_budget_width_clamped_rounds": (
+                budget_width_clamped_rounds),
+            "qwen_mtp_budget_draft_steps_avoided": (
+                budget_draft_steps_avoided),
+            "qwen_mtp_round_draft_widths": list(round_draft_widths),
             "qwen_mtp_prompt_history_enabled": int(
                 self.prompt_history_tokens > 0),
             "qwen_mtp_prompt_history_request_active": int(

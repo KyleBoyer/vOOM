@@ -17,6 +17,7 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from runtime.server import (Handler, INFER_LOCK, PreparedPrompt, PriorityLock, RequestValidationError,
+                            VModelThreadingHTTPServer,
                             _TokenOffsetIndex,
                             _active_context_limit,
                             _advertised_model_ids,
@@ -98,6 +99,21 @@ class _CountingCharTokenizer(_CharTokenizer):
     def encode(self, text):
         self.calls += 1
         return super().encode(text)
+
+
+def test_loopback_server_bind_does_not_depend_on_reverse_dns(monkeypatch):
+    import socket
+
+    def fail_reverse_dns(_host):
+        raise AssertionError("loopback server bind attempted reverse DNS")
+
+    monkeypatch.setattr(socket, "getfqdn", fail_reverse_dns)
+    server = VModelThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    try:
+        assert server.server_name == "127.0.0.1"
+        assert server.server_port > 0
+    finally:
+        server.server_close()
 
 
 def test_vision_dispatch_distinguishes_tower_presence_from_backend_support():
@@ -334,6 +350,22 @@ def test_vision_protocol_timing_exposes_qwen_mtp_round_trace():
             "qwen_mtp_used": 1,
             "qwen_mtp_round_outcomes": "AARRA",
             "qwen_mtp_depth": 2,
+            "qwen_mtp_entropy_stop_enabled": 1,
+            "qwen_mtp_entropy_stop_threshold": 0.75,
+            "qwen_mtp_entropy_stop_profiled_tokens": 7,
+            "qwen_mtp_entropy_stop_profiled_rounds": 3,
+            "qwen_mtp_entropy_stop_events": 2,
+            "qwen_mtp_entropy_stop_events_by_step": [0, 1],
+            "qwen_mtp_entropy_stop_mean_width": 2.333333,
+            "qwen_mtp_entropy_stop_round_records": [{
+                "normalized_entropies": [0.1, 0.9],
+                "accepted_prefix": 1,
+                "rejected": 1,
+            }],
+            "qwen_mtp_budget_aware_width_enabled": 1,
+            "qwen_mtp_budget_width_clamped_rounds": 1,
+            "qwen_mtp_budget_draft_steps_avoided": 2,
+            "qwen_mtp_round_draft_widths": [4, 2],
             "qwen_mtp_max_verify_width_observed": 5,
             "qwen_mtp_proposal_weight_representation": "mxfp4-q4-g32",
             "qwen_mtp_proposal_page_round_loads": 3,
@@ -404,6 +436,19 @@ def test_vision_protocol_timing_exposes_qwen_mtp_round_trace():
     assert timing["qwen_mtp_used"] == 1
     assert timing["qwen_mtp_round_outcomes"] == "AARRA"
     assert timing["qwen_mtp_depth"] == 2
+    assert timing["qwen_mtp_entropy_stop_enabled"] == 1
+    assert timing["qwen_mtp_entropy_stop_threshold"] == 0.75
+    assert timing["qwen_mtp_entropy_stop_profiled_tokens"] == 7
+    assert timing["qwen_mtp_entropy_stop_profiled_rounds"] == 3
+    assert timing["qwen_mtp_entropy_stop_events"] == 2
+    assert timing["qwen_mtp_entropy_stop_events_by_step"] == [0, 1]
+    assert timing["qwen_mtp_entropy_stop_mean_width"] == 2.333333
+    assert timing["qwen_mtp_entropy_stop_round_records"][0][
+        "accepted_prefix"] == 1
+    assert timing["qwen_mtp_budget_aware_width_enabled"] == 1
+    assert timing["qwen_mtp_budget_width_clamped_rounds"] == 1
+    assert timing["qwen_mtp_budget_draft_steps_avoided"] == 2
+    assert timing["qwen_mtp_round_draft_widths"] == [4, 2]
     assert timing["qwen_mtp_max_verify_width_observed"] == 5
     assert timing["qwen_mtp_proposal_weight_representation"] == "mxfp4-q4-g32"
     assert timing["qwen_mtp_proposal_page_round_loads"] == 3

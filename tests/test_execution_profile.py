@@ -25,12 +25,15 @@ def test_profiler_aggregates_nested_expert_and_substep_metrics():
     profiler = RequestProfiler("ops")
     stages = [1_000_000, 1, 256, 1_024]
     scale_stages = [2_048, 8_192, 500_000, 3]
+    parallel_stages = [1, 2_000, 3_000, 4_000_000, 5_000_000, 6_000_000,
+                       7_000_000]
     cache = SimpleNamespace(
         stats=SimpleNamespace(
             hits=1, misses=2, evictions=3, bytes_read=4, disk_s=0.5),
         store=SimpleNamespace(
             stage_snapshot=lambda: tuple(stages),
             k3_scale_sidecar_snapshot=lambda: tuple(scale_stages),
+            parallel_tier_snapshot=lambda: tuple(parallel_stages),
         ))
     before = profiler.cache_snapshot(cache)
     profiler.set_phase("prefill")
@@ -51,6 +54,13 @@ def test_profiler_aggregates_nested_expert_and_substep_metrics():
     scale_stages[1] += 16_384
     scale_stages[2] += 1_500_000
     scale_stages[3] += 2
+    parallel_stages[0] += 2
+    parallel_stages[1] += 8_192
+    parallel_stages[2] += 4_096
+    parallel_stages[3] += 2_000_000_000
+    parallel_stages[4] += 1_250_000_000
+    parallel_stages[5] += 1_500_000_000
+    parallel_stages[6] += 750_000_000
     profiler.record_layer(
         2, positions=8, weight_wait_s=1.0, compute_s=2.0,
         cache_before=before, cache_after=profiler.cache_snapshot(cache),
@@ -67,6 +77,13 @@ def test_profiler_aggregates_nested_expert_and_substep_metrics():
     assert row["cache_hits"] == 2
     assert row["cache_misses"] == 3
     assert row["store_bytes_read"] == 4096
+    assert row["parallel_tier_fetches"] == 2
+    assert row["parallel_tier_fast_bytes"] == 8192
+    assert row["parallel_tier_archive_bytes"] == 4096
+    assert row["parallel_tier_wall_s"] == 2.0
+    assert row["parallel_tier_fast_service_s"] == 1.25
+    assert row["parallel_tier_archive_service_s"] == 1.5
+    assert row["parallel_tier_hidden_s"] == 0.75
     assert row["ct_mxfp4_transform_s"] == 0.002
     assert row["ct_mxfp4_transform_calls"] == 2
     assert row["ct_mxfp4_input_bytes"] == 512

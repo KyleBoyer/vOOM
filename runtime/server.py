@@ -112,6 +112,7 @@ from dataclasses import replace
 from functools import lru_cache
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from socketserver import TCPServer
 
 from .profiles import (RuntimeProfileError, active_runtime_profile_fields,
                        apply_runtime_profiles, discover_runtime_profiles,
@@ -126,6 +127,23 @@ LOSSY_LONG_PREFIX = "lossy-long-"
 
 class RequestValidationError(ValueError):
     """A request/profile combination the client can correct (HTTP 400)."""
+
+
+class VModelThreadingHTTPServer(ThreadingHTTPServer):
+    """Loopback HTTP server whose bind never depends on reverse DNS.
+
+    ``HTTPServer.server_bind`` calls ``socket.getfqdn`` after binding. That
+    lookup is unnecessary for this loopback-only endpoint and can block for
+    tens of seconds when macOS name service is unhealthy, leaving the process
+    printed as started but not yet listening. Preserve the standard TCP bind
+    and port discovery while using the literal bind address as server_name.
+    """
+
+    def server_bind(self) -> None:
+        TCPServer.server_bind(self)
+        host, port = self.server_address[:2]
+        self.server_name = str(host)
+        self.server_port = int(port)
 
 
 class PreparedPrompt(str):
@@ -1252,6 +1270,8 @@ class EngineManager:
             "VMODEL_QWEN_MTP_NGRAM_FIRST", "0").strip()
         qwen_mtp_grammar_aware_draft_request = os.environ.get(
             "VMODEL_QWEN_MTP_GRAMMAR_AWARE_DRAFT", "0").strip()
+        qwen_mtp_budget_aware_width_request = os.environ.get(
+            "VMODEL_QWEN_MTP_BUDGET_AWARE_WIDTH", "0").strip()
         qwen_mtp_ablation_direction_request = os.environ.get(
             "VMODEL_QWEN_MTP_ABLATION_DIRECTION", "").strip()
         qwen_mtp_q_policy_kind = os.environ.get(
@@ -1292,6 +1312,8 @@ class EngineManager:
                 "VMODEL_QWEN_MTP_PROMPT_HISTORY_MIN_PROMPT_TOKENS", "0"))
             qwen_mtp_selective_tree_margin = float(os.environ.get(
                 "VMODEL_QWEN_MTP_SELECTIVE_TREE_MARGIN", "0"))
+            qwen_mtp_entropy_stop_threshold = float(os.environ.get(
+                "VMODEL_QWEN_MTP_ENTROPY_STOP_THRESHOLD", "0"))
             qwen_mtp_q_parameter = float(os.environ.get(
                 "VMODEL_QWEN_MTP_Q_PARAMETER", "1"))
             qwen_mtp_ablation_strength = float(os.environ.get(
@@ -1347,6 +1369,10 @@ class EngineManager:
                 or not 0.0 <= qwen_mtp_selective_tree_margin <= 16.0):
             raise RequestValidationError(
                 "VMODEL_QWEN_MTP_SELECTIVE_TREE_MARGIN must be in [0, 16]")
+        if (not math.isfinite(qwen_mtp_entropy_stop_threshold)
+                or not 0.0 <= qwen_mtp_entropy_stop_threshold <= 1.0):
+            raise RequestValidationError(
+                "VMODEL_QWEN_MTP_ENTROPY_STOP_THRESHOLD must be in [0, 1]")
         if qwen_mtp_ngram_first_request not in ("0", "1"):
             raise RequestValidationError(
                 "VMODEL_QWEN_MTP_NGRAM_FIRST must be 0 or 1")
@@ -1356,6 +1382,11 @@ class EngineManager:
                 "VMODEL_QWEN_MTP_GRAMMAR_AWARE_DRAFT must be 0 or 1")
         qwen_mtp_grammar_aware_draft = (
             qwen_mtp_grammar_aware_draft_request == "1")
+        if qwen_mtp_budget_aware_width_request not in ("0", "1"):
+            raise RequestValidationError(
+                "VMODEL_QWEN_MTP_BUDGET_AWARE_WIDTH must be 0 or 1")
+        qwen_mtp_budget_aware_width = (
+            qwen_mtp_budget_aware_width_request == "1")
         if qwen_mtp_tree_width and qwen_mtp_ngram_first:
             raise RequestValidationError(
                 "VMODEL_QWEN_MTP_TREE_WIDTH cannot be combined with "
@@ -1378,6 +1409,12 @@ class EngineManager:
             raise RequestValidationError(
                 "VMODEL_QWEN_MTP_SELECTIVE_TREE_MARGIN cannot be combined "
                 "with a native tree or n-gram-first")
+        if qwen_mtp_entropy_stop_threshold and (
+            qwen_mtp_tree_width or qwen_mtp_selective_tree_margin
+        ):
+            raise RequestValidationError(
+                "VMODEL_QWEN_MTP_ENTROPY_STOP_THRESHOLD cannot be combined "
+                "with native or selective proposal trees")
         if not 1 <= qwen_ar_draft_prefill_step_size <= 4096:
             raise RequestValidationError(
                 "VMODEL_QWEN_AR_DRAFT_PREFILL_STEP_SIZE must be in [1, 4096]")
@@ -2188,6 +2225,7 @@ class EngineManager:
             qwen_mtp_request,
             qwen_mtp_ngram_first_request,
             qwen_mtp_grammar_aware_draft_request,
+            qwen_mtp_budget_aware_width_request,
             qwen_mtp_ablation_direction_request,
             qwen_mtp_ablation_strength.hex(),
             qwen_mtp_max_prompt_tokens,
@@ -2199,6 +2237,7 @@ class EngineManager:
             qwen_mtp_prompt_history_tokens,
             qwen_mtp_prompt_history_min_prompt_tokens,
             qwen_mtp_selective_tree_margin.hex(),
+            qwen_mtp_entropy_stop_threshold.hex(),
             qwen_mtp_q_policy_kind,
             qwen_mtp_q_parameter.hex(),
             qwen_ar_draft_request,
@@ -2323,6 +2362,7 @@ class EngineManager:
             qwen_mtp_request,
             qwen_mtp_ngram_first_request,
             qwen_mtp_grammar_aware_draft_request,
+            qwen_mtp_budget_aware_width_request,
             qwen_mtp_ablation_direction_request,
             qwen_mtp_ablation_strength.hex(),
             qwen_mtp_max_prompt_tokens,
@@ -2334,6 +2374,7 @@ class EngineManager:
             qwen_mtp_prompt_history_tokens,
             qwen_mtp_prompt_history_min_prompt_tokens,
             qwen_mtp_selective_tree_margin.hex(),
+            qwen_mtp_entropy_stop_threshold.hex(),
             qwen_mtp_q_policy_kind,
             qwen_mtp_q_parameter.hex(),
             qwen_ar_draft_request,
@@ -5526,6 +5567,9 @@ class EngineManager:
                             qwen_mtp_prompt_history_min_prompt_tokens),
                         selective_tree_margin=(
                             qwen_mtp_selective_tree_margin),
+                        entropy_stop_threshold=(
+                            qwen_mtp_entropy_stop_threshold),
+                        budget_aware_width=qwen_mtp_budget_aware_width,
                         grammar_aware_draft=(
                             qwen_mtp_grammar_aware_draft),
                         ngram_first=qwen_mtp_ngram_first,
@@ -5557,6 +5601,10 @@ class EngineManager:
                         f"{qwen_mtp_prompt_history_min_prompt_tokens} "
                         f"selective_tree_margin="
                         f"{qwen_mtp_selective_tree_margin:g} "
+                        f"entropy_stop_threshold="
+                        f"{qwen_mtp_entropy_stop_threshold:g} "
+                        f"budget_aware_width="
+                        f"{int(qwen_mtp_budget_aware_width)} "
                         f"grammar_aware_draft="
                         f"{int(qwen_mtp_grammar_aware_draft)} "
                         f"ngram_first={int(qwen_mtp_ngram_first)} "
@@ -9477,6 +9525,13 @@ def _vision_protocol_timing(result: dict) -> dict:
         "qwen_mtp_used",
         "qwen_mtp_proposed",
         "qwen_mtp_depth",
+        "qwen_mtp_entropy_stop_enabled",
+        "qwen_mtp_entropy_stop_profiled_tokens",
+        "qwen_mtp_entropy_stop_profiled_rounds",
+        "qwen_mtp_entropy_stop_events",
+        "qwen_mtp_budget_aware_width_enabled",
+        "qwen_mtp_budget_width_clamped_rounds",
+        "qwen_mtp_budget_draft_steps_avoided",
         "qwen_mtp_prompt_history_enabled",
         "qwen_mtp_prompt_history_request_active",
         "qwen_mtp_prompt_history_requested_tokens",
@@ -9767,6 +9822,8 @@ def _vision_protocol_timing(result: dict) -> dict:
         "vision_weight_load_s",
         "qwen_mtp_accept_rate",
         "qwen_mtp_stochastic_expected_acceptance",
+        "qwen_mtp_entropy_stop_threshold",
+        "qwen_mtp_entropy_stop_mean_width",
         "weight_prefetch_wait_s",
         "weight_prefetch_load_s",
         "weight_prefetch_useful_load_s",
@@ -9914,6 +9971,9 @@ def _vision_protocol_timing(result: dict) -> dict:
     for key in (
         "qwen_mtp_accepted_by_step",
         "qwen_mtp_verified_by_step",
+        "qwen_mtp_entropy_stop_events_by_step",
+        "qwen_mtp_entropy_stop_round_records",
+        "qwen_mtp_round_draft_widths",
         "qwen_mtp_native_tree_selected_rank_counts",
         "qwen_mtp_native_tree_selected_rank_counts_by_step",
         "qwen_mtp_selective_tree_branch_steps",
@@ -12875,7 +12935,7 @@ def main():
                 MANAGER.close()
             ap.error(f"startup prewarm failed: {type(error).__name__}: {error}")
     print(f"[server] vOOM endpoint on http://127.0.0.1:{args.port}  models: {list(_registry())}", flush=True)
-    server = ThreadingHTTPServer(("127.0.0.1", args.port), Handler)
+    server = VModelThreadingHTTPServer(("127.0.0.1", args.port), Handler)
     try:
         server.serve_forever()
     finally:

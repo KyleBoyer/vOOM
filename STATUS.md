@@ -1,5 +1,72 @@
 # STATUS — 2026-09-01 (current corrections first; dated chronology below is history)
 
+## 2026-09-01: budget-aware MTP reaches 62.79s and new tier profiling closes placement
+
+The explicit uncensored Huihui Qwen3.8 27B MTP-quant route now shortens a
+greedy speculative chain when its remaining output budget cannot consume the
+configured depth. With `R` output slots remaining, at most `R-1` drafts plus
+the authoritative verifier bonus can affect the response; deeper proposals
+and verifier positions are provably unused. The target still verifies every
+emitted token, stochastic requests retain the old path, and the feature is
+enabled only in `huihui-qwen38-27b-fast-long-context-mtpquant` rather than in
+the generic server default.
+
+On the unmodified 178,616-byte / 134-tool / streamed temperature-zero /
+max-16 capture, the final MTP widths changed from `7,7,7` to `7,7,5`. The run
+avoided two draft steps, reduced verifier input positions 24 -> 22 and batched
+MLP positions 1,536 -> 1,408, and preserved output SHA-256
+`9b170095...b87b81`, three target sweeps, and 16 output tokens. Decode improved
+17.9744 -> **15.3428 seconds** and wall improved 68.5388 -> **64.8992 seconds**
+(-5.3%). Peak Metal was 2.699GB and swap-out growth was 2.343MB.
+
+A final cold replay selected only the committed named profile and required zero
+environment overrides. It improved again to **62.7884 seconds wall / 44.8497
+prefill / 15.1986 decode**, preserved the same SHA and `7,7,5` widths, peaked
+at 3.712GB Metal, and grew physical swap-out by 1.081MB. This is the shipped
+profile result; the 64.8992-second row remains the paired experiment result.
+
+The non-overfit paired gate changed to a 65-character system prompt, one
+developer message, two real tools, 1,371 rendered tokens, and a max-32 budget.
+The candidate changed the last widths from `7,7` to `4,1`, avoided nine draft
+steps, and preserved byte-identical SHA-256 `a8815ed2...9503c` plus the
+`mastra_workspace_list_files` call. Against a fresh-process same-profile
+control, decode improved 70.9659 -> **53.6084 seconds** and wall improved
+102.4617 -> **79.8216 seconds**. Both gates passed without request-body schema
+substitution.
+
+Execution profiling now attributes each layer's physical-tier fetch count,
+internal/fast bytes, archive bytes, parallel critical interval, per-device
+service, and hidden overlap. The calibration trace found prefill compute-bound:
+44.4711 of 45.5342 layer-accounted seconds were compute and only 1.0631 seconds
+were weight wait. Decode was mixed: 5.8192 seconds compute and 8.5131 seconds
+wait. Internal/archive service remained balanced (13.4570/13.5546 seconds), so
+the prior placement stop rule stands; more two-disk reshuffling is not a
+credible next win.
+
+Research also produced an explicit entropy-adaptive MTP probe inspired by
+SVIP. It records normalized draft entropy by step alongside accepted prefix
+without tokens, text, or logits. The real capture rejected a single global
+threshold: its first round began at 0.765 normalized entropy but then accepted
+four proposals, while a later rejection followed a much lower-entropy prefix.
+The mechanism therefore remains default-off and no bad threshold was promoted.
+Windowed-MTP remains a large-context candidate, but this 6.3K request already
+uses only 128 committed draft-history rows; TreeWY is memory-oriented and this
+path peaks below 3GB; Graft retrieval remains future work because prior local
+n-gram/tree probes did not clear their speed/quality gates.
+
+The broader regression pass also found and fixed two independent runtime
+defects. The loopback HTTP server no longer blocks startup on reverse DNS, and
+the uncompressed MLA branch now initializes its no-selection mask sentinel.
+All 369 directly impacted tests passed, as did both paired real-weight Kimi
+layer-stationary oracles.
+
+Evidence: `logs/qwen38_entropy_profile_capture16_20260901.json`,
+`logs/qwen38_budget_width_capture16_20260901.json`,
+`logs/qwen38_budget_width_developer32_20260901.json`, and
+`logs/qwen38_budget_width_developer32_control_20260901.json`, plus the final
+named-profile gate
+`logs/qwen38_budget_width_profile_capture16_final_20260901.json`.
+
 ## 2026-09-01: uncensored Qwen capture reaches 68.54s with exact two-disk balance
 
 The explicit lossy Huihui Qwen3.8 27B route now has a model-specific,

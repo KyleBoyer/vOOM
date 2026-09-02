@@ -81,6 +81,10 @@ class RequestProfiler:
     LEVELS = ("", "layers", "ops")
     _CACHE_FIELDS = (
         "hits", "misses", "evictions", "bytes_read", "disk_s",
+        "parallel_tier_fetches", "parallel_tier_fast_bytes",
+        "parallel_tier_archive_bytes", "parallel_tier_wall_ns",
+        "parallel_tier_fast_service_ns",
+        "parallel_tier_archive_service_ns", "parallel_tier_hidden_ns",
         "ct_mxfp4_transform_ns", "ct_mxfp4_transform_calls",
         "ct_mxfp4_input_bytes", "ct_mxfp4_resident_bytes",
         "k3_scale_sidecar_read_bytes", "k3_scale_sidecar_output_bytes",
@@ -118,6 +122,13 @@ class RequestProfiler:
             "cache_evictions": 0,
             "store_bytes_read": 0,
             "store_disk_s": 0.0,
+            "parallel_tier_fetches": 0,
+            "parallel_tier_fast_bytes": 0,
+            "parallel_tier_archive_bytes": 0,
+            "parallel_tier_wall_ns": 0,
+            "parallel_tier_fast_service_ns": 0,
+            "parallel_tier_archive_service_ns": 0,
+            "parallel_tier_hidden_ns": 0,
             "ct_mxfp4_transform_ns": 0,
             "ct_mxfp4_transform_calls": 0,
             "ct_mxfp4_input_bytes": 0,
@@ -178,9 +189,18 @@ class RequestProfiler:
             if callable(nf12_snapshot)
             else (0, 0, 0, 0)
         )
+        parallel_snapshot = getattr(
+            getattr(cache, "store", None), "parallel_tier_snapshot", None
+        )
+        parallel_stages = (
+            parallel_snapshot()
+            if callable(parallel_snapshot)
+            else (0, 0, 0, 0, 0, 0, 0)
+        )
         return (
             int(stats.hits), int(stats.misses), int(stats.evictions),
             int(stats.bytes_read), float(stats.disk_s),
+            *parallel_stages,
             *store_stages,
             *scale_stages,
             *nf12_stages,
@@ -208,6 +228,9 @@ class RequestProfiler:
         bucket["compute_s"] += max(0.0, float(compute_s))
         bucket["layer_type"] = str(layer_type)
         (hits, misses, evictions, bytes_read, disk_s,
+         parallel_fetches, parallel_fast_bytes, parallel_archive_bytes,
+         parallel_wall_ns, parallel_fast_service_ns,
+         parallel_archive_service_ns, parallel_hidden_ns,
          ct_transform_ns, ct_transform_calls, ct_input_bytes,
          ct_resident_bytes, scale_read_bytes, scale_output_bytes,
          scale_decode_ns, scale_decode_calls,
@@ -220,6 +243,15 @@ class RequestProfiler:
         bucket["cache_evictions"] += int(evictions)
         bucket["store_bytes_read"] += int(bytes_read)
         bucket["store_disk_s"] += float(disk_s)
+        bucket["parallel_tier_fetches"] += int(parallel_fetches)
+        bucket["parallel_tier_fast_bytes"] += int(parallel_fast_bytes)
+        bucket["parallel_tier_archive_bytes"] += int(parallel_archive_bytes)
+        bucket["parallel_tier_wall_ns"] += int(parallel_wall_ns)
+        bucket["parallel_tier_fast_service_ns"] += int(
+            parallel_fast_service_ns)
+        bucket["parallel_tier_archive_service_ns"] += int(
+            parallel_archive_service_ns)
+        bucket["parallel_tier_hidden_ns"] += int(parallel_hidden_ns)
         bucket["ct_mxfp4_transform_ns"] += int(ct_transform_ns)
         bucket["ct_mxfp4_transform_calls"] += int(ct_transform_calls)
         bucket["ct_mxfp4_input_bytes"] += int(ct_input_bytes)
@@ -349,6 +381,20 @@ class RequestProfiler:
                 "cache_evictions": int(raw["cache_evictions"]),
                 "store_bytes_read": int(raw["store_bytes_read"]),
                 "store_disk_s": self._round(raw["store_disk_s"]),
+                "parallel_tier_fetches": int(
+                    raw["parallel_tier_fetches"]),
+                "parallel_tier_fast_bytes": int(
+                    raw["parallel_tier_fast_bytes"]),
+                "parallel_tier_archive_bytes": int(
+                    raw["parallel_tier_archive_bytes"]),
+                "parallel_tier_wall_s": self._round(
+                    raw["parallel_tier_wall_ns"] / 1_000_000_000),
+                "parallel_tier_fast_service_s": self._round(
+                    raw["parallel_tier_fast_service_ns"] / 1_000_000_000),
+                "parallel_tier_archive_service_s": self._round(
+                    raw["parallel_tier_archive_service_ns"] / 1_000_000_000),
+                "parallel_tier_hidden_s": self._round(
+                    raw["parallel_tier_hidden_ns"] / 1_000_000_000),
                 "ct_mxfp4_transform_s": self._round(
                     raw["ct_mxfp4_transform_ns"] / 1_000_000_000),
                 "ct_mxfp4_transform_calls": int(
@@ -410,6 +456,11 @@ class RequestProfiler:
                 "store_disk_s": (
                     "nested store-accounted fetch/decode time; parallel work "
                     "may overlap"),
+                "parallel_tier_service_s": (
+                    "per-physical-tier nested service time; fast and archive "
+                    "service overlap each other, parallel_tier_wall_s is the "
+                    "critical interval, and parallel_tier_hidden_s is the "
+                    "overlap lower bound"),
                 "ct_mxfp4_transform_s": (
                     "nested inside store_disk_s/weight wait; eager dense "
                     "dequantization or native packed-view materialization, "

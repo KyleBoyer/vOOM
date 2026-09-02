@@ -324,6 +324,10 @@ def _mla_attention(
     # else: F92 -- Kimi Linear's MLA is NoPE, the "rope" head-dim split is
     # carried through unrotated; position info comes only from KDA layers.
     queries = mx.concatenate([q_nope, q_rope], axis=-1)
+    # The dense/uncompressed branch has no DSA selection mask. Define the
+    # shared post-attention sentinel before branching so it cannot inherit an
+    # unbound local from the compressed-only selection path.
+    selected_valid = None
 
     if getattr(kv, "compressed_mla", False):
         # F21: cache only [c_kv | roped k_rope] = 576 floats/token-layer (~50x
@@ -353,7 +357,6 @@ def _mla_attention(
         if dsa is not None and cfg.index_topk and not dsa_preselected:
             dsa.observe(layer, itype, h, w, prefix, offset)  # k-cache accumulates always, roped at absolute positions
         selected_lat = None
-        selected_valid = None
         if dsa is not None and cfg.index_topk and S > cfg.index_topk:
             sel = (
                 dsa.selection_for_range(
