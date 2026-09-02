@@ -91,6 +91,13 @@ def _glm53_expanded_prefill_cache(kv):
     return {}
 
 
+def _glm53_release_expanded_prefill_layer(kv, layer: int) -> None:
+    """Release one expanded layer when that optional cache exists."""
+    cache = getattr(kv, "_glm53_expanded_prefill", None)
+    if cache is not None:
+        cache.pop(int(layer), None)
+
+
 def qwen35_phase_head_request_active(
     enabled: bool,
     prompt_tokens: int,
@@ -8056,7 +8063,7 @@ class StreamingEngine:
                              or index % 64 == 0))
 
             if layer in self.cfg.full_attn_layers:
-                kv._glm53_expanded_prefill.pop(layer, None)
+                _glm53_release_expanded_prefill_layer(kv, layer)
                 mx.clear_cache()
 
             # Bound the float32 mHC mapping by tile and retain each normalized
