@@ -1,0 +1,13 @@
+schema: voom.runtime-profile.v1
+name: glm53-full-lossless-preallocate-prefetch-batch8-workers2
+description: Explicit full GLM-5.3 exact preallocation/batch-eight route with two ordered expert readers.
+notes:
+  - "Extends the full released-model index-preallocation and batch-eight expert-prefetch profile. Two exact future storage groups may read concurrently; demand consumption, one-expert arithmetic, routing, and reductions remain authoritative and ordered."
+  - "The existing one-worker 2,123-input gate is the control: 695.088 seconds, 708.060GB read, 2.246GB peak Metal, and exact request/output hashes. This child is rejected unless it preserves those witnesses and improves end-to-end wall with bounded pressure."
+  - "This is a short/medium-context experiment. The parent already fails the untouched 46.8K capture's live-memory admission, so this profile must not be used as a long-context workaround."
+  - "The two-reader 2,123-input gate passed: request/output hashes and 708.060GB read matched control. Wall fell 695.088 -> 500.372 seconds, expert wait 531.903 -> 355.826 seconds, and hidden service rose 83.225 -> 487.681 seconds. Peak fell to 2.170GB and swap-out growth improved to 44.433MB. Preferred explicit short/medium full-model schedule; long-context rejection is unchanged."
+extends:
+  - glm53-full-lossless-preallocate-prefetch-batch8
+settings:
+  VMODEL_GLM53_EXPERT_BATCH_PREFETCH_DEPTH: 2
+  VMODEL_GLM53_EXPERT_BATCH_PREFETCH_WORKERS: 2

@@ -93,6 +93,42 @@ swap-out grew 285.033MB over the full run. Do not promote this profile or call
 its scheduling speedup an answer-quality win. Retain the exact two-worker
 primitive for separately gated lossless/full-arithmetic and MTP compositions.
 
+The same two-reader scheduler now clears the released-arithmetic Flash gate,
+without compact MLA or coalesced expert GEMMs. Across 16 greedy outputs, every
+token, text/state/component hash, and all 159 tensor hashes matched the control
+exactly. Wall improved **374.604 -> 324.723 seconds (-13.3%)**, prefill 108.421
+-> **66.997 (-38.2%)**, and decode 263.551 -> 255.147. Read volume remained
+419.569GB, true peak was 2.090GB, and swap-out grew 15.090MB. The explicit
+`glm53-flash-lossless-expert-prefetch-batch8-workers2` profile is therefore the
+preferred released-arithmetic short/medium scheduling candidate, pending real
+Plex/tool and varied-shape gates.
+
+An exact one-slot cross-turn child also passed its first real continuation
+gate under the standard greedy-token criterion. It retained the actual
+autoregressive endpoint (prompt plus all fed-back outputs), reused all 49
+available tokens of a 62-token continuation, and preserved both greedy output
+tokens and decoded text. Versus a fresh cold computation of the identical
+complete input, continuation prefill fell **88.997 -> 45.838 seconds (-48.5%)**,
+wall **106.024 -> 62.830 (-40.7%)**, and reads 156.095 -> 89.792GB (-42.5%).
+Peak was 2.862GB versus 2.840GB. Cold layer-stationary and incremental
+continuation shapes did not produce byte-identical retained state tensors even
+though tokens matched, so this is not a strong-state pass; keep
+`glm53-flash-lossless-expert-prefetch-batch8-workers2-hot-kv` explicit pending
+sustained-output, real HTTP/tool-loop, and broader equality gates.
+
+The same exact scheduler also produced a large full GLM-5.3 win. On the
+identical deterministic 2,123-input/max-1 body, request SHA
+`7cd9187a...12490d`, greedy output SHA `d12fe7f...68f7c4`, and all 708.060GB
+of released reads matched the one-worker control. Wall improved **695.088 ->
+500.372 seconds (-28.0%)** and engine/prefill 691.316 -> **496.457 (-28.2%)**.
+Expert wait fell 531.903 -> **355.826 seconds**, hidden service rose 83.225 ->
+487.681 seconds, and all 2,323 exact groups were consumed in order. Peak Metal
+fell 2.246 -> 2.170GB and physical swap-out growth improved 49.070 -> 44.433MB.
+`glm53-full-lossless-preallocate-prefetch-batch8-workers2` becomes the
+preferred explicit short/medium full-model schedule. It remains rejected for
+the 46.8K capture because its parent already fails long-context live-memory
+admission; concurrency does not change that capacity proof.
+
 ## 2026-09-02: Qwen Flash abliterated overlay runs; new exact GLM schedules are isolated
 
 The pinned `windowsxp811203/Qwen3.8-Flash-Next-Abliterated` revision

@@ -1,0 +1,13 @@
+schema: voom.runtime-profile.v1
+name: glm53-flash-lossless-expert-prefetch-batch8-workers2
+description: Explicit lossless GLM-5.3-Flash batch-eight expert prefetch with two ordered readers.
+notes:
+  - "Extends the released-arithmetic batch-eight profile. Two exact future storage groups may read concurrently, but the consumer still awaits and executes them in authoritative ascending order with one-expert arithmetic. Released weights, router decisions, reductions, and sampling are unchanged."
+  - "The two-reader scheduler is state-exact across 16 outputs under the compact E-class parent, but this full-arithmetic composition requires its own request/output/state, timing, pressure, and Plex gates before promotion."
+  - "This is explicit and default-off. Concurrent reads can contend on one physical tier and retain more pages, so a same-body end-to-end win is required; queue occupancy alone is not evidence."
+  - "The released-arithmetic 16-output gate passed: all tokens, text/state/component hashes, and 159 tensor hashes matched control exactly. Wall fell 374.604 -> 324.723 seconds and prefill 108.421 -> 66.997 seconds; read volume stayed 419.569GB, peak was 2.090GB, and swap-out growth 15.090MB. Plex/tool and varied-shape gates remain pending."
+extends:
+  - glm53-flash-lossless-expert-prefetch-batch8
+settings:
+  VMODEL_GLM53_EXPERT_BATCH_PREFETCH_DEPTH: 2
+  VMODEL_GLM53_EXPERT_BATCH_PREFETCH_WORKERS: 2

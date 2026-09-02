@@ -1,0 +1,14 @@
+schema: voom.runtime-profile.v1
+name: glm53-flash-lossless-expert-prefetch-batch8-workers2-hot-kv
+description: Explicit lossless GLM-5.3-Flash two-reader profile with exact cross-turn state reuse.
+notes:
+  - "Extends the full-arithmetic two-reader experiment and retains one exact post-generation target endpoint. A later request reuses it only when its token sequence is an exact prefix; otherwise the generic fixed-boundary cache recomputes the unmatched suffix."
+  - "This is the lossless semantic-anchor analogue for serial agent/tool loops. It does not relocate tool spans, approximate hidden state, quantize KV, or alter target arithmetic. One slot is sufficient for a single continuing conversation and bounds resident state."
+  - "The profile is explicit/default-off pending a real multi-turn extension gate proving token/state equality, actual reused-token telemetry, lower suffix prefill, and safe Metal/system pressure."
+  - "The first real continuation gate reused all 49 available endpoint tokens and preserved both greedy outputs/text. Versus cold identical input, prefill fell 88.997 -> 45.838 seconds, wall 106.024 -> 62.830 seconds, and reads 156.095 -> 89.792GB at 2.862GB peak. Cold-batched and incremental state tensor hashes differed, so this is only a standard greedy-token pass, not a strong-state pass; sustained HTTP/tool-loop gates are still mandatory."
+extends:
+  - glm53-flash-lossless-expert-prefetch-batch8-workers2
+settings:
+  VMODEL_GLM53_HOT_PROMPT_KV: true
+  VMODEL_GLM53_HOT_KV_SLOTS: 1
+  VMODEL_GLM53_HOT_KV_MIN_TOKENS: 16
