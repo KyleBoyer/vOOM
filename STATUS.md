@@ -73,6 +73,17 @@ copied 9.006GB. The next explicit rung,
 rollback snapshots with exact recurrence factors; it is not promoted pending
 real state/output/timing gates.
 
+The first real compact-rollback state oracle has passed. On an eight-output
+candidate continuation it accepted 5/8 proposals, reduced target sweeps 7 ->
+3, captured **43.95MB** of exact factors and zero dense KDA endpoints, and
+restored three rejected suffixes in 0.186 seconds. All tokens, text, aggregate
+state, and separate KV/KDA/QSA/PLE hashes matched the plain candidate target.
+Compact-MTP wall was 98.232 seconds versus 111.094 seconds plain, but that
+plain-first order is explicitly not a balanced timing comparison. Peak Metal
+was 1.674GB and total swap-out growth was 15.139MB, just inside the 16MB oracle
+limit. The same-body 64-output HTTP A/B remains the wall/pressure promotion
+gate.
+
 The latest full-GLM trace exposed 966 exact DSA index-capacity grows and
 22,256,640 copied rows. `glm53-full-lossless-index-preallocate` now publishes
 the known final absolute request length before the first key tile, allocating
