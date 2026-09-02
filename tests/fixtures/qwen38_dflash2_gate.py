@@ -57,8 +57,8 @@ def _array_payload(value: mx.array) -> bytes:
     return np.asarray(value).tobytes()
 
 
-def _state_digest(engine) -> dict[str, object]:
-    kv = engine.last_kv
+def _state_digest(engine, *, kv=None, hidden=None) -> dict[str, object]:
+    kv = engine.last_kv if kv is None else kv
     if kv is None:
         raise RuntimeError("target did not retain a generation endpoint")
     digest = hashlib.sha256()
@@ -121,7 +121,7 @@ def _state_digest(engine) -> dict[str, object]:
         if history is not None:
             for index, value in enumerate(history):
                 add("conv_history", f"kda.{layer}.conv.{index}", value)
-    add("hidden", "hidden.last", engine._h_last)
+    add("hidden", "hidden.last", engine._h_last if hidden is None else hidden)
     return {
         "sha256": digest.hexdigest(),
         "tensors": tensors,

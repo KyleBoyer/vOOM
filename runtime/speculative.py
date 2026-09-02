@@ -269,6 +269,14 @@ class SpeculativeDecoder:
             max(2.0, 0.7 * (k + 1)) if cfg.num_experts else 1.15
         )
         self._recent: list[int] = []  # committed tokens of the last speculative rounds
+        # Diagnostic-only endpoint retention.  Real-checkpoint gates can opt in
+        # to hashing the exact committed target state *after* timed generation
+        # returns.  Keep this private and default-off: retaining a complete
+        # hybrid KV/KDA/DSA endpoint extends its lifetime and is inappropriate
+        # for the 16 GB serving path unless an explicit verifier requests it.
+        self._diagnostic_retain_generation_endpoint = False
+        self._diagnostic_generation_endpoint = None
+        self._diagnostic_generation_hidden = None
         self._cooldown = 0  # legacy F01 field (superseded by F48 _choose_k)
         self.PROBE_EVERY = 6
         self.controller_disabled_rounds = 0
@@ -343,6 +351,8 @@ class SpeculativeDecoder:
                  stop=None, on_progress=None, *,
                  encoded_ids: list[int] | None = None, constraint=None) -> dict:
         tgt, drf, k = self.target, self.draft, self.k
+        self._diagnostic_generation_endpoint = None
+        self._diagnostic_generation_hidden = None
         stats = SpecStats()
         if tgt.cfg.model_type == "glm5_next":
             tgt._glm53_mtp_state_only_prefill_tokens = 0
@@ -879,6 +889,14 @@ class SpeculativeDecoder:
         decode_s = time.perf_counter() - decode_t0
         endpoint_kv_bytes = t_kv.nbytes()
         endpoint_kv_positions = t_kv.offset
+        if (self._diagnostic_retain_generation_endpoint
+                and self.mtp is not None):
+            # ``t_kv`` has already been trimmed to the returned-token contract
+            # above.  ``_mtp_h`` is the trunk hidden row at that same committed
+            # boundary; ``tgt._h_last`` may still refer to the rejected tail of
+            # the most recent verification window.
+            self._diagnostic_generation_endpoint = t_kv
+            self._diagnostic_generation_hidden = self._mtp_h
         prompt_cache_stored = False
         if (cache_eligible and prompt_draft_compatible
                 and t_kv.offset >= len(ids)
@@ -975,6 +993,11 @@ class SpeculativeDecoder:
             # the rounds in that test), but only instance-attribute
             # inspection could show that.
             "speculative_controller_disabled_rounds": self.controller_disabled_rounds,
+            "speculative_controller_probe_every": self.PROBE_EVERY,
+            "speculative_controller_cost_estimate": self._c_est,
+            "speculative_controller_acceptance_estimate": (
+                self._acc_num / self._acc_den
+                if self._acc_den > 1e-6 else 0.0),
         }
         request_cache_after = _cache_io_snapshot(tgt)
         _record_cache_io_delta(

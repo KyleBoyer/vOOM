@@ -26,8 +26,14 @@ def main() -> None:
         "--execution-profile", choices=("", "layers", "ops"), default="")
     parser.add_argument("--expert-fetch-batch", type=int, default=1)
     parser.add_argument("--expert-batch-prefetch", action="store_true")
+    parser.add_argument("--expert-batch-prefetch-depth", type=int, default=1)
+    parser.add_argument("--expert-batch-prefetch-workers", type=int, default=1)
     parser.add_argument("--trunk-prefetch-depth", type=int, default=0)
     parser.add_argument("--trunk-prefetch-workers", type=int, default=1)
+    parser.add_argument("--state-digest", action="store_true")
+    parser.add_argument(
+        "--probe-every", type=int, default=0,
+        help="fixture-only adaptive-controller probe interval (0 keeps default)")
     parser.add_argument("--expected-tokens", default="")
     parser.add_argument("--result", type=Path)
     args = parser.parse_args()
@@ -42,6 +48,10 @@ def main() -> None:
         args.expert_fetch_batch)
     os.environ["VMODEL_GLM53_EXPERT_BATCH_PREFETCH"] = (
         "1" if args.expert_batch_prefetch else "0")
+    os.environ["VMODEL_GLM53_EXPERT_BATCH_PREFETCH_DEPTH"] = str(
+        args.expert_batch_prefetch_depth)
+    os.environ["VMODEL_GLM53_EXPERT_BATCH_PREFETCH_WORKERS"] = str(
+        args.expert_batch_prefetch_workers)
     os.environ["VMODEL_GLM53_TRUNK_PREFETCH_DEPTH"] = str(
         args.trunk_prefetch_depth)
     os.environ["VMODEL_GLM53_TRUNK_PREFETCH_WORKERS"] = str(
@@ -52,6 +62,14 @@ def main() -> None:
     manager = EngineManager()
     try:
         engine = manager.get(args.model, "lossless")
+        if args.probe_every < 0:
+            raise SystemExit("--probe-every must be nonnegative")
+        if args.probe_every:
+            if args.plain:
+                raise SystemExit("--probe-every requires native MTP")
+            engine.decoder.PROBE_EVERY = args.probe_every
+        if args.state_digest and not args.plain:
+            engine.decoder._diagnostic_retain_generation_endpoint = True
         if args.runs <= 0:
             raise SystemExit("--runs must be positive")
         runs = []
@@ -84,6 +102,14 @@ def main() -> None:
                 "accepted": stats.get("speculative_accepted", 0),
                 "target_sweeps": stats.get(
                     "speculative_target_sweeps", 0),
+                "controller_disabled_rounds": stats.get(
+                    "speculative_controller_disabled_rounds", 0),
+                "controller_probe_every": stats.get(
+                    "speculative_controller_probe_every", 0),
+                "controller_cost_estimate": stats.get(
+                    "speculative_controller_cost_estimate", 0.0),
+                "controller_acceptance_estimate": stats.get(
+                    "speculative_controller_acceptance_estimate", 0.0),
                 "mtp_state_only_prefill_tokens": stats.get(
                     "glm53_mtp_state_only_prefill_tokens", 0),
                 "draft_s": stats.get("speculative_draft_s", 0.0),
@@ -118,6 +144,20 @@ def main() -> None:
                     "expert_batch_prefetch_hidden_s", 0.0),
                 "execution_profile": result.get("execution_profile"),
             })
+        endpoint_state = None
+        if args.state_digest:
+            from tests.fixtures.qwen38_dflash2_gate import _state_digest
+            target = getattr(engine, "target", engine)
+            if args.plain:
+                endpoint_state = _state_digest(target)
+            else:
+                endpoint = engine.decoder._diagnostic_generation_endpoint
+                hidden = engine.decoder._diagnostic_generation_hidden
+                if endpoint is None or hidden is None:
+                    raise RuntimeError(
+                        "native MTP verifier did not retain its committed endpoint")
+                endpoint_state = _state_digest(
+                    target, kv=endpoint, hidden=hidden)
         document = {
             "schema": "voom.glm53-mtp-integrated-gate.v1",
             "tokens": runs[-1]["tokens"],
@@ -137,12 +177,21 @@ def main() -> None:
             "acceptance_rate": stats.get(
                 "speculative_acceptance_rate", 0.0),
             "target_sweeps": stats.get("speculative_target_sweeps", 0),
+            "controller_disabled_rounds": stats.get(
+                "speculative_controller_disabled_rounds", 0),
+            "controller_probe_every": stats.get(
+                "speculative_controller_probe_every", 0),
+            "controller_cost_estimate": stats.get(
+                "speculative_controller_cost_estimate", 0.0),
+            "controller_acceptance_estimate": stats.get(
+                "speculative_controller_acceptance_estimate", 0.0),
             "rounds": stats.get("speculative_rounds", []),
             "draft_s": stats.get("speculative_draft_s", 0.0),
             "verify_s": stats.get("speculative_verify_decode_s", 0.0),
             "draft_bytes": stats.get("speculative_draft_bytes", 0),
             "weight_store_bytes_read": stats.get(
                 "weight_store_bytes_read", 0),
+            "state": endpoint_state,
         }
         rendered = json.dumps(document, indent=2, sort_keys=True)
         print(rendered)

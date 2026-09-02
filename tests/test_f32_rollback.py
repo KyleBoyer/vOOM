@@ -188,6 +188,31 @@ def test_native_mtp_exact_repeat_reuses_both_prompt_boundaries():
     eng.close()
 
 
+def test_native_mtp_diagnostic_endpoint_retention_is_opt_in():
+    """State-oracle retention must not extend endpoint lifetime by default."""
+    _ensure_fixture()
+    from runtime.engine import RuntimeConfig, StreamingEngine
+    from runtime.speculative import SpeculativeDecoder
+
+    eng = StreamingEngine(str(FIXTURE), RuntimeConfig(
+        max_weight_cache_mb=200, pin_lm_head=True, mla_compressed_kv=True))
+    dec = SpeculativeDecoder(
+        eng, "mtp", k=2, prompt_cache_min_tokens=1,
+        _unsafe_allow_moe_verify=True)
+
+    dec.generate("Hi", max_tokens=4)
+    assert dec._diagnostic_generation_endpoint is None
+    assert dec._diagnostic_generation_hidden is None
+
+    dec._diagnostic_retain_generation_endpoint = True
+    measured = dec.generate("Hi", max_tokens=4)
+    assert dec._diagnostic_generation_endpoint is not None
+    assert dec._diagnostic_generation_endpoint.offset == measured["kv_positions"]
+    assert dec._diagnostic_generation_hidden is not None
+    assert dec._diagnostic_generation_hidden.shape[1] == 1
+    eng.close()
+
+
 def test_native_mtp_constraint_masks_draft_and_authoritative_target():
     """Grammar state advances sequentially while the target verifies in one sweep."""
     _ensure_fixture()
