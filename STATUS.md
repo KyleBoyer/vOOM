@@ -1,4 +1,50 @@
-# STATUS — 2026-09-01 (current corrections first; dated chronology below is history)
+# STATUS — 2026-09-02 (current corrections first; dated chronology below is history)
+
+## 2026-09-02: exact GLM levers advance; published Flash draft clears only an E-class gate
+
+The full released GLM-5.3 DSA selector now exposes an explicit 64-row query
+batch in `glm53-full-lossless-long-context`. At the real 46,849-key / top-2048
+geometry, query widths 64, 128, and 256 all returned byte-identical stable
+candidate IDs. Width 64 was the measured winner: 0.05110 seconds per synthetic
+group, 207.1MB peak Metal, and a 37.4-second projected whole-prompt score phase,
+versus 39.8/39.3 seconds and 374/707MB for widths 128/256. A fresh real captured
+harness replay remains the promotion gate.
+
+GLM-5.3-Flash's exact compiled KDA path has now completed the untouched
+46,849-token captured request. Wall time improved 2,778.144 -> **2,489.152
+seconds** (-10.4%) and KDA time improved 1,237.760 -> **958.511 seconds**
+(-22.6%), with 7.584GB peak Metal and no request-body substitution. The native
+fused Metal KDA experiment reached 11.91x over the ordinary operator and 9.36x
+over compiled KDA at released H64/D128/L128 geometry, but its nonzero
+2.61e-8/5.96e-8 output/state error makes it explicitly lossy.
+
+The pinned published `incoai/GLM-5.3-Flash-DFlash2` draft was downloaded,
+hash-attested, converted to an affine-4/group-64 659.1MB sidecar, and integrated
+behind an explicit profile. A forced-rejection real gate restored logical
+attention KV, DSA index, KDA recurrence, and convolution history exactly. On
+one unforced 16-token prompt it accepted 9 of 22 proposals in six target
+sweeps and improved wall 356.642 -> **347.241 seconds** (-2.7%). A stronger
+multi-prefix oracle then found the first released-state divergence at DSA
+layer 3, position 1: the layer-stationary verifier uses a one-row K/V
+projection while ordinary compressed decode reprojects the growing prefix
+with a two-row GEMM. Greedy winners matched in that diagnostic, but the route
+is correctly labeled lossy/E-class and cannot enter a lossless/default path.
+
+The selected uncensored candidates are
+`windowsxp811203/Qwen3.8-Flash-Next-Abliterated` and
+`dealignai/GLM-5.3-Flash-UNCENSORED-FP8`. Both retain the relevant model
+topology according to pinned Hub metadata, but neither will replace the local
+official model until independent harness, varied-shape, quality, vision, and
+pressure gates pass. The full `dealignai/GLM-5.3-UNCENSORED-FP8` is not a
+replacement for the exact official full-model goal and does not fit alongside
+the current 755GB checkpoint.
+
+Evidence: `logs/glm53_flash_long_compiled_kda_actual_20260901.json`,
+`logs/glm53_native_kda_h64_l128_20260902.json`,
+`logs/glm53_full_dsa_width{64,128,256}_20260902.json`,
+`logs/glm53_flash_dflash2_reject4_fix2_20260902.json`,
+`logs/glm53_flash_dflash2_spec16_20260902.json`, and
+`logs/glm53_serial_prefix4_diag_20260902.json`.
 
 ## 2026-09-01: budget-aware MTP reaches 62.79s and new tier profiling closes placement
 

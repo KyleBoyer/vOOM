@@ -1186,6 +1186,12 @@ class RuntimeConfig:
     # reduction order, and state materialization cadence; explicit until a
     # real checkpoint timing/token gate proves useful performance.
     glm53_compiled_kda_prefill: bool = False
+    # Explicit lossy GLM-5.3 KDA prefill scan.  The fused Metal kernel keeps
+    # the released causal recurrence and FP32 storage, but its in-kernel
+    # reductions can associate differently from MLX's operator graph.  It is
+    # therefore never selected by a lossless/default profile even when its
+    # numerical error is far below the greedy-token gate.
+    glm53_native_fused_kda_prefill: bool = False
     # Exact F75 query/key tiling for the official glm_moe_dsa indexer. The
     # score reduction dimension is unchanged; only the bounded candidate merge
     # schedule differs. It is inert below index_topk and remains explicit at
@@ -1469,6 +1475,8 @@ class RuntimeConfig:
                 "glm53_incremental_dsa_pool", False),
             glm53_compiled_kda_prefill=run.get(
                 "glm53_compiled_kda_prefill", False),
+            glm53_native_fused_kda_prefill=run.get(
+                "glm53_native_fused_kda_prefill", False),
             glm_dsa_key_tile_size=run.get(
                 "glm_dsa_key_tile_size", 256),
             glm_dsa_index_step_size=run.get(
@@ -5831,7 +5839,7 @@ class StreamingEngine:
                     native_fused_kda_decode=(
                         self.rc.native_fused_deltanet_decode),
                     native_fused_kda_prefill=(
-                        self.rc.kimi_k3_native_fused_kda_prefill),
+                        self.rc.glm53_native_fused_kda_prefill),
                     compiled_kda_prefill=(
                         self.rc.glm53_compiled_kda_prefill),
                     profile=profiler,
@@ -6016,9 +6024,12 @@ class StreamingEngine:
                     layer_type=self._profile_layer_type(i),
                 )
             if tap_layers is not None and i in tap_layers:
-                self._tap_hidden[i] = x  # read-only capture; x itself is untouched
+                tap_hidden = (
+                    mx.mean(hc_stream, axis=2)
+                    if self.cfg.model_type == "glm5_next" else x)
+                self._tap_hidden[i] = tap_hidden
                 if collector is not None:
-                    collector.observe(i, x, position_start=offset)
+                    collector.observe(i, tap_hidden, position_start=offset)
             if (self.rc.router_lookahead and moe and self.prefetcher
                     and i + 1 < n and x.shape[1] == 1):
                 # F45 — decode only: prefill's multi-position unions flooded the
@@ -7742,8 +7753,8 @@ class StreamingEngine:
 
     def _layer_stationary_glm5_next_sweep(
             self, x: mx.array, kv, offset: int, tile_width: int,
-            on_progress=None) -> mx.array:
-        """Layer-major exact prefill for GLM-5.3's mHC/KDA/DSA stack.
+            on_progress=None, tap_layers=None) -> mx.array:
+        """Layer-major bounded prefill for GLM-5.3's mHC/KDA/DSA stack.
 
         The released block is separable by position around its two stateful
         attention families: mHC maps and the MLP/router are row functions,
@@ -7752,7 +7763,10 @@ class StreamingEngine:
         the layer's MLP once over the concatenated reduced rows.  Consequently
         a routed expert is fetched at most once for this layer instead of once
         per prompt tile, without changing router inputs, expert accumulation
-        order, target weights, or recurrent endpoints.
+        order or target weights.  The DSA projection uses one bounded latent
+        tile at a time; that changes GEMM shape relative to ordinary compressed
+        decode and is therefore E-class unless a caller separately proves the
+        required released-state/token equivalence for its request corpus.
         """
         from .deepseek_v4 import (deepseek_v4_attention_residual, hc_post,
                                   hc_pre)
@@ -7777,11 +7791,16 @@ class StreamingEngine:
             x[:, :, None, :],
             (x.shape[0], total, self.cfg.hc_mult, x.shape[2]))
         tiles = [expanded[:, start:end] for start, end in spans]
+        collector = (
+            self._dspark_tap_collector if tap_layers is None else None)
+        if collector is not None:
+            tap_layers = collector.tap_layers
+        tapset = set(tap_layers) if tap_layers is not None else set()
         del expanded, x
-        # Exact eager GLM projects each latent row into K/V once before cache
-        # append. Keep that projection only for the currently active DSA
-        # layer; the durable endpoint remains the released compact latent.
-        # This removes quadratic re-projection without MLA reassociation.
+        # Keep each projection only for the currently active DSA layer; the
+        # durable endpoint remains the released compact latent.  This removes
+        # quadratic re-projection, but the bounded GEMM shape can round
+        # differently from ordinary growing-prefix compressed decode.
         kv._glm53_expanded_prefill = {}
 
         probe_positions = min(total, tile_width)
@@ -7937,7 +7956,7 @@ class StreamingEngine:
                             native_fused_decode=(
                                 self.rc.native_fused_deltanet_decode),
                             native_fused_prefill=(
-                                self.rc.kimi_k3_native_fused_kda_prefill),
+                                self.rc.glm53_native_fused_kda_prefill),
                             compiled_prefill=(
                                 self.rc.glm53_compiled_kda_prefill),
                             released_output_dtype=True,
@@ -8039,6 +8058,21 @@ class StreamingEngine:
                     publish=(index == 0 or end == total
                              or index % 64 == 0))
             del mlp_tiles, posts, combs
+
+            if layer in tapset:
+                tapped_tiles = []
+                for tile in tiles:
+                    tapped = mx.mean(tile, axis=2).astype(mx.bfloat16)
+                    mx.eval(tapped)
+                    tapped_tiles.append(tapped)
+                self._tap_hidden[layer] = (
+                    tapped_tiles[0] if len(tapped_tiles) == 1
+                    else mx.concatenate(tapped_tiles, axis=1))
+                mx.eval(self._tap_hidden[layer])
+                if collector is not None:
+                    collector.observe(
+                        layer, self._tap_hidden[layer],
+                        position_start=offset)
 
             compute_s = time.perf_counter() - compute_started
             self.timer.add("layer_compute", compute_s)
@@ -8960,11 +8994,9 @@ class StreamingEngine:
                 raise ValueError(
                     "GLM-5.3 verifier uses compact KDA factors, not dense "
                     "per-position endpoints")
-            if tap_layers is not None:
-                raise ValueError(
-                    "GLM-5.3 serial verification does not expose draft taps")
             x_all = self._layer_stationary_glm5_next_sweep(
-                embedded, kv, offset, tile_width=1)
+                embedded, kv, offset, tile_width=1,
+                tap_layers=tap_layers)
             positions = [
                 x_all[:, position:position + 1, :]
                 for position in range(x_all.shape[1])
@@ -9721,6 +9753,8 @@ class StreamingEngine:
                     self.rc.glm53_coalesced_expert_max_positions}"
                 f"glm53poolcache{int(self.rc.glm53_incremental_dsa_pool)}"
                 f"glm53compiledkda{int(self.rc.glm53_compiled_kda_prefill)}"
+                f"glm53nativekda{int(
+                    self.rc.glm53_native_fused_kda_prefill)}"
                 f"glmdsakeytile{self.rc.glm_dsa_key_tile_size}"
                 f"glmdsaindexstep{self.rc.glm_dsa_index_step_size}"
                 f"glmdsaquerytile{self.rc.glm_dsa_selection_query_tile_size}"
@@ -12361,6 +12395,8 @@ class StreamingEngine:
                 self.rc.glm53_incremental_dsa_pool)
             path_stats["glm53_compiled_kda_prefill"] = int(
                 self.rc.glm53_compiled_kda_prefill)
+            path_stats["glm53_native_fused_kda_prefill"] = int(
+                self.rc.glm53_native_fused_kda_prefill)
             path_stats["glm53_layer_stationary_memory_samples"] = int(
                 glm53_memory.get("memory_samples", 0))
             path_stats["glm53_layer_stationary_peak_metal_bytes"] = int(

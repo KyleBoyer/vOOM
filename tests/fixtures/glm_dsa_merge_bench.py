@@ -4,9 +4,16 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import statistics
+import sys
 import time
+from pathlib import Path
 from types import SimpleNamespace
+
+ROOT = Path(__file__).resolve().parents[2]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
 import mlx.core as mx
 
@@ -133,10 +140,13 @@ def main() -> None:
     parser.add_argument("--tile", type=int, default=1024)
     parser.add_argument("--repetitions", type=int, default=5)
     parser.add_argument("--score-selector", action="store_true")
+    parser.add_argument("--result-json", type=Path)
     args = parser.parse_args()
     if min(args.queries, args.keys, args.topk, args.tile,
            args.repetitions) <= 0 or args.keys <= args.topk:
         parser.error("invalid selector geometry")
+    if args.result_json is not None and args.result_json.exists():
+        parser.error("result JSON already exists")
 
     # Quantized deterministic scores deliberately create many exact ties,
     # including at merge boundaries, so equality proves the secondary-ID rule
@@ -242,7 +252,22 @@ def main() -> None:
         identical = identical and selector_identical
         result["classification"] = (
             "lossless" if identical else "rejected-nonidentical")
-    print(json.dumps(result, indent=2, sort_keys=True))
+    rendered = json.dumps(result, indent=2, sort_keys=True) + "\n"
+    if args.result_json is not None:
+        args.result_json.parent.mkdir(parents=True, exist_ok=True)
+        temporary = args.result_json.with_name(args.result_json.name + ".tmp")
+        descriptor = os.open(
+            temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
+        try:
+            payload = rendered.encode()
+            while payload:
+                written = os.write(descriptor, payload)
+                payload = payload[written:]
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+        os.replace(temporary, args.result_json)
+    print(rendered, end="")
     if not identical:
         raise SystemExit(1)
 

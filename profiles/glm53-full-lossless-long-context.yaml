@@ -1,0 +1,20 @@
+schema: voom.runtime-profile.v1
+name: glm53-full-lossless-long-context
+description: Explicit full GLM-5.3 released-weight long-context route with exact wide DSA preselection.
+notes:
+  - "The official fine-grained FP8/BF16 checkpoint remains byte-unchanged. DSA index scoring batches 64 adjacent query rows while compact attention retains an eight-row outer shape and released selected rows."
+  - "At the 46,849-key released geometry, 64/128/256-row selector gates were byte-identical. Width 64 had the best projected whole-prompt score time (37.4s versus 39.8s/39.3s) and the smallest selector peak (207MB versus 374MB/707MB)."
+  - "The query batch only amortizes exact score/merge launches; the head-dimension reduction, causal mask, stable score/ID tie-break, and stored per-attention-range selections are unchanged."
+  - "Completed compressed MLA and DSA state spill byte-exactly to Workspace NVMe. This is an explicit conformance profile until the real F22/F33 long-context ladder and heterogeneous replay corpus pass."
+settings:
+  VMODEL_RESIDENT_BACKEND: voom
+  VMODEL_EXECUTION_PROFILE: layers
+  VMODEL_GLM_DSA_LONG_CONTEXT: true
+  VMODEL_GLM_DSA_MLA_KV_SPILL_DIR: "/Volumes/Workspace NVME/vmodel-spill/glm53-full"
+  VMODEL_GLM_DSA_KEY_TILE_SIZE: 1024
+  VMODEL_GLM_DSA_PREFILL_TILE_WIDTH: 8
+  VMODEL_GLM_DSA_INDEX_STEP_SIZE: 1024
+  VMODEL_GLM_DSA_SELECTION_QUERY_TILE_SIZE: 64
+  VMODEL_GLM_DSA_DENSE_MLP_TILE_SIZE: 512
+  VMODEL_GLM53_EXPERT_FETCH_BATCH: 1
+  VMODEL_GLM53_EXPERT_BATCH_PREFETCH: false

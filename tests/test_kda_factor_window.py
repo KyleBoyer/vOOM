@@ -57,6 +57,10 @@ def test_factor_window_replays_every_prefix_exactly():
             )
             original[layer] = _advance(
                 original[layer], gate, key, value, beta)
+            # Reference ordinary decode has a materialized recurrent endpoint
+            # between positions; preserve that rounding boundary in the
+            # oracle rather than comparing two equivalent lazy graphs.
+            mx.eval(original[layer])
             expected.append(original[layer])
         expected_by_prefix.append(expected)
     window = live.finish_factor_capture(positions)

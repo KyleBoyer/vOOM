@@ -1,0 +1,13 @@
+schema: voom.runtime-profile.v1
+name: glm53-flash-lossless-compiled-kda
+description: Explicit GLM-5.3-Flash released-FP8/BF16 route with exact compiled KDA prefill.
+notes:
+  - "The target checkpoint stays exactly as released. This profile changes scheduling only: the KDA recurrence uses the same MLX operators and FP32 update order inside bounded compiled 32-position segments."
+  - "The released H64/D128/L128 operator oracle was byte-identical for output and recurrent state. A real 2,123-token target gate preserved its greedy output SHA while reducing KDA attention 15.2% and wall 2.4%."
+  - "The incremental DSA pool caches immutable exact pooled keys. Its 46,849-position weights-free gate was byte-identical and reduced pool construction roughly 9x."
+  - "This remains explicit until the compiled route passes heterogeneous real request shapes. It is never an automatic/default-on behavior."
+settings:
+  VMODEL_RESIDENT_BACKEND: voom
+  VMODEL_EXECUTION_PROFILE: layers
+  VMODEL_GLM53_COMPILED_KDA_PREFILL: true
+  VMODEL_GLM53_INCREMENTAL_DSA_POOL: true

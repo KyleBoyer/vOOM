@@ -26,7 +26,11 @@ from runtime.dflash2_adapter import (
     greedy_candidate_recall,
     validate_target_compatibility,
 )
-from runtime.dflash2_schema import DFlash2Config, OFFICIAL_CONFIG
+from runtime.dflash2_schema import (
+    DFlash2Config,
+    GLM53_FLASH_CONFIG,
+    OFFICIAL_CONFIG,
+)
 from runtime.dspark import (
     CtxCache,
     DSparkSpeculativeDecoder,
@@ -41,6 +45,13 @@ TAPS = (5, 19, 33, 47, 61)
 
 def _runtime_config() -> DFlash2RuntimeConfig:
     return DFlash2RuntimeConfig(DFlash2Config.from_mapping(OFFICIAL_CONFIG))
+
+
+def _glm_runtime_config() -> DFlash2RuntimeConfig:
+    return DFlash2RuntimeConfig(
+        DFlash2Config.from_mapping(GLM53_FLASH_CONFIG),
+        target_model_type="glm5_next",
+    )
 
 
 def test_fused_dynamic_convolution_is_an_explicit_runtime_opt_in():
@@ -114,10 +125,44 @@ def _compatible_target(**changes):
     return SimpleNamespace(**values)
 
 
+def _compatible_glm_target(**changes):
+    values = {
+        "model_type": "glm5_next",
+        "hidden_size": 4096,
+        "intermediate_size": 12288,
+        "vocab_size": 154880,
+        "num_hidden_layers": 45,
+        "rope_theta": 10000.0,
+        "max_position_embeddings": 1048576,
+        "tie_word_embeddings": False,
+        "attention_bias": False,
+        "layer_types": tuple(
+            "deepseek_sparse_attention" if (index + 1) % 4 == 0
+            else "linear_attention"
+            for index in range(45)
+        ),
+    }
+    values.update(changes)
+    return SimpleNamespace(**values)
+
+
 def test_official_taps_and_huihui_target_geometry_are_compatible():
     config = _runtime_config()
     assert tuple(config.target_layer_ids) == TAPS
     validate_target_compatibility(config, _compatible_target())
+
+
+def test_glm53_flash_dflash_taps_and_target_geometry_are_compatible():
+    config = _glm_runtime_config()
+    assert tuple(config.target_layer_ids) == (5, 14, 24, 33, 42)
+    validate_target_compatibility(config, _compatible_glm_target())
+
+    with pytest.raises(ValueError, match="compatibility failure"):
+        validate_target_compatibility(
+            config,
+            _compatible_glm_target(
+                layer_types=("linear_attention",) * 45),
+        )
 
 
 @pytest.mark.parametrize(

@@ -2090,6 +2090,16 @@ class EngineManager:
         if glm53_compiled_kda_prefill_request not in ("0", "1"):
             raise RequestValidationError(
                 "VMODEL_GLM53_COMPILED_KDA_PREFILL must be 0 or 1")
+        glm53_native_fused_kda_prefill_request = os.environ.get(
+            "VMODEL_GLM53_NATIVE_FUSED_KDA_PREFILL", "0").strip()
+        if glm53_native_fused_kda_prefill_request not in ("0", "1"):
+            raise RequestValidationError(
+                "VMODEL_GLM53_NATIVE_FUSED_KDA_PREFILL must be 0 or 1")
+        if (glm53_compiled_kda_prefill_request == "1"
+                and glm53_native_fused_kda_prefill_request == "1"):
+            raise RequestValidationError(
+                "GLM-5.3 compiled and native fused KDA prefill paths are "
+                "mutually exclusive")
         if (glm53_sparse_absorbed_mla_request == "1"
                 and glm53_sparse_fused_attention_request == "1"):
             raise RequestValidationError(
@@ -2318,6 +2328,7 @@ class EngineManager:
             glm53_coalesced_expert_max_positions,
             glm53_incremental_dsa_pool_request,
             glm53_compiled_kda_prefill_request,
+            glm53_native_fused_kda_prefill_request,
             glm_dsa_long_context_request,
             glm_dsa_sparse_absorbed_request,
             glm_dsa_mla_kv_spill_request,
@@ -2455,6 +2466,7 @@ class EngineManager:
             glm53_coalesced_expert_max_positions,
             glm53_incremental_dsa_pool_request,
             glm53_compiled_kda_prefill_request,
+            glm53_native_fused_kda_prefill_request,
             glm_dsa_long_context_request,
             glm_dsa_sparse_absorbed_request,
             glm_dsa_mla_kv_spill_request,
@@ -2820,6 +2832,8 @@ class EngineManager:
                     glm53_incremental_dsa_pool_request == "1")
                 rc.glm53_compiled_kda_prefill = (
                     glm53_compiled_kda_prefill_request == "1")
+                rc.glm53_native_fused_kda_prefill = (
+                    glm53_native_fused_kda_prefill_request == "1")
                 # Exact request-to-request prefix reuse is deliberately
                 # opt-in until it clears the heterogeneous real-request
                 # corpus.  GLM-5.3's layer-stationary prefill uses a fixed
@@ -9361,6 +9375,7 @@ def _vision_protocol_timing(result: dict) -> dict:
         "glm53_coalesced_expert_split_experts",
         "glm53_incremental_dsa_pool",
         "glm53_compiled_kda_prefill",
+        "glm53_native_fused_kda_prefill",
         "glm53_layer_stationary_memory_samples",
         "glm53_layer_stationary_peak_metal_bytes",
         "glm53_layer_stationary_initial_carrier_active_peak_bytes",

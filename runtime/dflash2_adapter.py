@@ -33,8 +33,8 @@ from .dflash2_ablation import load_artifact as load_ablation_artifact
 from .dflash2_schema import (
     DFlash2Config,
     OFFICIAL_REVISION,
-    OFFICIAL_WEIGHTS_SHA256,
     _read_safetensors_header,
+    release_for_repository,
     sha256_file,
 )
 from .dflash2_sidecar import MANIFEST_NAME, MANIFEST_SCHEMA, SIDECAR_SCHEMA
@@ -167,7 +167,7 @@ def validate_target_compatibility(
     """
     checkpoint = config.checkpoint
     expected = {
-        "model_type": "qwen3_5",
+        "model_type": config.target_model_type,
         "hidden_size": checkpoint.hidden_size,
         "intermediate_size": checkpoint.intermediate_size,
         "vocab_size": checkpoint.vocab_size,
@@ -184,11 +184,24 @@ def validate_target_compatibility(
             mismatches.append(f"{name}={actual!r} (expected {value!r})")
 
     layer_types = tuple(_target_value(target_config, "layer_types", ()))
-    expected_layers = tuple(
-        "full_attention" if (index + 1) % 4 == 0 else "linear_attention"
-        for index in range(checkpoint.num_target_layers))
-    if layer_types != expected_layers:
-        mismatches.append("layer_types do not match Qwen3.8's 3:1 hybrid layout")
+    if config.target_model_type == "qwen3_5":
+        expected_layers = tuple(
+            "full_attention" if (index + 1) % 4 == 0 else "linear_attention"
+            for index in range(checkpoint.num_target_layers))
+        if layer_types != expected_layers:
+            mismatches.append(
+                "layer_types do not match Qwen3.8's 3:1 hybrid layout")
+    elif config.target_model_type == "glm5_next":
+        expected_layers = tuple(
+            "deepseek_sparse_attention"
+            if (index + 1) % 4 == 0 else "linear_attention"
+            for index in range(checkpoint.num_target_layers))
+        if layer_types != expected_layers:
+            mismatches.append(
+                "layer_types do not match GLM-5.3-Flash's 3:1 KDA/DSA layout")
+    else:
+        mismatches.append(
+            f"unsupported DFlash2 target family {config.target_model_type!r}")
 
     # These are target-side Qwen3.8 shapes, intentionally distinct from the
     # smaller attention geometry inside the draft checkpoint.
@@ -203,7 +216,7 @@ def validate_target_compatibility(
         "linear_value_head_dim": 128,
         "linear_conv_kernel_dim": 4,
     }
-    if checkpoint.num_target_layers == 64 and checkpoint.hidden_size == 5120:
+    if config.target_model_type == "qwen3_5":
         for name, value in qwen38_target.items():
             actual = _target_value(target_config, name)
             if actual != value:
@@ -429,8 +442,6 @@ def inspect_runtime_sidecar(
     model_dir = Path(model_dir).resolve()
     raw = json.loads((model_dir / "config.json").read_text())
     checkpoint = DFlash2Config.from_mapping(raw)
-    if require_official_geometry:
-        checkpoint.validate_official_qwen38()
     sidecar = raw.get("vmodel_sidecar")
     if not isinstance(sidecar, dict):
         raise ValueError("DFlash2 artifact has no vmodel_sidecar identity")
@@ -446,11 +457,15 @@ def inspect_runtime_sidecar(
         sidecar.get(name) != value for name, value in required_sidecar.items()
     ):
         raise ValueError("DFlash2 sidecar identity/default-off contract mismatch")
-    if require_official_geometry and (
-        sidecar.get("source_revision") != OFFICIAL_REVISION
-        or sidecar.get("source_sha256") != OFFICIAL_WEIGHTS_SHA256
-    ):
-        raise ValueError("DFlash2 sidecar official source identity mismatch")
+    release = None
+    if require_official_geometry:
+        release = release_for_repository(sidecar.get("source_repository"))
+        checkpoint.validate_official_release(release)
+        if (
+            sidecar.get("source_revision") != release.revision
+            or sidecar.get("source_sha256") != release.weights_sha256
+        ):
+            raise ValueError("DFlash2 sidecar official source identity mismatch")
     manifest = json.loads((model_dir / MANIFEST_NAME).read_text())
     if not isinstance(manifest, dict) or manifest.get("schema") != MANIFEST_SCHEMA:
         raise ValueError("DFlash2 sidecar manifest schema mismatch")
@@ -524,7 +539,18 @@ def inspect_runtime_sidecar(
         raise ValueError("DFlash2 sidecar byte size differs from manifest")
     if verify_hash and sha256_file(weights_path) != output.get("weights_sha256"):
         raise ValueError("DFlash2 sidecar SHA-256 differs from manifest")
-    return DFlash2RuntimeConfig(checkpoint), physical_names, manifest
+    target_model_type = (
+        release.target_model_type if release is not None
+        else (
+            "glm5_next"
+            if (checkpoint.num_target_layers == 45
+                and checkpoint.hidden_size == 4096)
+            else "qwen3_5"
+        )
+    )
+    return DFlash2RuntimeConfig(
+        checkpoint, target_model_type=target_model_type,
+    ), physical_names, manifest
 
 
 class DFlash2Drafter(nn.Module):
@@ -821,6 +847,9 @@ class DFlash2SpeculativeDecoder(DSparkSpeculativeDecoder):
         self._unary_rounds: list[list[int]] = []
         self._native_mtp_drafter = None
         if self.native_mtp_fallback:
+            if target.cfg.model_type not in ("qwen3_5", "qwen3_5_moe"):
+                raise ValueError(
+                    "DFlash2 native-MTP fallback is currently Qwen-only")
             from .qwen35_mtp import QwenMTPDrafter
 
             self._native_mtp_drafter = QwenMTPDrafter(target)

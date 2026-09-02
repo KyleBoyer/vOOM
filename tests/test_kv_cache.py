@@ -256,6 +256,23 @@ def test_stepped_trim_layer_lengths_updates_capacity_side_table():
     assert cache.keys[1].flatten().tolist() == list(range(3))
 
 
+def test_stepped_logical_rollback_retains_capacity_and_hides_rejected_tail():
+    cache = SteppedKVCache(2)
+    cache.update(0, *_kv(range(9)))
+    cache.update(1, *_kv(range(5)))
+    capacity = tuple(value.shape[2] for value in cache.keys)
+
+    assert cache.layer_lengths() == (9, 5)
+    cache.rollback_layer_lengths((7, 3))
+    assert cache.layer_lengths() == (7, 3)
+    assert tuple(value.shape[2] for value in cache.keys) == capacity
+
+    visible, _ = cache.update(0, *_kv([70, 71]))
+    mx.eval(visible)
+    assert cache.layer_lengths() == (9, 3)
+    assert visible.flatten().tolist() == list(range(7)) + [70, 71]
+
+
 def test_from_cache_converts_compressed_mla_and_preserves_policy():
     plain = KVCache(1)
     plain.compressed_mla = True

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Real Huihui Qwen3.8/DFlash2 target-authoritative state and timing gate.
+"""Real Qwen3.8/GLM-5.3 DFlash2 state and timing gate.
 
 The plain and speculative arms use fresh ``StreamingEngine`` instances under
 the named fast profile.  The gate hashes every retained full-attention K/V
@@ -64,7 +64,9 @@ def _state_digest(engine) -> dict[str, object]:
     digest = hashlib.sha256()
     component_digests = {
         name: hashlib.sha256()
-        for name in ("attention_kv", "recurrent_state", "conv_history", "hidden")
+        for name in (
+            "attention_kv", "dsa_index", "recurrent_state",
+            "conv_history", "hidden")
     }
     tensor_sha256: dict[str, str] = {}
     tensors = 0
@@ -87,14 +89,32 @@ def _state_digest(engine) -> dict[str, object]:
         tensors += 1
         payload_bytes += len(payload)
 
+    logical_lengths = kv.layer_lengths()
+    compressed_mla = bool(getattr(kv, "compressed_mla", False))
     for layer, value in enumerate(kv.keys):
+        if value is not None:
+            length = logical_lengths[layer]
+            value = (value[:, :length, :] if compressed_mla
+                     else value[:, :, :length, :])
         add("attention_kv", f"kv.{layer}.k", value)
     for layer, value in enumerate(kv.values):
+        if value is not None:
+            value = value[:, :, :logical_lengths[layer], :]
         add("attention_kv", f"kv.{layer}.v", value)
+
+    dsa = getattr(kv, "dsa", None)
+    if dsa is not None:
+        for layer, value in sorted(dsa.k_idx.items()):
+            # Both DSA implementations expose ``k_idx`` as an authoritative
+            # logical view even when a private stepped backing has spare rows.
+            add("dsa_index", f"dsa.{layer}.k_idx", value)
+        for layer, value in sorted(
+                getattr(dsa, "pool_keys", {}).items()):
+            add("dsa_index", f"dsa.{layer}.pool", value)
 
     recurrent = getattr(kv, "kda_cache", None)
     if recurrent is None:
-        raise RuntimeError("Qwen endpoint omitted its recurrent companion")
+        raise RuntimeError("hybrid target endpoint omitted recurrent state")
     for layer in range(len(recurrent._state)):
         add("recurrent_state", f"kda.{layer}.state", recurrent.state(layer))
         history = recurrent.conv_history(layer)
@@ -121,6 +141,7 @@ def _configure_profile(profile: str) -> None:
     # profile defaults before application.  They keep each process isolated:
     # no native MTP, no durable/in-memory prompt endpoint reused across arms.
     os.environ["VMODEL_QWEN_MTP_SPECULATIVE"] = "0"
+    os.environ["VMODEL_GLM53_MTP"] = "0"
     os.environ["VMODEL_QWEN35_MIXED_DEPTH_HOT_KV_PERSIST"] = "0"
     os.environ["VMODEL_QWEN35_HOT_KV_PERSIST_DIR"] = ""
     apply_runtime_profiles((profile,), activate=True)
@@ -144,6 +165,8 @@ def _run_arm(
     fallback_min_accepted_per_round: float,
     tree_budget: int,
     load_margin_mb: int,
+    max_prompt_tokens: int,
+    release_between_sweeps: bool,
 ) -> dict[str, object]:
     manager = EngineManager()
     wrapper = None
@@ -157,9 +180,9 @@ def _run_arm(
                 target,
                 draft_path,
                 max_draft_tokens=cap,
-                max_prompt_tokens=262_144,
+                max_prompt_tokens=max_prompt_tokens,
                 prompt_cache_min_tokens=0,
-                release_between_sweeps=True,
+                release_between_sweeps=release_between_sweeps,
                 drafter_load_margin_bytes=load_margin_mb * 1_000_000,
                 proposal_policy=proposal_policy,
                 fused_dynamic_conv=fused_dynamic_conv,
@@ -211,6 +234,8 @@ def _run_arm(
                 fallback_min_accepted_per_round if mode == "spec" else None),
             "tree_budget": tree_budget if mode == "spec" else 0,
             "load_margin_mb": load_margin_mb if mode == "spec" else None,
+            "release_between_sweeps": (
+                bool(release_between_sweeps) if mode == "spec" else None),
             "prompt_sha256": hashlib.sha256(prompt.encode()).hexdigest(),
             "max_tokens": max_tokens,
             "cap": cap if mode == "spec" else 0,
@@ -258,6 +283,8 @@ def main() -> int:
     parser.add_argument("--tree-budget", type=int, choices=range(0, 9),
                         default=0)
     parser.add_argument("--load-margin-mb", type=int, default=400)
+    parser.add_argument("--max-prompt-tokens", type=int, default=1_048_576)
+    parser.add_argument("--retain-draft", action="store_true")
     parser.add_argument("--result", type=Path)
     args = parser.parse_args()
     if args.max_tokens < 2:
@@ -270,6 +297,8 @@ def main() -> int:
         parser.error("force-reject and tree-budget are mutually exclusive")
     if args.load_margin_mb < 0:
         parser.error("load-margin-mb must be non-negative")
+    if args.max_prompt_tokens <= 0:
+        parser.error("max-prompt-tokens must be positive")
     target = args.target.expanduser().resolve()
     draft = args.draft.expanduser().resolve()
     if not (target / "config.json").is_file():
@@ -290,7 +319,9 @@ def main() -> int:
             fallback_min_accepted_per_round=(
                 args.fallback_min_accepted_per_round),
             tree_budget=0,
-            load_margin_mb=args.load_margin_mb))
+            load_margin_mb=args.load_margin_mb,
+            max_prompt_tokens=args.max_prompt_tokens,
+            release_between_sweeps=True))
     if args.mode in ("spec", "compare"):
         arms.append(_run_arm(
             mode="spec", target_path=target, draft_path=draft,
@@ -307,10 +338,12 @@ def main() -> int:
             fallback_min_accepted_per_round=(
                 args.fallback_min_accepted_per_round),
             tree_budget=args.tree_budget,
-            load_margin_mb=args.load_margin_mb))
+            load_margin_mb=args.load_margin_mb,
+            max_prompt_tokens=args.max_prompt_tokens,
+            release_between_sweeps=not args.retain_draft))
 
     report: dict[str, object] = {
-        "schema": "voom.qwen38-dflash2-gate.v1",
+        "schema": "voom.dflash2-target-state-gate.v1",
         "profile": args.profile,
         "target": str(target),
         "draft": str(draft),
@@ -338,6 +371,7 @@ def main() -> int:
         released_state_exact = bool(
             endpoint_layout_exact
             and component_exact["attention_kv"]
+            and component_exact["dsa_index"]
             and component_exact["recurrent_state"]
             and component_exact["conv_history"]
         )

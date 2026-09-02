@@ -1,0 +1,20 @@
+schema: voom.runtime-profile.v1
+name: glm53-flash-dflash2-e-fast
+description: Explicit GLM-5.3-Flash DFlash2 speculative side profile with exact target weights but E-class verifier arithmetic.
+notes:
+  - "The target weights remain exactly released. The complete route is nevertheless lossy/E-class: the layer-stationary verifier first diverges from ordinary compressed decode at DSA layer 3, position 1 because it projects one latent row at a time instead of reprojecting the growing prefix with the released two-row GEMM shape."
+  - "On one real 16-token prompt, the pinned published draft accepted 9 of 22 proposed tokens in six target sweeps and reduced wall time from 356.6424s to 347.2405s (2.7%); this is not yet a general-corpus claim."
+  - "A forced-rejection gate restored all released logical attention KV, DSA index, KDA recurrent, and convolution-history state exactly. Accepted multi-token prefixes do not satisfy the stronger released-state oracle, so this profile must never be described as lossless."
+  - "The pinned local draft path is deliberately absent here. Compose this with a machine-local profile that sets VMODEL_QWEN_DFLASH2_DRAFT."
+extends:
+  - glm53-flash-lossless-compiled-kda
+settings:
+  VMODEL_QWEN_DFLASH2_MAX_DRAFT_TOKENS: 4
+  VMODEL_QWEN_DFLASH2_MAX_PROMPT_TOKENS: 1048576
+  VMODEL_QWEN_DFLASH2_PROMPT_CACHE_MIN_TOKENS: 0
+  VMODEL_QWEN_DFLASH2_PROPOSAL_POLICY: selector
+  VMODEL_QWEN_DFLASH2_RELEASE_AFTER_ROUND: true
+  VMODEL_QWEN_DFLASH2_FUSED_DYNAMIC_CONV: false
+  VMODEL_QWEN_DFLASH2_NATIVE_MTP_FALLBACK: false
+  VMODEL_QWEN_DFLASH2_TREE_BUDGET: 0
+  VMODEL_QWEN_DFLASH2_LOAD_MARGIN_MB: 400

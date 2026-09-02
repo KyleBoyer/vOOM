@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Plan, build, and validate a pinned Qwen3.8 DFlash 2 draft sidecar.
+"""Plan, build, and validate pinned Qwen3.8/GLM-5.3 DFlash 2 sidecars.
 
 Phase A is intentionally default-off.  Nothing in this module wires DFlash 2
 into ``runtime.server`` or claims that recurrent target rollback is proven.
@@ -35,7 +35,6 @@ from .dflash2_schema import (
     DFlash2Config,
     OFFICIAL_CONFIG,
     OFFICIAL_CONFIG_SHA256,
-    OFFICIAL_PARAMETER_COUNT,
     OFFICIAL_REPOSITORY,
     OFFICIAL_REVISION,
     OFFICIAL_UPSTREAM_REPOSITORY,
@@ -45,6 +44,8 @@ from .dflash2_schema import (
     _read_safetensors_header,
     canonical_json,
     inspect_source_file,
+    release_for_repository,
+    release_for_variant,
     require_revision,
     require_sha256,
     sha256_bytes,
@@ -170,8 +171,26 @@ def inspect_pinned_source(
             f"expected {expected_config_sha256}, got {config_sha256}")
     raw_config = json.loads(config_bytes)
     config = DFlash2Config.from_mapping(raw_config)
+    release = None
     if require_official_geometry:
-        config.validate_official_qwen38()
+        release = release_for_repository(repository)
+        expected_identity = (
+            revision,
+            expected_config_sha256,
+            expected_weights_sha256,
+            expected_weights_bytes,
+        )
+        pinned_identity = (
+            release.revision,
+            release.config_sha256,
+            release.weights_sha256,
+            release.weights_bytes,
+        )
+        if expected_identity != pinned_identity:
+            raise ValueError(
+                f"DFlash2 {release.variant} source identity does not match "
+                "the pinned release")
+        config.validate_official_release(release)
     tree = _source_tree(
         source,
         revision=revision,
@@ -184,12 +203,13 @@ def inspect_pinned_source(
             f"expected {expected_weights_bytes}, got {weights_path.stat().st_size}")
     header = inspect_source_file(config, weights_path)
     if require_official_geometry:
-        if header["parameter_count"] != OFFICIAL_PARAMETER_COUNT:
+        assert release is not None
+        if header["parameter_count"] != release.parameter_count:
             raise ValueError(
                 "DFlash2 official parameter count mismatch: "
-                f"expected {OFFICIAL_PARAMETER_COUNT}, "
+                f"expected {release.parameter_count}, "
                 f"got {header['parameter_count']}")
-        if header["file_bytes"] != OFFICIAL_WEIGHTS_BYTES:
+        if header["file_bytes"] != release.weights_bytes:
             raise ValueError("DFlash2 official file byte count mismatch")
     return {
         "repository": repository,
@@ -274,9 +294,13 @@ def plan_sidecar(
 
     inspected = None
     if source is None:
-        config = DFlash2Config.from_mapping(OFFICIAL_CONFIG)
-        if require_official_geometry:
-            config.validate_official_qwen38()
+        release = (
+            release_for_repository(repository)
+            if require_official_geometry else None)
+        config = DFlash2Config.from_mapping(
+            release.config if release is not None else OFFICIAL_CONFIG)
+        if release is not None:
+            config.validate_official_release(release)
     else:
         inspected = inspect_pinned_source(
             source,
@@ -629,8 +653,11 @@ def _parser() -> argparse.ArgumentParser:
             sub.add_argument("--output", required=True)
         else:
             sub.add_argument("--source")
-        sub.add_argument("--repository", default=OFFICIAL_REPOSITORY)
-        sub.add_argument("--revision", default=OFFICIAL_REVISION)
+        sub.add_argument(
+            "--variant", choices=("qwen38", "glm53-flash"),
+            default="qwen38")
+        sub.add_argument("--repository")
+        sub.add_argument("--revision")
         if command in ("plan", "build"):
             sub.add_argument("--bits", type=int, default=4)
             sub.add_argument("--group-size", type=int, default=64)
@@ -643,7 +670,19 @@ def _parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
-    common = {"repository": args.repository, "revision": args.revision}
+    release = release_for_variant(args.variant)
+    repository = args.repository or release.repository
+    revision = args.revision or release.revision
+    if repository != release.repository or revision != release.revision:
+        raise ValueError(
+            "--repository/--revision must match the selected pinned variant")
+    common = {
+        "repository": repository,
+        "revision": revision,
+        "expected_config_sha256": release.config_sha256,
+        "expected_weights_sha256": release.weights_sha256,
+        "expected_weights_bytes": release.weights_bytes,
+    }
     if args.command == "plan":
         report = plan_sidecar(
             args.source,

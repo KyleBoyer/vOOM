@@ -8,6 +8,9 @@ import pytest
 
 from runtime.dflash2_schema import (
     DFlash2Config,
+    GLM53_FLASH_CONFIG,
+    GLM53_FLASH_PARAMETER_COUNT,
+    GLM53_FLASH_RELEASE,
     OFFICIAL_CONFIG,
     OFFICIAL_PARAMETER_COUNT,
     validate_source_header,
@@ -64,6 +67,52 @@ def test_official_tensor_schema_matches_published_81_tensor_header():
     assert report["tensor_count"] == 81
     assert report["parameter_count"] == 1_924_404_480
     assert report["tensor_bytes"] == 3_848_808_960
+
+
+def test_glm53_flash_plan_is_independently_pinned_and_header_complete():
+    release = GLM53_FLASH_RELEASE
+    report = plan_sidecar(
+        repository=release.repository,
+        revision=release.revision,
+        expected_config_sha256=release.config_sha256,
+        expected_weights_sha256=release.weights_sha256,
+        expected_weights_bytes=release.weights_bytes,
+    )
+
+    assert report["architecture"] == {
+        "architecture": "DFlash2DraftModel",
+        "tensor_count": 81,
+        "parameter_count": GLM53_FLASH_PARAMETER_COUNT,
+        "tensor_schema_sha256": (
+            "d46fe79fe98bed4c2f0df126ee6ec3024711a658200378151221eb073285b51c"),
+        "target_layer_ids": [5, 14, 24, 33, 42],
+        "checkpoint_block_size": 8,
+        "checkpoint_proposal_count": 7,
+        "selector_top_k": 16,
+        "selector_rank": 256,
+        "conv_kernel_size": 2,
+        "conv_group_size": 16,
+        "is_causal": False,
+    }
+    assert report["conversion"]["quantized_tensors"] == 49
+    assert report["conversion"]["retained_bf16_bytes"] == 428_544
+    assert report["conversion"]["estimated_output_tensor_bytes"] == 659_040_768
+    assert report["source"]["repository"] == release.repository
+    assert report["source"]["revision"] == release.revision
+
+
+def test_glm53_flash_tensor_schema_matches_published_81_tensor_header():
+    config = DFlash2Config.from_mapping(GLM53_FLASH_CONFIG)
+    config.validate_official_glm53_flash()
+    config.validate_official_release(GLM53_FLASH_RELEASE)
+    header, payload_bytes = _header(config)
+
+    report = validate_source_header(
+        config, header, payload_bytes=payload_bytes)
+
+    assert report["tensor_count"] == 81
+    assert report["parameter_count"] == GLM53_FLASH_PARAMETER_COUNT
+    assert report["tensor_bytes"] == 2_342_160_896
 
 
 @pytest.mark.parametrize(

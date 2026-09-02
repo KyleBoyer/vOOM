@@ -132,6 +132,21 @@ def test_tap_collector_bounds_proposal_context_to_recent_window():
     assert caches[0].position_end == 8
 
 
+def test_tap_collector_drops_old_rows_before_all_taps_are_retained():
+    drafter = _RecordingDrafter()
+    collector = DSparkTapCollector(
+        drafter, [CtxCache()], position_floor=6)
+    collector.begin_attempt()
+    hidden = mx.arange(8, dtype=mx.float32).reshape(1, 8, 1)
+
+    for layer in collector.tap_layers[:-1]:
+        collector.observe(layer, hidden + layer, position_start=0)
+
+    assert set(collector._seen) == set(collector.tap_layers[:-1])
+    assert all(value[0] == 6 for value in collector._seen.values())
+    assert all(value[2].shape[1] == 2 for value in collector._seen.values())
+
+
 def test_tap_retry_clears_partial_context_and_noncontiguous_fails_closed():
     drafter = _RecordingDrafter()
     cache = CtxCache()

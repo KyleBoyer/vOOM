@@ -2838,6 +2838,7 @@ def test_glm53_sparse_absorbed_mla_is_explicit_and_in_engine_identity():
         "VMODEL_GLM53_COALESCED_EXPERT_MAX_POSITIONS": "512",
         "VMODEL_GLM53_INCREMENTAL_DSA_POOL": "0",
         "VMODEL_GLM53_COMPILED_KDA_PREFILL": "0",
+        "VMODEL_GLM53_NATIVE_FUSED_KDA_PREFILL": "0",
     }
     with patch.dict("os.environ", settings, clear=False), \
          patch("runtime.config.ModelConfig.from_dir", return_value=cfg), \
@@ -2861,8 +2862,11 @@ def test_glm53_sparse_absorbed_mla_is_explicit_and_in_engine_identity():
         manager.get(Path("/tmp/fake-glm53-sparse-absorbed"), "lossless")
         os.environ["VMODEL_GLM53_COMPILED_KDA_PREFILL"] = "1"
         manager.get(Path("/tmp/fake-glm53-sparse-absorbed"), "lossless")
+        os.environ["VMODEL_GLM53_COMPILED_KDA_PREFILL"] = "0"
+        os.environ["VMODEL_GLM53_NATIVE_FUSED_KDA_PREFILL"] = "1"
+        manager.get(Path("/tmp/fake-glm53-sparse-absorbed"), "lossless")
 
-    assert len(captured) == 8
+    assert len(captured) == 9
     assert captured[0].glm53_sparse_absorbed_mla is False
     assert captured[1].glm53_sparse_absorbed_mla is True
     assert captured[2].glm53_sparse_absorbed_mla is False
@@ -2881,6 +2885,9 @@ def test_glm53_sparse_absorbed_mla_is_explicit_and_in_engine_identity():
     assert captured[6].glm53_coalesced_expert_max_positions == 256
     assert captured[6].glm53_compiled_kda_prefill is False
     assert captured[7].glm53_compiled_kda_prefill is True
+    assert captured[7].glm53_native_fused_kda_prefill is False
+    assert captured[8].glm53_compiled_kda_prefill is False
+    assert captured[8].glm53_native_fused_kda_prefill is True
 
 
 def test_glm53_sparse_attention_candidates_are_mutually_exclusive():
@@ -2930,6 +2937,31 @@ def test_glm53_compiled_kda_prefill_rejects_untyped_env():
         "VMODEL_GLM53_COMPILED_KDA_PREFILL": "auto",
     }, clear=False):
         with pytest.raises(RequestValidationError, match="must be 0 or 1"):
+            EngineManager().get(Path("/tmp/unused-glm53"), "lossless")
+
+
+def test_glm53_native_fused_kda_prefill_rejects_untyped_env():
+    from unittest.mock import patch
+
+    from runtime.server import EngineManager, RequestValidationError
+
+    with patch.dict("os.environ", {
+        "VMODEL_GLM53_NATIVE_FUSED_KDA_PREFILL": "auto",
+    }, clear=False):
+        with pytest.raises(RequestValidationError, match="must be 0 or 1"):
+            EngineManager().get(Path("/tmp/unused-glm53"), "lossless")
+
+
+def test_glm53_kda_prefill_paths_are_mutually_exclusive():
+    from unittest.mock import patch
+
+    from runtime.server import EngineManager, RequestValidationError
+
+    with patch.dict("os.environ", {
+        "VMODEL_GLM53_COMPILED_KDA_PREFILL": "1",
+        "VMODEL_GLM53_NATIVE_FUSED_KDA_PREFILL": "1",
+    }, clear=False):
+        with pytest.raises(RequestValidationError, match="mutually exclusive"):
             EngineManager().get(Path("/tmp/unused-glm53"), "lossless")
 
 

@@ -1,12 +1,12 @@
-"""Pure metadata contract for the pinned Qwen3.8-27B DFlash 2 draft.
+"""Pure metadata contracts for pinned Qwen3.8 and GLM-5.3-Flash drafts.
 
 This module deliberately imports neither MLX nor the serving runtime.  Phase A
 only establishes what the published checkpoint *is* and rejects a partial or
 silently downgraded DFlash/DFlash2 artifact before any tensor is materialized.
 
 The pinned values below were obtained from Hugging Face repository metadata
-and a safetensors header-only range read on 2026-08-24.  The 3.85 GB payload
-was not downloaded while adding this contract.
+and safetensors header-only range reads. Each source identity is independently
+hash-pinned; similar DFlash2 geometry never substitutes for release identity.
 """
 
 from __future__ import annotations
@@ -31,6 +31,15 @@ OFFICIAL_WEIGHTS_BYTES = 3_848_817_896
 OFFICIAL_PARAMETER_COUNT = 1_924_404_480
 OFFICIAL_UPSTREAM_REPOSITORY = "https://github.com/z-lab/dflash"
 OFFICIAL_UPSTREAM_REVISION = "07ebd93db9f472af339b644bb70221ad8428328a"
+
+GLM53_FLASH_REPOSITORY = "incoai/GLM-5.3-Flash-DFlash2"
+GLM53_FLASH_REVISION = "bf582e4eacc1810f76656d1811693ff6c6737d2a"
+GLM53_FLASH_CONFIG_SHA256 = (
+    "c4aeac0101196a6e26705b34c45230bcd0c7c68ee2d2d1efdb242087f3712573")
+GLM53_FLASH_WEIGHTS_SHA256 = (
+    "b038e1d9d1e7833fa3880c2c0135ba9b673013f03da1b29fb831931584759dac")
+GLM53_FLASH_WEIGHTS_BYTES = 2_342_169_800
+GLM53_FLASH_PARAMETER_COUNT = 1_171_080_448
 
 
 # Kept as a literal receipt so ``plan`` remains useful before the large shard
@@ -77,6 +86,104 @@ OFFICIAL_CONFIG: dict[str, Any] = {
     "use_sliding_window": True,
     "vocab_size": 248320,
 }
+
+GLM53_FLASH_CONFIG: dict[str, Any] = {
+    "architectures": ["DFlash2DraftModel"],
+    "attention_bias": False,
+    "attention_dropout": 0.0,
+    "bos_token_id": None,
+    "dflash_config": {
+        "block_size": 8,
+        "conv_group_size": 16,
+        "conv_kernel_size": 2,
+        "mask_token_id": 154856,
+        "selector_rank": 256,
+        "selector_top_k": 16,
+        "target_layer_ids": [5, 14, 24, 33, 42],
+    },
+    "dtype": "bfloat16",
+    "eos_token_id": [154820, 154827, 154829],
+    "head_dim": 128,
+    "hidden_act": "silu",
+    "hidden_size": 4096,
+    "intermediate_size": 12288,
+    "is_causal": False,
+    "layer_types": ["sliding_attention"] * 5,
+    "max_position_embeddings": 1048576,
+    "max_window_layers": 5,
+    "model_type": "qwen3",
+    "num_attention_heads": 32,
+    "num_hidden_layers": 5,
+    "num_key_value_heads": 8,
+    "num_target_layers": 45,
+    "pad_token_id": 154820,
+    "rms_norm_eps": 1e-5,
+    "rope_parameters": {
+        "rope_theta": 10000.0,
+        "rope_type": "default",
+    },
+    "sliding_window": 2048,
+    "tie_word_embeddings": False,
+    "transformers_version": "5.7.0",
+    "use_cache": False,
+    "use_sliding_window": True,
+    "vocab_size": 154880,
+}
+
+
+@dataclass(frozen=True)
+class DFlash2Release:
+    variant: str
+    repository: str
+    revision: str
+    config_sha256: str
+    weights_sha256: str
+    weights_bytes: int
+    parameter_count: int
+    config: Mapping[str, Any]
+    target_model_type: str
+
+
+QWEN38_RELEASE = DFlash2Release(
+    variant="qwen38",
+    repository=OFFICIAL_REPOSITORY,
+    revision=OFFICIAL_REVISION,
+    config_sha256=OFFICIAL_CONFIG_SHA256,
+    weights_sha256=OFFICIAL_WEIGHTS_SHA256,
+    weights_bytes=OFFICIAL_WEIGHTS_BYTES,
+    parameter_count=OFFICIAL_PARAMETER_COUNT,
+    config=OFFICIAL_CONFIG,
+    target_model_type="qwen3_5",
+)
+GLM53_FLASH_RELEASE = DFlash2Release(
+    variant="glm53-flash",
+    repository=GLM53_FLASH_REPOSITORY,
+    revision=GLM53_FLASH_REVISION,
+    config_sha256=GLM53_FLASH_CONFIG_SHA256,
+    weights_sha256=GLM53_FLASH_WEIGHTS_SHA256,
+    weights_bytes=GLM53_FLASH_WEIGHTS_BYTES,
+    parameter_count=GLM53_FLASH_PARAMETER_COUNT,
+    config=GLM53_FLASH_CONFIG,
+    target_model_type="glm5_next",
+)
+
+
+def release_for_variant(variant: str) -> DFlash2Release:
+    releases = {
+        QWEN38_RELEASE.variant: QWEN38_RELEASE,
+        GLM53_FLASH_RELEASE.variant: GLM53_FLASH_RELEASE,
+    }
+    try:
+        return releases[str(variant)]
+    except KeyError as error:
+        raise ValueError(f"unsupported DFlash2 release variant {variant!r}") from error
+
+
+def release_for_repository(repository: str) -> DFlash2Release:
+    for release in (QWEN38_RELEASE, GLM53_FLASH_RELEASE):
+        if repository == release.repository:
+            return release
+    raise ValueError(f"unsupported official DFlash2 repository {repository!r}")
 
 
 def canonical_json(value: Any) -> bytes:
@@ -296,6 +403,26 @@ class DFlash2Config:
             raise ValueError(
                 "DFlash2 config does not match pinned Qwen3.8 geometry: "
                 + ", ".join(fields))
+
+    def validate_official_glm53_flash(self) -> None:
+        expected = DFlash2Config.from_mapping(GLM53_FLASH_CONFIG)
+        if self != expected:
+            fields = [
+                name for name in self.__dataclass_fields__
+                if getattr(self, name) != getattr(expected, name)]
+            raise ValueError(
+                "DFlash2 config does not match pinned GLM-5.3-Flash "
+                "geometry: " + ", ".join(fields))
+
+    def validate_official_release(self, release: DFlash2Release) -> None:
+        expected = DFlash2Config.from_mapping(release.config)
+        if self != expected:
+            fields = [
+                name for name in self.__dataclass_fields__
+                if getattr(self, name) != getattr(expected, name)]
+            raise ValueError(
+                f"DFlash2 config does not match pinned {release.variant} "
+                "geometry: " + ", ".join(fields))
 
     @property
     def proposal_count(self) -> int:

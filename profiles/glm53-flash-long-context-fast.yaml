@@ -1,0 +1,20 @@
+schema: voom.runtime-profile.v1
+name: glm53-flash-long-context-fast
+description: Explicit GLM-5.3-Flash long-context sidequest with compiled KDA and bounded lossy attention/MLP intermediates.
+notes:
+  - "This profile extends the exact compiled-KDA route, but the selected-row fused attention, int8 expanded K/V, coalesced expert-position GEMMs, and changed outer tile shapes make the composition explicitly lossy. Never report it as lossless."
+  - "The target weights remain released FP8/BF16. Storage fetch batching and prefetch preserve released expert order; the lossy scope is confined to the named intermediate/outer-shape switches."
+  - "Without compiled KDA, the untouched 46,849-token capture completed in 2,778.144 seconds wall at 7.584 GB peak Metal. Its one-token capacity result was stochastic and prior complete Plex gates rejected this family at 79/100, so it is a timing experiment, not a quality promotion."
+  - "Keep this route explicit and require a complete Plex/tool score before serving it as a preferred lossy profile."
+extends:
+  - glm53-flash-lossless-compiled-kda
+settings:
+  VMODEL_GLM53_PREFILL_TILE_WIDTH: 128
+  VMODEL_GLM53_EXPERT_FETCH_BATCH: 8
+  VMODEL_GLM53_EXPERT_BATCH_PREFETCH: true
+  VMODEL_GLM53_TRUNK_PREFETCH_DEPTH: 1
+  VMODEL_GLM53_TRUNK_PREFETCH_WORKERS: 1
+  VMODEL_GLM53_SPARSE_FUSED_ATTENTION: true
+  VMODEL_GLM53_SPARSE_FUSED_KV_INT8: true
+  VMODEL_GLM53_COALESCED_EXPERT_POSITIONS: true
+  VMODEL_GLM53_COALESCED_EXPERT_MAX_POSITIONS: 512

@@ -371,6 +371,17 @@ class DSparkTapCollector:
         if layer not in self._wanted:
             return
         start = self._contiguous_start(hidden, position_start, positions)
+        end = start + int(hidden.shape[1])
+        # DFlash/DSpark context is sliding.  Slice each tap to the requested
+        # floor before retaining it in ``_seen`` so a 46K target prefill does
+        # not hold five complete residual streams merely to build the final
+        # ~2K-token draft context.  This is an exact view operation; absolute
+        # positions and the deepest-tap alignment checks below are unchanged.
+        if end <= self.position_floor:
+            return
+        if start < self.position_floor:
+            hidden = hidden[:, self.position_floor - start:]
+            start = self.position_floor
         self._seen[layer] = (start, start + int(hidden.shape[1]), hidden)
         if not all(value in self._seen for value in self.tap_layers):
             return
@@ -1389,7 +1400,7 @@ class DSparkSpeculativeDecoder:
         prompt_cache_hit = cached is not None
         hybrid_qwen = (
             getattr(self._cfg, "target_model_type", "qwen3")
-            == "qwen3_5")
+            in ("qwen3_5", "glm5_next"))
         bootstrap_path_stats: dict = {}
         bootstrap_first_token_s = 0.0
         if prompt_cache_hit and hybrid_qwen:
@@ -1639,7 +1650,7 @@ class DSparkSpeculativeDecoder:
                 else None)
             k3_kda_checkpoint = (
                 target_kv.kda_cache.fork()
-                if (target.cfg.model_type == "kimi_k3"
+                if (target.cfg.model_type in ("kimi_k3", "glm5_next")
                     and getattr(target_kv, "kda_cache", None) is not None)
                 else None
             )
@@ -1691,9 +1702,16 @@ class DSparkSpeculativeDecoder:
             except BaseException:
                 target._dspark_expert_prefetch_plan = None
                 if round_layer_lengths is not None:
-                    target_kv.trim_layer_lengths(round_layer_lengths)
+                    rollback_layers = getattr(
+                        target_kv, "rollback_layer_lengths", None)
+                    if callable(rollback_layers):
+                        rollback_layers(round_layer_lengths)
+                    else:
+                        target_kv.trim_layer_lengths(round_layer_lengths)
                 elif target_kv.offset > base:
-                    target_kv.trim(base)
+                    rollback = getattr(target_kv, "rollback", None)
+                    (rollback(base) if callable(rollback)
+                     else target_kv.trim(base))
                 if k3_kda_checkpoint is not None:
                     target_kv.kda_cache = k3_kda_checkpoint
                     k3_kda_checkpoint.cancel_factor_capture()
@@ -1895,11 +1913,17 @@ class DSparkSpeculativeDecoder:
                         raise RuntimeError(
                             "DSpark Qwen verifier omitted the accepted KDA "
                             "endpoint")
-                    target_kv.trim_layer_lengths(tuple(
+                    retained_lengths = tuple(
                         start + (committed_inputs if value else 0)
                         for start, value in zip(
                             round_layer_lengths, growth, strict=True)
-                    ))
+                    )
+                    rollback_layers = getattr(
+                        target_kv, "rollback_layer_lengths", None)
+                    if callable(rollback_layers):
+                        rollback_layers(retained_lengths)
+                    else:
+                        target_kv.trim_layer_lengths(retained_lengths)
                     target_kv.kda_cache = retained
                     stats.qwen_kda_endpoint_restores += 1
                 else:
@@ -1911,7 +1935,11 @@ class DSparkSpeculativeDecoder:
                 target._h_last = hidden_window[
                     :, committed_inputs - 1:committed_inputs, :]
             else:
-                target_kv.trim(base + committed_inputs)
+                rollback = getattr(target_kv, "rollback", None)
+                if callable(rollback):
+                    rollback(base + committed_inputs)
+                else:
+                    target_kv.trim(base + committed_inputs)
             if k3_kda_checkpoint is not None:
                 consume_factors = getattr(
                     target, "consume_serial_kda_factors", None)
@@ -1939,7 +1967,11 @@ class DSparkSpeculativeDecoder:
                     else:
                         # Fail-slow exact fallback.  It is expected only for a
                         # custom K3 target lacking factor capture.
-                        target_kv.trim(base)
+                        rollback = getattr(target_kv, "rollback", None)
+                        if callable(rollback):
+                            rollback(base)
+                        else:
+                            target_kv.trim(base)
                         target_kv.kda_cache = k3_kda_checkpoint
                         replay = verify_ids[:committed_inputs]
                         replay_logits = target.forward_tokens_serial_positions(

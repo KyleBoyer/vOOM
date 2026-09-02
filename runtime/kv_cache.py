@@ -1166,6 +1166,44 @@ class SteppedKVCache(KVCache):
             0,
         )
 
+    def layer_lengths(self) -> tuple[int, ...]:
+        """Return logical lengths, never spare capacity dimensions."""
+        return tuple(self._layer_length(layer) for layer in range(len(self.keys)))
+
+    def rollback_layer_lengths(self, lengths) -> None:
+        """Logically roll back while retaining exact reusable capacity.
+
+        Bytes after each logical endpoint are unreachable and are overwritten
+        before a later append can expose them. Keeping the evaluated capacity
+        avoids slice/shrink/regrow churn on every speculative rejection; the
+        ordinary ``trim_layer_lengths`` method remains the materializing API
+        for persistence and callers that require compact physical arrays.
+        """
+        targets = tuple(int(value) for value in lengths)
+        if len(targets) != len(self.keys) or any(value < 0 for value in targets):
+            raise ValueError("invalid per-layer KV rollback lengths")
+        for layer, target in enumerate(targets):
+            current = self._layer_length(layer)
+            if target > current:
+                raise ValueError("cannot grow KV during rollback")
+            if self.keys[layer] is None and target:
+                raise ValueError("cannot restore a missing KV layer")
+            self._lengths[layer] = target
+
+    def rollback(self, length: int) -> None:
+        """Logically roll every layer and exact companion state to ``length``."""
+        if isinstance(length, bool) or not isinstance(length, int) or length < 0:
+            raise ValueError("KV rollback length must be a non-negative integer")
+        self.rollback_layer_lengths(tuple(
+            min(self._layer_length(layer), length)
+            for layer in range(len(self.keys))))
+        dsa = getattr(self, "dsa", None)
+        if dsa is not None:
+            dsa.trim(length)
+        qwen4 = getattr(self, "qwen4_cache", None)
+        if qwen4 is not None:
+            qwen4.trim(length)
+
     def nbytes(self) -> int:
         total = 0
         for layer, key in enumerate(self.keys):

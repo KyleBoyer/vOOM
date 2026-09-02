@@ -186,6 +186,13 @@ class KDAFactorWindow:
                     state = state + (
                         step.beta[..., None] * step.key
                     )[..., None] * residual[..., None, :]
+                    # Ordinary decode materializes the recurrent endpoint at
+                    # every token boundary. Without this barrier a multi-step
+                    # accepted prefix remains one larger lazy graph and Metal
+                    # can reassociate it, producing a different FP32 endpoint
+                    # from sequential GLM/Kimi decode even though greedy IDs
+                    # often remain unchanged.
+                    mx.eval(state)
                 elif step.gate.ndim == step.key.ndim - 1:
                     # Qwen DeltaNet: one scalar decay per value head. Match
                     # ordinary one-token decode and commit_indices exactly,

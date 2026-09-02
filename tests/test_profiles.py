@@ -148,6 +148,72 @@ def test_builtin_profiles_resolve_complete_agent_group():
     assert flash_settings["VMODEL_QWEN4_PARALLEL_STORAGE_READS"] == "1"
     assert flash_settings["VMODEL_QWEN4_FAST_TIER_DECODE_ONLY"] == "1"
 
+    glm_flash_order, glm_flash_settings = resolve_runtime_profiles(
+        ("glm53-flash-lossless-compiled-kda",), catalog)
+    assert glm_flash_order == ("glm53-flash-lossless-compiled-kda",)
+    assert glm_flash_settings[
+        "VMODEL_GLM53_COMPILED_KDA_PREFILL"] == "1"
+    assert glm_flash_settings[
+        "VMODEL_GLM53_INCREMENTAL_DSA_POOL"] == "1"
+    assert "VMODEL_GLM53_SPARSE_FUSED_ATTENTION" not in glm_flash_settings
+    assert "VMODEL_GLM53_COALESCED_EXPERT_POSITIONS" not in (
+        glm_flash_settings)
+
+    glm_fast_order, glm_fast_settings = resolve_runtime_profiles(
+        ("glm53-flash-long-context-fast",), catalog)
+    assert glm_fast_order == (
+        "glm53-flash-lossless-compiled-kda",
+        "glm53-flash-long-context-fast",
+    )
+    assert glm_fast_settings["VMODEL_GLM53_COMPILED_KDA_PREFILL"] == "1"
+    assert glm_fast_settings["VMODEL_GLM53_PREFILL_TILE_WIDTH"] == "128"
+    assert glm_fast_settings["VMODEL_GLM53_EXPERT_FETCH_BATCH"] == "8"
+    assert glm_fast_settings["VMODEL_GLM53_EXPERT_BATCH_PREFETCH"] == "1"
+    assert glm_fast_settings[
+        "VMODEL_GLM53_SPARSE_FUSED_ATTENTION"] == "1"
+    assert glm_fast_settings["VMODEL_GLM53_SPARSE_FUSED_KV_INT8"] == "1"
+    assert glm_fast_settings[
+        "VMODEL_GLM53_COALESCED_EXPERT_POSITIONS"] == "1"
+    assert glm_fast_settings[
+        "VMODEL_GLM53_COALESCED_EXPERT_MAX_POSITIONS"] == "512"
+
+    glm_native_order, glm_native_settings = resolve_runtime_profiles(
+        ("glm53-flash-long-context-native-kda",), catalog)
+    assert glm_native_order == (
+        "glm53-flash-lossless-compiled-kda",
+        "glm53-flash-long-context-fast",
+        "glm53-flash-long-context-native-kda",
+    )
+    assert glm_native_settings["VMODEL_GLM53_COMPILED_KDA_PREFILL"] == "0"
+    assert glm_native_settings[
+        "VMODEL_GLM53_NATIVE_FUSED_KDA_PREFILL"] == "1"
+
+    glm_dflash_order, glm_dflash_settings = resolve_runtime_profiles(
+        ("glm53-flash-dflash2-e-fast",), catalog)
+    assert glm_dflash_order == (
+        "glm53-flash-lossless-compiled-kda",
+        "glm53-flash-dflash2-e-fast",
+    )
+    assert "VMODEL_QWEN_DFLASH2_DRAFT" not in glm_dflash_settings
+    assert glm_dflash_settings[
+        "VMODEL_QWEN_DFLASH2_MAX_PROMPT_TOKENS"] == "1048576"
+    assert glm_dflash_settings[
+        "VMODEL_QWEN_DFLASH2_PROPOSAL_POLICY"] == "selector"
+    assert glm_dflash_settings[
+        "VMODEL_QWEN_DFLASH2_RELEASE_AFTER_ROUND"] == "1"
+    assert glm_dflash_settings[
+        "VMODEL_QWEN_DFLASH2_FUSED_DYNAMIC_CONV"] == "0"
+
+    glm_full_order, glm_full_settings = resolve_runtime_profiles(
+        ("glm53-full-lossless-long-context",), catalog)
+    assert glm_full_order == ("glm53-full-lossless-long-context",)
+    assert glm_full_settings["VMODEL_GLM_DSA_LONG_CONTEXT"] == "1"
+    assert glm_full_settings["VMODEL_GLM_DSA_PREFILL_TILE_WIDTH"] == "8"
+    assert glm_full_settings[
+        "VMODEL_GLM_DSA_SELECTION_QUERY_TILE_SIZE"] == "64"
+    assert glm_full_settings["VMODEL_GLM53_EXPERT_FETCH_BATCH"] == "1"
+    assert glm_full_settings["VMODEL_GLM53_EXPERT_BATCH_PREFETCH"] == "0"
+
     long_order, long_settings = resolve_runtime_profiles(
         ("huihui-qwen38-27b-fast-long-context",), catalog)
     assert long_order == (
