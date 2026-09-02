@@ -7,6 +7,7 @@ notes:
   - "Depth two on one worker was neutral at 2,123 inputs: 356.477 seconds versus 356.628 for depth one, with wait 168.231 versus 169.195 seconds. Two workers must beat that without unsafe pressure or it is rejected."
   - "The deterministic 2,123-input/max-1 gate passed its finite equality witness: request/output hashes and 300.907GB read volume matched. Wall fell 356.628 -> 260.742 seconds, expert-I/O wait 169.195 -> 53.901 seconds, peak was 3.013GB, swap-out growth 10.502MB, and no retry/clamp occurred. This promotes the scheduling component to broader quality gates, not the E-class parent itself."
   - "The released 16-output strong state gate also passed: all 16 tokens, text and aggregate-state hashes, every component hash, and all 159 tensor hashes matched control exactly. Wall fell 374.604 -> 322.649 seconds and prefill 108.421 -> 66.826 seconds; peak was 2.090GB, swap-out growth 16.728MB, and read volume 419.569GB. Plex/tool and varied-shape quality gates remain pending."
+  - "REJECTED for deployment by the real focused Plex gate: score 57.5/100 in 4717.649 seconds over three turns. It omitted required filter fields, repeated offset zero, and the 128-token final answer truncated after two of four eligible titles; host swap-out grew 285.033MB. The exact ordered scheduling primitive remains reusable, but this E-class parent is not an answer-quality profile."
 extends:
   - glm53-flash-e-compact-mla-coalesced-prefetch2
 settings:

@@ -80,6 +80,19 @@ proof of exact ordered scheduling, but the parent remains E-class; Plex/tool,
 vision, varied-shape, and untouched-capture quality gates remain required before
 any deployment recommendation.
 
+The real focused Plex gate now rejects that E-class composition. With the
+released full Plex schema, 2,187 input tokens on turn one, greedy sampling, a
+128-output cap, and no forced tool choice, it scored only **57.5/100** in
+4,717.649 seconds across three turns. It selected the Plex tool, bounded the
+page, excluded `/Kids/`, and attempted pagination, but omitted the required
+media/rating/operator filters, repeated offset zero, and truncated the final
+answer after two of four eligible titles. Turn walls were 1,635.473, 612.089,
+and 2,470.086 seconds; the last 128-token decode alone cost 2,165.881 seconds.
+All turns had zero resident expert hits despite a 1.5GB cache, and host
+swap-out grew 285.033MB over the full run. Do not promote this profile or call
+its scheduling speedup an answer-quality win. Retain the exact two-worker
+primitive for separately gated lossless/full-arithmetic and MTP compositions.
+
 ## 2026-09-02: Qwen Flash abliterated overlay runs; new exact GLM schedules are isolated
 
 The pinned `windowsxp811203/Qwen3.8-Flash-Next-Abliterated` revision
