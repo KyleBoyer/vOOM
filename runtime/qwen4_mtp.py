@@ -372,6 +372,7 @@ class Qwen4MTPSpeculativeEngine:
         ngram_max_ngram: int = 6,
         ngram_max_draft_tokens: int = 7,
         q_calibration_scales: Sequence[float] = (),
+        compact_kda_rollback: bool = False,
         drafter=None,
     ):
         if target.cfg.model_type != "qwen4_exp":
@@ -411,6 +412,8 @@ class Qwen4MTPSpeculativeEngine:
             raise ValueError(
                 "Qwen4 MTP n-gram-first and adaptive width are mutually "
                 "exclusive experiments")
+        if not isinstance(compact_kda_rollback, bool):
+            raise TypeError("Qwen4 MTP compact_kda_rollback must be bool")
         normalized_calibration_scales = []
         for value in q_calibration_scales:
             if isinstance(value, bool):
@@ -442,6 +445,7 @@ class Qwen4MTPSpeculativeEngine:
         self.ngram_max_ngram = ngram_max_ngram
         self.ngram_max_draft_tokens = ngram_max_draft_tokens
         self.q_calibration_scales = tuple(normalized_calibration_scales)
+        self.compact_kda_rollback = compact_kda_rollback
         self.drafter = drafter or Qwen4MTPDrafter(target)
         self.mtp_engine_identity = (
             f"qwen4-mtp-depth{depth}-qmin{min_draft_probability:g}"
@@ -450,6 +454,7 @@ class Qwen4MTPSpeculativeEngine:
             + ("-qcal-" + "_".join(
                 f"{scale:g}" for scale in self.q_calibration_scales)
                if self.q_calibration_scales else "")
+            + ("-compact-kda" if compact_kda_rollback else "")
             + "-exact-target")
 
     def __getattr__(self, name):
@@ -494,6 +499,8 @@ class Qwen4MTPSpeculativeEngine:
             "qwen4_mtp_adaptive_width_enabled": int(
                 self.min_draft_probability > 0.0),
             "qwen4_mtp_ngram_first_enabled": int(self.ngram_first),
+            "qwen4_mtp_compact_kda_rollback_enabled": int(
+                self.compact_kda_rollback),
             "qwen4_mtp_fallback_reason": reason,
             "qwen4_mtp_engine_identity": self.mtp_engine_identity,
         })
@@ -566,6 +573,8 @@ class Qwen4MTPSpeculativeEngine:
                 "qwen4_mtp_adaptive_width_enabled": int(
                     self.min_draft_probability > 0.0),
                 "qwen4_mtp_ngram_first_enabled": int(self.ngram_first),
+                "qwen4_mtp_compact_kda_rollback_enabled": int(
+                    self.compact_kda_rollback),
                 "qwen4_mtp_fallback_reason": (
                     "single-token-budget" if max_tokens == 1
                     else "terminal-first-token"),
@@ -641,6 +650,10 @@ class Qwen4MTPSpeculativeEngine:
         rollbacks = 0
         kda_restores = 0
         qwen4_restores = 0
+        kda_factor_restores = 0
+        kda_factor_capture_bytes = 0
+        kda_endpoint_capture_bytes = 0
+        kda_factor_restore_s = 0.0
         draft_s = 0.0
         verifier_s = 0.0
         stochastic_overlap_sum = 0.0
@@ -681,6 +694,8 @@ class Qwen4MTPSpeculativeEngine:
             round_start_offset = int(kv.offset)
             target_start_lengths = kv.layer_lengths()
             mtp_start_lengths = mtp_kv.layer_lengths()
+            kda_round_base = (
+                kv.kda_cache.fork() if self.compact_kda_rollback else None)
             draft_constraint = constraint.fork() if constraint is not None else None
             draft_tokens = []
             draft_probabilities = []
@@ -816,7 +831,8 @@ class Qwen4MTPSpeculativeEngine:
             logits_window = target.forward_tokens_serial_positions(
                 verify_tokens,
                 kv,
-                capture_kda_endpoints=True,
+                capture_kda_endpoints=not self.compact_kda_rollback,
+                capture_kda_factors=self.compact_kda_rollback,
                 capture_qwen4_endpoints=True,
             )
             verifier_s += time.perf_counter() - verifier_started
@@ -950,8 +966,28 @@ class Qwen4MTPSpeculativeEngine:
 
             emitted_this_round = len(emitted) - emitted_before
             target_fed = min(len(verify_tokens), max(1, emitted_this_round))
+            kda_factor_capture_bytes += int(getattr(
+                target, "_serial_kda_factor_retained_bytes", 0))
+            kda_endpoint_capture_bytes += int(getattr(
+                target, "_serial_kda_endpoint_retained_bytes", 0))
+            factors = (
+                target.consume_serial_kda_factors()
+                if self.compact_kda_rollback else None)
             if target_fed < len(verify_tokens):
-                kda_endpoint = target.consume_serial_kda_endpoint(target_fed)
+                if self.compact_kda_rollback:
+                    if factors is None or kda_round_base is None:
+                        raise RuntimeError(
+                            "Qwen4 verifier omitted compact KDA rollback "
+                            "factors")
+                    restore_t0 = time.perf_counter()
+                    kda_endpoint = factors.commit_prefix(
+                        kda_round_base, target_fed)
+                    kda_factor_restore_s += time.perf_counter() - restore_t0
+                    kda_factor_restores += 1
+                    target.consume_serial_kda_endpoint(None)
+                else:
+                    kda_endpoint = target.consume_serial_kda_endpoint(
+                        target_fed)
                 qwen4_endpoint = target.consume_serial_qwen4_endpoint(target_fed)
                 if kda_endpoint is None or qwen4_endpoint is None:
                     raise RuntimeError(
@@ -1096,6 +1132,14 @@ class Qwen4MTPSpeculativeEngine:
             "qwen4_mtp_target_prefix_rollbacks": rollbacks,
             "qwen4_mtp_kda_endpoint_restores": kda_restores,
             "qwen4_mtp_aux_endpoint_restores": qwen4_restores,
+            "qwen4_mtp_compact_kda_rollback_enabled": int(
+                self.compact_kda_rollback),
+            "qwen4_mtp_kda_factor_restores": kda_factor_restores,
+            "qwen4_mtp_kda_factor_capture_bytes": (
+                kda_factor_capture_bytes),
+            "qwen4_mtp_kda_endpoint_capture_bytes": (
+                kda_endpoint_capture_bytes),
+            "qwen4_mtp_kda_factor_restore_s": kda_factor_restore_s,
             "qwen4_mtp_draft_s": draft_s,
             "qwen4_mtp_verifier_s": verifier_s,
             "qwen4_mtp_round_outcomes": ",".join(outcomes),

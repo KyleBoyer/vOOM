@@ -3564,6 +3564,29 @@ def test_qwen4_mtp_ngram_first_is_strict_boolean(value):
             EngineManager().get(Path("/tmp/fake-qwen4"), "lossless")
 
 
+@pytest.mark.parametrize("value", ["2", "true", "bad"])
+def test_qwen4_mtp_compact_kda_rollback_is_strict_boolean(value):
+    from unittest.mock import patch
+
+    from runtime.server import EngineManager
+
+    cfg = SimpleNamespace(
+        model_type="qwen4_exp", tie_word_embeddings=False,
+        vision_config={"model_type": "qwen4_exp_vision"},
+        num_hidden_layers=48, num_experts=512,
+    )
+    with patch.dict(os.environ, {
+        "VMODEL_QWEN4_MTP_COMPACT_KDA_ROLLBACK": value,
+    }, clear=False), \
+         patch("runtime.config.ModelConfig.from_dir", return_value=cfg), \
+         patch("runtime.path_resolver.resolve_model_dir", side_effect=lambda path: path):
+        with pytest.raises(
+            RequestValidationError,
+            match="VMODEL_QWEN4_MTP_COMPACT_KDA_ROLLBACK",
+        ):
+            EngineManager().get(Path("/tmp/fake-qwen4"), "lossless")
+
+
 def test_qwen4_mtp_ngram_first_rejects_adaptive_width_combination():
     from unittest.mock import patch
 
@@ -3601,13 +3624,14 @@ def test_qwen4_phase_head_and_mtp_are_explicitly_wired():
     class FakeMTP:
         def __init__(
             self, target, *, depth, min_draft_probability, ngram_first,
-            q_calibration_scales,
+            q_calibration_scales, compact_kda_rollback,
         ):
             captured["target"] = target
             captured["depth"] = depth
             captured["min_draft_probability"] = min_draft_probability
             captured["ngram_first"] = ngram_first
             captured["q_calibration_scales"] = q_calibration_scales
+            captured["compact_kda_rollback"] = compact_kda_rollback
 
         def close(self):
             captured["target"].close()
@@ -3626,6 +3650,7 @@ def test_qwen4_phase_head_and_mtp_are_explicitly_wired():
         "VMODEL_QWEN4_SERIAL_VERIFY_SUSPEND_LM_HEAD": "1",
         "VMODEL_QWEN4_SERIAL_VERIFY_EXACT_BF16_GEMV": "1",
         "VMODEL_QWEN4_QSA_POOL_CACHE": "1",
+        "VMODEL_QWEN4_MTP_COMPACT_KDA_ROLLBACK": "1",
     }, clear=False), \
          patch("runtime.config.ModelConfig.from_dir", return_value=cfg), \
          patch("runtime.path_resolver.resolve_model_dir", side_effect=lambda path: path), \
@@ -3639,6 +3664,7 @@ def test_qwen4_phase_head_and_mtp_are_explicitly_wired():
     assert captured["min_draft_probability"] == pytest.approx(0.625)
     assert not captured["ngram_first"]
     assert captured["q_calibration_scales"] == [0.7, 1.0, 1.3]
+    assert captured["compact_kda_rollback"]
     assert captured["rc"].qwen4_phase_lm_head
     assert captured["rc"].qwen4_serial_verify_suspend_lm_head
     assert captured["rc"].qwen4_serial_verify_exact_bf16_gemv

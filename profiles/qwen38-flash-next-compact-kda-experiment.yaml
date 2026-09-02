@@ -1,0 +1,11 @@
+schema: voom.runtime-profile.v1
+name: qwen38-flash-next-compact-kda-experiment
+description: Explicit exact-factor rollback experiment for Qwen3.8-Flash-Next Lightning-MTP.
+notes:
+  - "Extends the measured released-BF16 profile and changes only speculative recurrent rollback storage: per-prefix dense DeltaNet matrices are replaced by exact low-rank update factors."
+  - "Every proposal remains target-verified. On a rejected suffix, the accepted factors replay through the ordinary FP32 recurrence with its original one-position evaluation boundaries; QSA and PLE use their existing exact strict-prefix restoration."
+  - "This is inspired by ReplaySSM/compact linear speculative state, but remains explicit until real released-state, captured-harness, varied-shape, and pressure gates pass."
+extends:
+  - qwen38-flash-next-instrumented-lossless
+settings:
+  VMODEL_QWEN4_MTP_COMPACT_KDA_ROLLBACK: true

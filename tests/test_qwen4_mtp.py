@@ -412,6 +412,20 @@ class _FakeRecurrent:
     def synchronize(self):
         pass
 
+    def fork(self):
+        return _FakeRecurrent(self.marker)
+
+
+class _FakeFactorWindow:
+    def __init__(self, width):
+        self.width = width
+        self.commits = []
+
+    def commit_prefix(self, base, count):
+        assert count <= self.width
+        self.commits.append((base.marker, count))
+        return _FakeRecurrent(f"factor-{count}")
+
 
 class _FakeAux:
     def __init__(self):
@@ -476,6 +490,7 @@ class _FakeTarget:
         self.cache = SimpleNamespace()
         self.verify_calls = []
         self._kda_endpoints = None
+        self._kda_factors = None
         self._aux_endpoints = None
         self.idle_head_releases = 0
         self._request_profiler = None
@@ -492,10 +507,15 @@ class _FakeTarget:
         }
 
     def forward_tokens_serial_positions(self, tokens, kv, **kwargs):
-        assert kwargs == {
+        assert kwargs in ({
             "capture_kda_endpoints": True,
+            "capture_kda_factors": False,
             "capture_qwen4_endpoints": True,
-        }
+        }, {
+            "capture_kda_endpoints": False,
+            "capture_kda_factors": True,
+            "capture_qwen4_endpoints": True,
+        })
         self.verify_calls.append(tuple(tokens))
         width = len(tokens)
         kv.grow(width)
@@ -506,6 +526,13 @@ class _FakeTarget:
         self._kda_endpoints = [
             _FakeRecurrent(f"kda-{index}") for index in range(1, width)
         ]
+        self._kda_factors = (
+            _FakeFactorWindow(width)
+            if kwargs["capture_kda_factors"] else None)
+        self._serial_kda_factor_retained_bytes = (
+            11 * width if self._kda_factors is not None else 0)
+        self._serial_kda_endpoint_retained_bytes = (
+            101 * (width - 1) if self._kda_factors is None else 0)
         self._aux_endpoints = [
             SimpleNamespace(marker=f"aux-{index}")
             for index in range(1, width)
@@ -520,6 +547,11 @@ class _FakeTarget:
     def consume_serial_kda_endpoint(self, count):
         endpoints, self._kda_endpoints = self._kda_endpoints, None
         return None if count is None else endpoints[count - 1]
+
+    def consume_serial_kda_factors(self):
+        factors, self._kda_factors = self._kda_factors, None
+        self._serial_kda_factor_retained_bytes = 0
+        return factors
 
     def consume_serial_qwen4_endpoint(self, count):
         endpoints, self._aux_endpoints = self._aux_endpoints, None
@@ -777,6 +809,7 @@ def test_ngram_first_rejection_restores_exact_hybrid_target_prefix(
         {"ngram_max_draft_tokens": 1},
         {"ngram_max_draft_tokens": 8},
         {"ngram_first": True, "min_draft_probability": 0.1},
+        {"compact_kda_rollback": 1},
     ],
 )
 def test_ngram_first_rejects_invalid_configuration(kwargs):
@@ -802,6 +835,30 @@ def test_speculative_controller_partial_reject_restores_all_target_state(
     assert target.last_kv.kda_cache.marker == "kda-2"
     assert target.last_kv.qwen4_cache.restores == [("aux-2", 4)]
     assert result["path_stats"]["qwen4_mtp_aux_endpoint_restores"] == 1
+
+
+def test_compact_kda_rollback_replays_exact_factors_instead_of_endpoints(
+        _cache_io_noop):
+    target = _FakeTarget([11, 99, 13])
+    engine = Qwen4MTPSpeculativeEngine(
+        target,
+        depth=2,
+        compact_kda_rollback=True,
+        drafter=_FakeDrafter([11, 12]),
+    )
+
+    result = engine.generate(
+        "prompt", max_tokens=3,
+        sampling=SamplingParams(temperature=0.0))
+
+    stats = result["path_stats"]
+    assert result["tokens"] == [10, 11, 99]
+    assert target.last_kv.kda_cache.marker == "factor-2"
+    assert stats["qwen4_mtp_compact_kda_rollback_enabled"] == 1
+    assert stats["qwen4_mtp_kda_factor_restores"] == 1
+    assert stats["qwen4_mtp_kda_factor_capture_bytes"] == 33
+    assert stats["qwen4_mtp_kda_endpoint_capture_bytes"] == 0
+    assert stats["qwen4_mtp_kda_factor_restore_s"] >= 0.0
 
 
 def test_speculative_controller_all_reject_keeps_final_token_unfed(

@@ -1246,6 +1246,7 @@ class EngineManager:
                 ("VMODEL_QWEN4_SERIAL_VERIFY_SUSPEND_LM_HEAD", "0"),
                 ("VMODEL_QWEN4_SERIAL_VERIFY_EXACT_BF16_GEMV", "0"),
                 ("VMODEL_QWEN4_QSA_POOL_CACHE", "0"),
+                ("VMODEL_QWEN4_MTP_COMPACT_KDA_ROLLBACK", "0"),
             )
         )
         dspark_request_identity = tuple(
@@ -3320,6 +3321,12 @@ class EngineManager:
                         "VMODEL_QWEN4_QSA_POOL_CACHE must be 0 or 1")
                 rc.qwen4_qsa_pool_cache = (
                     qwen4_request_identity[30] == "1")
+                if qwen4_request_identity[31] not in ("0", "1"):
+                    raise RequestValidationError(
+                        "VMODEL_QWEN4_MTP_COMPACT_KDA_ROLLBACK must be 0 "
+                        "or 1")
+                qwen4_mtp_compact_kda_rollback = (
+                    qwen4_request_identity[31] == "1")
                 rc.hot_prompt_kv_persist_dir = qwen4_request_identity[18]
                 if rc.hot_prompt_kv_persist_dir and not rc.hot_prompt_kv:
                     raise RequestValidationError(
@@ -5316,6 +5323,8 @@ class EngineManager:
                         ngram_first=qwen4_mtp_ngram_first,
                         q_calibration_scales=(
                             qwen4_mtp_q_calibration_scales),
+                        compact_kda_rollback=(
+                            qwen4_mtp_compact_kda_rollback),
                     )
                     print(
                         "[server] exact Qwen4 Lightning-MTP speculation: "
@@ -5325,6 +5334,8 @@ class EngineManager:
                         f"ngram_first={int(qwen4_mtp_ngram_first)} "
                         "q_calibration_scales="
                         f"{qwen4_mtp_q_calibration_scales} "
+                        "compact_kda_rollback="
+                        f"{int(qwen4_mtp_compact_kda_rollback)} "
                         f"phase_head={int(rc.qwen4_phase_lm_head)}",
                         flush=True,
                     )
@@ -9795,6 +9806,10 @@ def _vision_protocol_timing(result: dict) -> dict:
         "qwen4_mtp_target_prefix_rollbacks",
         "qwen4_mtp_kda_endpoint_restores",
         "qwen4_mtp_aux_endpoint_restores",
+        "qwen4_mtp_compact_kda_rollback_enabled",
+        "qwen4_mtp_kda_factor_restores",
+        "qwen4_mtp_kda_factor_capture_bytes",
+        "qwen4_mtp_kda_endpoint_capture_bytes",
         "qwen4_mtp_proposal_expert_pages",
         "qwen4_mtp_proposal_expert_bytes",
         "qwen4_mtp_constraint_verified",
@@ -9939,6 +9954,7 @@ def _vision_protocol_timing(result: dict) -> dict:
         "qwen4_mtp_target_tokens_per_sweep",
         "qwen4_mtp_draft_s",
         "qwen4_mtp_verifier_s",
+        "qwen4_mtp_kda_factor_restore_s",
         "qwen4_mtp_expected_acceptance",
         "qwen4_mtp_min_draft_probability",
         "qwen4_mtp_selected_probability_min",
