@@ -208,6 +208,8 @@ def test_builtin_profiles_resolve_complete_agent_group():
         ("glm53-full-lossless-long-context",), catalog)
     assert glm_full_order == ("glm53-full-lossless-long-context",)
     assert glm_full_settings["VMODEL_GLM_DSA_LONG_CONTEXT"] == "1"
+    assert glm_full_settings[
+        "VMODEL_GLM_DSA_SPARSE_ABSORBED_MLA"] == "1"
     assert glm_full_settings["VMODEL_GLM_DSA_PREFILL_TILE_WIDTH"] == "32"
     assert glm_full_settings[
         "VMODEL_GLM_DSA_SELECTION_QUERY_TILE_SIZE"] == "64"

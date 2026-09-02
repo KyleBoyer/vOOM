@@ -12,7 +12,10 @@ harness replay remains the promotion gate. The first composed replay also
 exposed and rejected an unrelated outer-tile regression: tile 8 had not
 finished layer 0 after 222 seconds versus 49.9 seconds in the proven tile-32
 baseline, with healthy memory. The profile therefore keeps outer tile 32 and
-changes only the independently gated DSA query width.
+changes only the independently gated DSA query width. The tile-32 route also
+explicitly retains the baseline's exact bounded absorbed-MLA switch; an early
+retry that omitted this dependency failed closed at request validation before
+model compute.
 
 GLM-5.3-Flash's exact compiled KDA path has now completed the untouched
 46,849-token captured request. Wall time improved 2,778.144 -> **2,489.152
