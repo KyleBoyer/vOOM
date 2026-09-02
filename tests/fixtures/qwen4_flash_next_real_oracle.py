@@ -37,6 +37,12 @@ def _pressure() -> dict[str, int]:
     }
 
 
+def _model_revision(model: Path) -> str:
+    trees = sorted(
+        (model.resolve() / ".cache/huggingface/trees").glob("*.json"))
+    return trees[-1].stem if trees else ""
+
+
 def _state_digest(kv) -> tuple[str, int, int, dict[str, str]]:
     digest = hashlib.sha256()
     components = {
@@ -258,10 +264,20 @@ def main() -> int:
     prompt = "Say hello in one word. " * args.prompt_repeat
     baseline = _run(
         args.model, prompt, args.chunk, args.compare_layer_stationary,
-        args.candidate_compiled if args.compare_layer_stationary else False,
+        (args.candidate_compiled and not args.candidate_native_fused_delta
+         if args.compare_layer_stationary else False),
         (args.candidate_ple_read_workers
          if args.compare_layer_stationary else 1),
-        False, False, 1, "", False, False, False, args.max_tokens)
+        (args.candidate_global_expert_rows
+         if args.compare_layer_stationary else False),
+        (args.candidate_sparse_expert_batch_rows
+         if args.compare_layer_stationary else False),
+        (args.candidate_expert_tile_eval_batch
+         if args.compare_layer_stationary else 1),
+        "", False, False,
+        (args.candidate_native_fused_delta
+         if args.compare_layer_stationary else False),
+        args.max_tokens)
     candidate = _run(
         args.model, prompt, args.chunk, True,
         (args.candidate_compiled
@@ -298,7 +314,7 @@ def main() -> int:
     )
     document = {
         "schema": "voom.qwen4-flash-next-layer-stationary-oracle.v1",
-        "model_revision": "f5d08274bafd880402bd16f5e3e6c514136ec06c",
+        "model_revision": _model_revision(args.model),
         "chunk": args.chunk,
         "prompt_repeat": args.prompt_repeat,
         "max_tokens": args.max_tokens,

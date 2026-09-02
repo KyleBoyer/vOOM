@@ -272,6 +272,20 @@ def test_builtin_profiles_resolve_complete_agent_group():
     assert candidate_settings["VMODEL_QWEN4_MTP_DEPTH"] == "0"
     assert "VMODEL_QWEN4_FAST_TIER_DIR" not in candidate_settings
 
+    candidate_fast_order, candidate_fast_settings = resolve_runtime_profiles(
+        ("qwen38-flash-next-candidate-fast-tier",), catalog)
+    assert candidate_fast_order == (
+        "qwen38-flash-next-candidate-bf16",
+        "qwen38-flash-next-candidate-fast-tier",
+    )
+    assert candidate_fast_settings["VMODEL_QWEN4_FAST_TIER_DIR"].endswith(
+        "Qwen3.8-Flash-Next-Abliterated-trace-v3-hot24")
+    assert candidate_fast_settings[
+        "VMODEL_QWEN4_PARALLEL_STORAGE_READS"] == "1"
+    assert candidate_fast_settings[
+        "VMODEL_QWEN4_FAST_TIER_DECODE_ONLY"] == "0"
+    assert candidate_fast_settings["VMODEL_QWEN4_MTP_DEPTH"] == "0"
+
     long_order, long_settings = resolve_runtime_profiles(
         ("huihui-qwen38-27b-fast-long-context",), catalog)
     assert long_order == (

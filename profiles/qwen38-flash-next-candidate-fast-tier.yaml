@@ -1,0 +1,14 @@
+schema: voom.runtime-profile.v1
+name: qwen38-flash-next-candidate-fast-tier
+description: Candidate-bound exact APFS-cloned fast tier for the abliterated Qwen3.8-Flash-Next checkpoint.
+notes:
+  - "Extends the isolated candidate BF16 route. Every served byte is validated against candidate revision deb02632504bb214702bc28b0381a93d3112f500; the official tier is never selected by model-name or shape coincidence."
+  - "The 20.500GB logical tier is an APFS copy-on-write clone of the released trace-v3-hot24 layout with 5.639GB of candidate-different blocks rewritten. Both source and candidate full-byte validation passed before publication."
+  - "Parallel reads overlap independent internal and external devices without changing tensors, arithmetic, routing, or accumulation order. On the paired 49-token real-checkpoint oracle, wall fell 97.020s -> 72.363s (-25.4%), 10.967GB moved from archive to internal reads, all token/KV/KDA/QSA/PLE digests matched, peak Metal stayed 0.822GB, and swap-out growth stayed below 8MB. Prefill use remains enabled only in this explicit candidate profile until real long-context pressure gates decide whether decode-only is safer."
+  - "Native MTP, prompt-state reuse, and all lossy paths remain disabled so the first timing and quality comparisons isolate storage placement."
+extends:
+  - qwen38-flash-next-candidate-bf16
+settings:
+  VMODEL_QWEN4_FAST_TIER_DIR: /Users/kyleboyer/vmodel_fast_tier/Qwen3.8-Flash-Next-Abliterated-trace-v3-hot24
+  VMODEL_QWEN4_PARALLEL_STORAGE_READS: true
+  VMODEL_QWEN4_FAST_TIER_DECODE_ONLY: false

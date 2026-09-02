@@ -31,9 +31,21 @@ extents, rebinds the immutable config/index identity, and byte-compares every
 published extent against the candidate before atomic publication. The unit
 gate changes one selected down-projection tensor and proves both the released
 source tier and candidate clone still validate while `WeightStore` serves the
-changed candidate bytes. This enables a roughly 20.5GB logical candidate tier
-without duplicating its unchanged physical blocks; the live build and timing
-gate remain pending.
+changed candidate bytes. The live clone now publishes 20.500GB logically while
+rewriting only 5.639GB of candidate-different blocks; source and candidate
+full-byte validation both passed, total logical fast-tier use is 68.698GB, and
+root free remained 25.847GB.
+
+The first paired real-checkpoint storage oracle used a 49-token prompt and
+greedy decode. Candidate-tier wall fell 97.020 -> **72.363 seconds** (-25.4%)
+and model-I/O service fell 91.943 -> **67.072 seconds**. The tier served
+10.967GB internally, reduced archive reads by the same amount, and hid 1.935
+seconds of internal service under independent-device archive reads. Token and
+complete state hashes matched, including each KV/KDA/QSA/PLE component; peak
+Metal was identical at 0.822GB and maximum swap-out growth was 7.63MB. This
+proves the exact storage path, not candidate quality: the direct-engine oracle
+does not apply a chat template and emitted EOS immediately. HTTP harness and
+varied-shape quality gates remain required before any replacement decision.
 
 The latest full-GLM trace exposed 966 exact DSA index-capacity grows and
 22,256,640 copied rows. `glm53-full-lossless-index-preallocate` now publishes
@@ -58,6 +70,7 @@ candidate pending a real-checkpoint request gate.
 Focused result: 348 DSA/server/profile/Qwen-MTP tests and six PLE-row witness
 tests pass. Evidence:
 `logs/qwen38_flash_next_abliterated_tensor_diff_20260902.json`,
+`logs/qwen38_flash_abliterated_fast_tier_oracle_20260902.json`,
 `logs/qwen38_flash_abliterated_smoke2_preflight_20260902.json`, and the
 verified overlay receipt beside the staged checkpoint.
 

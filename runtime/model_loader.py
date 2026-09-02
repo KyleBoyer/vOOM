@@ -1882,22 +1882,37 @@ class WeightStore:
                     raise ValueError(
                         "Qwen4 virtual fast tier lacks a readable binding"
                     ) from error
-                if not (
-                    isinstance(binding, dict)
-                    and binding.get("schema") in (
+                identity_checks = {
+                    "binding": isinstance(binding, dict),
+                    "schema": isinstance(binding, dict) and binding.get(
+                        "schema") in (
                         "voom.qwen4-fused-expert-fast-tier.v1",
                         "voom.qwen4-trunk-first-fast-tier.v2",
-                    )
-                    and binding.get("target_model") == self.dir.name
+                    ),
+                    # ``path_resolver`` preserves a caller's stable symlink
+                    # spelling. Builders/validators resolve it so the binding
+                    # names the immutable overlay directory. Both names are
+                    # acceptable only while all three content hashes match.
+                    "target_model": isinstance(binding, dict) and binding.get(
+                        "target_model") in {
+                            self.dir.name, self.dir.resolve().name},
+                    "source_index_sha256": isinstance(binding, dict)
                     and binding.get("source_index_sha256")
-                    == hashlib.sha256(index_bytes).hexdigest()
+                    == hashlib.sha256(index_bytes).hexdigest(),
+                    "source_config_sha256": isinstance(binding, dict)
                     and binding.get("source_config_sha256")
-                    == hashlib.sha256(config_bytes).hexdigest()
+                    == hashlib.sha256(config_bytes).hexdigest(),
+                    "fast_manifest_sha256": isinstance(binding, dict)
                     and binding.get("fast_manifest_sha256")
-                    == hashlib.sha256(manifest_bytes).hexdigest()
-                ):
+                    == hashlib.sha256(manifest_bytes).hexdigest(),
+                }
+                if not all(identity_checks.values()):
+                    failed = ",".join(
+                        name for name, passed in identity_checks.items()
+                        if not passed)
                     raise ValueError(
-                        "Qwen4 virtual fast-tier source identity mismatch")
+                        "Qwen4 virtual fast-tier source identity mismatch: "
+                        f"{failed}")
                 for name in qwen4_virtual_names:
                     entry = manifest[name]
                     spec = qwen4_slices[name]

@@ -349,7 +349,9 @@ def test_qwen4_fast_tier_clone_rewrites_only_candidate_bytes(
     assert fast_tier.validate_qwen4_fast_tier(
         released, source_tier)["verdict"] == "PASS"
 
-    store = WeightStore(candidate, fast_dirs=[candidate_tier])
+    candidate_alias = tmp_path / "candidate-alias"
+    candidate_alias.symlink_to(candidate, target_is_directory=True)
+    store = WeightStore(candidate_alias, fast_dirs=[candidate_tier])
     values, _seconds, nbytes = store.fetch([changed_name])
     actual = np.ascontiguousarray(_bits(values[changed_name])).tobytes()
     with shard.open("rb") as source:
