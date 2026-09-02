@@ -5,6 +5,7 @@ notes:
   - "Extends the isolated compact-MLA/coalesced-expert rung and changes only the layer-stationary outer tile width from 32 to 128. The 512-row expert gather ceiling remains independently bounded."
   - "The larger outer shape reduces Python/materialization/router overhead but can change mHC, attention-residual, and routed GEMM arithmetic boundaries. It is explicitly E-class/default-off even when finite output hashes agree."
   - "Require the deterministic medium gate first. Promote to sustained-output, Plex/tool, vision, varied-shape, and untouched-capture gates only if wall and pressure both improve without a quality regression."
+  - "Rejected on the deterministic 2,123-input/max-1 gate despite the matching output hash: wall 359.508 seconds versus 356.628 at tile 32, peak 3.291GB versus 3.167GB, and swap-out growth 22.921MB versus 16.122MB. Keep only as an explicit negative result."
 extends:
   - glm53-flash-e-compact-mla-coalesced-batch8
 settings:

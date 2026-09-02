@@ -318,6 +318,7 @@ def test_exact_next_expert_batch_fetch_overlaps_current_batch_consumer():
         _expert_batch_prefetch_submitted = 0
         _expert_batch_prefetch_wait_s = 0.0
         _expert_batch_prefetch_hidden_s = 0.0
+        _expert_batch_prefetch_max_futures = 0
 
         def _record_expert_route(self, *_args, **_kwargs):
             pass
@@ -358,6 +359,54 @@ def test_exact_next_expert_batch_fetch_overlaps_current_batch_consumer():
         (0, "page-0"), (1, "page-1"), (2, "page-2")]
     assert engine._expert_batch_prefetch_submitted == 3
     assert engine._expert_batch_prefetch_hidden_s > 0
+
+
+def test_exact_expert_batch_prefetch_depth_two_queues_two_ordered_futures():
+    import concurrent.futures as cf
+    from types import SimpleNamespace
+
+    from runtime.engine import StreamingEngine
+
+    consumed = []
+
+    class FakeEngine:
+        rc = SimpleNamespace(
+            expert_fetch_batch=1,
+            decode_expert_fetch_batch=0,
+            expert_batch_prefetch_depth=2,
+        )
+        governor = None
+        _expert_compute_batches = 0
+        _max_experts_per_compute_batch = 0
+        _adaptive_expert_batch_clamps = 0
+        _min_adaptive_expert_batch = 0
+        _expert_batch_prefetch_submitted = 0
+        _expert_batch_prefetch_wait_s = 0.0
+        _expert_batch_prefetch_hidden_s = 0.0
+        _expert_batch_prefetch_max_futures = 0
+
+        def _record_expert_route(self, *_args, **_kwargs):
+            pass
+
+        def _fetch_experts(self, _layer, expert_ids):
+            return {expert: f"page-{expert}" for expert in expert_ids}
+
+    engine = FakeEngine()
+    engine._expert_batch_executor = cf.ThreadPoolExecutor(max_workers=1)
+    try:
+        batches = StreamingEngine._iter_expert_batches(
+            engine, 4, [0, 1, 2],
+            positions={0: [0], 1: [1], 2: [2]})
+        assert engine._expert_batch_prefetch_submitted == 2
+        for batch_ids, pages in batches:
+            consumed.extend((expert, pages[expert]) for expert in batch_ids)
+    finally:
+        engine._expert_batch_executor.shutdown(
+            wait=True, cancel_futures=True)
+
+    assert consumed == [(0, "page-0"), (1, "page-1"), (2, "page-2")]
+    assert engine._expert_batch_prefetch_submitted == 3
+    assert engine._expert_batch_prefetch_max_futures == 2
 
 
 def test_k25_layer_page_estimate_distinguishes_dense_and_sparse_pages():

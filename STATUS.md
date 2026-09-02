@@ -37,6 +37,17 @@ reassociate arithmetic, the one-token witness is not an intelligence gate,
 and the strict 16MB pressure line was missed narrowly. New content-blind route
 occupancy/GEMM-fill telemetry is now exposed for the next bound and long gate.
 
+The follow-on tile-128 isolation is rejected. It preserved the same request
+and output hashes, but wall regressed 356.628 -> 359.508 seconds, MLP regressed
+284.828 -> 293.636 seconds, peak Metal rose 3.167 -> 3.291GB, and physical
+swap-out grew 22.921MB. Although mHC pre/post and attention became faster, the
+larger routed shape exposed 217.489 seconds of expert-I/O wait and hid only
+68.620 seconds. Occupancy showed 713,328 route assignments, 11,558 coalesced
+GEMMs, only two completely full 512-row chunks, and a hottest-expert fan-in of
+1,122 rows. Keep tile 32. The next explicit rung instead retains its arithmetic
+shape and queues two exact future storage batches on the same ordered worker;
+this is a lossless scheduling change relative to the already E-class parent.
+
 ## 2026-09-02: Qwen Flash abliterated overlay runs; new exact GLM schedules are isolated
 
 The pinned `windowsxp811203/Qwen3.8-Flash-Next-Abliterated` revision

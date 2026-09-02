@@ -1,0 +1,11 @@
+schema: voom.runtime-profile.v1
+name: glm53-flash-e-compact-mla-coalesced-prefetch2
+description: Explicit GLM-5.3-Flash compact/coalesced rung with two ordered future expert reads.
+notes:
+  - "Extends the tile-32 compact/coalesced winner and changes only the authoritative expert-I/O pipeline depth from one future batch to two. One disk worker preserves fetch order; routes, released pages, per-expert compute, and ascending accumulation order are unchanged."
+  - "Depth two is a lossless scheduling technique relative to this already E-class parent, but can retain one additional exact eight-page storage batch. The governor and 8.5GB hard cap remain authoritative."
+  - "The 2,123-token depth-one gate exposed 169.195 seconds of expert-I/O wait after coalescing reduced MLP compute. Require identical output/state, lower wait/wall, and bounded peak/swap before any longer gate."
+extends:
+  - glm53-flash-e-compact-mla-coalesced-batch8
+settings:
+  VMODEL_GLM53_EXPERT_BATCH_PREFETCH_DEPTH: 2

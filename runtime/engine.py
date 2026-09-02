@@ -16,6 +16,7 @@ prefetch:
 from __future__ import annotations
 
 import concurrent.futures as cf
+from collections import deque
 import time
 import math
 import re
@@ -1337,6 +1338,11 @@ class RuntimeConfig:
     # while Metal consumes batch N. This predicts no routes and never changes
     # their order; the only extra residency is one governor-admitted batch.
     expert_batch_prefetch: bool = False
+    # Number of authoritative future storage batches queued on the single
+    # expert-I/O worker. One is the proven baseline; a larger explicit depth
+    # can hide storage exposed by faster/coalesced expert compute while keeping
+    # routes, fetch order, and arithmetic order unchanged.
+    expert_batch_prefetch_depth: int = 1
     # Explicit measurement-only route analysis. Reconstruct adjacent-position
     # expert sets from the authoritative router output to quantify cache reuse
     # and speculative multi-position union growth. Disabled by default because
@@ -1576,6 +1582,8 @@ class RuntimeConfig:
             expert_compute_batch=run.get("expert_compute_batch", 0),
             decode_expert_fetch_batch=run.get("decode_expert_fetch_batch", 0),
             expert_batch_prefetch=run.get("expert_batch_prefetch", False),
+            expert_batch_prefetch_depth=run.get(
+                "expert_batch_prefetch_depth", 1),
             expert_route_overlap_telemetry=run.get(
                 "expert_route_overlap_telemetry", False
             ),
@@ -2690,6 +2698,7 @@ class StreamingEngine:
         self._expert_batch_prefetch_submitted = 0
         self._expert_batch_prefetch_wait_s = 0.0
         self._expert_batch_prefetch_hidden_s = 0.0
+        self._expert_batch_prefetch_max_futures = 0
         self._expert_shared_overlap_layers = 0
         self._resident_fast_decode_sweeps = 0
         self._resident_fast_prefill_sweeps = 0
@@ -2829,8 +2838,9 @@ class StreamingEngine:
             else None
         )
         # Separate from the trunk prefetch queue: this worker carries only the
-        # next authoritative routed batch and is awaited before that batch can
-        # execute. A persistent single worker avoids per-layer thread startup.
+        # next authoritative routed batches and is awaited before each batch can
+        # execute. A persistent single worker avoids per-layer thread startup;
+        # depth controls queued futures, not concurrent disk readers.
         self._expert_batch_executor = (
             cf.ThreadPoolExecutor(
                 max_workers=1, thread_name_prefix="vmodel-expert-batch")
@@ -5073,9 +5083,10 @@ class StreamingEngine:
 
         With ``expert_batch_prefetch``, the authoritative routed union is still
         divided in the same order and at the same live-governor boundary. The
-        exact batch-zero fetch is submitted before this method returns, and
-        batch N+1 runs while batch N computes. At most one future exists, so
-        residency remains bounded to the current and one successor batch.
+        exact leading fetches are submitted before this method returns, and
+        future batches run in order while the current batch computes. The
+        explicit depth bounds queued/resident successors; one remains the
+        default and previously proven schedule.
         """
         self._record_expert_route(layer, expert_ids, positions)
         position_union = {
@@ -5166,45 +5177,42 @@ class StreamingEngine:
 
             return synchronous_batches()
 
-        batch_ids, start = plan_batch(0)
-        first_future = executor.submit(timed_fetch, batch_ids)
-        self._expert_batch_prefetch_submitted += 1
+        prefetch_depth = max(1, int(getattr(
+            self.rc, "expert_batch_prefetch_depth", 1) or 1))
+        pending = deque()
+
+        def fill_pending(start: int) -> int:
+            while len(pending) < prefetch_depth and start < len(expert_ids):
+                queued_ids, start = plan_batch(start)
+                pending.append((
+                    queued_ids, executor.submit(timed_fetch, queued_ids)))
+                self._expert_batch_prefetch_submitted += 1
+                self._expert_batch_prefetch_max_futures = max(
+                    self._expert_batch_prefetch_max_futures, len(pending))
+            return start
+
+        start = fill_pending(0)
 
         def pipelined_batches():
-            current_ids = batch_ids
-            current_start = start
-            future = first_future
             try:
-                wait_started = time.perf_counter()
-                pages, fetch_s = future.result()
-                wait_s = time.perf_counter() - wait_started
-                self._expert_batch_prefetch_wait_s += wait_s
-                self._expert_batch_prefetch_hidden_s += max(
-                    0.0, fetch_s - wait_s)
-                future = None
-                while True:
-                    if current_start < len(expert_ids):
-                        next_ids, next_start = plan_batch(current_start)
-                        future = executor.submit(timed_fetch, next_ids)
-                        self._expert_batch_prefetch_submitted += 1
-                    yield from compute_chunks(current_ids, pages)
-                    # The consumer deletes its reference before resuming us.
-                    # Drop the producer's reference before awaiting successor.
-                    del pages
-                    if future is None:
-                        return
+                current_start = start
+                while pending:
+                    current_ids, future = pending.popleft()
+                    current_start = fill_pending(current_start)
                     wait_started = time.perf_counter()
                     pages, fetch_s = future.result()
                     wait_s = time.perf_counter() - wait_started
                     self._expert_batch_prefetch_wait_s += wait_s
                     self._expert_batch_prefetch_hidden_s += max(
                         0.0, fetch_s - wait_s)
-                    current_ids = next_ids
-                    current_start = next_start
-                    future = None
+                    yield from compute_chunks(current_ids, pages)
+                    # The consumer deletes its reference before resuming us.
+                    # Drop the producer's reference before advancing.
+                    del pages
             finally:
-                if future is not None:
+                for _batch_ids, future in pending:
                     future.cancel()
+                pending.clear()
 
         return pipelined_batches()
 
@@ -10216,6 +10224,7 @@ class StreamingEngine:
         self._expert_batch_prefetch_submitted = 0
         self._expert_batch_prefetch_wait_s = 0.0
         self._expert_batch_prefetch_hidden_s = 0.0
+        self._expert_batch_prefetch_max_futures = 0
         self._expert_shared_overlap_layers = 0
         self.expert_route_overlap_trace = []
         self._expert_route_last_by_layer = {}
@@ -12594,6 +12603,10 @@ class StreamingEngine:
             self._expert_batch_prefetch_wait_s)
         path_stats["expert_batch_prefetch_hidden_s"] = (
             self._expert_batch_prefetch_hidden_s)
+        path_stats["expert_batch_prefetch_depth"] = int(getattr(
+            self.rc, "expert_batch_prefetch_depth", 1))
+        path_stats["expert_batch_prefetch_max_futures"] = (
+            self._expert_batch_prefetch_max_futures)
         path_stats["expert_shared_overlap_layers"] = (
             self._expert_shared_overlap_layers)
         path_stats["qwen4_serial_verify_union_layers"] = (

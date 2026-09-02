@@ -10,5 +10,6 @@ notes:
 extends:
   - glm53-flash-e-compact-mla-prefetch-batch8
 settings:
+  VMODEL_GLM53_PREFILL_TILE_WIDTH: 32
   VMODEL_GLM53_COALESCED_EXPERT_POSITIONS: true
   VMODEL_GLM53_COALESCED_EXPERT_MAX_POSITIONS: 512

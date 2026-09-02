@@ -244,6 +244,17 @@ def test_builtin_profiles_resolve_complete_agent_group():
     assert "VMODEL_GLM53_SPARSE_FUSED_KV_INT8" not in (
         glm_compact_coalesced_settings)
 
+    glm_prefetch2_order, glm_prefetch2_settings = resolve_runtime_profiles(
+        ("glm53-flash-e-compact-mla-coalesced-prefetch2",), catalog)
+    assert glm_prefetch2_order[-2:] == (
+        "glm53-flash-e-compact-mla-coalesced-batch8",
+        "glm53-flash-e-compact-mla-coalesced-prefetch2",
+    )
+    assert glm_prefetch2_settings[
+        "VMODEL_GLM53_EXPERT_BATCH_PREFETCH_DEPTH"] == "2"
+    assert glm_prefetch2_settings[
+        "VMODEL_GLM53_PREFILL_TILE_WIDTH"] == "32"
+
     glm_compact_tile128_order, glm_compact_tile128_settings = (
         resolve_runtime_profiles(
             ("glm53-flash-e-compact-mla-coalesced-tile128",), catalog))

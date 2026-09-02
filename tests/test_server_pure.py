@@ -326,6 +326,8 @@ def test_vision_protocol_timing_exposes_qwen4_verifier_pipeline_and_q_calibratio
             "qwen4_qsa_pool_cache_bytes": 37_800_000,
             "expert_batch_prefetch": 1,
             "expert_batch_prefetch_submitted": 96,
+            "expert_batch_prefetch_depth": 2,
+            "expert_batch_prefetch_max_futures": 2,
             "expert_batch_prefetch_wait_s": 7.25,
             "expert_batch_prefetch_hidden_s": 8.25,
             "expert_compute_batches": 144,
@@ -355,6 +357,8 @@ def test_vision_protocol_timing_exposes_qwen4_verifier_pipeline_and_q_calibratio
     assert timing["qwen4_qsa_pool_cache_bytes"] == 37_800_000
     assert timing["expert_batch_prefetch"] == 1
     assert timing["expert_batch_prefetch_submitted"] == 96
+    assert timing["expert_batch_prefetch_depth"] == 2
+    assert timing["expert_batch_prefetch_max_futures"] == 2
     assert timing["expert_batch_prefetch_wait_s"] == 7.25
     assert timing["expert_batch_prefetch_hidden_s"] == 8.25
     assert timing["expert_compute_batches"] == 144
@@ -2721,6 +2725,8 @@ def test_glm53_hot_prompt_kv_is_opt_in_exact_and_in_engine_identity():
         ("VMODEL_GLM53_COALESCED_EXPERT_POSITIONS", "auto",
          "must be 0 or 1"),
         ("VMODEL_GLM53_EXPERT_BATCH_PREFETCH", "auto", "must be 0 or 1"),
+        ("VMODEL_GLM53_EXPERT_BATCH_PREFETCH_DEPTH", "4",
+         "must be in \\[1, 3\\]"),
         ("VMODEL_GLM53_EXPERT_FETCH_BATCH", "9", "must be in \\[1, 8\\]"),
         ("VMODEL_GLM53_TRUNK_PREFETCH_DEPTH", "3", "must be in \\[0, 2\\]"),
         ("VMODEL_GLM53_TRUNK_PREFETCH_WORKERS", "0", "must be in \\[1, 2\\]"),
@@ -2813,6 +2819,7 @@ def test_glm53_expert_storage_batch_and_pipeline_are_explicit_identity():
         "VMODEL_GLM53_MTP": "0",
         "VMODEL_GLM53_EXPERT_FETCH_BATCH": "1",
         "VMODEL_GLM53_EXPERT_BATCH_PREFETCH": "0",
+        "VMODEL_GLM53_EXPERT_BATCH_PREFETCH_DEPTH": "1",
         "VMODEL_GLM53_TRUNK_PREFETCH_DEPTH": "0",
         "VMODEL_GLM53_TRUNK_PREFETCH_WORKERS": "1",
     }
@@ -2825,6 +2832,7 @@ def test_glm53_expert_storage_batch_and_pipeline_are_explicit_identity():
         manager.get(Path("/tmp/fake-glm53-expert-pipeline"), "lossless")
         os.environ["VMODEL_GLM53_EXPERT_FETCH_BATCH"] = "8"
         os.environ["VMODEL_GLM53_EXPERT_BATCH_PREFETCH"] = "1"
+        os.environ["VMODEL_GLM53_EXPERT_BATCH_PREFETCH_DEPTH"] = "2"
         os.environ["VMODEL_GLM53_TRUNK_PREFETCH_DEPTH"] = "1"
         os.environ["VMODEL_GLM53_TRUNK_PREFETCH_WORKERS"] = "2"
         manager.get(Path("/tmp/fake-glm53-expert-pipeline"), "lossless")
@@ -2833,11 +2841,13 @@ def test_glm53_expert_storage_batch_and_pipeline_are_explicit_identity():
     baseline, candidate = captured
     assert baseline.expert_fetch_batch == 1
     assert not baseline.expert_batch_prefetch
+    assert baseline.expert_batch_prefetch_depth == 1
     assert baseline.expert_compute_batch == 1
     assert baseline.prefetch_depth == 0
     assert baseline.prefetch_workers == 1
     assert candidate.expert_fetch_batch == 8
     assert candidate.expert_batch_prefetch
+    assert candidate.expert_batch_prefetch_depth == 2
     assert candidate.prefetch_depth == 1
     assert candidate.prefetch_workers == 2
     # Storage grouping never changes the verified arithmetic grouping.
