@@ -75,7 +75,7 @@ def _parse_sse_comment_progress(line: str) -> tuple[str, int, int] | None:
     if not line.startswith(": "):
         return None
     parts = line[2:].split()
-    if len(parts) != 2 or "/" not in parts[1]:
+    if len(parts) < 2 or "/" not in parts[1]:
         return None
     label = parts[0]
     if label not in (
@@ -90,6 +90,33 @@ def _parse_sse_comment_progress(line: str) -> tuple[str, int, int] | None:
     if completed < 0 or total <= 0 or completed > total:
         return None
     return label, completed, total
+
+
+def _parse_sse_comment_retry_metadata(line: str) -> dict[str, object]:
+    """Parse the allowlisted, content-free suffix on a retry comment."""
+    if not line.startswith(": memory_retry "):
+        return {}
+    allowed_strings = {"retry_reason", "retry_subphase"}
+    allowed_ints = {
+        "retry_layer", "retry_completed_tokens",
+        "retry_observed_metal_bytes", "retry_metal_limit_bytes",
+        "retry_chunk", "retry_coalesced_expert_max_positions",
+    }
+    result: dict[str, object] = {}
+    for part in line[2:].split()[2:]:
+        if "=" not in part:
+            continue
+        key, value = part.split("=", 1)
+        if key in allowed_strings and value.replace("_", "").isalnum():
+            result[key] = value
+        elif key in allowed_ints:
+            try:
+                parsed = int(value)
+            except ValueError:
+                continue
+            if parsed >= 0:
+                result[key] = parsed
+    return result
 
 DEFERRED_ACTION_TURNS = [
     {"role": "user", "content": "Tell me a joke about Node.js."},
@@ -443,6 +470,9 @@ def _post(
                                     time.perf_counter() - started, 4),
                                 "transport": "sse_comment",
                             }
+                            if label == "memory_retry":
+                                item.update(
+                                    _parse_sse_comment_retry_metadata(line))
                             progress.append(item)
                             if print_progress:
                                 print(
@@ -474,7 +504,12 @@ def _post(
                                 "cache_source", "diagnostic", "subphase",
                                 "layer", "completed_tokens",
                                 "active_metal_bytes", "peak_metal_bytes",
-                                "host_spool_bytes", "metal_limit_bytes")
+                                "host_spool_bytes", "metal_limit_bytes",
+                                "retry_reason", "retry_subphase",
+                                "retry_layer", "retry_completed_tokens",
+                                "retry_observed_metal_bytes",
+                                "retry_metal_limit_bytes", "retry_chunk",
+                                "retry_coalesced_expert_max_positions")
                         })
                         if event.get("phase") == "memory_retry" \
                                 and fail_on_memory_retry:

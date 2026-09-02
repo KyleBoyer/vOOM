@@ -240,6 +240,51 @@ def test_memory_retry_replays_unsampled_prefill_on_lower_rungs():
     assert engine._hybrid_retry_chunk_ceiling == 0
 
 
+def test_memory_retry_publishes_sanitized_hard_cap_diagnostic():
+    from runtime.engine import StreamingEngine
+
+    engine = _bare_engine("glm5_next", hot_kv_persist=None,
+                          hot_prompt_kv_chunk_size=32)
+    engine.rc.prefill_chunk_size = 32
+    engine.rc.layer_stationary_prefill = True
+    progress = []
+    attempts = []
+
+    def generate(*_args, **_kwargs):
+        attempts.append(True)
+        engine._generation_sampled_tokens = 0
+        if len(attempts) == 1:
+            raise MemoryError(
+                "GLM-5.3 layer-stationary prefill crossed its hard Metal "
+                "cap: phase=attention_tile layer=3 tokens=24160 "
+                "observed=8501319252 limit=8500000000")
+        return {
+            "prefill_s": 1.0, "first_token_s": 1.5, "total_s": 2.0,
+            "path_stats": {},
+        }
+
+    engine.generate = generate
+    engine.discard_failed_request_state = lambda: None
+    with (patch("runtime.engine.mx.clear_cache"),
+          patch("runtime.engine.mx.reset_peak_memory")):
+        StreamingEngine.generate_with_memory_retry(
+            engine, "prompt", on_progress=progress.append)
+
+    assert progress[0] == {
+        "phase": "memory_retry",
+        "completed_retries": 1,
+        "total_retries": 5,
+        "retry_chunk": 8,
+        "retry_coalesced_expert_max_positions": 0,
+        "retry_reason": "hard_metal_cap",
+        "retry_subphase": "attention_tile",
+        "retry_layer": 3,
+        "retry_completed_tokens": 24160,
+        "retry_observed_metal_bytes": 8501319252,
+        "retry_metal_limit_bytes": 8500000000,
+    }
+
+
 def test_memory_retry_never_replays_after_sampling_started():
     from runtime.engine import StreamingEngine
 

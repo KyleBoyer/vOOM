@@ -18,6 +18,7 @@ from __future__ import annotations
 import concurrent.futures as cf
 import time
 import math
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -50,6 +51,32 @@ QWEN35_PREFILL_CHUNK_CEILINGS = frozenset((0, 1, 8, 32, 128, 512))
 # Keep it implementation-stable and explicit until a wider corpus justifies
 # either a tunable policy or a default-on profile.
 QWEN35_PHASE_HEAD_MIN_PROMPT_TOKENS = 8192
+
+
+_MEMORY_RETRY_HARD_CAP_RE = re.compile(
+    r"hard Metal cap: phase=(?P<subphase>[a-zA-Z0-9_-]+) "
+    r"layer=(?P<layer>\d+) tokens=(?P<tokens>\d+) "
+    r"observed=(?P<observed>\d+) limit=(?P<limit>\d+)")
+
+
+def _memory_retry_diagnostic(error: MemoryError) -> dict[str, object]:
+    """Return only content-free fields from a known memory refusal.
+
+    Exception text stays inside the engine because it may grow contextual
+    details later. The strict pattern admits only the operator phase label
+    and integers already produced by the hard-cap guards.
+    """
+    match = _MEMORY_RETRY_HARD_CAP_RE.search(str(error))
+    if match is None:
+        return {}
+    return {
+        "retry_reason": "hard_metal_cap",
+        "retry_subphase": match.group("subphase"),
+        "retry_layer": int(match.group("layer")),
+        "retry_completed_tokens": int(match.group("tokens")),
+        "retry_observed_metal_bytes": int(match.group("observed")),
+        "retry_metal_limit_bytes": int(match.group("limit")),
+    }
 
 
 def qwen35_phase_head_request_active(
@@ -13040,14 +13067,17 @@ class StreamingEngine:
                                     False))
                             ) else 0
                         )
-                        on_progress({
+                        retry_progress = {
                             "phase": "memory_retry",
                             "completed_retries": retry_count,
                             "total_retries": retry_total,
                             "retry_chunk": next_chunk,
                             "retry_coalesced_expert_max_positions": (
                                 next_coalesced_limit),
-                        })
+                        }
+                        retry_progress.update(
+                            _memory_retry_diagnostic(error))
+                        on_progress(retry_progress)
                     self.discard_failed_request_state()
                     if next_coalesced_limit:
                         self.rc.glm53_coalesced_expert_max_positions = (

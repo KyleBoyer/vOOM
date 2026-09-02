@@ -129,9 +129,15 @@ exact 300.530GB read count. Wall fell 583.754 -> **441.689 seconds** (-24.34%)
 versus batch 1, and 753.260 -> 441.689 seconds (-41.36%) versus serialized
 control. Submissions fell 11,435 -> 1,448, hidden service increased 215.573 ->
 256.396 seconds, wait fell 109.733 -> 31.950 seconds, peak changed by only
-16KB, and swap-out growth improved 1.77MB. Batch 8 is now the preferred
-explicit lossless Flash prefill route; captured-harness and Plex gates remain
-before any default. The full-model prefetch and DSA preallocation profiles
+16KB, and swap-out growth improved 1.77MB. The untouched 46,849-token/134-tool
+capture then rejected batch 8 before layer 3's attention tile completed at
+token 24,160: observed Metal reached 8,501,319,252 bytes against the hard
+8.5GB cap and triggered fail-fast retry after **730.041 seconds**. Post-failure
+availability was 3.32GB and swap-out growth was 34.75MB. Batch 8 remains the
+preferred explicit short/medium-context Flash route, but is rejected for this
+long shape; batch 1 is the next lower-residency exact captured-harness rung.
+Plex remains required before any default. The full-model prefetch and DSA
+preallocation profiles
 also now have a composed deterministic gate. On the official full GLM-5.3
 checkpoint, `glm53-full-lossless-preallocate-prefetch-batch8` preserved the
 2,123-input request hash, greedy output SHA `d12fe7f...68f7c4`, and exact

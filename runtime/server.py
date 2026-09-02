@@ -12507,9 +12507,33 @@ class Handler(BaseHTTPRequestHandler):
                         retry_chunk=progress.get("retry_chunk"),
                         retry_coalesced_expert_max_positions=progress.get(
                             "retry_coalesced_expert_max_positions"),
+                        retry_reason=progress.get("retry_reason"),
+                        retry_subphase=progress.get("retry_subphase"),
+                        retry_layer=progress.get("retry_layer"),
+                        retry_completed_tokens=progress.get(
+                            "retry_completed_tokens"),
+                        retry_observed_metal_bytes=progress.get(
+                            "retry_observed_metal_bytes"),
+                        retry_metal_limit_bytes=progress.get(
+                            "retry_metal_limit_bytes"),
                     )
                 else:
-                    self.wfile.write(f": {label} {done}/{total}\n\n".encode())
+                    suffix = ""
+                    if label == "memory_retry":
+                        fields = []
+                        for key in (
+                                "retry_reason", "retry_subphase",
+                                "retry_layer", "retry_completed_tokens",
+                                "retry_observed_metal_bytes",
+                                "retry_metal_limit_bytes", "retry_chunk",
+                                "retry_coalesced_expert_max_positions"):
+                            value = progress.get(key)
+                            if value is not None and value != "":
+                                fields.append(f"{key}={value}")
+                        if fields:
+                            suffix = " " + " ".join(fields)
+                    self.wfile.write(
+                        f": {label} {done}/{total}{suffix}\n\n".encode())
                     self.wfile.flush()
             except (BrokenPipeError, ConnectionResetError):
                 print("[server] !! client disconnected during prefill", flush=True)

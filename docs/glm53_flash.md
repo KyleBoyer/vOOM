@@ -274,7 +274,13 @@ On the deterministic 2,123-input/max-1 HTTP gate, request/output hashes and the
 prefetch. Grouped submissions fell 11,435 to 1,448, hidden service rose to
 256.396 seconds, wait fell to 31.950 seconds, peak changed by only 16KB, and
 swap-out growth improved by 1.77MB. Batch 8 is the preferred explicit lossless
-prefill profile, still non-default pending captured-tool and Plex gates.
+short/medium-context prefill profile. The untouched 46,849-token/134-tool
+capture rejected it before layer 3's attention tile completed at token 24,160:
+observed Metal reached 8,501,319,252 bytes against the hard 8.5GB cap and
+triggered fail-fast retry after 730.041 seconds. Post-failure availability was
+3.32GB and swap-out growth was 34.75MB. It is therefore not a long-context
+profile; batch-1 prefetch is the next exact lower-residency captured-harness
+rung. Plex remains pending.
 
 The same storage grouping has a separate full GLM-5.3 composition with exact
 DSA index preallocation. On a deterministic 2,123-input/max-1 released-model
