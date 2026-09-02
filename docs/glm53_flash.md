@@ -296,8 +296,12 @@ projected 7.48GB against a 7.31GB ceiling. The recorded `memory_retry 1/4`
 stopped the request before replay. Batch 2 is the next pressure-reduced rung.
 Batch 2 then cleared layer 37 but failed at layer 49 after 1,991.985 seconds:
 4.29GB active plus the next 2.59GB reservation and 0.40GB margin projected
-7.28GB against a 7.25GB ceiling. Batch 1 is the final prefetch rung; a retry
-there returns the long-context profile to preallocation with prefetch off.
+7.28GB against a 7.25GB ceiling. Batch 1 cleared those boundaries but failed
+after layer 75 at 3,119.328 seconds: 4.38GB active plus the next 2.48GB
+attention reservation and 0.40GB margin projected 7.25GB against the 7.24GB
+live ceiling. Its artifact records 4.07GB available and 141.84MB physical
+swap-out growth. That exhausts the exact prefetch-width ladder for this shape;
+long context returns to preallocation with prefetch off.
 
 The same trace identified a host-side governor cost: 626 shrink steps released
 zero cache bytes. Named reversible reservations were repeatedly lowering an

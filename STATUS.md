@@ -158,9 +158,14 @@ available memory, and 55.97MB swap-out growth; no replay was allowed.
 again, but the fail-fast capture rejected it at layer 49 after 1,991.985
 seconds: 4.29GB active plus the next 2.59GB reservation and 0.40GB margin
 projected 7.28GB against a 7.25GB ceiling. The artifact records 4.15GB
-available memory and 113.80MB swap-out growth. Batch 1 is the final prefetch
-rung; if it retries, full-model long context keeps preallocation but disables
-expert prefetch. The new `memory_retry`
+available memory and 113.80MB swap-out growth. Batch 1 then cleared all prior
+boundaries but was rejected after layer 75 at **3,119.328 seconds**: 4.38GB
+active plus the next 2.48GB attention reservation and 0.40GB margin projected
+7.25GB against the 7.24GB live ceiling. Available memory was 4.07GB and
+physical swap-out growth was 141.84MB. All full-model expert-prefetch widths
+are therefore rejected for this 46,849-token shape. Long context keeps exact
+DSA preallocation with expert prefetch disabled; future work must reduce live
+attention/index residency or improve the no-prefetch schedule. The new `memory_retry`
 SSE instrumentation is therefore live-proven: the harness aborts and publishes
 a failed artifact before an unsafe multi-hour replay. No automatic defaults.
 

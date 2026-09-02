@@ -3,8 +3,8 @@ name: glm53-full-lossless-preallocate-prefetch-batch1
 description: Full GLM-5.3 exact DSA preallocation with one-page expert prefetch.
 notes:
   - "Extends exact DSA index preallocation and overlaps only one exact FP8 expert page with current one-expert compute. Released routing, matmuls, and ascending accumulation remain unchanged."
-  - "This is the final prefetch rung for the real 46,849-token capture: batch 8 failed after layer 7, batch 4 after layer 37, and batch 2 after layer 49. Batch 1 minimizes future-page residency; if it retries, long context falls back to exact preallocation with prefetch off."
-  - "Explicit pending the fail-fast no-memory-retry captured-harness gate."
+  - "Rejected for the real 46,849-token capture: batch 1 cleared the batch-8, batch-4, and batch-2 pressure boundaries but failed after layer 75 at 3,119.328s. Active memory was 4.38GB and the next 2.48GB attention reservation plus 0.40GB margin projected 7.25GB against the 7.24GB live ceiling."
+  - "Retained only to reproduce the exact short/medium-context scheduling experiment. Do not use for full-model long context; glm53-full-lossless-long-context keeps expert prefetch off."
 extends:
   - glm53-full-lossless-index-preallocate
 settings:
