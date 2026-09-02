@@ -221,10 +221,18 @@ def plan_command(args: argparse.Namespace) -> None:
     base_dir = args.base_dir.expanduser().resolve()
     if not base_dir.is_dir():
         raise ValueError(f"base checkpoint does not exist: {base_dir}")
-    if destination == base_dir or base_dir in destination.parents:
-        raise ValueError("overlay destination must be outside the base checkpoint")
+    if (destination == base_dir or base_dir in destination.parents
+            or destination in base_dir.parents):
+        raise ValueError(
+            "overlay destination and base checkpoint must not contain "
+            "one another")
+    if destination.exists() and not destination.is_dir():
+        raise ValueError(f"overlay destination is not a directory: {destination}")
     destination.mkdir(parents=True, exist_ok=True)
     plan_path = destination / PLAN_NAME
+    if not plan_path.exists() and any(destination.iterdir()):
+        raise ValueError(
+            "new overlay destination must be empty before planning")
     if plan_path.exists() and not args.resume:
         raise FileExistsError(f"overlay plan already exists: {plan_path}")
 

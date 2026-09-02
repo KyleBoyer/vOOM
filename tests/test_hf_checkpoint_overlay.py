@@ -11,6 +11,7 @@ from runtime.hf_checkpoint_overlay import (
     _hub_record,
     _safe_relative,
     build_plan,
+    plan_command,
 )
 
 
@@ -96,3 +97,24 @@ def test_model_metadata_requires_identical_config_and_tensor_map(tmp_path):
 
 def test_plan_name_is_hidden_from_model_loader():
     assert Path(PLAN_NAME).name.startswith(".")
+
+
+@pytest.mark.parametrize("destination_kind", ["inside", "contains"])
+def test_plan_rejects_destination_base_containment(tmp_path, destination_kind):
+    base = tmp_path / "base"
+    base.mkdir()
+    destination = base / "candidate" if destination_kind == "inside" else tmp_path
+    args = SimpleNamespace(base_dir=base, destination=destination)
+    with pytest.raises(ValueError, match="must not contain"):
+        plan_command(args)
+
+
+def test_plan_rejects_nonempty_new_destination(tmp_path):
+    base = tmp_path / "base"
+    destination = tmp_path / "candidate"
+    base.mkdir()
+    destination.mkdir()
+    (destination / "unrelated").write_text("preserve me")
+    args = SimpleNamespace(base_dir=base, destination=destination)
+    with pytest.raises(ValueError, match="must be empty"):
+        plan_command(args)
