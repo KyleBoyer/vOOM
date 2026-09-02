@@ -8,7 +8,11 @@ geometry, query widths 64, 128, and 256 all returned byte-identical stable
 candidate IDs. Width 64 was the measured winner: 0.05110 seconds per synthetic
 group, 207.1MB peak Metal, and a 37.4-second projected whole-prompt score phase,
 versus 39.8/39.3 seconds and 374/707MB for widths 128/256. A fresh real captured
-harness replay remains the promotion gate.
+harness replay remains the promotion gate. The first composed replay also
+exposed and rejected an unrelated outer-tile regression: tile 8 had not
+finished layer 0 after 222 seconds versus 49.9 seconds in the proven tile-32
+baseline, with healthy memory. The profile therefore keeps outer tile 32 and
+changes only the independently gated DSA query width.
 
 GLM-5.3-Flash's exact compiled KDA path has now completed the untouched
 46,849-token captured request. Wall time improved 2,778.144 -> **2,489.152
