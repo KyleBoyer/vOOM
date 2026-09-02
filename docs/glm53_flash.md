@@ -264,6 +264,18 @@ without changing released matmuls or ascending accumulation order; the live
 governor may only clamp the storage group downward. It is isolated as
 `glm53-flash-lossless-expert-prefetch-batch8` pending real gates.
 
+Those real gates now pass. On the 16-output full-state gate, batch 8 preserved
+all tokens, text, aggregate state, and each attention/DSA/recurrent/convolution/
+hidden hash while improving wall 368.970 to 351.396 seconds (-4.76%). Peak rose
+167.6MB and swap-out growth rose by 14.0MB but remained below the 32MB gate.
+On the deterministic 2,123-input/max-1 HTTP gate, request/output hashes and the
+300.530GB read count remained identical. Wall fell 583.754 to 441.689 seconds
+(-24.34%) versus batch 1 and 753.260 to 441.689 seconds (-41.36%) versus no
+prefetch. Grouped submissions fell 11,435 to 1,448, hidden service rose to
+256.396 seconds, wait fell to 31.950 seconds, peak changed by only 16KB, and
+swap-out growth improved by 1.77MB. Batch 8 is the preferred explicit lossless
+prefill profile, still non-default pending captured-tool and Plex gates.
+
 The same trace identified a host-side governor cost: 626 shrink steps released
 zero cache bytes. Named reversible reservations were repeatedly lowering an
 already-empty cache limit, clearing MLX, then restoring the ineffective cut.

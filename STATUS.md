@@ -120,8 +120,19 @@ swap-out growth 50.348 -> 44.581MB. The profile is the preferred explicit
 lossless Flash prefill route, but remains non-default pending real tool/harness
 and Plex shapes. `glm53-flash-lossless-expert-prefetch-batch8` is the next
 explicit rung: it groups eight exact pages per storage fetch while retaining
-one-expert released arithmetic. The full-model prefetch and DSA preallocation
-profiles also remain unpromoted pending real gates.
+one-expert released arithmetic. It has now passed both gates. On 16 outputs,
+every token and aggregate/component state hash matched batch 1 while wall fell
+368.970 -> **351.396 seconds** (-4.76%); peak rose 167.6MB and physical
+swap-out growth rose 14.0MB but remained under 32MB. On the deterministic
+2,123-input/max-1 HTTP gate it again preserved the request/output hashes and
+exact 300.530GB read count. Wall fell 583.754 -> **441.689 seconds** (-24.34%)
+versus batch 1, and 753.260 -> 441.689 seconds (-41.36%) versus serialized
+control. Submissions fell 11,435 -> 1,448, hidden service increased 215.573 ->
+256.396 seconds, wait fell 109.733 -> 31.950 seconds, peak changed by only
+16KB, and swap-out growth improved 1.77MB. Batch 8 is now the preferred
+explicit lossless Flash prefill route; captured-harness and Plex gates remain
+before any default. The full-model prefetch and DSA preallocation profiles
+also remain unpromoted pending real gates.
 
 The compiled GLM-5.3-Flash KDA graph now accepts an identity-bound segment
 length of 16/32/64/128 positions. At released H64/D128/L128 geometry, every
