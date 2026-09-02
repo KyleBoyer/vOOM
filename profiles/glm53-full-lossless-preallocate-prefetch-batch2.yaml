@@ -1,0 +1,12 @@
+schema: voom.runtime-profile.v1
+name: glm53-full-lossless-preallocate-prefetch-batch2
+description: Full GLM-5.3 exact preallocation and two-page expert-prefetch long-context candidate.
+notes:
+  - "Extends exact DSA index preallocation and groups at most two exact FP8 expert pages per future storage read. expert_compute_batch remains one and released ascending accumulation is unchanged."
+  - "Batch 8 failed the real 46,849-token capture after layer 7; batch 4 cleared that boundary but failed at layer 37 with 4.48GB active and a 7.48GB projected reservation against a 7.31GB live ceiling. Batch 2 halves future-page residency again."
+  - "Explicit pending the fail-fast no-memory-retry captured-harness gate. Any retry rejects the profile before replay."
+extends:
+  - glm53-full-lossless-index-preallocate
+settings:
+  VMODEL_GLM53_EXPERT_FETCH_BATCH: 2
+  VMODEL_GLM53_EXPERT_BATCH_PREFETCH: true

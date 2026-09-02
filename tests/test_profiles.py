@@ -303,6 +303,21 @@ def test_builtin_profiles_resolve_complete_agent_group():
     assert glm_full_batch4_settings[
         "VMODEL_GLM53_EXPERT_BATCH_PREFETCH"] == "1"
 
+    glm_full_batch2_order, glm_full_batch2_settings = (
+        resolve_runtime_profiles(
+            ("glm53-full-lossless-preallocate-prefetch-batch2",), catalog))
+    assert glm_full_batch2_order == (
+        "glm53-full-lossless-long-context",
+        "glm53-full-lossless-index-preallocate",
+        "glm53-full-lossless-preallocate-prefetch-batch2",
+    )
+    assert glm_full_batch2_settings[
+        "VMODEL_GLM_DSA_INDEX_PREALLOCATE"] == "1"
+    assert glm_full_batch2_settings[
+        "VMODEL_GLM53_EXPERT_FETCH_BATCH"] == "2"
+    assert glm_full_batch2_settings[
+        "VMODEL_GLM53_EXPERT_BATCH_PREFETCH"] == "1"
+
     glm_full_prefetch_order, glm_full_prefetch_settings = (
         resolve_runtime_profiles(
             ("glm53-full-lossless-expert-prefetch",), catalog))

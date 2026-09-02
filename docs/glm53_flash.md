@@ -289,7 +289,11 @@ explicit short/medium-context full-model schedule. The real 46,849-token /
 next 2.50GB attention reservation and 0.40GB margin projected 7.60GB against a
 7.58GB live ceiling. The runtime correctly triggered a tile-8 replay, which is
 already known to be catastrophically slow, so the run was stopped. A batch-4
-profile halves the future storage group for the next long-context gate.
+profile halved the future storage group and cleared the early boundary, but a
+fail-fast capture rejected it at layer 37 after 1,562.664 seconds. Active memory
+was 4.48GB and the next 2.59GB attention reservation plus 0.40GB margin
+projected 7.48GB against a 7.31GB ceiling. The recorded `memory_retry 1/4`
+stopped the request before replay. Batch 2 is the next pressure-reduced rung.
 
 The same trace identified a host-side governor cost: 626 shrink steps released
 zero cache bytes. Named reversible reservations were repeatedly lowering an

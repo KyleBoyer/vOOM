@@ -149,9 +149,15 @@ refused it and began the previously rejected tile-8 full replay, so the run was
 stopped rather than misreported as a win. Batch 8 is no longer the long-context
 candidate. `glm53-full-lossless-preallocate-prefetch-batch4` halves the future
 storage group while retaining one-expert arithmetic and is the next explicit
-no-retry gate. New `memory_retry` SSE instrumentation lets the harness abort
-and publish a failed artifact before an unsafe multi-hour replay. No automatic
-default changes.
+no-retry gate. It cleared batch 8's early failure, but the fail-fast capture
+rejected it at layer 37 after 1,562.664 seconds: active memory was 4.48GB and
+the next 2.59GB attention reservation plus 0.40GB margin projected 7.48GB
+against a 7.31GB live ceiling. The artifact records `memory_retry 1/4`, 4.02GB
+available memory, and 55.97MB swap-out growth; no replay was allowed.
+`glm53-full-lossless-preallocate-prefetch-batch2` halves future-page residency
+again and is the next explicit long-context candidate. The new `memory_retry`
+SSE instrumentation is therefore live-proven: the harness aborts and publishes
+a failed artifact before an unsafe multi-hour replay. No automatic defaults.
 
 The compiled GLM-5.3-Flash KDA graph now accepts an identity-bound segment
 length of 16/32/64/128 positions. At released H64/D128/L128 geometry, every
