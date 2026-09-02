@@ -4,7 +4,7 @@ description: Full GLM-5.3 exact preallocation and two-page expert-prefetch long-
 notes:
   - "Extends exact DSA index preallocation and groups at most two exact FP8 expert pages per future storage read. expert_compute_batch remains one and released ascending accumulation is unchanged."
   - "Batch 8 failed the real 46,849-token capture after layer 7; batch 4 cleared that boundary but failed at layer 37 with 4.48GB active and a 7.48GB projected reservation against a 7.31GB live ceiling. Batch 2 halves future-page residency again."
-  - "Explicit pending the fail-fast no-memory-retry captured-harness gate. Any retry rejects the profile before replay."
+  - "Rejected by the fail-fast real capture at layer 49 after 1,991.985s. Active memory was 4.29GB; the next 2.59GB attention reservation plus 0.40GB margin projected 7.28GB against a 7.25GB live ceiling. The artifact records memory_retry 1/4, 4.15GB available, and 113.80MB swap-out growth. Batch 1 is the final long-context prefetch rung."
 extends:
   - glm53-full-lossless-index-preallocate
 settings:

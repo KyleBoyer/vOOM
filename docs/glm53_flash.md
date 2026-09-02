@@ -294,6 +294,10 @@ fail-fast capture rejected it at layer 37 after 1,562.664 seconds. Active memory
 was 4.48GB and the next 2.59GB attention reservation plus 0.40GB margin
 projected 7.48GB against a 7.31GB ceiling. The recorded `memory_retry 1/4`
 stopped the request before replay. Batch 2 is the next pressure-reduced rung.
+Batch 2 then cleared layer 37 but failed at layer 49 after 1,991.985 seconds:
+4.29GB active plus the next 2.59GB reservation and 0.40GB margin projected
+7.28GB against a 7.25GB ceiling. Batch 1 is the final prefetch rung; a retry
+there returns the long-context profile to preallocation with prefetch off.
 
 The same trace identified a host-side governor cost: 626 shrink steps released
 zero cache bytes. Named reversible reservations were repeatedly lowering an

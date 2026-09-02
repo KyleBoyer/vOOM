@@ -155,7 +155,12 @@ the next 2.59GB attention reservation plus 0.40GB margin projected 7.48GB
 against a 7.31GB live ceiling. The artifact records `memory_retry 1/4`, 4.02GB
 available memory, and 55.97MB swap-out growth; no replay was allowed.
 `glm53-full-lossless-preallocate-prefetch-batch2` halves future-page residency
-again and is the next explicit long-context candidate. The new `memory_retry`
+again, but the fail-fast capture rejected it at layer 49 after 1,991.985
+seconds: 4.29GB active plus the next 2.59GB reservation and 0.40GB margin
+projected 7.28GB against a 7.25GB ceiling. The artifact records 4.15GB
+available memory and 113.80MB swap-out growth. Batch 1 is the final prefetch
+rung; if it retries, full-model long context keeps preallocation but disables
+expert prefetch. The new `memory_retry`
 SSE instrumentation is therefore live-proven: the harness aborts and publishes
 a failed artifact before an unsafe multi-hour replay. No automatic defaults.
 
