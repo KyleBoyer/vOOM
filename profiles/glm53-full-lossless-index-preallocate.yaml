@@ -1,0 +1,11 @@
+schema: voom.runtime-profile.v1
+name: glm53-full-lossless-index-preallocate
+description: Explicit lossless full GLM-5.3 index-key capacity preallocation experiment.
+notes:
+  - "Extends the measured released-weight long-context profile and changes only the index-key backing allocation schedule. Values, released dtypes, RoPE positions, logical cache lengths, selector arithmetic, and model weights are unchanged."
+  - "The known final request length sizes each full indexer layer on its first tile, replacing repeated 1,024-row growth and prefix copies with one allocation. Telemetry must show one grow per full layer and zero copied rows on a fresh prefill."
+  - "Explicit until the untouched captured replay proves a wall-time gain and passes the existing Metal, availability, and swap-growth gates."
+extends:
+  - glm53-full-lossless-long-context
+settings:
+  VMODEL_GLM_DSA_INDEX_PREALLOCATE: true

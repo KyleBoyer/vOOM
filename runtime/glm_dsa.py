@@ -46,6 +46,7 @@ class DSAState:
     def __init__(
         self, cfg: ModelConfig, *, key_tile_size: int = 256,
         index_step_size: int = 0, selection_query_tile_size: int = 0,
+        index_preallocate: bool = False,
         selection_spill_dir: str = "",
     ):
         if key_tile_size <= 0:
@@ -59,6 +60,8 @@ class DSAState:
         self.key_tile_size = int(key_tile_size)
         self.index_step_size = int(index_step_size)
         self.selection_query_tile_size = int(selection_query_tile_size)
+        self.index_preallocate = bool(index_preallocate)
+        self._index_capacity_hint = 0
         self.selection_spill_dir = (
             Path(selection_spill_dir).expanduser().resolve()
             if selection_spill_dir else None)
@@ -103,6 +106,8 @@ class DSAState:
             "preselection_queries": 0,
             "preselection_attention_ranges": 0,
             "index_capacity_grows": 0,
+            "index_capacity_preallocations": 0,
+            "index_capacity_preallocated_rows": 0,
             "index_rows_copied": 0,
             "index_rows_appended": 0,
             "index_capacity_rows_peak": 0,
@@ -135,6 +140,7 @@ class DSAState:
             key_tile_size=self.key_tile_size,
             index_step_size=self.index_step_size,
             selection_query_tile_size=self.selection_query_tile_size,
+            index_preallocate=self.index_preallocate,
             selection_spill_dir=(
                 str(self.selection_spill_dir)
                 if self.selection_spill_dir is not None else ""),
@@ -165,7 +171,23 @@ class DSAState:
         branch.selection_ranges = dict(self.selection_ranges)
         branch.dense_ranges = set(self.dense_ranges)
         branch.stats = dict(self.stats)
+        branch._index_capacity_hint = self._index_capacity_hint
         return branch
+
+    def set_index_capacity_hint(self, end: int) -> None:
+        """Publish a content-independent upper bound for this request sweep.
+
+        Layer-stationary prefill knows its final absolute position before the
+        first index-key tile is observed.  Each full indexer layer can therefore
+        allocate the same stepped capacity it would eventually reach, once,
+        instead of copying its complete prefix on every 1,024-row growth.  The
+        hint changes only backing allocation; ``k_idx`` continues to expose
+        exactly the initialized logical prefix.
+        """
+        end = int(end)
+        if end < 0:
+            raise ValueError("DSA index capacity hint must be non-negative")
+        self._index_capacity_hint = max(self._index_capacity_hint, end)
 
     def clear_selections(self) -> None:
         """Release full-layer query selections after all IndexShare users."""
@@ -410,9 +432,15 @@ class DSAState:
             end = int(offset) + incoming
             backing = self._k_idx_capacity.get(layer)
             if backing is None or int(backing.shape[1]) < end:
-                target = (
+                ordinary_target = (
                     (end + self.index_step_size - 1)
                     // self.index_step_size * self.index_step_size)
+                hinted_target = ordinary_target
+                if self.index_preallocate and self._index_capacity_hint:
+                    hinted_target = (
+                        (self._index_capacity_hint + self.index_step_size - 1)
+                        // self.index_step_size * self.index_step_size)
+                target = max(ordinary_target, hinted_target)
                 tail = mx.zeros(
                     (int(k_new.shape[0]), target - int(offset),
                      int(k_new.shape[2])),
@@ -423,6 +451,10 @@ class DSAState:
                     else mx.concatenate((prev, tail), axis=1))
                 self.stats["index_capacity_grows"] += 1
                 self.stats["index_rows_copied"] += int(offset)
+                if target > ordinary_target:
+                    self.stats["index_capacity_preallocations"] += 1
+                    self.stats["index_capacity_preallocated_rows"] += (
+                        target - ordinary_target)
             backing[:, int(offset):end, :] = k_new
             mx.eval(backing)
             self._k_idx_capacity[layer] = backing

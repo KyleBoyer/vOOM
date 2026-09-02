@@ -2111,6 +2111,16 @@ class EngineManager:
         if glm_dsa_long_context_request not in ("0", "1"):
             raise RequestValidationError(
                 "VMODEL_GLM_DSA_LONG_CONTEXT must be 0 or 1")
+        glm_dsa_index_preallocate_request = os.environ.get(
+            "VMODEL_GLM_DSA_INDEX_PREALLOCATE", "0").strip()
+        if glm_dsa_index_preallocate_request not in ("0", "1"):
+            raise RequestValidationError(
+                "VMODEL_GLM_DSA_INDEX_PREALLOCATE must be 0 or 1")
+        if (glm_dsa_index_preallocate_request == "1"
+                and glm_dsa_long_context_request != "1"):
+            raise RequestValidationError(
+                "VMODEL_GLM_DSA_INDEX_PREALLOCATE requires "
+                "VMODEL_GLM_DSA_LONG_CONTEXT=1")
         glm_dsa_sparse_absorbed_request = os.environ.get(
             "VMODEL_GLM_DSA_SPARSE_ABSORBED_MLA", "0").strip()
         if glm_dsa_sparse_absorbed_request not in ("0", "1"):
@@ -2332,6 +2342,7 @@ class EngineManager:
             glm53_compiled_kda_prefill_request,
             glm53_native_fused_kda_prefill_request,
             glm_dsa_long_context_request,
+            glm_dsa_index_preallocate_request,
             glm_dsa_sparse_absorbed_request,
             glm_dsa_mla_kv_spill_request,
             glm_dsa_key_tile_size,
@@ -2470,6 +2481,7 @@ class EngineManager:
             glm53_compiled_kda_prefill_request,
             glm53_native_fused_kda_prefill_request,
             glm_dsa_long_context_request,
+            glm_dsa_index_preallocate_request,
             glm_dsa_sparse_absorbed_request,
             glm_dsa_mla_kv_spill_request,
             glm_dsa_key_tile_size,
@@ -2909,6 +2921,7 @@ class EngineManager:
                 rc.expert_fetch_batch = 1
                 rc.glm_dsa_key_tile_size = glm_dsa_key_tile_size
                 rc.glm_dsa_index_step_size = 0
+                rc.glm_dsa_index_preallocate = False
                 rc.glm_dsa_selection_query_tile_size = 0
                 rc.glm_dsa_dense_mlp_tile_size = 0
                 rc.glm_dsa_sparse_absorbed_mla = False
@@ -2953,6 +2966,8 @@ class EngineManager:
                     rc.expert_batch_prefetch = (
                         glm53_expert_batch_prefetch_request == "1")
                     rc.glm_dsa_index_step_size = glm_dsa_index_step_size
+                    rc.glm_dsa_index_preallocate = (
+                        glm_dsa_index_preallocate_request == "1")
                     rc.glm_dsa_selection_query_tile_size = (
                         glm_dsa_selection_query_tile_size)
                     rc.glm_dsa_dense_mlp_tile_size = (

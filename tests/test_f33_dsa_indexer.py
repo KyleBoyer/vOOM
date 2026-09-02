@@ -31,6 +31,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import mlx.core as mx
+import numpy as np
 import pytest
 import torch
 
@@ -153,6 +154,41 @@ def test_dsa_indexer_topk_selection_matches_hf():
         f"DSA indexer top-k mismatch: HF selected {sorted(hf_selection)}, "
         f"runtime selected {sorted(runtime_selection)}"
     )
+
+
+def test_dsa_index_capacity_preallocation_is_byte_exact_and_avoids_copies():
+    hf_cfg, indexer, _rope, _q_a_proj, _q_a_layernorm = _build_hf_indexer()
+    torch.manual_seed(26)
+    h_mx = mx.array(torch.randn(1, S, HIDDEN).numpy())
+    sd = indexer.state_dict()
+    weights = {
+        f"layer0.self_attn.indexer.{name}": mx.array(sd[name].numpy())
+        for name in (
+            "wk.weight", "k_norm.weight", "k_norm.bias",
+        )
+    }
+    cfg = _runtime_config(hf_cfg)
+
+    stepped = DSAState(cfg, key_tile_size=2, index_step_size=4)
+    preallocated = DSAState(
+        cfg, key_tile_size=2, index_step_size=4,
+        index_preallocate=True)
+    preallocated.set_index_capacity_hint(S)
+    for state in (stepped, preallocated):
+        state.observe(0, "full", h_mx[:, :4], weights, "layer0", offset=0)
+        state.observe(0, "full", h_mx[:, 4:], weights, "layer0", offset=4)
+
+    baseline_bytes = np.asarray(stepped.k_idx[0]).tobytes()
+    preallocated_bytes = np.asarray(preallocated.k_idx[0]).tobytes()
+    assert preallocated_bytes == baseline_bytes
+    assert preallocated.k_idx[0].shape == stepped.k_idx[0].shape == (
+        1, S, INDEX_HEAD_DIM)
+    assert preallocated.stats["index_capacity_grows"] == 1
+    assert preallocated.stats["index_capacity_preallocations"] == 1
+    assert preallocated.stats["index_rows_copied"] == 0
+    assert preallocated.stats["index_rows_appended"] == S
+    assert preallocated.stats["index_capacity_rows_peak"] == 8
+    assert preallocated.stats["index_capacity_preallocated_rows"] == 4
 
 
 def test_official_transformers_kth_tie_selects_lower_positions():

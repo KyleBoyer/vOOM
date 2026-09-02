@@ -1,0 +1,12 @@
+schema: voom.runtime-profile.v1
+name: glm53-full-lossless-expert-prefetch
+description: Explicit lossless full GLM-5.3 routed-expert I/O overlap experiment.
+notes:
+  - "Extends the measured released-weight long-context profile and overlaps one exact future routed-expert read with Metal compute for the current expert."
+  - "The authoritative released router still chooses every expert, exact FP8 values are loaded, and experts are accumulated in the original ascending order. At most one successor page is in flight."
+  - "Explicit until a fresh untouched capture proves the I/O hidden by compute exceeds contention and pressure costs on this two-tier 16-GB machine."
+extends:
+  - glm53-full-lossless-long-context
+settings:
+  VMODEL_GLM53_EXPERT_FETCH_BATCH: 1
+  VMODEL_GLM53_EXPERT_BATCH_PREFETCH: true

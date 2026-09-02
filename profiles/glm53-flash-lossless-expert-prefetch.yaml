@@ -1,0 +1,12 @@
+schema: voom.runtime-profile.v1
+name: glm53-flash-lossless-expert-prefetch
+description: Explicit lossless GLM-5.3-Flash routed-expert I/O overlap experiment.
+notes:
+  - "Extends the byte-exact compiled-KDA profile and overlaps one exact future routed-expert read with current expert compute. It does not enable the lossy fused-attention, int8 K/V, or coalesced-position switches from the fast sidequest profile."
+  - "The released router decisions, FP8 weights, expert compute, and ascending accumulation order are unchanged. Telemetry reports submissions, wait time, and disk time hidden by Metal."
+  - "Explicit pending released-model greedy/state, varied-shape, pressure, captured-harness, and Plex gates."
+extends:
+  - glm53-flash-lossless-compiled-kda
+settings:
+  VMODEL_GLM53_EXPERT_FETCH_BATCH: 1
+  VMODEL_GLM53_EXPERT_BATCH_PREFETCH: true

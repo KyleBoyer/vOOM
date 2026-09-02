@@ -1200,6 +1200,11 @@ class RuntimeConfig:
     # Exact spare-capacity rows for the full GLM index-key history. Zero keeps
     # the legacy concat path; the explicit long-context route uses 1024.
     glm_dsa_index_step_size: int = 0
+    # Allocate every full indexer's final stepped prompt capacity on its first
+    # tile. This is content-independent and byte-exact, but remains explicit
+    # until the real long-context pressure/timing gate proves the allocation
+    # schedule is beneficial on the 16-GB host.
+    glm_dsa_index_preallocate: bool = False
     # Query rows scored together by the exact full-GLM DSA selector. Compact
     # attention retains prefill_chunk_size; this independent width amortizes
     # score/merge launches without expanding more selected MLA rows at once.
@@ -1481,6 +1486,8 @@ class RuntimeConfig:
                 "glm_dsa_key_tile_size", 256),
             glm_dsa_index_step_size=run.get(
                 "glm_dsa_index_step_size", 0),
+            glm_dsa_index_preallocate=run.get(
+                "glm_dsa_index_preallocate", False),
             glm_dsa_selection_query_tile_size=run.get(
                 "glm_dsa_selection_query_tile_size", 0),
             glm_dsa_dense_mlp_tile_size=run.get(
@@ -1653,6 +1660,10 @@ class StreamingEngine:
             raise ValueError("glm_dsa_key_tile_size must be positive")
         if self.rc.glm_dsa_index_step_size < 0:
             raise ValueError("glm_dsa_index_step_size must be non-negative")
+        if (self.rc.glm_dsa_index_preallocate
+                and self.rc.glm_dsa_index_step_size <= 0):
+            raise ValueError(
+                "glm_dsa_index_preallocate requires a positive index step")
         if self.rc.glm_dsa_selection_query_tile_size < 0:
             raise ValueError(
                 "glm_dsa_selection_query_tile_size must be non-negative")
@@ -7175,6 +7186,13 @@ class StreamingEngine:
         profiler = self._request_profiler
         if profiler is not None:
             profiler.begin_sweep(total, path="layer_stationary_glm")
+        dsa = getattr(kv, "dsa", None)
+        if (
+            self.cfg.model_type == "glm_moe_dsa"
+            and dsa is not None
+            and self.rc.glm_dsa_index_preallocate
+        ):
+            dsa.set_index_capacity_hint(offset + total)
         for i in range(n):
             self._select_layer_transient(total, i)
             if self.prefetcher:
@@ -9757,6 +9775,7 @@ class StreamingEngine:
                     self.rc.glm53_native_fused_kda_prefill)}"
                 f"glmdsakeytile{self.rc.glm_dsa_key_tile_size}"
                 f"glmdsaindexstep{self.rc.glm_dsa_index_step_size}"
+                f"glmdsaindexprealloc{int(self.rc.glm_dsa_index_preallocate)}"
                 f"glmdsaquerytile{self.rc.glm_dsa_selection_query_tile_size}"
                 f"glmdsadensemlptile{self.rc.glm_dsa_dense_mlp_tile_size}"
                 f"glmdsaabsorbed{int(self.rc.glm_dsa_sparse_absorbed_mla)}"
@@ -9908,6 +9927,7 @@ class StreamingEngine:
                         self.cfg,
                         key_tile_size=self.rc.glm_dsa_key_tile_size,
                         index_step_size=self.rc.glm_dsa_index_step_size,
+                        index_preallocate=self.rc.glm_dsa_index_preallocate,
                         selection_query_tile_size=(
                             self.rc.glm_dsa_selection_query_tile_size),
                         selection_spill_dir=(
@@ -12320,6 +12340,8 @@ class StreamingEngine:
         if self.cfg.model_type == "glm_moe_dsa":
             path_stats["glm_dsa_dense_mlp_tile_size"] = int(
                 self.rc.glm_dsa_dense_mlp_tile_size)
+            path_stats["glm_dsa_index_preallocate"] = int(
+                self.rc.glm_dsa_index_preallocate)
         dsa_state = getattr(kv, "dsa", None)
         if dsa_state is not None:
             path_stats["dsa_observations"] = dsa_state.stats["observations"]
@@ -12348,6 +12370,10 @@ class StreamingEngine:
                 dsa_state.stats.get("preselection_attention_ranges", 0))
             path_stats["dsa_index_capacity_grows"] = int(
                 dsa_state.stats.get("index_capacity_grows", 0))
+            path_stats["dsa_index_capacity_preallocations"] = int(
+                dsa_state.stats.get("index_capacity_preallocations", 0))
+            path_stats["dsa_index_capacity_preallocated_rows"] = int(
+                dsa_state.stats.get("index_capacity_preallocated_rows", 0))
             path_stats["dsa_index_rows_copied"] = int(
                 dsa_state.stats.get("index_rows_copied", 0))
             path_stats["dsa_index_rows_appended"] = int(

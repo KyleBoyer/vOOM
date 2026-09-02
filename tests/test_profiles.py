@@ -159,6 +159,20 @@ def test_builtin_profiles_resolve_complete_agent_group():
     assert "VMODEL_GLM53_COALESCED_EXPERT_POSITIONS" not in (
         glm_flash_settings)
 
+    glm_flash_prefetch_order, glm_flash_prefetch_settings = (
+        resolve_runtime_profiles(
+            ("glm53-flash-lossless-expert-prefetch",), catalog))
+    assert glm_flash_prefetch_order == (
+        "glm53-flash-lossless-compiled-kda",
+        "glm53-flash-lossless-expert-prefetch",
+    )
+    assert glm_flash_prefetch_settings[
+        "VMODEL_GLM53_EXPERT_FETCH_BATCH"] == "1"
+    assert glm_flash_prefetch_settings[
+        "VMODEL_GLM53_EXPERT_BATCH_PREFETCH"] == "1"
+    assert "VMODEL_GLM53_SPARSE_FUSED_ATTENTION" not in (
+        glm_flash_prefetch_settings)
+
     glm_fast_order, glm_fast_settings = resolve_runtime_profiles(
         ("glm53-flash-long-context-fast",), catalog)
     assert glm_fast_order == (
@@ -216,6 +230,27 @@ def test_builtin_profiles_resolve_complete_agent_group():
         "VMODEL_GLM_DSA_SELECTION_QUERY_TILE_SIZE"] == "64"
     assert glm_full_settings["VMODEL_GLM53_EXPERT_FETCH_BATCH"] == "1"
     assert glm_full_settings["VMODEL_GLM53_EXPERT_BATCH_PREFETCH"] == "0"
+
+    glm_preallocate_order, glm_preallocate_settings = resolve_runtime_profiles(
+        ("glm53-full-lossless-index-preallocate",), catalog)
+    assert glm_preallocate_order == (
+        "glm53-full-lossless-long-context",
+        "glm53-full-lossless-index-preallocate",
+    )
+    assert glm_preallocate_settings[
+        "VMODEL_GLM_DSA_INDEX_PREALLOCATE"] == "1"
+
+    glm_full_prefetch_order, glm_full_prefetch_settings = (
+        resolve_runtime_profiles(
+            ("glm53-full-lossless-expert-prefetch",), catalog))
+    assert glm_full_prefetch_order == (
+        "glm53-full-lossless-long-context",
+        "glm53-full-lossless-expert-prefetch",
+    )
+    assert glm_full_prefetch_settings[
+        "VMODEL_GLM53_EXPERT_FETCH_BATCH"] == "1"
+    assert glm_full_prefetch_settings[
+        "VMODEL_GLM53_EXPERT_BATCH_PREFETCH"] == "1"
 
     candidate_order, candidate_settings = resolve_runtime_profiles(
         ("qwen38-flash-next-candidate-bf16",), catalog)

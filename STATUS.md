@@ -1,5 +1,47 @@
 # STATUS — 2026-09-02 (current corrections first; dated chronology below is history)
 
+## 2026-09-02: Qwen Flash abliterated overlay runs; new exact GLM schedules are isolated
+
+The pinned `windowsxp811203/Qwen3.8-Flash-Next-Abliterated` revision
+`deb02632504bb214702bc28b0381a93d3112f500` is now staged as a finalized
+hash-attested overlay. It stores 98,467,154,889 candidate bytes and links
+261,556,271,007 bytes that are published-identical to official revision
+`f5d08274bafd880402bd16f5e3e6c514136ec06c`. An independent tensor gate
+scanned all 1,658 entries and proved exactly 151 changed BF16 tensors / 85.221GB,
+with zero unexpected or missing changes. The vision tower, LM head, 51B PLE
+table, and every other untargeted tensor remain byte-identical. Candidate
+authors' scripts were downloaded as inert Hub files and never executed.
+
+The exact PLE direct-row provider now accepts a finalized overlay witness only
+after validating the receipt schema/status, immutable plan digest, pinned
+candidate revision, byte/count totals, destination, config/index topology
+links, and every PLE shard's linked-versus-regular file contract. Partial,
+misdirected, or plan-tampered overlays fail closed. Both linked and changed
+regular-shard unit gates pass, and the real candidate returned 48 rows /
+15,360 exact BF16 bytes under the candidate revision witness. The first live
+candidate forward then completed 54 input + 8 output tokens in 366.78 seconds
+cold. It read 160.99GB of expert data with zero official fast-tier reuse and
+returned an intentionally incomplete eight-token response, so this is a
+runtime proof rather than a quality or latency promotion.
+
+The latest full-GLM trace exposed 966 exact DSA index-capacity grows and
+22,256,640 copied rows. `glm53-full-lossless-index-preallocate` now publishes
+the known final absolute request length before the first key tile, allocating
+each full indexer's eventual 1,024-stepped capacity once while exposing only
+the initialized logical prefix. The synthetic gate is byte-identical and
+reduces two growths/one prefix copy to one growth/zero copies. Separate
+`glm53-full-lossless-expert-prefetch` and
+`glm53-flash-lossless-expert-prefetch` profiles isolate one-page exact routed
+expert I/O overlap without enabling fused attention, int8 K/V, coalesced
+positions, pruning, or changed target weights. All three remain explicit and
+unpromoted pending real timing, pressure, and greedy/state gates.
+
+Focused result: 348 DSA/server/profile/Qwen-MTP tests and six PLE-row witness
+tests pass. Evidence:
+`logs/qwen38_flash_next_abliterated_tensor_diff_20260902.json`,
+`logs/qwen38_flash_abliterated_smoke2_preflight_20260902.json`, and the
+verified overlay receipt beside the staged checkpoint.
+
 ## 2026-09-02: exact GLM levers advance; published Flash draft clears only an E-class gate
 
 The full released GLM-5.3 DSA selector now exposes an explicit 64-row query

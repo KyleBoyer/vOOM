@@ -29,6 +29,10 @@ from .qwen4_exp_ple import Qwen4ExpPLELayout
 _PART_PATTERN = re.compile(
     r"^(?P<prefix>.+\.ple_embedding\.ngram_embedding)"
     r"\.shard_(?P<part>\d+)\.weight$")
+_OVERLAY_PLAN_SCHEMA = "voom.hf-checkpoint-overlay-plan.v1"
+_OVERLAY_RECEIPT_SCHEMA = "voom.hf-checkpoint-overlay-receipt.v1"
+_OVERLAY_PLAN_NAME = ".voom-overlay-plan.json"
+_OVERLAY_RECEIPT_NAME = "voom.overlay.receipt.json"
 
 
 def _sha256_file(path: Path) -> str:
@@ -64,6 +68,127 @@ def _safetensor_header(path: Path) -> tuple[int, dict]:
     if not isinstance(header, dict):
         raise ValueError(f"invalid safetensors header in {path}")
     return header_size, header
+
+
+def _native_release_witness(
+    model_dir: Path, shards: tuple[str, ...],
+) -> tuple[list[tuple[str, str, int]], str]:
+    tree_dir = model_dir / ".cache" / "huggingface" / "trees"
+    for tree_path in sorted(tree_dir.glob("*.json")):
+        try:
+            tree = json.loads(tree_path.read_text())
+            files = tree.get("files", {})
+        except (OSError, ValueError):
+            continue
+        candidate = []
+        for shard in shards:
+            meta = files.get(shard, {})
+            sha = str(meta.get("lfs_sha256") or "")
+            size = int(meta.get("lfs_size") or 0)
+            if (not re.fullmatch(r"[0-9a-f]{64}", sha)
+                    or size != (model_dir / shard).stat().st_size):
+                candidate = []
+                break
+            metadata_path = (
+                model_dir / ".cache" / "huggingface" / "download"
+                / f"{shard}.metadata")
+            lines = (
+                metadata_path.read_text().splitlines()
+                if metadata_path.is_file() else [])
+            if (len(lines) < 2 or lines[0].strip() != tree_path.stem
+                    or lines[1].strip().strip('"') != sha):
+                candidate = []
+                break
+            candidate.append((shard, sha, size))
+        if candidate:
+            return candidate, tree_path.stem
+    return [], ""
+
+
+def _overlay_release_witness(
+    model_dir: Path, shards: tuple[str, ...],
+) -> tuple[list[tuple[str, str, int]], str]:
+    """Validate the finalized hash-attested overlay provenance chain.
+
+    Finalization already hashes every downloaded candidate file against its
+    pinned Hub object and every linked file against the candidate's identical
+    published object identity. Runtime revalidates the immutable plan/receipt,
+    file kinds, sizes, destinations, and exact topology links; it does not
+    trust a partially downloaded candidate or a name-only symlink farm.
+    """
+    plan_path = model_dir / _OVERLAY_PLAN_NAME
+    receipt_path = model_dir / _OVERLAY_RECEIPT_NAME
+    if not plan_path.is_file() or not receipt_path.is_file():
+        return [], ""
+    try:
+        plan_bytes = plan_path.read_bytes()
+        plan = json.loads(plan_bytes)
+        receipt = json.loads(receipt_path.read_text())
+        if (plan.get("schema") != _OVERLAY_PLAN_SCHEMA
+                or receipt.get("schema") != _OVERLAY_RECEIPT_SCHEMA
+                or receipt.get("status") != "verified"):
+            return [], ""
+        if hashlib.sha256(plan_bytes).hexdigest() != receipt.get("plan_sha256"):
+            return [], ""
+        if (Path(plan.get("destination", "")).resolve() != model_dir
+                or Path(receipt.get("destination", "")).resolve() != model_dir):
+            return [], ""
+        if (plan.get("base") != receipt.get("base")
+                or plan.get("candidate") != receipt.get("candidate")
+                or receipt.get("config_equal") is not True
+                or receipt.get("tensor_to_shard_map_equal") is not True):
+            return [], ""
+        files = plan.get("files", {})
+        downloads = files.get("download", [])
+        links = files.get("link", [])
+        if (len(downloads) != int(receipt.get("downloaded_files", -1))
+                or len(links) != int(receipt.get("linked_files", -1))
+                or sum(int(item["size"]) for item in downloads)
+                != int(receipt.get("verified_download_bytes", -1))
+                or sum(int(item["size"]) for item in links)
+                != int(receipt.get("verified_link_bytes", -1))):
+            return [], ""
+        download_map = {str(item["path"]): item for item in downloads}
+        link_map = {str(item["path"]): item for item in links}
+        if (len(download_map) != len(downloads)
+                or len(link_map) != len(links)
+                or download_map.keys() & link_map.keys()):
+            return [], ""
+        base = Path(plan["base"]["directory"]).resolve()
+        # Exact config and tensor placement are mandatory links to the pinned
+        # base. Candidate-edited topology cannot inherit the PLE address proof.
+        for name in ("config.json", "model.safetensors.index.json"):
+            path = model_dir / name
+            target = base / name
+            if (name not in link_map or not path.is_symlink()
+                    or path.resolve() != target.resolve()):
+                return [], ""
+        revision = str(plan["candidate"].get("revision", ""))
+        if not re.fullmatch(r"[0-9a-f]{40}", revision):
+            return [], ""
+        witnesses = []
+        for shard in shards:
+            path = model_dir / shard
+            record = link_map.get(shard)
+            if record is not None:
+                target = base / shard
+                if (not path.is_symlink()
+                        or path.resolve() != target.resolve()):
+                    return [], ""
+            else:
+                record = download_map.get(shard)
+                if record is None or path.is_symlink():
+                    return [], ""
+            size = int(record["size"])
+            sha = str(record.get("hash", ""))
+            if (record.get("hash_kind") != "sha256"
+                    or not re.fullmatch(r"[0-9a-f]{64}", sha)
+                    or not path.is_file() or path.stat().st_size != size):
+                return [], ""
+            witnesses.append((shard, sha, size))
+        return witnesses, revision
+    except (KeyError, OSError, TypeError, ValueError):
+        return [], ""
 
 
 @dataclass(frozen=True)
@@ -202,40 +327,11 @@ class Qwen4ExpPLERowStore:
     def _source_identity(
         self, shards: tuple[str, ...], split_parts: int, index_path: Path,
     ) -> PLESourceIdentity:
-        tree_dir = self.model_dir / ".cache" / "huggingface" / "trees"
-        tree_paths = sorted(tree_dir.glob("*.json"))
-        witnesses = []
-        revision = ""
-        for tree_path in tree_paths:
-            try:
-                tree = json.loads(tree_path.read_text())
-                files = tree.get("files", {})
-            except (OSError, ValueError):
-                continue
-            candidate = []
-            for shard in shards:
-                meta = files.get(shard, {})
-                sha = str(meta.get("lfs_sha256") or "")
-                size = int(meta.get("lfs_size") or 0)
-                if (not re.fullmatch(r"[0-9a-f]{64}", sha)
-                        or size != (self.model_dir / shard).stat().st_size):
-                    candidate = []
-                    break
-                metadata_path = (
-                    self.model_dir / ".cache" / "huggingface" / "download"
-                    / f"{shard}.metadata")
-                lines = (
-                    metadata_path.read_text().splitlines()
-                    if metadata_path.is_file() else [])
-                if (len(lines) < 2 or lines[0].strip() != tree_path.stem
-                        or lines[1].strip().strip('"') != sha):
-                    candidate = []
-                    break
-                candidate.append((shard, sha, size))
-            if candidate:
-                witnesses = candidate
-                revision = tree_path.stem
-                break
+        witnesses, revision = _native_release_witness(
+            self.model_dir, shards)
+        if not witnesses:
+            witnesses, revision = _overlay_release_witness(
+                self.model_dir, shards)
 
         descriptor = {
             "revision": revision,

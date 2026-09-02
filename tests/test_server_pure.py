@@ -2539,6 +2539,7 @@ def test_full_glm_long_context_is_explicit_tiled_and_external_spilled():
         "VMODEL_GLM_DSA_KEY_TILE_SIZE": "8192",
         "VMODEL_GLM_DSA_PREFILL_TILE_WIDTH": "32",
         "VMODEL_GLM_DSA_INDEX_STEP_SIZE": "512",
+        "VMODEL_GLM_DSA_INDEX_PREALLOCATE": "1",
         "VMODEL_GLM_DSA_SELECTION_QUERY_TILE_SIZE": "64",
         "VMODEL_GLM_DSA_DENSE_MLP_TILE_SIZE": "256",
         "VMODEL_GLM53_EXPERT_FETCH_BATCH": "8",
@@ -2555,6 +2556,7 @@ def test_full_glm_long_context_is_explicit_tiled_and_external_spilled():
     assert rc.prefill_chunk_size == 32
     assert rc.glm_dsa_key_tile_size == 8192
     assert rc.glm_dsa_index_step_size == 512
+    assert rc.glm_dsa_index_preallocate
     assert rc.glm_dsa_selection_query_tile_size == 64
     assert rc.glm_dsa_dense_mlp_tile_size == 256
     assert rc.glm_dsa_sparse_absorbed_mla
@@ -2579,6 +2581,20 @@ def test_full_glm_long_context_requires_external_spill():
         "VMODEL_GLM_DSA_MLA_KV_SPILL_DIR": "",
     }, clear=False), pytest.raises(
         RequestValidationError, match="requires the exact external spill tier"
+    ):
+        EngineManager().get(Path("/tmp/unused-full-glm53"), "lossless")
+
+
+def test_full_glm_index_preallocation_requires_long_context_route():
+    from unittest.mock import patch
+
+    from runtime.server import EngineManager
+
+    with patch.dict(os.environ, {
+        "VMODEL_GLM_DSA_LONG_CONTEXT": "0",
+        "VMODEL_GLM_DSA_INDEX_PREALLOCATE": "1",
+    }, clear=False), pytest.raises(
+        RequestValidationError, match="INDEX_PREALLOCATE requires"
     ):
         EngineManager().get(Path("/tmp/unused-full-glm53"), "lossless")
 
