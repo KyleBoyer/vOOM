@@ -270,6 +270,24 @@ def test_builtin_profiles_resolve_complete_agent_group():
     assert glm_preallocate_settings[
         "VMODEL_GLM_DSA_INDEX_PREALLOCATE"] == "1"
 
+    glm_full_composed_order, glm_full_composed_settings = (
+        resolve_runtime_profiles(
+            ("glm53-full-lossless-preallocate-prefetch-batch8",), catalog))
+    assert glm_full_composed_order == (
+        "glm53-full-lossless-long-context",
+        "glm53-full-lossless-index-preallocate",
+        "glm53-full-lossless-preallocate-prefetch-batch8",
+    )
+    assert glm_full_composed_settings[
+        "VMODEL_GLM_DSA_INDEX_PREALLOCATE"] == "1"
+    assert glm_full_composed_settings[
+        "VMODEL_GLM53_EXPERT_FETCH_BATCH"] == "8"
+    assert glm_full_composed_settings[
+        "VMODEL_GLM53_EXPERT_BATCH_PREFETCH"] == "1"
+    assert glm_full_composed_settings[
+        "VMODEL_GLM_DSA_SELECTION_QUERY_TILE_SIZE"] == "64"
+    assert "VMODEL_GLM_DSA_KEY_TILE_SIZE" in glm_full_composed_settings
+
     glm_full_prefetch_order, glm_full_prefetch_settings = (
         resolve_runtime_profiles(
             ("glm53-full-lossless-expert-prefetch",), catalog))

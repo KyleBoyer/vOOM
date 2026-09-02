@@ -1,0 +1,12 @@
+schema: voom.runtime-profile.v1
+name: glm53-full-lossless-preallocate-prefetch-batch8
+description: Explicit full GLM-5.3 exact index preallocation and eight-page expert-prefetch composition.
+notes:
+  - "Extends the exact index-preallocation profile. The request's known final length allocates each DSA index backing once; logical lengths and released selector arithmetic are unchanged."
+  - "Groups up to eight exact FP8 expert pages per storage fetch and overlaps one future group with current compute. expert_compute_batch remains one, so released matmuls and ascending expert accumulation order are unchanged."
+  - "Every component is content-blind and fail-closed under the live memory governor. Explicit pending a deterministic released-model output/pressure gate and an untouched captured-harness replay."
+extends:
+  - glm53-full-lossless-index-preallocate
+settings:
+  VMODEL_GLM53_EXPERT_FETCH_BATCH: 8
+  VMODEL_GLM53_EXPERT_BATCH_PREFETCH: true
