@@ -90,6 +90,23 @@ def test_factor_storage_is_smaller_than_dense_endpoints_for_k3_geometry():
     assert factor_bytes < endpoint_bytes / 6
 
 
+def test_factor_storage_is_smaller_than_dense_qwen_flash_endpoints():
+    # Released Qwen3.8-Flash-Next geometry: 36 DeltaNet layers, 48 expanded
+    # value/key heads, Dk=Dv=128, and one BF16 3-row convolution history over
+    # the 10,240-wide fused Q/K/V input. A depth-three verifier retains three
+    # strict-prefix dense endpoints today, versus four token-factor records.
+    layers, positions, strict_prefixes = 36, 4, 3
+    heads, dim, history_rows, fused_qkv = 48, 128, 3, 10240
+    factor_step_bytes = (
+        (heads + heads * dim + heads * dim + heads) * 4
+        + history_rows * fused_qkv * 2
+    )
+    factor_window_bytes = layers * positions * factor_step_bytes
+    dense_endpoint_bytes = (
+        layers * strict_prefixes * heads * dim * dim * 4)
+    assert factor_window_bytes < dense_endpoint_bytes / 20
+
+
 def test_native_factor_step_matches_plain_mlx_recurrence():
     mx.random.seed(20260731)
     batch, heads, width = 1, 3, 17

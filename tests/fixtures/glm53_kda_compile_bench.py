@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import functools
 import hashlib
 import json
 import statistics
@@ -72,10 +73,24 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--length", type=int, default=128)
     parser.add_argument("--repeats", type=int, default=3)
+    parser.add_argument(
+        "--segments", default="16,32,64,128",
+        help="comma-separated compiled segment widths to compare",
+    )
     parser.add_argument("--result", required=True, type=Path)
     args = parser.parse_args()
     if args.length <= 1 or args.repeats <= 0:
         parser.error("length must exceed one and repeats must be positive")
+    try:
+        segments = tuple(dict.fromkeys(
+            int(item.strip()) for item in args.segments.split(",")
+            if item.strip()))
+    except ValueError as error:
+        parser.error(f"segments must be comma-separated integers: {error}")
+    if not segments or any(segment <= 0 for segment in segments):
+        parser.error("segments must contain positive integers")
+    if 32 not in segments:
+        parser.error("segments must include the released baseline width 32")
     if args.result.exists():
         parser.error("result already exists")
 
@@ -91,40 +106,57 @@ def main() -> int:
         (1, 64, 128, 128), dtype=np.float32))
     values = (q, k, v, gate, beta, state)
 
-    # Compile once outside the measured steady-state samples. A real model
-    # amortizes this graph across 34 KDA layers and hundreds of same-width
-    # tiles; the result still reports only steady-state recurrence time.
-    warm_output, warm_state = _compiled_kda_prefill_scan(*values)
-    mx.eval(warm_output, warm_state)
-
     reference = _measure(_reference, values, args.repeats)
-    compiled = _measure(_compiled_kda_prefill_scan, values, args.repeats)
-    exact = (
-        reference["output_sha256"] == compiled["output_sha256"]
-        and reference["state_sha256"] == compiled["state_sha256"]
+    compiled = {}
+    for segment in segments:
+        candidate = functools.partial(
+            _compiled_kda_prefill_scan, segment=segment)
+        # Compile once outside the measured steady-state samples. A real model
+        # amortizes this graph across 34 KDA layers and hundreds of same-width
+        # tiles; the result still reports only steady-state recurrence time.
+        warm_output, warm_state = candidate(*values)
+        mx.eval(warm_output, warm_state)
+        measurement = _measure(candidate, values, args.repeats)
+        measurement["byte_identical"] = (
+            reference["output_sha256"] == measurement["output_sha256"]
+            and reference["state_sha256"] == measurement["state_sha256"]
+        )
+        measurement["speedup_vs_reference"] = (
+            reference["median_s"] / measurement["median_s"]
+            if measurement["median_s"] else None)
+        compiled[str(segment)] = measurement
+    exact_segments = [
+        segment for segment in segments
+        if compiled[str(segment)]["byte_identical"]
+    ]
+    winner = min(
+        exact_segments,
+        key=lambda segment: compiled[str(segment)]["median_s"],
+        default=None,
     )
+    baseline_exact = compiled["32"]["byte_identical"]
     result = {
-        "schema": "voom.glm53-kda-compile-bench.v1",
+        "schema": "voom.glm53-kda-compile-segment-sweep.v2",
         "geometry": {
             "batch": 1,
             "length": args.length,
             "heads": 64,
             "head_dim": 128,
             "dtype": "float32",
-            "segment": 32,
+            "reference_state_eval_segment": 32,
+            "candidate_segments": list(segments),
         },
         "reference": reference,
         "compiled": compiled,
-        "byte_identical": exact,
-        "speedup": (
-            reference["median_s"] / compiled["median_s"]
-            if compiled["median_s"] else None),
-        "passed": exact,
+        "byte_identical_segments": exact_segments,
+        "fastest_byte_identical_segment": winner,
+        "baseline_segment_32_byte_identical": baseline_exact,
+        "passed": baseline_exact,
     }
     args.result.parent.mkdir(parents=True, exist_ok=True)
     args.result.write_text(json.dumps(result, indent=2, sort_keys=True) + "\n")
     print(json.dumps(result, indent=2, sort_keys=True))
-    return 0 if exact else 1
+    return 0 if baseline_exact else 1
 
 
 if __name__ == "__main__":
