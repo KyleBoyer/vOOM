@@ -426,6 +426,14 @@ def test_glm53_layer_stationary_moe_preserves_tile_shapes_and_expert_order():
     assert coalesced_stats["max_positions"] <= 1
     assert coalesced_stats["gemm_calls"] >= len(requested)
     assert coalesced_stats["split_experts"] >= 1
+    assert coalesced_stats["layers"] == 1
+    assert coalesced_stats["input_positions"] == 4
+    assert coalesced_stats["route_assignments"] == 8
+    assert coalesced_stats["unique_experts"] == len(requested)
+    assert coalesced_stats["max_unique_experts"] == len(requested)
+    assert coalesced_stats["max_expert_routes"] >= 1
+    assert coalesced_stats["gemm_input_positions"] == 8
+    assert coalesced_stats["gemm_full_chunks"] == 8
 
 
 def test_glm53_coalesced_expert_position_limit_must_be_positive():

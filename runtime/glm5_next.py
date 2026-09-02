@@ -150,6 +150,24 @@ def glm5_next_mlp_layer_stationary_tiles(
 
     expert_ids = sorted(global_positions)
     routed = [mx.zeros_like(tile) for tile in hidden_tiles]
+    if coalesced_stats is not None and coalesce_expert_positions:
+        route_assignments = sum(
+            len(positions) for positions in global_positions.values())
+        coalesced_stats["layers"] = int(
+            coalesced_stats.get("layers", 0)) + 1
+        coalesced_stats["input_positions"] = int(
+            coalesced_stats.get("input_positions", 0)) + position_base
+        coalesced_stats["route_assignments"] = int(
+            coalesced_stats.get("route_assignments", 0)) + route_assignments
+        coalesced_stats["unique_experts"] = int(
+            coalesced_stats.get("unique_experts", 0)) + len(expert_ids)
+        coalesced_stats["max_unique_experts"] = max(
+            int(coalesced_stats.get("max_unique_experts", 0)),
+            len(expert_ids))
+        coalesced_stats["max_expert_routes"] = max(
+            int(coalesced_stats.get("max_expert_routes", 0)),
+            max((len(global_positions[expert]) for expert in expert_ids),
+                default=0))
 
     if iter_expert_batches is None:
         experts = get_experts(
@@ -221,6 +239,13 @@ def glm5_next_mlp_layer_stationary_tiles(
                 if coalesced_stats is not None:
                     coalesced_stats["gemm_calls"] = int(
                         coalesced_stats.get("gemm_calls", 0)) + len(chunks)
+                    coalesced_stats["gemm_input_positions"] = int(
+                        coalesced_stats.get("gemm_input_positions", 0)) + sum(
+                            width for _inputs, _destinations, width in chunks)
+                    coalesced_stats["gemm_full_chunks"] = int(
+                        coalesced_stats.get("gemm_full_chunks", 0)) + sum(
+                            width == coalesced_expert_max_positions
+                            for _inputs, _destinations, width in chunks)
                     coalesced_stats["max_positions"] = max(
                         int(coalesced_stats.get("max_positions", 0)),
                         max(width for _inputs, _destinations, width in chunks))

@@ -7902,7 +7902,15 @@ class StreamingEngine:
         mlp_s = 0.0
         ffn_hc_post_s = 0.0
         coalesced_stats = {
+            "layers": 0,
+            "input_positions": 0,
+            "route_assignments": 0,
+            "unique_experts": 0,
+            "max_unique_experts": 0,
+            "max_expert_routes": 0,
             "gemm_calls": 0,
+            "gemm_input_positions": 0,
+            "gemm_full_chunks": 0,
             "max_positions": 0,
             "split_experts": 0,
         }
@@ -8226,6 +8234,32 @@ class StreamingEngine:
             "coalesced_expert_split_experts": int(previous_stats.get(
                 "coalesced_expert_split_experts", 0)) + int(
                     coalesced_stats["split_experts"]),
+            "coalesced_expert_layers": int(previous_stats.get(
+                "coalesced_expert_layers", 0)) + int(
+                    coalesced_stats["layers"]),
+            "coalesced_expert_input_positions": int(previous_stats.get(
+                "coalesced_expert_input_positions", 0)) + int(
+                    coalesced_stats["input_positions"]),
+            "coalesced_expert_route_assignments": int(previous_stats.get(
+                "coalesced_expert_route_assignments", 0)) + int(
+                    coalesced_stats["route_assignments"]),
+            "coalesced_expert_unique_experts": int(previous_stats.get(
+                "coalesced_expert_unique_experts", 0)) + int(
+                    coalesced_stats["unique_experts"]),
+            "coalesced_expert_max_unique_experts": max(
+                int(previous_stats.get(
+                    "coalesced_expert_max_unique_experts", 0)),
+                int(coalesced_stats["max_unique_experts"])),
+            "coalesced_expert_max_expert_routes": max(
+                int(previous_stats.get(
+                    "coalesced_expert_max_expert_routes", 0)),
+                int(coalesced_stats["max_expert_routes"])),
+            "coalesced_expert_gemm_input_positions": int(previous_stats.get(
+                "coalesced_expert_gemm_input_positions", 0)) + int(
+                    coalesced_stats["gemm_input_positions"]),
+            "coalesced_expert_gemm_full_chunks": int(previous_stats.get(
+                "coalesced_expert_gemm_full_chunks", 0)) + int(
+                    coalesced_stats["gemm_full_chunks"]),
         }
         del kv._glm53_expanded_prefill
         self._restore_aggregate_layer_transient(total)
@@ -12469,6 +12503,13 @@ class StreamingEngine:
                 glm53_memory.get("coalesced_expert_max_positions", 0))
             path_stats["glm53_coalesced_expert_split_experts"] = int(
                 glm53_memory.get("coalesced_expert_split_experts", 0))
+            for metric in (
+                    "layers", "input_positions", "route_assignments",
+                    "unique_experts", "max_unique_experts",
+                    "max_expert_routes", "gemm_input_positions",
+                    "gemm_full_chunks"):
+                path_stats[f"glm53_coalesced_expert_{metric}"] = int(
+                    glm53_memory.get(f"coalesced_expert_{metric}", 0))
             path_stats["glm53_incremental_dsa_pool"] = int(
                 self.rc.glm53_incremental_dsa_pool)
             path_stats["glm53_compiled_kda_prefill"] = int(

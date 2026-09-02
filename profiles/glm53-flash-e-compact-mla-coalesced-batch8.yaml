@@ -1,0 +1,13 @@
+schema: voom.runtime-profile.v1
+name: glm53-flash-e-compact-mla-coalesced-batch8
+description: Explicit GLM-5.3-Flash E-class compact sparse MLA plus bounded coalesced expert GEMMs.
+notes:
+  - "Extends compact sparse MLA and the exact batch-eight prefetch schedule, then coalesces routed positions for each released expert into GEMMs bounded at 512 rows. Released weights, router choices, expert IDs, routing weights, and scatter destinations are unchanged."
+  - "Coalescing changes expert GEMM outer shapes and floating-point boundaries, so this composition is explicitly E-class/lossy even when finite tokens agree. It remains default-off and content-blind."
+  - "Unlike glm53-flash-long-context-fast, this isolation rung keeps the proven tile-32 outer sweep and does not enable int8 expanded K/V or fused expanded attention. Compact MLA owns sparse attention after 2,048 keys."
+  - "Require deterministic output/state gates, bounded peak and swap pressure, sustained output, Plex/tool, vision, varied shapes, and the untouched captured harness before any promotion."
+extends:
+  - glm53-flash-e-compact-mla-prefetch-batch8
+settings:
+  VMODEL_GLM53_COALESCED_EXPERT_POSITIONS: true
+  VMODEL_GLM53_COALESCED_EXPERT_MAX_POSITIONS: 512

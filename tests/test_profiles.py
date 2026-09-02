@@ -218,6 +218,32 @@ def test_builtin_profiles_resolve_complete_agent_group():
     assert "VMODEL_GLM53_SPARSE_FUSED_KV_INT8" not in (
         glm_absorbed_settings)
 
+    glm_compact_coalesced_order, glm_compact_coalesced_settings = (
+        resolve_runtime_profiles(
+            ("glm53-flash-e-compact-mla-coalesced-batch8",), catalog))
+    assert glm_compact_coalesced_order == (
+        "glm53-flash-lossless-compiled-kda",
+        "glm53-flash-e-compact-mla",
+        "glm53-flash-lossless-expert-prefetch",
+        "glm53-flash-lossless-expert-prefetch-batch8",
+        "glm53-flash-e-compact-mla-prefetch-batch8",
+        "glm53-flash-e-compact-mla-coalesced-batch8",
+    )
+    assert glm_compact_coalesced_settings[
+        "VMODEL_GLM53_SPARSE_ABSORBED_MLA"] == "1"
+    assert glm_compact_coalesced_settings[
+        "VMODEL_GLM53_EXPERT_FETCH_BATCH"] == "8"
+    assert glm_compact_coalesced_settings[
+        "VMODEL_GLM53_EXPERT_BATCH_PREFETCH"] == "1"
+    assert glm_compact_coalesced_settings[
+        "VMODEL_GLM53_COALESCED_EXPERT_POSITIONS"] == "1"
+    assert glm_compact_coalesced_settings[
+        "VMODEL_GLM53_COALESCED_EXPERT_MAX_POSITIONS"] == "512"
+    assert "VMODEL_GLM53_SPARSE_FUSED_ATTENTION" not in (
+        glm_compact_coalesced_settings)
+    assert "VMODEL_GLM53_SPARSE_FUSED_KV_INT8" not in (
+        glm_compact_coalesced_settings)
+
     glm_fast_order, glm_fast_settings = resolve_runtime_profiles(
         ("glm53-flash-long-context-fast",), catalog)
     assert glm_fast_order == (
