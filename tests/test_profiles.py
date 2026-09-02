@@ -244,6 +244,20 @@ def test_builtin_profiles_resolve_complete_agent_group():
     assert "VMODEL_GLM53_SPARSE_FUSED_KV_INT8" not in (
         glm_compact_coalesced_settings)
 
+    glm_compact_tile128_order, glm_compact_tile128_settings = (
+        resolve_runtime_profiles(
+            ("glm53-flash-e-compact-mla-coalesced-tile128",), catalog))
+    assert glm_compact_tile128_order[-2:] == (
+        "glm53-flash-e-compact-mla-coalesced-batch8",
+        "glm53-flash-e-compact-mla-coalesced-tile128",
+    )
+    assert glm_compact_tile128_settings[
+        "VMODEL_GLM53_PREFILL_TILE_WIDTH"] == "128"
+    assert glm_compact_tile128_settings[
+        "VMODEL_GLM53_COALESCED_EXPERT_MAX_POSITIONS"] == "512"
+    assert "VMODEL_GLM53_SPARSE_FUSED_KV_INT8" not in (
+        glm_compact_tile128_settings)
+
     glm_fast_order, glm_fast_settings = resolve_runtime_profiles(
         ("glm53-flash-long-context-fast",), catalog)
     assert glm_fast_order == (

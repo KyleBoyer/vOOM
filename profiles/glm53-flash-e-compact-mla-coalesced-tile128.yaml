@@ -1,0 +1,11 @@
+schema: voom.runtime-profile.v1
+name: glm53-flash-e-compact-mla-coalesced-tile128
+description: Explicit GLM-5.3-Flash E-class compact/coalesced profile with a 128-position outer sweep.
+notes:
+  - "Extends the isolated compact-MLA/coalesced-expert rung and changes only the layer-stationary outer tile width from 32 to 128. The 512-row expert gather ceiling remains independently bounded."
+  - "The larger outer shape reduces Python/materialization/router overhead but can change mHC, attention-residual, and routed GEMM arithmetic boundaries. It is explicitly E-class/default-off even when finite output hashes agree."
+  - "Require the deterministic medium gate first. Promote to sustained-output, Plex/tool, vision, varied-shape, and untouched-capture gates only if wall and pressure both improve without a quality regression."
+extends:
+  - glm53-flash-e-compact-mla-coalesced-batch8
+settings:
+  VMODEL_GLM53_PREFILL_TILE_WIDTH: 128
