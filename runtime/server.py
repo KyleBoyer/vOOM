@@ -12460,7 +12460,11 @@ class Handler(BaseHTTPRequestHandler):
             # reset proxy/client idle timers during a long cold prefill, before
             # the first generated token exists.
             try:
-                if progress.get("phase") == "vision":
+                if progress.get("phase") == "memory_retry":
+                    done = int(progress.get("completed_retries", 0))
+                    total = int(progress.get("total_retries", 0))
+                    label = "memory_retry"
+                elif progress.get("phase") == "vision":
                     done = int(progress.get("completed_images", 0))
                     total = int(progress.get("total_images", 0))
                     label = "vision"
@@ -12500,6 +12504,9 @@ class Handler(BaseHTTPRequestHandler):
                         peak_metal_bytes=progress.get("peak_metal_bytes"),
                         host_spool_bytes=progress.get("host_spool_bytes"),
                         metal_limit_bytes=progress.get("metal_limit_bytes"),
+                        retry_chunk=progress.get("retry_chunk"),
+                        retry_coalesced_expert_max_positions=progress.get(
+                            "retry_coalesced_expert_max_positions"),
                     )
                 else:
                     self.wfile.write(f": {label} {done}/{total}\n\n".encode())

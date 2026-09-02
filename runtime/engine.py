@@ -13021,6 +13021,33 @@ class StreamingEngine:
                         retry_coalesced_limits.append(
                             next_coalesced_limit)
                     retry_failures.append(str(error))
+                    if on_progress is not None:
+                        # Surface a privacy-safe retry boundary before the
+                        # expensive replay begins. Long captured-request gates
+                        # can fail fast on this event instead of silently
+                        # spending hours on a known-bad smaller tile. No prompt,
+                        # route, tensor, or exception text leaves the engine.
+                        retry_count = (
+                            len(retry_chunks)
+                            + len(retry_coalesced_limits)
+                        )
+                        retry_total = len(retry_ladder) + (
+                            5 if (
+                                self.cfg.model_type == "glm5_next"
+                                and bool(getattr(
+                                    self.rc,
+                                    "glm53_coalesced_expert_positions",
+                                    False))
+                            ) else 0
+                        )
+                        on_progress({
+                            "phase": "memory_retry",
+                            "completed_retries": retry_count,
+                            "total_retries": retry_total,
+                            "retry_chunk": next_chunk,
+                            "retry_coalesced_expert_max_positions": (
+                                next_coalesced_limit),
+                        })
                     self.discard_failed_request_state()
                     if next_coalesced_limit:
                         self.rc.glm53_coalesced_expert_max_positions = (

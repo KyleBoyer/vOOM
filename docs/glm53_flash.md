@@ -284,7 +284,12 @@ control. Wall fell 826.026 to 695.088 seconds (-15.85%), index grows fell 63 to
 reads and hid 83.225 seconds. Peak rose from 1.070GB to 2.246GB but remained
 far below the 8.5GB ceiling; swap-out growth improved from 75.006MB to 49.070MB.
 `glm53-full-lossless-preallocate-prefetch-batch8` is therefore the preferred
-explicit full-model schedule pending an untouched captured-harness replay.
+explicit short/medium-context full-model schedule. The real 46,849-token /
+134-tool captured replay rejected it after layer 7: 4.70GB active plus the
+next 2.50GB attention reservation and 0.40GB margin projected 7.60GB against a
+7.58GB live ceiling. The runtime correctly triggered a tile-8 replay, which is
+already known to be catastrophically slow, so the run was stopped. A batch-4
+profile halves the future storage group for the next long-context gate.
 
 The same trace identified a host-side governor cost: 626 shrink steps released
 zero cache bytes. Named reversible reservations were repeatedly lowering an

@@ -78,7 +78,8 @@ def _parse_sse_comment_progress(line: str) -> tuple[str, int, int] | None:
     if len(parts) != 2 or "/" not in parts[1]:
         return None
     label = parts[0]
-    if label not in ("prefill", "prefill_layer", "vision"):
+    if label not in (
+            "prefill", "prefill_layer", "vision", "memory_retry"):
         return None
     completed_raw, total_raw = parts[1].split("/", 1)
     try:
@@ -404,7 +405,8 @@ def _post(
         expected_output_text_terms: tuple[str, ...] = (),
         expected_output_text_any_terms: tuple[str, ...] = (),
         score_plex_profile: bool = False,
-        print_progress: bool = False) -> dict:
+        print_progress: bool = False,
+        fail_on_memory_retry: bool = False) -> dict:
     request = urllib.request.Request(
         url, data=payload, headers={"Content-Type": "application/json"},
         method="POST")
@@ -414,6 +416,7 @@ def _post(
     comment_progress_seen: set[tuple[str, int, int]] = set()
     deltas: list[str] = []
     response_value = None
+    aborted_on_memory_retry = False
     try:
         with urllib.request.urlopen(request, timeout=timeout) as response:
             if not stream:
@@ -448,6 +451,10 @@ def _post(
                                     f"elapsed={item['elapsed_s']:.4f}s",
                                     flush=True,
                                 )
+                            if label == "memory_retry" \
+                                    and fail_on_memory_retry:
+                                aborted_on_memory_retry = True
+                                break
                         continue
                     if not line.startswith("data: "):
                         continue
@@ -469,6 +476,10 @@ def _post(
                                 "active_metal_bytes", "peak_metal_bytes",
                                 "host_spool_bytes", "metal_limit_bytes")
                         })
+                        if event.get("phase") == "memory_retry" \
+                                and fail_on_memory_retry:
+                            aborted_on_memory_retry = True
+                            break
                     if event_type in (
                             "response.completed", "response.incomplete",
                             "response.failed"):
@@ -497,6 +508,21 @@ def _post(
             "http_status": 599,
             "response_status": None,
             "error": f"{type(error).__name__}: {error}",
+            "wall_seconds": round(time.perf_counter() - started, 4),
+            "sse_event_types": events,
+            "output_text_delta_events": len(deltas),
+            "output_text_delta_bytes": sum(
+                len(delta.encode("utf-8")) for delta in deltas),
+            "output_text_delta_max_bytes": max(
+                (len(delta.encode("utf-8")) for delta in deltas), default=0),
+            "prefill_progress": progress,
+        }
+    if aborted_on_memory_retry:
+        return {
+            "http_status": 598,
+            "response_status": None,
+            "error": "aborted_on_memory_retry",
+            "aborted_on_memory_retry": True,
             "wall_seconds": round(time.perf_counter() - started, 4),
             "sse_event_types": events,
             "output_text_delta_events": len(deltas),
@@ -652,6 +678,12 @@ def main() -> int:
         help=(
             "print privacy-safe prefill progress comments with elapsed time; "
             "does not alter the captured request body"))
+    parser.add_argument(
+        "--fail-on-memory-retry", action="store_true",
+        help=(
+            "close the response and publish a failed artifact as soon as the "
+            "server reports a prefill replay; useful for rejecting known-slow "
+            "fallbacks without waiting for the restarted request"))
     parser.add_argument("--expected-selected-tools", type=int)
     parser.add_argument("--expected-max-input-tokens", type=int)
     parser.add_argument("--expected-embedding-status")
@@ -940,7 +972,8 @@ def main() -> int:
             expected_output_text_any_terms=tuple(
                 args.expected_output_text_any_term),
             score_plex_profile=args.score_plex_profile,
-            print_progress=args.print_progress)
+            print_progress=args.print_progress,
+            fail_on_memory_retry=args.fail_on_memory_retry)
         after = _pressure()
         row["repeat"] = index + 1
         row["request_label"] = label
@@ -1213,6 +1246,7 @@ def main() -> int:
                 for item in (request_value.get("input") or ())
                 if isinstance(item, dict) and item.get("role") == "system"),
             "score_plex_profile": args.score_plex_profile,
+            "fail_on_memory_retry": args.fail_on_memory_retry,
         },
         "expectations": {
             "max_first_wall_seconds": args.expected_max_first_wall_seconds,

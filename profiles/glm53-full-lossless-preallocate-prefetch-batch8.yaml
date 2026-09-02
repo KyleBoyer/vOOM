@@ -4,7 +4,8 @@ description: Explicit full GLM-5.3 exact index preallocation and eight-page expe
 notes:
   - "Extends the exact index-preallocation profile. The request's known final length allocates each DSA index backing once; logical lengths and released selector arithmetic are unchanged."
   - "Groups up to eight exact FP8 expert pages per storage fetch and overlaps one future group with current compute. expert_compute_batch remains one, so released matmuls and ascending expert accumulation order are unchanged."
-  - "The deterministic 2,123-input/max-1 released-model gate preserved request/output hashes and the exact 708.060GB read count. Wall fell 826.026s to 695.088s (-15.85%); index grows fell 63 to 21, copied rows 64,512 to zero, and prefetch hid 83.225s. Peak rose 1.070GB to 2.246GB but remained far below 8.5GB; swap-out growth improved 75.006MB to 49.070MB. Preferred explicit full-model schedule pending an untouched captured-harness replay."
+  - "The deterministic 2,123-input/max-1 released-model gate preserved request/output hashes and the exact 708.060GB read count. Wall fell 826.026s to 695.088s (-15.85%); index grows fell 63 to 21, copied rows 64,512 to zero, and prefetch hid 83.225s. Peak rose 1.070GB to 2.246GB; swap-out growth improved 75.006MB to 49.070MB."
+  - "Rejected for the real 46,849-token/134-tool capture: after layer 7, active memory reached 4.70GB and the next 2.50GB attention reservation projected 7.60GB against a 7.58GB live ceiling, triggering the already-rejected tile-8 full replay. Retained only as a short/medium-context explicit profile; batch 4 is the pressure-reduced long-context candidate."
 extends:
   - glm53-full-lossless-index-preallocate
 settings:

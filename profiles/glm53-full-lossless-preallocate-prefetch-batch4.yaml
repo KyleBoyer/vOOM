@@ -1,0 +1,12 @@
+schema: voom.runtime-profile.v1
+name: glm53-full-lossless-preallocate-prefetch-batch4
+description: Full GLM-5.3 exact preallocation and four-page expert-prefetch long-context candidate.
+notes:
+  - "Extends the exact index-preallocation profile and groups at most four exact FP8 expert pages per storage fetch while retaining expert_compute_batch=1 and released ascending accumulation."
+  - "This is the pressure-reduced successor to batch 8. Batch 8 won the deterministic 2,123-input gate but was rejected on the real 46,849-token/134-tool capture after layer 7: a 2.50GB attention reservation projected 7.60GB against a 7.58GB live ceiling and triggered the known-catastrophic tile-8 replay."
+  - "Explicit pending a fail-fast no-retry captured-harness gate. Any memory_retry progress event rejects the run before the smaller-tile replay begins."
+extends:
+  - glm53-full-lossless-index-preallocate
+settings:
+  VMODEL_GLM53_EXPERT_FETCH_BATCH: 4
+  VMODEL_GLM53_EXPERT_BATCH_PREFETCH: true

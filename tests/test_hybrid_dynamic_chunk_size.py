@@ -194,6 +194,7 @@ def test_memory_retry_replays_unsampled_prefill_on_lower_rungs():
     engine.rc.prefill_chunk_size = 512
     attempts = []
     discards = []
+    progress = []
 
     def generate(*_args, **_kwargs):
         attempts.append(engine.rc.prefill_chunk_size)
@@ -209,12 +210,29 @@ def test_memory_retry_replays_unsampled_prefill_on_lower_rungs():
     engine.discard_failed_request_state = lambda: discards.append(True)
     with (patch("runtime.engine.mx.clear_cache"),
           patch("runtime.engine.mx.reset_peak_memory")):
-        result = StreamingEngine.generate_with_memory_retry(engine, "prompt")
+        result = StreamingEngine.generate_with_memory_retry(
+            engine, "prompt", on_progress=progress.append)
 
     assert attempts == [512, 128, 32]
     assert len(discards) == 2
     assert result["path_stats"]["memory_prefill_retries"] == 2
     assert result["path_stats"]["memory_prefill_retry_chunks"] == [128, 32]
+    assert progress == [
+        {
+            "phase": "memory_retry",
+            "completed_retries": 1,
+            "total_retries": 4,
+            "retry_chunk": 128,
+            "retry_coalesced_expert_max_positions": 0,
+        },
+        {
+            "phase": "memory_retry",
+            "completed_retries": 2,
+            "total_retries": 4,
+            "retry_chunk": 32,
+            "retry_coalesced_expert_max_positions": 0,
+        },
+    ]
     cleanup = result["path_stats"]["memory_prefill_retry_cleanup"]
     assert [entry["chunk"] for entry in cleanup] == [128, 32]
     assert all(entry["released_bytes"] >= 0 for entry in cleanup)

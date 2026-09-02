@@ -8,6 +8,8 @@ def test_parse_privacy_safe_progress_comment():
         "prefill_layer", 17, 45)
     assert _parse_sse_comment_progress(": vision 3/8") == (
         "vision", 3, 8)
+    assert _parse_sse_comment_progress(": memory_retry 1/4") == (
+        "memory_retry", 1, 4)
 
 
 def test_reject_non_progress_or_invalid_comment():

@@ -141,7 +141,16 @@ copied rows 64,512 -> zero; 2,323 grouped future reads hid 83.225 seconds of
 service. Peak Metal rose 1.070 -> 2.246GB but remained far below the 8.5GB
 ceiling, while swap-out growth improved 75.006 -> 49.070MB and post-run
 available memory increased by 178MB. The composition is the preferred explicit
-full-model schedule pending an untouched captured-harness replay; no automatic
+full-model short/medium-context schedule, but the first real 46,849-token /
+134-tool capture rejected batch 8 after layer 7. Active memory reached 4.70GB;
+the next exact attention reservation required 2.50GB plus 0.40GB margin, for a
+7.60GB projection against the 7.58GB live ceiling. The runtime correctly
+refused it and began the previously rejected tile-8 full replay, so the run was
+stopped rather than misreported as a win. Batch 8 is no longer the long-context
+candidate. `glm53-full-lossless-preallocate-prefetch-batch4` halves the future
+storage group while retaining one-expert arithmetic and is the next explicit
+no-retry gate. New `memory_retry` SSE instrumentation lets the harness abort
+and publish a failed artifact before an unsafe multi-hour replay. No automatic
 default changes.
 
 The compiled GLM-5.3-Flash KDA graph now accepts an identity-bound segment
