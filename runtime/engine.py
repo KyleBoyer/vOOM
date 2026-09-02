@@ -1343,6 +1343,9 @@ class RuntimeConfig:
     # can hide storage exposed by faster/coalesced expert compute while keeping
     # routes, fetch order, and arithmetic order unchanged.
     expert_batch_prefetch_depth: int = 1
+    # Explicit storage-worker count for the ordered future queue. Consumption
+    # remains authoritative-order even when two independent reads overlap.
+    expert_batch_prefetch_workers: int = 1
     # Explicit measurement-only route analysis. Reconstruct adjacent-position
     # expert sets from the authoritative router output to quantify cache reuse
     # and speculative multi-position union growth. Disabled by default because
@@ -1584,6 +1587,8 @@ class RuntimeConfig:
             expert_batch_prefetch=run.get("expert_batch_prefetch", False),
             expert_batch_prefetch_depth=run.get(
                 "expert_batch_prefetch_depth", 1),
+            expert_batch_prefetch_workers=run.get(
+                "expert_batch_prefetch_workers", 1),
             expert_route_overlap_telemetry=run.get(
                 "expert_route_overlap_telemetry", False
             ),
@@ -2843,7 +2848,9 @@ class StreamingEngine:
         # depth controls queued futures, not concurrent disk readers.
         self._expert_batch_executor = (
             cf.ThreadPoolExecutor(
-                max_workers=1, thread_name_prefix="vmodel-expert-batch")
+                max_workers=max(1, int(getattr(
+                    self.rc, "expert_batch_prefetch_workers", 1) or 1)),
+                thread_name_prefix="vmodel-expert-batch")
             if self.rc.expert_batch_prefetch and self.cfg.num_experts
             else None
         )
@@ -12605,6 +12612,8 @@ class StreamingEngine:
             self._expert_batch_prefetch_hidden_s)
         path_stats["expert_batch_prefetch_depth"] = int(getattr(
             self.rc, "expert_batch_prefetch_depth", 1))
+        path_stats["expert_batch_prefetch_workers"] = int(getattr(
+            self.rc, "expert_batch_prefetch_workers", 1))
         path_stats["expert_batch_prefetch_max_futures"] = (
             self._expert_batch_prefetch_max_futures)
         path_stats["expert_shared_overlap_layers"] = (

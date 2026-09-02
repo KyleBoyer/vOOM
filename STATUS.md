@@ -48,6 +48,17 @@ GEMMs, only two completely full 512-row chunks, and a hottest-expert fan-in of
 shape and queues two exact future storage batches on the same ordered worker;
 this is a lossless scheduling change relative to the already E-class parent.
 
+That one-worker depth-two rung is also not a speed promotion. It retained the
+same deterministic request/output hashes, exact 300.907GB read volume, tile
+32, and 11,550 coalesced GEMMs, but wall changed only 356.628 -> 356.477
+seconds (noise). Expert-I/O wait improved just 169.195 -> 168.231 seconds and
+hidden time 104.997 -> 107.215 seconds. Peak measured lower at 2.778GB, while
+swap-out grew 18.989MB. The ordered queue and `max_futures=2` telemetry are
+verified, but one worker is storage-bound. A final explicit scheduling rung
+allows the two queued reads to overlap on two workers while consuming them in
+authoritative order; reject it unless end-to-end wall improves with bounded
+peak/swap, since concurrent same-tier reads can just as easily contend.
+
 ## 2026-09-02: Qwen Flash abliterated overlay runs; new exact GLM schedules are isolated
 
 The pinned `windowsxp811203/Qwen3.8-Flash-Next-Abliterated` revision

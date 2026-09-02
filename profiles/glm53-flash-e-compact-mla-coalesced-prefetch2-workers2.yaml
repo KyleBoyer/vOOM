@@ -1,0 +1,11 @@
+schema: voom.runtime-profile.v1
+name: glm53-flash-e-compact-mla-coalesced-prefetch2-workers2
+description: Explicit GLM-5.3-Flash compact/coalesced rung with two ordered future reads on two workers.
+notes:
+  - "Extends the depth-two exact expert-I/O queue and allows its two future batches to read concurrently. The consumer still awaits and executes batches in authoritative ascending order; target arithmetic is unchanged relative to the E-class parent."
+  - "This is an end-to-end storage experiment, not a bandwidth-microbenchmark promotion. Concurrent reads can contend on one tier and retain two exact page groups, so wall, read volume, Metal peak, swap, and the deterministic output witness are mandatory."
+  - "Depth two on one worker was neutral at 2,123 inputs: 356.477 seconds versus 356.628 for depth one, with wait 168.231 versus 169.195 seconds. Two workers must beat that without unsafe pressure or it is rejected."
+extends:
+  - glm53-flash-e-compact-mla-coalesced-prefetch2
+settings:
+  VMODEL_GLM53_EXPERT_BATCH_PREFETCH_WORKERS: 2

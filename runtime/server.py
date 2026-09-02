@@ -2222,6 +2222,8 @@ class EngineManager:
                 "VMODEL_GLM53_EXPERT_FETCH_BATCH", "1"))
             glm53_expert_batch_prefetch_depth = int(os.environ.get(
                 "VMODEL_GLM53_EXPERT_BATCH_PREFETCH_DEPTH", "1"))
+            glm53_expert_batch_prefetch_workers = int(os.environ.get(
+                "VMODEL_GLM53_EXPERT_BATCH_PREFETCH_WORKERS", "1"))
             glm53_trunk_prefetch_depth = int(os.environ.get(
                 "VMODEL_GLM53_TRUNK_PREFETCH_DEPTH", "0"))
             glm53_trunk_prefetch_workers = int(os.environ.get(
@@ -2235,6 +2237,9 @@ class EngineManager:
         if not 1 <= glm53_expert_batch_prefetch_depth <= 3:
             raise RequestValidationError(
                 "VMODEL_GLM53_EXPERT_BATCH_PREFETCH_DEPTH must be in [1, 3]")
+        if not 1 <= glm53_expert_batch_prefetch_workers <= 2:
+            raise RequestValidationError(
+                "VMODEL_GLM53_EXPERT_BATCH_PREFETCH_WORKERS must be in [1, 2]")
         if not 0 <= glm53_trunk_prefetch_depth <= 2:
             raise RequestValidationError(
                 "VMODEL_GLM53_TRUNK_PREFETCH_DEPTH must be in [0, 2]")
@@ -2371,6 +2376,7 @@ class EngineManager:
             glm53_expert_fetch_batch,
             glm53_expert_batch_prefetch_request,
             glm53_expert_batch_prefetch_depth,
+            glm53_expert_batch_prefetch_workers,
             glm53_trunk_prefetch_depth,
             glm53_trunk_prefetch_workers,
         )
@@ -2512,6 +2518,7 @@ class EngineManager:
             glm53_expert_fetch_batch,
             glm53_expert_batch_prefetch_request,
             glm53_expert_batch_prefetch_depth,
+            glm53_expert_batch_prefetch_workers,
             glm53_trunk_prefetch_depth,
             glm53_trunk_prefetch_workers,
         )
@@ -2851,6 +2858,8 @@ class EngineManager:
                     glm53_expert_batch_prefetch_request == "1")
                 rc.expert_batch_prefetch_depth = (
                     glm53_expert_batch_prefetch_depth)
+                rc.expert_batch_prefetch_workers = (
+                    glm53_expert_batch_prefetch_workers)
                 rc.prefill_chunk_size = glm53_prefill_tile_width
                 rc.layer_stationary_prefill = True
                 rc.adaptive_chunk_size = False
@@ -2990,6 +2999,8 @@ class EngineManager:
                         glm53_expert_batch_prefetch_request == "1")
                     rc.expert_batch_prefetch_depth = (
                         glm53_expert_batch_prefetch_depth)
+                    rc.expert_batch_prefetch_workers = (
+                        glm53_expert_batch_prefetch_workers)
                     rc.glm_dsa_index_step_size = glm_dsa_index_step_size
                     rc.glm_dsa_index_preallocate = (
                         glm_dsa_index_preallocate_request == "1")
@@ -9558,6 +9569,7 @@ def _vision_protocol_timing(result: dict) -> dict:
         "expert_batch_prefetch",
         "expert_batch_prefetch_submitted",
         "expert_batch_prefetch_depth",
+        "expert_batch_prefetch_workers",
         "expert_batch_prefetch_max_futures",
         "expert_shared_overlap_layers",
         "speculative_enabled",

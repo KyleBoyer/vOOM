@@ -255,6 +255,19 @@ def test_builtin_profiles_resolve_complete_agent_group():
     assert glm_prefetch2_settings[
         "VMODEL_GLM53_PREFILL_TILE_WIDTH"] == "32"
 
+    glm_prefetch2_workers2_order, glm_prefetch2_workers2_settings = (
+        resolve_runtime_profiles((
+            "glm53-flash-e-compact-mla-coalesced-prefetch2-workers2",),
+            catalog))
+    assert glm_prefetch2_workers2_order[-2:] == (
+        "glm53-flash-e-compact-mla-coalesced-prefetch2",
+        "glm53-flash-e-compact-mla-coalesced-prefetch2-workers2",
+    )
+    assert glm_prefetch2_workers2_settings[
+        "VMODEL_GLM53_EXPERT_BATCH_PREFETCH_DEPTH"] == "2"
+    assert glm_prefetch2_workers2_settings[
+        "VMODEL_GLM53_EXPERT_BATCH_PREFETCH_WORKERS"] == "2"
+
     glm_compact_tile128_order, glm_compact_tile128_settings = (
         resolve_runtime_profiles(
             ("glm53-flash-e-compact-mla-coalesced-tile128",), catalog))

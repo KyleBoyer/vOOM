@@ -5,6 +5,7 @@ notes:
   - "Extends the tile-32 compact/coalesced winner and changes only the authoritative expert-I/O pipeline depth from one future batch to two. One disk worker preserves fetch order; routes, released pages, per-expert compute, and ascending accumulation order are unchanged."
   - "Depth two is a lossless scheduling technique relative to this already E-class parent, but can retain one additional exact eight-page storage batch. The governor and 8.5GB hard cap remain authoritative."
   - "The 2,123-token depth-one gate exposed 169.195 seconds of expert-I/O wait after coalescing reduced MLP compute. Require identical output/state, lower wait/wall, and bounded peak/swap before any longer gate."
+  - "Depth two on one worker preserved the deterministic output hash and exact 300.907GB read volume, but was neutral: 356.477 versus 356.628 seconds. Wait fell only 169.195 -> 168.231 seconds; peak was 2.778GB and swap-out growth 18.989MB. Keep as instrumentation/capacity infrastructure, not a speed promotion."
 extends:
   - glm53-flash-e-compact-mla-coalesced-batch8
 settings:
