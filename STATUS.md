@@ -1,5 +1,30 @@
 # STATUS — 2026-09-02 (current corrections first; dated chronology below is history)
 
+## 2026-09-02: compact GLM Flash clears untouched 46.8K capacity; latency is rejected
+
+The explicit `glm53-flash-e-compact-mla-prefetch-batch8` composition has now
+completed the **untouched** pinned 178,616-byte / 134-tool capture at 46,849
+input tokens and the original streaming/sampling shape. The gate changed only
+the model alias and applied a one-output capacity cap; capture SHA remained
+`8ac18b8e...90e85`, no synthetic tool schema or replacement message was used,
+and all five expected profile identities were present with zero overrides.
+It passed HTTP/profile/capacity validation with zero memory retries and zero
+adaptive expert-batch clamps. Wall was **8,408.109 seconds** (8,402.167 engine,
+8,402.161 prefill), true peak Metal was **6.516GB**, and the profile read
+316.313GB.
+
+This is a capacity proof, not a speed or quality promotion. The compact sparse
+MLA route prevented the batch-eight failure seen with expanded K/V, but MLP
+still consumed 5,320.214 seconds and attention 2,962.084 seconds (1,099.434
+compiled KDA + 1,862.650 absorbed MLA). Exact expert prefetch hid 335.343
+seconds and waited only 9.139 seconds, so storage overlap is no longer the
+dominant remaining lever. Physical swap-out grew 265.126MB, above the normal
+64/128MB pressure gates even though Metal stayed below 8.5GB. Keep this profile
+explicit/default-off as the long-capacity baseline; next isolate bounded
+expert-position coalescing and the fused selected-row attention operator, then
+require deterministic equality, sustained-output, Plex/tool, vision, varied
+shape, and strict pressure gates before promotion.
+
 ## 2026-09-02: Qwen Flash abliterated overlay runs; new exact GLM schedules are isolated
 
 The pinned `windowsxp811203/Qwen3.8-Flash-Next-Abliterated` revision
