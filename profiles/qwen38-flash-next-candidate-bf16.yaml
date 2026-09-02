@@ -1,0 +1,36 @@
+schema: voom.runtime-profile.v1
+name: qwen38-flash-next-candidate-bf16
+description: Isolated exact-representation BF16 evaluation route for Qwen3.8-Flash-Next weight-edited candidates.
+notes:
+  - The candidate's published BF16 tensors are served byte-for-byte. This is lossless with respect to the candidate representation but is not the official Qwen target; the weight edit remains a semantic sidequest until independent quality gates pass.
+  - Official trace-balanced expert mirrors, derived embedding rows, prompt-state journals, and cached MTP calibration are deliberately disabled because the candidate edits embeddings, routed/shared experts, trunk output projections, and MTP.
+  - The exact compiled DeltaNet recurrence, bounded 1024-position layer-stationary prefill, PLE direct-row provider, phase-scoped output head, and four-graph expert synchronization are content-independent runtime optimizations already gated on the released topology.
+  - Native MTP is disabled for first-pass quality isolation. A later candidate-specific profile may enable it only after plain autoregressive harness, varied-shape, vision, and pressure gates pass.
+  - Keep this profile explicit. It must never select an official-model fast tier merely because filenames and shapes match.
+settings:
+  VMODEL_RESIDENT_BACKEND: voom
+  VMODEL_EXECUTION_PROFILE: layers
+  VMODEL_QWEN4_WEIGHT_CACHE_MB: 400
+  VMODEL_QWEN4_MIN_WEIGHT_CACHE_MB: 64
+  VMODEL_QWEN4_MLX_CACHE_MB: 128
+  VMODEL_QWEN4_PREFILL_CHUNK: 1024
+  VMODEL_QWEN4_EXPERT_FETCH_BATCH: 16
+  VMODEL_QWEN4_DECODE_EXPERT_FETCH_BATCH: 16
+  VMODEL_QWEN4_PREFETCH_DEPTH: 1
+  VMODEL_QWEN4_PREFETCH_WORKERS: 1
+  VMODEL_QWEN4_PLE_READ_WORKERS: 8
+  VMODEL_QWEN4_MAX_METAL_MB: 8500
+  VMODEL_QWEN4_SPARSE_EXPERT_BATCH_ROWS: false
+  VMODEL_QWEN4_GLOBAL_EXPERT_ROWS: false
+  VMODEL_QWEN4_EXPERT_TILE_EVAL_BATCH: 4
+  VMODEL_QWEN4_COMPILED_DELTA: true
+  VMODEL_QWEN4_PARALLEL_STORAGE_READS: false
+  VMODEL_QWEN4_HOT_PROMPT_KV: false
+  VMODEL_QWEN4_FAST_TIER_DECODE_ONLY: false
+  VMODEL_QWEN4_PHASE_LM_HEAD: true
+  VMODEL_QWEN4_MTP_DEPTH: 0
+  VMODEL_QWEN4_SERIAL_VERIFY_SUSPEND_LM_HEAD: false
+  VMODEL_QWEN4_SERIAL_VERIFY_EXACT_BF16_GEMV: false
+  VMODEL_EXPERT_BATCH_PREFETCH: false
+  VMODEL_FAST_TOOL_GATEWAY: false
+  VMODEL_QWEN_MTP_SPECULATIVE: false

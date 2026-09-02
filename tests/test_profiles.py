@@ -217,6 +217,15 @@ def test_builtin_profiles_resolve_complete_agent_group():
     assert glm_full_settings["VMODEL_GLM53_EXPERT_FETCH_BATCH"] == "1"
     assert glm_full_settings["VMODEL_GLM53_EXPERT_BATCH_PREFETCH"] == "0"
 
+    candidate_order, candidate_settings = resolve_runtime_profiles(
+        ("qwen38-flash-next-candidate-bf16",), catalog)
+    assert candidate_order == ("qwen38-flash-next-candidate-bf16",)
+    assert candidate_settings["VMODEL_QWEN4_PREFILL_CHUNK"] == "1024"
+    assert candidate_settings["VMODEL_QWEN4_COMPILED_DELTA"] == "1"
+    assert candidate_settings["VMODEL_QWEN4_HOT_PROMPT_KV"] == "0"
+    assert candidate_settings["VMODEL_QWEN4_MTP_DEPTH"] == "0"
+    assert "VMODEL_QWEN4_FAST_TIER_DIR" not in candidate_settings
+
     long_order, long_settings = resolve_runtime_profiles(
         ("huihui-qwen38-27b-fast-long-context",), catalog)
     assert long_order == (
