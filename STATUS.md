@@ -25,6 +25,18 @@ expert-position coalescing and the fused selected-row attention operator, then
 require deterministic equality, sustained-output, Plex/tool, vision, varied
 shape, and strict pressure gates before promotion.
 
+The first isolated coalescing rung has now cleared the same deterministic
+2,123-input/max-1 witness. Request SHA `dbc7247b...b15ae` and output SHA
+`58bb119c...09cb5` matched the compact/batch-eight control. Bounded 512-row
+expert GEMMs reduced wall **427.193 -> 356.628 seconds (-16.5%)** and MLP
+355.563 -> **284.828 seconds (-19.9%)** while preserving tile 32, compact MLA,
+released routing, and the 300.907GB read volume. True peak was effectively
+unchanged at 3.167GB, no retry/clamp occurred, and physical swap-out grew
+16.122MB. This is promising but still E-class: changed GEMM outer shapes can
+reassociate arithmetic, the one-token witness is not an intelligence gate,
+and the strict 16MB pressure line was missed narrowly. New content-blind route
+occupancy/GEMM-fill telemetry is now exposed for the next bound and long gate.
+
 ## 2026-09-02: Qwen Flash abliterated overlay runs; new exact GLM schedules are isolated
 
 The pinned `windowsxp811203/Qwen3.8-Flash-Next-Abliterated` revision

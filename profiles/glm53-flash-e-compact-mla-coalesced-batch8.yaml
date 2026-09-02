@@ -5,6 +5,7 @@ notes:
   - "Extends compact sparse MLA and the exact batch-eight prefetch schedule, then coalesces routed positions for each released expert into GEMMs bounded at 512 rows. Released weights, router choices, expert IDs, routing weights, and scatter destinations are unchanged."
   - "Coalescing changes expert GEMM outer shapes and floating-point boundaries, so this composition is explicitly E-class/lossy even when finite tokens agree. It remains default-off and content-blind."
   - "Unlike glm53-flash-long-context-fast, this isolation rung keeps the proven tile-32 outer sweep and does not enable int8 expanded K/V or fused expanded attention. Compact MLA owns sparse attention after 2,048 keys."
+  - "On the deterministic 2,123-input/max-1 witness, request/output hashes matched the compact batch-eight control. Wall fell 427.193 -> 356.628 seconds and MLP 355.563 -> 284.828 seconds at a 3.167GB peak, with zero retry/clamp and 16.122MB physical swap-out growth. This remains a finite equality/timing witness, not an intelligence promotion."
   - "Require deterministic output/state gates, bounded peak and swap pressure, sustained output, Plex/tool, vision, varied shapes, and the untouched captured harness before any promotion."
 extends:
   - glm53-flash-e-compact-mla-prefetch-batch8

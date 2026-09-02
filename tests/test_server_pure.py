@@ -222,6 +222,24 @@ def test_protocol_timing_exposes_glm53_phase_active_peaks():
         assert timing[key] == value
 
 
+def test_protocol_timing_exposes_glm53_coalescing_occupancy():
+    counters = {
+        "glm53_coalesced_expert_layers": 42,
+        "glm53_coalesced_expert_input_positions": 89_166,
+        "glm53_coalesced_expert_route_assignments": 713_328,
+        "glm53_coalesced_expert_unique_experts": 10_752,
+        "glm53_coalesced_expert_max_unique_experts": 256,
+        "glm53_coalesced_expert_max_expert_routes": 1_100,
+        "glm53_coalesced_expert_gemm_input_positions": 713_328,
+        "glm53_coalesced_expert_gemm_full_chunks": 512,
+    }
+
+    timing = _vision_protocol_timing({"path_stats": counters})
+
+    for key, value in counters.items():
+        assert timing[key] == value
+
+
 def test_protocol_timing_preserves_full_glm_dsa_phase_precision():
     phases = {
         "dsa_selection_spill_write_s": 0.125,
