@@ -7,8 +7,15 @@ batch in `glm53-full-lossless-long-context`. At the real 46,849-key / top-2048
 geometry, query widths 64, 128, and 256 all returned byte-identical stable
 candidate IDs. Width 64 was the measured winner: 0.05110 seconds per synthetic
 group, 207.1MB peak Metal, and a 37.4-second projected whole-prompt score phase,
-versus 39.8/39.3 seconds and 374/707MB for widths 128/256. A fresh real captured
-harness replay remains the promotion gate. The first composed replay also
+versus 39.8/39.3 seconds and 374/707MB for widths 128/256. The fresh untouched
+captured-harness replay has now passed: wall fell 3,573.109 -> **3,541.475
+seconds** (-31.635s, -0.89%), prefill fell 3,567.451 -> **3,535.103 seconds**,
+and measured selector time fell 481.262 -> **429.936 seconds** (-10.66%). Peak
+Metal fell 6.024 -> **5.829GB** and swap-out grew 120.81MiB, below the 128MiB
+run gate. The capture samples at temperature 1 without a seed, so its different
+one-token hash is not an arithmetic-identity test; the byte-identical synthetic
+width/tie gate remains the exact component proof pending a paired real
+temperature-zero replay. The first composed replay also
 exposed and rejected an unrelated outer-tile regression: tile 8 had not
 finished layer 0 after 222 seconds versus 49.9 seconds in the proven tile-32
 baseline, with healthy memory. The profile therefore keeps outer tile 32 and
@@ -49,6 +56,7 @@ the current 755GB checkpoint.
 Evidence: `logs/glm53_flash_long_compiled_kda_actual_20260901.json`,
 `logs/glm53_native_kda_h64_l128_20260902.json`,
 `logs/glm53_full_dsa_width{64,128,256}_20260902.json`,
+`logs/glm53_full_width64_tile32_actual_v2_20260902.json`,
 `logs/glm53_flash_dflash2_reject4_fix2_20260902.json`,
 `logs/glm53_flash_dflash2_spec16_20260902.json`, and
 `logs/glm53_serial_prefix4_diag_20260902.json`.
