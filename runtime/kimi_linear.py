@@ -713,6 +713,7 @@ def _kda_attention(
     native_fused_decode: bool = False,
     native_fused_prefill: bool = False,
     compiled_prefill: bool = False,
+    compiled_prefill_segment: int = 32,
     released_output_dtype: bool = False,
     profile=None,
 ) -> mx.array:
@@ -813,7 +814,8 @@ def _kda_attention(
             q, k, v, gate, beta, state)
     elif L > 1 and compiled_prefill:
         o, state = _compiled_kda_prefill_scan(
-            q, k, v, gate, beta, state)
+            q, k, v, gate, beta, state,
+            segment=compiled_prefill_segment)
     else:
         outputs = []
         for t in range(L):

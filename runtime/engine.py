@@ -1186,6 +1186,9 @@ class RuntimeConfig:
     # reduction order, and state materialization cadence; explicit until a
     # real checkpoint timing/token gate proves useful performance.
     glm53_compiled_kda_prefill: bool = False
+    # Positions per compiled recurrence graph. Segment 32 is the measured
+    # baseline; 16 is an explicit lower-peak candidate until a real-model gate.
+    glm53_compiled_kda_segment: int = 32
     # Explicit lossy GLM-5.3 KDA prefill scan.  The fused Metal kernel keeps
     # the released causal recurrence and FP32 storage, but its in-kernel
     # reductions can associate differently from MLX's operator graph.  It is
@@ -1480,6 +1483,8 @@ class RuntimeConfig:
                 "glm53_incremental_dsa_pool", False),
             glm53_compiled_kda_prefill=run.get(
                 "glm53_compiled_kda_prefill", False),
+            glm53_compiled_kda_segment=run.get(
+                "glm53_compiled_kda_segment", 32),
             glm53_native_fused_kda_prefill=run.get(
                 "glm53_native_fused_kda_prefill", False),
             glm_dsa_key_tile_size=run.get(
@@ -1677,6 +1682,9 @@ class StreamingEngine:
             raise ValueError(
                 "glm_dsa_mla_kv_spill_dir requires compressed MLA"
             )
+        if self.rc.glm53_compiled_kda_segment not in (16, 32, 64, 128):
+            raise ValueError(
+                "glm53_compiled_kda_segment must be 16, 32, 64, or 128")
         if (
             self.rc.glm_dsa_sparse_absorbed_mla
             and not self.rc.glm_dsa_mla_kv_spill_dir
@@ -5853,6 +5861,8 @@ class StreamingEngine:
                         self.rc.glm53_native_fused_kda_prefill),
                     compiled_kda_prefill=(
                         self.rc.glm53_compiled_kda_prefill),
+                    compiled_kda_prefill_segment=(
+                        self.rc.glm53_compiled_kda_segment),
                     profile=profiler,
                 )
                 mx.eval(hc_stream)
@@ -7977,6 +7987,8 @@ class StreamingEngine:
                                 self.rc.glm53_native_fused_kda_prefill),
                             compiled_prefill=(
                                 self.rc.glm53_compiled_kda_prefill),
+                            compiled_prefill_segment=(
+                                self.rc.glm53_compiled_kda_segment),
                             released_output_dtype=True,
                             profile=profiler,
                         )
@@ -9771,6 +9783,7 @@ class StreamingEngine:
                     self.rc.glm53_coalesced_expert_max_positions}"
                 f"glm53poolcache{int(self.rc.glm53_incremental_dsa_pool)}"
                 f"glm53compiledkda{int(self.rc.glm53_compiled_kda_prefill)}"
+                f"glm53compiledkdaseg{self.rc.glm53_compiled_kda_segment}"
                 f"glm53nativekda{int(
                     self.rc.glm53_native_fused_kda_prefill)}"
                 f"glmdsakeytile{self.rc.glm_dsa_key_tile_size}"
@@ -12421,6 +12434,8 @@ class StreamingEngine:
                 self.rc.glm53_incremental_dsa_pool)
             path_stats["glm53_compiled_kda_prefill"] = int(
                 self.rc.glm53_compiled_kda_prefill)
+            path_stats["glm53_compiled_kda_segment"] = int(
+                self.rc.glm53_compiled_kda_segment)
             path_stats["glm53_native_fused_kda_prefill"] = int(
                 self.rc.glm53_native_fused_kda_prefill)
             path_stats["glm53_layer_stationary_memory_samples"] = int(

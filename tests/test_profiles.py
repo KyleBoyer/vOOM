@@ -159,6 +159,17 @@ def test_builtin_profiles_resolve_complete_agent_group():
     assert "VMODEL_GLM53_COALESCED_EXPERT_POSITIONS" not in (
         glm_flash_settings)
 
+    glm_segment16_order, glm_segment16_settings = resolve_runtime_profiles(
+        ("glm53-flash-lossless-compiled-kda-segment16",), catalog)
+    assert glm_segment16_order == (
+        "glm53-flash-lossless-compiled-kda",
+        "glm53-flash-lossless-compiled-kda-segment16",
+    )
+    assert glm_segment16_settings[
+        "VMODEL_GLM53_COMPILED_KDA_PREFILL"] == "1"
+    assert glm_segment16_settings[
+        "VMODEL_GLM53_COMPILED_KDA_SEGMENT"] == "16"
+
     glm_flash_prefetch_order, glm_flash_prefetch_settings = (
         resolve_runtime_profiles(
             ("glm53-flash-lossless-expert-prefetch",), catalog))

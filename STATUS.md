@@ -24,6 +24,17 @@ cold. It read 160.99GB of expert data with zero official fast-tier reuse and
 returned an intentionally incomplete eight-token response, so this is a
 runtime proof rather than a quality or latency promotion.
 
+An exact candidate-tier constructor now validates the official Qwen fast tier,
+requires same-volume internal APFS clonefile semantics, accounts both logical
+copies against the 90GB global policy, rewrites only candidate-different 8MB
+extents, rebinds the immutable config/index identity, and byte-compares every
+published extent against the candidate before atomic publication. The unit
+gate changes one selected down-projection tensor and proves both the released
+source tier and candidate clone still validate while `WeightStore` serves the
+changed candidate bytes. This enables a roughly 20.5GB logical candidate tier
+without duplicating its unchanged physical blocks; the live build and timing
+gate remain pending.
+
 The latest full-GLM trace exposed 966 exact DSA index-capacity grows and
 22,256,640 copied rows. `glm53-full-lossless-index-preallocate` now publishes
 the known final absolute request length before the first key tile, allocating
@@ -35,6 +46,14 @@ reduces two growths/one prefix copy to one growth/zero copies. Separate
 expert I/O overlap without enabling fused attention, int8 K/V, coalesced
 positions, pruning, or changed target weights. All three remain explicit and
 unpromoted pending real timing, pressure, and greedy/state gates.
+
+The compiled GLM-5.3-Flash KDA graph now accepts an identity-bound segment
+length of 16/32/64/128 positions. At released H64/D128/L128 geometry, every
+segment returned byte-identical output and recurrent state. Segment 16 measured
+62.860ms versus 63.018ms for the segment-32 baseline while reducing scan peak
+850.4MB -> 714.6MB; the timing delta is noise-sized, so
+`glm53-flash-lossless-compiled-kda-segment16` remains an explicit pressure
+candidate pending a real-checkpoint request gate.
 
 Focused result: 348 DSA/server/profile/Qwen-MTP tests and six PLE-row witness
 tests pass. Evidence:

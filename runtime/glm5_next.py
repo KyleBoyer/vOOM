@@ -804,7 +804,9 @@ def run_glm5_next_block(
         layer: int, offset: int, get_experts, *, mlp_last_only: bool = False,
         iter_expert_batches=None, native_fused_kda_decode: bool = False,
         native_fused_kda_prefill: bool = False,
-        compiled_kda_prefill: bool = False, profile=None) -> mx.array:
+        compiled_kda_prefill: bool = False,
+        compiled_kda_prefill_segment: int = 32,
+        profile=None) -> mx.array:
     """Run one released GLM-5.3 decoder block over four mHC streams."""
     hc = {
         "attn_fn": w[f"{prefix}.hc_attn_fn"],
@@ -830,6 +832,7 @@ def run_glm5_next_block(
                 native_fused_decode=native_fused_kda_decode,
                 native_fused_prefill=native_fused_kda_prefill,
                 compiled_prefill=compiled_kda_prefill,
+                compiled_prefill_segment=compiled_kda_prefill_segment,
                 released_output_dtype=True,
                 profile=profile,
             )

@@ -2091,6 +2091,17 @@ class EngineManager:
         if glm53_compiled_kda_prefill_request not in ("0", "1"):
             raise RequestValidationError(
                 "VMODEL_GLM53_COMPILED_KDA_PREFILL must be 0 or 1")
+        try:
+            glm53_compiled_kda_segment = int(os.environ.get(
+                "VMODEL_GLM53_COMPILED_KDA_SEGMENT", "32"))
+        except ValueError as error:
+            raise RequestValidationError(
+                "VMODEL_GLM53_COMPILED_KDA_SEGMENT must be an integer"
+            ) from error
+        if glm53_compiled_kda_segment not in (16, 32, 64, 128):
+            raise RequestValidationError(
+                "VMODEL_GLM53_COMPILED_KDA_SEGMENT must be one of "
+                "16, 32, 64, 128")
         glm53_native_fused_kda_prefill_request = os.environ.get(
             "VMODEL_GLM53_NATIVE_FUSED_KDA_PREFILL", "0").strip()
         if glm53_native_fused_kda_prefill_request not in ("0", "1"):
@@ -2340,6 +2351,7 @@ class EngineManager:
             glm53_coalesced_expert_max_positions,
             glm53_incremental_dsa_pool_request,
             glm53_compiled_kda_prefill_request,
+            glm53_compiled_kda_segment,
             glm53_native_fused_kda_prefill_request,
             glm_dsa_long_context_request,
             glm_dsa_index_preallocate_request,
@@ -2479,6 +2491,7 @@ class EngineManager:
             glm53_coalesced_expert_max_positions,
             glm53_incremental_dsa_pool_request,
             glm53_compiled_kda_prefill_request,
+            glm53_compiled_kda_segment,
             glm53_native_fused_kda_prefill_request,
             glm_dsa_long_context_request,
             glm_dsa_index_preallocate_request,
@@ -2846,6 +2859,7 @@ class EngineManager:
                     glm53_incremental_dsa_pool_request == "1")
                 rc.glm53_compiled_kda_prefill = (
                     glm53_compiled_kda_prefill_request == "1")
+                rc.glm53_compiled_kda_segment = glm53_compiled_kda_segment
                 rc.glm53_native_fused_kda_prefill = (
                     glm53_native_fused_kda_prefill_request == "1")
                 # Exact request-to-request prefix reuse is deliberately

@@ -13,6 +13,7 @@ import json
 import os
 import shutil
 import struct
+import subprocess
 import sys
 import uuid
 from collections import Counter, defaultdict
@@ -574,6 +575,193 @@ def build_qwen4_fast_tier(
     }
 
 
+def _clone_tree(source: Path, destination: Path) -> None:
+    """Create an APFS copy-on-write clone; never silently full-copy."""
+    subprocess.run(
+        ["cp", "-cR", str(source), str(destination)], check=True)
+
+
+def build_qwen4_fast_tier_clone(
+    model_dir: str | Path,
+    source_model_dir: str | Path,
+    source_tier: str | Path,
+    fast_root: str | Path,
+    *,
+    target_name: str,
+    max_bytes: int = MAX_INTERNAL_FAST_TIER_BYTES,
+    min_free_bytes: int = MIN_INTERNAL_FREE_BYTES,
+) -> dict:
+    """Clone a validated tier and rewrite only candidate-different extents.
+
+    Qwen4 ablation checkpoints commonly keep topology, gates/up projections,
+    and most trunk tensors byte-identical while editing residual writers and
+    expert down projections. APFS clonefile lets those identical fast-tier
+    blocks share physical storage. Every manifest extent is then compared to
+    the candidate checkpoint; differing chunks are rewritten into the clone,
+    and the entire result is validated against the candidate before publish.
+    """
+    model_dir = Path(model_dir).expanduser().resolve()
+    source_model_dir = Path(source_model_dir).expanduser().resolve()
+    source_tier = Path(source_tier).expanduser().resolve()
+    fast_root = Path(fast_root).expanduser().resolve()
+    target_name = str(target_name)
+    max_bytes = int(max_bytes)
+    min_free_bytes = int(min_free_bytes)
+    if (not target_name or target_name in (".", "..")
+            or Path(target_name).name != target_name):
+        raise ValueError("Qwen4 cloned tier target must be one path component")
+    if max_bytes <= 0 or min_free_bytes < 0:
+        raise ValueError("invalid cloned fast-tier storage policy")
+    if not _is_internal_root(fast_root):
+        raise ValueError("Qwen4 copy-on-write tier requires the internal APFS root")
+    if max_bytes > MAX_INTERNAL_FAST_TIER_BYTES:
+        raise ValueError("internal fast-tier budget exceeds 90 GB policy")
+    target = fast_root / target_name
+    if target.exists() or target.is_symlink():
+        raise FileExistsError(f"cloned Qwen4 fast tier already exists: {target}")
+    if source_tier.parent != fast_root:
+        raise ValueError(
+            "Qwen4 clone source must be a direct child of the fast-tier root")
+    if source_tier.stat().st_dev != _existing_parent(fast_root).stat().st_dev:
+        raise ValueError("Qwen4 clone source and destination must share a volume")
+
+    source_validation = validate_qwen4_fast_tier(
+        source_model_dir, source_tier)
+    source_manifest_bytes = (source_tier / MANIFEST_NAME).read_bytes()
+    manifest = json.loads(source_manifest_bytes)
+    source_binding = json.loads((source_tier / BINDING_NAME).read_text())
+    groups, identity = _catalog(model_dir)
+    schema = source_binding.get("schema")
+    placement = source_binding.get("placement", "experts")
+    if schema == TRUNK_FIRST_SCHEMA and placement == "trunk-first":
+        trunk = _trunk_catalog(model_dir, identity["layers"])
+    elif schema == SCHEMA and placement == "experts":
+        trunk = []
+    else:
+        raise ValueError("Qwen4 cloned tier source schema is unsupported")
+    specs = {
+        entry["name"]: entry
+        for group in groups
+        for entry in group["entries"]
+    }
+    specs.update({entry["name"]: entry for entry in trunk})
+    for name, entry in manifest.items():
+        spec = specs.get(name)
+        if not (
+            spec is not None
+            and entry.get("dtype") == spec["dtype"]
+            and entry.get("shape") == spec["shape"]
+            and int(entry.get("nbytes", -1)) == spec["nbytes"]
+            and entry.get("source_file") == spec["source_file"]
+            and int(entry.get("source_offset", -1)) == spec["source_offset"]
+        ):
+            raise ValueError(
+                f"candidate topology differs at cloned tier tensor {name}")
+
+    source_tree_bytes = _tree_file_bytes(source_tier)
+    # ``other`` already includes the source tier. Add one more logical copy
+    # for the candidate: clone sharing saves physical blocks, but the global
+    # policy intentionally accounts the complete addressable tier size.
+    other = _tree_file_bytes(fast_root)
+    projected_global = other + source_tree_bytes
+    if projected_global > max_bytes:
+        raise ValueError("cloned Qwen4 tier exceeds the global 90 GB policy")
+    free_before = shutil.disk_usage(_existing_parent(fast_root)).free
+    if free_before - source_tree_bytes < min_free_bytes:
+        raise ValueError(
+            "cloned Qwen4 tier lacks a full-copy fallback safety margin")
+
+    staging = fast_root / f".{target_name}.building-{uuid.uuid4().hex}"
+    changed_tensors = 0
+    rewritten_bytes = 0
+    modified_files = set()
+    try:
+        fast_root.mkdir(parents=True, exist_ok=True)
+        _clone_tree(source_tier, staging)
+        for name, entry in sorted(manifest.items()):
+            spec = specs[name]
+            fast_path = staging / entry["file"]
+            source_path = model_dir / spec["source_file"]
+            fast_fd = os.open(fast_path, os.O_RDWR)
+            source_fd = os.open(source_path, os.O_RDONLY)
+            tensor_changed = False
+            try:
+                remaining = spec["nbytes"]
+                fast_offset = int(entry["offset"])
+                source_offset = int(spec["source_offset"])
+                while remaining:
+                    length = min(8 * 1024 * 1024, remaining)
+                    old = os.pread(fast_fd, length, fast_offset)
+                    new = os.pread(source_fd, length, source_offset)
+                    if len(old) != length or len(new) != length:
+                        raise IOError(f"truncated cloned tier extent: {name}")
+                    if old != new:
+                        written = os.pwrite(fast_fd, new, fast_offset)
+                        if written != length:
+                            raise IOError(f"short cloned tier rewrite: {name}")
+                        rewritten_bytes += length
+                        tensor_changed = True
+                    fast_offset += length
+                    source_offset += length
+                    remaining -= length
+                if tensor_changed:
+                    os.fsync(fast_fd)
+                    modified_files.add(entry["file"])
+                    changed_tensors += 1
+            finally:
+                os.close(fast_fd)
+                os.close(source_fd)
+
+        binding = dict(source_binding)
+        binding.update(identity)
+        binding["target_model"] = model_dir.name
+        binding["fast_manifest_sha256"] = _sha256(source_manifest_bytes)
+        binding["clone_source_model"] = source_model_dir.name
+        binding["clone_source_revision"] = source_validation[
+            "source_revision"]
+        binding["clone_rewritten_tensors"] = changed_tensors
+        binding["clone_rewritten_bytes"] = rewritten_bytes
+        binding_path = staging / BINDING_NAME
+        temporary = binding_path.with_name(binding_path.name + ".tmp")
+        with temporary.open("w") as output:
+            json.dump(binding, output, sort_keys=True)
+            output.write("\n")
+            output.flush()
+            os.fsync(output.fileno())
+        os.replace(temporary, binding_path)
+
+        candidate_validation = validate_qwen4_fast_tier(model_dir, staging)
+        free_after = shutil.disk_usage(_existing_parent(fast_root)).free
+        staged_logical = _tree_file_bytes(staging)
+        if free_after < min_free_bytes:
+            raise RuntimeError(
+                "cloned Qwen4 tier crossed the 10 GB actual-free floor")
+        if other + staged_logical > max_bytes:
+            raise RuntimeError("cloned Qwen4 tier crossed the global budget")
+        os.replace(staging, target)
+    except BaseException:
+        shutil.rmtree(staging, ignore_errors=True)
+        raise
+
+    return {
+        "schema": "voom.qwen4-fast-tier-clone.v1",
+        "target": str(target),
+        "target_model": model_dir.name,
+        "source_tier": str(source_tier),
+        "source_revision": source_validation["source_revision"],
+        "candidate_revision": identity["source_revision"],
+        "logical_bytes": _tree_file_bytes(target),
+        "changed_tensors": changed_tensors,
+        "rewritten_bytes": rewritten_bytes,
+        "modified_files": len(modified_files),
+        "free_before_bytes": free_before,
+        "free_after_bytes": free_after,
+        "projected_global_fast_tier_bytes": projected_global,
+        "source_validation": source_validation["verdict"],
+        "candidate_validation": candidate_validation["verdict"],
+    }
+
+
 def validate_qwen4_fast_tier(
     model_dir: str | Path, target: str | Path,
 ) -> dict:
@@ -663,6 +851,12 @@ def main() -> None:
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--validate-only", action="store_true")
     parser.add_argument(
+        "--clone-from-tier", default="",
+        help="APFS-clone this validated Qwen4 tier and patch candidate bytes")
+    parser.add_argument(
+        "--clone-source-model", default="",
+        help="released model directory that binds --clone-from-tier")
+    parser.add_argument(
         "--placement", choices=("experts", "trunk-first"),
         default="experts")
     parser.add_argument("--max-bytes", type=int, default=58_000_000_000)
@@ -682,12 +876,23 @@ def main() -> None:
         help="publish under a distinct one-component candidate directory")
     args = parser.parse_args()
     target_name = args.target_name or Path(args.model_dir).name
-    report = (
-        validate_qwen4_fast_tier(
+    if bool(args.clone_from_tier) != bool(args.clone_source_model):
+        parser.error(
+            "--clone-from-tier and --clone-source-model require each other")
+    if args.validate_only:
+        report = validate_qwen4_fast_tier(
             args.model_dir,
             Path(args.fast_root).expanduser() / target_name)
-        if args.validate_only else
-        build_qwen4_fast_tier(
+    elif args.clone_from_tier:
+        if args.dry_run or args.trace or args.candidate_max_bytes:
+            parser.error("clone mode does not accept build-selection options")
+        report = build_qwen4_fast_tier_clone(
+            args.model_dir, args.clone_source_model,
+            args.clone_from_tier, args.fast_root,
+            target_name=target_name, max_bytes=args.max_bytes,
+            min_free_bytes=args.min_free_bytes)
+    else:
+        report = build_qwen4_fast_tier(
             args.model_dir, args.fast_root, dry_run=args.dry_run,
             max_bytes=args.max_bytes, min_free_bytes=args.min_free_bytes,
             placement=args.placement, trace_paths=args.trace,
@@ -695,7 +900,6 @@ def main() -> None:
                 args.trace_hot_experts_per_layer),
             candidate_max_bytes=args.candidate_max_bytes,
             target_name=args.target_name)
-    )
     print(json.dumps(report, indent=2, sort_keys=True))
 
 

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+import shutil
 import struct
 
 import mlx.core as mx
@@ -289,6 +290,74 @@ def test_qwen4_trunk_first_fast_tier_serves_all_target_trunk_exactly(tmp_path):
         _bits(values[names[0]]), expected["router"])
     assert nbytes == trunk_bytes
     assert store.fast_tier_bytes == trunk_bytes
+    assert store.archive_bytes == 0
+
+
+def test_qwen4_fast_tier_clone_rewrites_only_candidate_bytes(
+        tmp_path, monkeypatch):
+    import formats.qwen4_fast_tier as fast_tier
+
+    released, _expected = _fixture(tmp_path)
+    candidate = tmp_path / "flash-next-abliterated"
+    shutil.copytree(released, candidate)
+    fast_root = tmp_path / "fast"
+    source_report = fast_tier.build_qwen4_fast_tier(
+        released,
+        fast_root,
+        max_bytes=2_000_000 + 72,
+        target_name="released-tier",
+    )
+    source_tier = Path(source_report["target"])
+    manifest = json.loads(
+        (source_tier / "fast_tier_manifest.json").read_text())
+    changed_name = next(
+        name for name in manifest if name.endswith(".down_proj.weight"))
+    changed = manifest[changed_name]
+    shard = candidate / changed["source_file"]
+    with shard.open("r+b") as output:
+        output.seek(changed["source_offset"])
+        original = output.read(1)
+        output.seek(changed["source_offset"])
+        output.write(bytes([original[0] ^ 0x01]))
+
+    # Production requires an internal APFS clone. The portable fixture still
+    # exercises topology checks, selective rewrites, binding, validation, and
+    # runtime serving while substituting a normal tree copy for clonefile.
+    monkeypatch.setattr(fast_tier, "_is_internal_root", lambda _path: True)
+    monkeypatch.setattr(
+        fast_tier,
+        "_clone_tree",
+        lambda source, destination: shutil.copytree(source, destination),
+    )
+    report = fast_tier.build_qwen4_fast_tier_clone(
+        candidate,
+        released,
+        source_tier,
+        fast_root,
+        target_name="candidate-tier",
+        max_bytes=10_000_000,
+        min_free_bytes=0,
+    )
+
+    candidate_tier = Path(report["target"])
+    assert report["source_validation"] == "PASS"
+    assert report["candidate_validation"] == "PASS"
+    assert report["changed_tensors"] == 1
+    assert report["rewritten_bytes"] == changed["nbytes"]
+    assert fast_tier.validate_qwen4_fast_tier(
+        candidate, candidate_tier)["verdict"] == "PASS"
+    assert fast_tier.validate_qwen4_fast_tier(
+        released, source_tier)["verdict"] == "PASS"
+
+    store = WeightStore(candidate, fast_dirs=[candidate_tier])
+    values, _seconds, nbytes = store.fetch([changed_name])
+    actual = np.ascontiguousarray(_bits(values[changed_name])).tobytes()
+    with shard.open("rb") as source:
+        source.seek(changed["source_offset"])
+        expected = source.read(changed["nbytes"])
+    assert actual == expected
+    assert nbytes == changed["nbytes"]
+    assert store.fast_tier_bytes == changed["nbytes"]
     assert store.archive_bytes == 0
 
 
