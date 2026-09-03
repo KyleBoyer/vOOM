@@ -932,6 +932,130 @@ def dequantize_finegrained_fp8(
         weight_scale_inv, values.shape)).astype(mx.bfloat16)
 
 
+_FINEGRAINED_FP8_METAL_HEADER = r"""
+#include <metal_stdlib>
+using namespace metal;
+
+// Decode E4M3FN through the same exactly-representable half construction used
+// by MLX's fp8_e4m3 helper.  Every E4M3 value is exactly representable in half;
+// the multiply remains float32 and only the final store rounds to BF16.
+inline float voom_e4m3fn_to_float(uint8_t bits) {
+    uint16_t value = uint16_t(bits & 127u);
+    // mx.from_fp8 treats the two all-ones payloads as signed finite 480.0,
+    // rather than the NaN interpretation used by MLX's quantized-matmul
+    // helper.  This decoder mirrors from_fp8 because that is the released
+    // checkpoint oracle used by the eager path.
+    if (value == 127u) {
+        return (bits & 128u) ? -480.0f : 480.0f;
+    }
+    uint16_t sign = uint16_t((bits >> 7) & 1u) << 15;
+    uint16_t half_bits =
+        (value << 7) | (uint16_t((value + 1) >> 7) << 14) | sign;
+    return float(as_type<half>(half_bits)) * 256.0f;
+}
+"""
+
+_FINEGRAINED_FP8_METAL_SOURCE = r"""
+    uint base = thread_position_in_grid.x * 4u;
+    #pragma unroll
+    for (uint offset = 0; offset < 4u; ++offset) {
+        uint index = base + offset;
+        if (index >= COUNT) return;
+        uint row = index / COLS;
+        uint col = index - row * COLS;
+        uint scale_index =
+            (row / BLOCK_ROWS) * SCALE_COLS + (col / BLOCK_COLS);
+        float value = voom_e4m3fn_to_float(packed[index]);
+        out[index] = T(value * weight_scale_inv[scale_index]);
+    }
+"""
+
+_finegrained_fp8_metal_kernel_cache: dict[
+    tuple[int, int, int, int], "mx.fast.metal_kernel"
+] = {}
+
+
+def _finegrained_fp8_metal_kernel(
+    rows: int, cols: int, block_rows: int, block_cols: int,
+):
+    key = (rows, cols, block_rows, block_cols)
+    kernel = _finegrained_fp8_metal_kernel_cache.get(key)
+    if kernel is None:
+        scale_cols = (cols + block_cols - 1) // block_cols
+        # Replace the longer symbols first: ``COLS`` is deliberately also a
+        # suffix of ``BLOCK_COLS`` and ``SCALE_COLS``.
+        source = (_FINEGRAINED_FP8_METAL_SOURCE
+                  .replace("SCALE_COLS", str(scale_cols))
+                  .replace("BLOCK_ROWS", str(block_rows))
+                  .replace("BLOCK_COLS", str(block_cols))
+                  .replace("COUNT", str(rows * cols))
+                  .replace("COLS", str(cols)))
+        kernel = mx.fast.metal_kernel(
+            name=(f"voom_finegrained_fp8_dequant_r{rows}_c{cols}_"
+                  f"br{block_rows}_bc{block_cols}"),
+            input_names=["packed", "weight_scale_inv"],
+            output_names=["out"],
+            header=_FINEGRAINED_FP8_METAL_HEADER,
+            source=source,
+            ensure_row_contiguous=False,
+        )
+        _finegrained_fp8_metal_kernel_cache[key] = kernel
+    return kernel
+
+
+def dequantize_finegrained_fp8_metal(
+    packed: mx.array,
+    weight_scale_inv: mx.array,
+    *,
+    block_shape: tuple[int, int],
+) -> mx.array:
+    """One-dispatch Metal decoder for released 128x128 FP8/F32 blocks.
+
+    This preserves the checkpoint representation and the eager decoder's
+    operation order (exact FP8->FP32, FP32 multiply, BF16 rounding).  It is a
+    separate opt-in primitive until both byte equality and real end-to-end
+    latency are proven; unsupported devices fail closed rather than silently
+    selecting a different arithmetic path.
+    """
+    if not mx.metal.is_available():
+        raise RuntimeError("fine-grained FP8 native dequant requires Metal")
+    if packed.dtype != mx.uint8 or packed.ndim != 2:
+        raise ValueError(
+            "fine-grained FP8 native dequant requires a rank-2 uint8 weight")
+    if weight_scale_inv.dtype != mx.float32 or weight_scale_inv.ndim != 2:
+        raise ValueError(
+            "fine-grained FP8 native dequant requires a rank-2 float32 scale")
+    if (len(block_shape) != 2
+            or any(not isinstance(v, int) or isinstance(v, bool) or v <= 0
+                   for v in block_shape)):
+        raise ValueError(
+            "fine-grained FP8 native block_shape must contain two positive "
+            "integers")
+    rows, cols = map(int, packed.shape)
+    block_rows, block_cols = map(int, block_shape)
+    expected = (
+        (rows + block_rows - 1) // block_rows,
+        (cols + block_cols - 1) // block_cols,
+    )
+    if tuple(map(int, weight_scale_inv.shape)) != expected:
+        raise ValueError(
+            "fine-grained FP8 native scale grid does not match the declared "
+            f"block shape: weight={(rows, cols)}, "
+            f"scale={tuple(weight_scale_inv.shape)}, block={block_shape}, "
+            f"expected={expected}")
+    work_items = (rows * cols + 3) // 4
+    return _finegrained_fp8_metal_kernel(
+        rows, cols, block_rows, block_cols,
+    )(
+        inputs=[packed, weight_scale_inv],
+        template=[("T", mx.bfloat16)],
+        grid=(work_items, 1, 1),
+        threadgroup=(min(work_items, 256), 1, 1),
+        output_shapes=[(rows, cols)],
+        output_dtypes=[mx.bfloat16],
+    )[0]
+
+
 def dequantize_deepseek_v4_fp4(packed: mx.array, scale: mx.array
                                ) -> mx.array:
     """Dequantize a routed expert: E2M1 FP4 packed two per byte, E8M0 scales.

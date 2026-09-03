@@ -161,6 +161,18 @@ def main() -> None:
                 "draft_bytes": stats.get("speculative_draft_bytes", 0),
                 "weight_store_bytes_read": stats.get(
                     "weight_store_bytes_read", 0),
+                "glm53_native_fp8_dequant": stats.get(
+                    "glm53_native_fp8_dequant", 0),
+                "glm53_fp8_transform_s": stats.get(
+                    "glm53_fp8_transform_ns", 0) / 1e9,
+                "glm53_fp8_transform_calls": stats.get(
+                    "glm53_fp8_transform_calls", 0),
+                "glm53_fp8_native_calls": stats.get(
+                    "glm53_fp8_native_calls", 0),
+                "glm53_fp8_input_bytes": stats.get(
+                    "glm53_fp8_input_bytes", 0),
+                "glm53_fp8_resident_bytes": stats.get(
+                    "glm53_fp8_resident_bytes", 0),
                 "prefill_weight_store_bytes_read": stats.get(
                     "prefill_weight_store_bytes_read", 0),
                 "decode_weight_store_bytes_read": stats.get(
@@ -279,6 +291,15 @@ def main() -> None:
             "draft_bytes": stats.get("speculative_draft_bytes", 0),
             "weight_store_bytes_read": stats.get(
                 "weight_store_bytes_read", 0),
+            "glm53_native_fp8_dequant": runs[-1][
+                "glm53_native_fp8_dequant"],
+            "glm53_fp8_transform_s": runs[-1]["glm53_fp8_transform_s"],
+            "glm53_fp8_transform_calls": runs[-1][
+                "glm53_fp8_transform_calls"],
+            "glm53_fp8_native_calls": runs[-1]["glm53_fp8_native_calls"],
+            "glm53_fp8_input_bytes": runs[-1]["glm53_fp8_input_bytes"],
+            "glm53_fp8_resident_bytes": runs[-1][
+                "glm53_fp8_resident_bytes"],
             "state": endpoint_state,
         }
         rendered = json.dumps(document, indent=2, sort_keys=True)

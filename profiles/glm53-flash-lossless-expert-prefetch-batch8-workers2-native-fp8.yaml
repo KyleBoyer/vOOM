@@ -1,0 +1,11 @@
+schema: voom.runtime-profile.v1
+name: glm53-flash-lossless-expert-prefetch-batch8-workers2-native-fp8
+description: Explicit exact GLM-5.3-Flash two-reader profile with fused released-FP8 reconstruction.
+notes:
+  - "Extends the measured released-arithmetic expert-prefetch schedule and changes only the released E4M3 plus FP32 block-multiplier reconstruction into exact BF16."
+  - "The one-dispatch Metal decoder is byte-exact against the eager path over every payload and real checkpoint tensors. No checkpoint value, router choice, matmul, or reduction changes."
+  - "This remains explicit/default-off until its own short, varied-shape, vision, and Plex gates pass."
+extends:
+  - glm53-flash-lossless-expert-prefetch-batch8-workers2
+settings:
+  VMODEL_GLM53_NATIVE_FP8_DEQUANT: 1

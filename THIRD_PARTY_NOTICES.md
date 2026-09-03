@@ -10,3 +10,14 @@ Copyright (c) 2025 Prince Canuma
 
 Licensed under the MIT License. The full license text is available at
 <https://github.com/Blaizzy/mlx-vlm/blob/main/LICENSE>.
+
+## MLX E4M3 decode construction
+
+The native fine-grained-FP8 reconstruction kernel in `runtime/quant.py`
+adapts the exactly-representable half-bit construction used by MLX's
+`mlx/backend/metal/kernels/fp8.h`.
+
+Copyright © 2023 Apple Inc.
+
+Licensed under the MIT License. The full license text is available at
+<https://github.com/ml-explore/mlx/blob/main/LICENSE>.

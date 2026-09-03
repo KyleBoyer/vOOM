@@ -265,6 +265,17 @@ class WeightStore:
         self.ct_mxfp4_transform_calls = 0
         self.ct_mxfp4_input_bytes = 0
         self.ct_mxfp4_resident_bytes = 0
+        # Fine-grained GLM FP8 always reconstructs the released BF16 compute
+        # value.  The explicit native path fuses decode/scale/rounding into one
+        # Metal dispatch; these counters make its real share of weight-wait
+        # time and its actual coverage visible per request.
+        self.native_glm53_fp8_dequant = (
+            os.environ.get("VMODEL_GLM53_NATIVE_FP8_DEQUANT") == "1")
+        self.glm53_fp8_transform_ns = 0
+        self.glm53_fp8_transform_calls = 0
+        self.glm53_fp8_native_calls = 0
+        self.glm53_fp8_input_bytes = 0
+        self.glm53_fp8_resident_bytes = 0
         self.k3_scale_sidecar = None
         self.k3_scale_sidecar_read_bytes = 0
         self.k3_scale_sidecar_output_bytes = 0
@@ -960,7 +971,8 @@ class WeightStore:
         from .deepseek_v4 import PackedExpert, PackedFP8
         from .quant import (dequantize_deepseek_v4_fp4,
                             dequantize_deepseek_v4_fp8,
-                            dequantize_finegrained_fp8)
+                            dequantize_finegrained_fp8,
+                            dequantize_finegrained_fp8_metal)
 
         joined: dict = {}
         for name in names:
@@ -979,9 +991,20 @@ class WeightStore:
                     raise ValueError(
                         "GLM-5.3 FP8 pair has unexpected dtypes: "
                         f"weight={weight.dtype}, scale={scale.dtype}")
-                joined[name] = dequantize_finegrained_fp8(
-                    weight, scale, block_shape=glm53.block_shape)
+                started_ns = time.perf_counter_ns()
+                if self.native_glm53_fp8_dequant:
+                    joined[name] = dequantize_finegrained_fp8_metal(
+                        weight, scale, block_shape=glm53.block_shape)
+                else:
+                    joined[name] = dequantize_finegrained_fp8(
+                        weight, scale, block_shape=glm53.block_shape)
                 mx.eval(joined[name])
+                self._record_glm53_fp8_transform(
+                    elapsed_ns=time.perf_counter_ns() - started_ns,
+                    input_bytes=int(weight.nbytes + scale.nbytes),
+                    resident_bytes=int(joined[name].nbytes),
+                    native=self.native_glm53_fp8_dequant,
+                )
                 continue
             # Dtype, not config, decides for DeepSeek V4: routed experts are
             # packed FP4 in int8 containers while trunk/shared weights are FP8.
@@ -1016,6 +1039,27 @@ class WeightStore:
                 int(self.ct_mxfp4_transform_calls),
                 int(self.ct_mxfp4_input_bytes),
                 int(self.ct_mxfp4_resident_bytes),
+            )
+
+    def _record_glm53_fp8_transform(
+        self, *, elapsed_ns: int, input_bytes: int, resident_bytes: int,
+        native: bool,
+    ) -> None:
+        with self._stage_lock:
+            self.glm53_fp8_transform_ns += max(0, int(elapsed_ns))
+            self.glm53_fp8_transform_calls += 1
+            self.glm53_fp8_native_calls += int(bool(native))
+            self.glm53_fp8_input_bytes += max(0, int(input_bytes))
+            self.glm53_fp8_resident_bytes += max(0, int(resident_bytes))
+
+    def glm53_fp8_snapshot(self) -> tuple[int, int, int, int, int]:
+        with self._stage_lock:
+            return (
+                int(self.glm53_fp8_transform_ns),
+                int(self.glm53_fp8_transform_calls),
+                int(self.glm53_fp8_native_calls),
+                int(self.glm53_fp8_input_bytes),
+                int(self.glm53_fp8_resident_bytes),
             )
 
     def parallel_tier_snapshot(self) -> tuple[int, ...]:

@@ -1,0 +1,11 @@
+schema: voom.runtime-profile.v1
+name: glm53-flash-lossless-native-mtp3-confidence1-workers2-native-fp8
+description: Fastest explicit exact GLM-5.3-Flash composition with native MTP and fused FP8 reconstruction.
+notes:
+  - "Combines the released native-MTP confidence schedule, exact target verification, two-reader expert overlap, one-layer trunk overlap, and the byte-exact one-dispatch released-FP8 reconstruction."
+  - "The FP8 decoder changes no reconstructed BF16 byte; MTP candidates still cannot be emitted unless the unchanged target accepts them. The composition is therefore lossless, with timing—not quality—as its empirical gate."
+  - "This remains explicit/default-off until short, varied, untouched real-tool/Plex, long-context, streaming, and vision gates demonstrate broad benefit."
+extends:
+  - glm53-flash-lossless-native-mtp3-confidence1-workers2
+settings:
+  VMODEL_GLM53_NATIVE_FP8_DEQUANT: 1

@@ -1,0 +1,11 @@
+schema: voom.runtime-profile.v1
+name: glm53-full-lossless-preallocate-prefetch-batch8-workers2-trunk1-native-fp8
+description: Explicit exact full GLM-5.3 overlap profile with fused released-FP8 reconstruction.
+notes:
+  - "Extends the measured full-GLM expert/trunk overlap and validated two-disk raw tier. It changes only how each released E4M3 value is multiplied by its released FP32 128x128 block multiplier and rounded to BF16."
+  - "The native Metal decoder is byte-exact against the eager MLX decoder over every 8-bit payload, arbitrary scales, partial edge blocks, and real released tensors; no weight is requantized and downstream matmul arithmetic is unchanged."
+  - "This remains explicit/default-off until a fresh real-request corpus proves the isolated transform win survives compilation, I/O overlap, and multiple request shapes."
+extends:
+  - glm53-full-lossless-preallocate-prefetch-batch8-workers2-trunk1
+settings:
+  VMODEL_GLM53_NATIVE_FP8_DEQUANT: 1

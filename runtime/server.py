@@ -2025,6 +2025,11 @@ class EngineManager:
         if glm53_hot_kv_min_tokens < 0:
             raise RequestValidationError(
                 "VMODEL_GLM53_HOT_KV_MIN_TOKENS must be non-negative")
+        glm53_native_fp8_dequant_request = os.environ.get(
+            "VMODEL_GLM53_NATIVE_FP8_DEQUANT", "0").strip()
+        if glm53_native_fp8_dequant_request not in ("0", "1"):
+            raise RequestValidationError(
+                "VMODEL_GLM53_NATIVE_FP8_DEQUANT must be 0 or 1")
         glm53_mtp_request = os.environ.get(
             "VMODEL_GLM53_MTP", "0").strip()
         if glm53_mtp_request not in ("0", "1"):
@@ -2372,6 +2377,7 @@ class EngineManager:
             glm53_hot_prompt_kv_request,
             glm53_hot_kv_slots,
             glm53_hot_kv_min_tokens,
+            glm53_native_fp8_dequant_request,
             glm53_mtp_request,
             glm53_mtp_depth,
             glm53_mtp_max_prompt_tokens,
@@ -2517,6 +2523,7 @@ class EngineManager:
             glm53_hot_prompt_kv_request,
             glm53_hot_kv_slots,
             glm53_hot_kv_min_tokens,
+            glm53_native_fp8_dequant_request,
             glm53_mtp_request,
             glm53_mtp_depth,
             glm53_mtp_max_prompt_tokens,
@@ -2554,6 +2561,11 @@ class EngineManager:
         # retry behavior as WeightStore.
         cfg_probe = ModelConfig.from_dir(model_dir)
         mtype = cfg_probe.model_type
+        if (glm53_native_fp8_dequant_request == "1"
+                and mtype not in ("glm_moe_dsa", "glm5_next")):
+            raise RequestValidationError(
+                "VMODEL_GLM53_NATIVE_FP8_DEQUANT requires a GLM-5.3 "
+                "fine-grained-FP8 checkpoint")
         if (qwen_rerank_lm_head_rank_capture_path
                 and mtype != "qwen3_5"):
             raise RequestValidationError(
@@ -9419,6 +9431,12 @@ def _vision_protocol_timing(result: dict) -> dict:
         "decode_weight_store_bytes_read",
         "weight_fast_tier_bytes",
         "weight_archive_bytes",
+        "glm53_native_fp8_dequant",
+        "glm53_fp8_transform_ns",
+        "glm53_fp8_transform_calls",
+        "glm53_fp8_native_calls",
+        "glm53_fp8_input_bytes",
+        "glm53_fp8_resident_bytes",
         "weight_cache_hits",
         "weight_cache_misses",
         "weight_cache_evictions",

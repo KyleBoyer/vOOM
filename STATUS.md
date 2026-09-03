@@ -1,5 +1,65 @@
 # STATUS — 2026-09-03 (current corrections first; dated chronology below is history)
 
+## 2026-09-03: exact GLM FP8 reconstruction fused; full model split across both NVMe tiers
+
+The full uncensored GLM-5.3 now has a checkpoint-bound raw fast tier on the
+internal SSD, built transactionally from the same real safetensors headers and
+validated byte-for-byte. The deterministic global budget selected 403 tensors
+and 14,299,830,272 logical bytes; combined internal tiers are exactly 83.0GB
+logical and the root retained about 14.7GB actual free. The first real
+two-device gate served 13,999,925,248 bytes from the internal tier and
+200,903,776,832 from Workspace, overlapped 78 mixed-tier fetches, preserved
+output SHA `3fee95da...1043` and the exact 214,903,702,080-byte read total, and
+improved the 850MB/trunk-prefetch path **144.633 -> 136.162s (-5.86%)**. This
+is **149.189 -> 136.162s (-8.73%)** versus the prior preferred full-model
+profile. Peak Metal was 2.730GB, minimum available memory 4.884GB, and
+swap-out growth 9.978MB. No checkpoint or tier was copied to NAS.
+
+A new explicit Metal decoder now fuses released E4M3 decoding, the released
+FP32 128x128 block multiplier, and final BF16 rounding into one dispatch. It
+does not requantize or retain a different weight representation. Its exhaustive
+gate matches the eager `mx.from_fp8` path byte-for-byte over all 256 payloads,
+arbitrary FP32 multipliers, and partial edge blocks. Three real released
+matrices (routed expert, shared expert, and attention) also matched their full
+BF16 hashes while isolated reconstruction improved **3.78x--5.68x**. The
+runtime now reports transform time, calls, native calls, input bytes, and BF16
+resident bytes per request; profiles remain explicit/default-off.
+
+The real full-model composition preserved the same output and exact read total
+while improving **136.162 -> 131.684s (-3.29%)**; all 16,404 transforms used
+the native path. Relative to the earlier 149.189s preferred path, the combined
+fast-tier plus native-decode result is **11.73% faster**. On GLM-5.3-Flash, the
+plain exact four-output gate preserved all tokens and the complete endpoint
+state while improving **74.670 -> 68.955s (-7.65%)**, with 11,113/11,113
+native transforms. Combining the decoder with exact target-verified native MTP
+set a new short leader at **64.154s**, down from 68.836s (-6.80%). A separate
+JSON-shaped 16-input/six-output witness improved **93.187 -> 86.922s
+(-6.72%)**, again preserving every token and the complete endpoint state with
+14,319/14,319 native transforms. Focused configuration, profile, telemetry,
+format, server, and speculative tests pass **347/347** before the final broad
+suite.
+
+This is the safe subset of the larger fused-FP8 idea. Current MLX
+`quantized_matmul(mode="mxfp8")` consumes E8M0 power-of-two group scales, not
+GLM's arbitrary FP32 128x128 multipliers; restating GLM scales as MXFP8 would
+change released values. Current vLLM supports the GLM-style block scheme via
+CUDA/ROCm kernels, but that does not provide a Metal implementation. Therefore
+the runtime fuses only the representation transform and leaves MLX's ordinary
+BF16 matmul/reduction untouched. A direct arbitrary-scale Metal GEMV remains a
+larger future candidate and must reproduce the ordinary GEMV reduction order.
+
+The uncensored-Qwen search found no safe replacement for the current official
+Qwen3.8-Flash-Next tree. `orcarouter/Qwen3.8-Flash-Next-Uncensored` is gated
+and inaccessible from the current Hub session. Public
+`dealignai/Qwen3.8-Flash-Next-UNCENSORED-FP8` is 185.5GB, does not fit current
+Workspace free space, and its released fine-grained-FP8 runtime has not passed
+the local 16GB or Plex gates; its own card reports a 2.50-point MMLU drop.
+`dealignai/...CRACK-6S` is a 114.1GB custom MLX artifact aimed at a 128GB Mac,
+and the public REAP/MTP 4-bit variant reports roughly 40.3GB peak on a 64GB
+Mac. The accessible WindowsXP candidate remains rejected by the real focused
+Plex test. Neither GLM tree needs replacement: both full and Flash already use
+the best verified accessible dealignai uncensored FP8 releases.
+
 ## 2026-09-03: uncensored GLM Flash attested; Qwen candidate rejected; exact I/O instrumentation
 
 The pinned official GLM-5.3-Flash tree has now been replaced in place with
@@ -25,10 +85,11 @@ than backed up. Its replacement contains all 1,455 deterministic tensors and
 12,932,311,928 exact candidate bytes; its binding names revision `d21b195...`
 plus config/index/receipt/shard-stat/manifest hashes. A new full validator
 derived every source extent from the candidate index/header and compared all
-1,455 tensors / 12.932GB byte-for-byte: **PASS**. Global internal tier use is
-68.70GB decimal with 26.50GB projected actual free, inside both machine
-policies. Real inference/vision results follow; Plex and long-context gates
-remain pending, and Hub claims alone do not promote a checkpoint.
+1,455 tensors / 12.932GB byte-for-byte: **PASS**. At that gate global internal
+tier use was 68.70GB decimal; the later full-GLM tier brings it to the 83.0GB
+budget described above while retaining about 14.7GB actual root free. Real
+inference/vision results follow; Plex and long-context gates remain pending,
+and Hub claims alone do not promote a checkpoint.
 
 Real inference and vision now pass on that attested candidate. The existing
 exact depth-one trunk prefetch was missing from the named native-MTP profile;
@@ -152,10 +213,9 @@ but two roughly 802MB dense pages still exceeded the cache. The final explicit
 preserved the same output and exact 214.904GB total reads, and improved wall
 **149.189 -> 144.633s (-3.05%)**. It hid at least 16.471s of trunk I/O, peaked
 at 2.755GB Metal, kept available memory at 4.969GB, and grew swap-out 9.388MB.
-`auto` and the safe 150MB long-context default remain unchanged. The next gate
-is the checkpoint-bound partial raw tier: deterministic trunk bytes on the
-internal SSD, routed experts on Workspace NVMe, under both the 90GB total-tier
-and 10GB actual-free constraints.
+`auto` and the safe 150MB long-context default remain unchanged. The
+checkpoint-bound partial raw-tier gate described in the current section above
+has since passed.
 
 ## 2026-09-02: exact Qwen Flash cross-turn reuse cuts continuation wall 45%
 

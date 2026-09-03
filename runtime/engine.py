@@ -406,6 +406,11 @@ def _cache_io_snapshot(engine) -> tuple[int, ...]:
     stage_snapshot = getattr(engine.store, "stage_snapshot", None)
     store_stages = (
         stage_snapshot() if callable(stage_snapshot) else (0, 0, 0, 0))
+    glm53_fp8_snapshot = getattr(engine.store, "glm53_fp8_snapshot", None)
+    glm53_fp8_stages = (
+        glm53_fp8_snapshot()
+        if callable(glm53_fp8_snapshot) else (0, 0, 0, 0, 0)
+    )
     scale_snapshot = getattr(
         engine.store, "k3_scale_sidecar_snapshot", None
     )
@@ -504,6 +509,7 @@ def _cache_io_snapshot(engine) -> tuple[int, ...]:
         int(getattr(engine.store, "archive_bytes", 0) or 0),
         *parallel_stages,
         *store_stages,
+        *glm53_fp8_stages,
         *scale_stages,
         *nf12_stages,
     )
@@ -597,6 +603,9 @@ def _record_cache_io_delta(
         "parallel_tier_archive_service_ns", "parallel_tier_hidden_ns",
         "ct_mxfp4_transform_ns", "ct_mxfp4_transform_calls",
         "ct_mxfp4_input_bytes", "ct_mxfp4_resident_bytes",
+        "glm53_fp8_transform_ns", "glm53_fp8_transform_calls",
+        "glm53_fp8_native_calls", "glm53_fp8_input_bytes",
+        "glm53_fp8_resident_bytes",
         "k3_scale_sidecar_read_bytes", "k3_scale_sidecar_output_bytes",
         "k3_scale_sidecar_decode_ns", "k3_scale_sidecar_decode_calls",
         "bf16_nf12_read_bytes", "bf16_nf12_output_bytes",
@@ -685,6 +694,8 @@ def _quantization_cache_identity(rc: "RuntimeConfig", store) -> str:
             str(top_k) for top_k in rc.expert_top_k_by_layer)
     if getattr(rc, "native_ct_mxfp4", False):
         identity += "+ct-mxfp4-native"
+    if getattr(store, "native_glm53_fp8_dequant", False):
+        identity += "+glm53-fp8-dequant-native"
     return identity
 
 
@@ -12519,6 +12530,9 @@ class StreamingEngine:
                 self.rc.glm_dsa_dense_mlp_tile_size)
             path_stats["glm_dsa_index_preallocate"] = int(
                 self.rc.glm_dsa_index_preallocate)
+        if self.cfg.model_type in ("glm_moe_dsa", "glm5_next"):
+            path_stats["glm53_native_fp8_dequant"] = int(
+                bool(getattr(self.store, "native_glm53_fp8_dequant", False)))
         dsa_state = getattr(kv, "dsa", None)
         if dsa_state is not None:
             path_stats["dsa_observations"] = dsa_state.stats["observations"]

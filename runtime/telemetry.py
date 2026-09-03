@@ -87,6 +87,9 @@ class RequestProfiler:
         "parallel_tier_archive_service_ns", "parallel_tier_hidden_ns",
         "ct_mxfp4_transform_ns", "ct_mxfp4_transform_calls",
         "ct_mxfp4_input_bytes", "ct_mxfp4_resident_bytes",
+        "glm53_fp8_transform_ns", "glm53_fp8_transform_calls",
+        "glm53_fp8_native_calls", "glm53_fp8_input_bytes",
+        "glm53_fp8_resident_bytes",
         "k3_scale_sidecar_read_bytes", "k3_scale_sidecar_output_bytes",
         "k3_scale_sidecar_decode_ns", "k3_scale_sidecar_decode_calls",
         "bf16_nf12_read_bytes", "bf16_nf12_output_bytes",
@@ -133,6 +136,11 @@ class RequestProfiler:
             "ct_mxfp4_transform_calls": 0,
             "ct_mxfp4_input_bytes": 0,
             "ct_mxfp4_resident_bytes": 0,
+            "glm53_fp8_transform_ns": 0,
+            "glm53_fp8_transform_calls": 0,
+            "glm53_fp8_native_calls": 0,
+            "glm53_fp8_input_bytes": 0,
+            "glm53_fp8_resident_bytes": 0,
             "k3_scale_sidecar_read_bytes": 0,
             "k3_scale_sidecar_output_bytes": 0,
             "k3_scale_sidecar_decode_ns": 0,
@@ -171,6 +179,13 @@ class RequestProfiler:
                                  "stage_snapshot", None)
         store_stages = (
             stage_snapshot() if callable(stage_snapshot) else (0, 0, 0, 0))
+        glm53_fp8_snapshot = getattr(
+            getattr(cache, "store", None), "glm53_fp8_snapshot", None
+        )
+        glm53_fp8_stages = (
+            glm53_fp8_snapshot()
+            if callable(glm53_fp8_snapshot) else (0, 0, 0, 0, 0)
+        )
         scale_snapshot = getattr(
             getattr(cache, "store", None),
             "k3_scale_sidecar_snapshot",
@@ -202,6 +217,7 @@ class RequestProfiler:
             int(stats.bytes_read), float(stats.disk_s),
             *parallel_stages,
             *store_stages,
+            *glm53_fp8_stages,
             *scale_stages,
             *nf12_stages,
         )
@@ -232,7 +248,10 @@ class RequestProfiler:
          parallel_wall_ns, parallel_fast_service_ns,
          parallel_archive_service_ns, parallel_hidden_ns,
          ct_transform_ns, ct_transform_calls, ct_input_bytes,
-         ct_resident_bytes, scale_read_bytes, scale_output_bytes,
+         ct_resident_bytes, glm53_fp8_transform_ns,
+         glm53_fp8_transform_calls, glm53_fp8_native_calls,
+         glm53_fp8_input_bytes, glm53_fp8_resident_bytes,
+         scale_read_bytes, scale_output_bytes,
          scale_decode_ns, scale_decode_calls,
          nf12_read_bytes, nf12_output_bytes,
          nf12_decode_ns, nf12_decode_calls) = self._cache_delta(
@@ -256,6 +275,12 @@ class RequestProfiler:
         bucket["ct_mxfp4_transform_calls"] += int(ct_transform_calls)
         bucket["ct_mxfp4_input_bytes"] += int(ct_input_bytes)
         bucket["ct_mxfp4_resident_bytes"] += int(ct_resident_bytes)
+        bucket["glm53_fp8_transform_ns"] += int(glm53_fp8_transform_ns)
+        bucket["glm53_fp8_transform_calls"] += int(
+            glm53_fp8_transform_calls)
+        bucket["glm53_fp8_native_calls"] += int(glm53_fp8_native_calls)
+        bucket["glm53_fp8_input_bytes"] += int(glm53_fp8_input_bytes)
+        bucket["glm53_fp8_resident_bytes"] += int(glm53_fp8_resident_bytes)
         bucket["k3_scale_sidecar_read_bytes"] += int(scale_read_bytes)
         bucket["k3_scale_sidecar_output_bytes"] += int(scale_output_bytes)
         bucket["k3_scale_sidecar_decode_ns"] += int(scale_decode_ns)
@@ -402,6 +427,16 @@ class RequestProfiler:
                 "ct_mxfp4_input_bytes": int(raw["ct_mxfp4_input_bytes"]),
                 "ct_mxfp4_resident_bytes": int(
                     raw["ct_mxfp4_resident_bytes"]),
+                "glm53_fp8_transform_s": self._round(
+                    raw["glm53_fp8_transform_ns"] / 1_000_000_000),
+                "glm53_fp8_transform_calls": int(
+                    raw["glm53_fp8_transform_calls"]),
+                "glm53_fp8_native_calls": int(
+                    raw["glm53_fp8_native_calls"]),
+                "glm53_fp8_input_bytes": int(
+                    raw["glm53_fp8_input_bytes"]),
+                "glm53_fp8_resident_bytes": int(
+                    raw["glm53_fp8_resident_bytes"]),
                 "k3_scale_sidecar_read_bytes": int(
                     raw["k3_scale_sidecar_read_bytes"]),
                 "k3_scale_sidecar_output_bytes": int(
@@ -465,6 +500,9 @@ class RequestProfiler:
                     "nested inside store_disk_s/weight wait; eager dense "
                     "dequantization or native packed-view materialization, "
                     "depending on the active representation"),
+                "glm53_fp8_transform_s": (
+                    "nested inside store_disk_s/weight wait; released E4M3 "
+                    "plus FP32 block-scale reconstruction to exact BF16"),
                 "k3_scale_sidecar_decode_s": (
                     "nested inside store_disk_s/weight wait; exact fused "
                     "E8M0 scale reconstruction, excluding sidecar file reads"),

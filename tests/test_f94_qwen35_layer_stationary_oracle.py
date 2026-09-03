@@ -38,6 +38,11 @@ _PROMPT = (
     "The capital of France is Paris. The capital of Germany is Berlin. "
     "The capital of Italy is Rome. The capital of Spain is"
 )
+# Eight full-attention layers at this checkpoint's 4x256-head geometry need
+# more than roughly 31 positions to exceed the integer 1 MB paging floor.
+# Keep the paged oracle comfortably above that floor so tokenizer drift cannot
+# silently turn its spill assertion into a machine-dependent false failure.
+_PAGED_PROMPT = _PROMPT + " Madrid. " + _PROMPT
 _CHUNK = 8
 
 
@@ -45,6 +50,7 @@ def _run(
     layer_stationary: bool, count_fetches: bool = False,
     max_tokens: int = 6, *, compiled_delta: bool = False,
     native_delta: bool = False,
+    prompt: str = _PROMPT,
 ):
     rc = RuntimeConfig(
         prefill_chunk_size=_CHUNK,
@@ -66,7 +72,7 @@ def _run(
         engine.cache.get = counting_get
     try:
         result = engine.generate(
-            _PROMPT, max_tokens=max_tokens,
+            prompt, max_tokens=max_tokens,
             sampling=SamplingParams(temperature=0.0))
     finally:
         engine.close()
@@ -123,7 +129,7 @@ def _run_with_paged_attention(tmp_path: Path):
     engine = StreamingEngine(str(_REAL_MODEL_DIR), rc)
     try:
         result = engine.generate(
-            _PROMPT, max_tokens=2,
+            _PAGED_PROMPT, max_tokens=2,
             sampling=SamplingParams(temperature=0.0))
         kv = engine.last_kv
         recurrent = getattr(kv, "kda_cache", None)
@@ -160,7 +166,7 @@ def test_compiled_delta_matches_sequential_on_real_checkpoint():
 
 @_model_skip
 def test_paged_attention_preserves_real_qwen_recurrence_and_tokens(tmp_path):
-    unpaged, _ = _run(True, max_tokens=2)
+    unpaged, _ = _run(True, max_tokens=2, prompt=_PAGED_PROMPT)
     paged, stats = _run_with_paged_attention(tmp_path)
     assert stats["spills"] > 0
     assert stats["recurrent_bytes"] > 0

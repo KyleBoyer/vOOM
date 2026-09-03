@@ -1013,6 +1013,9 @@ class SpeculativeDecoder:
         }
         if self.mtp is not None:
             path_stats.update(self.mtp.confidence_telemetry())
+        if tgt.cfg.model_type in ("glm_moe_dsa", "glm5_next"):
+            path_stats["glm53_native_fp8_dequant"] = int(bool(getattr(
+                tgt.store, "native_glm53_fp8_dequant", False)))
         request_cache_after = _cache_io_snapshot(tgt)
         _record_cache_io_delta(
             tgt, request_cache_before, path_stats,

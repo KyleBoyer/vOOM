@@ -202,6 +202,41 @@ def test_glm53_float_scale_fp8_dequant_matches_explicit_block_reference():
     assert bool(mx.all(expected == got))
 
 
+def test_glm53_native_fp8_dequant_is_byte_exact_for_all_codes_and_tail():
+    import mlx.core as mx
+
+    from runtime.quant import (
+        dequantize_finegrained_fp8,
+        dequantize_finegrained_fp8_metal,
+    )
+
+    if not mx.metal.is_available():
+        pytest.skip("native fine-grained FP8 decoder requires Metal")
+    # Cover all 256 bit patterns (including signs, subnormals and MLX's finite
+    # all-ones payload interpretation) while also exercising ceil-divided edge
+    # blocks in both dimensions.
+    codes = np.resize(np.arange(256, dtype=np.uint8), 259 * 131).reshape(
+        259, 131)
+    scales = np.array([
+        [0.03125, 0.7],
+        [1.0, 3.1415927],
+        [100.0, 0.00390625],
+    ], dtype=np.float32)
+    packed = mx.array(codes)
+    multiplier = mx.array(scales)
+    want = dequantize_finegrained_fp8(
+        packed, multiplier, block_shape=(128, 128))
+    got = dequantize_finegrained_fp8_metal(
+        packed, multiplier, block_shape=(128, 128))
+    mx.eval(want, got)
+
+    want_nan = mx.isnan(want)
+    got_nan = mx.isnan(got)
+    assert bool(mx.all(want_nan == got_nan))
+    assert bool(mx.all(mx.where(want_nan, 0, want) == mx.where(
+        got_nan, 0, got)))
+
+
 def test_glm53_weight_store_joins_and_hides_scale_inv(tmp_path):
     import mlx.core as mx
 
@@ -239,6 +274,52 @@ def test_glm53_weight_store_joins_and_hides_scale_inv(tmp_path):
     assert fetched[logical].dtype == mx.bfloat16
     assert bool(mx.all(fetched[logical] == want))
     assert physical_bytes == codes.nbytes + scale.nbytes
+
+
+def test_glm53_weight_store_native_dequant_is_exact_and_instrumented(
+    tmp_path, monkeypatch,
+):
+    import mlx.core as mx
+
+    from runtime.model_loader import WeightStore
+    from runtime.quant import dequantize_finegrained_fp8
+
+    if not mx.metal.is_available():
+        pytest.skip("native fine-grained FP8 decoder requires Metal")
+    config = _config()
+    config["quantization_config"] = {
+        "quant_method": "fp8",
+        "activation_scheme": "dynamic",
+        "weight_block_size": [2, 2],
+    }
+    (tmp_path / "config.json").write_text(json.dumps(config))
+    codes = np.arange(20, dtype=np.uint8).reshape(5, 4)
+    scale = np.array([
+        [0.25, 0.5],
+        [1.0, 2.0],
+        [3.0, 4.0],
+    ], dtype=np.float32)
+    physical = "model.language_model.layers.0.mlp.gate_proj"
+    _write_safetensor(tmp_path, {
+        f"{physical}.weight": (codes, "F8_E4M3"),
+        f"{physical}.weight_scale_inv": (scale, "F32"),
+    })
+    monkeypatch.setenv("VMODEL_GLM53_NATIVE_FP8_DEQUANT", "1")
+    store = WeightStore(tmp_path)
+    logical = "model.layers.0.mlp.gate_proj.weight"
+    fetched, _seconds, _physical_bytes = store.fetch([logical])
+    want = dequantize_finegrained_fp8(
+        mx.array(codes), mx.array(scale), block_shape=(2, 2))
+    mx.eval(fetched[logical], want)
+
+    assert store.native_glm53_fp8_dequant
+    assert bool(mx.all(fetched[logical] == want))
+    elapsed_ns, calls, native_calls, input_bytes, resident_bytes = (
+        store.glm53_fp8_snapshot())
+    assert elapsed_ns > 0
+    assert calls == native_calls == 1
+    assert input_bytes == codes.nbytes + scale.nbytes
+    assert resident_bytes == codes.size * 2
 
 
 def test_glm53_fp8_scale_dtype_mismatch_fails_closed():

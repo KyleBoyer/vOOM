@@ -2583,6 +2583,7 @@ def test_full_glm_long_context_is_explicit_tiled_and_external_spilled():
         "VMODEL_GLM53_TRUNK_PREFETCH_DEPTH": "1",
         "VMODEL_GLM53_TRUNK_PREFETCH_WORKERS": "2",
         "VMODEL_GLM53_FULL_WEIGHT_CACHE_MB": "400",
+        "VMODEL_GLM53_NATIVE_FP8_DEQUANT": "1",
     }
     with patch.dict(os.environ, settings, clear=False), \
          patch("runtime.config.ModelConfig.from_dir", return_value=cfg), \
@@ -2748,6 +2749,7 @@ def test_glm53_hot_prompt_kv_is_opt_in_exact_and_in_engine_identity():
     ("variable", "value", "message"),
     [
         ("VMODEL_GLM53_HOT_PROMPT_KV", "auto", "must be 0 or 1"),
+        ("VMODEL_GLM53_NATIVE_FP8_DEQUANT", "auto", "must be 0 or 1"),
         ("VMODEL_GLM53_HOT_KV_SLOTS", "0", "must be in \\[1, 4\\]"),
         ("VMODEL_GLM53_HOT_KV_MIN_TOKENS", "-1", "non-negative"),
         ("VMODEL_GLM53_MTP", "auto", "must be 0 or 1"),
@@ -6808,6 +6810,7 @@ def test_cache_io_delta_reports_only_current_request():
     cache_stats = SimpleNamespace(
         hits=10, misses=20, evictions=3, bytes_read=1_000)
     store_stages = [1_000, 2, 3_000, 4_000]
+    glm53_stages = [9_000, 10, 11, 12_000, 13_000]
     scale_stages = [5_000, 6_000, 7_000, 8]
     engine = SimpleNamespace(
         cache=SimpleNamespace(
@@ -6815,6 +6818,7 @@ def test_cache_io_delta_reports_only_current_request():
         store=SimpleNamespace(
             fast_tier_bytes=100, archive_bytes=900,
             stage_snapshot=lambda: tuple(store_stages),
+            glm53_fp8_snapshot=lambda: tuple(glm53_stages),
             k3_scale_sidecar_snapshot=lambda: tuple(scale_stages)),
         governor=SimpleNamespace(
             reservations=2,
@@ -6878,6 +6882,11 @@ def test_cache_io_delta_reports_only_current_request():
     store_stages[1] += 12
     store_stages[2] += 13
     store_stages[3] += 14
+    glm53_stages[0] += 19
+    glm53_stages[1] += 20
+    glm53_stages[2] += 21
+    glm53_stages[3] += 22
+    glm53_stages[4] += 23
     scale_stages[0] += 15
     scale_stages[1] += 16
     scale_stages[2] += 17
@@ -6914,6 +6923,11 @@ def test_cache_io_delta_reports_only_current_request():
     assert stats["ct_mxfp4_transform_calls"] == 12
     assert stats["ct_mxfp4_input_bytes"] == 13
     assert stats["ct_mxfp4_resident_bytes"] == 14
+    assert stats["glm53_fp8_transform_ns"] == 19
+    assert stats["glm53_fp8_transform_calls"] == 20
+    assert stats["glm53_fp8_native_calls"] == 21
+    assert stats["glm53_fp8_input_bytes"] == 22
+    assert stats["glm53_fp8_resident_bytes"] == 23
     assert stats["k3_scale_sidecar_read_bytes"] == 15
     assert stats["k3_scale_sidecar_output_bytes"] == 16
     assert stats["k3_scale_sidecar_decode_ns"] == 17

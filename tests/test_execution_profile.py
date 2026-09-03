@@ -24,6 +24,7 @@ GLM_FIXTURE = str(
 def test_profiler_aggregates_nested_expert_and_substep_metrics():
     profiler = RequestProfiler("ops")
     stages = [1_000_000, 1, 256, 1_024]
+    glm53_stages = [3_000_000, 3, 2, 1_024, 2_048]
     scale_stages = [2_048, 8_192, 500_000, 3]
     parallel_stages = [1, 2_000, 3_000, 4_000_000, 5_000_000, 6_000_000,
                        7_000_000]
@@ -32,6 +33,7 @@ def test_profiler_aggregates_nested_expert_and_substep_metrics():
             hits=1, misses=2, evictions=3, bytes_read=4, disk_s=0.5),
         store=SimpleNamespace(
             stage_snapshot=lambda: tuple(stages),
+            glm53_fp8_snapshot=lambda: tuple(glm53_stages),
             k3_scale_sidecar_snapshot=lambda: tuple(scale_stages),
             parallel_tier_snapshot=lambda: tuple(parallel_stages),
         ))
@@ -50,6 +52,11 @@ def test_profiler_aggregates_nested_expert_and_substep_metrics():
     stages[1] += 2
     stages[2] += 512
     stages[3] += 2_048
+    glm53_stages[0] += 4_000_000
+    glm53_stages[1] += 4
+    glm53_stages[2] += 4
+    glm53_stages[3] += 4_096
+    glm53_stages[4] += 8_192
     scale_stages[0] += 4_096
     scale_stages[1] += 16_384
     scale_stages[2] += 1_500_000
@@ -88,12 +95,18 @@ def test_profiler_aggregates_nested_expert_and_substep_metrics():
     assert row["ct_mxfp4_transform_calls"] == 2
     assert row["ct_mxfp4_input_bytes"] == 512
     assert row["ct_mxfp4_resident_bytes"] == 2048
+    assert row["glm53_fp8_transform_s"] == 0.004
+    assert row["glm53_fp8_transform_calls"] == 4
+    assert row["glm53_fp8_native_calls"] == 4
+    assert row["glm53_fp8_input_bytes"] == 4096
+    assert row["glm53_fp8_resident_bytes"] == 8192
     assert row["k3_scale_sidecar_read_bytes"] == 4096
     assert row["k3_scale_sidecar_output_bytes"] == 16384
     assert row["k3_scale_sidecar_decode_s"] == 0.0015
     assert row["k3_scale_sidecar_decode_calls"] == 2
     assert row["substeps"]["attention"]["wall_s"] == 0.5
     assert "do not add" in result["semantics"]["expert_fetch_s"]
+    assert "exact BF16" in result["semantics"]["glm53_fp8_transform_s"]
 
 
 def test_resident_stack_does_not_double_count_its_sweep_path():

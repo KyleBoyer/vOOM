@@ -391,6 +391,11 @@ corpus required by the anti-overfit policy:
 - `VMODEL_GLM53_EXPERT_BATCH_PREFETCH=1`
 - `VMODEL_GLM53_TRUNK_PREFETCH_DEPTH=0..2` (measured at 1)
 - `VMODEL_GLM53_TRUNK_PREFETCH_WORKERS=1..2` (measured at 1)
+- `VMODEL_GLM53_NATIVE_FP8_DEQUANT=1` fuses the released E4M3 decode,
+  arbitrary FP32 128x128 block multiplier, and BF16 rounding into one Metal
+  dispatch. It is byte-exact against the eager decoder over all payloads and
+  real checkpoint tensors; current full/Flash end-to-end wins are 3.29% and
+  6.72--7.65%. It does not use MLX's incompatible E8M0 MXFP8 matmul path.
 - `VMODEL_GLM53_HOT_PROMPT_KV=1` enables the ordinary target's generic exact
   hot-prefix cache. Native MTP has its own exact paired target/draft boundary.
 - `VMODEL_EXECUTION_PROFILE=layers|ops` enables bounded request attribution.
@@ -405,9 +410,13 @@ controls `VMODEL_GLM_DSA_LONG_CONTEXT=1`,
 query, index, and dense-MLP tile settings. Its storage-only expert grouping
 reuses `VMODEL_GLM53_EXPERT_FETCH_BATCH` and
 `VMODEL_GLM53_EXPERT_BATCH_PREFETCH`; arithmetic still executes one expert at
-a time in released ascending order. The batch-eight/prefetch composition
-regressed the measured full-model gate and is not a recommended full-target
-profile.
+a time in released ascending order. Batch-eight/two-reader expert prefetch is
+now the measured full-model base; an 850MB exact trunk page cache, one-page
+trunk prefetch, a checkpoint-bound 14.300GB internal raw tier, and native FP8
+reconstruction reduce the same 17-input/max-1 path from 149.189s to 131.684s
+while preserving output and the exact 214.904GB read total. The composition is
+still explicit and is not valid as a workaround for the known long-context
+expert-prefetch residency rejection.
 
 ## Scope still to prove
 
