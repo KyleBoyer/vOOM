@@ -39,6 +39,15 @@ JSON-shaped 16-input/six-output witness improved **93.187 -> 86.922s
 format, server, and speculative tests pass **347/347** before the final broad
 suite.
 
+The independent released vision path also passes with this exact composition:
+the same 181-byte green image produced `green`, wall improved **103.891 ->
+98.958s (-4.75%)**, vision-tower time improved 0.8913 -> 0.7573s, and peak
+Metal fell 2.869 -> 2.745GB. The untouched long Flash fast profile is not a
+promotion candidate: its attention/KV/expert-intermediate path is lossy and its
+real Plex gate scored only 79/100 while omitting a required call field. Large
+lossless validation therefore continues on the exact full-GLM profile rather
+than relabeling or accepting that bad lossy answer.
+
 This is the safe subset of the larger fused-FP8 idea. Current MLX
 `quantized_matmul(mode="mxfp8")` consumes E8M0 power-of-two group scales, not
 GLM's arbitrary FP32 128x128 multipliers; restating GLM scales as MXFP8 would

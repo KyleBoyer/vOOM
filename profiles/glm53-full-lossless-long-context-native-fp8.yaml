@@ -1,0 +1,11 @@
+schema: voom.runtime-profile.v1
+name: glm53-full-lossless-long-context-native-fp8
+description: Exact full GLM-5.3 long-context profile with fused released-FP8 reconstruction.
+notes:
+  - "Extends the proven 46,849-token released-weight capacity route and changes only E4M3 plus released FP32 128x128 multiplier reconstruction into byte-identical BF16. DSA scoring, MLA spill, expert order, matmuls, and reductions are unchanged."
+  - "Expert prefetch remains disabled because every exact prefetch width failed the 46,849-token memory gate. The checkpoint-bound two-disk raw tier is discovered independently and retains exact source bytes."
+  - "This remains explicit/default-off pending a fresh untouched captured-request replay and the 32K through 1M F22/F33 conformance ladder."
+extends:
+  - glm53-full-lossless-long-context
+settings:
+  VMODEL_GLM53_NATIVE_FP8_DEQUANT: 1

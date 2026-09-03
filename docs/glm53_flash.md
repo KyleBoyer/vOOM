@@ -395,7 +395,9 @@ corpus required by the anti-overfit policy:
   arbitrary FP32 128x128 block multiplier, and BF16 rounding into one Metal
   dispatch. It is byte-exact against the eager decoder over all payloads and
   real checkpoint tensors; current full/Flash end-to-end wins are 3.29% and
-  6.72--7.65%. It does not use MLX's incompatible E8M0 MXFP8 matmul path.
+  6.72--7.65%. The independent green-image gate also preserved `green` while
+  improving wall 103.891 -> 98.958 seconds and reducing peak Metal 2.869 ->
+  2.745GB. It does not use MLX's incompatible E8M0 MXFP8 matmul path.
 - `VMODEL_GLM53_HOT_PROMPT_KV=1` enables the ordinary target's generic exact
   hot-prefix cache. Native MTP has its own exact paired target/draft boundary.
 - `VMODEL_EXECUTION_PROFILE=layers|ops` enables bounded request attribution.
