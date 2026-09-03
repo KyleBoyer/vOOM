@@ -2383,6 +2383,7 @@ class StreamingEngine:
         self._qwen4_serial_verify_exact_bf16_calls = 0
         self._qwen4_serial_verify_exact_bf16_rows = 0
         self._qwen4_serial_verify_exact_bf16_fallback_calls = 0
+        self._qwen4_serial_verify_exact_bf16_fallback_reasons = {}
         self._layer_transient_margin = 400_000_000
         self._token_transient = 0  # F42: whole-token transient (greedy sync point)
         # 2026-07-13: F42's own per-layer/per-token mx.reset_peak_memory() calls
@@ -9564,6 +9565,17 @@ class StreamingEngine:
                     exact_bf16_stats.get("rows", 0))
                 self._qwen4_serial_verify_exact_bf16_fallback_calls += int(
                     exact_bf16_stats.get("fallback_calls", 0))
+                for reason in (
+                    "unavailable", "rank", "dtype", "inner_dimension",
+                    "empty_batch", "singleton_window", "window_too_wide",
+                    "output_geometry", "skinny_output", "unknown",
+                ):
+                    value = int(exact_bf16_stats.get(
+                        f"fallback_{reason}_calls", 0))
+                    if value:
+                        reasons = (
+                            self._qwen4_serial_verify_exact_bf16_fallback_reasons)
+                        reasons[reason] = reasons.get(reason, 0) + value
                 mx.eval(*next_positions)
                 if self._expert_batch_executor is None:
                     del experts
@@ -10228,6 +10240,7 @@ class StreamingEngine:
         self._qwen4_serial_verify_exact_bf16_calls = 0
         self._qwen4_serial_verify_exact_bf16_rows = 0
         self._qwen4_serial_verify_exact_bf16_fallback_calls = 0
+        self._qwen4_serial_verify_exact_bf16_fallback_reasons = {}
         self._true_peak_metal_bytes = mx.get_active_memory()  # see _note_true_peak
         if self.governor is not None:
             self.governor.reset_request_peak(self._true_peak_metal_bytes)
@@ -12661,6 +12674,12 @@ class StreamingEngine:
             self._qwen4_serial_verify_exact_bf16_rows)
         path_stats["qwen4_serial_verify_exact_bf16_fallback_calls"] = int(
             self._qwen4_serial_verify_exact_bf16_fallback_calls)
+        for reason, count in (
+            self._qwen4_serial_verify_exact_bf16_fallback_reasons.items()
+        ):
+            path_stats[
+                f"qwen4_serial_verify_exact_bf16_fallback_{reason}_calls"
+            ] = int(count)
         qwen4_state = getattr(kv, "qwen4_cache", None)
         if qwen4_state is not None:
             path_stats.update(qwen4_state.qsa_pool_cache_stats())

@@ -462,6 +462,19 @@ def test_builtin_profiles_resolve_complete_agent_group():
     assert "VMODEL_QWEN4_MTP_Q_CALIBRATION_SCALES" not in (
         candidate_mtp_settings)
 
+    candidate_hot_order, candidate_hot_settings = resolve_runtime_profiles(
+        ("qwen38-flash-next-candidate-fast-tier-mtp-hot-kv",), catalog)
+    assert candidate_hot_order == (
+        "qwen38-flash-next-candidate-bf16",
+        "qwen38-flash-next-candidate-fast-tier",
+        "qwen38-flash-next-candidate-fast-tier-mtp",
+        "qwen38-flash-next-candidate-fast-tier-mtp-hot-kv",
+    )
+    assert candidate_hot_settings["VMODEL_QWEN4_HOT_PROMPT_KV"] == "1"
+    assert candidate_hot_settings["VMODEL_QWEN4_HOT_KV_SLOTS"] == "2"
+    assert candidate_hot_settings[
+        "VMODEL_QWEN4_HOT_KV_MIN_TOKENS"] == "16"
+
     candidate_compact_order, candidate_compact_settings = (
         resolve_runtime_profiles(
             ("qwen38-flash-next-candidate-fast-tier-mtp-compact-kda",),

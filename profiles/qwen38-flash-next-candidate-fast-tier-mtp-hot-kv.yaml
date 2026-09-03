@@ -1,0 +1,15 @@
+schema: voom.runtime-profile.v1
+name: qwen38-flash-next-candidate-fast-tier-mtp-hot-kv
+description: Candidate-native MTP plus exact recurrent/KV endpoint reuse for multi-turn tool loops.
+notes:
+  - "Extends the candidate-bound exact fast-tier/MTP profile. A continuation reuses state only when the complete retained candidate-token endpoint is an exact prefix of the next rendered request; edited or unrelated recurrent prompts run cold."
+  - "The cache retains candidate BF16 KV, DeltaNet, QSA, PLE, hidden endpoint, and logits without quantization or relocation. It changes scheduling only and remains lossless with respect to the abliterated candidate representation."
+  - "Two slots cover one continuing harness conversation plus one interleaved request. The 16-token floor rejects only trivial probes; the live memory governor can evict inactive endpoints before admitting growth on the 16GB host."
+  - "The first real candidate continuation reused 50/63 input tokens and preserved greedy output bytes. Versus a fresh cold target it reduced prefill 105.866 -> 47.541s (-55.1%), wall 128.308 -> 70.115s (-45.4%), and reads 98.866 -> 62.238GB (-37.0%) at 1.817GB peak. Cold layer-stationary and incremental continuation state tensors differed, so this is a standard released-token pass, not a strong-state pass."
+  - "Explicit/default-off pending real Plex multi-round timing, varied-shape replay, and a stricter whole-run pressure gate; the three-phase oracle accumulated 30.6MB of physical swap-out."
+extends:
+  - qwen38-flash-next-candidate-fast-tier-mtp
+settings:
+  VMODEL_QWEN4_HOT_PROMPT_KV: true
+  VMODEL_QWEN4_HOT_KV_SLOTS: 2
+  VMODEL_QWEN4_HOT_KV_MIN_TOKENS: 16

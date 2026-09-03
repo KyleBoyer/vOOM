@@ -39,13 +39,20 @@ def _exact_verify_linear_window(
 ) -> mx.array:
     """Batch independent verifier rows without changing GEMV reduction order."""
 
-    from .exact_verify_bf16 import exact_verify_bf16_matmul
+    from .exact_verify_bf16 import (
+        exact_verify_bf16_matmul,
+        exact_verify_bf16_rejection_reason,
+    )
 
     weight = weights[f"{name}.weight"]
     out = exact_verify_bf16_matmul(x, weight)
     if out is None:
         if stats is not None:
             stats["fallback_calls"] = stats.get("fallback_calls", 0) + 1
+            reason = exact_verify_bf16_rejection_reason(x, weight)
+            reason = reason or "unknown"
+            key = f"fallback_{reason}_calls"
+            stats[key] = stats.get(key, 0) + 1
         rows = [
             _linear(x[:, row:row + 1], weights, name)
             for row in range(int(x.shape[1]))

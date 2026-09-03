@@ -1,5 +1,41 @@
 # STATUS — 2026-09-02 (current corrections first; dated chronology below is history)
 
+## 2026-09-02: exact Qwen Flash cross-turn reuse cuts continuation wall 45%
+
+The candidate-bound Qwen3.8-Flash-Next MTP route now has an explicit exact
+cross-turn cache rung. It retains at most two complete BF16 KV/DeltaNet/QSA/PLE
+endpoints and reuses one only when its entire candidate-token sequence is an
+exact prefix of the next request. There is no tool relocation, semantic
+matching, quantization, changed target verification, or content-specific
+trigger. The 16-token retention floor rejects trivial probes; the live memory
+governor remains authoritative before endpoint growth.
+
+The first real-checkpoint continuation gate reused exactly **50/63** input
+tokens and returned the same three greedy tokens and decoded bytes as a fresh
+cold candidate target. Prefill fell **105.866 -> 47.541 seconds (-55.1%)**,
+wall **128.308 -> 70.115 (-45.4%)**, and released-byte reads **98.866 ->
+62.238GB (-37.0%)**. The hot arm peaked at 1.817GB Metal versus 3.107GB cold.
+Cold layer-stationary and incremental continuation shapes did not leave
+byte-identical attention/recurrent/hidden tensors even though greedy outputs
+matched, so this is the project's standard released-token lossless proof, not
+a strong-state pass. The three-phase gate accumulated 30.6MB physical
+swap-out; `qwen38-flash-next-candidate-fast-tier-mtp-hot-kv` therefore remains
+explicit/default-off pending an untouched multi-round Plex gate, varied-shape
+replay, and stricter pressure proof.
+
+The gate fixture itself also now isolates sequential profile selections
+correctly. Runtime profiles intentionally act as defaults; keys installed by
+the control arm previously looked like operator overrides to the later hot
+arm. The fixture clears only keys introduced by its immediately preceding
+profile before switching arms, leaving unrelated caller environment untouched.
+
+Exact verifier instrumentation now classifies every unfused BF16 projection by
+stable contract reason (singleton verifier window, skinny output geometry,
+dtype/rank/width failures, and availability) without changing arithmetic. The
+next MTP harness run will identify whether heterogeneous singleton-expert
+fusion or the narrow hyper-connection projections are the higher-value kernel
+target.
+
 ## 2026-09-02: GLM-5.3-Flash native MTP is now strong-state exact and 21-27% faster
 
 The released native-MTP block is now composed with the preferred exact

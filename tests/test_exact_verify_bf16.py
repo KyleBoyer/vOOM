@@ -7,6 +7,7 @@ import pytest
 from runtime.exact_verify_bf16 import (
     exact_verify_bf16_available,
     exact_verify_bf16_matmul,
+    exact_verify_bf16_rejection_reason,
 )
 
 
@@ -51,4 +52,26 @@ def test_exact_verify_bf16_fails_closed_outside_contract():
     assert exact_verify_bf16_matmul(
         mx.zeros((1, 2, 64), dtype=mx.bfloat16),
         mx.zeros((4, 64), dtype=mx.bfloat16),
+    ) is None
+
+
+def test_exact_verify_bf16_reports_stable_rejection_reasons():
+    if not exact_verify_bf16_available():
+        pytest.skip("Metal unavailable")
+    x = mx.zeros((1, 2, 16), dtype=mx.bfloat16)
+    assert exact_verify_bf16_rejection_reason(
+        x[:, :1], mx.zeros((16, 16), dtype=mx.bfloat16)
+    ) == "singleton_window"
+    assert exact_verify_bf16_rejection_reason(
+        x.astype(mx.float16), mx.zeros((16, 16), dtype=mx.bfloat16)
+    ) == "dtype"
+    assert exact_verify_bf16_rejection_reason(
+        x, mx.zeros((3, 16), dtype=mx.bfloat16)
+    ) == "output_geometry"
+    assert exact_verify_bf16_rejection_reason(
+        mx.zeros((1, 2, 64), dtype=mx.bfloat16),
+        mx.zeros((4, 64), dtype=mx.bfloat16),
+    ) == "skinny_output"
+    assert exact_verify_bf16_rejection_reason(
+        x, mx.zeros((16, 16), dtype=mx.bfloat16)
     ) is None

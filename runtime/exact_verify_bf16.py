@@ -98,6 +98,35 @@ def exact_verify_bf16_available() -> bool:
     return _EXACT_VERIFY_BF16_GEMV is not None
 
 
+def exact_verify_bf16_rejection_reason(
+    x: mx.array,
+    weight: mx.array,
+) -> str | None:
+    """Return the stable contract reason that prevents fused verification."""
+
+    if _EXACT_VERIFY_BF16_GEMV is None:
+        return "unavailable"
+    if x.ndim != 3 or weight.ndim != 2:
+        return "rank"
+    if x.dtype != mx.bfloat16 or weight.dtype != mx.bfloat16:
+        return "dtype"
+    if int(x.shape[-1]) != int(weight.shape[-1]):
+        return "inner_dimension"
+    batch, length, dimensions = (int(value) for value in x.shape)
+    outputs = int(weight.shape[0])
+    if batch <= 0:
+        return "empty_batch"
+    if length <= 1:
+        return "singleton_window"
+    if length > 8:
+        return "window_too_wide"
+    if outputs < 4 or outputs % 4:
+        return "output_geometry"
+    if dimensions >= 16 * outputs:
+        return "skinny_output"
+    return None
+
+
 def exact_verify_bf16_matmul(
     x: mx.array,
     weight: mx.array,
@@ -108,26 +137,10 @@ def exact_verify_bf16_matmul(
     kernel contract; callers must fall back to ordinary singleton calls.
     """
 
-    if (
-        _EXACT_VERIFY_BF16_GEMV is None
-        or x.ndim != 3
-        or weight.ndim != 2
-        or x.dtype != mx.bfloat16
-        or weight.dtype != mx.bfloat16
-        or int(x.shape[-1]) != int(weight.shape[-1])
-    ):
+    if exact_verify_bf16_rejection_reason(x, weight) is not None:
         return None
     batch, length, dimensions = (int(value) for value in x.shape)
     outputs = int(weight.shape[0])
-    if (
-        batch <= 0
-        or length <= 1
-        or length > 8
-        or outputs < 4
-        or outputs % 4
-        or dimensions >= 16 * outputs
-    ):
-        return None
 
     rows = batch * length
     padded_rows = ((rows + 7) // 8) * 8
@@ -151,4 +164,5 @@ def exact_verify_bf16_matmul(
 __all__ = [
     "exact_verify_bf16_available",
     "exact_verify_bf16_matmul",
+    "exact_verify_bf16_rejection_reason",
 ]

@@ -1244,6 +1244,14 @@ class Qwen4MTPSpeculativeEngine:
             "expert_shared_overlap_layers": int(getattr(
                 target, "_expert_shared_overlap_layers", 0)),
         })
+        for reason, count in getattr(
+            target,
+            "_qwen4_serial_verify_exact_bf16_fallback_reasons",
+            {},
+        ).items():
+            path_stats[
+                f"qwen4_serial_verify_exact_bf16_fallback_{reason}_calls"
+            ] = int(count)
         # Bootstrap telemetry predates every speculative verifier position.
         # Refresh the derived QSA cache counters from the authoritative target
         # endpoint after all accept/reject trims have completed.

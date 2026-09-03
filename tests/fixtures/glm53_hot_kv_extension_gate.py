@@ -103,11 +103,28 @@ def main() -> int:
     if not (model / "config.json").is_file():
         parser.error(f"model is not a complete checkpoint: {model}")
 
-    # Keep native MTP out of this isolation gate.  The only candidate behavior
-    # is exact endpoint retention/reuse on top of the same ordered I/O profile.
+    # This fixture selects several profiles in one process. Profile settings
+    # are defaults by design, so a key written by the control selection would
+    # otherwise look like an explicit operator override when the hot arm is
+    # selected later. Clear only keys introduced by the preceding selection;
+    # unrelated caller environment remains authoritative.
+    managed_profile_keys: set[str] = set()
+
+    def activate_profile(name: str) -> None:
+        for key in managed_profile_keys:
+            os.environ.pop(key, None)
+        application = apply_runtime_profiles((name,), activate=True)
+        if application is None:
+            raise RuntimeError(f"profile {name!r} did not activate")
+        managed_profile_keys.clear()
+        managed_profile_keys.update(application.setting_keys)
+
+    # Keep native GLM MTP out of this isolation gate. Qwen4 profiles may use
+    # their target-verified MTP wrapper; the cache comparison still changes
+    # only endpoint retention between the two otherwise identical arms.
     os.environ["VMODEL_GLM53_MTP"] = "0"
     os.environ.pop("VMODEL_GLM53_HOT_PROMPT_KV", None)
-    apply_runtime_profiles((args.control_profile,), activate=True)
+    activate_profile(args.control_profile)
 
     manager = EngineManager()
     try:
@@ -125,7 +142,7 @@ def main() -> int:
     # Produce the exact assistant-token endpoint that the later continuation
     # must contain.  This is done under the hot profile because that profile is
     # responsible for retaining the post-generation target state.
-    apply_runtime_profiles((args.hot_profile,), activate=True)
+    activate_profile(args.hot_profile)
     hot_manager = EngineManager()
     swap_before = int(psutil.swap_memory().sout)
     try:
@@ -141,7 +158,7 @@ def main() -> int:
 
     # Start from an empty target state and recompute the identical complete
     # token sequence.  Remove the opt-in before constructing the control.
-    os.environ["VMODEL_GLM53_HOT_PROMPT_KV"] = "0"
+    activate_profile(args.control_profile)
     control_manager = EngineManager()
     try:
         control_engine = control_manager.get(model, "fast")
