@@ -53,6 +53,11 @@ def _header(path: Path) -> tuple[dict, int]:
 
 
 def _source_revision(model_dir: Path) -> str:
+    from runtime.checkpoint_identity import checkpoint_release_revision
+
+    revision = checkpoint_release_revision(model_dir)
+    if revision:
+        return revision
     trees = sorted(
         (model_dir / ".cache/huggingface/trees").glob("*.json"))
     return trees[-1].stem if trees else ""

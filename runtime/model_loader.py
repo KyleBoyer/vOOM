@@ -24,6 +24,12 @@ from pathlib import Path
 import mlx.core as mx
 
 from .config import ModelConfig
+from .checkpoint_identity import (
+    checkpoint_release_revision,
+    has_checkpoint_receipt,
+    refuse_incomplete_checkpoint,
+    validate_raw_fast_tier_binding,
+)
 from .local_config import get_storage_config
 
 
@@ -195,6 +201,7 @@ class WeightStore:
         in an earlier tier are read from there instead of the primary store —
         bytes served from a fast tier leave the slow disk's critical path."""
         self.dir = get_storage_config().resolve(model_dir)
+        refuse_incomplete_checkpoint(self.dir)
         self.fast_dirs = [Path(d).expanduser() for d in (fast_dirs or [])]
         self.fast_tier_bytes = 0
         self.fast_tier_tensors = 0
@@ -222,6 +229,24 @@ class WeightStore:
         self.qwen4_fused_read_extents = 0
         self.qwen4_fused_requested_tensors = 0
         self.qwen4_fused_read_bytes = 0
+        # Direct range readers otherwise reopen the same ~100-230 files for
+        # every streamed layer/token.  Cached descriptors preserve identical
+        # pread semantics while removing open/fstat churn.  F_NOCACHE is a
+        # separate explicit experiment: it can help out-of-core scans but may
+        # hurt reuse, so it never follows from descriptor caching itself.
+        self._direct_fd_lock = threading.Lock()
+        self._direct_fds: dict[str, tuple[int, int]] = {}
+        self._direct_fd_nocache = (
+            os.environ.get("VMODEL_DIRECT_IO_NOCACHE") == "1")
+        self.direct_fd_opens = 0
+        self.direct_fd_hits = 0
+        self.direct_fd_open_ns = 0
+        self.direct_fd_nocache_applied = 0
+        self.direct_pread_calls = 0
+        self.direct_pread_requested_bytes = 0
+        self.direct_pread_bytes = 0
+        self.direct_pread_ns = 0
+        self.direct_pread_short_reads = 0
         # Experimental lossless representation switch for published
         # compressed-tensors MXFP4 pairs. The format probe and runtime fetch
         # path fail closed unless the descriptor and physical dtypes match
@@ -1211,6 +1236,79 @@ class WeightStore:
                 "virtual_tensors": len(self._qwen4_fused_expert_slices),
             }
 
+    def direct_io_snapshot(self) -> dict[str, int]:
+        """Cumulative descriptor/range-read counters for request deltas."""
+        with self._direct_fd_lock:
+            return {
+                "fd_opens": int(self.direct_fd_opens),
+                "fd_hits": int(self.direct_fd_hits),
+                "fd_open_ns": int(self.direct_fd_open_ns),
+                "fd_cached": len(self._direct_fds),
+                "fd_nocache_applied": int(self.direct_fd_nocache_applied),
+                "pread_calls": int(self.direct_pread_calls),
+                "pread_requested_bytes": int(
+                    self.direct_pread_requested_bytes),
+                "pread_bytes": int(self.direct_pread_bytes),
+                "pread_ns": int(self.direct_pread_ns),
+                "pread_short_reads": int(self.direct_pread_short_reads),
+            }
+
+    def _direct_fd(self, path: Path) -> tuple[int, int]:
+        """Return a store-lifetime read-only descriptor and immutable size."""
+        key = os.fspath(path)
+        with self._direct_fd_lock:
+            cached = self._direct_fds.get(key)
+            if cached is not None:
+                self.direct_fd_hits += 1
+                return cached
+            started = time.perf_counter_ns()
+            descriptor = os.open(path, os.O_RDONLY)
+            try:
+                size = int(os.fstat(descriptor).st_size)
+                nocache = False
+                if self._direct_fd_nocache:
+                    from .uncached_io import set_darwin_nocache
+
+                    nocache = set_darwin_nocache(descriptor)
+            except BaseException:
+                os.close(descriptor)
+                raise
+            self._direct_fds[key] = (descriptor, size)
+            self.direct_fd_opens += 1
+            self.direct_fd_open_ns += time.perf_counter_ns() - started
+            self.direct_fd_nocache_applied += int(nocache)
+            return descriptor, size
+
+    def _pread_exact(self, descriptor: int, length: int, offset: int) -> bytes:
+        """Read an exact range and expose real short-read/service telemetry."""
+        requested = int(length)
+        started = time.perf_counter_ns()
+        chunks = []
+        done = 0
+        calls = 0
+        short_reads = 0
+        while done < requested:
+            chunk = os.pread(descriptor, requested - done, int(offset) + done)
+            calls += 1
+            if not chunk:
+                raise IOError(
+                    f"truncated direct read at {offset}: expected {requested}, "
+                    f"got {done}"
+                )
+            if len(chunk) < requested - done:
+                short_reads += 1
+            chunks.append(chunk)
+            done += len(chunk)
+        raw = chunks[0] if len(chunks) == 1 else b"".join(chunks)
+        elapsed = time.perf_counter_ns() - started
+        with self._direct_fd_lock:
+            self.direct_pread_calls += calls
+            self.direct_pread_requested_bytes += requested
+            self.direct_pread_bytes += len(raw)
+            self.direct_pread_ns += elapsed
+            self.direct_pread_short_reads += short_reads
+        return raw
+
     def _read_qwen4_fused_expert_slices(
         self, names: Sequence[str],
     ) -> tuple[dict[str, mx.array], int]:
@@ -1247,37 +1345,24 @@ class WeightStore:
                     runs.append([item])
 
             path = self.dir / shard
-            fd = os.open(path, os.O_RDONLY)
-            try:
-                file_size = os.fstat(fd).st_size
-                for run in runs:
-                    start = run[0][1].offset
-                    end = run[-1][1].offset + run[-1][1].nbytes
-                    if start < 0 or end > file_size:
-                        raise IOError(
-                            f"Qwen4-Exp expert extent [{start}, {end}) "
-                            f"exceeds {path} ({file_size} bytes)")
-                    chunks = []
-                    done = 0
-                    while done < end - start:
-                        chunk = os.pread(fd, end - start - done, start + done)
-                        if not chunk:
-                            raise IOError(
-                                f"truncated Qwen4-Exp expert read from {path}")
-                        chunks.append(chunk)
-                        done += len(chunk)
-                    raw = b"".join(chunks)
-                    read_bytes += len(raw)
-                    extent_count += 1
-                    view = memoryview(raw)
-                    for name, spec in run:
-                        relative = spec.offset - start
-                        out[name] = to_mx(
-                            {"dtype": spec.dtype, "shape": spec.shape},
-                            view[relative:relative + spec.nbytes],
-                        )
-            finally:
-                os.close(fd)
+            fd, file_size = self._direct_fd(path)
+            for run in runs:
+                start = run[0][1].offset
+                end = run[-1][1].offset + run[-1][1].nbytes
+                if start < 0 or end > file_size:
+                    raise IOError(
+                        f"Qwen4-Exp expert extent [{start}, {end}) "
+                        f"exceeds {path} ({file_size} bytes)")
+                raw = self._pread_exact(fd, end - start, start)
+                read_bytes += len(raw)
+                extent_count += 1
+                view = memoryview(raw)
+                for name, spec in run:
+                    relative = spec.offset - start
+                    out[name] = to_mx(
+                        {"dtype": spec.dtype, "shape": spec.shape},
+                        view[relative:relative + spec.nbytes],
+                    )
         mx.eval(list(out.values()))
         with self._stage_lock:
             self.qwen4_fused_read_calls += 1
@@ -1871,6 +1956,9 @@ class WeightStore:
                 name for name in manifest
                 if name in qwen4_slices
             ]
+            if not qwen4_virtual_names and has_checkpoint_receipt(self.dir):
+                validate_raw_fast_tier_binding(
+                    self.dir, candidate, manifest_bytes)
             if qwen4_virtual_names:
                 binding_path = candidate / "qwen4_fused_expert_fast_tier.json"
                 try:
@@ -1906,6 +1994,12 @@ class WeightStore:
                     and binding.get("fast_manifest_sha256")
                     == hashlib.sha256(manifest_bytes).hexdigest(),
                 }
+                release_revision = checkpoint_release_revision(self.dir)
+                if release_revision:
+                    identity_checks["source_revision"] = (
+                        isinstance(binding, dict)
+                        and binding.get("source_revision") == release_revision
+                    )
                 if not all(identity_checks.values()):
                     failed = ",".join(
                         name for name, passed in identity_checks.items()
@@ -2154,43 +2248,35 @@ class WeightStore:
                 else:
                     runs.append([item])
 
-            fd = os.open(path, os.O_RDONLY)
-            try:
-                file_size = os.fstat(fd).st_size
-                for run in runs:
-                    run_start = int(run[0][1].get("offset", 0))
-                    run_end = (
-                        int(run[-1][1].get("offset", 0))
-                        + int(run[-1][1]["nbytes"])
+            fd, file_size = self._direct_fd(path)
+            for run in runs:
+                run_start = int(run[0][1].get("offset", 0))
+                run_end = (
+                    int(run[-1][1].get("offset", 0))
+                    + int(run[-1][1]["nbytes"])
+                )
+                if run_start < 0 or run_end > file_size:
+                    raise IOError(
+                        f"fast-tier extent [{run_start}, {run_end}) "
+                        f"exceeds {path} ({file_size} bytes)"
                     )
-                    if run_start < 0 or run_end > file_size:
-                        raise IOError(
-                            f"fast-tier extent [{run_start}, {run_end}) "
-                            f"exceeds {path} ({file_size} bytes)"
-                        )
-                    raw = os.pread(fd, run_end - run_start, run_start)
-                    if len(raw) != run_end - run_start:
-                        raise IOError(
-                            f"truncated fast-tier read from {path}: expected "
-                            f"{run_end - run_start}, got {len(raw)}"
-                        )
-                    nbytes += len(raw)
-                    view = memoryview(raw)
-                    for name, entry in run:
-                        relative = (
-                            int(entry.get("offset", 0)) - run_start
-                        )
-                        length = int(entry["nbytes"])
-                        tensor_raw = view[relative:relative + length]
-                        out[name] = to_mx(
-                            {
-                                "dtype": entry["dtype"],
-                                "shape": entry["shape"],
-                            },
-                            tensor_raw,
-                        )
-            finally:
-                os.close(fd)
+                raw = self._pread_exact(
+                    fd, run_end - run_start, run_start)
+                nbytes += len(raw)
+                view = memoryview(raw)
+                for name, entry in run:
+                    relative = (
+                        int(entry.get("offset", 0)) - run_start
+                    )
+                    length = int(entry["nbytes"])
+                    tensor_raw = view[relative:relative + length]
+                    out[name] = to_mx(
+                        {
+                            "dtype": entry["dtype"],
+                            "shape": entry["shape"],
+                        },
+                        tensor_raw,
+                    )
         mx.eval(list(out.values()))
         return out, nbytes
 
@@ -2296,12 +2382,22 @@ class WeightStore:
         return out, fast_bytes + slow_bytes
 
     def close(self) -> None:
-        """Join the optional fast-tier worker owned by this store."""
+        """Join the fast-tier worker and close store-lifetime descriptors."""
         with self._stage_lock:
             executor = self._raw_fast_tier_executor
             self._raw_fast_tier_executor = None
         if executor is not None:
             executor.shutdown(wait=True, cancel_futures=True)
+        direct_fd_lock = getattr(self, "_direct_fd_lock", None)
+        if direct_fd_lock is None:
+            descriptors = []
+        else:
+            with direct_fd_lock:
+                descriptors = [
+                    item[0] for item in self._direct_fds.values()]
+                self._direct_fds = {}
+        for descriptor in descriptors:
+            os.close(descriptor)
 
     def fetch(self, names: list[str]) -> tuple[dict[str, mx.array], float, int]:
         """Materialize tensors; return arrays, wall seconds, store-accounted bytes.

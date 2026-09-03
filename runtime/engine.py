@@ -10169,6 +10169,9 @@ class StreamingEngine:
         is never passed to `on_token` (streaming clients never see past the
         stop point)."""
         request_t0 = time.perf_counter()
+        direct_io_snapshot = getattr(self.store, "direct_io_snapshot", None)
+        direct_io_before = (
+            direct_io_snapshot() if callable(direct_io_snapshot) else None)
         qwen4_expert_before = (
             self.store.qwen4_fused_expert_snapshot()
             if self.cfg.model_type == "qwen4_exp" else None)
@@ -12971,6 +12974,21 @@ class StreamingEngine:
                     - int(qwen4_expert_before[key]))
             path_stats["qwen4_fused_expert_virtual_tensors"] = int(
                 qwen4_expert_after["virtual_tensors"])
+        if direct_io_before is not None:
+            direct_io_after = direct_io_snapshot()
+            for key in (
+                "fd_opens", "fd_hits", "fd_open_ns", "fd_nocache_applied",
+                "pread_calls", "pread_requested_bytes", "pread_bytes",
+                "pread_ns", "pread_short_reads",
+            ):
+                path_stats[f"direct_io_{key}"] = max(
+                    0,
+                    int(direct_io_after[key]) - int(direct_io_before[key]),
+                )
+            path_stats["direct_io_fd_cached"] = int(
+                direct_io_after["fd_cached"])
+            path_stats["direct_io_nocache_enabled"] = int(
+                getattr(self.store, "_direct_fd_nocache", False))
         if qwen4_ple_before is not None:
             qwen4_ple_after = self._qwen4_ple_rows.telemetry()
             for key in (

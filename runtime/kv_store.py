@@ -54,6 +54,7 @@ def model_fingerprint(model_dir: str | Path, compressed_mla: bool,
     for extra in (
         "model.safetensors.index.json", "tokenizer.json",
         "weights.vpack2.index.json", "vpack2.CURRENT",
+        "voom.checkpoint.receipt.json", "voom.overlay.receipt.json",
     ):
         p = d / extra
         if p.exists():  # checkpoint-revision + tokenizer identity

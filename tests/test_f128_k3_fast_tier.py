@@ -147,6 +147,9 @@ def test_fast_tier_packs_selected_tensors_per_shard(tmp_path):
 
     model_dir = tmp_path / "model"
     model_dir.mkdir()
+    (model_dir / "config.json").write_text(json.dumps({
+        "model_type": "test",
+    }))
     shard = model_dir / "model-00001-of-00001.safetensors"
     names = [
         "language_model.model.layers.0.self_attn.q_proj.weight",

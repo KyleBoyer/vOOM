@@ -1,4 +1,44 @@
-# STATUS — 2026-09-02 (current corrections first; dated chronology below is history)
+# STATUS — 2026-09-03 (current corrections first; dated chronology below is history)
+
+## 2026-09-03: Qwen uncensored candidate rejected; exact I/O instrumentation lands
+
+The first multi-turn Plex run rejects the staged
+`windowsxp811203/Qwen3.8-Flash-Next-Abliterated` candidate for promotion. It
+scored **80/100** over five tool calls but regressed pagination
+`0 -> 200 -> 0 -> 200 -> 400`, found none of the four required eligible
+titles, and exhausted the tool-round budget without a final answer. Total wall
+was **9,939.071 seconds**; individual turn walls were 2,100.118, 1,690.329,
+2,074.370, 1,992.701, and 2,081.550 seconds. Available memory fell 8.010 ->
+4.411GB and host swap-out grew 749.077MB. This was not an untouched-capture
+result: `--profile focused` kept the captured user request and real Plex
+function schema but reduced 134 tools to one, replaced the surrounding input
+with focused system text, forced non-streaming/temperature zero/max-256, and
+used synthetic two-page tool results. The checkpoint remains an isolated
+candidate; it does not replace the official Qwen tree or become an automatic
+profile.
+
+The run exposed 7.3--10.0TB of store-accounted expert traffic across its five
+turns with zero resident hits. The exact direct-range reader now caches one
+read-only descriptor and immutable file size per source/fast-tier file for the
+store lifetime instead of repeating `open`/`fstat` on every streamed fetch.
+Per-request telemetry reports descriptor opens/hits/open time, cached count,
+`pread` calls/requested/actual bytes/service time/short reads, and whether the
+separate `VMODEL_DIRECT_IO_NOCACHE=1` experiment actually applied Darwin
+`F_NOCACHE`. The uncached behavior remains explicit/default-off pending a real
+A/B; descriptor reuse does not alter bytes or arithmetic.
+
+Same-layout uncensored checkpoint replacement is now resumable and
+fail-closed for models too large to duplicate. It pins both Hub revisions,
+requires identical config and tensor-to-shard index, classifies each changed
+file against both published hashes in one pass, preserves 10GB free while
+staging, verifies the candidate before an atomic same-filesystem rename, and
+keeps a loader-blocking marker until one full candidate-tree attestation
+commits a receipt. There is intentionally no NAS backup; the pinned Hub base
+revision is the recovery source. Replaced checkpoints require newly built raw
+fast tiers carrying revision/config/index/shard-stat/manifest identity, while
+Qwen's specialized tier now cross-checks its source revision against overlay
+or replacement receipts. Focused integrity, paging, runtime, telemetry, and
+server regressions pass **345/345** with two real-model skips.
 
 ## 2026-09-02: exact Qwen Flash cross-turn reuse cuts continuation wall 45%
 

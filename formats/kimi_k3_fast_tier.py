@@ -32,6 +32,11 @@ import uuid
 from collections import defaultdict
 from pathlib import Path
 
+from runtime.checkpoint_identity import (
+    RAW_FAST_TIER_BINDING_NAME,
+    raw_fast_tier_binding,
+)
+
 _EXPERT_RE = re.compile(r"(?:block_sparse_moe|mlp)\.experts\.")
 _LAYER_RE = re.compile(
     r"(?:^|\.)(?:model\.language_model|language_model\.model|model)"
@@ -376,6 +381,14 @@ def build_fast_tier(
             manifest_path = staging / "fast_tier_manifest.json"
             with manifest_path.open("w") as output:
                 json.dump(manifest, output)
+                output.flush()
+                os.fsync(output.fileno())
+            binding_path = staging / RAW_FAST_TIER_BINDING_NAME
+            binding = raw_fast_tier_binding(
+                model_dir, manifest_path.read_bytes())
+            with binding_path.open("w") as output:
+                json.dump(binding, output, sort_keys=True)
+                output.write("\n")
                 output.flush()
                 os.fsync(output.fileno())
             if internal_root:
