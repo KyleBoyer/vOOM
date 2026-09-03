@@ -4,7 +4,7 @@ description: Explicit exact GLM-5.3-Flash two-reader profile with fused released
 notes:
   - "Extends the measured released-arithmetic expert-prefetch schedule and changes only the released E4M3 plus FP32 block-multiplier reconstruction into exact BF16."
   - "The one-dispatch Metal decoder is byte-exact against the eager path over every payload and real checkpoint tensors. No checkpoint value, router choice, matmul, or reduction changes."
-  - "This remains explicit/default-off until its own short, varied-shape, vision, and Plex gates pass."
+  - "Short, varied-shape, and vision gates passed, but a deterministic 2,123-input A/B/A rejected this composition: native wall was 460.790s versus 433.005/430.597s eager controls despite exact output, reads, and peak. Retain only as an explicit short/vision profile; do not select it for medium prefill."
 extends:
   - glm53-flash-lossless-expert-prefetch-batch8-workers2
 settings:

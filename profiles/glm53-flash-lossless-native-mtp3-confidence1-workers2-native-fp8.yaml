@@ -4,7 +4,7 @@ description: Fastest explicit exact GLM-5.3-Flash composition with native MTP an
 notes:
   - "Combines the released native-MTP confidence schedule, exact target verification, two-reader expert overlap, one-layer trunk overlap, and the byte-exact one-dispatch released-FP8 reconstruction."
   - "The FP8 decoder changes no reconstructed BF16 byte; MTP candidates still cannot be emitted unless the unchanged target accepts them. The composition is therefore lossless, with timing—not quality—as its empirical gate."
-  - "This remains explicit/default-off until short, varied, untouched real-tool/Plex, long-context, streaming, and vision gates demonstrate broad benefit."
+  - "Short, varied, and vision gates passed. The same native decoder regressed a deterministic 2,123-input exact two-reader prefill by 6.71% versus bracketed eager controls, so this composition remains short/vision-only and explicit/default-off pending its own real-tool/Plex and longer-output proof."
 extends:
   - glm53-flash-lossless-native-mtp3-confidence1-workers2
 settings:

@@ -48,6 +48,18 @@ real Plex gate scored only 79/100 while omitting a required call field. Large
 lossless validation therefore continues on the exact full-GLM profile rather
 than relabeling or accepting that bad lossy answer.
 
+The native decoder is also now bounded honestly by a deterministic
+2,123-input/max-1 Flash A/B/A. Both eager controls returned the established
+output SHA `58bb119c...09cb5` in 433.005s and 430.597s; the native candidate
+returned the same SHA, exact 300.933GB read count, and identical 3.936GB Metal
+peak in **460.790s**. That is a **6.71% regression** versus the bracketed
+431.801s control mean, far outside the controls' 0.56% span. Native transform
+time did fall 115--116s -> 52.828s over all 34,532 calls, but the saving did
+not survive the full two-reader layer schedule: MLP wall rose and hidden I/O
+overlap fell. The native composition is therefore retained for its proven
+short/vision shapes but rejected for this medium exact-prefetch profile; no
+automatic length threshold is inferred from either regime.
+
 This is the safe subset of the larger fused-FP8 idea. Current MLX
 `quantized_matmul(mode="mxfp8")` consumes E8M0 power-of-two group scales, not
 GLM's arbitrary FP32 128x128 multipliers; restating GLM scales as MXFP8 would

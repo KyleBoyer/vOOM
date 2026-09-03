@@ -397,7 +397,11 @@ corpus required by the anti-overfit policy:
   real checkpoint tensors; current full/Flash end-to-end wins are 3.29% and
   6.72--7.65%. The independent green-image gate also preserved `green` while
   improving wall 103.891 -> 98.958 seconds and reducing peak Metal 2.869 ->
-  2.745GB. It does not use MLX's incompatible E8M0 MXFP8 matmul path.
+  2.745GB. A deterministic 2,123-input Flash A/B/A then rejected this switch
+  with the exact two-reader profile: eager controls took 433.005/430.597s and
+  native took 460.790s despite identical output/read/peak evidence. Keep it
+  short/vision-only pending a better overlap schedule. It does not use MLX's
+  incompatible E8M0 MXFP8 matmul path.
 - `VMODEL_GLM53_HOT_PROMPT_KV=1` enables the ordinary target's generic exact
   hot-prefix cache. Native MTP has its own exact paired target/draft boundary.
 - `VMODEL_EXECUTION_PROFILE=layers|ops` enables bounded request attribution.
