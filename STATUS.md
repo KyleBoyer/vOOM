@@ -50,6 +50,17 @@ serving retains no additional KV. The plain gate now captures its actual final
 fed-token hidden row rather than the drafting scratch value, without adding an
 evaluation. The focused runtime/profile suite passes **349/349** tests.
 
+The same adapter was temporarily widened to full `glm_moe_dsa` GLM-5.3 and
+then rejected and removed after a real released-weight 28-input/4-output gate.
+Tokens and text matched, but MTP accepted 0/2 proposals; wall regressed
+**287.452 -> 319.737 seconds (+11.2%)**, decode 99.382 -> 131.337 (+32.2%),
+and reads 403.650GB -> 456.014GB (+13.0%). The new spill-aware state oracle
+reloaded all exact NVMe-tiered MLA latents after timing and found 79/100 tensors
+identical: all 78 MLA latents plus hidden matched, while all 21 DSA-index
+tensors differed. Full GLM native MTP therefore remains unavailable; fixing its
+released step-zero/index-share DSA rule is a correctness prerequisite, and a
+future speed retry also needs a trace with materially better acceptance.
+
 ## 2026-09-02: compact GLM Flash clears untouched 46.8K capacity; latency is rejected
 
 The explicit `glm53-flash-e-compact-mla-prefetch-batch8` composition has now

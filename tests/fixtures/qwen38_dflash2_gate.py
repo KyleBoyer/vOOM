@@ -57,7 +57,9 @@ def _array_payload(value: mx.array) -> bytes:
     return np.asarray(value).tobytes()
 
 
-def _state_digest(engine, *, kv=None, hidden=None) -> dict[str, object]:
+def _state_digest(
+        engine, *, kv=None, hidden=None,
+        require_recurrent: bool = True) -> dict[str, object]:
     kv = engine.last_kv if kv is None else kv
     if kv is None:
         raise RuntimeError("target did not retain a generation endpoint")
@@ -92,6 +94,14 @@ def _state_digest(engine, *, kv=None, hidden=None) -> dict[str, object]:
     logical_lengths = kv.layer_lengths()
     compressed_mla = bool(getattr(kv, "compressed_mla", False))
     for layer, value in enumerate(kv.keys):
+        if (value is None and compressed_mla and logical_lengths[layer]
+                and callable(getattr(
+                    kv, "materialize_latent_layer_for_persistence", None))):
+            # Long-context GLM releases completed exact MLA latents to its
+            # temporary NVMe tier.  State gates run after timing and must hash
+            # those authoritative bytes rather than treating a spilled layer
+            # as an architecture without attention state.
+            value = kv.materialize_latent_layer_for_persistence(layer)
         if value is not None:
             length = logical_lengths[layer]
             value = (value[:, :length, :] if compressed_mla
@@ -113,14 +123,17 @@ def _state_digest(engine, *, kv=None, hidden=None) -> dict[str, object]:
             add("dsa_index", f"dsa.{layer}.pool", value)
 
     recurrent = getattr(kv, "kda_cache", None)
-    if recurrent is None:
+    if recurrent is None and require_recurrent:
         raise RuntimeError("hybrid target endpoint omitted recurrent state")
-    for layer in range(len(recurrent._state)):
-        add("recurrent_state", f"kda.{layer}.state", recurrent.state(layer))
-        history = recurrent.conv_history(layer)
-        if history is not None:
-            for index, value in enumerate(history):
-                add("conv_history", f"kda.{layer}.conv.{index}", value)
+    if recurrent is not None:
+        for layer in range(len(recurrent._state)):
+            add(
+                "recurrent_state", f"kda.{layer}.state",
+                recurrent.state(layer))
+            history = recurrent.conv_history(layer)
+            if history is not None:
+                for index, value in enumerate(history):
+                    add("conv_history", f"kda.{layer}.conv.{index}", value)
     add("hidden", "hidden.last", engine._h_last if hidden is None else hidden)
     return {
         "sha256": digest.hexdigest(),

@@ -165,13 +165,16 @@ def main() -> None:
         if args.state_digest:
             from tests.fixtures.qwen38_dflash2_gate import _state_digest
             target = getattr(engine, "target", engine)
+            require_recurrent = target.cfg.model_type == "glm5_next"
             if args.plain:
                 hidden = getattr(
                     target, "_diagnostic_generation_hidden", None)
                 if hidden is None:
                     raise RuntimeError(
                         "plain decoder did not retain its committed hidden row")
-                endpoint_state = _state_digest(target, hidden=hidden)
+                endpoint_state = _state_digest(
+                    target, hidden=hidden,
+                    require_recurrent=require_recurrent)
             else:
                 endpoint = engine.decoder._diagnostic_generation_endpoint
                 hidden = engine.decoder._diagnostic_generation_hidden
@@ -179,7 +182,8 @@ def main() -> None:
                     raise RuntimeError(
                         "native MTP verifier did not retain its committed endpoint")
                 endpoint_state = _state_digest(
-                    target, kv=endpoint, hidden=hidden)
+                    target, kv=endpoint, hidden=hidden,
+                    require_recurrent=require_recurrent)
         document = {
             "schema": "voom.glm53-mtp-integrated-gate.v1",
             "tokens": runs[-1]["tokens"],
