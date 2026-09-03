@@ -159,6 +159,22 @@ def main() -> None:
                     "expert_batch_prefetch_wait_s", 0.0),
                 "expert_batch_prefetch_hidden_s": stats.get(
                     "expert_batch_prefetch_hidden_s", 0.0),
+                "direct_io_fd_cache_enabled": stats.get(
+                    "direct_io_fd_cache_enabled", 0),
+                "direct_io_fd_opens": stats.get("direct_io_fd_opens", 0),
+                "direct_io_fd_hits": stats.get("direct_io_fd_hits", 0),
+                "direct_io_fd_closes": stats.get("direct_io_fd_closes", 0),
+                "direct_io_fd_open_s": stats.get(
+                    "direct_io_fd_open_ns", 0) / 1e9,
+                "direct_io_fd_cached": stats.get("direct_io_fd_cached", 0),
+                "direct_io_pread_calls": stats.get(
+                    "direct_io_pread_calls", 0),
+                "direct_io_pread_bytes": stats.get(
+                    "direct_io_pread_bytes", 0),
+                "direct_io_pread_s": stats.get(
+                    "direct_io_pread_ns", 0) / 1e9,
+                "direct_io_pread_short_reads": stats.get(
+                    "direct_io_pread_short_reads", 0),
                 "execution_profile": result.get("execution_profile"),
             })
         endpoint_state = None

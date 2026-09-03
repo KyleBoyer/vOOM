@@ -9,6 +9,7 @@ fetch rather than holding evaluated arrays — residency is entirely the caller'
 from __future__ import annotations
 
 from bisect import bisect_left
+from contextlib import contextmanager
 import hashlib
 import json
 import os
@@ -236,10 +237,13 @@ class WeightStore:
         # hurt reuse, so it never follows from descriptor caching itself.
         self._direct_fd_lock = threading.Lock()
         self._direct_fds: dict[str, tuple[int, int]] = {}
+        self._direct_fd_cache_enabled = (
+            os.environ.get("VMODEL_DIRECT_FD_CACHE") == "1")
         self._direct_fd_nocache = (
             os.environ.get("VMODEL_DIRECT_IO_NOCACHE") == "1")
         self.direct_fd_opens = 0
         self.direct_fd_hits = 0
+        self.direct_fd_closes = 0
         self.direct_fd_open_ns = 0
         self.direct_fd_nocache_applied = 0
         self.direct_pread_calls = 0
@@ -1242,8 +1246,10 @@ class WeightStore:
             return {
                 "fd_opens": int(self.direct_fd_opens),
                 "fd_hits": int(self.direct_fd_hits),
+                "fd_closes": int(self.direct_fd_closes),
                 "fd_open_ns": int(self.direct_fd_open_ns),
                 "fd_cached": len(self._direct_fds),
+                "fd_cache_enabled": int(self._direct_fd_cache_enabled),
                 "fd_nocache_applied": int(self.direct_fd_nocache_applied),
                 "pread_calls": int(self.direct_pread_calls),
                 "pread_requested_bytes": int(
@@ -1257,7 +1263,9 @@ class WeightStore:
         """Return a store-lifetime read-only descriptor and immutable size."""
         key = os.fspath(path)
         with self._direct_fd_lock:
-            cached = self._direct_fds.get(key)
+            cached = (
+                self._direct_fds.get(key)
+                if self._direct_fd_cache_enabled else None)
             if cached is not None:
                 self.direct_fd_hits += 1
                 return cached
@@ -1273,11 +1281,23 @@ class WeightStore:
             except BaseException:
                 os.close(descriptor)
                 raise
-            self._direct_fds[key] = (descriptor, size)
+            if self._direct_fd_cache_enabled:
+                self._direct_fds[key] = (descriptor, size)
             self.direct_fd_opens += 1
             self.direct_fd_open_ns += time.perf_counter_ns() - started
             self.direct_fd_nocache_applied += int(nocache)
             return descriptor, size
+
+    @contextmanager
+    def _direct_reader(self, path: Path):
+        descriptor, size = self._direct_fd(path)
+        try:
+            yield descriptor, size
+        finally:
+            if not self._direct_fd_cache_enabled:
+                os.close(descriptor)
+                with self._direct_fd_lock:
+                    self.direct_fd_closes += 1
 
     def _pread_exact(self, descriptor: int, length: int, offset: int) -> bytes:
         """Read an exact range and expose real short-read/service telemetry."""
@@ -1345,24 +1365,24 @@ class WeightStore:
                     runs.append([item])
 
             path = self.dir / shard
-            fd, file_size = self._direct_fd(path)
-            for run in runs:
-                start = run[0][1].offset
-                end = run[-1][1].offset + run[-1][1].nbytes
-                if start < 0 or end > file_size:
-                    raise IOError(
-                        f"Qwen4-Exp expert extent [{start}, {end}) "
-                        f"exceeds {path} ({file_size} bytes)")
-                raw = self._pread_exact(fd, end - start, start)
-                read_bytes += len(raw)
-                extent_count += 1
-                view = memoryview(raw)
-                for name, spec in run:
-                    relative = spec.offset - start
-                    out[name] = to_mx(
-                        {"dtype": spec.dtype, "shape": spec.shape},
-                        view[relative:relative + spec.nbytes],
-                    )
+            with self._direct_reader(path) as (fd, file_size):
+                for run in runs:
+                    start = run[0][1].offset
+                    end = run[-1][1].offset + run[-1][1].nbytes
+                    if start < 0 or end > file_size:
+                        raise IOError(
+                            f"Qwen4-Exp expert extent [{start}, {end}) "
+                            f"exceeds {path} ({file_size} bytes)")
+                    raw = self._pread_exact(fd, end - start, start)
+                    read_bytes += len(raw)
+                    extent_count += 1
+                    view = memoryview(raw)
+                    for name, spec in run:
+                        relative = spec.offset - start
+                        out[name] = to_mx(
+                            {"dtype": spec.dtype, "shape": spec.shape},
+                            view[relative:relative + spec.nbytes],
+                        )
         mx.eval(list(out.values()))
         with self._stage_lock:
             self.qwen4_fused_read_calls += 1
@@ -2248,35 +2268,35 @@ class WeightStore:
                 else:
                     runs.append([item])
 
-            fd, file_size = self._direct_fd(path)
-            for run in runs:
-                run_start = int(run[0][1].get("offset", 0))
-                run_end = (
-                    int(run[-1][1].get("offset", 0))
-                    + int(run[-1][1]["nbytes"])
-                )
-                if run_start < 0 or run_end > file_size:
-                    raise IOError(
-                        f"fast-tier extent [{run_start}, {run_end}) "
-                        f"exceeds {path} ({file_size} bytes)"
+            with self._direct_reader(path) as (fd, file_size):
+                for run in runs:
+                    run_start = int(run[0][1].get("offset", 0))
+                    run_end = (
+                        int(run[-1][1].get("offset", 0))
+                        + int(run[-1][1]["nbytes"])
                     )
-                raw = self._pread_exact(
-                    fd, run_end - run_start, run_start)
-                nbytes += len(raw)
-                view = memoryview(raw)
-                for name, entry in run:
-                    relative = (
-                        int(entry.get("offset", 0)) - run_start
-                    )
-                    length = int(entry["nbytes"])
-                    tensor_raw = view[relative:relative + length]
-                    out[name] = to_mx(
-                        {
-                            "dtype": entry["dtype"],
-                            "shape": entry["shape"],
-                        },
-                        tensor_raw,
-                    )
+                    if run_start < 0 or run_end > file_size:
+                        raise IOError(
+                            f"fast-tier extent [{run_start}, {run_end}) "
+                            f"exceeds {path} ({file_size} bytes)"
+                        )
+                    raw = self._pread_exact(
+                        fd, run_end - run_start, run_start)
+                    nbytes += len(raw)
+                    view = memoryview(raw)
+                    for name, entry in run:
+                        relative = (
+                            int(entry.get("offset", 0)) - run_start
+                        )
+                        length = int(entry["nbytes"])
+                        tensor_raw = view[relative:relative + length]
+                        out[name] = to_mx(
+                            {
+                                "dtype": entry["dtype"],
+                                "shape": entry["shape"],
+                            },
+                            tensor_raw,
+                        )
         mx.eval(list(out.values()))
         return out, nbytes
 
@@ -2398,6 +2418,9 @@ class WeightStore:
                 self._direct_fds = {}
         for descriptor in descriptors:
             os.close(descriptor)
+        if descriptors:
+            with self._direct_fd_lock:
+                self.direct_fd_closes += len(descriptors)
 
     def fetch(self, names: list[str]) -> tuple[dict[str, mx.array], float, int]:
         """Materialize tensors; return arrays, wall seconds, store-accounted bytes.

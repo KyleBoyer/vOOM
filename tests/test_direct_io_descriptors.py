@@ -10,9 +10,11 @@ def _bare_store():
     store._raw_fast_tier_executor = None
     store._direct_fd_lock = threading.Lock()
     store._direct_fds = {}
+    store._direct_fd_cache_enabled = True
     store._direct_fd_nocache = False
     store.direct_fd_opens = 0
     store.direct_fd_hits = 0
+    store.direct_fd_closes = 0
     store.direct_fd_open_ns = 0
     store.direct_fd_nocache_applied = 0
     store.direct_pread_calls = 0
@@ -63,3 +65,21 @@ def test_direct_read_fails_closed_on_truncation(tmp_path):
             raise AssertionError("truncated direct read was accepted")
     finally:
         store.close()
+
+
+def test_direct_descriptor_cache_has_a_real_disabled_control(tmp_path):
+    path = tmp_path / "weights.bin"
+    path.write_bytes(b"0123456789")
+    store = _bare_store()
+    store._direct_fd_cache_enabled = False
+    for _ in range(2):
+        with store._direct_reader(path) as (descriptor, size):
+            assert size == 10
+            assert store._pread_exact(descriptor, 2, 4) == b"45"
+    snapshot = store.direct_io_snapshot()
+    assert snapshot["fd_cache_enabled"] == 0
+    assert snapshot["fd_opens"] == 2
+    assert snapshot["fd_hits"] == 0
+    assert snapshot["fd_closes"] == 2
+    assert snapshot["fd_cached"] == 0
+    store.close()

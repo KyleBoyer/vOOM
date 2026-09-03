@@ -1,6 +1,34 @@
 # STATUS — 2026-09-03 (current corrections first; dated chronology below is history)
 
-## 2026-09-03: Qwen uncensored candidate rejected; exact I/O instrumentation lands
+## 2026-09-03: uncensored GLM Flash attested; Qwen candidate rejected; exact I/O instrumentation
+
+The pinned official GLM-5.3-Flash tree has now been replaced in place with
+`dealignai/GLM-5.3-Flash-UNCENSORED-FP8` revision
+`d21b19569d30e6f471c433b11e672b3bbb80552a`. This was a deliberate
+same-layout replacement, not an alias or NAS copy: 34/62 changed shards
+(182.338GB) were individually base-hash checked, candidate-hash checked, and
+atomically replaced; 146.028GB remained byte-identical to both releases. The
+final independent pass verified all 74 candidate files and
+**328,366,192,129 repository bytes** before removing the loader-blocking
+marker. The permanent `voom.checkpoint.receipt.json` pins both revisions and
+the replacement-plan hash. An Xet transfer stalled at 4.496/5.364GB with its
+only socket in `CLOSE_WAIT`; the process was interrupted safely and the same
+marker resumed 22 already-committed shards by published hash. Plain HTTP then
+completed the remaining 59.006GB without weakening any content gate.
+
+Real header inspection reports the expected unchanged serving format: 45
+target layers plus one MTP block, 288 experts/top-8, 62 shards, 76,108 tensors,
+FP8 experts with FP32 128x128 inverse scales, BF16 embeddings/head, and 347
+BF16 vision tensors. Released tensor payload remains
+**328,326,771,576 bytes**. The old 12GB official fast tier was deleted rather
+than backed up. Its replacement contains all 1,455 deterministic tensors and
+12,932,311,928 exact candidate bytes; its binding names revision `d21b195...`
+plus config/index/receipt/shard-stat/manifest hashes. A new full validator
+derived every source extent from the candidate index/header and compared all
+1,455 tensors / 12.932GB byte-for-byte: **PASS**. Global internal tier use is
+68.70GB decimal with 26.50GB projected actual free, inside both machine
+policies. Inference, Plex, vision, and timing gates are still pending; Hub
+claims alone do not promote the checkpoint.
 
 The first multi-turn Plex run rejects the staged
 `windowsxp811203/Qwen3.8-Flash-Next-Abliterated` candidate for promotion. It
@@ -17,15 +45,17 @@ used synthetic two-page tool results. The checkpoint remains an isolated
 candidate; it does not replace the official Qwen tree or become an automatic
 profile.
 
-The run exposed 7.3--10.0TB of store-accounted expert traffic across its five
+The Qwen run exposed 7.3--10.0TB of store-accounted expert traffic across its five
 turns with zero resident hits. The exact direct-range reader now caches one
 read-only descriptor and immutable file size per source/fast-tier file for the
 store lifetime instead of repeating `open`/`fstat` on every streamed fetch.
-Per-request telemetry reports descriptor opens/hits/open time, cached count,
+Per-request telemetry reports descriptor opens/hits/closes/open time, cached count,
 `pread` calls/requested/actual bytes/service time/short reads, and whether the
 separate `VMODEL_DIRECT_IO_NOCACHE=1` experiment actually applied Darwin
-`F_NOCACHE`. The uncached behavior remains explicit/default-off pending a real
-A/B; descriptor reuse does not alter bytes or arithmetic.
+`F_NOCACHE`. Both uncached I/O and descriptor reuse remain
+explicit/default-off (`VMODEL_DIRECT_IO_NOCACHE=1` and
+`VMODEL_DIRECT_FD_CACHE=1`) pending real A/Bs; descriptor reuse does not alter
+bytes or arithmetic.
 
 Same-layout uncensored checkpoint replacement is now resumable and
 fail-closed for models too large to duplicate. It pins both Hub revisions,

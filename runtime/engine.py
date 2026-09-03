@@ -12977,7 +12977,8 @@ class StreamingEngine:
         if direct_io_before is not None:
             direct_io_after = direct_io_snapshot()
             for key in (
-                "fd_opens", "fd_hits", "fd_open_ns", "fd_nocache_applied",
+                "fd_opens", "fd_hits", "fd_closes", "fd_open_ns",
+                "fd_nocache_applied",
                 "pread_calls", "pread_requested_bytes", "pread_bytes",
                 "pread_ns", "pread_short_reads",
             ):
@@ -12987,6 +12988,8 @@ class StreamingEngine:
                 )
             path_stats["direct_io_fd_cached"] = int(
                 direct_io_after["fd_cached"])
+            path_stats["direct_io_fd_cache_enabled"] = int(
+                direct_io_after["fd_cache_enabled"])
             path_stats["direct_io_nocache_enabled"] = int(
                 getattr(self.store, "_direct_fd_nocache", False))
         if qwen4_ple_before is not None:

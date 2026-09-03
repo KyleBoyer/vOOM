@@ -32,9 +32,15 @@ import uuid
 from collections import defaultdict
 from pathlib import Path
 
+# Preserve the long-standing documented direct-script entry point in addition
+# to ``python -m formats.kimi_k3_fast_tier``.
+if __package__ in (None, ""):
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
 from runtime.checkpoint_identity import (
     RAW_FAST_TIER_BINDING_NAME,
     raw_fast_tier_binding,
+    validate_raw_fast_tier_binding,
 )
 
 _EXPERT_RE = re.compile(r"(?:block_sparse_moe|mlp)\.experts\.")
@@ -441,6 +447,122 @@ def build_fast_tier(
     }
 
 
+def validate_fast_tier(
+    model_dir: str | Path, target: str | Path,
+) -> dict:
+    """Compare every published generic fast-tier byte with its bound source."""
+    model_dir = Path(model_dir).expanduser().resolve()
+    target = Path(target).expanduser().resolve()
+    manifest_path = target / "fast_tier_manifest.json"
+    manifest_bytes = manifest_path.read_bytes()
+    manifest = json.loads(manifest_bytes)
+    if not isinstance(manifest, dict) or not manifest:
+        raise ValueError("fast-tier manifest must be a non-empty object")
+    validate_raw_fast_tier_binding(model_dir, target, manifest_bytes)
+
+    index = json.loads(
+        (model_dir / "model.safetensors.index.json").read_text())
+    weight_map = index.get("weight_map", {})
+    canonical_names = {}
+    for raw_name, shard in weight_map.items():
+        canonical = _canonical(raw_name)
+        if canonical in canonical_names:
+            raise ValueError(f"canonical tensor collision: {canonical}")
+        canonical_names[canonical] = (raw_name, shard)
+
+    source_headers = {}
+    fast_headers = {}
+    descriptors = {}
+
+    def descriptor(path: Path):
+        key = str(path)
+        if key not in descriptors:
+            descriptors[key] = os.open(path, os.O_RDONLY)
+        return descriptors[key]
+
+    checked = 0
+    checked_bytes = 0
+    try:
+        for name, entry in sorted(manifest.items()):
+            if not isinstance(entry, dict):
+                raise ValueError(f"invalid fast-tier entry: {name}")
+            source = canonical_names.get(name)
+            if source is None:
+                raise ValueError(f"fast-tier tensor is absent from source: {name}")
+            raw_name, shard = source
+            if Path(shard).name != shard:
+                raise ValueError(f"unsafe source shard: {shard}")
+            if shard not in source_headers:
+                source_headers[shard] = _read_header(model_dir / shard)
+            source_header, source_base = source_headers[shard]
+            source_entry = source_header.get(raw_name)
+            if not isinstance(source_entry, dict):
+                raise ValueError(f"source header lacks tensor: {raw_name}")
+            source_start, source_end = (
+                int(value) for value in source_entry["data_offsets"])
+            length = source_end - source_start
+            filename = entry.get("file")
+            if not isinstance(filename, str) or Path(filename).name != filename:
+                raise ValueError(f"unsafe fast-tier file for {name}")
+            fast_path = target / filename
+            if fast_path.suffix == ".safetensors":
+                if filename not in fast_headers:
+                    fast_headers[filename] = _read_header(fast_path)
+                fast_header, fast_base = fast_headers[filename]
+                fast_entry = fast_header.get(name)
+                if not isinstance(fast_entry, dict):
+                    raise ValueError(f"fast container lacks tensor: {name}")
+                fast_start, fast_end = (
+                    int(value) for value in fast_entry["data_offsets"])
+                fast_offset = fast_base + fast_start
+                fast_length = fast_end - fast_start
+            else:
+                fast_offset = int(entry.get("offset", -1))
+                fast_length = int(entry.get("nbytes", -1))
+            if not (
+                entry.get("dtype") == source_entry.get("dtype")
+                and tuple(entry.get("shape", ()))
+                == tuple(source_entry.get("shape", ()))
+                and int(entry.get("nbytes", -1)) == length
+                and fast_length == length
+                and fast_offset >= 0
+                and fast_offset + length <= fast_path.stat().st_size
+            ):
+                raise ValueError(f"fast-tier metadata mismatch: {name}")
+            source_fd = descriptor(model_dir / shard)
+            fast_fd = descriptor(fast_path)
+            compared = 0
+            while compared < length:
+                chunk_length = min(8 * 1024 * 1024, length - compared)
+                source_bytes = os.pread(
+                    source_fd, chunk_length,
+                    source_base + source_start + compared,
+                )
+                fast_bytes = os.pread(
+                    fast_fd, chunk_length, fast_offset + compared)
+                if (
+                    len(source_bytes) != chunk_length
+                    or len(fast_bytes) != chunk_length
+                    or source_bytes != fast_bytes
+                ):
+                    raise ValueError(
+                        f"fast-tier byte mismatch: {name} at {compared}")
+                compared += chunk_length
+            checked += 1
+            checked_bytes += length
+    finally:
+        for fd in descriptors.values():
+            os.close(fd)
+    return {
+        "schema": "voom.raw-fast-tier-validation.v1",
+        "verdict": "PASS",
+        "model_dir": str(model_dir),
+        "target": str(target),
+        "checked_tensors": checked,
+        "checked_bytes": checked_bytes,
+    }
+
+
 def main() -> None:
     import argparse
 
@@ -457,11 +579,20 @@ def main() -> None:
         choices=("raw", "safetensors"),
         default="raw",
     )
+    parser.add_argument(
+        "--validate-target",
+        help="validate an existing tier instead of building one",
+    )
     args = parser.parse_args()
-    report = build_fast_tier(
-        args.model_dir, args.fast_root, dry_run=args.dry_run,
-        max_bytes=args.max_bytes, min_free_bytes=args.min_free_bytes,
-        container_format=args.container_format)
+    if args.validate_target:
+        if args.dry_run:
+            parser.error("--validate-target is incompatible with --dry-run")
+        report = validate_fast_tier(args.model_dir, args.validate_target)
+    else:
+        report = build_fast_tier(
+            args.model_dir, args.fast_root, dry_run=args.dry_run,
+            max_bytes=args.max_bytes, min_free_bytes=args.min_free_bytes,
+            container_format=args.container_format)
     print(json.dumps(report, indent=2))
 
 

@@ -143,7 +143,7 @@ def test_budgeted_selection_balances_qwen_multimodal_wrapper_layers():
 
 
 def test_fast_tier_packs_selected_tensors_per_shard(tmp_path):
-    from formats.kimi_k3_fast_tier import build_fast_tier
+    from formats.kimi_k3_fast_tier import build_fast_tier, validate_fast_tier
 
     model_dir = tmp_path / "model"
     model_dir.mkdir()
@@ -204,6 +204,11 @@ def test_fast_tier_packs_selected_tensors_per_shard(tmp_path):
         assert set(store._raw_fast_tier_manifest) == {
             raw_name.removeprefix("language_model.") for raw_name in names
         }
+
+    validation = validate_fast_tier(model_dir, target)
+    assert validation["verdict"] == "PASS"
+    assert validation["checked_tensors"] == 2
+    assert validation["checked_bytes"] == 128
 
 
 def test_raw_fast_tier_reuses_one_store_lifetime_worker():
