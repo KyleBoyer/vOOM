@@ -104,6 +104,31 @@ Qwen's specialized tier now cross-checks its source revision against overlay
 or replacement receipts. Focused integrity, paging, runtime, telemetry, and
 server regressions pass **345/345** with two real-model skips.
 
+The full-size uncensored regular checkpoint is now pinned for a separate
+relayout-safe migration. `dealignai/GLM-5.3-UNCENSORED-FP8` revision
+`aff05d054bf581b95bdfd87ba9792dbf1e4365b2` has the byte-identical released
+config and exactly the same **118,629 tensor names** as official GLM-5.3, but
+splits them across 282 rather than 141 shards. Its model card reports a v2
+weight edit to BF16 residual writers while retaining the released FP8 expert
+representation; this is intentionally an uncensored/modified checkpoint, not
+a claim of output equivalence to official GLM-5.3. The real pinned dry plan
+covers 755,631,998,192 candidate shard bytes, ends 52,128 bytes smaller on
+disk, and needs at most **10,040,383,840 transient bytes** under the
+conservative double-staging model. With about 45.8GB free at planning time it
+clears the 10GB reserve by more than 25GB.
+
+`runtime.hf_checkpoint_relayout_replace.py` keeps this changed-layout path
+separate from the proven same-layout code. It requires identical config and
+tensor-name sets, disjoint shard filenames, pins both Hub revisions and every
+file hash, publishes the same loader-blocking marker, and commits candidate
+shards in coverage order. An official shard is hash-verified and deleted only
+after every candidate shard containing any of its tensors is durable. Resume
+audits reject invalid bytes and any coverage hole; candidate serving metadata
+is swapped only after all shards complete, while upstream-only tokenizers and
+model code are preserved. The synthetic relayout plus existing same-layout
+crash/restart suites pass **8/8**. The dry plan did not publish a marker or
+alter any official shard; the actual rolling download remains the next step.
+
 ## 2026-09-02: exact Qwen Flash cross-turn reuse cuts continuation wall 45%
 
 The candidate-bound Qwen3.8-Flash-Next MTP route now has an explicit exact
