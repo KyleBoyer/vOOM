@@ -1849,10 +1849,16 @@ class QwenMTPSpeculativeEngine:
         # an arbitrary 8K prompt limit. After this bootstrap, ``last_kv`` is at
         # the same endpoint the MTP loop expects: prompt fully fed, first token
         # sampled but not fed.
-        from .engine import _cache_io_snapshot, _record_cache_io_delta
+        from .engine import (
+            _cache_io_snapshot,
+            _direct_io_snapshot,
+            _record_cache_io_delta,
+            _record_direct_io_delta,
+        )
 
         request_t0 = time.perf_counter()
         request_cache_before = _cache_io_snapshot(tgt)
+        request_direct_io_before = _direct_io_snapshot(tgt)
         draft_head_detach_before = (
             int(getattr(self.drafter, "_head_host_detach_calls", 0)),
             int(getattr(self.drafter, "_head_host_detach_bytes", 0)),
@@ -4219,6 +4225,7 @@ class QwenMTPSpeculativeEngine:
         _record_cache_io_delta(
             tgt, decode_cache_before, path_stats, prefix="decode_",
             after=request_cache_after)
+        _record_direct_io_delta(tgt, request_direct_io_before, path_stats)
 
         # The bootstrap result only observed the first target token. Publish
         # the complete paged-cache lifetime before the server profile releases

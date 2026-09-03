@@ -23,6 +23,8 @@ any draft KV.
 
 from __future__ import annotations
 
+import math
+
 import mlx.core as mx
 
 from . import quant
@@ -46,6 +48,57 @@ class MTPDrafter:
             assert self.mtp_layer == MTP_LAYER, "released-checkpoint MTP layer drifted from 78"
         names = engine.store.names_with_prefix(f"model.layers.{self.mtp_layer}.")
         self._page_names = [n for n in names if ".mlp.experts." not in n]
+        self._capture_logit_margin = False
+        self._min_logit_margin = 0.0
+        self.reset_confidence_telemetry()
+
+    def configure_confidence(
+        self, *, capture_logit_margin: bool = False,
+        min_logit_margin: float = 0.0,
+    ) -> None:
+        """Configure content-blind confidence telemetry/width truncation.
+
+        A positive margin threshold may withhold a weak candidate after its
+        native MTP state update but before widening the authoritative target
+        verifier.  The target still emits every token; this can change only
+        speculative work, never target acceptance or sampling arithmetic.
+        """
+        if not isinstance(capture_logit_margin, bool):
+            raise TypeError("capture_logit_margin must be bool")
+        try:
+            margin = float(min_logit_margin)
+        except (TypeError, ValueError) as error:
+            raise ValueError("MTP minimum logit margin must be finite") from error
+        if not math.isfinite(margin) or margin < 0.0:
+            raise ValueError("MTP minimum logit margin must be finite and nonnegative")
+        self._capture_logit_margin = capture_logit_margin
+        self._min_logit_margin = margin
+
+    def reset_confidence_telemetry(self) -> None:
+        self._proposal_logit_margins: list[float] = []
+        self._synchronization_logit_margins: list[float] = []
+        self._confidence_withheld = 0
+        self._confidence_synchronization = False
+
+    def confidence_telemetry(self) -> dict[str, int | float | str]:
+        margins = self._proposal_logit_margins
+        synchronization = self._synchronization_logit_margins
+        return {
+            "glm53_mtp_confidence_enabled": int(
+                self._capture_logit_margin or self._min_logit_margin > 0.0),
+            "glm53_mtp_min_logit_margin": float(self._min_logit_margin),
+            "glm53_mtp_confidence_candidates": len(margins),
+            "glm53_mtp_confidence_withheld": int(self._confidence_withheld),
+            "glm53_mtp_logit_margin_min": min(margins) if margins else 0.0,
+            "glm53_mtp_logit_margin_mean": (
+                sum(margins) / len(margins) if margins else 0.0),
+            "glm53_mtp_logit_margin_max": max(margins) if margins else 0.0,
+            "glm53_mtp_logit_margins": ",".join(
+                f"{value:.8g}" for value in margins),
+            "glm53_mtp_sync_confidence_candidates": len(synchronization),
+            "glm53_mtp_sync_logit_margins": ",".join(
+                f"{value:.8g}" for value in synchronization),
+        }
 
     def _weights(self) -> dict:
         return self.engine.cache.get(f"layer.{self.mtp_layer}", self._page_names)
@@ -197,6 +250,19 @@ class MTPDrafter:
                 logits = constraint.mask_logits(logits)
             mx.eval(logits)
             tok = int(mx.argmax(logits))
+            if self._capture_logit_margin or self._min_logit_margin > 0.0:
+                top_two = mx.topk(logits, 2)
+                mx.eval(top_two)
+                margin = float(
+                    (mx.max(top_two) - mx.min(top_two)).item())
+                if self._confidence_synchronization:
+                    self._synchronization_logit_margins.append(margin)
+                else:
+                    self._proposal_logit_margins.append(margin)
+                if (not self._confidence_synchronization
+                        and margin < self._min_logit_margin):
+                    self._confidence_withheld += 1
+                    break
             drafts.append(tok)
             if constraint is not None:
                 constraint.accept_token(tok)

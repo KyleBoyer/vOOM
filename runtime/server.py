@@ -2044,6 +2044,22 @@ class EngineManager:
         if not 1 <= glm53_mtp_max_prompt_tokens <= 65_536:
             raise RequestValidationError(
                 "VMODEL_GLM53_MTP_MAX_PROMPT_TOKENS must be in [1, 65536]")
+        glm53_mtp_confidence_telemetry_request = os.environ.get(
+            "VMODEL_GLM53_MTP_CONFIDENCE_TELEMETRY", "0").strip()
+        if glm53_mtp_confidence_telemetry_request not in ("0", "1"):
+            raise RequestValidationError(
+                "VMODEL_GLM53_MTP_CONFIDENCE_TELEMETRY must be 0 or 1")
+        try:
+            glm53_mtp_min_logit_margin = float(os.environ.get(
+                "VMODEL_GLM53_MTP_MIN_LOGIT_MARGIN", "0"))
+        except ValueError as error:
+            raise RequestValidationError(
+                "VMODEL_GLM53_MTP_MIN_LOGIT_MARGIN must be numeric") from error
+        if (not math.isfinite(glm53_mtp_min_logit_margin)
+                or glm53_mtp_min_logit_margin < 0.0):
+            raise RequestValidationError(
+                "VMODEL_GLM53_MTP_MIN_LOGIT_MARGIN must be finite and "
+                "nonnegative")
         glm53_sparse_absorbed_mla_request = os.environ.get(
             "VMODEL_GLM53_SPARSE_ABSORBED_MLA", "0").strip()
         if glm53_sparse_absorbed_mla_request not in ("0", "1"):
@@ -2354,6 +2370,8 @@ class EngineManager:
             glm53_mtp_request,
             glm53_mtp_depth,
             glm53_mtp_max_prompt_tokens,
+            glm53_mtp_confidence_telemetry_request,
+            glm53_mtp_min_logit_margin.hex(),
             glm53_sparse_absorbed_mla_request,
             glm53_sparse_fused_attention_request,
             glm53_sparse_fused_kv_int8_request,
@@ -2496,6 +2514,8 @@ class EngineManager:
             glm53_mtp_request,
             glm53_mtp_depth,
             glm53_mtp_max_prompt_tokens,
+            glm53_mtp_confidence_telemetry_request,
+            glm53_mtp_min_logit_margin.hex(),
             glm53_sparse_absorbed_mla_request,
             glm53_sparse_fused_attention_request,
             glm53_sparse_fused_kv_int8_request,
@@ -5404,11 +5424,18 @@ class EngineManager:
                         target_engine,
                         k=glm53_mtp_depth,
                         max_prompt_tokens=glm53_mtp_max_prompt_tokens,
+                        capture_logit_margin=(
+                            glm53_mtp_confidence_telemetry_request == "1"),
+                        min_logit_margin=glm53_mtp_min_logit_margin,
                     )
                     print(
                         "[server] exact GLM-5.3 native-MTP speculation: "
                         f"target={model_dir.name} depth={glm53_mtp_depth} "
-                        f"prompt_limit={glm53_mtp_max_prompt_tokens}",
+                        f"prompt_limit={glm53_mtp_max_prompt_tokens} "
+                        "confidence_telemetry="
+                        f"{glm53_mtp_confidence_telemetry_request} "
+                        "min_logit_margin="
+                        f"{glm53_mtp_min_logit_margin:g}",
                         flush=True,
                     )
                 except Exception as error:
@@ -9402,6 +9429,19 @@ def _vision_protocol_timing(result: dict) -> dict:
         "parallel_tier_fast_service_ns",
         "parallel_tier_archive_service_ns",
         "parallel_tier_hidden_ns",
+        "direct_io_fd_opens",
+        "direct_io_fd_hits",
+        "direct_io_fd_closes",
+        "direct_io_fd_open_ns",
+        "direct_io_fd_cached",
+        "direct_io_fd_cache_enabled",
+        "direct_io_fd_nocache_applied",
+        "direct_io_nocache_enabled",
+        "direct_io_pread_calls",
+        "direct_io_pread_requested_bytes",
+        "direct_io_pread_bytes",
+        "direct_io_pread_ns",
+        "direct_io_pread_short_reads",
         "weight_cache_pinned_bytes",
         "weight_cache_prefetched_bytes",
         "weight_cache_resident_bytes",
@@ -9505,6 +9545,10 @@ def _vision_protocol_timing(result: dict) -> dict:
         "glm53_mtp_used",
         "glm53_mtp_depth",
         "glm53_mtp_max_prompt_tokens",
+        "glm53_mtp_confidence_enabled",
+        "glm53_mtp_confidence_candidates",
+        "glm53_mtp_confidence_withheld",
+        "glm53_mtp_sync_confidence_candidates",
         "glm53_mtp_constraint_verified",
         "glm53_mtp_state_only_prefill_tokens",
         "prompt_cache_extension_tokens",
@@ -9936,6 +9980,10 @@ def _vision_protocol_timing(result: dict) -> dict:
         "expert_batch_prefetch_hidden_s",
         "glm53_dsa_pool_build_s",
         "glm53_dsa_selection_s",
+        "glm53_mtp_min_logit_margin",
+        "glm53_mtp_logit_margin_min",
+        "glm53_mtp_logit_margin_mean",
+        "glm53_mtp_logit_margin_max",
         "glm53_layer_stationary_weight_wait_s",
         "glm53_layer_stationary_attention_s",
         "glm53_layer_stationary_kda_attention_s",

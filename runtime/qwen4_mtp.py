@@ -546,10 +546,16 @@ class Qwen4MTPSpeculativeEngine:
                 f"prompt({len(ids)})+max_tokens({max_tokens}) exceeds active "
                 f"context limit={target.effective_max_position_embeddings}")
 
-        from .engine import _cache_io_snapshot, _record_cache_io_delta
+        from .engine import (
+            _cache_io_snapshot,
+            _direct_io_snapshot,
+            _record_cache_io_delta,
+            _record_direct_io_delta,
+        )
 
         request_started = time.perf_counter()
         request_cache_before = _cache_io_snapshot(target)
+        request_direct_io_before = _direct_io_snapshot(target)
         stop = stop or []
         bootstrap_generate = getattr(
             target, "generate_with_memory_retry", target.generate)
@@ -1263,6 +1269,8 @@ class Qwen4MTPSpeculativeEngine:
         _record_cache_io_delta(
             target, request_cache_before, path_stats,
             after=request_cache_after)
+        _record_direct_io_delta(
+            target, request_direct_io_before, path_stats)
 
         if endpoint_slot is not None and last_emitted_logits is not None:
             mx.eval(last_emitted_logits)

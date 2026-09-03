@@ -20,6 +20,8 @@ def main() -> None:
     parser.add_argument("--max-tokens", type=int, default=4)
     parser.add_argument("--depth", type=int, default=3)
     parser.add_argument("--mtp-max-prompt-tokens", type=int, default=2048)
+    parser.add_argument("--mtp-confidence-telemetry", action="store_true")
+    parser.add_argument("--mtp-min-logit-margin", type=float, default=0.0)
     parser.add_argument("--plain", action="store_true")
     parser.add_argument("--runs", type=int, default=1)
     parser.add_argument(
@@ -42,6 +44,10 @@ def main() -> None:
     os.environ["VMODEL_GLM53_MTP_DEPTH"] = str(args.depth)
     os.environ["VMODEL_GLM53_MTP_MAX_PROMPT_TOKENS"] = str(
         args.mtp_max_prompt_tokens)
+    os.environ["VMODEL_GLM53_MTP_CONFIDENCE_TELEMETRY"] = (
+        "1" if args.mtp_confidence_telemetry else "0")
+    os.environ["VMODEL_GLM53_MTP_MIN_LOGIT_MARGIN"] = str(
+        args.mtp_min_logit_margin)
     os.environ["VMODEL_GLM53_HOT_PROMPT_KV"] = "0"
     os.environ["VMODEL_EXECUTION_PROFILE"] = args.execution_profile
     os.environ["VMODEL_GLM53_EXPERT_FETCH_BATCH"] = str(
@@ -127,6 +133,26 @@ def main() -> None:
                     "speculative_controller_cost_estimate", 0.0),
                 "controller_acceptance_estimate": stats.get(
                     "speculative_controller_acceptance_estimate", 0.0),
+                "mtp_confidence_enabled": stats.get(
+                    "glm53_mtp_confidence_enabled", 0),
+                "mtp_min_logit_margin": stats.get(
+                    "glm53_mtp_min_logit_margin", 0.0),
+                "mtp_confidence_candidates": stats.get(
+                    "glm53_mtp_confidence_candidates", 0),
+                "mtp_confidence_withheld": stats.get(
+                    "glm53_mtp_confidence_withheld", 0),
+                "mtp_logit_margin_min": stats.get(
+                    "glm53_mtp_logit_margin_min", 0.0),
+                "mtp_logit_margin_mean": stats.get(
+                    "glm53_mtp_logit_margin_mean", 0.0),
+                "mtp_logit_margin_max": stats.get(
+                    "glm53_mtp_logit_margin_max", 0.0),
+                "mtp_logit_margins": stats.get(
+                    "glm53_mtp_logit_margins", ""),
+                "mtp_sync_confidence_candidates": stats.get(
+                    "glm53_mtp_sync_confidence_candidates", 0),
+                "mtp_sync_logit_margins": stats.get(
+                    "glm53_mtp_sync_logit_margins", ""),
                 "mtp_state_only_prefill_tokens": stats.get(
                     "glm53_mtp_state_only_prefill_tokens", 0),
                 "draft_s": stats.get("speculative_draft_s", 0.0),
@@ -143,6 +169,20 @@ def main() -> None:
                     "weight_fast_tier_bytes", 0),
                 "weight_archive_bytes": stats.get(
                     "weight_archive_bytes", 0),
+                "parallel_tier_fetches": stats.get(
+                    "parallel_tier_fetches", 0),
+                "parallel_tier_fast_bytes": stats.get(
+                    "parallel_tier_fast_bytes", 0),
+                "parallel_tier_archive_bytes": stats.get(
+                    "parallel_tier_archive_bytes", 0),
+                "parallel_tier_wall_s": stats.get(
+                    "parallel_tier_wall_s", 0.0),
+                "parallel_tier_fast_service_s": stats.get(
+                    "parallel_tier_fast_service_s", 0.0),
+                "parallel_tier_archive_service_s": stats.get(
+                    "parallel_tier_archive_service_s", 0.0),
+                "parallel_tier_hidden_s": stats.get(
+                    "parallel_tier_hidden_s", 0.0),
                 "weight_prefetch_waits": stats.get(
                     "weight_prefetch_waits", 0),
                 "weight_prefetch_wait_s": stats.get(
@@ -169,12 +209,18 @@ def main() -> None:
                 "direct_io_fd_cached": stats.get("direct_io_fd_cached", 0),
                 "direct_io_pread_calls": stats.get(
                     "direct_io_pread_calls", 0),
+                "direct_io_pread_requested_bytes": stats.get(
+                    "direct_io_pread_requested_bytes", 0),
                 "direct_io_pread_bytes": stats.get(
                     "direct_io_pread_bytes", 0),
                 "direct_io_pread_s": stats.get(
                     "direct_io_pread_ns", 0) / 1e9,
                 "direct_io_pread_short_reads": stats.get(
                     "direct_io_pread_short_reads", 0),
+                "direct_io_nocache_enabled": stats.get(
+                    "direct_io_nocache_enabled", 0),
+                "direct_io_fd_nocache_applied": stats.get(
+                    "direct_io_fd_nocache_applied", 0),
                 "execution_profile": result.get("execution_profile"),
             })
         endpoint_state = None

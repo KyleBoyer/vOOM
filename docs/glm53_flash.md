@@ -359,6 +359,15 @@ corpus required by the anti-overfit policy:
 - `VMODEL_GLM53_MTP=1`
 - `VMODEL_GLM53_MTP_DEPTH=1..5` (measured at 3)
 - `VMODEL_GLM53_MTP_MAX_PROMPT_TOKENS=1..65536`
+- `VMODEL_GLM53_MTP_CONFIDENCE_TELEMETRY=1` records content-blind top-two
+  native-MTP logit margins and separates proposal attempts from discarded
+  state-synchronization predictions.
+- `VMODEL_GLM53_MTP_MIN_LOGIT_MARGIN=<nonnegative>` withholds a weaker native
+  candidate after its exact MTP state update but before widening the target
+  verifier. Threshold `1.0` is exposed only by the explicit
+  `glm53-flash-lossless-native-mtp3-confidence1-workers2` experiment; it won
+  two different real-weight direct-engine shapes but is not a monotonic
+  acceptance oracle and is not an automatic default.
 - `VMODEL_GLM53_SPARSE_FUSED_ATTENTION=1` enables the explicitly lossy
   online-softmax selected-row kernel.
 - `VMODEL_GLM53_SPARSE_FUSED_KV_INT8=1` halves the expanded request-local

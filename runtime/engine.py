@@ -505,6 +505,46 @@ def _cache_io_snapshot(engine) -> tuple[int, ...]:
     )
 
 
+def _direct_io_snapshot(engine) -> dict[str, int] | None:
+    """Snapshot direct-reader counters without requiring every backend.
+
+    Several speculative adapters bypass :meth:`StreamingEngine.generate` and
+    call the target's lower-level sweeps directly.  Keeping this small helper
+    next to the cache-I/O accounting lets those adapters publish the same
+    physical-read evidence as ordinary generation instead of silently losing
+    it at the wrapper boundary.
+    """
+    store = getattr(engine, "store", None)
+    snapshot = getattr(store, "direct_io_snapshot", None)
+    if not callable(snapshot):
+        return None
+    return {str(key): int(value) for key, value in snapshot().items()}
+
+
+def _record_direct_io_delta(
+    engine, before: dict[str, int] | None, stats: dict, *,
+    after: dict[str, int] | None = None,
+) -> None:
+    """Publish one request's direct-reader work and active policy state."""
+    if before is None:
+        return
+    after = _direct_io_snapshot(engine) if after is None else after
+    if after is None:
+        return
+    for key in (
+        "fd_opens", "fd_hits", "fd_closes", "fd_open_ns",
+        "fd_nocache_applied", "pread_calls", "pread_requested_bytes",
+        "pread_bytes", "pread_ns", "pread_short_reads",
+    ):
+        stats[f"direct_io_{key}"] = max(
+            0, int(after.get(key, 0)) - int(before.get(key, 0)))
+    stats["direct_io_fd_cached"] = int(after.get("fd_cached", 0))
+    stats["direct_io_fd_cache_enabled"] = int(
+        after.get("fd_cache_enabled", 0))
+    stats["direct_io_nocache_enabled"] = int(
+        getattr(getattr(engine, "store", None), "_direct_fd_nocache", False))
+
+
 def _record_cache_io_delta(
     engine, before: tuple[int, ...], stats: dict, *,
     prefix: str = "", after: tuple[int, ...] | None = None,
@@ -10169,9 +10209,7 @@ class StreamingEngine:
         is never passed to `on_token` (streaming clients never see past the
         stop point)."""
         request_t0 = time.perf_counter()
-        direct_io_snapshot = getattr(self.store, "direct_io_snapshot", None)
-        direct_io_before = (
-            direct_io_snapshot() if callable(direct_io_snapshot) else None)
+        direct_io_before = _direct_io_snapshot(self)
         qwen4_expert_before = (
             self.store.qwen4_fused_expert_snapshot()
             if self.cfg.model_type == "qwen4_exp" else None)
@@ -12974,24 +13012,7 @@ class StreamingEngine:
                     - int(qwen4_expert_before[key]))
             path_stats["qwen4_fused_expert_virtual_tensors"] = int(
                 qwen4_expert_after["virtual_tensors"])
-        if direct_io_before is not None:
-            direct_io_after = direct_io_snapshot()
-            for key in (
-                "fd_opens", "fd_hits", "fd_closes", "fd_open_ns",
-                "fd_nocache_applied",
-                "pread_calls", "pread_requested_bytes", "pread_bytes",
-                "pread_ns", "pread_short_reads",
-            ):
-                path_stats[f"direct_io_{key}"] = max(
-                    0,
-                    int(direct_io_after[key]) - int(direct_io_before[key]),
-                )
-            path_stats["direct_io_fd_cached"] = int(
-                direct_io_after["fd_cached"])
-            path_stats["direct_io_fd_cache_enabled"] = int(
-                direct_io_after["fd_cache_enabled"])
-            path_stats["direct_io_nocache_enabled"] = int(
-                getattr(self.store, "_direct_fd_nocache", False))
+        _record_direct_io_delta(self, direct_io_before, path_stats)
         if qwen4_ple_before is not None:
             qwen4_ple_after = self._qwen4_ple_rows.telemetry()
             for key in (

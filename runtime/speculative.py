@@ -370,9 +370,15 @@ class SpeculativeDecoder:
             if tgt.rc.execution_profile else None)
         if tgt._request_profiler is not None:
             tgt._request_profiler.set_phase("prefill")
-        from .engine import _cache_io_snapshot, _record_cache_io_delta
+        from .engine import (
+            _cache_io_snapshot,
+            _direct_io_snapshot,
+            _record_cache_io_delta,
+            _record_direct_io_delta,
+        )
 
         request_cache_before = _cache_io_snapshot(tgt)
+        request_direct_io_before = _direct_io_snapshot(tgt)
         expert_pipeline_before = (
             int(getattr(tgt, "_expert_batch_prefetch_submitted", 0) or 0),
             float(getattr(tgt, "_expert_batch_prefetch_wait_s", 0.0) or 0.0),
@@ -425,6 +431,7 @@ class SpeculativeDecoder:
         if self.mtp is not None:
             self._mtp_kv = self._new_mtp_kv()
             self._mtp_h = None
+            self.mtp.reset_confidence_telemetry()
         tgt._true_peak_metal_bytes = mx.get_active_memory()
         if tgt.governor is not None:
             tgt.governor.reset_request_peak(tgt._true_peak_metal_bytes)
@@ -832,8 +839,13 @@ class SpeculativeDecoder:
                         h_sync, tok_sync = self._mtp_h, all_tokens[-1]
                     else:
                         h_sync, tok_sync = tgt._h_window[:, m - 1 : m, :], proposals[m - 1]
-                    self.mtp.draft_tokens(h_sync, tok_sync, 1, self._mtp_kv,
-                                          offset=valid - 2)
+                    self.mtp._confidence_synchronization = True
+                    try:
+                        self.mtp.draft_tokens(
+                            h_sync, tok_sync, 1, self._mtp_kv,
+                            offset=valid - 2)
+                    finally:
+                        self.mtp._confidence_synchronization = False
                 # F32: next round drafts from the trunk state at window index m
                 # (the hidden that predicted the last committed token)
                 self._mtp_h = tgt._h_window[:, m : m + 1, :]
@@ -999,6 +1011,8 @@ class SpeculativeDecoder:
                 self._acc_num / self._acc_den
                 if self._acc_den > 1e-6 else 0.0),
         }
+        if self.mtp is not None:
+            path_stats.update(self.mtp.confidence_telemetry())
         request_cache_after = _cache_io_snapshot(tgt)
         _record_cache_io_delta(
             tgt, request_cache_before, path_stats,
@@ -1009,6 +1023,7 @@ class SpeculativeDecoder:
         _record_cache_io_delta(
             tgt, prefill_cache_after, path_stats,
             prefix="decode_", after=request_cache_after)
+        _record_direct_io_delta(tgt, request_direct_io_before, path_stats)
         expert_pipeline_after = (
             int(getattr(tgt, "_expert_batch_prefetch_submitted", 0) or 0),
             float(getattr(tgt, "_expert_batch_prefetch_wait_s", 0.0) or 0.0),
@@ -1173,7 +1188,9 @@ class NativeMTPEngine:
     """Explicit target-verified adapter for an appended native NextN block."""
 
     def __init__(self, target: StreamingEngine, *, k: int = 3,
-                 max_prompt_tokens: int = 2048):
+                 max_prompt_tokens: int = 2048,
+                 capture_logit_margin: bool = False,
+                 min_logit_margin: float = 0.0):
         if not 1 <= k <= 5:
             raise ValueError("native MTP depth must be in [1, 5]")
         if not 1 <= max_prompt_tokens <= 65_536:
@@ -1184,8 +1201,14 @@ class NativeMTPEngine:
         self.target = target
         self.decoder = SpeculativeDecoder(
             target, "mtp", k=k, prompt_cache_min_tokens=1)
+        self.decoder.mtp.configure_confidence(
+            capture_logit_margin=capture_logit_margin,
+            min_logit_margin=min_logit_margin,
+        )
         self.max_prompt_tokens = int(max_prompt_tokens)
         self._speculative_k = int(k)
+        self._capture_logit_margin = bool(capture_logit_margin)
+        self._min_logit_margin = float(min_logit_margin)
         self._closed = False
 
     def __getattr__(self, name):
@@ -1213,6 +1236,9 @@ class NativeMTPEngine:
             "glm53_mtp_fallback_reason": reason,
             "glm53_mtp_depth": self._speculative_k,
             "glm53_mtp_max_prompt_tokens": self.max_prompt_tokens,
+            "glm53_mtp_confidence_enabled": int(
+                self._capture_logit_margin or self._min_logit_margin > 0.0),
+            "glm53_mtp_min_logit_margin": self._min_logit_margin,
             "glm53_mtp_constraint_verified": 0,
         })
         return result
@@ -1254,6 +1280,9 @@ class NativeMTPEngine:
             "glm53_mtp_fallback_reason": "",
             "glm53_mtp_depth": self._speculative_k,
             "glm53_mtp_max_prompt_tokens": self.max_prompt_tokens,
+            "glm53_mtp_confidence_enabled": int(
+                self._capture_logit_margin or self._min_logit_margin > 0.0),
+            "glm53_mtp_min_logit_margin": self._min_logit_margin,
             "glm53_mtp_constraint_verified": int(constraint is not None),
             "glm53_mtp_state_only_prefill_tokens": int(getattr(
                 self.target, "_glm53_mtp_state_only_prefill_tokens", 0)),

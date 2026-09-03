@@ -1,0 +1,13 @@
+schema: voom.runtime-profile.v1
+name: glm53-flash-lossless-native-mtp3-confidence1-workers2
+description: Experimental exact GLM-5.3-Flash native-MTP profile with margin-gated verifier width.
+notes:
+  - "Extends the exact two-reader/two-device native-MTP profile. The released MTP block still advances its exact state, but a candidate whose top-two draft-logit margin is below 1.0 is withheld before it can widen the authoritative target verification window. Every visible token remains selected by the unchanged released target."
+  - "On the attested uncensored checkpoint, a 12-input/four-output witness preserved all tokens and 159 endpoint tensors while improving 83.328s ungated MTP -> 68.836s (-17.39%) and 74.670s plain -> 68.836s (-7.81%). Reads fell 149.651GB -> 122.869GB versus ungated MTP."
+  - "A different 16-input/six-output JSON-oriented witness also preserved every token and endpoint tensor: 96.665s ungated -> 93.187s (-3.60%) and 104.160s plain -> 93.187s (-10.53%). The first low-margin proposal on that trace would have been correct, proving margin is not a monotonic acceptance oracle even though later scheduling recovered a net win."
+  - "This profile is explicit/default-off and remains experimental until an untouched real tool/Plex corpus, streaming, sampling fallback, long-context, and vision gates pass. It must not become auto from two direct-engine witnesses."
+extends:
+  - glm53-flash-lossless-native-mtp3-workers2
+settings:
+  VMODEL_GLM53_MTP_CONFIDENCE_TELEMETRY: true
+  VMODEL_GLM53_MTP_MIN_LOGIT_MARGIN: 1.0

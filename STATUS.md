@@ -27,8 +27,42 @@ plus config/index/receipt/shard-stat/manifest hashes. A new full validator
 derived every source extent from the candidate index/header and compared all
 1,455 tensors / 12.932GB byte-for-byte: **PASS**. Global internal tier use is
 68.70GB decimal with 26.50GB projected actual free, inside both machine
-policies. Inference, Plex, vision, and timing gates are still pending; Hub
-claims alone do not promote the checkpoint.
+policies. Real inference/vision results follow; Plex and long-context gates
+remain pending, and Hub claims alone do not promote a checkpoint.
+
+Real inference and vision now pass on that attested candidate. The existing
+exact depth-one trunk prefetch was missing from the named native-MTP profile;
+enabling it on a 12-input/four-output cold witness preserved all four greedy
+tokens plus all 159 endpoint tensors and cut wall **107.251 -> 83.359 seconds
+(-22.28%)**. It hid at least 25.910s across 172 useful internal-tier pages and
+peaked at 3.001GB Metal. An exact repeat in the same process took **32.060s**
+with a 5ms first token. The authoritative plain target matched every token and
+state hash and took 74.670s, exposing that ungated MTP itself regressed this
+low-acceptance trace by 11.64% even though trunk prefetch was a strong win.
+
+An explicit confidence-modulated MTP experiment now measures the released MTP
+head's top-two logit margin and may withhold a weak candidate before widening
+the target verifier. Threshold 1.0 preserved the complete target state and
+improved the first trace **83.328 -> 68.836s (-17.39%)** versus ungated MTP and
+74.670 -> 68.836s (-7.81%) versus plain. On a different 16-input/six-output
+JSON-oriented prompt it again matched all target tokens/state and improved
+96.665 -> **93.187s (-3.60%)** versus ungated and 104.160 -> 93.187s (-10.53%)
+versus plain. The second trace's accepted first proposal had margin 0.125 while
+a later rejected proposal had margin 1.125, proving margin is not a monotonic
+acceptance oracle. The new
+`glm53-flash-lossless-native-mtp3-confidence1-workers2` profile is therefore
+explicit/default-off; `auto` is unchanged pending the required real corpus.
+
+Low-level A/Bs rejected two smaller I/O ideas. Descriptor caching changed
+65.632 -> 65.389s (-0.37%) but removed only 5.5ms of actual open time while
+the identical 25.377GB/646-pread body dominated; Darwin `F_NOCACHE` worsened
+65.632 -> 66.010s (+0.58%) and raw-tier service 9.800 -> 10.283s. Both remain
+explicit/default-off. The native-MTP, Qwen4-MTP, and Qwen3.5-MTP wrappers now
+forward descriptor/pread policy and physical-service counters instead of
+dropping them at the speculative boundary. The real image HTTP gate also
+passed on the uncensored checkpoint: exact answer `green`, 44 input/3 output
+tokens, **103.891s** request wall, 0.891s vision tower, and 2.869GB peak Metal.
+Plex and long-context gates remain pending.
 
 The first multi-turn Plex run rejects the staged
 `windowsxp811203/Qwen3.8-Flash-Next-Abliterated` candidate for promotion. It

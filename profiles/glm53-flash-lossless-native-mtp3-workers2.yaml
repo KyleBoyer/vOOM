@@ -1,10 +1,11 @@
 schema: voom.runtime-profile.v1
 name: glm53-flash-lossless-native-mtp3-workers2
-description: Explicit lossless GLM-5.3-Flash two-reader profile with released native-MTP target verification.
+description: Explicit lossless GLM-5.3-Flash two-reader/two-device profile with released native-MTP target verification.
 notes:
   - "Extends the released-arithmetic two-reader profile and uses the checkpoint's appended native MTP block to propose up to three tokens. Every emitted token remains greedily verified by the official target; rejected proposals are discarded through the target rollback path."
   - "The native adapter retains its paired target/draft prompt endpoint for repeats and extensions. It does not use the generic hot-KV profile, a separately trained sidecar, altered target weights, expert pruning, quantized KV, or approximate kernels."
   - "The GLM serial verifier reprojects the authoritative growing latent prefix for each position, matching canonical one-token MLA GEMM shapes while loading each layer once. Two different real-weight prompt/output shapes matched all greedy tokens, text, aggregate/component state hashes, and all 159 endpoint tensor hashes."
+  - "Depth-one trunk prefetch overlaps the next exact deterministic page from the internal mirror with current routed-expert work from Workspace. On the attested uncensored checkpoint it preserved four greedy tokens plus all 159 endpoint tensors and reduced a cold 12-input/four-output witness from 107.251s to 83.359s (-22.28%); 172 useful pages hid at least 25.910s at 3.001GB peak."
   - "This profile remains explicit/default-off pending unmodified real tool/Plex, streaming, sampling, long-context, and vision gates. Do not make it an automatic default from these two direct-engine greedy witnesses alone."
 extends:
   - glm53-flash-lossless-expert-prefetch-batch8-workers2
@@ -12,3 +13,5 @@ settings:
   VMODEL_GLM53_MTP: true
   VMODEL_GLM53_MTP_DEPTH: 3
   VMODEL_GLM53_MTP_MAX_PROMPT_TOKENS: 65536
+  VMODEL_GLM53_TRUNK_PREFETCH_DEPTH: 1
+  VMODEL_GLM53_TRUNK_PREFETCH_WORKERS: 1

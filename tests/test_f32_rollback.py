@@ -101,6 +101,32 @@ def test_rollback_accept_all():
     assert emitted == truth, f"accept-all: {emitted} != {truth}"
 
 
+def test_confidence_threshold_withholds_drafts_but_target_stays_exact():
+    """A withheld proposal narrows work; it never becomes an output token."""
+    from runtime.engine import RuntimeConfig, StreamingEngine
+    from runtime.speculative import SpeculativeDecoder
+
+    _ensure_fixture()
+    prompt, max_tokens = "Confidence gate", 6
+    truth = _true_greedy(prompt, max_tokens)
+    eng = StreamingEngine(str(FIXTURE), RuntimeConfig(
+        max_weight_cache_mb=200, pin_lm_head=True, mla_compressed_kv=True))
+    dec = SpeculativeDecoder(
+        eng, "mtp", k=3, _unsafe_allow_moe_verify=True)
+    dec.mtp.configure_confidence(
+        capture_logit_margin=True, min_logit_margin=1e9)
+    result = dec.generate(prompt, max_tokens=max_tokens)
+    eng.close()
+
+    assert result["tokens"] == truth
+    stats = result["path_stats"]
+    assert stats["glm53_mtp_confidence_enabled"] == 1
+    assert stats["glm53_mtp_min_logit_margin"] == 1e9
+    assert stats["glm53_mtp_confidence_candidates"] > 0
+    assert stats["glm53_mtp_confidence_withheld"] == stats[
+        "glm53_mtp_confidence_candidates"]
+
+
 def test_rollback_above_dsa_threshold_is_quarantined():
     """MTP speculative decoding above a model's index_topk is deliberately
     refused (runtime/speculative.py), not silently run through an unproven

@@ -661,6 +661,12 @@ def test_protocol_timing_exposes_pin_and_prefetch_measurements():
             "weight_cache_prefetched_bytes": 200_000_000,
             "planned_trunk_pin_layers": 4,
             "planned_trunk_pin_bytes": 350_000_000,
+            "direct_io_fd_opens": 45,
+            "direct_io_fd_hits": 135,
+            "direct_io_fd_cache_enabled": 1,
+            "direct_io_pread_calls": 646,
+            "direct_io_pread_bytes": 25_376_862_704,
+            "direct_io_pread_ns": 9_800_000_000,
         },
     })
 
@@ -681,6 +687,12 @@ def test_protocol_timing_exposes_pin_and_prefetch_measurements():
     assert timing["weight_cache_prefetched_bytes"] == 200_000_000
     assert timing["planned_trunk_pin_layers"] == 4
     assert timing["planned_trunk_pin_bytes"] == 350_000_000
+    assert timing["direct_io_fd_opens"] == 45
+    assert timing["direct_io_fd_hits"] == 135
+    assert timing["direct_io_fd_cache_enabled"] == 1
+    assert timing["direct_io_pread_calls"] == 646
+    assert timing["direct_io_pread_bytes"] == 25_376_862_704
+    assert timing["direct_io_pread_ns"] == 9_800_000_000
 
 
 def test_protocol_timing_exposes_phase_head_physical_lifetime():
@@ -2722,6 +2734,9 @@ def test_glm53_hot_prompt_kv_is_opt_in_exact_and_in_engine_identity():
         ("VMODEL_GLM53_MTP", "auto", "must be 0 or 1"),
         ("VMODEL_GLM53_MTP_DEPTH", "6", "must be in \\[1, 5\\]"),
         ("VMODEL_GLM53_MTP_MAX_PROMPT_TOKENS", "65537", "in \\[1, 65536\\]"),
+        ("VMODEL_GLM53_MTP_CONFIDENCE_TELEMETRY", "auto", "must be 0 or 1"),
+        ("VMODEL_GLM53_MTP_MIN_LOGIT_MARGIN", "nan", "finite and nonnegative"),
+        ("VMODEL_GLM53_MTP_MIN_LOGIT_MARGIN", "-1", "finite and nonnegative"),
         ("VMODEL_GLM53_SPARSE_ABSORBED_MLA", "auto", "must be 0 or 1"),
         ("VMODEL_GLM53_SPARSE_FUSED_KV_INT8", "auto", "must be 0 or 1"),
         ("VMODEL_GLM53_COALESCED_EXPERT_POSITIONS", "auto",
@@ -2764,10 +2779,13 @@ def test_glm53_native_mtp_is_explicit_and_in_engine_identity():
             pass
 
     class FakeMTP:
-        def __init__(self, target, *, k, max_prompt_tokens):
+        def __init__(self, target, *, k, max_prompt_tokens,
+                     capture_logit_margin, min_logit_margin):
             self.target = target
             self.k = k
             self.max_prompt_tokens = max_prompt_tokens
+            self.capture_logit_margin = capture_logit_margin
+            self.min_logit_margin = min_logit_margin
             wrappers.append(self)
 
         def close(self):
@@ -2797,6 +2815,8 @@ def test_glm53_native_mtp_is_explicit_and_in_engine_identity():
     assert mtp is wrappers[0]
     assert mtp.k == 3
     assert mtp.max_prompt_tokens == 8192
+    assert not mtp.capture_logit_margin
+    assert mtp.min_logit_margin == 0.0
     assert len(targets) == 2
 
 

@@ -2,6 +2,7 @@ import os
 import threading
 
 from runtime.model_loader import WeightStore
+from runtime.engine import _direct_io_snapshot, _record_direct_io_delta
 
 
 def _bare_store():
@@ -83,3 +84,40 @@ def test_direct_descriptor_cache_has_a_real_disabled_control(tmp_path):
     assert snapshot["fd_closes"] == 2
     assert snapshot["fd_cached"] == 0
     store.close()
+
+
+def test_direct_io_request_delta_preserves_policy_and_physical_counts():
+    store = _bare_store()
+    engine = type("Engine", (), {"store": store})()
+    before = _direct_io_snapshot(engine)
+    store.direct_fd_opens = 3
+    store.direct_fd_hits = 11
+    store.direct_fd_closes = 2
+    store.direct_fd_open_ns = 700
+    store.direct_pread_calls = 13
+    store.direct_pread_requested_bytes = 4096
+    store.direct_pread_bytes = 4096
+    store.direct_pread_ns = 900
+    store.direct_pread_short_reads = 1
+    store._direct_fds["weights"] = (123, 4096)
+    store._direct_fd_nocache = True
+    store.direct_fd_nocache_applied = 3
+
+    stats = {}
+    _record_direct_io_delta(engine, before, stats)
+
+    assert stats == {
+        "direct_io_fd_opens": 3,
+        "direct_io_fd_hits": 11,
+        "direct_io_fd_closes": 2,
+        "direct_io_fd_open_ns": 700,
+        "direct_io_fd_nocache_applied": 3,
+        "direct_io_pread_calls": 13,
+        "direct_io_pread_requested_bytes": 4096,
+        "direct_io_pread_bytes": 4096,
+        "direct_io_pread_ns": 900,
+        "direct_io_pread_short_reads": 1,
+        "direct_io_fd_cached": 1,
+        "direct_io_fd_cache_enabled": 1,
+        "direct_io_nocache_enabled": 1,
+    }
