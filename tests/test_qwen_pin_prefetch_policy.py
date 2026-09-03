@@ -58,10 +58,14 @@ def test_request_telemetry_exposes_pin_and_prefetch_effectiveness():
         pinned_hits=5, prefetch_hits=6, prefetch_waits=7,
         prefetch_wait_s=0.25,
         prefetch_loads=8, prefetch_loaded_bytes=800,
+        prefetch_loaded_resident_bytes=1_600,
+        prefetch_oversize_pages=0,
         prefetch_load_s=0.5,
         prefetch_useful_pages=6, prefetch_useful_bytes=600,
+        prefetch_useful_resident_bytes=1_200,
         prefetch_useful_load_s=0.4,
         prefetch_wasted_pages=2, prefetch_wasted_bytes=200,
+        prefetch_wasted_resident_bytes=400,
         prefetch_wasted_load_s=0.1,
     )
     engine = SimpleNamespace(
@@ -85,12 +89,16 @@ def test_request_telemetry_exposes_pin_and_prefetch_effectiveness():
     cache_stats.prefetch_wait_s += 0.125
     cache_stats.prefetch_loads += 4
     cache_stats.prefetch_loaded_bytes += 400
+    cache_stats.prefetch_loaded_resident_bytes += 800
+    cache_stats.prefetch_oversize_pages += 1
     cache_stats.prefetch_load_s += 0.25
     cache_stats.prefetch_useful_pages += 3
     cache_stats.prefetch_useful_bytes += 300
+    cache_stats.prefetch_useful_resident_bytes += 600
     cache_stats.prefetch_useful_load_s += 0.2
     cache_stats.prefetch_wasted_pages += 1
     cache_stats.prefetch_wasted_bytes += 100
+    cache_stats.prefetch_wasted_resident_bytes += 200
     cache_stats.prefetch_wasted_load_s += 0.05
     stats = {}
     _record_cache_io_delta(engine, before, stats)
@@ -102,8 +110,12 @@ def test_request_telemetry_exposes_pin_and_prefetch_effectiveness():
     assert stats["weight_prefetch_wait_s"] == 0.125
     assert stats["weight_prefetch_loads"] == 4
     assert stats["weight_prefetch_loaded_bytes"] == 400
+    assert stats["weight_prefetch_loaded_resident_bytes"] == 800
+    assert stats["weight_prefetch_oversize_pages"] == 1
     assert stats["weight_prefetch_useful_pages"] == 3
+    assert stats["weight_prefetch_useful_resident_bytes"] == 600
     assert stats["weight_prefetch_wasted_pages"] == 1
+    assert stats["weight_prefetch_wasted_resident_bytes"] == 200
     assert stats["weight_prefetch_hidden_lower_bound_s"] == pytest.approx(0.075)
     assert stats["weight_cache_prefetched_bytes"] == 200
     assert stats["planned_trunk_pin_layers"] == 4

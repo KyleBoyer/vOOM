@@ -438,13 +438,17 @@ def _cache_io_snapshot(engine) -> tuple[int, ...]:
         int(float(getattr(stats, "prefetch_wait_s", 0.0) or 0.0) * 1e9),
         int(getattr(stats, "prefetch_loads", 0) or 0),
         int(getattr(stats, "prefetch_loaded_bytes", 0) or 0),
+        int(getattr(stats, "prefetch_loaded_resident_bytes", 0) or 0),
+        int(getattr(stats, "prefetch_oversize_pages", 0) or 0),
         int(float(getattr(stats, "prefetch_load_s", 0.0) or 0.0) * 1e9),
         int(getattr(stats, "prefetch_useful_pages", 0) or 0),
         int(getattr(stats, "prefetch_useful_bytes", 0) or 0),
+        int(getattr(stats, "prefetch_useful_resident_bytes", 0) or 0),
         int(float(
             getattr(stats, "prefetch_useful_load_s", 0.0) or 0.0) * 1e9),
         int(getattr(stats, "prefetch_wasted_pages", 0) or 0),
         int(getattr(stats, "prefetch_wasted_bytes", 0) or 0),
+        int(getattr(stats, "prefetch_wasted_resident_bytes", 0) or 0),
         int(float(
             getattr(stats, "prefetch_wasted_load_s", 0.0) or 0.0) * 1e9),
         int(engine.expert_hits),
@@ -557,9 +561,14 @@ def _record_cache_io_delta(
         "weight_cache_pinned_hits", "weight_cache_prefetch_hits",
         "weight_prefetch_waits", "weight_prefetch_wait_ns",
         "weight_prefetch_loads", "weight_prefetch_loaded_bytes",
+        "weight_prefetch_loaded_resident_bytes",
+        "weight_prefetch_oversize_pages",
         "weight_prefetch_load_ns", "weight_prefetch_useful_pages",
-        "weight_prefetch_useful_bytes", "weight_prefetch_useful_load_ns",
+        "weight_prefetch_useful_bytes",
+        "weight_prefetch_useful_resident_bytes",
+        "weight_prefetch_useful_load_ns",
         "weight_prefetch_wasted_pages", "weight_prefetch_wasted_bytes",
+        "weight_prefetch_wasted_resident_bytes",
         "weight_prefetch_wasted_load_ns",
         "expert_cache_hits", "expert_cache_misses",
         "governor_reservations", "governor_reservation_calls",
@@ -5841,7 +5850,12 @@ class StreamingEngine:
             last_only = final_mlp_last_only and i == n - 1 and x.shape[1] > 1
             if self.prefetcher:
                 for j in range(i + 1, min(i + 1 + self.rc.prefetch_depth, n)):
-                    self.prefetcher.schedule(self._layer_key(j), self._layer_names(j))
+                    hint = self._layer_fetch_bytes_estimate(j)
+                    self.prefetcher.schedule(
+                        self._layer_key(j),
+                        self._layer_names(j),
+                        page_size_hint=hint or None,
+                    )
 
             cache_before = (
                 profiler.cache_snapshot(self.cache)

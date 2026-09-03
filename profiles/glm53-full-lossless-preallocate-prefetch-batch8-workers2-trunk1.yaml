@@ -1,0 +1,14 @@
+schema: voom.runtime-profile.v1
+name: glm53-full-lossless-preallocate-prefetch-batch8-workers2-trunk1
+description: Explicit full GLM-5.3 exact expert/trunk overlap composition for short and medium contexts.
+notes:
+  - "Extends the measured two-reader expert-prefetch schedule and overlaps one deterministic next-layer non-expert trunk page. Candidate weights, routing, demand order, one-expert arithmetic, reductions, and target logits are unchanged."
+  - "The shared trunk controls were previously wired only for glm5_next. This profile is the first real full glm_moe_dsa timing/equality gate and remains explicit/default-off regardless of a short-shape win."
+  - "The parent is already rejected for the untouched 46.8K capture because expert-prefetch residency fails long-context admission. This child inherits that restriction and must never be selected as a long-context workaround."
+  - "Released MoE trunk pages average about 213 MB on disk and widen from released FP8 to roughly 426 MB of exact BF16 compute payload; two dense-layer pages measured about 802 MB resident. This explicit candidate raises only the full-model weight LRU from the safe long-context default of 150 MB to 850 MB so every one-page-ahead trunk prefetch can survive; unconsumed prefetch pages remain protected ahead of ordinary expert-cache entries and the default remains unchanged."
+extends:
+  - glm53-full-lossless-preallocate-prefetch-batch8-workers2
+settings:
+  VMODEL_GLM53_TRUNK_PREFETCH_DEPTH: 1
+  VMODEL_GLM53_TRUNK_PREFETCH_WORKERS: 1
+  VMODEL_GLM53_FULL_WEIGHT_CACHE_MB: 850

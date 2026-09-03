@@ -104,18 +104,20 @@ Qwen's specialized tier now cross-checks its source revision against overlay
 or replacement receipts. Focused integrity, paging, runtime, telemetry, and
 server regressions pass **345/345** with two real-model skips.
 
-The full-size uncensored regular checkpoint is now pinned for a separate
-relayout-safe migration. `dealignai/GLM-5.3-UNCENSORED-FP8` revision
-`aff05d054bf581b95bdfd87ba9792dbf1e4365b2` has the byte-identical released
-config and exactly the same **118,629 tensor names** as official GLM-5.3, but
-splits them across 282 rather than 141 shards. Its model card reports a v2
-weight edit to BF16 residual writers while retaining the released FP8 expert
-representation; this is intentionally an uncensored/modified checkpoint, not
-a claim of output equivalence to official GLM-5.3. The real pinned dry plan
-covers 755,631,998,192 candidate shard bytes, ends 52,128 bytes smaller on
-disk, and needs at most **10,040,383,840 transient bytes** under the
-conservative double-staging model. With about 45.8GB free at planning time it
-clears the 10GB reserve by more than 25GB.
+The full-size regular checkpoint has also been replaced in place with
+`dealignai/GLM-5.3-UNCENSORED-FP8` revision
+`aff05d054bf581b95bdfd87ba9792dbf1e4365b2`. The source and candidate configs
+are byte-identical and their **118,629 tensor names** match exactly, but the
+candidate splits them across 282 rather than 141 shards. Its model card
+reports a v2 edit to BF16 residual writers while retaining the released FP8
+expert representation; this is intentionally an uncensored/modified
+checkpoint, not a claim of output equivalence to official GLM-5.3. The rolling
+Xet migration verified every candidate shard before publication and each
+official shard before deletion, then completed both its full candidate audit
+and an independent finalize audit. There was no NAS backup. Header inspection
+confirms 78 layers, 256 experts/top-8, the released MTP block, 118,629 known
+tensors, 755,617,140,416 tensor bytes, FP8 experts plus FP32 block scales, and
+BF16 embeddings/head. The permanent receipt pins revision `aff05d...`.
 
 `runtime.hf_checkpoint_relayout_replace.py` keeps this changed-layout path
 separate from the proven same-layout code. It requires identical config and
@@ -126,8 +128,34 @@ after every candidate shard containing any of its tensors is durable. Resume
 audits reject invalid bytes and any coverage hole; candidate serving metadata
 is swapped only after all shards complete, while upstream-only tokenizers and
 model code are preserved. The synthetic relayout plus existing same-layout
-crash/restart suites pass **8/8**. The dry plan did not publish a marker or
-alter any official shard; the actual rolling download remains the next step.
+crash/restart suites pass **8/8**. A deliberately interrupted plain-HTTP start
+left one candidate shard and all 141 source shards recoverable; the resume
+audit found no coverage hole, and the adaptive Xet continuation completed the
+same marker safely.
+
+The uncensored full checkpoint now passes real inference. The conservative
+long-context profile completed a 17-input/max-1 smoke in **228.698s**, read
+214.904GB, and peaked at 0.928GB Metal. Reusing the existing exact batch-eight,
+two-reader expert schedule preserved output SHA `3fee95da...1043`, the exact
+214.904GB read volume, and reduced wall to **149.189s (-34.8%)** with a 1.855GB
+peak. This is the preferred explicit short/medium baseline; its known 46.8K
+live-memory rejection is unchanged.
+
+Full-model deterministic trunk prefetch is now wired through the same explicit
+GLM controls and instrumented with checkpoint-byte, resident-byte, useful,
+wasted, and oversize-page counters. The first 150MB and 400MB trials rejected
+the idea honestly: all 77 completed prefetches were evicted unused, added
+16.424GB of duplicate reads, and regressed wall to 151.841/152.121s. Released
+FP8 trunk weights widen to BF16 for compute; at 500MB, 57 pages became useful
+but two roughly 802MB dense pages still exceeded the cache. The final explicit
+850MB candidate consumed **76/76** scheduled pages with zero waste/oversize,
+preserved the same output and exact 214.904GB total reads, and improved wall
+**149.189 -> 144.633s (-3.05%)**. It hid at least 16.471s of trunk I/O, peaked
+at 2.755GB Metal, kept available memory at 4.969GB, and grew swap-out 9.388MB.
+`auto` and the safe 150MB long-context default remain unchanged. The next gate
+is the checkpoint-bound partial raw tier: deterministic trunk bytes on the
+internal SSD, routed experts on Workspace NVMe, under both the 90GB total-tier
+and 10GB actual-free constraints.
 
 ## 2026-09-02: exact Qwen Flash cross-turn reuse cuts continuation wall 45%
 

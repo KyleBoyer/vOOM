@@ -2244,6 +2244,8 @@ class EngineManager:
                 "VMODEL_GLM53_TRUNK_PREFETCH_DEPTH", "0"))
             glm53_trunk_prefetch_workers = int(os.environ.get(
                 "VMODEL_GLM53_TRUNK_PREFETCH_WORKERS", "1"))
+            glm53_full_weight_cache_mb = int(os.environ.get(
+                "VMODEL_GLM53_FULL_WEIGHT_CACHE_MB", "150"))
         except ValueError as error:
             raise RequestValidationError(
                 "VMODEL_GLM53 expert/prefetch settings must be integers") from error
@@ -2262,6 +2264,9 @@ class EngineManager:
         if not 1 <= glm53_trunk_prefetch_workers <= 2:
             raise RequestValidationError(
                 "VMODEL_GLM53_TRUNK_PREFETCH_WORKERS must be in [1, 2]")
+        if not 150 <= glm53_full_weight_cache_mb <= 2000:
+            raise RequestValidationError(
+                "VMODEL_GLM53_FULL_WEIGHT_CACHE_MB must be in [150, 2000]")
         key = (
             str(model_dir), mode, yarn_factor.hex(),
             bool(requires_vision), resident_backend_request,
@@ -2397,6 +2402,7 @@ class EngineManager:
             glm53_expert_batch_prefetch_workers,
             glm53_trunk_prefetch_depth,
             glm53_trunk_prefetch_workers,
+            glm53_full_weight_cache_mb,
         )
         # A healthy resident engine owns all state it needs. Return before
         # touching model storage so a transient NAS disconnect cannot stall or
@@ -2541,6 +2547,7 @@ class EngineManager:
             glm53_expert_batch_prefetch_workers,
             glm53_trunk_prefetch_depth,
             glm53_trunk_prefetch_workers,
+            glm53_full_weight_cache_mb,
         )
         # Validate the requested profile before evicting a healthy resident
         # engine. ModelConfig.from_dir is read-only and has the same remount
@@ -3001,12 +3008,18 @@ class EngineManager:
                     # real-harness rung, so start at the already-supported
                     # 150 MB minimum. Oversized demand pages remain valid and
                     # are evicted before the following released page arrives.
-                    rc.max_weight_cache_mb = 150
+                    rc.max_weight_cache_mb = glm53_full_weight_cache_mb
                     rc.min_weight_cache_mb = 150
                     rc.mlx_cache_limit_mb = 512
                     rc.metal_limit_mb = 8500
-                    rc.prefetch_depth = 0
-                    rc.prefetch_workers = 1
+                    # The same deterministic next-layer trunk read used by
+                    # glm5_next is valid for full glm_moe_dsa: only storage
+                    # timing changes, while demand consumption and released
+                    # arithmetic remain authoritative.  Keep depth zero as
+                    # the default and expose it only through the shared
+                    # explicit GLM-5.3 controls.
+                    rc.prefetch_depth = glm53_trunk_prefetch_depth
+                    rc.prefetch_workers = glm53_trunk_prefetch_workers
                     rc.expert_compute_batch = 1
                     rc.decode_expert_fetch_batch = 1
                     # Storage grouping and a single future read are exact:
@@ -9415,12 +9428,16 @@ def _vision_protocol_timing(result: dict) -> dict:
         "weight_prefetch_wait_ns",
         "weight_prefetch_loads",
         "weight_prefetch_loaded_bytes",
+        "weight_prefetch_loaded_resident_bytes",
+        "weight_prefetch_oversize_pages",
         "weight_prefetch_load_ns",
         "weight_prefetch_useful_pages",
         "weight_prefetch_useful_bytes",
+        "weight_prefetch_useful_resident_bytes",
         "weight_prefetch_useful_load_ns",
         "weight_prefetch_wasted_pages",
         "weight_prefetch_wasted_bytes",
+        "weight_prefetch_wasted_resident_bytes",
         "weight_prefetch_wasted_load_ns",
         "parallel_tier_fetches",
         "parallel_tier_fast_bytes",

@@ -168,8 +168,11 @@ def test_prefetch_hit_updates_reserved_accounting_without_changing_total(
     assert cache.stats.prefetch_hits == 1
     assert cache.stats.prefetch_loads == 1
     assert cache.stats.prefetch_loaded_bytes == 10
+    assert cache.stats.prefetch_loaded_resident_bytes == 10
+    assert cache.stats.prefetch_oversize_pages == 0
     assert cache.stats.prefetch_useful_pages == 1
     assert cache.stats.prefetch_useful_bytes == 10
+    assert cache.stats.prefetch_useful_resident_bytes == 10
     assert cache.stats.prefetch_wasted_pages == 0
 
 
@@ -185,6 +188,20 @@ def test_unused_prefetch_is_counted_as_waste_on_eviction(monkeypatch):
     assert cache.stats.prefetch_useful_pages == 0
     assert cache.stats.prefetch_wasted_pages == 1
     assert cache.stats.prefetch_wasted_bytes == 10
+    assert cache.stats.prefetch_wasted_resident_bytes == 10
+
+
+def test_oversize_prefetch_records_resident_bytes(monkeypatch):
+    monkeypatch.setattr(cache_module, "_clear_device_cache", lambda: None)
+    cache = WeightCache(FakeStore(), max_bytes=9)
+    cache.get("oversize", ["oversize.weight"], origin="prefetch")
+
+    assert cache.stats.prefetch_loads == 1
+    assert cache.stats.prefetch_loaded_bytes == 10
+    assert cache.stats.prefetch_loaded_resident_bytes == 10
+    assert cache.stats.prefetch_oversize_pages == 1
+    assert cache.stats.prefetch_wasted_pages == 1
+    assert cache.stats.prefetch_wasted_resident_bytes == 10
 
 
 def test_replacing_a_pinned_page_keeps_byte_counters_exact(monkeypatch):

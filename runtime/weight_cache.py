@@ -51,12 +51,16 @@ class CacheStats:
     # bound on I/O hidden behind compute without adding synchronization.
     prefetch_loads: int = 0
     prefetch_loaded_bytes: int = 0
+    prefetch_loaded_resident_bytes: int = 0
+    prefetch_oversize_pages: int = 0
     prefetch_load_s: float = 0.0
     prefetch_useful_pages: int = 0
     prefetch_useful_bytes: int = 0
+    prefetch_useful_resident_bytes: int = 0
     prefetch_useful_load_s: float = 0.0
     prefetch_wasted_pages: int = 0
     prefetch_wasted_bytes: int = 0
+    prefetch_wasted_resident_bytes: int = 0
     prefetch_wasted_load_s: float = 0.0
     disk_s: float = 0.0
     bytes_read: int = 0
@@ -253,6 +257,9 @@ class WeightCache:
                 if origin == "prefetch":
                     self.stats.prefetch_loads += 1
                     self.stats.prefetch_loaded_bytes += nbytes
+                    self.stats.prefetch_loaded_resident_bytes += resident
+                    if resident > self.max_bytes:
+                        self.stats.prefetch_oversize_pages += 1
                     self.stats.prefetch_load_s += secs
                 self._evict_locked()
             return tensors
@@ -641,6 +648,7 @@ class WeightCache:
         if page.origin == "prefetch":
             self.stats.prefetch_useful_pages += 1
             self.stats.prefetch_useful_bytes += page.store_bytes
+            self.stats.prefetch_useful_resident_bytes += page.nbytes
             self.stats.prefetch_useful_load_s += page.fetch_s
         page.origin = "demand"
         if was_reserved and not self._reserved(page):
@@ -651,6 +659,7 @@ class WeightCache:
             return
         self.stats.prefetch_wasted_pages += 1
         self.stats.prefetch_wasted_bytes += page.store_bytes
+        self.stats.prefetch_wasted_resident_bytes += page.nbytes
         self.stats.prefetch_wasted_load_s += page.fetch_s
 
     def _evict_locked(self):

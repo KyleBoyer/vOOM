@@ -2580,6 +2580,9 @@ def test_full_glm_long_context_is_explicit_tiled_and_external_spilled():
         "VMODEL_GLM_DSA_DENSE_MLP_TILE_SIZE": "256",
         "VMODEL_GLM53_EXPERT_FETCH_BATCH": "8",
         "VMODEL_GLM53_EXPERT_BATCH_PREFETCH": "1",
+        "VMODEL_GLM53_TRUNK_PREFETCH_DEPTH": "1",
+        "VMODEL_GLM53_TRUNK_PREFETCH_WORKERS": "2",
+        "VMODEL_GLM53_FULL_WEIGHT_CACHE_MB": "400",
     }
     with patch.dict(os.environ, settings, clear=False), \
          patch("runtime.config.ModelConfig.from_dir", return_value=cfg), \
@@ -2599,12 +2602,28 @@ def test_full_glm_long_context_is_explicit_tiled_and_external_spilled():
     assert rc.glm_dsa_mla_kv_spill_dir == "/Volumes/Test/glm-dsa-spill"
     assert rc.layer_stationary_prefill
     assert not rc.adaptive_chunk_size
-    assert rc.max_weight_cache_mb == 150
+    assert rc.max_weight_cache_mb == 400
     assert rc.metal_limit_mb == 8500
     assert rc.expert_fetch_batch == 8
     assert rc.expert_compute_batch == 1
     assert rc.expert_batch_prefetch
+    assert rc.prefetch_depth == 1
+    assert rc.prefetch_workers == 2
     assert rc.embed_rows and rc.stream_lm_head
+
+
+def test_full_glm_weight_cache_limit_is_bounded():
+    from unittest.mock import patch
+
+    from runtime.server import EngineManager
+
+    with patch.dict(os.environ, {
+        "VMODEL_GLM53_FULL_WEIGHT_CACHE_MB": "2001",
+    }, clear=False), pytest.raises(
+        RequestValidationError,
+        match="VMODEL_GLM53_FULL_WEIGHT_CACHE_MB must be in",
+    ):
+        EngineManager().get(Path("/tmp/unused-full-glm53"), "lossless")
 
 
 def test_full_glm_long_context_requires_external_spill():
