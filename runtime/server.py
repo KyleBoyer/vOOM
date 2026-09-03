@@ -2030,6 +2030,11 @@ class EngineManager:
         if glm53_native_fp8_dequant_request not in ("0", "1"):
             raise RequestValidationError(
                 "VMODEL_GLM53_NATIVE_FP8_DEQUANT must be 0 or 1")
+        glm53_native_fp8_prefetch_request = os.environ.get(
+            "VMODEL_GLM53_NATIVE_FP8_PREFETCH", "1").strip()
+        if glm53_native_fp8_prefetch_request not in ("0", "1"):
+            raise RequestValidationError(
+                "VMODEL_GLM53_NATIVE_FP8_PREFETCH must be 0 or 1")
         glm53_mtp_request = os.environ.get(
             "VMODEL_GLM53_MTP", "0").strip()
         if glm53_mtp_request not in ("0", "1"):
@@ -2378,6 +2383,7 @@ class EngineManager:
             glm53_hot_kv_slots,
             glm53_hot_kv_min_tokens,
             glm53_native_fp8_dequant_request,
+            glm53_native_fp8_prefetch_request,
             glm53_mtp_request,
             glm53_mtp_depth,
             glm53_mtp_max_prompt_tokens,
@@ -2524,6 +2530,7 @@ class EngineManager:
             glm53_hot_kv_slots,
             glm53_hot_kv_min_tokens,
             glm53_native_fp8_dequant_request,
+            glm53_native_fp8_prefetch_request,
             glm53_mtp_request,
             glm53_mtp_depth,
             glm53_mtp_max_prompt_tokens,
@@ -2566,6 +2573,11 @@ class EngineManager:
             raise RequestValidationError(
                 "VMODEL_GLM53_NATIVE_FP8_DEQUANT requires a GLM-5.3 "
                 "fine-grained-FP8 checkpoint")
+        if (glm53_native_fp8_prefetch_request == "0"
+                and glm53_native_fp8_dequant_request != "1"):
+            raise RequestValidationError(
+                "VMODEL_GLM53_NATIVE_FP8_PREFETCH=0 requires "
+                "VMODEL_GLM53_NATIVE_FP8_DEQUANT=1")
         if (qwen_rerank_lm_head_rank_capture_path
                 and mtype != "qwen3_5"):
             raise RequestValidationError(
@@ -9432,11 +9444,15 @@ def _vision_protocol_timing(result: dict) -> dict:
         "weight_fast_tier_bytes",
         "weight_archive_bytes",
         "glm53_native_fp8_dequant",
+        "glm53_native_fp8_prefetch",
         "glm53_fp8_transform_ns",
         "glm53_fp8_transform_calls",
         "glm53_fp8_native_calls",
         "glm53_fp8_input_bytes",
         "glm53_fp8_resident_bytes",
+        "glm53_fp8_prefetch_transform_ns",
+        "glm53_fp8_prefetch_transform_calls",
+        "glm53_fp8_prefetch_native_calls",
         "weight_cache_hits",
         "weight_cache_misses",
         "weight_cache_evictions",

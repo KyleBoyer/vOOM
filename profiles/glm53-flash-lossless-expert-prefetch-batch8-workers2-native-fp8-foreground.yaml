@@ -1,0 +1,11 @@
+schema: voom.runtime-profile.v1
+name: glm53-flash-lossless-expert-prefetch-batch8-workers2-native-fp8-foreground
+description: Experimental exact GLM-5.3-Flash hybrid FP8 reconstruction schedule.
+notes:
+  - "The exact fused decoder remains active on the request thread, while vmodel-expert-batch prefetch workers use the exact eager reconstruction path. Released weights, BF16 results, routing, matmuls, and reductions are unchanged."
+  - "This isolates the medium-context contention seen when background Metal reconstruction competed with foreground expert GEMMs. It is explicit/default-off and requires real output/state, timing, pressure, and overlap gates before promotion."
+  - "Two fresh-process 2,123-input gates preserved output SHA, the exact 300.933GB read count, and the 3.936GB Metal peak at 426.610/426.630s engine. This closes the all-native regression by 6.81%, but beats the two eager controls' engine mean by only 0.49%; retain as an explicit measured experiment, not an automatic/default route."
+extends:
+  - glm53-flash-lossless-expert-prefetch-batch8-workers2-native-fp8
+settings:
+  VMODEL_GLM53_NATIVE_FP8_PREFETCH: 0

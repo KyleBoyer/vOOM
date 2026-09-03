@@ -264,6 +264,24 @@ without changing released matmuls or ascending accumulation order; the live
 governor may only clamp the storage group downward. It is isolated as
 `glm53-flash-lossless-expert-prefetch-batch8` pending real gates.
 
+Native FP8 reconstruction now has a thread-attributed hybrid experiment. The
+2,123-input trace showed that running exact fused reconstruction inside both
+expert-prefetch workers competed with the foreground MLP: reconstruction fell
+116.343 -> 52.828 seconds, but hidden prefetch fell 300.396 -> 240.820 seconds
+and MLP rose 345.334 -> 373.704 seconds. The explicit
+`glm53-flash-lossless-expert-prefetch-batch8-workers2-native-fp8-foreground`
+profile therefore retains fused reconstruction only outside
+`vmodel-expert-batch`; background pages use the exact eager decoder.
+
+Two fresh-process hybrid runs were nearly identical at 426.610/426.630 seconds
+engine and 429.439/429.504 seconds HTTP wall. They preserved the established
+output SHA, exact 300.933GB read count, and 3.936GB Metal peak. Background
+instrumentation reported 34,353/34,353 eager transforms and 179 foreground
+native transforms. This is 6.81% faster than the rejected all-native medium
+arm, but only 0.49% faster than the two eager controls' engine mean, so it is a
+confirmed scheduling mechanism and explicit medium experiment—not an
+automatic threshold or replacement for the all-native short/vision leader.
+
 Those real gates now pass. On the 16-output full-state gate, batch 8 preserved
 all tokens, text, aggregate state, and each attention/DSA/recurrent/convolution/
 hidden hash while improving wall 368.970 to 351.396 seconds (-4.76%). Peak rose

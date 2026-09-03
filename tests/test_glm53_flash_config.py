@@ -5,6 +5,7 @@ from __future__ import annotations
 import copy
 import json
 import struct
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -314,12 +315,64 @@ def test_glm53_weight_store_native_dequant_is_exact_and_instrumented(
 
     assert store.native_glm53_fp8_dequant
     assert bool(mx.all(fetched[logical] == want))
-    elapsed_ns, calls, native_calls, input_bytes, resident_bytes = (
+    (elapsed_ns, calls, native_calls, input_bytes, resident_bytes,
+     prefetch_ns, prefetch_calls, prefetch_native_calls) = (
         store.glm53_fp8_snapshot())
     assert elapsed_ns > 0
     assert calls == native_calls == 1
     assert input_bytes == codes.nbytes + scale.nbytes
     assert resident_bytes == codes.size * 2
+    assert prefetch_ns == prefetch_calls == prefetch_native_calls == 0
+
+
+def test_glm53_native_fp8_can_leave_expert_prefetch_on_exact_eager_path(
+    tmp_path, monkeypatch,
+):
+    import mlx.core as mx
+
+    from runtime.model_loader import WeightStore
+    from runtime.quant import dequantize_finegrained_fp8
+
+    if not mx.metal.is_available():
+        pytest.skip("native fine-grained FP8 decoder requires Metal")
+    config = _config()
+    config["quantization_config"] = {
+        "quant_method": "fp8",
+        "activation_scheme": "dynamic",
+        "weight_block_size": [2, 2],
+    }
+    (tmp_path / "config.json").write_text(json.dumps(config))
+    codes = np.arange(20, dtype=np.uint8).reshape(5, 4)
+    scale = np.array([
+        [0.25, 0.5],
+        [1.0, 2.0],
+        [3.0, 4.0],
+    ], dtype=np.float32)
+    physical = "model.language_model.layers.0.mlp.gate_proj"
+    _write_safetensor(tmp_path, {
+        f"{physical}.weight": (codes, "F8_E4M3"),
+        f"{physical}.weight_scale_inv": (scale, "F32"),
+    })
+    monkeypatch.setenv("VMODEL_GLM53_NATIVE_FP8_DEQUANT", "1")
+    monkeypatch.setenv("VMODEL_GLM53_NATIVE_FP8_PREFETCH", "0")
+    monkeypatch.setattr(
+        "runtime.model_loader.threading.current_thread",
+        lambda: SimpleNamespace(name="vmodel-expert-batch_0"),
+    )
+    store = WeightStore(tmp_path)
+    logical = "model.layers.0.mlp.gate_proj.weight"
+    fetched, _seconds, _physical_bytes = store.fetch([logical])
+    want = dequantize_finegrained_fp8(
+        mx.array(codes), mx.array(scale), block_shape=(2, 2))
+    mx.eval(fetched[logical], want)
+
+    assert bool(mx.all(fetched[logical] == want))
+    (_elapsed_ns, calls, native_calls, _input_bytes, _resident_bytes,
+     prefetch_ns, prefetch_calls, prefetch_native_calls) = (
+        store.glm53_fp8_snapshot())
+    assert calls == prefetch_calls == 1
+    assert native_calls == prefetch_native_calls == 0
+    assert prefetch_ns > 0
 
 
 def test_glm53_fp8_scale_dtype_mismatch_fails_closed():

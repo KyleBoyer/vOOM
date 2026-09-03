@@ -271,11 +271,22 @@ class WeightStore:
         # time and its actual coverage visible per request.
         self.native_glm53_fp8_dequant = (
             os.environ.get("VMODEL_GLM53_NATIVE_FP8_DEQUANT") == "1")
+        # The fused decoder is exact, but medium layer-stationary profiling
+        # showed that dispatching it from expert-prefetch workers can contend
+        # with the foreground expert GEMM on Metal.  Keep today's all-native
+        # behavior by default; an explicit experiment may leave background
+        # expert pages on the eager decoder while retaining native foreground
+        # reconstruction.
+        self.native_glm53_fp8_prefetch = (
+            os.environ.get("VMODEL_GLM53_NATIVE_FP8_PREFETCH", "1") == "1")
         self.glm53_fp8_transform_ns = 0
         self.glm53_fp8_transform_calls = 0
         self.glm53_fp8_native_calls = 0
         self.glm53_fp8_input_bytes = 0
         self.glm53_fp8_resident_bytes = 0
+        self.glm53_fp8_prefetch_transform_ns = 0
+        self.glm53_fp8_prefetch_transform_calls = 0
+        self.glm53_fp8_prefetch_native_calls = 0
         self.k3_scale_sidecar = None
         self.k3_scale_sidecar_read_bytes = 0
         self.k3_scale_sidecar_output_bytes = 0
@@ -991,8 +1002,15 @@ class WeightStore:
                     raise ValueError(
                         "GLM-5.3 FP8 pair has unexpected dtypes: "
                         f"weight={weight.dtype}, scale={scale.dtype}")
+                is_expert_prefetch = threading.current_thread().name.startswith(
+                    "vmodel-expert-batch")
+                use_native = (
+                    self.native_glm53_fp8_dequant
+                    and (self.native_glm53_fp8_prefetch
+                         or not is_expert_prefetch)
+                )
                 started_ns = time.perf_counter_ns()
-                if self.native_glm53_fp8_dequant:
+                if use_native:
                     joined[name] = dequantize_finegrained_fp8_metal(
                         weight, scale, block_shape=glm53.block_shape)
                 else:
@@ -1003,7 +1021,8 @@ class WeightStore:
                     elapsed_ns=time.perf_counter_ns() - started_ns,
                     input_bytes=int(weight.nbytes + scale.nbytes),
                     resident_bytes=int(joined[name].nbytes),
-                    native=self.native_glm53_fp8_dequant,
+                    native=use_native,
+                    expert_prefetch=is_expert_prefetch,
                 )
                 continue
             # Dtype, not config, decides for DeepSeek V4: routed experts are
@@ -1043,7 +1062,7 @@ class WeightStore:
 
     def _record_glm53_fp8_transform(
         self, *, elapsed_ns: int, input_bytes: int, resident_bytes: int,
-        native: bool,
+        native: bool, expert_prefetch: bool = False,
     ) -> None:
         with self._stage_lock:
             self.glm53_fp8_transform_ns += max(0, int(elapsed_ns))
@@ -1051,8 +1070,13 @@ class WeightStore:
             self.glm53_fp8_native_calls += int(bool(native))
             self.glm53_fp8_input_bytes += max(0, int(input_bytes))
             self.glm53_fp8_resident_bytes += max(0, int(resident_bytes))
+            if expert_prefetch:
+                self.glm53_fp8_prefetch_transform_ns += max(
+                    0, int(elapsed_ns))
+                self.glm53_fp8_prefetch_transform_calls += 1
+                self.glm53_fp8_prefetch_native_calls += int(bool(native))
 
-    def glm53_fp8_snapshot(self) -> tuple[int, int, int, int, int]:
+    def glm53_fp8_snapshot(self) -> tuple[int, ...]:
         with self._stage_lock:
             return (
                 int(self.glm53_fp8_transform_ns),
@@ -1060,6 +1084,9 @@ class WeightStore:
                 int(self.glm53_fp8_native_calls),
                 int(self.glm53_fp8_input_bytes),
                 int(self.glm53_fp8_resident_bytes),
+                int(self.glm53_fp8_prefetch_transform_ns),
+                int(self.glm53_fp8_prefetch_transform_calls),
+                int(self.glm53_fp8_prefetch_native_calls),
             )
 
     def parallel_tier_snapshot(self) -> tuple[int, ...]:

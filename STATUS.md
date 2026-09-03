@@ -1,5 +1,59 @@
 # STATUS — 2026-09-03 (current corrections first; dated chronology below is history)
 
+## 2026-09-03: exact FP8 prefetch scheduling recovers medium Flash overlap; MLX upgrade rejected
+
+The native GLM fine-grained-FP8 decoder's 2,123-input regression is now
+explained and bounded rather than hidden behind an aggregate transform timer.
+The all-native arm reduced exact reconstruction 116.343 -> 52.828 seconds,
+but issuing those Metal kernels from the two expert-prefetch workers reduced
+hidden service 300.396 -> 240.820 seconds and increased MLP wall 345.334 ->
+373.704 seconds. It therefore lost end to end despite faster isolated decode.
+
+An explicit hybrid schedule keeps the byte-exact fused decoder on the request
+thread while `vmodel-expert-batch` workers use the byte-exact eager decoder.
+Two fresh-process runs on the identical 2,123-input/max-1 request took
+**426.610 / 426.630 seconds engine** and **429.439 / 429.504 seconds HTTP
+wall**. The eager controls were 430.030 / 427.427 engine and 433.005 / 430.597
+wall; all-native was 457.784 engine / 460.790 wall. All five arms preserved
+output SHA `58bb119c...09cb5`, exactly 300,932,636,920 bytes read, and the
+3,935,685,604-byte Metal peak. The hybrid's 34,353 background transforms were
+all eager while 179 foreground transforms were native; hidden service returned
+to 296.35--296.40 seconds and MLP returned to 344.70--345.05 seconds. The
+hybrid mean is a reproducible 6.81% win over all-native, but only 0.49% faster
+than the eager engine mean (0.54% by HTTP wall), so it remains an explicit
+medium-context experiment rather than a new automatic/default route.
+
+Instrumentation now reports background transform time/calls/native coverage
+separately and includes the background policy in engine identity. The existing
+all-native profile remains the proven short/vision leader; the hybrid child is
+`glm53-flash-lossless-expert-prefetch-batch8-workers2-native-fp8-foreground`.
+Focused tests pass 340/340.
+
+An isolated MLX 0.32.2 install was also tested without modifying the working
+0.32.0 environment. On the exact short Flash/MTP gate it preserved the four
+tokens but changed all persisted state components and regressed total wall
+64.154 -> 64.624 seconds (+0.73%); prefill regressed 0.547 seconds and decode
+improved only 0.077 seconds. It is rejected. This M4 does not benefit from the
+new NAX-only head-dimension-256 attention path, and the advertised wide GEMV
+kernel did not improve the real verifier-heavy route.
+
+The full GLM native-FP8 untouched 46,849-token/134-tool replay crossed the
+earlier control failure point but still refused safely after roughly 39
+minutes: 4.23GB active plus a 2.18GB exact attention reservation and 0.40GB
+margin met a 6.81GB live ceiling while system availability was only 3.78GB.
+It retried at the already-rejected width eight and was stopped. This is a
+capacity near-pass, not a timing win; long-context work still needs lower live
+attention/index residency.
+
+The latest uncensored-model search also found no safe replacement. Public
+`0bserverx/RVN-Qwen3.8-Flash-Next-Abliterated-Uncensored` omits the vision
+tower and MTP/NextN, so it cannot replace the complete tree. Public
+`junafinity/Qwen-3.8-Flash-Next-Uncensored-MLX-MXFP4` retains them but is
+93.63GiB, cannot be staged beside the current checkpoint with 40GiB free, and
+publishes no quality measurement; its BF16 parent reports benchmark drops.
+No unverified lossy checkpoint replaced the current model. Both GLM models
+already use the verified dealignai uncensored FP8 releases.
+
 ## 2026-09-03: exact GLM FP8 reconstruction fused; full model split across both NVMe tiers
 
 The full uncensored GLM-5.3 now has a checkpoint-bound raw fast tier on the

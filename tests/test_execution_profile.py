@@ -24,7 +24,7 @@ GLM_FIXTURE = str(
 def test_profiler_aggregates_nested_expert_and_substep_metrics():
     profiler = RequestProfiler("ops")
     stages = [1_000_000, 1, 256, 1_024]
-    glm53_stages = [3_000_000, 3, 2, 1_024, 2_048]
+    glm53_stages = [3_000_000, 3, 2, 1_024, 2_048, 500_000, 1, 1]
     scale_stages = [2_048, 8_192, 500_000, 3]
     parallel_stages = [1, 2_000, 3_000, 4_000_000, 5_000_000, 6_000_000,
                        7_000_000]
@@ -57,6 +57,9 @@ def test_profiler_aggregates_nested_expert_and_substep_metrics():
     glm53_stages[2] += 4
     glm53_stages[3] += 4_096
     glm53_stages[4] += 8_192
+    glm53_stages[5] += 2_000_000
+    glm53_stages[6] += 2
+    glm53_stages[7] += 1
     scale_stages[0] += 4_096
     scale_stages[1] += 16_384
     scale_stages[2] += 1_500_000
@@ -100,6 +103,9 @@ def test_profiler_aggregates_nested_expert_and_substep_metrics():
     assert row["glm53_fp8_native_calls"] == 4
     assert row["glm53_fp8_input_bytes"] == 4096
     assert row["glm53_fp8_resident_bytes"] == 8192
+    assert row["glm53_fp8_prefetch_transform_s"] == 0.002
+    assert row["glm53_fp8_prefetch_transform_calls"] == 2
+    assert row["glm53_fp8_prefetch_native_calls"] == 1
     assert row["k3_scale_sidecar_read_bytes"] == 4096
     assert row["k3_scale_sidecar_output_bytes"] == 16384
     assert row["k3_scale_sidecar_decode_s"] == 0.0015
