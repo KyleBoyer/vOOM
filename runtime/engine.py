@@ -7835,7 +7835,8 @@ class StreamingEngine:
 
     def _layer_stationary_glm5_next_sweep(
             self, x: mx.array, kv, offset: int, tile_width: int,
-            on_progress=None, tap_layers=None) -> mx.array:
+            on_progress=None, tap_layers=None, *,
+            incremental_expanded_mla: bool = True) -> mx.array:
         """Layer-major bounded prefill for GLM-5.3's mHC/KDA/DSA stack.
 
         The released block is separable by position around its two stateful
@@ -7879,11 +7880,16 @@ class StreamingEngine:
             tap_layers = collector.tap_layers
         tapset = set(tap_layers) if tap_layers is not None else set()
         del expanded, x
-        # Keep each projection only for the currently active DSA layer; the
-        # durable endpoint remains the released compact latent.  This removes
-        # quadratic re-projection, but the bounded GEMM shape can round
-        # differently from ordinary growing-prefix compressed decode.
-        kv._glm53_expanded_prefill = _glm53_expanded_prefill_cache(kv)
+        # Ordinary prefill keeps each projection only for the currently active
+        # DSA layer; the durable endpoint remains the released compact latent.
+        # This removes quadratic re-projection, but its bounded GEMM shape can
+        # round differently from ordinary growing-prefix compressed decode.
+        # The target-exact serial verifier therefore disables this cache and
+        # reprojects the same growing latent prefix once per position, matching
+        # canonical one-token decode while still loading each layer only once.
+        kv._glm53_expanded_prefill = (
+            _glm53_expanded_prefill_cache(kv)
+            if incremental_expanded_mla else None)
 
         probe_positions = min(total, tile_width)
         (self._layer_transient,
@@ -9114,7 +9120,8 @@ class StreamingEngine:
                     "per-position endpoints")
             x_all = self._layer_stationary_glm5_next_sweep(
                 embedded, kv, offset, tile_width=1,
-                tap_layers=tap_layers)
+                tap_layers=tap_layers,
+                incremental_expanded_mla=False)
             positions = [
                 x_all[:, position:position + 1, :]
                 for position in range(x_all.shape[1])

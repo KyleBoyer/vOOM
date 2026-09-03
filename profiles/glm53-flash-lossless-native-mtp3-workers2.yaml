@@ -1,10 +1,11 @@
 schema: voom.runtime-profile.v1
-name: glm53-flash-e-native-mtp3-workers2
-description: Explicit E-class GLM-5.3-Flash two-reader candidate with released native-MTP target verification.
+name: glm53-flash-lossless-native-mtp3-workers2
+description: Explicit lossless GLM-5.3-Flash two-reader profile with released native-MTP target verification.
 notes:
   - "Extends the released-arithmetic two-reader profile and uses the checkpoint's appended native MTP block to propose up to three tokens. Every emitted token remains greedily verified by the official target; rejected proposals are discarded through the target rollback path."
   - "The native adapter retains its paired target/draft prompt endpoint for repeats and extensions. It does not use the generic hot-KV profile, a separately trained sidecar, altered target weights, expert pruning, quantized KV, or approximate kernels."
-  - "A released 28-input/16-output gate matched every greedy token and reduced total time from 329.445s to 259.548s, but its committed endpoint differed in 145/159 tensor hashes because the multi-position verifier uses the separately classified E-class layer-stationary arithmetic shape. Keep this explicit/default-off pending varied-shape token gates, real tool grammar, Plex quality, and a continuation-divergence gate; do not describe it as strong state-exact lossless."
+  - "The GLM serial verifier reprojects the authoritative growing latent prefix for each position, matching canonical one-token MLA GEMM shapes while loading each layer once. Two different real-weight prompt/output shapes matched all greedy tokens, text, aggregate/component state hashes, and all 159 endpoint tensor hashes."
+  - "This profile remains explicit/default-off pending unmodified real tool/Plex, streaming, sampling, long-context, and vision gates. Do not make it an automatic default from these two direct-engine greedy witnesses alone."
 extends:
   - glm53-flash-lossless-expert-prefetch-batch8-workers2
 settings:

@@ -1,28 +1,38 @@
 # STATUS — 2026-09-02 (current corrections first; dated chronology below is history)
 
-## 2026-09-02: GLM-5.3-Flash native MTP is faster, but strong state rejects lossless promotion
+## 2026-09-02: GLM-5.3-Flash native MTP is now strong-state exact and 21-27% faster
 
-The released native-MTP block has now been composed with the preferred exact
-two-reader expert schedule and measured against a fresh plain control on the
-same 28-input/16-output greedy request. All 16 output token IDs and decoded
-text matched. Depth-three MTP accepted 6/7 proposals, reduced decode target
-sweeps from 15 to 9, and cut physical model reads from **431.803GB to
-350.533GB (-18.8%)**. Total time fell **329.445 -> 259.548 seconds (-21.2%,
-1.269x throughput)** and decode fell **254.979 -> 185.108 seconds (-27.4%,
-1.377x throughput)**; prefill was unchanged at 74.464/74.437 seconds. True
-peak Metal rose from 2.864GB to 3.031GB, still well below the 8.5GB ceiling.
+The released native-MTP block is now composed with the preferred exact
+two-reader expert schedule and passes two real-checkpoint plain-versus-MTP
+greedy gates at different prompt/output lengths. The verifier now preserves
+canonical one-token GLM MLA arithmetic: it reprojects the authoritative growing
+latent prefix once per serial position instead of using prefill's incremental
+expanded-K/V cache. This still loads each layer once per verification window,
+but removes the GEMM-shape drift first isolated at layer 15 by the new
+per-layer attention input/output oracle.
 
-The new post-timing endpoint oracle prevents that token result from being
-overstated. It hashes every committed attention-KV, DSA-index, recurrent,
-convolution-history, and hidden tensor. KV offsets and layer lengths matched,
-but only 14/159 tensor hashes were byte-identical; all five aggregate component
-hashes differed. The equal tensors stop at the first three dense layers plus
-the first full-attention boundary. This is consistent with the verifier's
-documented E-class layer-stationary GLM arithmetic shape, not proof of a
-strong-state-exact continuation. The profile is therefore named
-`glm53-flash-e-native-mtp3-workers2`, remains explicit/default-off, and must
-not be presented as lossless until varied prompts and a continuation gate show
-that the changed endpoint cannot alter later target tokens.
+On the 28-input/16-output witness, every output token, decoded byte, aggregate
+state hash, all five component hashes, and all **159/159** committed
+attention-KV, DSA-index, recurrent, convolution-history, and hidden tensor
+hashes matched the plain target. Depth-three MTP accepted 6/7 proposals,
+reduced decode target sweeps from 15 to 9, and cut physical reads **431.803GB
+-> 350.507GB (-18.8%)**. Total time fell **329.496 -> 259.934 seconds (-21.1%,
+1.268x throughput)** and decode fell **254.950 -> 185.390 seconds (-27.3%)**;
+prefill was unchanged at 74.545/74.541 seconds. True peak Metal was 2.894GB
+versus 2.881GB, safely below the 8.5GB ceiling.
+
+A different 16-input/8-output coding prompt independently matched every token,
+text byte, aggregate/component hash, and **159/159** endpoint tensors. It
+accepted 4/5 proposals and used three target sweeps for seven decode positions.
+Wall fell **177.014 -> 129.267 seconds (-27.0%, 1.369x)**, decode **119.519 ->
+71.856 (-39.9%)**, and reads **235.221GB -> 180.366GB (-23.3%)**. This rules
+out dependence on the first prompt's token trace, but is not the broad real
+harness corpus required for an automatic default.
+
+The old E-class profile has therefore been replaced by the explicit/default-off
+`glm53-flash-lossless-native-mtp3-workers2` profile. It remains opt-in pending
+untouched real tool/Plex, streaming/non-streaming, sampling, long-context, and
+vision gates. The direct-engine witnesses do not authorize changing `auto`.
 
 Two follow-up controller levers were rejected on the same token oracle. Depth
 two preserved the 16 tokens but took 263.078 seconds and 357.186GB (6/8
@@ -32,13 +42,13 @@ needed 10 sweeps, and regressed to 275.841 seconds / 371.057GB. The existing
 six-round probe interval remains the measured winner for this trace; neither
 rejected tweak is exposed in a runtime profile.
 
-Instrumentation now reports the adaptive controller's final acceptance and
+Instrumentation reports the adaptive controller's final acceptance and
 cost estimates plus its probe interval and disabled-round count. A private,
 default-off verifier hook retains the already-computed committed endpoint only
 when a real-checkpoint state oracle explicitly requests it, so production
-serving retains no additional KV. The synthetic regression proves both the
-default-off lifetime and the opt-in endpoint/hidden boundary; 33 focused
-MTP/speculative tests pass.
+serving retains no additional KV. The plain gate now captures its actual final
+fed-token hidden row rather than the drafting scratch value, without adding an
+evaluation. The focused runtime/profile suite passes **349/349** tests.
 
 ## 2026-09-02: compact GLM Flash clears untouched 46.8K capacity; latency is rejected
 

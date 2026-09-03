@@ -70,6 +70,23 @@ def main() -> None:
             engine.decoder.PROBE_EVERY = args.probe_every
         if args.state_digest and not args.plain:
             engine.decoder._diagnostic_retain_generation_endpoint = True
+        if args.state_digest and args.plain:
+            # ``StreamingEngine._h_last`` is a drafting aid, not a generation
+            # endpoint: ordinary token-at-a-time generation deliberately does
+            # not refresh it after every decode sweep.  Capture the final fed
+            # token's trunk row without changing its lifetime in production so
+            # the plain arm can be compared to the speculative arm's committed
+            # endpoint.  The wrapper adds no evaluation or arithmetic.
+            target = getattr(engine, "target", engine)
+            original_sweep = target._sweep
+
+            def capture_endpoint_hidden(*sweep_args, **sweep_kwargs):
+                hidden = original_sweep(*sweep_args, **sweep_kwargs)
+                target._diagnostic_generation_hidden = hidden[:, -1:, :]
+                return hidden
+
+            target._diagnostic_generation_hidden = None
+            target._sweep = capture_endpoint_hidden
         if args.runs <= 0:
             raise SystemExit("--runs must be positive")
         runs = []
@@ -149,7 +166,12 @@ def main() -> None:
             from tests.fixtures.qwen38_dflash2_gate import _state_digest
             target = getattr(engine, "target", engine)
             if args.plain:
-                endpoint_state = _state_digest(target)
+                hidden = getattr(
+                    target, "_diagnostic_generation_hidden", None)
+                if hidden is None:
+                    raise RuntimeError(
+                        "plain decoder did not retain its committed hidden row")
+                endpoint_state = _state_digest(target, hidden=hidden)
             else:
                 endpoint = engine.decoder._diagnostic_generation_endpoint
                 hidden = engine.decoder._diagnostic_generation_hidden
