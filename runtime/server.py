@@ -2133,6 +2133,11 @@ class EngineManager:
         if glm53_native_fused_kda_prefill_request not in ("0", "1"):
             raise RequestValidationError(
                 "VMODEL_GLM53_NATIVE_FUSED_KDA_PREFILL must be 0 or 1")
+        glm53_layer_stationary_host_spool_request = os.environ.get(
+            "VMODEL_GLM53_LAYER_STATIONARY_HOST_SPOOL", "0").strip()
+        if glm53_layer_stationary_host_spool_request not in ("0", "1"):
+            raise RequestValidationError(
+                "VMODEL_GLM53_LAYER_STATIONARY_HOST_SPOOL must be 0 or 1")
         if (glm53_compiled_kda_prefill_request == "1"
                 and glm53_native_fused_kda_prefill_request == "1"):
             raise RequestValidationError(
@@ -2398,6 +2403,7 @@ class EngineManager:
             glm53_compiled_kda_prefill_request,
             glm53_compiled_kda_segment,
             glm53_native_fused_kda_prefill_request,
+            glm53_layer_stationary_host_spool_request,
             glm_dsa_long_context_request,
             glm_dsa_index_preallocate_request,
             glm_dsa_sparse_absorbed_request,
@@ -2545,6 +2551,7 @@ class EngineManager:
             glm53_compiled_kda_prefill_request,
             glm53_compiled_kda_segment,
             glm53_native_fused_kda_prefill_request,
+            glm53_layer_stationary_host_spool_request,
             glm_dsa_long_context_request,
             glm_dsa_index_preallocate_request,
             glm_dsa_sparse_absorbed_request,
@@ -2931,6 +2938,8 @@ class EngineManager:
                 rc.glm53_compiled_kda_segment = glm53_compiled_kda_segment
                 rc.glm53_native_fused_kda_prefill = (
                     glm53_native_fused_kda_prefill_request == "1")
+                rc.glm53_layer_stationary_host_spool = (
+                    glm53_layer_stationary_host_spool_request == "1")
                 # Exact request-to-request prefix reuse is deliberately
                 # opt-in until it clears the heterogeneous real-request
                 # corpus.  GLM-5.3's layer-stationary prefill uses a fixed
@@ -3069,6 +3078,8 @@ class EngineManager:
                         glm_dsa_sparse_absorbed_request == "1")
                     rc.glm_dsa_mla_kv_spill_dir = (
                         glm_dsa_mla_kv_spill_request)
+                    rc.glm53_layer_stationary_host_spool = (
+                        glm53_layer_stationary_host_spool_request == "1")
             elif mtype == "kimi_k25":
                 # 2026-07-19: K2.5's vocab_size (163840) x hidden_size (7168)
                 # combination makes its untied lm_head unusually large
@@ -9538,6 +9549,10 @@ def _vision_protocol_timing(result: dict) -> dict:
         "glm53_incremental_dsa_pool",
         "glm53_compiled_kda_prefill",
         "glm53_native_fused_kda_prefill",
+        "glm53_layer_stationary_host_spool",
+        "glm53_layer_stationary_host_spool_h2d_bytes",
+        "glm53_layer_stationary_host_spool_d2h_bytes",
+        "glm53_layer_stationary_host_spool_peak_host_bytes",
         "glm53_layer_stationary_memory_samples",
         "glm53_layer_stationary_peak_metal_bytes",
         "glm53_layer_stationary_initial_carrier_active_peak_bytes",
@@ -10042,6 +10057,7 @@ def _vision_protocol_timing(result: dict) -> dict:
         "glm53_layer_stationary_ffn_hc_pre_s",
         "glm53_layer_stationary_mlp_s",
         "glm53_layer_stationary_ffn_hc_post_s",
+        "glm53_layer_stationary_host_spool_copy_s",
         "dsa_selection_spill_write_s",
         "dsa_selection_spill_read_s",
         "dsa_selection_score_s",
@@ -12622,6 +12638,18 @@ class Handler(BaseHTTPRequestHandler):
                     if progress.get("diagnostic") == "qwen4_host_spool":
                         print(
                             "[qwen4-spool] "
+                            f"layer={progress.get('layer')} "
+                            f"phase={progress.get('subphase')} "
+                            f"tokens={progress.get('completed_tokens')} "
+                            f"metal={int(progress.get('active_metal_bytes', 0)) / 1e9:.3f}GB "
+                            f"peak={int(progress.get('peak_metal_bytes', 0)) / 1e9:.3f}GB "
+                            f"host={int(progress.get('host_spool_bytes', 0)) / 1e9:.3f}GB",
+                            flush=True,
+                        )
+                    elif progress.get("diagnostic") == "glm53_layer_stationary" \
+                            and progress.get("host_spool_bytes"):
+                        print(
+                            "[glm53-spool] "
                             f"layer={progress.get('layer')} "
                             f"phase={progress.get('subphase')} "
                             f"tokens={progress.get('completed_tokens')} "

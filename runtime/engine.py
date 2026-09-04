@@ -1300,6 +1300,12 @@ class RuntimeConfig:
     # therefore never selected by a lossless/default profile even when its
     # numerical error is far below the greedy-token gate.
     glm53_native_fused_kda_prefill: bool = False
+    # Exact-capacity candidate for GLM-5.3 layer-stationary activations.
+    # Materialized BF16 tiles are copied to host as raw uint16 payloads between
+    # attention/MLP phases, then restored at the identical operator shapes. No
+    # floating-point conversion; default-off until real output/state/read gates
+    # prove the full and Flash compositions independently.
+    glm53_layer_stationary_host_spool: bool = False
     # Exact F75 query/key tiling for the official glm_moe_dsa indexer. The
     # score reduction dimension is unchanged; only the bounded candidate merge
     # schedule differs. It is inert below index_topk and remains explicit at
@@ -1600,6 +1606,8 @@ class RuntimeConfig:
                 "glm53_compiled_kda_segment", 32),
             glm53_native_fused_kda_prefill=run.get(
                 "glm53_native_fused_kda_prefill", False),
+            glm53_layer_stationary_host_spool=run.get(
+                "glm53_layer_stationary_host_spool", False),
             glm_dsa_key_tile_size=run.get(
                 "glm_dsa_key_tile_size", 256),
             glm_dsa_index_step_size=run.get(
@@ -7306,11 +7314,108 @@ class StreamingEngine:
         real Kimi-K2.5 checkpoint (kimi_k25 shares this exact block shape).
         """
         from .glm import _glm_attention_residual, _glm_mlp_residual
+        import numpy as np
 
         if tile_width <= 0:
             raise ValueError("tile_width must be positive")
         n = self.cfg.num_hidden_layers
         total = int(x.shape[1])
+        host_spool = bool(getattr(
+            self.rc, "glm53_layer_stationary_host_spool", False))
+        spool_h2d_bytes = 0
+        spool_d2h_bytes = 0
+        spool_copy_s = 0.0
+        spool_peak_host_bytes = 0
+        memory_samples = 0
+        memory_peak = 0
+        memory_phase_active = {
+            "initial_carrier": 0,
+            "attention": 0,
+            "ffn_hc_pre": 0,
+            "mlp": 0,
+            "ffn_hc_post": 0,
+        }
+        metal_limit_bytes = max(
+            0, int(getattr(self.rc, "metal_limit_mb", 0))) * 1_000_000
+
+        def host_bits(value: mx.array, *, retained_host_bytes: int = 0):
+            """Copy released BF16 bits to CPU-owned memory without casting."""
+            nonlocal spool_d2h_bytes, spool_copy_s, spool_peak_host_bytes
+            if value.dtype != mx.bfloat16:
+                raise TypeError(
+                    "full GLM host spool requires BF16 activations, "
+                    f"got {value.dtype}")
+            started = time.perf_counter()
+            mx.eval(value)
+            result = np.array(
+                np.asarray(value.view(mx.uint16)), dtype=np.uint16, copy=True)
+            spool_d2h_bytes += int(result.nbytes)
+            spool_copy_s += time.perf_counter() - started
+            spool_peak_host_bytes = max(
+                spool_peak_host_bytes,
+                int(retained_host_bytes) + int(result.nbytes))
+            return result
+
+        def metal_bits(value: np.ndarray) -> mx.array:
+            """Restore one raw BF16 CPU payload at its original shape."""
+            nonlocal spool_h2d_bytes, spool_copy_s
+            started = time.perf_counter()
+            result = mx.array(value, dtype=mx.uint16).view(mx.bfloat16)
+            mx.eval(result)
+            spool_h2d_bytes += int(value.nbytes)
+            spool_copy_s += time.perf_counter() - started
+            return result
+
+        def note_memory(
+                phase: str, layer: int, completed_tokens: int = 0,
+                *, publish: bool = False) -> None:
+            """Attribute full-GLM phases and enforce the configured Metal cap."""
+            nonlocal memory_samples, memory_peak
+            active = int(mx.get_active_memory())
+            peak = int(mx.get_peak_memory())
+            observed = max(active, peak)
+            if phase.startswith("attention") or phase == "preselect":
+                group = "attention"
+            elif phase.startswith("dense_mlp") or phase == "routed_mlp":
+                group = "mlp"
+            else:
+                group = "initial_carrier"
+            memory_phase_active[group] = max(
+                memory_phase_active[group], active)
+            memory_samples += 1
+            memory_peak = max(memory_peak, observed)
+            self._note_true_peak()
+            if publish and on_progress is not None:
+                on_progress({
+                    "phase": "prefill_layer",
+                    "diagnostic": "glm53_layer_stationary",
+                    "subphase": phase,
+                    "layer": int(layer),
+                    "completed_layers": max(0, int(layer)),
+                    "total_layers": n,
+                    "completed_tokens": int(completed_tokens),
+                    "total_tokens": total,
+                    "active_metal_bytes": active,
+                    "peak_metal_bytes": peak,
+                    "host_spool_bytes": int(spool_peak_host_bytes),
+                    "metal_limit_bytes": metal_limit_bytes,
+                    "cache_source": "cold",
+                })
+            if metal_limit_bytes and observed > metal_limit_bytes:
+                raise MemoryError(
+                    "full GLM layer-stationary prefill crossed its hard Metal "
+                    f"cap: phase={phase} layer={layer} "
+                    f"tokens={completed_tokens} observed={observed} "
+                    f"limit={metal_limit_bytes}")
+
+        hidden_host = None
+        if host_spool:
+            hidden_host = host_bits(x)
+            del x
+            mx.clear_cache()
+            note_memory("initial_carrier", 0, total, publish=True)
+        else:
+            note_memory("initial_carrier", 0, total)
         (self._layer_transient,
          self._layer_transient_margin) = _layer_transient_for_positions(
              total,
@@ -7345,7 +7450,9 @@ class StreamingEngine:
                 if incoming_page:
                     self.cache.prepare_for(incoming_page)
                     if self.governor is not None:
-                        self.governor.reserve(incoming_page)
+                        self.governor.reserve(
+                            incoming_page,
+                            reason="glm53-full-prefill-layer-page")
             w = self.cache.get(layer_key, layer_names)
             if self._dsv4_packed_trunk:
                 w = self._materialize_packed_trunk(w)
@@ -7370,12 +7477,17 @@ class StreamingEngine:
                 and indexer_type == "full"
                 and selection_width > tile_width
             ):
+                preselect_input = (
+                    metal_bits(hidden_host) if host_spool else x)
                 dsa.preselect_full_layer(
-                    i, x, w, f"model.layers.{i}", offset,
+                    i, preselect_input, w, f"model.layers.{i}", offset,
                     attention_tile_width=tile_width)
+                if host_spool:
+                    del preselect_input
                 # All query-sized selections are now external-spilled; return
                 # score graphs/allocator cache before compact MLA expansion.
                 mx.clear_cache()
+                note_memory("preselect", i, total, publish=host_spool)
             is_dense_mlp = (
                 self.cfg.mlp_layer_types[i] == "dense"
                 if i < len(self.cfg.mlp_layer_types)
@@ -7389,6 +7501,7 @@ class StreamingEngine:
             tiles = []
             dense_attention_tiles = []
             dense_attention_positions = 0
+            dense_output_position = 0
             dense_mlp_s = 0.0
             pos = 0
             while pos < total:
@@ -7396,8 +7509,11 @@ class StreamingEngine:
                 if self.governor is not None and self._layer_transient:
                     self.governor.reserve(
                         self._layer_transient,
-                        margin=self._layer_transient_margin)
-                xt = x[:, pos:end, :]
+                        margin=self._layer_transient_margin,
+                        reason="glm53-full-attention-transient")
+                xt = (
+                    metal_bits(hidden_host[:, pos:end])
+                    if host_spool else x[:, pos:end, :])
                 attention_t0 = time.perf_counter()
                 yt = _glm_attention_residual(
                     xt, w, f"model.layers.{i}", self.cfg, kv, i, offset + pos,
@@ -7409,15 +7525,23 @@ class StreamingEngine:
                         time.perf_counter() - attention_t0,
                         positions=end - pos)
                 if tile_dense_mlp:
-                    dense_attention_tiles.append(yt)
+                    dense_attention_tiles.append(
+                        host_bits(
+                            yt,
+                            retained_host_bytes=int(hidden_host.nbytes))
+                        if host_spool else yt)
                     dense_attention_positions += end - pos
                     if (dense_attention_positions >= dense_mlp_tile_size
                             or end == total):
+                        dense_attention_metal = (
+                            [metal_bits(tile)
+                             for tile in dense_attention_tiles]
+                            if host_spool else dense_attention_tiles)
                         dense_input = (
-                            dense_attention_tiles[0]
-                            if len(dense_attention_tiles) == 1
+                            dense_attention_metal[0]
+                            if len(dense_attention_metal) == 1
                             else mx.concatenate(
-                                dense_attention_tiles, axis=1))
+                                dense_attention_metal, axis=1))
                         dense_mlp_t0 = time.perf_counter()
                         dense_output = _glm_mlp_residual(
                             dense_input, w, f"model.layers.{i}", self.cfg, i,
@@ -7426,32 +7550,79 @@ class StreamingEngine:
                             profile=profiler)
                         mx.eval(dense_output)
                         dense_mlp_s += time.perf_counter() - dense_mlp_t0
-                        tiles.append(dense_output)
+                        if host_spool:
+                            dense_bits = host_bits(
+                                dense_output,
+                                retained_host_bytes=int(hidden_host.nbytes))
+                            dense_end = (
+                                dense_output_position
+                                + int(dense_output.shape[1]))
+                            hidden_host[
+                                :, dense_output_position:dense_end] = dense_bits
+                            dense_output_position = dense_end
+                            dense_attention_metal = dense_input = None
+                            dense_output = dense_bits = None
+                            mx.clear_cache()
+                            note_memory(
+                                "dense_mlp_tile", i, dense_output_position,
+                                publish=(dense_output_position == total))
+                        else:
+                            tiles.append(dense_output)
                         dense_attention_tiles = []
                         dense_attention_positions = 0
                 else:
-                    tiles.append(yt)
+                    if host_spool:
+                        attention_bits = host_bits(
+                            yt,
+                            retained_host_bytes=int(hidden_host.nbytes))
+                        hidden_host[:, pos:end] = attention_bits
+                        attention_bits = yt = xt = None
+                        mx.clear_cache()
+                        note_memory(
+                            "attention_tile", i, end,
+                            publish=(pos == 0 or end == total
+                                     or end % (tile_width * 64) == 0))
+                    else:
+                        tiles.append(yt)
                 pos = end
             mlp_t0 = time.perf_counter()
             if tile_dense_mlp:
                 if dense_attention_tiles or dense_attention_positions:
                     raise AssertionError(
                         "dense GLM MLP tile buffer was not flushed")
-                x = (
-                    tiles[0]
-                    if len(tiles) == 1
-                    else mx.concatenate(tiles, axis=1))
+                if host_spool:
+                    if dense_output_position != total:
+                        raise AssertionError(
+                            "dense GLM host spool did not cover every row")
+                    x = metal_bits(hidden_host)
+                else:
+                    x = (
+                        tiles[0]
+                        if len(tiles) == 1
+                        else mx.concatenate(tiles, axis=1))
             else:
-                x_after_attn = (
-                    tiles[0]
-                    if len(tiles) == 1
-                    else mx.concatenate(tiles, axis=1))
+                if host_spool:
+                    x_after_attn = metal_bits(hidden_host)
+                else:
+                    x_after_attn = (
+                        tiles[0]
+                        if len(tiles) == 1
+                        else mx.concatenate(tiles, axis=1))
                 x = _glm_mlp_residual(
                     x_after_attn, w, f"model.layers.{i}", self.cfg, i,
                     self._get_experts,
                     iter_expert_batches=self._iter_expert_batches,
                     profile=profiler)
             mx.eval(x)
+            note_memory("routed_mlp", i, total, publish=host_spool)
+            if host_spool and i + 1 < n:
+                if not tile_dense_mlp:
+                    hidden_host = host_bits(
+                        x, retained_host_bytes=int(hidden_host.nbytes))
+                del x
+                if not tile_dense_mlp:
+                    del x_after_attn
+                mx.clear_cache()
             if (
                 self.cfg.model_type == "glm_moe_dsa"
                 and self.rc.glm_dsa_mla_kv_spill_dir
@@ -7500,6 +7671,38 @@ class StreamingEngine:
             if callable(clear_selections):
                 clear_selections()
         self._restore_aggregate_layer_transient(total)
+        previous_stats = dict(getattr(
+            self, "_glm53_layer_stationary_stats", {}) or {})
+        self._glm53_layer_stationary_stats = {
+            "memory_samples": int(previous_stats.get(
+                "memory_samples", 0)) + memory_samples,
+            "peak_metal_bytes": max(
+                int(previous_stats.get("peak_metal_bytes", 0)),
+                memory_peak),
+            **{
+                f"{phase}_active_peak_bytes": max(
+                    int(previous_stats.get(
+                        f"{phase}_active_peak_bytes", 0)), value)
+                for phase, value in memory_phase_active.items()
+            },
+            "tile_width": int(tile_width),
+            "positions": max(
+                int(previous_stats.get("positions", 0)), total),
+            "sweep_positions": int(previous_stats.get(
+                "sweep_positions", 0)) + total,
+            "sweeps": int(previous_stats.get("sweeps", 0)) + 1,
+            "host_spool": int(host_spool),
+            "host_spool_h2d_bytes": int(previous_stats.get(
+                "host_spool_h2d_bytes", 0)) + spool_h2d_bytes,
+            "host_spool_d2h_bytes": int(previous_stats.get(
+                "host_spool_d2h_bytes", 0)) + spool_d2h_bytes,
+            "host_spool_copy_s": float(previous_stats.get(
+                "host_spool_copy_s", 0.0)) + spool_copy_s,
+            "host_spool_peak_host_bytes": max(
+                int(previous_stats.get(
+                    "host_spool_peak_host_bytes", 0)),
+                spool_peak_host_bytes),
+        }
         return x
 
     def _layer_stationary_deepseek_v4_sweep(
@@ -7929,6 +8132,7 @@ class StreamingEngine:
             glm5_next_mlp_layer_stationary_tiles,
         )
         from .kimi_linear import _kda_attention
+        import numpy as np
 
         if tile_width <= 0:
             raise ValueError("tile_width must be positive")
@@ -7941,16 +8145,55 @@ class StreamingEngine:
             (start, min(start + tile_width, total))
             for start in range(0, total, tile_width)
         ]
+        host_spool = bool(self.rc.glm53_layer_stationary_host_spool)
+        spool_h2d_bytes = 0
+        spool_d2h_bytes = 0
+        spool_copy_s = 0.0
+        spool_peak_host_bytes = 0
+
+        def host_bits(value: mx.array) -> np.ndarray:
+            """Copy one released BF16 tile without a numeric conversion."""
+            nonlocal spool_d2h_bytes, spool_copy_s
+            if value.dtype != mx.bfloat16:
+                raise TypeError(
+                    "GLM-5.3 host spool requires BF16 carrier tiles, "
+                    f"got {value.dtype}")
+            started = time.perf_counter()
+            mx.eval(value)
+            result = np.array(
+                np.asarray(value.view(mx.uint16)), dtype=np.uint16, copy=True)
+            spool_d2h_bytes += int(result.nbytes)
+            spool_copy_s += time.perf_counter() - started
+            return result
+
+        def metal_bits(value: np.ndarray) -> mx.array:
+            """Restore one raw BF16 host tile at its original shape."""
+            nonlocal spool_h2d_bytes, spool_copy_s
+            started = time.perf_counter()
+            result = mx.array(value, dtype=mx.uint16).view(mx.bfloat16)
+            mx.eval(result)
+            spool_h2d_bytes += int(value.nbytes)
+            spool_copy_s += time.perf_counter() - started
+            return result
+
         expanded = mx.broadcast_to(
             x[:, :, None, :],
             (x.shape[0], total, self.cfg.hc_mult, x.shape[2]))
-        tiles = [expanded[:, start:end] for start, end in spans]
+        if host_spool:
+            tiles = [
+                host_bits(expanded[:, start:end]) for start, end in spans
+            ]
+            spool_peak_host_bytes = sum(int(tile.nbytes) for tile in tiles)
+        else:
+            tiles = [expanded[:, start:end] for start, end in spans]
         collector = (
             self._dspark_tap_collector if tap_layers is None else None)
         if collector is not None:
             tap_layers = collector.tap_layers
         tapset = set(tap_layers) if tap_layers is not None else set()
         del expanded, x
+        if host_spool:
+            mx.clear_cache()
         # Ordinary prefill keeps each projection only for the currently active
         # DSA layer; the durable endpoint remains the released compact latent.
         # This removes quadratic re-projection, but its bounded GEMM shape can
@@ -8044,6 +8287,7 @@ class StreamingEngine:
                     "total_tokens": total,
                     "active_metal_bytes": active,
                     "peak_metal_bytes": peak,
+                    "host_spool_bytes": int(spool_peak_host_bytes),
                     "metal_limit_bytes": metal_limit_bytes,
                     "cache_source": "cold",
                 })
@@ -8138,8 +8382,10 @@ class StreamingEngine:
                         f"GLM-5.3 layer {layer} has no attention type")
 
                 attention_tile_started = time.perf_counter()
+                source_tile = (
+                    metal_bits(tiles[index]) if host_spool else tiles[index])
                 tile = deepseek_v4_attention_residual(
-                    tiles[index], hc, norms, attention, **common)
+                    source_tile, hc, norms, attention, **common)
                 tile = tile.astype(mx.bfloat16)
                 mx.eval(tile)
                 attention_tile_s = (
@@ -8149,7 +8395,10 @@ class StreamingEngine:
                     kda_attention_s += attention_tile_s
                 else:
                     mla_attention_s += attention_tile_s
-                tiles[index] = tile
+                tiles[index] = host_bits(tile) if host_spool else tile
+                if host_spool:
+                    source_tile = tile = None
+                    mx.clear_cache()
                 note_memory(
                     "attention_tile", layer, end,
                     publish=(index == 0 or end == total
@@ -8165,8 +8414,9 @@ class StreamingEngine:
             hidden_tiles, posts, combs = [], [], []
             for index, (tile, (_start, end)) in enumerate(zip(tiles, spans)):
                 hc_pre_started = time.perf_counter()
+                source_tile = metal_bits(tile) if host_spool else tile
                 reduced, post, comb = hc_pre(
-                    tile, hc["ffn_fn"], hc["ffn_scale"], hc["ffn_base"],
+                    source_tile, hc["ffn_fn"], hc["ffn_scale"], hc["ffn_base"],
                     hc_mult=self.cfg.hc_mult,
                     norm_eps=self.cfg.rms_norm_eps,
                     sinkhorn_iters=self.cfg.hc_sinkhorn_iters,
@@ -8185,6 +8435,9 @@ class StreamingEngine:
                 hidden_tiles.append(hidden)
                 posts.append(post)
                 combs.append(comb)
+                if host_spool:
+                    source_tile = reduced = None
+                    mx.clear_cache()
                 note_memory(
                     "ffn_hc_pre_tile", layer, end,
                     publish=(index == 0 or end == total
@@ -8216,12 +8469,18 @@ class StreamingEngine:
 
             for index, (start, end) in enumerate(spans):
                 hc_post_started = time.perf_counter()
+                source_tile = (
+                    metal_bits(tiles[index])
+                    if host_spool else tiles[index])
                 merged = hc_post(
-                    mlp_tiles[index], tiles[index],
+                    mlp_tiles[index], source_tile,
                     posts[index], combs[index]).astype(mx.bfloat16)
                 mx.eval(merged)
                 ffn_hc_post_s += time.perf_counter() - hc_post_started
-                tiles[index] = merged
+                tiles[index] = host_bits(merged) if host_spool else merged
+                if host_spool:
+                    source_tile = merged = None
+                    mx.clear_cache()
                 note_memory(
                     "ffn_hc_post_tile", layer, end,
                     publish=(index == 0 or end == total
@@ -8231,9 +8490,12 @@ class StreamingEngine:
             if layer in tapset:
                 tapped_tiles = []
                 for tile in tiles:
-                    tapped = mx.mean(tile, axis=2).astype(mx.bfloat16)
+                    source_tile = metal_bits(tile) if host_spool else tile
+                    tapped = mx.mean(
+                        source_tile, axis=2).astype(mx.bfloat16)
                     mx.eval(tapped)
                     tapped_tiles.append(tapped)
+                    source_tile = None
                 self._tap_hidden[layer] = (
                     tapped_tiles[0] if len(tapped_tiles) == 1
                     else mx.concatenate(tapped_tiles, axis=1))
@@ -8267,8 +8529,11 @@ class StreamingEngine:
         # The released hyper head is an unweighted mean. Collapse each tile
         # before joining so the temporary is one quarter of the carrier.
         for index, tile in enumerate(tiles):
-            tiles[index] = mx.mean(tile, axis=2).astype(mx.bfloat16)
+            source_tile = metal_bits(tile) if host_spool else tile
+            tiles[index] = mx.mean(
+                source_tile, axis=2).astype(mx.bfloat16)
             mx.eval(tiles[index])
+            source_tile = None
         result = (
             tiles[0] if len(tiles) == 1
             else mx.concatenate(tiles, axis=1))
@@ -8293,6 +8558,16 @@ class StreamingEngine:
             "sweep_positions": int(previous_stats.get(
                 "sweep_positions", 0)) + total,
             "sweeps": int(previous_stats.get("sweeps", 0)) + 1,
+            "host_spool": int(host_spool),
+            "host_spool_h2d_bytes": int(previous_stats.get(
+                "host_spool_h2d_bytes", 0)) + spool_h2d_bytes,
+            "host_spool_d2h_bytes": int(previous_stats.get(
+                "host_spool_d2h_bytes", 0)) + spool_d2h_bytes,
+            "host_spool_copy_s": float(previous_stats.get(
+                "host_spool_copy_s", 0.0)) + spool_copy_s,
+            "host_spool_peak_host_bytes": max(
+                int(previous_stats.get("host_spool_peak_host_bytes", 0)),
+                spool_peak_host_bytes),
             "sparse_fused_calls": int(previous_stats.get(
                 "sparse_fused_calls", 0)) + int(getattr(
                     kv, "_glm53_sparse_fused_calls", 0)) - fused_calls_before,
@@ -9963,6 +10238,8 @@ class StreamingEngine:
                 f"glm53compiledkdaseg{self.rc.glm53_compiled_kda_segment}"
                 f"glm53nativekda{int(
                     self.rc.glm53_native_fused_kda_prefill)}"
+                f"glm53hostspool{int(
+                    self.rc.glm53_layer_stationary_host_spool)}"
                 f"glmdsakeytile{self.rc.glm_dsa_key_tile_size}"
                 f"glmdsaindexstep{self.rc.glm_dsa_index_step_size}"
                 f"glmdsaindexprealloc{int(self.rc.glm_dsa_index_preallocate)}"
@@ -10254,7 +10531,7 @@ class StreamingEngine:
         self._request_profiler = (
             telemetry.RequestProfiler(self.rc.execution_profile)
             if self.rc.execution_profile else None)
-        if self.cfg.model_type == "glm5_next":
+        if self.cfg.model_type in ("glm5_next", "glm_moe_dsa"):
             self._glm53_layer_stationary_stats = {}
         if self._dspark_tap_collector is not None:
             self._dspark_tap_collector.begin_attempt()
@@ -12596,6 +12873,38 @@ class StreamingEngine:
                 dsa_state.stats.get("preselection_s", 0.0))
             path_stats["dsa_index_observe_s"] = float(
                 dsa_state.stats.get("index_observe_s", 0.0))
+        if self.cfg.model_type == "glm_moe_dsa":
+            glm53_memory = getattr(
+                self, "_glm53_layer_stationary_stats", {}) or {}
+            path_stats["glm53_layer_stationary_host_spool"] = int(
+                self.rc.glm53_layer_stationary_host_spool)
+            path_stats["glm53_layer_stationary_memory_samples"] = int(
+                glm53_memory.get("memory_samples", 0))
+            path_stats["glm53_layer_stationary_peak_metal_bytes"] = int(
+                glm53_memory.get("peak_metal_bytes", 0))
+            for phase in (
+                    "initial_carrier", "attention", "ffn_hc_pre", "mlp",
+                    "ffn_hc_post"):
+                path_stats[
+                    f"glm53_layer_stationary_{phase}_active_peak_bytes"
+                ] = int(glm53_memory.get(
+                    f"{phase}_active_peak_bytes", 0))
+            path_stats["glm53_layer_stationary_tile_width"] = int(
+                glm53_memory.get("tile_width", 0))
+            path_stats["glm53_layer_stationary_positions"] = int(
+                glm53_memory.get("positions", 0))
+            path_stats["glm53_layer_stationary_sweep_positions"] = int(
+                glm53_memory.get("sweep_positions", 0))
+            path_stats["glm53_layer_stationary_sweeps"] = int(
+                glm53_memory.get("sweeps", 0))
+            for metric in (
+                    "host_spool_h2d_bytes", "host_spool_d2h_bytes",
+                    "host_spool_peak_host_bytes"):
+                path_stats[f"glm53_layer_stationary_{metric}"] = int(
+                    glm53_memory.get(metric, 0))
+            path_stats[
+                "glm53_layer_stationary_host_spool_copy_s"
+            ] = float(glm53_memory.get("host_spool_copy_s", 0.0))
         if self.cfg.model_type == "glm5_next":
             glm53_memory = getattr(
                 self, "_glm53_layer_stationary_stats", {}) or {}
@@ -12630,6 +12939,8 @@ class StreamingEngine:
                 self.rc.glm53_compiled_kda_segment)
             path_stats["glm53_native_fused_kda_prefill"] = int(
                 self.rc.glm53_native_fused_kda_prefill)
+            path_stats["glm53_layer_stationary_host_spool"] = int(
+                self.rc.glm53_layer_stationary_host_spool)
             path_stats["glm53_layer_stationary_memory_samples"] = int(
                 glm53_memory.get("memory_samples", 0))
             path_stats["glm53_layer_stationary_peak_metal_bytes"] = int(
@@ -12649,6 +12960,13 @@ class StreamingEngine:
                 glm53_memory.get("sweep_positions", 0))
             path_stats["glm53_layer_stationary_sweeps"] = int(
                 glm53_memory.get("sweeps", 0))
+            for metric in (
+                    "host_spool_h2d_bytes", "host_spool_d2h_bytes",
+                    "host_spool_peak_host_bytes"):
+                path_stats[f"glm53_layer_stationary_{metric}"] = int(
+                    glm53_memory.get(metric, 0))
+            path_stats["glm53_layer_stationary_host_spool_copy_s"] = float(
+                glm53_memory.get("host_spool_copy_s", 0.0))
             path_stats["glm53_sparse_fused_calls"] = int(
                 glm53_memory.get("sparse_fused_calls", 0))
             path_stats["glm53_sparse_fused_positions"] = int(

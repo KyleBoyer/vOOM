@@ -392,9 +392,12 @@ def test_unreclaimable_projection_fails_before_allocation():
     module, mx = load_pressure(int(9.9e9))
     gov = make_governor(module, mx, cache_max=int(1.5e9), floor=int(1.5e9))
     try:
-        gov.reserve(int(1e9), margin=int(0.4e9))
+        gov.reserve(
+            int(1e9), margin=int(0.4e9),
+            reason="glm53-full-prefill-layer-page")
     except MemoryError as exc:
         assert "refused before allocation" in str(exc)
+        assert "reason=glm53-full-prefill-layer-page" in str(exc)
         assert "projected=11.30GB" in str(exc)
     else:
         raise AssertionError("unsafe reservation was allowed to continue")

@@ -89,7 +89,9 @@ INDEXER_WEIGHT_NAMES = [
 ]
 
 
-def test_glm_layer_stationary_scheduler_preselects_before_attention(monkeypatch):
+@pytest.mark.parametrize("host_spool", [False, True])
+def test_glm_layer_stationary_scheduler_preselects_before_attention(
+        monkeypatch, host_spool):
     """Guard the engine integration, not only DSAState's isolated helper."""
     from runtime.engine import StreamingEngine
     import runtime.glm as glm_mod
@@ -140,6 +142,9 @@ def test_glm_layer_stationary_scheduler_preselects_before_attention(monkeypatch)
         prefetch_depth=0,
         glm_dsa_mla_kv_spill_dir="",
         glm_dsa_dense_mlp_tile_size=4,
+        glm_dsa_index_preallocate=False,
+        glm53_layer_stationary_host_spool=host_spool,
+        metal_limit_mb=8500,
     )
     engine.prefetcher = None
     engine.cache = FakeCache()
@@ -159,10 +164,21 @@ def test_glm_layer_stationary_scheduler_preselects_before_attention(monkeypatch)
     engine._note_true_peak = lambda: None
 
     kv = SimpleNamespace(dsa=FakeDSA(), latent_spill_enabled=False)
-    x = mx.zeros((1, 6, 3), dtype=mx.float32)
+    x = mx.zeros(
+        (1, 6, 3),
+        dtype=mx.bfloat16 if host_spool else mx.float32)
     out = engine._layer_stationary_glm_sweep(
         x, kv, offset=7, tile_width=2)
     mx.eval(out)
+
+    if host_spool:
+        assert np.array_equal(
+            np.asarray(out.view(mx.uint16)),
+            np.zeros((1, 6, 3), dtype=np.uint16))
+        stats = engine._glm53_layer_stationary_stats
+        assert stats["host_spool"] == 1
+        assert stats["host_spool_h2d_bytes"] > 0
+        assert stats["host_spool_d2h_bytes"] > 0
 
     assert events == [
         ("preselect", 0, 6, 7, 2),

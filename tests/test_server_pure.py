@@ -210,6 +210,11 @@ def test_protocol_timing_exposes_glm53_phase_active_peaks():
         "glm53_layer_stationary_ffn_hc_pre_active_peak_bytes": 103,
         "glm53_layer_stationary_mlp_active_peak_bytes": 104,
         "glm53_layer_stationary_ffn_hc_post_active_peak_bytes": 105,
+        "glm53_layer_stationary_host_spool": 1,
+        "glm53_layer_stationary_host_spool_h2d_bytes": 106,
+        "glm53_layer_stationary_host_spool_d2h_bytes": 107,
+        "glm53_layer_stationary_host_spool_peak_host_bytes": 108,
+        "glm53_layer_stationary_host_spool_copy_s": 1.25,
         "memory_prefill_retry_cleanup": [{
             "chunk": 8, "released_bytes": 700_000_000}],
         "memory_prefill_retry_failures": [
@@ -2584,6 +2589,7 @@ def test_full_glm_long_context_is_explicit_tiled_and_external_spilled():
         "VMODEL_GLM53_TRUNK_PREFETCH_WORKERS": "2",
         "VMODEL_GLM53_FULL_WEIGHT_CACHE_MB": "400",
         "VMODEL_GLM53_NATIVE_FP8_DEQUANT": "1",
+        "VMODEL_GLM53_LAYER_STATIONARY_HOST_SPOOL": "1",
     }
     with patch.dict(os.environ, settings, clear=False), \
          patch("runtime.config.ModelConfig.from_dir", return_value=cfg), \
@@ -2611,6 +2617,7 @@ def test_full_glm_long_context_is_explicit_tiled_and_external_spilled():
     assert rc.prefetch_depth == 1
     assert rc.prefetch_workers == 2
     assert rc.embed_rows and rc.stream_lm_head
+    assert rc.glm53_layer_stationary_host_spool
 
 
 def test_full_glm_weight_cache_limit_is_bounded():
@@ -2934,6 +2941,7 @@ def test_glm53_sparse_absorbed_mla_is_explicit_and_in_engine_identity():
         "VMODEL_GLM53_COMPILED_KDA_PREFILL": "0",
         "VMODEL_GLM53_COMPILED_KDA_SEGMENT": "32",
         "VMODEL_GLM53_NATIVE_FUSED_KDA_PREFILL": "0",
+        "VMODEL_GLM53_LAYER_STATIONARY_HOST_SPOOL": "0",
     }
     with patch.dict("os.environ", settings, clear=False), \
          patch("runtime.config.ModelConfig.from_dir", return_value=cfg), \
@@ -2962,8 +2970,10 @@ def test_glm53_sparse_absorbed_mla_is_explicit_and_in_engine_identity():
         os.environ["VMODEL_GLM53_COMPILED_KDA_PREFILL"] = "0"
         os.environ["VMODEL_GLM53_NATIVE_FUSED_KDA_PREFILL"] = "1"
         manager.get(Path("/tmp/fake-glm53-sparse-absorbed"), "lossless")
+        os.environ["VMODEL_GLM53_LAYER_STATIONARY_HOST_SPOOL"] = "1"
+        manager.get(Path("/tmp/fake-glm53-sparse-absorbed"), "lossless")
 
-    assert len(captured) == 10
+    assert len(captured) == 11
     assert captured[0].glm53_sparse_absorbed_mla is False
     assert captured[1].glm53_sparse_absorbed_mla is True
     assert captured[2].glm53_sparse_absorbed_mla is False
@@ -2988,6 +2998,9 @@ def test_glm53_sparse_absorbed_mla_is_explicit_and_in_engine_identity():
     assert captured[8].glm53_compiled_kda_segment == 16
     assert captured[9].glm53_compiled_kda_prefill is False
     assert captured[9].glm53_native_fused_kda_prefill is True
+    assert captured[9].glm53_layer_stationary_host_spool is False
+    assert captured[10].glm53_native_fused_kda_prefill is True
+    assert captured[10].glm53_layer_stationary_host_spool is True
 
 
 def test_glm53_sparse_attention_candidates_are_mutually_exclusive():
@@ -3060,6 +3073,18 @@ def test_glm53_native_fused_kda_prefill_rejects_untyped_env():
 
     with patch.dict("os.environ", {
         "VMODEL_GLM53_NATIVE_FUSED_KDA_PREFILL": "auto",
+    }, clear=False):
+        with pytest.raises(RequestValidationError, match="must be 0 or 1"):
+            EngineManager().get(Path("/tmp/unused-glm53"), "lossless")
+
+
+def test_glm53_layer_stationary_host_spool_rejects_untyped_env():
+    from unittest.mock import patch
+
+    from runtime.server import EngineManager, RequestValidationError
+
+    with patch.dict("os.environ", {
+        "VMODEL_GLM53_LAYER_STATIONARY_HOST_SPOOL": "auto",
     }, clear=False):
         with pytest.raises(RequestValidationError, match="must be 0 or 1"):
             EngineManager().get(Path("/tmp/unused-glm53"), "lossless")

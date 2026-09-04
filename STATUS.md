@@ -1,5 +1,32 @@
 # STATUS — 2026-09-03 (current corrections first; dated chronology below is history)
 
+## 2026-09-03: full GLM activation-spool instrumentation reaches the real path
+
+The explicit `glm53-full-exact-host-spool-candidate` now runs inside full
+GLM-5.3's actual `glm_moe_dsa` layer-stationary sweep.  The first implementation
+was correctly rejected as evidence because it was attached only to the
+`glm5_next` (Flash) sweep and therefore produced zero spool telemetry.  The
+corrected path preserves every evaluated BF16 activation as raw `uint16` bits,
+restores the proven attention-tile and whole-MoE shapes unchanged, and keeps the
+feature default-off.  It moves activations between MLX-owned Metal buffers and
+CPU-owned memory; it is placement, not CPU inference, and unified-memory
+pressure remains part of the acceptance gate.
+
+The real 17-input/max-1 released-checkpoint gate passed: output SHA remained
+`3fee95da...1043`, exact model reads remained 214,903,702,080 bytes, and wall
+was 185.609 seconds versus 186.724 seconds for the earlier inert-profile run.
+That timing delta is noise at this prompt size.  The corrected run reported
+36,974,592 H2D bytes, 32,587,776 D2H bytes, 0.0229 seconds copy time, 417,792
+peak host bytes, and a 813,772,889-byte true Metal peak; minimum system
+availability was 5.822GB and swap-outs grew 8.274MB.  Governor failures now
+include their named reservation phase in the error text, while full-GLM layer
+page and attention-transient admissions have distinct reason labels.
+
+The candidate is not promoted by this short proof.  The 2,123-input identity,
+read, peak, pressure, and timing gate is next; only a byte-identical medium
+result can justify attempting the 46,849-token captured replay.  Focused DSA,
+GLM-Flash, server, profile, and governor suites pass 377/377.
+
 ## 2026-09-03: isolated native-KDA speedup is real but remains lossy and unpromoted
 
 The one-dispatch Metal KDA recurrence is now isolated from every other lossy

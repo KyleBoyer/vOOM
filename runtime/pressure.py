@@ -370,6 +370,7 @@ class MemoryGovernor:
                 self.reservation_budget_restored_bytes += restored
             raise MemoryError(
                 "unsafe Metal reservation refused before allocation: "
+                f"reason={reason} "
                 f"active={active / 1e9:.2f}GB incoming={incoming_bytes / 1e9:.2f}GB "
                 f"margin={margin / 1e9:.2f}GB projected={projected / 1e9:.2f}GB "
                 f"available={available / 1e9:.2f}GB "
