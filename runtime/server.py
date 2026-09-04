@@ -2290,6 +2290,11 @@ class EngineManager:
         if glm53_expert_batch_prefetch_request not in ("0", "1"):
             raise RequestValidationError(
                 "VMODEL_GLM53_EXPERT_BATCH_PREFETCH must be 0 or 1")
+        glm53_short_stream_lm_head_request = os.environ.get(
+            "VMODEL_GLM53_SHORT_STREAM_LM_HEAD", "0").strip()
+        if glm53_short_stream_lm_head_request not in ("0", "1"):
+            raise RequestValidationError(
+                "VMODEL_GLM53_SHORT_STREAM_LM_HEAD must be 0 or 1")
         try:
             glm53_expert_fetch_batch = int(os.environ.get(
                 "VMODEL_GLM53_EXPERT_FETCH_BATCH", "1"))
@@ -2301,6 +2306,8 @@ class EngineManager:
                 "VMODEL_GLM53_TRUNK_PREFETCH_DEPTH", "0"))
             glm53_trunk_prefetch_workers = int(os.environ.get(
                 "VMODEL_GLM53_TRUNK_PREFETCH_WORKERS", "1"))
+            glm53_short_weight_cache_mb = int(os.environ.get(
+                "VMODEL_GLM53_SHORT_WEIGHT_CACHE_MB", "5000"))
             glm53_full_weight_cache_mb = int(os.environ.get(
                 "VMODEL_GLM53_FULL_WEIGHT_CACHE_MB", "150"))
         except ValueError as error:
@@ -2321,6 +2328,9 @@ class EngineManager:
         if not 1 <= glm53_trunk_prefetch_workers <= 2:
             raise RequestValidationError(
                 "VMODEL_GLM53_TRUNK_PREFETCH_WORKERS must be in [1, 2]")
+        if not 1500 <= glm53_short_weight_cache_mb <= 5000:
+            raise RequestValidationError(
+                "VMODEL_GLM53_SHORT_WEIGHT_CACHE_MB must be in [1500, 5000]")
         if not 150 <= glm53_full_weight_cache_mb <= 2000:
             raise RequestValidationError(
                 "VMODEL_GLM53_FULL_WEIGHT_CACHE_MB must be in [150, 2000]")
@@ -2463,8 +2473,10 @@ class EngineManager:
             glm53_expert_batch_prefetch_request,
             glm53_expert_batch_prefetch_depth,
             glm53_expert_batch_prefetch_workers,
+            glm53_short_stream_lm_head_request,
             glm53_trunk_prefetch_depth,
             glm53_trunk_prefetch_workers,
+            glm53_short_weight_cache_mb,
             glm53_full_weight_cache_mb,
         )
         # A healthy resident engine owns all state it needs. Return before
@@ -2614,8 +2626,10 @@ class EngineManager:
             glm53_expert_batch_prefetch_request,
             glm53_expert_batch_prefetch_depth,
             glm53_expert_batch_prefetch_workers,
+            glm53_short_stream_lm_head_request,
             glm53_trunk_prefetch_depth,
             glm53_trunk_prefetch_workers,
+            glm53_short_weight_cache_mb,
             glm53_full_weight_cache_mb,
         )
         # Validate the requested profile before evicting a healthy resident
@@ -3014,7 +3028,15 @@ class EngineManager:
                     rc.hot_prompt_kv_slots = glm53_hot_kv_slots
                     rc.hot_prompt_kv_min_tokens = glm53_hot_kv_min_tokens
             elif mtype == "glm_moe_dsa":
-                rc.max_weight_cache_mb = 5000
+                rc.max_weight_cache_mb = glm53_short_weight_cache_mb
+                if glm53_short_stream_lm_head_request == "1":
+                    # The block stream reads the same BF16 vocabulary rows and
+                    # preserves each output logit's hidden-dimension reduction,
+                    # but avoids pinning the complete ~1.9GB head. Keep this
+                    # explicit: every generated token rereads the head, so the
+                    # memory/latency trade belongs to pressure-gated profiles.
+                    rc.pin_lm_head = False
+                    rc.stream_lm_head = True
                 if mode in ("fast", "fast-long"):
                     # Side-quest GLM used to advertise a lossy model id while
                     # retaining the exact same BF16 weight path as lossless.
@@ -3073,7 +3095,26 @@ class EngineManager:
                 # Multi-position prefill remains at the fail-closed q=1
                 # fallback. Fast-mode single-position decode has a separately
                 # bounded q=8 path above; lossless keeps q=1 everywhere.
-                rc.expert_fetch_batch = 1
+                # Full GLM used to leave the generic depth-two trunk prefetch
+                # in place here, silently ignoring the explicit GLM setting.
+                # Honor the same deterministic storage-only control as Flash;
+                # the GLM default remains off and tuned profiles opt into one
+                # page of look-ahead.
+                rc.prefetch_depth = glm53_trunk_prefetch_depth
+                rc.prefetch_workers = glm53_trunk_prefetch_workers
+                # The same authoritative-route storage controls used by
+                # glm5_next are valid below the long-context DSA gate too.
+                # Defaults remain batch=1/prefetch-off; explicit profiles may
+                # overlap one bounded future page without predicting routes or
+                # changing the one-expert arithmetic/materialization order.
+                rc.expert_fetch_batch = glm53_expert_fetch_batch
+                rc.expert_compute_batch = 1
+                rc.expert_batch_prefetch = (
+                    glm53_expert_batch_prefetch_request == "1")
+                rc.expert_batch_prefetch_depth = (
+                    glm53_expert_batch_prefetch_depth)
+                rc.expert_batch_prefetch_workers = (
+                    glm53_expert_batch_prefetch_workers)
                 rc.glm_dsa_key_tile_size = glm_dsa_key_tile_size
                 rc.glm_dsa_index_step_size = 0
                 rc.glm_dsa_index_preallocate = False

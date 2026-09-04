@@ -1,5 +1,64 @@
 # STATUS — 2026-09-04 (current corrections first; dated chronology below is history)
 
+## 2026-09-04: full GLM exact expert overlap cuts short-request wall 22%
+
+Full `glm_moe_dsa` was silently ignoring the explicit GLM short-context trunk
+and routed-expert prefetch controls: only Flash and full-GLM long-context wired
+them into `RuntimeConfig`.  Both controls now apply to ordinary full GLM and
+remain part of engine identity.  Defaults preserve batch-one expert arithmetic,
+disable expert overlap, and disable the GLM-specific trunk look-ahead; profiles
+opt into the measured depth-one schedules explicitly.
+
+The real-checkpoint gate first established a matching depth-one control at
+**292.166s** total / 235.496s prefill / 56.669s decode.  A one-page expert
+pipeline at a 4.5GB cache preserved all four greedy tokens, text, aggregate and
+component hashes, and all 79 endpoint tensor hashes while reaching 228.789s,
+but exceeded the physical page-out gate at 23.314MB.  New cache instrumentation
+then showed zero expert hits: all reuse came from deterministic trunk prefetch.
+
+A 2.5GB cache passed pressure at 11.469MB and remained exact, but retained only
+152 useful trunk hits and regressed to 251.444s.  The fastest pinned-head 3.5GB
+arm retained all 302 useful trunk hits, stayed exact, and completed in **226.921s**: prefill
+173.832s, decode 53.088s, **22.33% faster end to end** than the corrected control.
+True peak Metal fell to 4.566GB, physical page-out was 10.338MB, and the live
+governor reported zero pressure events or reservation failures.  It is saved as
+`glm53-full-lossless-direct-fp8-qmv-expert-pipeline`, explicit/default-off and
+short-context-only pending complete-output Plex gates.  A first 3.5GB HTTP
+shape run exposed a 1.903GB pinned BF16 LM head and missed the 16MB page-out
+gate by 105KB.  The saved profile block-streams the same released head rows,
+preserving each logit's hidden-dimension reduction while trading one sequential
+head scan per output token for memory headroom; its separate state and HTTP
+pressure gates are recorded below.
+
+The composed streamed-head/2.5GB-cache state gate then preserved the same four
+tokens and every one of the 79 endpoint hashes.  Unlike the pinned-head 2.5GB
+arm, it retained 299 useful trunk-prefetch hits, completed in **231.768s**
+(20.67% faster than control), and reduced peak Metal to **3.662GB** with
+10.338MB physical page-out and zero governor events.  This is the saved profile
+setting; its modest 4.847s cost versus the 3.5GB pinned-head timing buys roughly
+0.9GB lower measured Metal residency and a substantially safer HTTP envelope.
+
+The real fixture now records weight-cache hits, misses, evictions, budget,
+residency, prefetch hits, and expert hits/misses so future memory reductions are
+trace-driven rather than guessed.
+
+A fresh pinned-capture-derived HTTP request with an alternate real shape
+(30 input / four output tokens, no tools, streaming, greedy) passed every
+single-request gate with the selected profile: **228.281s** client wall,
+224.280s engine total, 167.236s prefill, 57.042s decode, 3.700GB peak Metal,
+and 15.385MB physical page-out.  It produced the same output hash as both
+requests in a separate two-repeat greedy run.  The repeat run recorded 16.597MB
+cumulative process page-out, just over a fixture limit designed for one request,
+although each request was individually below 16MB; this cumulative accounting
+is not being relabeled as a per-request pass.
+
+Evidence:
+`logs/glm53_full_direct_trunk1_wired_control_plain_max4_20260904.json`,
+`logs/glm53_full_direct_expert_pipeline_trunk1_cache{2500,3500,4500}_plain_max4_20260904.json`,
+`logs/glm53_full_direct_expert_pipeline_trunk1_cache2500_stream_head_plain_max4_20260904.json`,
+`logs/glm53_full_pipeline_http_short_direct_t0_cache2500_max4_repeat2_20260904.json`,
+and `logs/glm53_full_pipeline_http_short_direct_t0_cache2500_max4_single_20260904.json`.
+
 ## 2026-09-04: phase-scoped Qwen expert pipeline clears the pressure gate
 
 Qwen4 expert-batch prefetch is now phase-aware and fully instrumented.  A new

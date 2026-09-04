@@ -34,6 +34,7 @@ def main() -> None:
     parser.add_argument("--expert-batch-prefetch-workers", type=int, default=1)
     parser.add_argument("--trunk-prefetch-depth", type=int, default=0)
     parser.add_argument("--trunk-prefetch-workers", type=int, default=1)
+    parser.add_argument("--weight-cache-mb", type=int, default=5000)
     parser.add_argument("--state-digest", action="store_true")
     parser.add_argument(
         "--dsa-row-digest", action="store_true",
@@ -70,6 +71,8 @@ def main() -> None:
         args.trunk_prefetch_depth)
     os.environ["VMODEL_GLM53_TRUNK_PREFETCH_WORKERS"] = str(
         args.trunk_prefetch_workers)
+    os.environ["VMODEL_GLM53_SHORT_WEIGHT_CACHE_MB"] = str(
+        args.weight_cache_mb)
 
     from runtime.server import EngineManager
 
@@ -188,6 +191,18 @@ def main() -> None:
                 "draft_bytes": stats.get("speculative_draft_bytes", 0),
                 "weight_store_bytes_read": stats.get(
                     "weight_store_bytes_read", 0),
+                "weight_cache_hits": stats.get("weight_cache_hits", 0),
+                "weight_cache_misses": stats.get("weight_cache_misses", 0),
+                "weight_cache_evictions": stats.get(
+                    "weight_cache_evictions", 0),
+                "weight_cache_resident_bytes": stats.get(
+                    "weight_cache_resident_bytes", 0),
+                "weight_cache_budget_bytes": stats.get(
+                    "weight_cache_budget_bytes", 0),
+                "weight_cache_prefetch_hits": stats.get(
+                    "weight_cache_prefetch_hits", 0),
+                "expert_cache_hits": stats.get("expert_cache_hits", 0),
+                "expert_cache_misses": stats.get("expert_cache_misses", 0),
                 "glm53_native_fp8_dequant": stats.get(
                     "glm53_native_fp8_dequant", 0),
                 "glm53_fp8_direct_qmv": stats.get(

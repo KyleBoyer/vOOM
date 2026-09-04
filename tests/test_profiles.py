@@ -424,6 +424,25 @@ def test_builtin_profiles_resolve_complete_agent_group():
     assert "VMODEL_GLM53_EXPERT_BATCH_PREFETCH" not in (
         glm_full_direct_settings)
 
+    glm_full_pipeline_order, glm_full_pipeline_settings = (
+        resolve_runtime_profiles(
+            ("glm53-full-lossless-direct-fp8-qmv-expert-pipeline",),
+            catalog))
+    assert glm_full_pipeline_order == (
+        "glm53-full-lossless-direct-fp8-qmv",
+        "glm53-full-lossless-direct-fp8-qmv-expert-pipeline",
+    )
+    assert glm_full_pipeline_settings[
+        "VMODEL_GLM53_EXPERT_BATCH_PREFETCH"] == "1"
+    assert glm_full_pipeline_settings[
+        "VMODEL_GLM53_EXPERT_BATCH_PREFETCH_DEPTH"] == "1"
+    assert glm_full_pipeline_settings[
+        "VMODEL_GLM53_EXPERT_BATCH_PREFETCH_WORKERS"] == "1"
+    assert glm_full_pipeline_settings[
+        "VMODEL_GLM53_SHORT_WEIGHT_CACHE_MB"] == "2500"
+    assert glm_full_pipeline_settings[
+        "VMODEL_GLM53_SHORT_STREAM_LM_HEAD"] == "1"
+
     glm_full_decode_direct_order, glm_full_decode_direct_settings = (
         resolve_runtime_profiles(
             ("glm53-full-lossless-direct-fp8-qmv-decode-only",), catalog))

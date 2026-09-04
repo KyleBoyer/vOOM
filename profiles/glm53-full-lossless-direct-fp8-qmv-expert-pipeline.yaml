@@ -1,0 +1,20 @@
+schema: voom.runtime-profile.v1
+name: glm53-full-lossless-direct-fp8-qmv-expert-pipeline
+description: Pressure-gated full GLM-5.3 direct-FP8 QMV with exact expert and trunk I/O overlap.
+notes:
+  - "Extends the released-representation direct-QMV profile. One authoritative routed-expert page is read ahead while the current page computes; routing, expert order, accumulation boundaries, target logits, and every checkpoint byte remain unchanged."
+  - "Full glm_moe_dsa previously ignored the explicit short-context expert and trunk controls. The server now wires both into engine identity while retaining batch-one arithmetic and default-off expert overlap."
+  - "On the 28-input/four-output real uncensored checkpoint gate, the matching depth-one control took 292.166s. This profile preserved all four greedy tokens, text, aggregate/component state hashes, and all 79 endpoint tensor hashes while improving prefill 235.496 -> 173.832s and total 292.166 -> 226.921s (-22.33%)."
+  - "A cache trace found zero expert reuse and 302 useful deterministic trunk-prefetch hits. With the head pinned, 3.5GB retained all hits but 2.5GB retained only 152 and regressed to 251.444s. Streaming the head lets the saved 2.5GB cache retain 299 useful hits, reducing true peak Metal to 3.662GB with 10.338MB swap-out."
+  - "The HTTP server envelope exposed a 1.903GB pinned BF16 LM head. This profile block-streams those same released rows without changing each logit's hidden-dimension reduction. It trades one sequential head scan per output token for memory safety. The composed state gate stayed exact at 231.768s total, 173.832s prefill, 57.155s decode, 3.662GB peak Metal, and 10.338MB page-out."
+  - "A fresh pinned-capture-derived alternate HTTP shape (30 input/four output tokens, no tools, streaming, greedy) passed its single-request gates at 228.281s client wall, 224.280s engine total, 167.236s prefill, 57.042s decode, 3.700GB peak Metal, and 15.385MB page-out. Its output hash repeated across a separate two-request greedy run; that run's cumulative process page-out was 16.597MB even though each request was below 16MB."
+  - "This remains explicit/default-off and short-context-only pending a complete-output real Plex quality gate and heterogeneous HTTP corpus. It is lossless relative to the installed uncensored FP8 checkpoint, not Z.ai's censored source checkpoint."
+extends:
+  - glm53-full-lossless-direct-fp8-qmv
+settings:
+  VMODEL_GLM53_EXPERT_FETCH_BATCH: 1
+  VMODEL_GLM53_EXPERT_BATCH_PREFETCH: 1
+  VMODEL_GLM53_EXPERT_BATCH_PREFETCH_DEPTH: 1
+  VMODEL_GLM53_EXPERT_BATCH_PREFETCH_WORKERS: 1
+  VMODEL_GLM53_SHORT_WEIGHT_CACHE_MB: 2500
+  VMODEL_GLM53_SHORT_STREAM_LM_HEAD: 1

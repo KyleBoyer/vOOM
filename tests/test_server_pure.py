@@ -2808,6 +2808,7 @@ def test_glm53_hot_prompt_kv_is_opt_in_exact_and_in_engine_identity():
         ("VMODEL_GLM53_COALESCED_EXPERT_POSITIONS", "auto",
          "must be 0 or 1"),
         ("VMODEL_GLM53_EXPERT_BATCH_PREFETCH", "auto", "must be 0 or 1"),
+        ("VMODEL_GLM53_SHORT_STREAM_LM_HEAD", "auto", "must be 0 or 1"),
         ("VMODEL_GLM53_EXPERT_BATCH_PREFETCH_DEPTH", "4",
          "must be in \\[1, 3\\]"),
         ("VMODEL_GLM53_EXPERT_BATCH_PREFETCH_WORKERS", "3",
@@ -2815,6 +2816,8 @@ def test_glm53_hot_prompt_kv_is_opt_in_exact_and_in_engine_identity():
         ("VMODEL_GLM53_EXPERT_FETCH_BATCH", "9", "must be in \\[1, 8\\]"),
         ("VMODEL_GLM53_TRUNK_PREFETCH_DEPTH", "3", "must be in \\[0, 2\\]"),
         ("VMODEL_GLM53_TRUNK_PREFETCH_WORKERS", "0", "must be in \\[1, 2\\]"),
+        ("VMODEL_GLM53_SHORT_WEIGHT_CACHE_MB", "1499",
+         "must be in \\[1500, 5000\\]"),
     ],
 )
 def test_glm53_hot_prompt_kv_settings_fail_closed(variable, value, message):
@@ -2976,7 +2979,9 @@ def test_full_glm_native_mtp_requires_dsa_elided_bounded_target():
                 target(dsa_elided=True, context_bound=4096))
 
 
-def test_glm53_expert_storage_batch_and_pipeline_are_explicit_identity():
+@pytest.mark.parametrize("model_type", ["glm5_next", "glm_moe_dsa"])
+def test_glm53_expert_storage_batch_and_pipeline_are_explicit_identity(
+        model_type):
     from unittest.mock import patch
 
     from runtime.server import EngineManager
@@ -2992,8 +2997,9 @@ def test_glm53_expert_storage_batch_and_pipeline_are_explicit_identity():
             pass
 
     cfg = SimpleNamespace(
-        model_type="glm5_next", tie_word_embeddings=False,
-        index_topk=2048, vision_config=None, num_experts_per_tok=8,
+        model_type=model_type, tie_word_embeddings=False,
+        index_topk=2048, max_position_embeddings=1_048_576,
+        vision_config=None, num_experts_per_tok=8,
     )
     settings = {
         "VMODEL_GLM53_MTP": "0",
@@ -3003,6 +3009,8 @@ def test_glm53_expert_storage_batch_and_pipeline_are_explicit_identity():
         "VMODEL_GLM53_EXPERT_BATCH_PREFETCH_WORKERS": "1",
         "VMODEL_GLM53_TRUNK_PREFETCH_DEPTH": "0",
         "VMODEL_GLM53_TRUNK_PREFETCH_WORKERS": "1",
+        "VMODEL_GLM53_SHORT_WEIGHT_CACHE_MB": "5000",
+        "VMODEL_GLM53_SHORT_STREAM_LM_HEAD": "0",
     }
     with patch.dict("os.environ", settings, clear=False), \
          patch("runtime.config.ModelConfig.from_dir", return_value=cfg), \
@@ -3017,6 +3025,8 @@ def test_glm53_expert_storage_batch_and_pipeline_are_explicit_identity():
         os.environ["VMODEL_GLM53_EXPERT_BATCH_PREFETCH_WORKERS"] = "2"
         os.environ["VMODEL_GLM53_TRUNK_PREFETCH_DEPTH"] = "1"
         os.environ["VMODEL_GLM53_TRUNK_PREFETCH_WORKERS"] = "2"
+        os.environ["VMODEL_GLM53_SHORT_WEIGHT_CACHE_MB"] = "4500"
+        os.environ["VMODEL_GLM53_SHORT_STREAM_LM_HEAD"] = "1"
         manager.get(Path("/tmp/fake-glm53-expert-pipeline"), "lossless")
 
     assert len(captured) == 2
@@ -3026,6 +3036,8 @@ def test_glm53_expert_storage_batch_and_pipeline_are_explicit_identity():
     assert baseline.expert_batch_prefetch_depth == 1
     assert baseline.expert_batch_prefetch_workers == 1
     assert baseline.expert_compute_batch == 1
+    assert baseline.max_weight_cache_mb == (
+        1500 if model_type == "glm5_next" else 5000)
     assert baseline.prefetch_depth == 0
     assert baseline.prefetch_workers == 1
     assert candidate.expert_fetch_batch == 8
@@ -3034,6 +3046,14 @@ def test_glm53_expert_storage_batch_and_pipeline_are_explicit_identity():
     assert candidate.expert_batch_prefetch_workers == 2
     assert candidate.prefetch_depth == 1
     assert candidate.prefetch_workers == 2
+    assert candidate.max_weight_cache_mb == (
+        1500 if model_type == "glm5_next" else 4500)
+    if model_type == "glm_moe_dsa":
+        assert baseline.pin_lm_head and not baseline.stream_lm_head
+        assert not candidate.pin_lm_head and candidate.stream_lm_head
+    else:
+        assert not baseline.pin_lm_head and baseline.stream_lm_head
+        assert not candidate.pin_lm_head and candidate.stream_lm_head
     # Storage grouping never changes the verified arithmetic grouping.
     assert candidate.expert_compute_batch == 1
 
