@@ -4,6 +4,7 @@ description: Explicit full GLM-5.3 exact packed routed-expert singleton-QMV prof
 notes:
   - "Retains every released routed-expert E4M3 byte and FP32 128x128 multiplier in cache; it neither requantizes nor changes the checkpoint's BF16 reconstruction boundary. Singleton BF16 projections use the exact direct Metal QMV and wider shapes reconstruct BF16 before the ordinary matmul."
   - "On the attested uncensored checkpoint, a fresh 28-input/four-output plain-target gate preserved all four greedy tokens, text, aggregate/component state hashes, and all 79 endpoint tensor hashes while improving 362.018 -> 295.689 seconds (-18.32%)."
+  - "Changing the exact direct kernel from four to two output rows per SIMD preserved the same four tokens and all 79 endpoint tensors, then improved the already-packed wall 295.689s -> 285.641s and decode 60.387s -> 56.327s. A real gate/up/down tile sweep was byte-exact at tiles 1/2/4/8/16 and selected two for all three projections."
   - "The gate exercised 16,452 singleton direct calls and 10,095 exact wider fallbacks, reduced peak Metal residency 6.426 -> 6.022 GB (-6.29%), and read 1.381 GB fewer bytes through compact-page reuse. One 20.1 MB pressure-growth event occurred, so this remains explicit/default-off and is not a long-context recommendation."
   - "Depth-one deterministic trunk prefetch is retained because it was part of the matched control/candidate schedule. Expert batch prefetch and native MTP remain off for this profile."
 settings:

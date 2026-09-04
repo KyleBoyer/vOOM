@@ -1,5 +1,49 @@
 # STATUS — 2026-09-04 (current corrections first; dated chronology below is history)
 
+## 2026-09-04: exact two-row FP8 QMV improves Qwen and full GLM decode
+
+The packed fine-grained-FP8 singleton kernel now maps two output rows to each
+SIMD group instead of four.  A tracked real-checkpoint sweep measures output
+tiles 1/2/4/8/16 against the ordinary dequantize-to-BF16 GEMV reference and
+stores the output digest for every projection.  All candidates were byte-exact
+on Qwen3.8-Flash-Next, GLM-5.3-Flash, and full GLM-5.3 gate/up/down experts.
+Two rows was the only robust winner across all nine released projection shapes:
+it beat four rows by 5.6--12.0% on Qwen and 9.4--16.9% on full GLM; Flash's
+individual gate preferred eight, but its up/down projections and combined
+shape favored two.  The tile count participates in the compiled-kernel cache
+key and name, so an old four-row specialization cannot alias the new kernel.
+
+On Qwen's independent five-input/four-output France trace, tile two preserved
+all four tokens, text, four state components, and all 121 endpoint arrays.  It
+improved the already-packed candidate from 49.624 -> **48.534s wall (-2.20%)**
+and 38.802 -> **37.803s generation (-2.57%)**, with the same 44.120GB physical
+reads, 4,320 direct calls, and zero fallbacks.  GLM-5.3-Flash likewise preserved
+all four tokens and 159 endpoint tensors, but its 84.138s wall was neutral to
+the four-row 84.012s witness; it is correctness evidence, not a Flash speed
+claim.  Full GLM-5.3 preserved four tokens and every one of 79 endpoint tensors
+while improving wall **295.689 -> 285.641s (-3.40%)**, prefill 235.301 ->
+229.314s, and decode **60.387 -> 56.327s (-6.72%)**.  The full run observed
+12.009MB external swap-out versus 48.792MB in its historical four-row run.
+
+The unmodified focused Plex capture also validates the preceding Qwen packed
+decode path on a different, production-shaped request: 2,358 input tokens, all
+134 real tools and their full schemas, greedy decoding, and a 32-token cap.  It
+preserved the exact same truncated tool-call bytes, read count, and 20/34 MTP
+acceptance as the prior fast-tier/native-MTP profile.  Wall improved **294.053
+-> 276.138s (-6.09%)**, engine time 279.717 -> 261.426s, and decode **116.219
+-> 99.670s (-14.24%)**; prefill was essentially unchanged at 161.754s.  The
+15/100 rubric is deliberately invalid because the output cap truncates the
+JSON call mid-argument, so this is a generalized shape/latency/identity gate,
+not an intelligence claim.  Swap-out growth was 15.335MB, just under the 16MB
+gate, and the profile remains explicit/default-off.
+
+Evidence:
+`logs/{qwen,glm53_flash,glm53_full}_fp8_qmv_tile_sweep_20260904.json`,
+`logs/qwen_uncensored_fp8_direct_qmv_tile2_france4_20260904.json`,
+`logs/glm53_flash_direct_decode_only_tile2_default_max4_20260904.json`,
+`logs/glm53_full_direct_qmv_tile2_plain_max4_20260904.json`, and
+`logs/qwen_uncensored_fp8_direct_qmv_plex_max32_20260904.json`.
+
 ## 2026-09-04: exact packed expert decode extends to uncensored Qwen Flash
 
 Qwen3.8-Flash-Next's installed uncensored FP8 checkpoint uses the same released

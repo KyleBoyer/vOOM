@@ -1090,11 +1090,14 @@ def dequantize_finegrained_fp8_metal(
     )[0]
 
 
+_FINEGRAINED_FP8_QMV_OUTPUTS_PER_SIMD = 2
+
+
 _FINEGRAINED_FP8_QMV_SOURCE = r"""
-    constexpr uint OUTPUTS_PER_SIMD = 4u;
+    constexpr uint OUTPUTS_PER_SIMD = OUTPUTS_PER_SIMD_VALUEu;
     uint lane = thread_index_in_simdgroup;
     uint row0 = threadgroup_position_in_grid.x * OUTPUTS_PER_SIMD;
-    float accum[OUTPUTS_PER_SIMD] = {0.0f, 0.0f, 0.0f, 0.0f};
+    float accum[OUTPUTS_PER_SIMD] = {0.0f};
 
     // MLX's singleton BF16 GEMV assigns four adjacent K values to each SIMD
     // lane and advances by a 128-value block. Matching that partition and the
@@ -1139,18 +1142,20 @@ _FINEGRAINED_FP8_QMV_SOURCE = r"""
 """
 
 _finegrained_fp8_qmv_kernel_cache: dict[
-    tuple[int, int, int, int], "mx.fast.metal_kernel"
+    tuple[int, int, int, int, int], "mx.fast.metal_kernel"
 ] = {}
 
 
 def _finegrained_fp8_qmv_kernel(
     rows: int, cols: int, block_rows: int, block_cols: int,
 ):
-    key = (rows, cols, block_rows, block_cols)
+    outputs_per_simd = _FINEGRAINED_FP8_QMV_OUTPUTS_PER_SIMD
+    key = (rows, cols, block_rows, block_cols, outputs_per_simd)
     kernel = _finegrained_fp8_qmv_kernel_cache.get(key)
     if kernel is None:
         scale_cols = (cols + block_cols - 1) // block_cols
         source = (_FINEGRAINED_FP8_QMV_SOURCE
+                  .replace("OUTPUTS_PER_SIMD_VALUE", str(outputs_per_simd))
                   .replace("SCALE_COLS", str(scale_cols))
                   .replace("BLOCK_ROWS", str(block_rows))
                   .replace("BLOCK_COLS", str(block_cols))
@@ -1158,7 +1163,7 @@ def _finegrained_fp8_qmv_kernel(
                   .replace("COLS", str(cols)))
         kernel = mx.fast.metal_kernel(
             name=(f"voom_finegrained_fp8_qmv_r{rows}_c{cols}_"
-                  f"br{block_rows}_bc{block_cols}"),
+                  f"br{block_rows}_bc{block_cols}_o{outputs_per_simd}"),
             input_names=["x", "packed", "weight_scale_inv"],
             output_names=["out"],
             header=_FINEGRAINED_FP8_METAL_HEADER,
@@ -1206,7 +1211,8 @@ def finegrained_fp8_qmv(
     )(
         inputs=[x, packed, weight_scale_inv],
         template=[("T", mx.bfloat16)],
-        grid=(((rows + 3) // 4) * 32, 1, 1),
+        grid=(((rows + _FINEGRAINED_FP8_QMV_OUTPUTS_PER_SIMD - 1)
+               // _FINEGRAINED_FP8_QMV_OUTPUTS_PER_SIMD) * 32, 1, 1),
         threadgroup=(32, 1, 1),
         output_shapes=[(rows,)],
         output_dtypes=[mx.bfloat16],
