@@ -3671,6 +3671,7 @@ def test_qwen4_instrumented_profile_is_exact_bounded_and_in_engine_identity():
         "VMODEL_QWEN4_MTP_NGRAM_FIRST": "0",
         "VMODEL_QWEN4_MTP_Q_CALIBRATION_SCALES": "",
         "VMODEL_QWEN4_EXPERT_BATCH_PREFETCH_PREFILL_ONLY": "0",
+        "VMODEL_QWEN4_NATIVE_FUSED_DELTA_PREFILL": "0",
     }
     with patch.dict(os.environ, settings, clear=False), \
          patch("runtime.config.ModelConfig.from_dir", return_value=cfg), \
@@ -3683,14 +3684,20 @@ def test_qwen4_instrumented_profile_is_exact_bounded_and_in_engine_identity():
         os.environ[
             "VMODEL_QWEN4_EXPERT_BATCH_PREFETCH_PREFILL_ONLY"] = "1"
         manager.get(Path("/tmp/fake-qwen4"), "lossless")
+        os.environ[
+            "VMODEL_QWEN4_NATIVE_FUSED_DELTA_PREFILL"] = "1"
+        os.environ["VMODEL_QWEN4_COMPILED_DELTA"] = "0"
+        manager.get(Path("/tmp/fake-qwen4"), "lossless")
 
-    assert len(captured) == 3
-    baseline, changed, prefill_pipeline = captured
+    assert len(captured) == 4
+    baseline, changed, prefill_pipeline, exact_fused = captured
     assert baseline.max_weight_cache_mb == 300
     assert changed.max_weight_cache_mb == 301
     assert prefill_pipeline.max_weight_cache_mb == 301
     assert prefill_pipeline.qwen4_expert_batch_prefetch_prefill_only
     assert prefill_pipeline.expert_batch_prefetch
+    assert exact_fused.qwen_native_fused_delta_prefill
+    assert not exact_fused.qwen_compiled_delta_prefill
     for rc in (baseline, changed):
         assert rc.min_weight_cache_mb == 64
         assert rc.mlx_cache_limit_mb == 128
@@ -3722,6 +3729,7 @@ def test_qwen4_instrumented_profile_is_exact_bounded_and_in_engine_identity():
         assert not rc.parallel_storage_reads
         assert rc.quant_bits == 0
         assert not rc.qwen_compiled_delta_prefill
+        assert not rc.qwen_native_fused_delta_prefill
 
 
 def test_qwen4_instrumented_profile_rejects_invalid_cache_bounds():

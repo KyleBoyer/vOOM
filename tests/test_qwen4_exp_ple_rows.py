@@ -13,6 +13,33 @@ import pytest
 from runtime.qwen4_exp_ple_rows import Qwen4ExpPLERowStore
 
 
+def test_qwen4_layer_page_excludes_both_direct_ple_body_layouts():
+    from types import SimpleNamespace
+
+    from runtime.engine import StreamingEngine
+
+    engine = object.__new__(StreamingEngine)
+    engine.store = SimpleNamespace(layer_param_names=lambda _layer: [
+        "model.layers.2.ple.ple_embedding.ngram_embedding.weight",
+        "model.layers.2.ple.ngram_embedding.shards.0.weight",
+        "model.layers.2.ple.ngram_embedding.shards.0.scales",
+        "model.layers.2.ple.ngram_embedding.shards.0.biases",
+        "model.layers.2.ple.key_proj.weight",
+        "model.layers.2.self_attn.q_proj.weight",
+    ])
+    engine.cfg = SimpleNamespace(
+        num_experts=512,
+        moe_expert_prefix="mlp.experts",
+        model_type="qwen4_exp",
+    )
+    engine._dsa_elided = False
+
+    assert engine._layer_names(2) == [
+        "model.layers.2.ple.key_proj.weight",
+        "model.layers.2.self_attn.q_proj.weight",
+    ]
+
+
 def _write_safetensor(path: Path, tensors: dict[str, np.ndarray]) -> None:
     header = {}
     payload = bytearray()
@@ -36,8 +63,13 @@ def _write_typed_safetensor(
     header = {}
     payload = bytearray()
     for name, (dtype, value) in tensors.items():
-        storage = np.asarray(
-            value, dtype=np.uint8 if dtype == "F8_E4M3" else np.uint16)
+        numpy_dtype = {
+            "F8_E4M3": np.uint8,
+            "BF16": np.uint16,
+            "F16": np.float16,
+            "U32": np.uint32,
+        }[dtype]
+        storage = np.asarray(value, dtype=numpy_dtype)
         raw = storage.tobytes()
         start = len(payload)
         payload.extend(raw)
@@ -172,6 +204,73 @@ def _fp8_fixture(tmp_path: Path) -> tuple[Path, np.ndarray]:
     return root, packed
 
 
+def _affine3_fixture(
+    tmp_path: Path,
+) -> tuple[Path, np.ndarray, np.ndarray, np.ndarray]:
+    root = tmp_path / "qwen4-exp-affine3"
+    root.mkdir()
+    config = {
+        "model_type": "qwen4_exp",
+        "text_config": {
+            "model_type": "qwen4_exp_text",
+            "vocab_size": 64,
+            "hidden_size": 128,
+            "eos_token_id": 63,
+            "ngram_size": 3,
+            "heads_per_ngram": 2,
+            "ngram_vocab_size_base": 11,
+            "make_ngram_vocab_size_divisible_by": 4,
+            "split_ngram_parts": 4,
+        },
+        "quantization": {"bits": 8, "group_size": 64},
+    }
+    prefix = "language_model.layers.1.ple.ngram_embedding.shards"
+    rows_per_part = 15
+    row_width = 32
+    packed_width = row_width * 3 // 32
+    packed = np.arange(
+        rows_per_part * 4 * packed_width, dtype=np.uint32,
+    ).reshape(rows_per_part * 4, packed_width)
+    scales = np.full((rows_per_part * 4, 1), 0.25, dtype=np.float16)
+    biases = np.full((rows_per_part * 4, 1), -1.0, dtype=np.float16)
+    tensors = {}
+    weight_map = {}
+    for part in range(4):
+        stem = f"{prefix}.{part}"
+        start = part * rows_per_part
+        stop = start + rows_per_part
+        tensors[f"{stem}.weight"] = ("U32", packed[start:stop])
+        tensors[f"{stem}.scales"] = ("F16", scales[start:stop])
+        tensors[f"{stem}.biases"] = ("F16", biases[start:stop])
+        config["quantization"][stem] = {"bits": 3, "group_size": 32}
+        for suffix in ("weight", "scales", "biases"):
+            weight_map[f"{stem}.{suffix}"] = "model.safetensors"
+    (root / "config.json").write_text(json.dumps(config))
+    shard = root / "model.safetensors"
+    _write_typed_safetensor(shard, tensors)
+    (root / "model.safetensors.index.json").write_text(json.dumps({
+        "weight_map": weight_map,
+    }))
+
+    revision = "f" * 40
+    sha = hashlib.sha256(shard.read_bytes()).hexdigest()
+    cache = root / ".cache" / "huggingface"
+    (cache / "trees").mkdir(parents=True)
+    (cache / "download").mkdir()
+    (cache / "trees" / f"{revision}.json").write_text(json.dumps({
+        "format_version": 1,
+        "files": {
+            shard.name: {
+                "lfs_sha256": sha,
+                "lfs_size": shard.stat().st_size,
+            },
+        },
+    }))
+    (cache / "download" / f"{shard.name}.metadata").write_text(
+        f"{revision}\n{sha}\n")
+    return root, packed, scales, biases
+
+
 def _overlay_fixture(base: Path, root: Path, *, download_shard: bool) -> Path:
     root.mkdir()
     shard_name = "model.safetensors"
@@ -298,6 +397,38 @@ def test_fp8_rows_selectively_dequantize_with_global_bf16_scale(tmp_path):
         assert stats["output_row_bytes"] == 4
 
 
+def test_affine3_rows_read_only_selected_triplets_and_match_mlx(tmp_path):
+    import mlx.core as mx
+
+    root, packed, scales, biases = _affine3_fixture(tmp_path)
+    requested = np.array([[0, 14, 15], [16, 31, 59]])
+    with Qwen4ExpPLERowStore(
+            root, row_cache=0, read_workers=4) as store:
+        actual = store.read_rows(requested)
+        flat = requested.reshape(-1)
+        expected = mx.dequantize(
+            mx.array(packed[flat]),
+            scales=mx.array(scales[flat]),
+            biases=mx.array(biases[flat]),
+            group_size=32,
+            bits=3,
+            mode="affine",
+        )
+        mx.eval(expected)
+        expected_bits = np.asarray(expected).view(np.uint16).reshape(
+            *requested.shape, 32)
+
+        np.testing.assert_array_equal(actual, expected_bits)
+        assert store.identity.storage_dtype == "MLX_AFFINE3"
+        assert store.identity.storage_row_bytes == 16
+        stats = store.telemetry()
+        assert stats["output_dtype"] == "F16"
+        assert stats["output_row_bytes"] == 64
+        assert stats["bytes_read"] == requested.size * 16
+        assert stats["unique_rows_read"] == requested.size
+        assert stats["parallel_read_calls"] == 1
+
+
 def test_fp8_bf16_lookup_matches_mlx_all_storage_values():
     import mlx.core as mx
 
@@ -352,6 +483,31 @@ def test_missing_release_witness_and_bad_rows_fail_closed(tmp_path):
     with Qwen4ExpPLERowStore(root, require_release_hash=False) as store:
         with pytest.raises(IndexError, match="outside"):
             store.read_rows([[store.layout.padded_vocab_size]])
+
+
+def test_modern_hf_local_dir_metadata_is_a_mtime_guarded_witness(tmp_path):
+    root, _ = _fixture(tmp_path)
+    tree = next((root / ".cache" / "huggingface" / "trees").iterdir())
+    tree.unlink()
+    shard = root / "model.safetensors"
+    sha = hashlib.sha256(shard.read_bytes()).hexdigest()
+    (root / "SHARD_HASHES.txt").write_text(
+        f"{sha}  {shard.name}\n")
+    metadata = (
+        root / ".cache" / "huggingface" / "download"
+        / f"{shard.name}.metadata")
+    metadata.write_text(
+        f"{'a' * 40}\n{sha}\n{shard.stat().st_mtime}\n")
+
+    with Qwen4ExpPLERowStore(root, row_cache=0) as store:
+        assert store.identity.verified_release_hash
+        assert store.identity.revision == "a" * 40
+        assert store.read_rows([[0]]).shape == (1, 1, 2)
+
+    future = shard.stat().st_mtime + 2
+    os.utime(shard, (future, future))
+    with pytest.raises(ValueError, match="release witness"):
+        Qwen4ExpPLERowStore(root, row_cache=0)
 
 
 @pytest.mark.parametrize("download_shard", [False, True])

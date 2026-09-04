@@ -38,22 +38,25 @@ def _reference(q, k, v, gate, beta, state):
     return mx.stack(outputs, axis=1), state
 
 
-@pytest.mark.parametrize("length", [2, 17, 64])
-def test_native_kda_prefill_matches_serial_recurrence(length):
+@pytest.mark.parametrize("length", [2, 17, 32, 33, 64])
+def test_native_kda_prefill_is_byte_identical(length):
     rng = np.random.default_rng(151 + length)
-    batch, heads, dim = 1, 3, 16
-    q = mx.array(rng.standard_normal(
-        (batch, length, heads, dim), dtype=np.float32))
-    k = mx.array(rng.standard_normal(
-        (batch, length, heads, dim), dtype=np.float32))
-    v = mx.array(rng.standard_normal(
-        (batch, length, heads, dim), dtype=np.float32))
+    batch, heads, dim = 1, 2, 128
+    shape = (batch, length, heads, dim)
+    q_host = rng.standard_normal(shape, dtype=np.float32)
+    q_host /= np.linalg.norm(q_host, axis=-1, keepdims=True)
+    q_host *= dim ** -0.5
+    k_host = rng.standard_normal(shape, dtype=np.float32)
+    k_host /= np.linalg.norm(k_host, axis=-1, keepdims=True)
+    q = mx.array(q_host)
+    k = mx.array(k_host)
+    v = mx.array(rng.normal(0.0, 0.04, shape).astype(np.float32))
     gate = mx.array(rng.uniform(
         -5.0, -0.001, (batch, length, heads, dim)).astype(np.float32))
     beta = mx.array(rng.uniform(
         0.01, 0.99, (batch, length, heads)).astype(np.float32))
-    state = mx.array(rng.standard_normal(
-        (batch, heads, dim, dim), dtype=np.float32) * 0.05)
+    state = mx.array(rng.normal(
+        0.0, 0.01, (batch, heads, dim, dim)).astype(np.float32))
 
     reference_out, reference_state = _reference(
         q, k, v, gate, beta, state)
@@ -61,17 +64,24 @@ def test_native_kda_prefill_matches_serial_recurrence(length):
         q, k, v, gate, beta, state)
     mx.eval(reference_out, reference_state, fused_out, fused_state)
 
-    output_error = float(mx.max(mx.abs(fused_out - reference_out)))
-    state_error = float(mx.max(mx.abs(fused_state - reference_state)))
-    assert output_error < 2e-4
-    assert state_error < 2e-4
+    assert bool(mx.array_equal(fused_out, reference_out))
+    assert bool(mx.array_equal(fused_state, reference_state))
 
 
 def test_native_kda_prefill_rejects_single_position():
-    value = mx.zeros((1, 1, 2, 8), dtype=mx.float32)
+    value = mx.zeros((1, 1, 2, 128), dtype=mx.float32)
     beta = mx.zeros((1, 1, 2), dtype=mx.float32)
-    state = mx.zeros((1, 2, 8, 8), dtype=mx.float32)
+    state = mx.zeros((1, 2, 128, 128), dtype=mx.float32)
     with pytest.raises(ValueError, match="more than one position"):
+        _native_fused_kda_prefill_scan(
+            value, value, value, value, beta, state)
+
+
+def test_native_kda_prefill_rejects_unproved_head_dimension():
+    value = mx.zeros((1, 2, 2, 64), dtype=mx.float32)
+    beta = mx.zeros((1, 2, 2), dtype=mx.float32)
+    state = mx.zeros((1, 2, 64, 64), dtype=mx.float32)
+    with pytest.raises(ValueError, match="released head dimension 128"):
         _native_fused_kda_prefill_scan(
             value, value, value, value, beta, state)
 

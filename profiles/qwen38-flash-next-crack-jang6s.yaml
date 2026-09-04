@@ -1,0 +1,18 @@
+schema: voom.runtime-profile.v1
+name: qwen38-flash-next-crack-jang6s
+description: Mixed-precision uncensored Qwen3.8-Flash-Next JANG_6S sidequest baseline.
+notes:
+  - "Pinned checkpoint: dealignai/Qwen3.8-Flash-Next-CRACK-JANG_6S revision d0156c02b76098baf8b06512c57a049a6d090f5a. All 26 published shard SHA-256 values passed locally before first load. This is a separate lossy candidate; it does not replace the installed released-representation or uncensored FP8 checkpoints."
+  - "The checkpoint keeps trunk matrices at affine q8/g64, routed gate/up at q4/g64, routed down at q6/g64, and PLE rows at q3/g32. vOOM slices the fused 3-D expert tensors into exact packed per-expert QTensor pages and selectively reads only requested PLE weight/scale/bias rows. No runtime requantization occurs."
+  - "The publisher reports MMLU 86.10 versus 87.72 for its baseline (-1.62 points). Treat this as a quality-gated fast sidequest, not a lossless GLM/Qwen target and not an automatic route."
+  - "Native MTP, internal fast-tier reuse, prompt-state reuse, and gateway shortcuts are disabled for first-pass target isolation. Candidate-specific variants may enable them only after real Plex, varied-shape, sustained-output, vision, and pressure gates pass."
+extends:
+  - qwen38-flash-next-candidate-bf16
+settings:
+  VMODEL_QWEN4_MTP_DEPTH: 0
+  VMODEL_QWEN4_PARALLEL_STORAGE_READS: false
+  VMODEL_QWEN4_HOT_PROMPT_KV: false
+  VMODEL_QWEN4_FAST_TIER_DECODE_ONLY: false
+  VMODEL_EXPERT_BATCH_PREFETCH: false
+  VMODEL_FAST_TOOL_GATEWAY: false
+  VMODEL_QWEN_MTP_SPECULATIVE: false

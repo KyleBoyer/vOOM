@@ -19,7 +19,10 @@ if str(ROOT) not in sys.path:
 import mlx.core as mx
 import numpy as np
 
-from runtime.kimi_linear import _compiled_kda_prefill_scan
+from runtime.kimi_linear import (
+    _compiled_kda_prefill_scan,
+    _native_fused_kda_prefill_scan,
+)
 
 
 def _reference(q, k, v, gate, beta, initial_state):
@@ -96,14 +99,19 @@ def main() -> int:
 
     rng = np.random.default_rng(53128)
     shape = (1, args.length, 64, 128)
-    q = mx.array(rng.standard_normal(shape, dtype=np.float32))
-    k = mx.array(rng.standard_normal(shape, dtype=np.float32))
-    v = mx.array(rng.standard_normal(shape, dtype=np.float32))
+    q_host = rng.standard_normal(shape, dtype=np.float32)
+    q_host /= np.linalg.norm(q_host, axis=-1, keepdims=True)
+    q_host *= shape[-1] ** -0.5
+    k_host = rng.standard_normal(shape, dtype=np.float32)
+    k_host /= np.linalg.norm(k_host, axis=-1, keepdims=True)
+    q = mx.array(q_host)
+    k = mx.array(k_host)
+    v = mx.array(rng.normal(0.0, 0.04, shape).astype(np.float32))
     gate = mx.array(rng.uniform(-5, 0, shape).astype(np.float32))
     beta = mx.array(rng.uniform(
         0, 1, (1, args.length, 64)).astype(np.float32))
-    state = mx.array(rng.standard_normal(
-        (1, 64, 128, 128), dtype=np.float32))
+    state = mx.array(rng.normal(
+        0.0, 0.01, (1, 64, 128, 128)).astype(np.float32))
     values = (q, k, v, gate, beta, state)
 
     reference = _measure(_reference, values, args.repeats)
@@ -135,8 +143,22 @@ def main() -> int:
         default=None,
     )
     baseline_exact = compiled["32"]["byte_identical"]
+    warm_output, warm_state = _native_fused_kda_prefill_scan(*values)
+    mx.eval(warm_output, warm_state)
+    native = _measure(
+        _native_fused_kda_prefill_scan, values, args.repeats)
+    native["byte_identical"] = (
+        reference["output_sha256"] == native["output_sha256"]
+        and reference["state_sha256"] == native["state_sha256"]
+    )
+    native["speedup_vs_reference"] = (
+        reference["median_s"] / native["median_s"]
+        if native["median_s"] else None)
+    native["speedup_vs_compiled_32"] = (
+        compiled["32"]["median_s"] / native["median_s"]
+        if native["median_s"] else None)
     result = {
-        "schema": "voom.glm53-kda-compile-segment-sweep.v2",
+        "schema": "voom.glm53-kda-compile-segment-sweep.v3",
         "geometry": {
             "batch": 1,
             "length": args.length,
@@ -148,15 +170,16 @@ def main() -> int:
         },
         "reference": reference,
         "compiled": compiled,
+        "native_striped": native,
         "byte_identical_segments": exact_segments,
         "fastest_byte_identical_segment": winner,
         "baseline_segment_32_byte_identical": baseline_exact,
-        "passed": baseline_exact,
+        "passed": baseline_exact and native["byte_identical"],
     }
     args.result.parent.mkdir(parents=True, exist_ok=True)
     args.result.write_text(json.dumps(result, indent=2, sort_keys=True) + "\n")
     print(json.dumps(result, indent=2, sort_keys=True))
-    return 0 if baseline_exact else 1
+    return 0 if result["passed"] else 1
 
 
 if __name__ == "__main__":

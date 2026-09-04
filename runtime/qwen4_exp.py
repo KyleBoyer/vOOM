@@ -132,7 +132,14 @@ def hyper_connection_mix(
         *hidden.shape[:-1], count, cfg.hidden_size)
     streams = normalized.reshape(
         *hidden.shape[:-1], count, cfg.hidden_size)
-    mixed = mx.mean(mixed_gate * streams, axis=-2)
+    # Mixed MLX-affine checkpoints keep their quantized projections/scales in
+    # FP16 while the small unquantized hyper matrices remain released BF16.
+    # MLX promotes that product to FP32. PyTorch autocast and the publisher's
+    # intended 16-bit execution return the branch carrier to the activation
+    # dtype here; retaining FP32 would double the long-prompt spool and change
+    # every following quantized projection. The all-BF16 released path is a
+    # no-op cast.
+    mixed = mx.mean(mixed_gate * streams, axis=-2).astype(hidden.dtype)
     if not inject:
         return mixed
     injection_input = (_linear(
@@ -205,8 +212,13 @@ def apply_ple(
     previous = state.ple_context[layer] if state is not None else None
     row_ids = row_store.layout.row_ids(tokens, previous_context=previous)
     storage = row_store.read_rows(row_ids)
-    # numpy uint16 carries the exact BF16 bit pattern; view changes only dtype.
-    embeddings = mx.array(storage).view(mx.bfloat16).reshape(
+    # numpy uint16 carries the exact compute-dtype bit pattern; view changes
+    # only dtype. Released BF16/FP8 checkpoints reconstruct BF16, while a
+    # standard MLX affine checkpoint reconstructs the F16 output its scales
+    # prescribe.
+    embedding_dtype = (
+        mx.float16 if row_store.output_dtype == "F16" else mx.bfloat16)
+    embeddings = mx.array(storage).view(embedding_dtype).reshape(
         1, len(tokens), cfg.qwen4_ple_embed_dim)
     count = cfg.qwen4_hc_count
     keys = qwen4_rms_norm(
@@ -553,7 +565,7 @@ def qwen4_mlp_route_window_exact(
         *hidden.shape[:-1], count, cfg.hidden_size)
     streams = normalized.reshape(
         *hidden.shape[:-1], count, cfg.hidden_size)
-    mixed = mx.mean(mixed_gate * streams, axis=-2)
+    mixed = mx.mean(mixed_gate * streams, axis=-2).astype(hidden.dtype)
     injection_input = (_exact_verify_linear_window(
         normalized,
         weights,
@@ -626,7 +638,7 @@ def qwen4_mlp_from_groups(
     shared = _swiglu(mixed, weights, f"{prefix}.mlp.shared_expert")
     shared_gate = mx.sigmoid(_linear(
         mixed, weights, f"{prefix}.mlp.shared_expert_gate"))
-    branch = routed + shared_gate * shared
+    branch = (routed + shared_gate * shared).astype(mixed.dtype)
     return hyper_connection_inject(branch, hyper_input, injection)
 
 
@@ -734,7 +746,7 @@ def qwen4_mlp_from_group_batches(
         )
         shared_gate = mx.sigmoid(_linear(
             mixed, weights, f"{prefix}.mlp.shared_expert_gate"))
-        branch = routed_output + shared_gate * shared
+        branch = (routed_output + shared_gate * shared).astype(mixed.dtype)
         outputs.append(hyper_connection_inject(
             branch, hyper_input, injection))
     return outputs

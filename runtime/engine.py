@@ -60,6 +60,34 @@ _MEMORY_RETRY_HARD_CAP_RE = re.compile(
     r"observed=(?P<observed>\d+) limit=(?P<limit>\d+)")
 
 
+def _lossless_16bit_host_spool(value: mx.array, *, expected_dtype):
+    """Copy a released FP16/BF16 activation to CPU without conversion."""
+    import numpy as np
+
+    if expected_dtype not in (mx.float16, mx.bfloat16):
+        raise TypeError(
+            "lossless host spool supports only FP16/BF16 activations, "
+            f"got {expected_dtype}")
+    if value.dtype != expected_dtype:
+        raise TypeError(
+            "lossless host spool activation dtype changed: "
+            f"expected {expected_dtype}, got {value.dtype}")
+    mx.eval(value)
+    return np.array(
+        np.asarray(value.view(mx.uint16)), dtype=np.uint16, copy=True)
+
+
+def _restore_lossless_16bit_host_spool(value, *, dtype) -> mx.array:
+    """Restore an exact raw FP16/BF16 CPU payload to its released dtype."""
+    if dtype not in (mx.float16, mx.bfloat16):
+        raise TypeError(
+            "lossless host spool supports only FP16/BF16 activations, "
+            f"got {dtype}")
+    result = mx.array(value, dtype=mx.uint16).view(dtype)
+    mx.eval(result)
+    return result
+
+
 def _memory_retry_diagnostic(error: MemoryError) -> dict[str, object]:
     """Return only content-free fields from a known memory refusal.
 
@@ -1131,9 +1159,11 @@ class RuntimeConfig:
     # K3 path above, this traces the ordinary recurrence operators in bounded
     # 32-position segments without the WY path's FP32 reassociation.
     qwen_compiled_delta_prefill: bool = False
-    # Explicit lossy serial Metal scan. It preserves the causal recurrence but
-    # uses scalar in-kernel reductions whose FP32 association can differ from
-    # the released MLX operator tree.
+    # Explicit serial Metal scan. The current 128x128 implementation mirrors
+    # MLX 0.32's BM=32 strided-reduction association and disables contraction;
+    # direct and real-checkpoint Qwen4 state oracles are byte-identical. The
+    # Qwen3.5 server route remains classified lossy until its own heterogeneous
+    # real-model corpus is rerun under this replacement kernel.
     qwen_native_fused_delta_prefill: bool = False
     # Chunkwise WY DeltaNet prefill. Numerically close but not
     # activation-identical across arbitrary checkpoint splits, so server.py
@@ -3630,7 +3660,10 @@ class StreamingEngine:
             # bodies must never enter the ordinary WeightCache.
             names = [
                 name for name in names
-                if ".ple.ple_embedding." not in name
+                if (
+                    ".ple.ple_embedding." not in name
+                    and ".ple.ngram_embedding.shards." not in name
+                )
             ]
         if self._dsa_elided:
             # F43: with S bounded <= index_topk the indexer selects every position
@@ -6770,6 +6803,11 @@ class StreamingEngine:
             "output": 0.0,
         }
         metal_limit_bytes = max(0, int(self.rc.metal_limit_mb)) * 1_000_000
+        activation_dtype = x.dtype
+        if activation_dtype not in (mx.float16, mx.bfloat16):
+            raise TypeError(
+                "Qwen4 host spool requires released FP16/BF16 activations, "
+                f"got {activation_dtype}")
 
         def note_spool(
             phase: str, *, layer: int, completed_tokens: int = 0,
@@ -6806,16 +6844,11 @@ class StreamingEngine:
                     f"observed={observed} limit={metal_limit_bytes}")
 
         def host_bits(value: mx.array) -> np.ndarray:
-            """Copy exact BF16 payload out of Metal without FP conversion."""
+            """Copy the exact released 16-bit payload without conversion."""
             nonlocal spool_d2h_bytes, spool_copy_s
-            if value.dtype != mx.bfloat16:
-                raise TypeError(
-                    "Qwen4 host spool requires released BF16 activations, "
-                    f"got {value.dtype}")
             started = time.perf_counter()
-            mx.eval(value)
-            result = np.array(
-                np.asarray(value.view(mx.uint16)), dtype=np.uint16, copy=True)
+            result = _lossless_16bit_host_spool(
+                value, expected_dtype=activation_dtype)
             spool_d2h_bytes += int(result.nbytes)
             spool_copy_s += time.perf_counter() - started
             return result
@@ -6823,8 +6856,8 @@ class StreamingEngine:
         def metal_bits(value: np.ndarray) -> mx.array:
             nonlocal spool_h2d_bytes, spool_copy_s
             started = time.perf_counter()
-            result = mx.array(value, dtype=mx.uint16).view(mx.bfloat16)
-            mx.eval(result)
+            result = _restore_lossless_16bit_host_spool(
+                value, dtype=activation_dtype)
             spool_h2d_bytes += int(value.nbytes)
             spool_copy_s += time.perf_counter() - started
             return result
@@ -6832,12 +6865,12 @@ class StreamingEngine:
         # One prompt-sized host copy is intentionally retained while Metal
         # owns only bounded tiles. On this model the four-stream 49K hidden is
         # ~1.01GB; retaining all seven Metal tiles and their lazy parents was
-        # measured at 14.4GB. Host uint16 preserves every released BF16 bit.
+        # measured at 14.4GB. Host uint16 preserves every released 16-bit bit.
         # Each causal tile's input is dead after its attention/recurrent state
         # update, so the same host allocation is overwritten first with the
         # post-attention bits and later with the final layer-output bits. This
         # avoids a second prompt-sized host array without changing arithmetic,
-        # tile boundaries, or any BF16 payload.
+        # tile boundaries, or any activation payload.
         hidden_host = host_bits(x)
         spool_peak_host_bytes = int(hidden_host.nbytes)
         note_spool(
@@ -6941,7 +6974,7 @@ class StreamingEngine:
                     "groups": groups,
                     "routed": mx.zeros(
                         (1, end - pos, self.cfg.hidden_size),
-                        dtype=mx.bfloat16),
+                        dtype=activation_dtype),
                 })
                 source = ple = mixed = hyper_input = injection = None
                 branch = post_attention = indices = scores = None
@@ -7133,7 +7166,9 @@ class StreamingEngine:
                     mixed, w, f"{prefix}.mlp.shared_expert")
                 shared_gate = mx.sigmoid(_linear(
                     mixed, w, f"{prefix}.mlp.shared_expert_gate"))
-                branch = record["routed"] + shared_gate * shared
+                branch = (
+                    record["routed"] + shared_gate * shared
+                ).astype(activation_dtype)
                 output = hyper_connection_inject(
                     branch, hyper_input, injection)
                 mx.eval(output)
@@ -7189,6 +7224,7 @@ class StreamingEngine:
             "copy_seconds": spool_copy_s,
             "peak_host_bytes": spool_peak_host_bytes,
             "memory_samples": spool_samples,
+            "activation_dtype": str(activation_dtype),
             "global_expert_rows": int(self.rc.qwen4_global_expert_rows),
             "expert_row_gathers": spool_expert_row_gathers,
             "expert_rows_uploaded": spool_expert_rows_uploaded,

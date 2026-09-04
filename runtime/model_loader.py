@@ -110,12 +110,12 @@ class _CTMXFP4Aux:
 
 @dataclass(frozen=True)
 class _Qwen4FusedExpertSlice:
-    """One exact logical expert matrix inside Qwen4-Exp's fused BF16 body."""
+    """One exact logical tensor slice inside a fused Qwen4 expert body."""
 
     shard: str
     physical_name: str
     dtype: str
-    shape: tuple[int, int]
+    shape: tuple[int, ...]
     offset: int
     nbytes: int
 
@@ -690,7 +690,19 @@ class WeightStore:
             elif n.startswith("language_model.model."):
                 canon = "model." + n[len("language_model.model."):]
             elif n.startswith("language_model."):
-                canon = n[len("language_model."):]
+                tail = n[len("language_model."):]
+                # Some MLX Qwen4 conversions omit the inner ``model`` object
+                # and publish ``language_model.layers.*`` directly. Decoder
+                # body tensors still belong under the engine's canonical
+                # ``model.*`` namespace; wrapper-owned outputs such as
+                # ``language_model.lm_head`` do not.
+                canon = (
+                    "model." + tail
+                    if tail.startswith((
+                        "embed_tokens.", "layers.", "norm.",
+                        "hyper_connection_mixer.",
+                    )) else tail
+                )
             elif n.startswith("vision_tower."):
                 canon = "model.visual." + n[len("vision_tower."):]
             else:
@@ -698,6 +710,22 @@ class WeightStore:
             self._real_name[canon] = n
             self.weight_map[canon] = self.weight_map.pop(n)
         self._real_name.update(self._gguf_pending_real_names)
+
+        # MLX Qwen4 conversions flatten the depthwise PLE parameter to
+        # ``conv1d_weight`` while the released Transformers checkpoint and
+        # runtime formula address ``conv1d.weight``. This is a name-only
+        # canonicalization: the original tensor bytes and shape stay intact.
+        for source in [
+            name for name in self.weight_map
+            if name.endswith(".ple.conv1d_weight")
+        ]:
+            canonical = source[:-len("conv1d_weight")] + "conv1d.weight"
+            if canonical in self.weight_map:
+                raise ValueError(
+                    "Qwen4 checkpoint contains both flattened and canonical "
+                    f"PLE convolution names: {source}, {canonical}")
+            self.weight_map[canonical] = self.weight_map.pop(source)
+            self._real_name[canonical] = self._real_name.pop(source, source)
 
         # F213: DeepSeek V4 ships no ``model.`` prefix at all -- its tensors
         # are ``layers.N.*``, ``embed.weight``, ``head.weight``,
@@ -1385,38 +1413,60 @@ class WeightStore:
 
         Mixed or partial representations fail before any model tensor is
         served. The per-expert FP8 branch is metadata-only here; the generic
-        fine-grained pair registration below owns dtype/scale joining.
+        fine-grained pair registration below owns dtype/scale joining. MLX
+        mixed-precision derivatives use a third representation: one affine-
+        quantized 3-D ``switch_mlp`` body per projection. Those bodies are
+        exposed as exact per-expert QTensor pages without materializing or
+        copying the other 511 experts.
         """
         cfg = self.config
-        prefixes = [
+        main_prefixes = [
             f"model.layers.{layer}.mlp.experts"
             for layer in range(cfg.num_hidden_layers)
         ]
-        if any(name.startswith("mtp.") for name in self.weight_map):
-            prefixes.append("mtp.layers.0.mlp.experts")
+        mtp_prefix = "mtp.layers.0.mlp.experts"
+        has_mtp = any(name.startswith("mtp.") for name in self.weight_map)
         fused_probes = {
             f"{prefix}.{projection}"
-            for prefix in prefixes
+            for prefix in main_prefixes
             for projection in ("gate_up_proj", "down_proj")
         }
         per_expert_probes = {
             f"{prefix}.0.{projection}.weight"
-            for prefix in prefixes
+            for prefix in main_prefixes
+            for projection in ("gate_proj", "up_proj", "down_proj")
+        }
+        switch_probes = {
+            f"model.layers.{layer}.mlp.switch_mlp.{projection}.weight"
+            for layer in range(cfg.num_hidden_layers)
             for projection in ("gate_proj", "up_proj", "down_proj")
         }
         has_fused = any(name in self.weight_map for name in fused_probes)
         has_per_expert = any(
             name in self.weight_map for name in per_expert_probes)
-        if has_fused and has_per_expert:
+        has_switch = any(name in self.weight_map for name in switch_probes)
+        if sum((has_fused, has_per_expert, has_switch)) > 1:
             raise ValueError(
                 "Qwen4-Exp checkpoint mixes fused and per-expert layouts")
         if has_fused:
-            self._register_qwen4_fused_expert_slices()
+            prefixes = list(main_prefixes)
+            if has_mtp:
+                prefixes.append(mtp_prefix)
+            self._register_qwen4_fused_expert_slices(prefixes)
             self.qwen4_expert_layout = "fused-bf16"
+            return
+        if has_switch:
+            self._register_qwen4_affine_switch_expert_slices()
+            if has_mtp:
+                self._register_qwen4_affine_mtp_expert_slices(mtp_prefix)
+            self.qwen4_expert_layout = "fused-affine"
             return
         if not has_per_expert:
             raise ValueError("Qwen4-Exp checkpoint has no supported expert layout")
 
+        prefixes = list(main_prefixes)
+        if has_mtp:
+            prefixes.append(mtp_prefix)
         missing = []
         for prefix in prefixes:
             for expert in range(int(cfg.num_experts)):
@@ -1439,7 +1489,9 @@ class WeightStore:
                 + ", ".join(missing))
         self.qwen4_expert_layout = "per-expert-fp8"
 
-    def _register_qwen4_fused_expert_slices(self) -> None:
+    def _register_qwen4_fused_expert_slices(
+        self, expert_prefixes: Sequence[str] | None = None,
+    ) -> None:
         """Expose released fused expert rows as ordinary logical matrices.
 
         The released layout is gate_up=[E,2M,H] and down=[E,H,M].  A single
@@ -1458,13 +1510,13 @@ class WeightStore:
         if experts <= 0 or width <= 0 or hidden <= 0:
             raise ValueError("Qwen4-Exp fused expert geometry is incomplete")
 
-        expert_prefixes = [
-            f"model.layers.{layer}.mlp.experts"
-            for layer in range(cfg.num_hidden_layers)
-        ]
-        has_mtp = any(name.startswith("mtp.") for name in self.weight_map)
-        if has_mtp:
-            expert_prefixes.append("mtp.layers.0.mlp.experts")
+        if expert_prefixes is None:
+            expert_prefixes = [
+                f"model.layers.{layer}.mlp.experts"
+                for layer in range(cfg.num_hidden_layers)
+            ]
+            if any(name.startswith("mtp.") for name in self.weight_map):
+                expert_prefixes.append("mtp.layers.0.mlp.experts")
         for prefix in expert_prefixes:
             fused_specs = (
                 (f"{prefix}.gate_up_proj", (experts, 2 * width, hidden)),
@@ -1544,6 +1596,193 @@ class WeightStore:
                             f"Qwen4-Exp virtual expert name collides: {logical}")
                     self.weight_map[logical] = spec.shard
                     self._qwen4_fused_expert_slices[logical] = spec
+
+    def _qwen4_physical_tensor_info(
+        self,
+        name: str,
+        *,
+        dtype: str,
+        shape: tuple[int, ...],
+    ) -> tuple[str, str, int, int]:
+        """Validate one fused physical tensor and return its absolute extent."""
+
+        shard = self.weight_map.get(name)
+        if shard is None:
+            raise ValueError(f"Qwen4-Exp affine expert tensor is missing: {name}")
+        real = self._real_name.get(name, name)
+        metadata = self._safetensors_header(shard).get(real)
+        item_size = {"U32": 4, "F16": 2}.get(dtype)
+        if item_size is None:
+            raise AssertionError(f"unsupported Qwen4 virtual dtype {dtype}")
+        elements = 1
+        for extent in shape:
+            elements *= extent
+        offsets = metadata.get("data_offsets") if isinstance(metadata, dict) else None
+        if (
+            not isinstance(metadata, dict)
+            or metadata.get("dtype") != dtype
+            or tuple(int(value) for value in metadata.get("shape", ())) != shape
+            or not isinstance(offsets, list)
+            or len(offsets) != 2
+            or int(offsets[1]) - int(offsets[0]) != elements * item_size
+        ):
+            raise ValueError(
+                f"unexpected Qwen4-Exp affine expert metadata for {name}: "
+                f"{metadata}"
+            )
+        with (self.dir / shard).open("rb") as handle:
+            length_raw = handle.read(8)
+        if len(length_raw) != 8:
+            raise EOFError(f"truncated safetensors shard {shard}")
+        payload_base = 8 + struct.unpack("<Q", length_raw)[0]
+        absolute = payload_base + int(offsets[0])
+        self._qwen4_fused_physical_names.add(name)
+        # ``language_model.layers.*`` first canonicalizes to ``layers.*`` and
+        # F213 then adds the normal ``model.layers.*`` alias. Hide both names;
+        # only the directly pageable per-expert views belong in the scheduler.
+        if name.startswith("model.layers."):
+            self._qwen4_fused_physical_names.add(name[len("model."):])
+        return shard, real, absolute, elements * item_size
+
+    def _register_qwen4_affine_projection_slices(
+        self,
+        *,
+        physical_stem: str,
+        logical_prefix: str,
+        input_width: int,
+        output_slices: Sequence[tuple[str, int, int]],
+    ) -> None:
+        """Expose selected output rows of one fused MLX affine projection."""
+
+        real_stem = self._real_name.get(
+            f"{physical_stem}.weight", f"{physical_stem}.weight"
+        )[:-len(".weight")]
+        descriptor = self.quantization.get(
+            physical_stem, self.quantization.get(real_stem))
+        params = _quant_params(descriptor)
+        if params is None or params[2] != "affine":
+            raise ValueError(
+                "Qwen4-Exp fused affine expert projection has no valid MLX "
+                f"descriptor: {physical_stem}"
+            )
+        bits, group_size, mode = params
+        if input_width % group_size or (input_width * bits) % 32:
+            raise ValueError(
+                f"Qwen4-Exp affine expert geometry cannot pack {physical_stem}"
+            )
+        outputs = sum(count for _name, _start, count in output_slices)
+        if outputs <= 0 or any(
+            start < 0 or count <= 0 or start + count > outputs
+            for _name, start, count in output_slices
+        ):
+            raise ValueError(
+                f"Qwen4-Exp affine expert output slices are invalid: "
+                f"{physical_stem}"
+            )
+        experts = int(self.config.num_experts)
+        packed_width = input_width * bits // 32
+        group_width = input_width // group_size
+        component_specs = (
+            ("weight", "U32", packed_width, 4),
+            ("scales", "F16", group_width, 2),
+            ("biases", "F16", group_width, 2),
+        )
+        physical = {}
+        for suffix, dtype, row_width, item_size in component_specs:
+            physical_name = f"{physical_stem}.{suffix}"
+            info = self._qwen4_physical_tensor_info(
+                physical_name,
+                dtype=dtype,
+                shape=(experts, outputs, row_width),
+            )
+            physical[suffix] = (
+                physical_name, dtype, row_width, item_size, info)
+
+        normalized_descriptor = {
+            "bits": bits,
+            "group_size": group_size,
+            "mode": mode,
+        }
+        for expert in range(experts):
+            for projection, output_start, output_count in output_slices:
+                logical_stem = f"{logical_prefix}.{expert}.{projection}"
+                self.quantization[logical_stem] = normalized_descriptor
+                for suffix, (_physical_name, dtype, row_width, item_size,
+                             info) in physical.items():
+                    shard, real, absolute, _physical_nbytes = info
+                    expert_stride = outputs * row_width * item_size
+                    relative = (
+                        expert * expert_stride
+                        + output_start * row_width * item_size
+                    )
+                    shape = (output_count, row_width)
+                    nbytes = output_count * row_width * item_size
+                    logical = f"{logical_stem}.{suffix}"
+                    if logical in self.weight_map:
+                        raise ValueError(
+                            "Qwen4-Exp affine virtual expert name collides: "
+                            f"{logical}"
+                        )
+                    spec = _Qwen4FusedExpertSlice(
+                        shard=shard,
+                        physical_name=real,
+                        dtype=dtype,
+                        shape=shape,
+                        offset=absolute + relative,
+                        nbytes=nbytes,
+                    )
+                    self.weight_map[logical] = shard
+                    self._qwen4_fused_expert_slices[logical] = spec
+
+    def _register_qwen4_affine_switch_expert_slices(self) -> None:
+        """Register JANG-style q4/q6 ``switch_mlp`` expert bodies."""
+
+        cfg = self.config
+        hidden = int(cfg.hidden_size)
+        width = int(cfg.moe_intermediate_size)
+        for layer in range(int(cfg.num_hidden_layers)):
+            physical = f"model.layers.{layer}.mlp.switch_mlp"
+            logical = f"model.layers.{layer}.mlp.experts"
+            self._register_qwen4_affine_projection_slices(
+                physical_stem=f"{physical}.gate_proj",
+                logical_prefix=logical,
+                input_width=hidden,
+                output_slices=(("gate_proj", 0, width),),
+            )
+            self._register_qwen4_affine_projection_slices(
+                physical_stem=f"{physical}.up_proj",
+                logical_prefix=logical,
+                input_width=hidden,
+                output_slices=(("up_proj", 0, width),),
+            )
+            self._register_qwen4_affine_projection_slices(
+                physical_stem=f"{physical}.down_proj",
+                logical_prefix=logical,
+                input_width=width,
+                output_slices=(("down_proj", 0, hidden),),
+            )
+
+    def _register_qwen4_affine_mtp_expert_slices(self, prefix: str) -> None:
+        """Register JANG's q6 fused gate/up MTP proposal expert body."""
+
+        cfg = self.config
+        hidden = int(cfg.hidden_size)
+        width = int(cfg.moe_intermediate_size)
+        self._register_qwen4_affine_projection_slices(
+            physical_stem=f"{prefix}.gate_up_proj",
+            logical_prefix=prefix,
+            input_width=hidden,
+            output_slices=(
+                ("gate_proj", 0, width),
+                ("up_proj", width, width),
+            ),
+        )
+        self._register_qwen4_affine_projection_slices(
+            physical_stem=f"{prefix}.down_proj",
+            logical_prefix=prefix,
+            input_width=width,
+            output_slices=(("down_proj", 0, hidden),),
+        )
 
     def qwen4_fused_expert_snapshot(self) -> dict[str, int]:
         """Cumulative exact direct-row I/O counters."""
@@ -2823,9 +3062,43 @@ class WeightStore:
             if name in self._qwen4_fused_expert_slices]
         if virtual_names:
             started = time.perf_counter()
+            physical_virtual_names = []
+            seen_virtual_names: set[str] = set()
+            for name in virtual_names:
+                aux = self._quant_aux.get(name)
+                expanded = (
+                    (name, aux.scales, aux.biases)
+                    if aux is not None else (name,)
+                )
+                for component in expanded:
+                    if (component is not None
+                            and component not in seen_virtual_names):
+                        physical_virtual_names.append(component)
+                        seen_virtual_names.add(component)
             virtual_out, virtual_bytes = (
-                self._read_qwen4_virtual_expert_tiers(virtual_names))
-            remaining = [name for name in names if name not in virtual_out]
+                self._read_qwen4_virtual_expert_tiers(
+                    physical_virtual_names))
+            if any(self._quant_aux.get(name) is not None
+                   for name in virtual_names):
+                from .quant import QTensor
+
+                logical_virtual_out = {}
+                for name in virtual_names:
+                    aux = self._quant_aux.get(name)
+                    if aux is None:
+                        logical_virtual_out[name] = virtual_out[name]
+                    else:
+                        logical_virtual_out[name] = QTensor(
+                            virtual_out[name],
+                            virtual_out[aux.scales],
+                            (virtual_out[aux.biases]
+                             if aux.biases is not None else None),
+                            aux.bits,
+                            aux.group_size,
+                            aux.mode,
+                        )
+                virtual_out = logical_virtual_out
+            remaining = [name for name in names if name not in virtual_names]
             if remaining:
                 regular_out, _regular_seconds, regular_bytes = self.fetch(
                     remaining)

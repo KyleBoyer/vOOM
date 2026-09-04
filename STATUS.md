@@ -1,5 +1,107 @@
 # STATUS — 2026-09-04 (current corrections first; dated chronology below is history)
 
+## 2026-09-04: exact SIMD recurrence cuts real Qwen prefill 39%; GLM KDA is exact too
+
+MLX 0.32's strided K-axis reduction was transcribed into a one-dispatch Metal
+DeltaNet scan: every SIMD lane accumulates `lane + 32*n`, `simd_sum` combines
+the same 32 partials, `metal::precise::exp` preserves the unary operator, and
+floating-point contraction is disabled.  Unlike the earlier scalar native
+scan, the new kernel is byte-identical.  Direct boundary gates at lengths
+2/31/32/33/64 and a real Qwen checkpoint gate matched output and recurrent
+state exactly.  The L1024/H16/D128 operator improved **110.862ms -> 17.433ms
+(6.36x)**.
+
+The mixed q8/q4/q6/q3 `dealignai/Qwen3.8-Flash-Next-CRACK-JANG_6S` checkpoint
+is now supported without converting its published tensors.  Its untouched
+49,255-token, 134-tool streamed max-one capture established a 1,402.624-second
+baseline.  Exact fused DeltaNet reduced it to **915.380s (-34.74%)**, primarily
+cutting attention/recurrence 948.908 -> 444.578 seconds.  Composing the already
+exact, prefill-only routed-expert pipeline reduced wall again to **859.894s**:
+6.07% below fused alone and **38.69% below baseline**.  Expert time fell
+321.331 -> 264.846 seconds; 61.284 seconds of storage service was hidden with
+only 1.944 seconds of wait, 6.088GB peak Metal, zero retry, and zero governor
+pressure.  This is lossless relative to JANG_6S, but JANG_6S is a lossy
+checkpoint relative to Qwen's released representation and max-one is not an
+intelligence score.  Both profiles remain explicit/default-off.
+
+The same fused Qwen kernel separately passed the installed uncensored-FP8
+checkpoint: token/text plus all 121 KV/KDA/QSA/PLE arrays and component hashes
+were byte-identical with 0.672MB page-out.  This is independent-checkpoint
+evidence that the recurrence optimization is not fitted to JANG's weights.
+
+GLM-5.3-Flash uses a related KDA recurrence with per-channel decay and the
+distinct released grouping `(beta * key) * residual`.  A second striped kernel
+now preserves that grouping and fails closed outside the published D128
+geometry.  At H64/D128/L1024 it matched exact compiled output/state byte for
+byte while reducing scan time **0.4511s -> 0.1023s (4.41x)** and isolated peak
+**4.785GB -> 0.214GB**.  A real four-token gate then matched tokens, text,
+aggregate/component hashes, **all 159 endpoint tensors**, and the exact
+178.250GB read count; wall moved 125.053 -> 124.483 seconds on that short
+prompt.  The deterministic 2,123-token witness retained the known request and
+output hashes, exact 300.933GB reads, and 3.936GB peak at **403.515s**, 6.55%
+below the historical exact compiled-control mean.  Its 31.539MB page-out misses
+the strict 16MB pressure gate, so `glm53-flash-lossless-striped-kda` remains an
+explicit short/medium profile.  A no-expert-prefetch long-context profile is
+staged for the untouched 46,849-token capture.
+
+The checkpoint search found no replacement to perform.  The installed Qwen
+Flash, GLM-5.3-Flash, and full GLM targets are already the uncensored FP8
+variants.  `dealignai/Qwen3.8-Flash-Next-CRACK-6S` is only an alias of the exact
+installed JANG_6S revision; full uncensored GLM NVFP4 does not fit, and the
+66.5GB pruned Flash NVFP4 removes 208/288 routed experts on 42 layers and has no
+quality evidence beyond a smoke test.  It is not downloaded because a weak
+lossy answer is not an acceptable storage trade.
+
+Evidence:
+`logs/qwen_striped_delta_prefill_bench_20260904.json`,
+`logs/qwen38_flash_jang6s_{striped_exact_oracle,exact_fused_plex_max1,exact_fused_prefetch_plex_max1}_20260904.json`,
+`logs/qwen_uncensored_fp8_exact_fused_delta_oracle_20260904.json`,
+`logs/glm53_exact_striped_kda_h64_l1024_v3_20260904.json`,
+`logs/glm53_flash_striped_kda_real_{control_state4,candidate_state4_v2}_20260904.json`,
+and `logs/glm53_flash_exact_striped_kda_long2123_20260904.json`.
+
+## 2026-09-04: wider-FP8 reconstruction cache has no live reuse; depth three stays narrow
+
+New fallback instrumentation tested whether the all-phase direct-FP8 path
+could retain each exact BF16 expert reconstruction inside its admitted packed
+page.  Admission conservatively charged both representations and prefill/decode
+used disjoint cache keys.  A matched four-token GLM-5.3-Flash A/B preserved the
+same tokens, text digest, aggregate/component state hashes, and all 159 endpoint
+tensor hashes.  The candidate completed in 87.340s versus 87.825s control, a
+0.55% delta below the promotion threshold, while all 4,614 wider fallbacks
+reported **zero cache hits**.  Each routed projection is consumed once before
+that expert page's lifetime ends; the 491,043-fallback Plex bottleneck repeats
+across page admissions, not within one page.  The production switch, telemetry,
+tests, and profile were removed rather than shipping an inert option.
+
+The remaining synchronization boundary was measured separately on real Flash
+layer-3 gate/up/down tensors for row widths 2/4/8/16/32.  Deferring the same
+released FP8 -> FP32 scale -> BF16 graph into the ordinary GEMM remained
+byte-exact and improved the eager decoder by 1.119x geometric mean and the
+native decoder by 1.254x.  This is an isolated same-thread result only.  Worker
+prefetch crosses MLX thread-local streams, and the real direct path receives a
+fresh expert page for every wider call, so no production synchronization was
+removed without an end-to-end and cross-thread proof.
+
+A three-future expert-prefetch schedule also passed three independent
+16-token state gates.  Against a fresh depth-two control, its two runs averaged
+324.112s versus 330.091s (1.81% faster wall, 2.31% faster decode) with identical
+tokens, text, state components, and all 159 endpoint tensors.  It remains an
+explicit short/decode-heavy option: the unmodified 2,187-token Plex max-1 replay
+took 494.716s versus the selected depth-two profile's 477.450s (3.62% slower).
+Reducing the weight cache to 150MB and/or MLX cache to 64MB lowered residency
+but also regressed Plex wall to 488.691--502.456s, so those controls were
+removed.  Depth two with the established 1.5GB/512MB caches remains the real
+Plex recommendation.
+
+Evidence:
+`logs/glm53_flash_direct_{wide_cache_state4,control_state4_matched}_20260904.json`,
+`logs/glm53_flash_fp8_lazy_matmul_bench_20260904.json`,
+`logs/glm53_flash_prefetch8_workers2_depth2_control_state16_20260904.json`,
+`logs/glm53_flash_prefetch8_workers2_depth3{,_repeat}_state16_20260904.json`,
+`logs/glm53_flash_direct_decode_only_plex_max1_20260904.json`, and
+`logs/glm53_flash_depth3_default_caches_plex_focused_max1_20260904.json`.
+
 ## 2026-09-04: full GLM exact expert overlap cuts short-request wall 22%
 
 Full `glm_moe_dsa` was silently ignoring the explicit GLM short-context trunk

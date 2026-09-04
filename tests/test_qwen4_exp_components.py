@@ -120,12 +120,77 @@ def test_hyper_mix_preserves_released_bfloat16_activation_dtype():
     assert output.dtype == mx.bfloat16
 
 
+def test_hyper_mix_preserves_affine_float16_activation_with_bfloat16_weights():
+    cfg = _cfg(torch_dtype="float16")
+    rng = np.random.default_rng(23)
+    hidden = mx.array(
+        rng.normal(size=(1, 3, 8)).astype(np.float32)).astype(mx.float16)
+    prefix = "hc"
+    weights = {
+        f"{prefix}.hc_norm.weight": mx.array(
+            rng.normal(scale=.1, size=(8,)).astype(np.float32)
+        ).astype(mx.bfloat16),
+        f"{prefix}.input_mix_weight_down.weight": mx.array(
+            rng.normal(scale=.1, size=(3, 8)).astype(np.float32)
+        ).astype(mx.bfloat16),
+        f"{prefix}.input_mix_weight_up.weight": mx.array(
+            rng.normal(scale=.1, size=(8, 3)).astype(np.float32)
+        ).astype(mx.bfloat16),
+        f"{prefix}.block_inject_weight.weight": mx.array(
+            rng.normal(scale=.1, size=(2, 8)).astype(np.float32)
+        ).astype(mx.bfloat16),
+    }
+
+    mixed, residual, injection = hyper_connection_mix(
+        hidden, weights, prefix, cfg)
+    branch = mx.zeros((1, 3, 4), dtype=mx.float16)
+    output = hyper_connection_inject(branch, residual, injection)
+    mx.eval(mixed, injection, output)
+
+    assert mixed.dtype == mx.float16
+    assert injection.dtype == mx.float16
+    assert output.dtype == mx.float16
+
+
 def test_hyper_injection_rejects_promoted_branch_dtype():
     residual = mx.zeros((1, 2, 8), dtype=mx.bfloat16)
     branch = mx.zeros((1, 2, 4), dtype=mx.float32)
     injection = mx.ones((1, 2, 2), dtype=mx.bfloat16)
     with pytest.raises(TypeError, match="one activation dtype"):
         hyper_connection_inject(branch, residual, injection)
+
+
+def test_qwen_moe_preserves_float16_with_bfloat16_shared_gate():
+    cfg = _cfg(
+        torch_dtype="float16", num_experts=1, num_experts_per_tok=1)
+    prefix = "model.layers.0"
+    hidden = mx.array([[[0.5, -0.25, 0.75, 1.0]]], dtype=mx.float16)
+
+    def matrix(shape, dtype=mx.float16):
+        values = np.linspace(-0.2, 0.2, int(np.prod(shape)), dtype=np.float32)
+        return mx.array(values.reshape(shape)).astype(dtype)
+
+    weights = {
+        f"{prefix}.mlp.gate.weight": matrix((1, 4)),
+        f"{prefix}.mlp.shared_expert.gate_proj.weight": matrix((3, 4)),
+        f"{prefix}.mlp.shared_expert.up_proj.weight": matrix((3, 4)),
+        f"{prefix}.mlp.shared_expert.down_proj.weight": matrix((4, 3)),
+        f"{prefix}.mlp.shared_expert_gate.weight": matrix(
+            (1, 4), mx.bfloat16),
+    }
+    expert = {
+        f"{prefix}.mlp.experts.0.gate_proj.weight": matrix((3, 4)),
+        f"{prefix}.mlp.experts.0.up_proj.weight": matrix((3, 4)),
+        f"{prefix}.mlp.experts.0.down_proj.weight": matrix((4, 3)),
+    }
+
+    output = _moe(
+        hidden, weights, prefix, cfg, 0,
+        lambda _layer, _ids, positions=None: {0: expert},
+    )
+    mx.eval(output)
+
+    assert output.dtype == mx.float16
 
 
 def test_serial_route_union_reuses_pages_without_changing_one_row_math():

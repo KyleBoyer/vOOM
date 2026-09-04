@@ -1,0 +1,12 @@
+schema: voom.runtime-profile.v1
+name: glm53-flash-lossless-striped-kda-long-context
+description: Exact SIMD-striped GLM-5.3-Flash KDA without long-context expert overlap.
+notes:
+  - "Extends the proven exact compiled-KDA long-context route, replacing only its recurrence implementation with the byte-identical SIMD-striped Metal scan."
+  - "Expert prefetch stays disabled because both exact prefetch widths crossed the 8.5GB Metal ceiling on the untouched 46,849-token capture. Released FP8/BF16 weights, DSA, routing, expert arithmetic, and sampling are unchanged."
+  - "Keep explicit pending the untouched captured 46,849-token timing, output-identity, and pressure gate."
+extends:
+  - glm53-flash-lossless-compiled-kda
+settings:
+  VMODEL_GLM53_COMPILED_KDA_PREFILL: false
+  VMODEL_GLM53_NATIVE_FUSED_KDA_PREFILL: true

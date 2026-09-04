@@ -32,8 +32,12 @@ from .qwen4_exp_ple import Qwen4ExpPLELayout
 _PART_PATTERN = re.compile(
     r"^(?P<prefix>.+\.ple_embedding\.ngram_embedding)"
     r"\.shard_(?P<part>\d+)\.weight$")
+_AFFINE_PART_PATTERN = re.compile(
+    r"^(?P<prefix>.+\.ple\.ngram_embedding\.shards)"
+    r"\.(?P<part>\d+)\.weight$")
 _FP8_DTYPE = "F8_E4M3"
 _BF16_DTYPE = "BF16"
+_AFFINE3_DTYPE = "MLX_AFFINE3"
 _OVERLAY_PLAN_SCHEMA = "voom.hf-checkpoint-overlay-plan.v1"
 _OVERLAY_RECEIPT_SCHEMA = "voom.hf-checkpoint-overlay-receipt.v1"
 _OVERLAY_PLAN_NAME = ".voom-overlay-plan.json"
@@ -145,6 +149,60 @@ def _native_release_witness(
         if candidate:
             return candidate, tree_path.stem
     return [], ""
+
+
+def _local_dir_release_witness(
+    model_dir: Path, shards: tuple[str, ...],
+) -> tuple[list[tuple[str, str, int]], str]:
+    """Validate a modern ``hf download --local-dir`` release witness.
+
+    Current huggingface_hub records the pinned revision, immutable object
+    hash, and completion timestamp in one ``download/<file>.metadata`` file,
+    but no longer emits the older aggregate ``trees/<revision>.json`` used by
+    :func:`_native_release_witness`. A publisher-provided shard-hash manifest
+    plus matching Hub metadata and an unchanged post-download mtime provide
+    the equivalent cheap startup witness after the one-time full hash gate.
+    """
+
+    manifest_path = model_dir / "SHARD_HASHES.txt"
+    try:
+        expected = {}
+        for line in manifest_path.read_text().splitlines():
+            fields = line.split()
+            if len(fields) != 2 or not re.fullmatch(r"[0-9a-f]{64}", fields[0]):
+                return [], ""
+            filename = fields[1]
+            if Path(filename).name != filename or filename in expected:
+                return [], ""
+            expected[filename] = fields[0]
+    except OSError:
+        return [], ""
+
+    revision = ""
+    witnesses = []
+    for shard in shards:
+        expected_hash = expected.get(shard, "")
+        metadata_path = (
+            model_dir / ".cache" / "huggingface" / "download"
+            / f"{shard}.metadata")
+        try:
+            lines = metadata_path.read_text().splitlines()
+            candidate_revision = lines[0].strip()
+            candidate_hash = lines[1].strip().strip('"')
+            completed = float(lines[2])
+            stat = (model_dir / shard).stat()
+        except (IndexError, OSError, ValueError):
+            return [], ""
+        if (not re.fullmatch(r"[0-9a-f]{40}", candidate_revision)
+                or candidate_hash != expected_hash
+                or completed <= 0
+                or stat.st_size <= 0
+                or stat.st_mtime > completed + 1e-3
+                or (revision and candidate_revision != revision)):
+            return [], ""
+        revision = candidate_revision
+        witnesses.append((shard, candidate_hash, int(stat.st_size)))
+    return witnesses, revision
 
 
 def _overlay_release_witness(
@@ -327,6 +385,13 @@ class _Part:
     rows: int
     row_start: int
     data_start: int
+    weight_row_bytes: int
+    scales_shard: str = ""
+    scales_data_start: int = 0
+    scales_row_bytes: int = 0
+    biases_shard: str = ""
+    biases_data_start: int = 0
+    biases_row_bytes: int = 0
 
 
 class Qwen4ExpPLERowStore:
@@ -359,20 +424,27 @@ class Qwen4ExpPLERowStore:
         if not isinstance(weight_map, dict):
             raise ValueError("Qwen4-Exp checkpoint has no safetensor weight map")
 
-        names: dict[int, tuple[str, str]] = {}
+        names: dict[int, tuple[str, str, str]] = {}
         prefixes = set()
+        layouts = set()
         for name, shard in weight_map.items():
             match = _PART_PATTERN.match(name)
+            layout = "released"
             if match is None:
-                continue
+                match = _AFFINE_PART_PATTERN.match(name)
+                layout = "affine3"
+                if match is None:
+                    continue
             part_index = int(match.group("part"))
             if part_index in names:
                 raise ValueError(f"duplicate PLE shard index {part_index}")
             if not isinstance(shard, str) or not shard:
                 raise ValueError(f"PLE part {part_index} has no shard file")
-            names[part_index] = (name, shard)
+            names[part_index] = (name, shard, layout)
             prefixes.add(match.group("prefix"))
-        if sorted(names) != list(range(split_parts)) or len(prefixes) != 1:
+            layouts.add(layout)
+        if (sorted(names) != list(range(split_parts)) or len(prefixes) != 1
+                or len(layouts) != 1):
             raise ValueError(
                 f"PLE split is incomplete or ambiguous: found {len(names)} "
                 f"parts and {len(prefixes)} prefixes, expected {split_parts}")
@@ -381,33 +453,105 @@ class Qwen4ExpPLERowStore:
         parts = []
         row_start = 0
         storage_dtype = ""
-        for part_index in range(split_parts):
-            name, shard = names[part_index]
-            shard_path = self.model_dir / shard
-            if not shard_path.is_file():
-                raise FileNotFoundError(f"missing PLE source shard {shard_path}")
+        quantization = config.get("quantization")
+        if not isinstance(quantization, dict):
+            quantization = {}
+
+        def tensor_metadata(name: str, shard: str) -> tuple[int, dict]:
+            path = self.model_dir / shard
+            if not path.is_file():
+                raise FileNotFoundError(f"missing PLE source shard {path}")
             if shard not in headers:
-                headers[shard] = _safetensor_header(shard_path)
+                headers[shard] = _safetensor_header(path)
             header_size, header = headers[shard]
-            meta = header.get(name)
-            if not isinstance(meta, dict):
+            metadata = header.get(name)
+            if not isinstance(metadata, dict):
                 raise ValueError(f"PLE tensor {name!r} is missing from {shard}")
+            return header_size, metadata
+
+        for part_index in range(split_parts):
+            name, shard, layout = names[part_index]
+            header_size, meta = tensor_metadata(name, shard)
             shape = tuple(int(value) for value in meta.get("shape", ()))
             dtype = str(meta.get("dtype", ""))
-            if (dtype not in (_BF16_DTYPE, _FP8_DTYPE) or len(shape) != 2
-                    or shape[1] != self.layout.row_width):
-                raise ValueError(f"unexpected PLE tensor metadata for {name}: {meta}")
-            if storage_dtype and dtype != storage_dtype:
+            if layout == "released":
+                if (dtype not in (_BF16_DTYPE, _FP8_DTYPE) or len(shape) != 2
+                        or shape[1] != self.layout.row_width):
+                    raise ValueError(
+                        f"unexpected PLE tensor metadata for {name}: {meta}")
+                part_storage_dtype = dtype
+                weight_row_bytes = self.layout.row_width * (
+                    2 if dtype == _BF16_DTYPE else 1)
+                storage_row_bytes = weight_row_bytes
+                scales_shard = biases_shard = ""
+                scales_data_start = biases_data_start = 0
+                scales_row_bytes = biases_row_bytes = 0
+            else:
+                stem = name[:-len(".weight")]
+                descriptor = quantization.get(stem)
+                try:
+                    bits = int(descriptor["bits"])
+                    group_size = int(descriptor["group_size"])
+                    mode = str(descriptor.get("mode", "affine"))
+                except (KeyError, TypeError, ValueError):
+                    bits = group_size = 0
+                    mode = ""
+                if ((bits, group_size, mode) != (3, 32, "affine")
+                        or self.layout.row_width % group_size
+                        or (self.layout.row_width * bits) % 32):
+                    raise ValueError(
+                        f"unsupported quantized PLE descriptor for {stem}: "
+                        f"{descriptor}")
+                packed_width = self.layout.row_width * bits // 32
+                if (dtype != "U32" or len(shape) != 2
+                        or shape[1] != packed_width):
+                    raise ValueError(
+                        f"unexpected quantized PLE weight metadata for "
+                        f"{name}: {meta}")
+                groups = self.layout.row_width // group_size
+                component_values = []
+                for suffix in ("scales", "biases"):
+                    component_name = f"{stem}.{suffix}"
+                    component_shard = weight_map.get(component_name)
+                    if not isinstance(component_shard, str) or not component_shard:
+                        raise ValueError(
+                            f"quantized PLE part lacks {component_name}")
+                    component_header_size, component_meta = tensor_metadata(
+                        component_name, component_shard)
+                    component_shape = tuple(int(value) for value in (
+                        component_meta.get("shape", ())))
+                    component_offsets = component_meta.get("data_offsets")
+                    if (component_meta.get("dtype") != "F16"
+                            or component_shape != (shape[0], groups)
+                            or not isinstance(component_offsets, list)
+                            or len(component_offsets) != 2
+                            or int(component_offsets[1])
+                            - int(component_offsets[0]) != shape[0] * groups * 2):
+                        raise ValueError(
+                            f"unexpected quantized PLE {suffix} metadata for "
+                            f"{component_name}: {component_meta}")
+                    component_values.append((
+                        component_shard,
+                        8 + component_header_size + int(component_offsets[0]),
+                        groups * 2,
+                    ))
+                part_storage_dtype = _AFFINE3_DTYPE
+                weight_row_bytes = packed_width * 4
+                scales_shard, scales_data_start, scales_row_bytes = (
+                    component_values[0])
+                biases_shard, biases_data_start, biases_row_bytes = (
+                    component_values[1])
+                storage_row_bytes = (
+                    weight_row_bytes + scales_row_bytes + biases_row_bytes)
+            if storage_dtype and part_storage_dtype != storage_dtype:
                 raise ValueError(
                     "PLE split mixes storage dtypes: "
-                    f"{storage_dtype} and {dtype} at {name}")
-            storage_dtype = dtype
-            storage_row_bytes = self.layout.row_width * (
-                2 if dtype == _BF16_DTYPE else 1)
+                    f"{storage_dtype} and {part_storage_dtype} at {name}")
+            storage_dtype = part_storage_dtype
             offsets = meta.get("data_offsets")
             if (not isinstance(offsets, list) or len(offsets) != 2
                     or offsets[1] - offsets[0]
-                    != shape[0] * storage_row_bytes):
+                    != shape[0] * weight_row_bytes):
                 raise ValueError(f"invalid PLE tensor extent for {name}")
             parts.append(_Part(
                 index=part_index,
@@ -416,6 +560,13 @@ class Qwen4ExpPLERowStore:
                 rows=shape[0],
                 row_start=row_start,
                 data_start=8 + header_size + int(offsets[0]),
+                weight_row_bytes=weight_row_bytes,
+                scales_shard=scales_shard,
+                scales_data_start=scales_data_start,
+                scales_row_bytes=scales_row_bytes,
+                biases_shard=biases_shard,
+                biases_data_start=biases_data_start,
+                biases_row_bytes=biases_row_bytes,
             ))
             row_start += shape[0]
         if row_start != self.layout.padded_vocab_size:
@@ -423,13 +574,17 @@ class Qwen4ExpPLERowStore:
                 f"PLE row count {row_start} != released layout "
                 f"{self.layout.padded_vocab_size}")
         self.storage_dtype = storage_dtype
-        self.storage_row_bytes = self.layout.row_width * (
-            2 if storage_dtype == _BF16_DTYPE else 1)
+        self.storage_row_bytes = (
+            parts[0].weight_row_bytes + parts[0].scales_row_bytes
+            + parts[0].biases_row_bytes)
         # ``row_bytes`` historically described source I/O and remains an
-        # alias for callers that inspect it. The returned rows are always
-        # ``output_row_bytes`` BF16 bytes.
+        # alias for callers that inspect it. The returned rows use the
+        # checkpoint's compute dtype: BF16 for released/FP8 checkpoints and
+        # F16 for standard MLX affine checkpoints.
         self.row_bytes = self.storage_row_bytes
         self.output_row_bytes = self.layout.row_bytes_bf16
+        self.output_dtype = (
+            "F16" if storage_dtype == _AFFINE3_DTYPE else _BF16_DTYPE)
         self.scale_name = ""
         self.scale_bf16_bits: int | None = None
         self._fp8_lookup: np.ndarray | None = None
@@ -469,7 +624,8 @@ class Qwen4ExpPLERowStore:
                 np.frombuffer(scale_raw, dtype="<u2")[0])
             self._fp8_lookup = _fp8_bf16_lookup(self.scale_bf16_bits)
             self.scale_bytes_read = len(scale_raw)
-        elif f"{next(iter(prefixes))}.weight_scale" in weight_map:
+        elif (storage_dtype != _AFFINE3_DTYPE
+              and f"{next(iter(prefixes))}.weight_scale" in weight_map):
             raise ValueError("BF16 PLE split unexpectedly has an FP8 weight_scale")
         self.parts = tuple(parts)
         self._part_ends = tuple(part.row_start + part.rows for part in parts)
@@ -505,6 +661,9 @@ class Qwen4ExpPLERowStore:
         witnesses, revision = _native_release_witness(
             self.model_dir, shards)
         if not witnesses:
+            witnesses, revision = _local_dir_release_witness(
+                self.model_dir, shards)
+        if not witnesses:
             witnesses, revision = _overlay_release_witness(
                 self.model_dir, shards)
         if not witnesses:
@@ -519,6 +678,7 @@ class Qwen4ExpPLERowStore:
             "row_width": self.layout.row_width,
             "storage_dtype": self.storage_dtype,
             "storage_row_bytes": self.storage_row_bytes,
+            "output_dtype": self.output_dtype,
             "scale_name": self.scale_name,
             "scale_bf16_bits": self.scale_bf16_bits,
             "config_sha256": _sha256_file(self.model_dir / "config.json"),
@@ -531,6 +691,13 @@ class Qwen4ExpPLERowStore:
                     "rows": part.rows,
                     "row_start": part.row_start,
                     "data_start": part.data_start,
+                    "weight_row_bytes": part.weight_row_bytes,
+                    "scales_shard": part.scales_shard,
+                    "scales_data_start": part.scales_data_start,
+                    "scales_row_bytes": part.scales_row_bytes,
+                    "biases_shard": part.biases_shard,
+                    "biases_data_start": part.biases_data_start,
+                    "biases_row_bytes": part.biases_row_bytes,
                 }
                 for part in self.parts
             ],
@@ -560,7 +727,7 @@ class Qwen4ExpPLERowStore:
         return part, row_id - part.row_start
 
     def read_rows(self, row_ids: Sequence[Sequence[int]] | np.ndarray) -> np.ndarray:
-        """Return uint16 BF16 storage with shape ``row_ids + [row_width]``."""
+        """Return uint16 compute-dtype bits shaped ``row_ids + [row_width]``."""
         requested = np.asarray(row_ids, dtype=np.int64)
         if requested.ndim == 0 or requested.size == 0:
             raise ValueError("PLE row IDs must be a non-empty array")
@@ -580,35 +747,57 @@ class Qwen4ExpPLERowStore:
                 self.cache_hits += 1
                 rows[row_id] = cached
 
+        unique_missing = sorted(set(missing))
         locations = []
-        for row_id in sorted(set(missing)):
+        for row_id in unique_missing:
             part, local_row = self._location(row_id)
             locations.append((
                 part.shard,
-                part.data_start + local_row * self.storage_row_bytes,
+                part.data_start + local_row * part.weight_row_bytes,
                 row_id,
+                "weight",
+                part.weight_row_bytes,
             ))
+            if self.storage_dtype == _AFFINE3_DTYPE:
+                locations.extend((
+                    (
+                        part.scales_shard,
+                        part.scales_data_start
+                        + local_row * part.scales_row_bytes,
+                        row_id,
+                        "scales",
+                        part.scales_row_bytes,
+                    ),
+                    (
+                        part.biases_shard,
+                        part.biases_data_start
+                        + local_row * part.biases_row_bytes,
+                        row_id,
+                        "biases",
+                        part.biases_row_bytes,
+                    ),
+                ))
         locations.sort(key=lambda value: (value[0], value[1]))
         cursor = 0
         extents = []
         while cursor < len(locations):
-            shard, offset, _ = locations[cursor]
+            shard, offset, _row_id, _component, size = locations[cursor]
             end = cursor + 1
             while (end < len(locations)
                    and locations[end][0] == shard
                    and locations[end][1]
-                   == locations[end - 1][1] + self.storage_row_bytes):
+                   == locations[end - 1][1] + locations[end - 1][4]):
                 end += 1
+            run = locations[cursor:end]
             extents.append((
-                shard, offset, cursor, end,
-                (end - cursor) * self.storage_row_bytes))
+                shard, offset, run, sum(item[4] for item in run)))
             cursor = end
 
         started = time.perf_counter()
         if self._executor is None or len(extents) <= 1:
             raw_extents = [
                 _pread_exact(self._fds[shard], size, offset)
-                for shard, offset, _start, _end, size in extents
+                for shard, offset, _run, size in extents
             ]
         else:
             # Contiguous chunks keep every worker moving forward through a
@@ -622,7 +811,7 @@ class Qwen4ExpPLERowStore:
             def read_group(group):
                 return [
                     _pread_exact(self._fds[shard], size, offset)
-                    for shard, offset, _start, _end, size in group
+                    for shard, offset, _run, size in group
                 ]
 
             futures = [
@@ -635,31 +824,77 @@ class Qwen4ExpPLERowStore:
             self.parallel_read_calls += 1
         self.read_seconds += time.perf_counter() - started
 
+        pieces = {}
         for extent, raw in zip(extents, raw_extents):
-            _shard, _offset, cursor, end, _size = extent
-            if self.storage_dtype == _BF16_DTYPE:
-                storage = np.frombuffer(raw, dtype=np.uint16).reshape(
-                    end - cursor, self.layout.row_width)
-            else:
-                if self._fp8_lookup is None:
-                    raise RuntimeError("FP8 PLE lookup was not initialized")
-                packed = np.frombuffer(raw, dtype=np.uint8).reshape(
-                    end - cursor, self.layout.row_width)
-                storage = self._fp8_lookup[packed]
-            for local_index, (_, _, row_id) in enumerate(
-                    locations[cursor:end]):
-                row = storage[local_index].copy()
+            _shard, _offset, run, _size = extent
+            position = 0
+            for _item_shard, _item_offset, row_id, component, size in run:
+                pieces[(row_id, component)] = raw[position:position + size]
+                position += size
+            if position != len(raw):
+                raise RuntimeError("quantized PLE extent accounting mismatch")
+
+        if self.storage_dtype == _AFFINE3_DTYPE and unique_missing:
+            import mlx.core as mx
+
+            packed_width = self.layout.row_width * 3 // 32
+            groups = self.layout.row_width // 32
+            packed = np.stack([
+                np.frombuffer(pieces[(row_id, "weight")], dtype="<u4")
+                .reshape(packed_width)
+                for row_id in unique_missing
+            ])
+            scales = np.stack([
+                np.frombuffer(pieces[(row_id, "scales")], dtype="<f2")
+                .reshape(groups)
+                for row_id in unique_missing
+            ])
+            biases = np.stack([
+                np.frombuffer(pieces[(row_id, "biases")], dtype="<f2")
+                .reshape(groups)
+                for row_id in unique_missing
+            ])
+            decoded = mx.dequantize(
+                mx.array(packed),
+                scales=mx.array(scales),
+                biases=mx.array(biases),
+                group_size=32,
+                bits=3,
+                mode="affine",
+            )
+            mx.eval(decoded)
+            if decoded.dtype != mx.float16:
+                decoded = decoded.astype(mx.float16)
+                mx.eval(decoded)
+            storage_rows = np.asarray(decoded).view(np.uint16)
+            for local_index, row_id in enumerate(unique_missing):
+                rows[row_id] = storage_rows[local_index].copy()
+        else:
+            for row_id in unique_missing:
+                raw = pieces[(row_id, "weight")]
+                if self.storage_dtype == _BF16_DTYPE:
+                    row = np.frombuffer(raw, dtype=np.uint16).reshape(
+                        self.layout.row_width).copy()
+                else:
+                    if self._fp8_lookup is None:
+                        raise RuntimeError("FP8 PLE lookup was not initialized")
+                    packed = np.frombuffer(raw, dtype=np.uint8).reshape(
+                        self.layout.row_width)
+                    row = self._fp8_lookup[packed].copy()
                 rows[row_id] = row
-                if self._cache_cap:
-                    self._cache[row_id] = row
-                    self._cache.move_to_end(row_id)
-                    if len(self._cache) > self._cache_cap:
-                        self._cache.popitem(last=False)
+
+        for row_id in unique_missing:
+            row = rows[row_id]
+            if self._cache_cap:
+                self._cache[row_id] = row
+                self._cache.move_to_end(row_id)
+                if len(self._cache) > self._cache_cap:
+                    self._cache.popitem(last=False)
         self.read_calls += 1
         self.read_extents += len(extents)
         self.rows_requested += int(flat.size)
-        self.unique_rows_read += len(locations)
-        self.bytes_read += len(locations) * self.storage_row_bytes
+        self.unique_rows_read += len(unique_missing)
+        self.bytes_read += len(unique_missing) * self.storage_row_bytes
         result = np.stack([rows[int(row_id)] for row_id in flat])
         return result.reshape(*requested.shape, self.layout.row_width)
 
@@ -673,6 +908,7 @@ class Qwen4ExpPLERowStore:
             "unique_shards": self.identity.unique_shards,
             "storage_dtype": self.storage_dtype,
             "storage_row_bytes": self.storage_row_bytes,
+            "output_dtype": self.output_dtype,
             "output_row_bytes": self.output_row_bytes,
             "scale_bytes_read": self.scale_bytes_read,
             "read_calls": self.read_calls,

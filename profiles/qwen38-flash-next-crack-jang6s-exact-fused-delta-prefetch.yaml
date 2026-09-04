@@ -1,0 +1,12 @@
+schema: voom.runtime-profile.v1
+name: qwen38-flash-next-crack-jang6s-exact-fused-delta-prefetch
+description: Exact fused-DeltaNet JANG_6S path with phase-scoped expert I/O overlap.
+notes:
+  - "Extends the byte-exact fused-DeltaNet profile and submits only authoritative sorted routed-expert pages during prefill. The worker is disabled at the prefill/decode boundary."
+  - "A real-checkpoint oracle preserved the token, text digest, all 121 state arrays, and every component digest while improving the fused control from 48.583s to 46.147s. It hid 2.569s of expert I/O and stayed below 8.28MB page-out."
+  - "The untouched 49,255-token/134-tool streamed harness replay preserved the one-token incomplete-response shape and improved wall 915.380s -> 859.894s (-6.07%) over fused DeltaNet alone, or 1402.624s -> 859.894s (-38.69%) versus the JANG_6S baseline. Expert time fell 321.331s -> 264.846s; the worker hid 61.284s, waited 1.944s, and recorded zero governor pressure or prefill retries at 6.088GB peak Metal."
+  - "Keep explicit: the runtime is lossless relative to JANG_6S, but JANG_6S is a lossy checkpoint relative to Qwen's released representation, and a max-one incomplete response is a latency/shape gate rather than an intelligence score."
+extends:
+  - qwen38-flash-next-crack-jang6s-exact-fused-delta
+settings:
+  VMODEL_QWEN4_EXPERT_BATCH_PREFETCH_PREFILL_ONLY: true

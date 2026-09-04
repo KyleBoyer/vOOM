@@ -1,0 +1,12 @@
+schema: voom.runtime-profile.v1
+name: qwen38-flash-next-crack-jang6s-exact-fused-delta
+description: Byte-exact fused-DeltaNet fast path for uncensored Qwen3.8-Flash-Next JANG_6S.
+notes:
+  - "This remains a lossy checkpoint sidequest: the runtime consumes every published JANG_6S value exactly, but JANG_6S is quantized relative to Qwen's released target representation. It never replaces or silently routes the official or uncensored FP8 checkpoints."
+  - "The fused recurrence mirrors MLX 0.32's 32-lane strided reduction and disables multiply/add contraction. It matched the compiled reference output and state byte-for-byte over multiple boundary lengths at released 128x128 geometry, then matched the real checkpoint's token, text digest, all 121 recurrent-state arrays, and KDA/KV/QSA/PLE component hashes."
+  - "At 1024 positions and 16 heads, the isolated recurrence improved 6.36x (110.862ms -> 17.433ms median). Keep this profile explicit until the untouched 49K-token harness, varied shapes, sustained output, vision, and pressure gates pass."
+extends:
+  - qwen38-flash-next-crack-jang6s
+settings:
+  VMODEL_QWEN4_COMPILED_DELTA: false
+  VMODEL_QWEN4_NATIVE_FUSED_DELTA_PREFILL: true

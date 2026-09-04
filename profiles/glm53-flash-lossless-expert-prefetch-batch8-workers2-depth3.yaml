@@ -1,0 +1,12 @@
+schema: voom.runtime-profile.v1
+name: glm53-flash-lossless-expert-prefetch-batch8-workers2-depth3
+description: Experimental exact GLM-5.3-Flash three-batch expert I/O look-ahead.
+notes:
+  - "Extends the exact batch-eight/two-reader schedule by permitting one additional future storage batch. Expert arithmetic, ascending consumption order, released FP8 reconstruction, routing, and every checkpoint byte remain unchanged."
+  - "The validated 1.5 GB weight cache and 512 MB MLX cache remain unchanged. Lower-cache arms reduced short-gate Metal use, but the real 2,187-token Plex prefill needs its asynchronously prefetched trunk pages and rejected both changes for speed."
+  - "Three fresh 16-token state gates matched tokens, text, components, and all 159 endpoint tensors. The two depth-three runs averaged 324.112 seconds versus a 330.091-second fresh depth-two control (1.81% faster wall and 2.31% faster decode)."
+  - "The unmodified 2,187-token Plex max-1 replay rejected this as a general default: depth three took 494.716 seconds versus 477.450 seconds for selected depth two (3.62% slower). Keep it explicit/default-off for short or decode-heavy experiments only."
+extends:
+  - glm53-flash-lossless-expert-prefetch-batch8-workers2
+settings:
+  VMODEL_GLM53_EXPERT_BATCH_PREFETCH_DEPTH: 3

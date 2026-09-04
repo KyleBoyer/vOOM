@@ -107,6 +107,11 @@ def _fixture(
             np.arange(hidden, dtype=np.uint16) + 2500, "BF16"),
         "model.language_model.hyper_connection_mixer.hc_norm.weight": (
             np.arange(2 * hidden, dtype=np.uint16) + 2600, "BF16"),
+        "language_model.layers.0.ple.conv1d_weight": (
+            np.arange(2 * hidden, dtype=np.uint16).reshape(
+                2 * hidden, 1, 1) + 2650,
+            "BF16",
+        ),
         "language_model.lm_head.weight": (
             np.arange(32 * hidden, dtype=np.uint16).reshape(32, hidden) + 2700,
             "BF16",
@@ -187,8 +192,157 @@ def _per_expert_fp8_fixture(
     return root, expected
 
 
+def _fused_affine_fixture(
+    tmp_path: Path, *, include_mtp: bool = True,
+    omit_down_bias: bool = False,
+) -> tuple[Path, dict[str, np.ndarray]]:
+    root, _expected = _fixture(tmp_path)
+    config = json.loads((root / "config.json").read_text())
+    hidden = width = 64
+    experts = 2
+    text = config["text_config"]
+    text.update({
+        "hidden_size": hidden,
+        "intermediate_size": width,
+        "head_dim": hidden,
+        "num_experts": experts,
+        "moe_intermediate_size": width,
+        "shared_expert_intermediate_size": width,
+        "ple_embed_dim": hidden,
+    })
+    quantization = {"bits": 8, "group_size": 64}
+    tensors: dict[str, tuple[np.ndarray, str]] = {}
+    expected: dict[str, np.ndarray] = {}
+
+    def add_projection(stem: str, *, bits: int, inputs: int, outputs: int):
+        packed = inputs * bits // 32
+        groups = inputs // 64
+        seed = len(tensors) + 1
+        weight = (
+            np.arange(experts * outputs * packed, dtype=np.uint32)
+            .reshape(experts, outputs, packed) + seed
+        )
+        scales = np.full(
+            (experts, outputs, groups), np.float16(0.125 * seed),
+            dtype=np.float16,
+        )
+        biases = np.full(
+            (experts, outputs, groups), np.float16(-0.25 * seed),
+            dtype=np.float16,
+        )
+        tensors[f"{stem}.weight"] = (weight, "U32")
+        tensors[f"{stem}.scales"] = (scales, "F16")
+        if not (omit_down_bias and stem.endswith("down_proj")):
+            tensors[f"{stem}.biases"] = (biases, "F16")
+        quantization[stem] = {"bits": bits, "group_size": 64}
+        expected[f"{stem}.weight"] = weight
+        expected[f"{stem}.scales"] = scales
+        expected[f"{stem}.biases"] = biases
+
+    switch = "language_model.layers.0.mlp.switch_mlp"
+    add_projection(
+        f"{switch}.gate_proj", bits=4, inputs=hidden, outputs=width)
+    add_projection(
+        f"{switch}.up_proj", bits=4, inputs=hidden, outputs=width)
+    add_projection(
+        f"{switch}.down_proj", bits=6, inputs=width, outputs=hidden)
+    if include_mtp:
+        mtp = "mtp.layers.0.mlp.experts"
+        add_projection(
+            f"{mtp}.gate_up_proj", bits=6, inputs=hidden,
+            outputs=2 * width)
+        add_projection(
+            f"{mtp}.down_proj", bits=6, inputs=width, outputs=hidden)
+    config["quantization"] = quantization
+    (root / "config.json").write_text(json.dumps(config))
+    shard = root / "model.safetensors"
+    _write_safetensor(shard, tensors)
+    (root / "model.safetensors.index.json").write_text(json.dumps({
+        "weight_map": {name: shard.name for name in tensors},
+    }))
+    return root, expected
+
+
 def _bits(value: mx.array) -> np.ndarray:
     return np.asarray(value.view(mx.uint16))
+
+
+def test_flattened_ple_convolution_name_is_canonicalized_without_cast(tmp_path):
+    root, _expected = _fixture(tmp_path)
+    store = WeightStore(root)
+
+    canonical = "model.layers.0.ple.conv1d.weight"
+    assert store.has(canonical)
+    assert not store.has("model.layers.0.ple.conv1d_weight")
+    loaded, _elapsed, _physical = store.fetch([canonical])
+    expected = np.arange(8, dtype=np.uint16).reshape(8, 1, 1) + 2650
+    np.testing.assert_array_equal(
+        np.asarray(loaded[canonical].view(mx.uint16)), expected)
+
+
+def test_fused_affine_switch_experts_are_direct_quantized_pages(tmp_path):
+    from runtime.quant import QTensor, matmul
+
+    root, expected = _fused_affine_fixture(tmp_path, include_mtp=False)
+    store = WeightStore(root)
+    prefix = "model.layers.0.mlp.experts.1"
+    names = [
+        f"{prefix}.{projection}.weight"
+        for projection in ("gate_proj", "up_proj", "down_proj")
+    ]
+
+    assert store.qwen4_expert_layout == "fused-affine"
+    assert all(store.has(name) and store.is_quantized(name) for name in names)
+    assert "model.layers.0.mlp.switch_mlp.gate_proj.weight" not in (
+        store.names_with_prefix("model.layers.0.mlp"))
+    values, _seconds, nbytes = store.fetch(names)
+
+    switch = "language_model.layers.0.mlp.switch_mlp"
+    for name, projection, bits in zip(
+        names, ("gate_proj", "up_proj", "down_proj"), (4, 4, 6),
+    ):
+        value = values[name]
+        assert isinstance(value, QTensor)
+        assert (value.bits, value.group_size, value.mode) == (bits, 64, "affine")
+        assert tuple(value.shape) == (64, 64)
+        source = f"{switch}.{projection}"
+        np.testing.assert_array_equal(
+            np.asarray(value.wq), expected[f"{source}.weight"][1])
+        np.testing.assert_array_equal(
+            np.asarray(value.scales), expected[f"{source}.scales"][1])
+        np.testing.assert_array_equal(
+            np.asarray(value.biases), expected[f"{source}.biases"][1])
+        output = matmul(mx.ones((1, 1, 64), dtype=mx.float16), value)
+        mx.eval(output)
+        assert tuple(output.shape) == (1, 1, 64)
+    assert nbytes == sum(
+        values[name].nbytes for name in names)
+    assert store.qwen4_fused_expert_snapshot()["bytes"] == nbytes
+
+
+def test_fused_affine_mtp_gate_up_is_split_without_repacking(tmp_path):
+    from runtime.quant import QTensor
+
+    root, expected = _fused_affine_fixture(tmp_path)
+    store = WeightStore(root)
+    prefix = "mtp.layers.0.mlp.experts.1"
+    gate = f"{prefix}.gate_proj.weight"
+    up = f"{prefix}.up_proj.weight"
+    values, _seconds, _nbytes = store.fetch([gate, up])
+
+    source = expected["mtp.layers.0.mlp.experts.gate_up_proj.weight"][1]
+    assert isinstance(values[gate], QTensor)
+    assert isinstance(values[up], QTensor)
+    np.testing.assert_array_equal(values[gate].wq, source[:64])
+    np.testing.assert_array_equal(values[up].wq, source[64:])
+    assert (values[gate].bits, values[up].bits) == (6, 6)
+
+
+def test_fused_affine_expert_missing_bias_fails_closed(tmp_path):
+    root, _expected = _fused_affine_fixture(
+        tmp_path, include_mtp=False, omit_down_bias=True)
+    with pytest.raises(ValueError, match="affine expert tensor is missing"):
+        WeightStore(root)
 
 
 def test_fused_experts_are_virtual_exact_pages_and_physical_bodies_are_hidden(

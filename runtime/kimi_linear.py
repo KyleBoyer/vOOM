@@ -531,7 +531,7 @@ def _kimi_dense_mlp_tiled(
     return output
 
 
-_NATIVE_KDA_PREFILL_SCAN_SOURCE = r"""
+_NATIVE_SCALAR_KDA_PREFILL_SCAN_SOURCE = r"""
     constexpr uint MAX_D = 256;
 
     const uint dv = thread_position_in_grid.x;
@@ -590,18 +590,18 @@ _NATIVE_KDA_PREFILL_SCAN_SOURCE = r"""
 
 
 @lru_cache(maxsize=1)
-def _native_kda_prefill_scan_kernel():
+def _native_scalar_kda_prefill_scan_kernel():
     if not mx.metal.is_available():
         return None
     return mx.fast.metal_kernel(
         name="voom_kimi_kda_prefill_scan",
         input_names=["q", "k", "v", "gate", "beta", "state"],
         output_names=["out", "out_state"],
-        source=_NATIVE_KDA_PREFILL_SCAN_SOURCE,
+        source=_NATIVE_SCALAR_KDA_PREFILL_SCAN_SOURCE,
     )
 
 
-def _native_fused_kda_prefill_scan(
+def _native_scalar_fused_kda_prefill_scan(
     q: mx.array,
     k: mx.array,
     v: mx.array,
@@ -626,8 +626,8 @@ def _native_fused_kda_prefill_scan(
     batch, length, heads, dim = map(int, q.shape)
     if length <= 1:
         raise ValueError("native KDA prefill requires more than one position")
-    if not 1 <= dim <= 256:
-        raise ValueError("native KDA prefill head dimension must be <=256")
+    if dim != 128:
+        raise ValueError("native KDA prefill requires released head dimension 128")
     if beta.shape != (batch, length, heads):
         raise ValueError(
             f"native KDA beta shape {beta.shape} != "
@@ -639,7 +639,7 @@ def _native_fused_kda_prefill_scan(
     if any(value.dtype != mx.float32
            for value in (q, k, v, gate, beta, state)):
         raise ValueError("native KDA prefill currently requires float32")
-    kernel = _native_kda_prefill_scan_kernel()
+    kernel = _native_scalar_kda_prefill_scan_kernel()
     if kernel is None:
         raise RuntimeError("native KDA prefill requires Metal")
     output, final_state = kernel(
@@ -651,6 +651,142 @@ def _native_fused_kda_prefill_scan(
         output_dtypes=[state.dtype, state.dtype],
     )
     return output, final_state
+
+
+_NATIVE_STRIPED_KDA_PREFILL_SCAN_SOURCE = r"""
+    const uint lane = thread_index_in_simdgroup;
+    const uint simd_group = simdgroup_index_in_threadgroup;
+    const uint dv_block = threadgroup_position_in_grid.x;
+    const uint h = threadgroup_position_in_grid.y;
+    const uint b = threadgroup_position_in_grid.z;
+    const uint L = q_shape[1];
+    const uint H = q_shape[2];
+    const uint D = q_shape[3];
+    const uint dv = dv_block * 8 + simd_group;
+    if (dv >= D) return;
+
+    const size_t state_base = ((size_t)b * H + h) * D * D + dv;
+    for (uint t = 0; t < L; ++t) {
+        const size_t vector_base = ((size_t)b * L + t) * H * D + h * D;
+        float predicted_partial = 0.0f;
+        for (uint dk = lane; dk < D; dk += 32) {
+            const size_t index = state_base + (size_t)dk * D;
+            const float previous = t == 0
+                ? static_cast<float>(state[index])
+                : static_cast<float>(out_state[index]);
+            const float decay = metal::precise::exp(
+                static_cast<float>(gate[vector_base + dk]));
+            const float decayed = previous * decay;
+            out_state[index] = static_cast<T>(decayed);
+            const float product =
+                static_cast<float>(k[vector_base + dk]) * decayed;
+            predicted_partial = product + predicted_partial;
+        }
+        const float predicted = simd_sum(predicted_partial);
+        const size_t value_index = vector_base + dv;
+        const float residual = static_cast<float>(v[value_index]) - predicted;
+        const float beta_value = static_cast<float>(
+            beta[((size_t)b * L + t) * H + h]);
+
+        float output_partial = 0.0f;
+        for (uint dk = lane; dk < D; dk += 32) {
+            const size_t index = state_base + (size_t)dk * D;
+            const float key = static_cast<float>(k[vector_base + dk]);
+            // Preserve the reference expression's two FP32 roundings:
+            // ``(beta * key) * residual``.  Scaling residual first is
+            // algebraically equivalent but changes released-state bits.
+            const float weighted_key = beta_value * key;
+            const float update = weighted_key * residual;
+            const float updated = static_cast<float>(out_state[index])
+                + update;
+            out_state[index] = static_cast<T>(updated);
+            const float product =
+                static_cast<float>(q[vector_base + dk]) * updated;
+            output_partial = product + output_partial;
+        }
+        const float output = simd_sum(output_partial);
+        if (lane == 0) {
+            out[value_index] = static_cast<T>(output);
+        }
+    }
+"""
+
+
+@lru_cache(maxsize=1)
+def _native_striped_kda_prefill_scan_kernel():
+    if not mx.metal.is_available():
+        return None
+    return mx.fast.metal_kernel(
+        name="voom_kimi_kda_striped_prefill_scan",
+        input_names=["q", "k", "v", "gate", "beta", "state"],
+        output_names=["out", "out_state"],
+        header="#pragma clang fp contract(off)\n",
+        source=_NATIVE_STRIPED_KDA_PREFILL_SCAN_SOURCE,
+    )
+
+
+def _native_striped_kda_prefill_scan(
+    q: mx.array,
+    k: mx.array,
+    v: mx.array,
+    gate: mx.array,
+    beta: mx.array,
+    state: mx.array,
+) -> tuple[mx.array, mx.array]:
+    """Fuse KDA while duplicating MLX's 32-lane reduction association."""
+    if q.shape != k.shape or q.shape != v.shape or q.shape != gate.shape:
+        raise ValueError(
+            "native KDA prefill requires matching q/k/v/gate shapes")
+    if len(q.shape) != 4:
+        raise ValueError("native KDA prefill expects [B,L,H,D] tensors")
+    batch, length, heads, dim = map(int, q.shape)
+    if length <= 1:
+        raise ValueError("native KDA prefill requires more than one position")
+    if dim != 128:
+        raise ValueError("native KDA prefill requires released head dimension 128")
+    if beta.shape != (batch, length, heads):
+        raise ValueError(
+            f"native KDA beta shape {beta.shape} != "
+            f"{(batch, length, heads)}")
+    if state.shape != (batch, heads, dim, dim):
+        raise ValueError(
+            f"native KDA state shape {state.shape} != "
+            f"{(batch, heads, dim, dim)}")
+    if any(value.dtype != mx.float32
+           for value in (q, k, v, gate, beta, state)):
+        raise ValueError("native KDA prefill currently requires float32")
+    kernel = _native_striped_kda_prefill_scan_kernel()
+    if kernel is None:
+        raise RuntimeError("native KDA prefill requires Metal")
+    output, final_state = kernel(
+        inputs=[q, k, v, gate, beta, state],
+        template=[("T", state.dtype)],
+        grid=(((dim + 7) // 8) * 256, heads, batch),
+        threadgroup=(256, 1, 1),
+        output_shapes=[q.shape, state.shape],
+        output_dtypes=[state.dtype, state.dtype],
+    )
+    return output, final_state
+
+
+def _native_fused_kda_prefill_scan(
+    q: mx.array,
+    k: mx.array,
+    v: mx.array,
+    gate: mx.array,
+    beta: mx.array,
+    state: mx.array,
+) -> tuple[mx.array, mx.array]:
+    """Run the SIMD-striped, contraction-disabled exact KDA scan.
+
+    MLX 0.32 lowers each K-axis dot to one strided partial per SIMD lane,
+    followed by ``simd_sum``.  The kernel mirrors that order, uses precise
+    exponentiation for the per-channel decay, and disables multiply/add
+    contraction so the fused dispatch retains the reference FP32 boundaries.
+    Real-checkpoint state gates remain mandatory for each architecture that
+    enables this explicit path.
+    """
+    return _native_striped_kda_prefill_scan(q, k, v, gate, beta, state)
 
 
 @mx.compile

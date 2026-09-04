@@ -1250,6 +1250,7 @@ class EngineManager:
                 ("VMODEL_QWEN4_FP8_DIRECT_QMV", "0"),
                 ("VMODEL_QWEN4_FP8_DIRECT_QMV_DECODE_ONLY", "0"),
                 ("VMODEL_QWEN4_EXPERT_BATCH_PREFETCH_PREFILL_ONLY", "0"),
+                ("VMODEL_QWEN4_NATIVE_FUSED_DELTA_PREFILL", "0"),
             )
         )
         dspark_request_identity = tuple(
@@ -3468,6 +3469,9 @@ class EngineManager:
                     qwen4_request_identity[34] == "1")
                 if rc.qwen4_expert_batch_prefetch_prefill_only:
                     rc.expert_batch_prefetch = True
+                if qwen4_request_identity[35] not in ("0", "1"):
+                    raise RequestValidationError(
+                        "VMODEL_QWEN4_NATIVE_FUSED_DELTA_PREFILL must be 0 or 1")
                 if qwen4_request_identity[23] not in ("0", "1"):
                     raise RequestValidationError(
                         "VMODEL_QWEN4_PHASE_LM_HEAD must be 0 or 1")
@@ -5250,11 +5254,19 @@ class EngineManager:
             )
             chunked_delta_request = os.environ.get(
                 "VMODEL_QWEN35_CHUNKED_DELTA", "auto")
-            native_delta_request = os.environ.get(
-                "VMODEL_QWEN35_NATIVE_FUSED_DELTA_PREFILL", "0")
+            native_delta_label = (
+                "VMODEL_QWEN4_NATIVE_FUSED_DELTA_PREFILL"
+                if mtype == "qwen4_exp" else
+                "VMODEL_QWEN35_NATIVE_FUSED_DELTA_PREFILL"
+            )
+            native_delta_request = (
+                qwen4_request_identity[35]
+                if mtype == "qwen4_exp" else
+                os.environ.get(native_delta_label, "0")
+            )
             if native_delta_request not in ("0", "1"):
                 raise RequestValidationError(
-                    "VMODEL_QWEN35_NATIVE_FUSED_DELTA_PREFILL must be 0 or 1")
+                    f"{native_delta_label} must be 0 or 1")
             try:
                 (rc.qwen_compiled_delta_prefill,
                  compiled_delta_reason,
@@ -5269,16 +5281,20 @@ class EngineManager:
                 raise RequestValidationError(str(error)) from error
             rc.qwen_native_fused_delta_prefill = bool(
                 native_delta_request == "1"
-                and mtype in ("qwen3_5", "qwen3_5_moe"))
+                and mtype in ("qwen3_5", "qwen3_5_moe", "qwen4_exp"))
             native_delta_reason = (
                 "operator-disabled"
                 if native_delta_request == "0" else
                 "unsupported-architecture"
-                if mtype not in ("qwen3_5", "qwen3_5_moe") else
+                if mtype not in (
+                    "qwen3_5", "qwen3_5_moe", "qwen4_exp") else
+                "operator-forced-exact"
+                if mtype == "qwen4_exp" else
                 "operator-forced-lossy"
             )
             if rc.qwen_native_fused_delta_prefill:
-                if mode not in ("fast", "fast-long"):
+                if (mtype != "qwen4_exp"
+                        and mode not in ("fast", "fast-long")):
                     raise RequestValidationError(
                         "VMODEL_QWEN35_NATIVE_FUSED_DELTA_PREFILL is lossy "
                         "and requires a fast mode")

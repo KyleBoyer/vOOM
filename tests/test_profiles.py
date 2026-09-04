@@ -148,6 +148,61 @@ def test_builtin_profiles_resolve_complete_agent_group():
     assert flash_settings["VMODEL_QWEN4_PARALLEL_STORAGE_READS"] == "1"
     assert flash_settings["VMODEL_QWEN4_FAST_TIER_DECODE_ONLY"] == "1"
 
+    jang_order, jang_settings = resolve_runtime_profiles(
+        ("qwen38-flash-next-crack-jang6s",), catalog)
+    assert jang_order == (
+        "qwen38-flash-next-candidate-bf16",
+        "qwen38-flash-next-crack-jang6s",
+    )
+    assert jang_settings["VMODEL_QWEN4_MTP_DEPTH"] == "0"
+    assert jang_settings["VMODEL_QWEN4_COMPILED_DELTA"] == "1"
+    assert jang_settings["VMODEL_QWEN4_PLE_READ_WORKERS"] == "8"
+    assert jang_settings["VMODEL_QWEN4_PARALLEL_STORAGE_READS"] == "0"
+    assert jang_settings["VMODEL_QWEN4_HOT_PROMPT_KV"] == "0"
+
+    jang_fused_order, jang_fused_settings = resolve_runtime_profiles(
+        ("qwen38-flash-next-crack-jang6s-exact-fused-delta",), catalog)
+    assert jang_fused_order == (
+        "qwen38-flash-next-candidate-bf16",
+        "qwen38-flash-next-crack-jang6s",
+        "qwen38-flash-next-crack-jang6s-exact-fused-delta",
+    )
+    assert jang_fused_settings["VMODEL_QWEN4_COMPILED_DELTA"] == "0"
+    assert jang_fused_settings[
+        "VMODEL_QWEN4_NATIVE_FUSED_DELTA_PREFILL"] == "1"
+    assert jang_fused_settings[
+        "VMODEL_QWEN4_SPARSE_EXPERT_BATCH_ROWS"] == "0"
+    assert jang_fused_settings["VMODEL_QWEN4_MTP_DEPTH"] == "0"
+
+    jang_prefetch_order, jang_prefetch_settings = resolve_runtime_profiles(
+        ("qwen38-flash-next-crack-jang6s-exact-fused-delta-prefetch",),
+        catalog,
+    )
+    assert jang_prefetch_order[-2:] == (
+        "qwen38-flash-next-crack-jang6s-exact-fused-delta",
+        "qwen38-flash-next-crack-jang6s-exact-fused-delta-prefetch",
+    )
+    assert jang_prefetch_settings[
+        "VMODEL_QWEN4_EXPERT_BATCH_PREFETCH_PREFILL_ONLY"] == "1"
+    assert jang_prefetch_settings[
+        "VMODEL_QWEN4_NATIVE_FUSED_DELTA_PREFILL"] == "1"
+
+    qwen_exact_fused_order, qwen_exact_fused_settings = (
+        resolve_runtime_profiles((
+            "qwen38-flash-next-uncensored-fp8-fast-tier-mtp-"
+            "direct-fp8-qmv-prefill-pipeline-exact-fused-delta",
+        ), catalog))
+    assert qwen_exact_fused_order[-2:] == (
+        "qwen38-flash-next-uncensored-fp8-fast-tier-mtp-"
+        "direct-fp8-qmv-prefill-pipeline",
+        "qwen38-flash-next-uncensored-fp8-fast-tier-mtp-"
+        "direct-fp8-qmv-prefill-pipeline-exact-fused-delta",
+    )
+    assert qwen_exact_fused_settings[
+        "VMODEL_QWEN4_COMPILED_DELTA"] == "0"
+    assert qwen_exact_fused_settings[
+        "VMODEL_QWEN4_NATIVE_FUSED_DELTA_PREFILL"] == "1"
+
     glm_flash_order, glm_flash_settings = resolve_runtime_profiles(
         ("glm53-flash-lossless-compiled-kda",), catalog)
     assert glm_flash_order == ("glm53-flash-lossless-compiled-kda",)
@@ -353,11 +408,34 @@ def test_builtin_profiles_resolve_complete_agent_group():
     assert glm_native_settings[
         "VMODEL_GLM53_NATIVE_FUSED_KDA_PREFILL"] == "1"
 
+    glm_striped_order, glm_striped_settings = resolve_runtime_profiles(
+        ("glm53-flash-lossless-striped-kda",), catalog)
+    assert glm_striped_order[-2:] == (
+        "glm53-flash-lossless-expert-prefetch-batch8-workers2",
+        "glm53-flash-lossless-striped-kda",
+    )
+    assert glm_striped_settings[
+        "VMODEL_GLM53_COMPILED_KDA_PREFILL"] == "0"
+    assert glm_striped_settings[
+        "VMODEL_GLM53_NATIVE_FUSED_KDA_PREFILL"] == "1"
+
+    glm_striped_long_order, glm_striped_long_settings = (
+        resolve_runtime_profiles(
+            ("glm53-flash-lossless-striped-kda-long-context",), catalog))
+    assert glm_striped_long_order == (
+        "glm53-flash-lossless-compiled-kda",
+        "glm53-flash-lossless-striped-kda-long-context",
+    )
+    assert glm_striped_long_settings[
+        "VMODEL_GLM53_COMPILED_KDA_PREFILL"] == "0"
+    assert glm_striped_long_settings[
+        "VMODEL_GLM53_NATIVE_FUSED_KDA_PREFILL"] == "1"
+
     glm_isolated_kda_order, glm_isolated_kda_settings = (
         resolve_runtime_profiles(
             ("glm53-flash-lossy-native-kda-isolated",), catalog))
     assert glm_isolated_kda_order[-2:] == (
-        "glm53-flash-lossless-expert-prefetch-batch8-workers2",
+        "glm53-flash-lossless-striped-kda",
         "glm53-flash-lossy-native-kda-isolated",
     )
     assert glm_isolated_kda_settings[

@@ -542,8 +542,8 @@ _native_deltanet_prefill_kernel = mx.fast.metal_kernel(
 )
 
 
-def _native_fused_gated_delta_prefill(q, k, v, beta, decay, state):
-    """Run a complete serial DeltaNet tile in one Metal dispatch.
+def _native_scalar_gated_delta_prefill(q, k, v, beta, decay, state):
+    """Legacy scalar-reduction DeltaNet tile in one Metal dispatch.
 
     One thread owns one recurrent-state value column and loops over positions
     in released causal order. This removes the Python/per-position dispatch
@@ -568,6 +568,112 @@ def _native_fused_gated_delta_prefill(q, k, v, beta, decay, state):
         output_dtypes=[state.dtype, state.dtype],
     )
     return outputs[0], outputs[1]
+
+
+_NATIVE_STRIPED_DELTANET_PREFILL_SOURCE = """
+    uint lane = thread_index_in_simdgroup;
+    uint simd_group = simdgroup_index_in_threadgroup;
+    uint dv_block = threadgroup_position_in_grid.x;
+    uint h = threadgroup_position_in_grid.y;
+    uint b = threadgroup_position_in_grid.z;
+    uint L = q_shape[1];
+    uint H = q_shape[2];
+    uint Dk = q_shape[3];
+    uint Dv = v_shape[3];
+    uint dv = dv_block * 8 + simd_group;
+    if (dv >= Dv) return;
+
+    uint state_base = ((b * H + h) * Dk) * Dv + dv;
+    for (uint t = 0; t < L; t++) {
+        uint bh = (b * L + t) * H + h;
+        float dec = metal::precise::exp(float(decay[bh]));
+        float bet = float(beta[bh]);
+        float vt = float(v[bh * Dv + dv]);
+
+        // MLX 0.32 lowers this strided K-axis reduction to BM=32:
+        // one SIMD lane accumulates dk=lane+32*n, then simd_sum combines
+        // lanes. Preserve that association instead of the old scalar 0..Dk
+        // loop. The state write is disjoint across lanes.
+        float predicted_partial = 0.0f;
+        for (uint dk = lane; dk < Dk; dk += 32) {
+            uint index = state_base + dk * Dv;
+            float previous = (
+                t == 0 ? float(state[index]) : float(out_state[index]));
+            float decayed = previous * dec;
+            out_state[index] = decayed;
+            float product = float(k[bh * Dk + dk]) * decayed;
+            predicted_partial = product + predicted_partial;
+        }
+        float predicted = simd_sum(predicted_partial);
+        float delta = (vt - predicted) * bet;
+
+        float value_partial = 0.0f;
+        for (uint dk = lane; dk < Dk; dk += 32) {
+            uint index = state_base + dk * Dv;
+            float kk = float(k[bh * Dk + dk]);
+            float updated = float(out_state[index]) + kk * delta;
+            out_state[index] = updated;
+            float product = float(q[bh * Dk + dk]) * updated;
+            value_partial = product + value_partial;
+        }
+        float value = simd_sum(value_partial);
+        if (lane == 0) {
+            out[bh * Dv + dv] = value;
+        }
+    }
+"""
+
+_native_striped_deltanet_prefill_kernel = mx.fast.metal_kernel(
+    name="qwen35_deltanet_striped_serial_prefill",
+    input_names=["q", "k", "v", "beta", "decay", "state"],
+    output_names=["out", "out_state"],
+    header="#pragma clang fp contract(off)\n",
+    source=_NATIVE_STRIPED_DELTANET_PREFILL_SOURCE,
+)
+
+
+def _native_striped_gated_delta_prefill(q, k, v, beta, decay, state):
+    """Candidate fused scan matching MLX's 32-lane strided reductions.
+
+    This is not a lossless production path until the direct byte oracle and a
+    real-checkpoint recurrent-state gate both pass.  It is kept separate from
+    the older scalar-reduction kernel so a failed experiment cannot change an
+    existing explicit profile.
+    """
+    B, L, H, Dk = q.shape
+    Dv = int(v.shape[-1])
+    if L <= 1:
+        raise ValueError(
+            "native striped DeltaNet prefill requires more than one position")
+    if (k.shape != q.shape or v.shape[:3] != (B, L, H)
+            or beta.shape != (B, L, H) or decay.shape != (B, L, H)
+            or state.shape != (B, H, Dk, Dv)):
+        raise ValueError("invalid native striped DeltaNet prefill geometry")
+    outputs = _native_striped_deltanet_prefill_kernel(
+        inputs=[q, k, v, beta, decay, state],
+        grid=(((Dv + 7) // 8) * 256, H, B),
+        threadgroup=(256, 1, 1),
+        output_shapes=[(B, L, H, Dv), state.shape],
+        output_dtypes=[state.dtype, state.dtype],
+    )
+    return outputs[0], outputs[1]
+
+
+def _native_fused_gated_delta_prefill(q, k, v, beta, decay, state):
+    """Run the SIMD-striped, contraction-disabled fused DeltaNet scan.
+
+    At the released 128x128 recurrent geometry this duplicates MLX 0.32's
+    BM=32 strided-reduction association: each lane accumulates indices
+    ``lane + 32*n`` before ``simd_sum`` combines the 32 lanes.  Disabling
+    floating-point contraction also preserves the separate multiply/add
+    roundings of MLX's elementwise product followed by reduction.
+
+    Direct byte equality is a necessary local gate, not sufficient production
+    proof; real-checkpoint state and output gates remain mandatory wherever
+    this explicit path is selected.
+    """
+    return _native_striped_gated_delta_prefill(
+        q, k, v, beta, decay, state)
 
 
 def _chunked_gated_delta_rule(q, k, v, beta, decay, state, chunk: int = 64):
@@ -840,7 +946,11 @@ def _moe(
     shared = _swiglu(h, w, f"{prefix}.mlp.shared_expert")
     shared_gate = mx.sigmoid(_linear(
         h, w, f"{prefix}.mlp.shared_expert_gate"))
-    return routed + shared_gate * shared
+    # Standard MLX-affine derivatives may retain this tiny gate matrix as
+    # BF16 while quantized expert projections emit FP16. MLX promotes the
+    # mixed product to FP32; the released residual stream remains in the
+    # incoming activation dtype.
+    return (routed + shared_gate * shared).astype(h.dtype)
 
 
 def _qwen35_attention_residual(

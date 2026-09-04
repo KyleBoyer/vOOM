@@ -13,6 +13,7 @@ import mlx.core as mx
 
 from runtime.qwen35 import (
     _native_fused_gated_delta_prefill,
+    _native_striped_gated_delta_prefill,
     _sequential_gated_delta_rule,
 )
 
@@ -77,3 +78,34 @@ def test_native_serial_prefill_is_split_stable(split):
 def test_native_serial_prefill_rejects_single_position():
     with pytest.raises(ValueError, match="more than one position"):
         _native_fused_gated_delta_prefill(*_inputs(1))
+
+
+@pytest.mark.parametrize("length", [2, 31, 32, 33, 64])
+def test_native_striped_prefill_matches_reference_bytes_at_real_geometry(length):
+    args = _inputs(length, heads=4, dim=128)
+    reference_out, reference_state = _sequential_gated_delta_rule(*args)
+    candidate_out, candidate_state = _native_striped_gated_delta_prefill(*args)
+    mx.eval(reference_out, reference_state, candidate_out, candidate_state)
+
+    assert np.array_equal(
+        np.asarray(candidate_out), np.asarray(reference_out))
+    assert np.array_equal(
+        np.asarray(candidate_state), np.asarray(reference_state))
+
+
+def test_native_striped_prefill_rejects_single_position():
+    with pytest.raises(ValueError, match="more than one position"):
+        _native_striped_gated_delta_prefill(
+            *_inputs(1, heads=4, dim=128))
+
+
+def test_native_fused_prefill_uses_byte_exact_striped_kernel():
+    args = _inputs(33, heads=4, dim=128)
+    reference_out, reference_state = _sequential_gated_delta_rule(*args)
+    candidate_out, candidate_state = _native_fused_gated_delta_prefill(*args)
+    mx.eval(reference_out, reference_state, candidate_out, candidate_state)
+
+    assert np.array_equal(
+        np.asarray(candidate_out), np.asarray(reference_out))
+    assert np.array_equal(
+        np.asarray(candidate_state), np.asarray(reference_state))

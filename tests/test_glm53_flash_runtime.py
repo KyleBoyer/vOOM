@@ -286,6 +286,9 @@ def test_decode_only_direct_qmv_qualifies_cache_representation(family):
     from runtime.engine import StreamingEngine
 
     engine = StreamingEngine.__new__(StreamingEngine)
+    engine._expert_batch_executor = None
+    engine.rc = SimpleNamespace(
+        qwen4_expert_batch_prefetch_prefill_only=False)
     engine.store = SimpleNamespace(**{
         f"{family}_fp8_direct_qmv": True,
         f"{family}_fp8_direct_qmv_decode_only": True,
