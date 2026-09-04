@@ -9,12 +9,16 @@
 > of `STATUS.md` and `docs/benchmark_results.md`.
 >
 > The current candidate also has a source-bound 20.499GB per-expert FP8 tier at
-> `/Users/kyleboyer/vmodel_fast_tier/Qwen3.8-Flash-Next-uncensored-fp8-plex-hot24`.
+> `/Users/kyleboyer/vmodel_fast_tier/Qwen3.8-Flash-Next-uncensored-fp8-plex-hot-all-corpus3`.
 > It contains 4,170 complete weight+scale expert groups selected from a
-> privacy-safe real Plex route trace and passed a full 25,020-tensor byte
-> comparison.  Use only the explicit
+> privacy-safe, equal-request-weighted three-trace Plex corpus and passed a full
+> 25,020-tensor byte comparison.  Leave-one-request-out route coverage is
+> 69.48--77.48%.  On the identical focused max-32 replay, the new placement
+> preserved output bytes and improved wall 303.099 -> 294.053 seconds and
+> decode 123.454 -> 116.219 seconds.  Use only the explicit
 > `qwen38-flash-next-uncensored-fp8-fast-tier-mtp` profile (or its exact
-> in-memory `-hot-kv` continuation) until the full quality corpus passes.
+> in-memory `-hot-kv` continuation): the max-256 Plex quality run failed at
+> 75/100 after a malformed pagination tool tag, so neither path is promoted.
 
 Status: the pinned checkpoint download and checksum gate completed on
 2026-08-27. Exact released-BF16 text serving, the PLE direct-row provider,

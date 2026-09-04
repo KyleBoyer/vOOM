@@ -1,4 +1,68 @@
-# STATUS — 2026-09-03 (current corrections first; dated chronology below is history)
+# STATUS — 2026-09-04 (current corrections first; dated chronology below is history)
+
+## 2026-09-04: route-capacity rebalance is exact and improves real Qwen Plex decode
+
+The uncensored Qwen FP8 tier had inherited a policy intended for a different
+layout: only 24 experts per layer came from measured route heat, while the
+remaining 62--63 slots were deliberately filled from the cold end to leave
+bandwidth for an always-touched trunk.  This candidate tier contains no trunk.
+The new MLX-free `runtime.qwen_fast_tier_balance` planner reuses the builder's
+selection semantics, distinguishes 4,915,800 source bytes from the 4,916,400
+runtime service bytes per expert, measures both device rates, and evaluates
+every placement rung plus leave-one-request-out coverage.
+
+Three equal-request-weighted real Plex traces select full-capacity heat
+(`trace_hot_experts_per_layer=0`): 4,170 unchanged expert groups / 20,498,886,000
+bytes / 86--87 experts per layer.  Corpus route coverage rises from
+48.29/35.22/35.69% to 86.62/73.97/77.37%; leave-one-request-out coverage is
+77.48/70.14/69.48%, so the direction survives holding out each request.  The
+old reproducible `...plex-hot24` tier was permanently deleted without a NAS
+copy, then rebuilt as `...plex-hot-all-corpus3`.  The independent validator
+reread and matched all 25,020 tensors against source revision `2d9a479...`.
+Global internal tiers remain 62.50GB and root free space remains about 22.8GB.
+
+The native-MTP oracle again matched all four tokens, text, and all 121
+KV/KDA/QSA/PLE arrays; swap-out growth was 8.585MB.  On the identical focused
+2,358-input/32-output full-schema Plex request, the 256MB-cache tier preserved
+the exact truncated output bytes and improved wall **303.099 -> 294.053s
+(-2.98%)**, engine **288.674 -> 279.717s (-3.10%)**, prefill 165.214 ->
+163.496s (-1.04%), and decode **123.454 -> 116.219s (-5.86%)**.  Parallel
+two-device wall fell 134.164 -> 115.279s, peak Metal was 4.292GB, and swap-out
+growth was 13.599MB.  The 32-token rubric remains invalid because it truncates
+mid-call; this is a latency/identity result, not an intelligence result.
+
+The separate max-256 quality run did complete a semantically correct first
+Plex call but emitted a malformed closing tool tag on the pagination turn. It
+scored 75/100 in 898.573s and grew swap-out by 74.088MB, so the candidate and
+hot-KV path remain explicit and unpromoted.  Its second turn nevertheless
+proved an exact 2,351/2,690-token in-memory prefix reuse.  OrcaRouter's newer
+Qwen and GLM-Flash uncensored FP8 candidates remain approval-gated to this
+machine; the already installed dealignai uncensored revisions therefore remain
+the only complete accessible FP8 targets rather than being replaced tonight.
+
+Evidence:
+`logs/qwen_uncensored_fp8_fast_tier_balance_plan_20260903.json`,
+`logs/qwen_uncensored_fp8_fast_tier_hot_all_corpus3_validation_20260903.json`,
+`logs/qwen_uncensored_fp8_fast_tier_hot_all_corpus3_mtp_depth3_oracle_20260903.json`,
+`logs/qwen_uncensored_fp8_fast_tier_hot_all_corpus3_plex_max32_20260903.json`,
+and `logs/qwen_uncensored_fp8_fast_tier_hotkv_plex_max256_20260903.json`.
+
+## 2026-09-04: GLM-5.3-Flash MTP depth four is exact but trace-dependent
+
+An upstream depth-width report motivated a fresh local depth-three/four A/B on
+the attested uncensored Flash checkpoint.  On a 28-input/eight-output trace,
+depth four matched all tokens, text, five state components, and 159/159 endpoint
+tensors while improving wall 123.237 -> **120.278s (-2.40%)**, decode 54.492
+-> **51.651s (-5.21%)**, and reads 211.393 -> **204.342GB (-3.34%)**.  On a
+different 19-input/eight-output coding trace where both depths accepted zero
+proposals, depth four regressed wall 138.063 -> 139.383s (+0.96%), decode
+84.431 -> 85.859s (+1.69%), and reads by 0.67%.  All four arms stayed below
+10MB swap-out growth.  Depth three remains the general explicit profile; a
+blanket depth-four profile is rejected pending a content-independent adaptive
+policy with broader proof.
+
+Evidence: `logs/glm53_flash_uncensored_mtp_depth{3,4}_max8_20260903.json`
+and `logs/glm53_flash_uncensored_mtp_depth{3,4}_code8_20260904.json`.
 
 ## 2026-09-03: uncensored Qwen FP8 gets an exact route-hot tier
 

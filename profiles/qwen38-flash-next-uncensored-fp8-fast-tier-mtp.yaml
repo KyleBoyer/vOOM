@@ -2,16 +2,16 @@ schema: voom.runtime-profile.v1
 name: qwen38-flash-next-uncensored-fp8-fast-tier-mtp
 description: Candidate-bound trace-hot FP8 experts plus exact native MTP verification.
 notes:
-  - "Extends the pinned dealignai candidate and its state-gated native MTP path. The internal tier contains 20,498,886,000 unchanged released bytes: 4,170 complete routed experts (86-87 per layer), including the 24 hottest experts per layer from a real 2,358-token full-schema Plex request."
+  - "Extends the pinned dealignai candidate and its state-gated native MTP path. The internal tier contains 20,498,886,000 unchanged released bytes: 4,170 complete routed experts (86-87 per layer), with the full capacity ranked by three equal-request-weighted real Plex traces rather than filling unused capacity from the cold end."
+  - "The trace corpus covers 32- and 101-token first turns plus a 62-token exact-prefix continuation. Leave-one-request-out route coverage is 69.48-77.48%, versus 34.41-37.67% for the inherited hot-24/cold-fill policy. This remains an explicit workload-scoped profile because the corpus is still Plex-shaped."
   - "Each placed expert is indivisible: all three published E4M3 matrices and all three BF16 inverse-scale grids are source-bound. The completed build passed a 25,020-tensor / 20.499GB byte-for-byte comparison against candidate revision 2d9a479fd8643c394f1602b4ef1c8757dda4c518."
-  - "Independent internal/external reads are overlapped without changing values, routing, arithmetic, or accumulation order. On the identical 2,358-input/32-output full-schema Plex request, the tier preserved the exact truncated output prefix while cutting wall 338.095s -> 301.675s, engine 324.839s -> 287.657s, prefill 180.681s -> 164.779s, and decode 144.155s -> 122.876s. The 32-token rubric is invalid for quality because it ends mid-tool-call."
-  - "A 256MB scan cache repeated the same output in 303.099s, reduced peak Metal 4.430GB -> 4.292GB, and held swap-out growth to 11.960MB versus 17.433MB at 400MB. The safe cache is selected despite the 1.424s timing cost."
-  - "The four-token state oracle matched every token plus all 121 KV/KDA/QSA/PLE arrays and stayed below 5MB swap-out growth. Its unrelated tiny prompt was slightly slower with the route tier, so this remains a workload-scoped profile rather than a universal default."
-  - "This profile is lossless relative to the uncensored FP8 candidate, not relative to Qwen's official BF16 checkpoint. It remains explicit until varied-shape, sustained-output, tool, vision, and local Plex quality gates pass."
+  - "Independent internal/external reads are overlapped without changing values, routing, arithmetic, or accumulation order. Against the inherited 256MB hot-24/cold-fill arm, the identical 2,358-input/32-output full-schema Plex request preserved exact output bytes and improved wall 303.099s -> 294.053s, engine 288.674s -> 279.717s, prefill 165.214s -> 163.496s, and decode 123.454s -> 116.219s. Peak Metal was 4.292GB and swap-out growth 13.599MB."
+  - "The four-token state oracle matched every token plus all 121 KV/KDA/QSA/PLE arrays and stayed below 9MB swap-out growth. Its unrelated tiny prompt was slightly slower with a route tier, so this remains a workload-scoped profile rather than a universal default."
+  - "The 32-token rubric is invalid because it ends mid-tool-call. A separate max-256 multi-turn run scored 75/100: the first Plex call was correct, but the model emitted a malformed closing tool tag on pagination and exceeded the pressure gate. This profile is lossless relative to the uncensored FP8 candidate, not relative to Qwen's official BF16 checkpoint, and remains explicit/unpromoted."
 extends:
   - qwen38-flash-next-uncensored-fp8-mtp
 settings:
   VMODEL_QWEN4_WEIGHT_CACHE_MB: 256
-  VMODEL_QWEN4_FAST_TIER_DIR: /Users/kyleboyer/vmodel_fast_tier/Qwen3.8-Flash-Next-uncensored-fp8-plex-hot24
+  VMODEL_QWEN4_FAST_TIER_DIR: /Users/kyleboyer/vmodel_fast_tier/Qwen3.8-Flash-Next-uncensored-fp8-plex-hot-all-corpus3
   VMODEL_QWEN4_PARALLEL_STORAGE_READS: true
   VMODEL_QWEN4_FAST_TIER_DECODE_ONLY: false

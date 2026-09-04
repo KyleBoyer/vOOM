@@ -1011,6 +1011,9 @@ def main() -> None:
     parser.add_argument(
         "--target-name", default="",
         help="publish under a distinct one-component candidate directory")
+    parser.add_argument(
+        "--result", type=Path,
+        help="also write the structured report atomically to this path")
     args = parser.parse_args()
     target_name = args.target_name or Path(args.model_dir).name
     if bool(args.clone_from_tier) != bool(args.clone_source_model):
@@ -1037,6 +1040,13 @@ def main() -> None:
                 args.trace_hot_experts_per_layer),
             candidate_max_bytes=args.candidate_max_bytes,
             target_name=args.target_name)
+    if args.result:
+        result_path = args.result.expanduser()
+        result_path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = result_path.with_name(
+            result_path.name + f".tmp-{os.getpid()}")
+        temporary.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n")
+        os.replace(temporary, result_path)
     print(json.dumps(report, indent=2, sort_keys=True))
 
 

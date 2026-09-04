@@ -1,11 +1,21 @@
 # GLM-5.3-Flash on the 16 GB M4
 
-Status date: 2026-08-31
+Status date: 2026-09-04
+
+> Current-tree correction: `models/GLM-5.3-Flash` is the attested
+> `dealignai/GLM-5.3-Flash-UNCENSORED-FP8` revision
+> `d21b19569d30e6f471c433b11e672b3bbb80552a`, retaining vision and native MTP.
+> The source remains on Workspace NVMe.  A fresh exact depth-three/four A/B
+> found depth four 2.40% faster on one accepted-proposal trace but 0.96% slower
+> on a zero-acceptance coding trace; all tokens and 159 endpoint tensors matched.
+> Depth three therefore remains the general explicit profile.
 
 ## Checkpoint and storage
 
-- Released checkpoint: `zai-org/GLM-5.3-Flash`
-- Pinned revision: `04c4e9e95c5da8862dced7e5056455116f83a7e0`
+- Current checkpoint: `dealignai/GLM-5.3-Flash-UNCENSORED-FP8`
+- Pinned revision: `d21b19569d30e6f471c433b11e672b3bbb80552a`
+- Base release: `zai-org/GLM-5.3-Flash` revision
+  `04c4e9e95c5da8862dced7e5056455116f83a7e0`
 - Local source: `models/GLM-5.3-Flash` on Workspace NVMe
 - Released tensor payload: 328,326,771,576 bytes across 62 shards
 - Hub verification: all 72 repository files passed strict cache verification

@@ -516,7 +516,7 @@ def test_builtin_profiles_resolve_complete_agent_group():
     )
     assert uncensored_fast_settings[
         "VMODEL_QWEN4_FAST_TIER_DIR"].endswith(
-            "Qwen3.8-Flash-Next-uncensored-fp8-plex-hot24")
+            "Qwen3.8-Flash-Next-uncensored-fp8-plex-hot-all-corpus3")
     assert uncensored_fast_settings[
         "VMODEL_QWEN4_PARALLEL_STORAGE_READS"] == "1"
     assert uncensored_fast_settings[
