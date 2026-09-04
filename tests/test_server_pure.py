@@ -2779,6 +2779,8 @@ def test_glm53_hot_prompt_kv_is_opt_in_exact_and_in_engine_identity():
         ("VMODEL_GLM53_FP8_DIRECT_QMV", "auto", "must be 0 or 1"),
         ("VMODEL_GLM53_FP8_DIRECT_QMV_DECODE_ONLY", "auto", "must be 0 or 1"),
         ("VMODEL_QWEN4_NATIVE_FP8_DEQUANT", "auto", "must be 0 or 1"),
+        ("VMODEL_QWEN4_FP8_DIRECT_QMV", "auto", "must be 0 or 1"),
+        ("VMODEL_QWEN4_FP8_DIRECT_QMV_DECODE_ONLY", "auto", "must be 0 or 1"),
         ("VMODEL_GLM53_HOT_KV_SLOTS", "0", "must be in \\[1, 4\\]"),
         ("VMODEL_GLM53_HOT_KV_MIN_TOKENS", "-1", "non-negative"),
         ("VMODEL_GLM53_MTP", "auto", "must be 0 or 1"),
@@ -2822,6 +2824,19 @@ def test_glm53_decode_only_direct_qmv_requires_direct():
     }, clear=False):
         with pytest.raises(RequestValidationError, match="requires.*DIRECT_QMV=1"):
             EngineManager().get(Path("/tmp/not-opened-glm53"), "lossless")
+
+
+def test_qwen4_decode_only_direct_qmv_requires_direct():
+    from unittest.mock import patch
+
+    from runtime.server import EngineManager, RequestValidationError
+
+    with patch.dict("os.environ", {
+        "VMODEL_QWEN4_FP8_DIRECT_QMV": "0",
+        "VMODEL_QWEN4_FP8_DIRECT_QMV_DECODE_ONLY": "1",
+    }, clear=False):
+        with pytest.raises(RequestValidationError, match="requires.*DIRECT_QMV=1"):
+            EngineManager().get(Path("/tmp/not-opened-qwen4"), "lossless")
 
 
 def test_glm53_decode_only_direct_qmv_is_in_engine_identity():

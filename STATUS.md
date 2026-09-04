@@ -1,5 +1,40 @@
 # STATUS — 2026-09-04 (current corrections first; dated chronology below is history)
 
+## 2026-09-04: exact packed expert decode extends to uncensored Qwen Flash
+
+Qwen3.8-Flash-Next's installed uncensored FP8 checkpoint uses the same released
+128x128 E4M3/inverse-scale expert representation as the GLM direct-QMV kernel.
+A separate Qwen-only opt-in now keeps its established eager BF16 prefill and
+switches target plus MTP expert pages to the packed representation only after
+prefill.  The engine/cache/response identity, representation-qualified cache
+keys, and page/call/position/fallback/reconstruction telemetry are Qwen-specific.
+Dense or fused-BF16 Qwen checkpoints fail closed.  The dense exact-verifier probe
+also now recognizes non-array packed carriers and takes its existing singleton
+fallback, which lets each verifier row use exact direct QMV rather than crashing.
+
+On the unrelated five-input/four-output France trace, eager and packed-decode
+matched all four tokens, text, aggregate state, four component hashes, and all
+121 persistent KV/KDA/QSA/PLE arrays.  Candidate generation improved **41.892 ->
+38.802s (-7.38%)** and wall **52.712 -> 49.624s (-5.86%)**.  All 4,320 expert
+projections used direct QMV, with zero fallbacks; physical target reads remained
+44.120GB.  A first smoke prompt that immediately emitted EOS was retained only as
+a prefill identity gate and is not counted as speed evidence.
+
+The complete trace-hot fast-tier/native-MTP composition passed its own rollback
+gate with the same four tokens and all 121 state arrays.  It accepted 2/4 drafts,
+performed two rather than three target sweeps, issued 8,760 direct expert QMV
+calls with zero fallbacks, and observed 4.882MB swap-out growth.  Against the
+historical identical profile without direct QMV, MTP decode improved **23.286 ->
+18.513s (-20.49%)**, generation **37.969 -> 31.578s (-16.83%)**, and end-to-end
+wall **49.152 -> 43.126s (-12.26%)**.  This is a historical same-shape timing
+comparison; the token/state proof is simultaneous plain-versus-MTP.  The profile
+remains explicit/default-off until the unmodified Plex call, varied prompt shapes,
+streaming/sampling, sustained output, and vision gates pass.
+
+Evidence:
+`logs/qwen_uncensored_fp8_direct_qmv_decode_only_{oracle,france4}_20260904.json`
+and `logs/qwen_uncensored_fp8_direct_qmv_mtp_depth3_oracle_20260904.json`.
+
 ## 2026-09-04: phase-aware FP8 QMV removes the medium-prefill regression
 
 The exact direct-QMV path now has an explicit decode-only policy.  GLM prefill

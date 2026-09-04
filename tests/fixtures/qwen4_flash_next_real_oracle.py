@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import sys
 import time
 from dataclasses import asdict
@@ -38,6 +39,17 @@ def _pressure() -> dict[str, int]:
 
 
 def _model_revision(model: Path) -> str:
+    receipt = model.resolve() / "voom.checkpoint.receipt.json"
+    if receipt.is_file():
+        try:
+            document = json.loads(receipt.read_text())
+            candidate = document.get("candidate", {})
+            if (document.get("status") == "verified"
+                    and isinstance(candidate, dict)
+                    and candidate.get("revision")):
+                return str(candidate["revision"])
+        except (OSError, ValueError, TypeError):
+            pass
     trees = sorted(
         (model.resolve() / ".cache/huggingface/trees").glob("*.json"))
     return trees[-1].stem if trees else ""
@@ -118,6 +130,7 @@ def _run(
     fast_tier_decode_only: bool = False,
     native_fused_delta: bool = False,
     max_tokens: int = 1,
+    fp8_direct_qmv_decode_only: bool = False,
 ) -> dict:
     before = _pressure()
     rc = RuntimeConfig(
@@ -146,7 +159,23 @@ def _run(
         governor=True,
     )
     started = time.perf_counter()
-    engine = StreamingEngine(str(model), rc)
+    direct_names = (
+        "VMODEL_QWEN4_FP8_DIRECT_QMV",
+        "VMODEL_QWEN4_FP8_DIRECT_QMV_DECODE_ONLY",
+    )
+    previous_direct = {name: os.environ.get(name) for name in direct_names}
+    os.environ[direct_names[0]] = (
+        "1" if fp8_direct_qmv_decode_only else "0")
+    os.environ[direct_names[1]] = (
+        "1" if fp8_direct_qmv_decode_only else "0")
+    try:
+        engine = StreamingEngine(str(model), rc)
+    finally:
+        for name, value in previous_direct.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
     try:
         initialized = time.perf_counter()
         result = engine.generate(
@@ -171,6 +200,7 @@ def _run(
             "fast_tier_dir": fast_tier_dir,
             "parallel_storage_reads": parallel_storage_reads,
             "fast_tier_decode_only": fast_tier_decode_only,
+            "fp8_direct_qmv_decode_only": fp8_direct_qmv_decode_only,
             "max_tokens": max_tokens,
             "startup_seconds": round(initialized - started, 6),
             "generation_seconds": round(completed - initialized, 6),
@@ -190,6 +220,15 @@ def _run(
                 result["path_stats"].get("weight_fast_tier_bytes", 0)),
             "archive_read_bytes": int(
                 result["path_stats"].get("weight_archive_bytes", 0)),
+            "fp8_direct": {
+                key: result["path_stats"].get(f"qwen4_fp8_direct_{key}", 0)
+                for key in (
+                    "pages", "resident_bytes", "qmv_calls", "qmv_positions",
+                    "fallback_calls", "fallback_positions",
+                    "fallback_reconstruct_ns",
+                    "fallback_reconstruct_bytes",
+                )
+            },
             "parallel_tier": {
                 key: result["path_stats"].get(f"parallel_tier_{key}", 0)
                 for key in (
@@ -242,6 +281,7 @@ def main() -> int:
     parser.add_argument(
         "--candidate-expert-tile-eval-batch", type=int, default=1)
     parser.add_argument("--compare-layer-stationary", action="store_true")
+    parser.add_argument("--prompt")
     parser.add_argument("--prompt-repeat", type=int, default=1)
     parser.add_argument("--candidate-fast-tier-dir", default="")
     parser.add_argument(
@@ -249,6 +289,8 @@ def main() -> int:
     parser.add_argument(
         "--candidate-fast-tier-decode-only", action="store_true")
     parser.add_argument("--max-tokens", type=int, default=1)
+    parser.add_argument(
+        "--candidate-direct-fp8-qmv-decode-only", action="store_true")
     parser.add_argument("--result", type=Path)
     args = parser.parse_args()
     if args.chunk <= 0:
@@ -261,7 +303,10 @@ def main() -> int:
         parser.error("candidate-expert-tile-eval-batch must be in [1, 16]")
     if args.max_tokens <= 0:
         parser.error("max-tokens must be positive")
-    prompt = "Say hello in one word. " * args.prompt_repeat
+    prompt = (
+        args.prompt
+        if args.prompt is not None
+        else "Say hello in one word. " * args.prompt_repeat)
     baseline = _run(
         args.model, prompt, args.chunk, args.compare_layer_stationary,
         (args.candidate_compiled and not args.candidate_native_fused_delta
@@ -277,7 +322,7 @@ def main() -> int:
         "", False, False,
         (args.candidate_native_fused_delta
          if args.compare_layer_stationary else False),
-        args.max_tokens)
+        args.max_tokens, False)
     candidate = _run(
         args.model, prompt, args.chunk, True,
         (args.candidate_compiled
@@ -289,7 +334,8 @@ def main() -> int:
         args.candidate_parallel_storage_reads,
         args.candidate_fast_tier_decode_only,
         args.candidate_native_fused_delta,
-        args.max_tokens)
+        args.max_tokens,
+        args.candidate_direct_fp8_qmv_decode_only)
     matched = {
         "tokens": candidate["tokens"] == baseline["tokens"],
         "text": candidate["text_sha256"] == baseline["text_sha256"],

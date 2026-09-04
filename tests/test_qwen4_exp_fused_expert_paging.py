@@ -315,6 +315,49 @@ def test_per_expert_fp8_bf16_scales_widen_exactly_and_keep_physical_count(
     assert store.glm53_fp8_snapshot()[2] == 1
 
 
+def test_qwen4_decode_only_direct_qmv_switches_exact_representation(
+        tmp_path, monkeypatch):
+    from runtime.quant import FineGrainedFP8Tensor, matmul
+
+    root, _expected = _per_expert_fp8_fixture(tmp_path, bf16_scale=True)
+    monkeypatch.setenv("VMODEL_QWEN4_FP8_DIRECT_QMV", "1")
+    monkeypatch.setenv("VMODEL_QWEN4_FP8_DIRECT_QMV_DECODE_ONLY", "1")
+    store = WeightStore(root)
+    name = "model.layers.0.mlp.experts.1.gate_proj.weight"
+
+    prefill, _seconds, _physical_bytes = store.fetch([name])
+    assert not isinstance(prefill[name], FineGrainedFP8Tensor)
+    assert prefill[name].dtype == mx.bfloat16
+    assert store.expert_resident_bytes_per_weight == 2.0
+
+    store.qwen4_fp8_direct_qmv_active = True
+    decode, _seconds, _physical_bytes = store.fetch([name])
+    assert isinstance(decode[name], FineGrainedFP8Tensor)
+    x = mx.zeros((1, 1, 4), dtype=mx.bfloat16)
+    actual = matmul(x, decode[name])
+    expected = x @ prefill[name].T
+    mx.eval(actual, expected)
+    np.testing.assert_array_equal(_bits(actual), _bits(expected))
+    qwen = store.qwen4_fp8_direct_snapshot()
+    assert qwen[0] == 1
+    assert qwen[4:6] == (1, 1)
+    assert store.glm53_fp8_direct_snapshot() == (0,) * 8
+
+
+def test_qwen4_decode_only_direct_qmv_requires_direct(tmp_path, monkeypatch):
+    root, _expected = _per_expert_fp8_fixture(tmp_path)
+    monkeypatch.setenv("VMODEL_QWEN4_FP8_DIRECT_QMV_DECODE_ONLY", "1")
+    with pytest.raises(ValueError, match="requires.*DIRECT_QMV=1"):
+        WeightStore(root)
+
+
+def test_qwen4_direct_qmv_rejects_fused_bf16_checkpoint(tmp_path, monkeypatch):
+    root, _expected = _fixture(tmp_path)
+    monkeypatch.setenv("VMODEL_QWEN4_FP8_DIRECT_QMV", "1")
+    with pytest.raises(ValueError, match="per-expert fine-grained-FP8"):
+        WeightStore(root)
+
+
 def test_qwen4_virtual_fast_tier_is_byte_exact_and_source_bound(tmp_path):
     from formats.qwen4_fast_tier import build_qwen4_fast_tier
 

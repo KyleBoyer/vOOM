@@ -1247,6 +1247,8 @@ class EngineManager:
                 ("VMODEL_QWEN4_SERIAL_VERIFY_EXACT_BF16_GEMV", "0"),
                 ("VMODEL_QWEN4_QSA_POOL_CACHE", "0"),
                 ("VMODEL_QWEN4_MTP_COMPACT_KDA_ROLLBACK", "0"),
+                ("VMODEL_QWEN4_FP8_DIRECT_QMV", "0"),
+                ("VMODEL_QWEN4_FP8_DIRECT_QMV_DECODE_ONLY", "0"),
             )
         )
         dspark_request_identity = tuple(
@@ -2055,6 +2057,19 @@ class EngineManager:
         if qwen4_native_fp8_dequant_request not in ("0", "1"):
             raise RequestValidationError(
                 "VMODEL_QWEN4_NATIVE_FP8_DEQUANT must be 0 or 1")
+        qwen4_fp8_direct_qmv_request = qwen4_request_identity[32]
+        qwen4_fp8_direct_qmv_decode_only_request = qwen4_request_identity[33]
+        if qwen4_fp8_direct_qmv_request not in ("0", "1"):
+            raise RequestValidationError(
+                "VMODEL_QWEN4_FP8_DIRECT_QMV must be 0 or 1")
+        if qwen4_fp8_direct_qmv_decode_only_request not in ("0", "1"):
+            raise RequestValidationError(
+                "VMODEL_QWEN4_FP8_DIRECT_QMV_DECODE_ONLY must be 0 or 1")
+        if (qwen4_fp8_direct_qmv_decode_only_request == "1"
+                and qwen4_fp8_direct_qmv_request != "1"):
+            raise RequestValidationError(
+                "VMODEL_QWEN4_FP8_DIRECT_QMV_DECODE_ONLY=1 requires "
+                "VMODEL_QWEN4_FP8_DIRECT_QMV=1")
         glm53_mtp_request = os.environ.get(
             "VMODEL_GLM53_MTP", "0").strip()
         if glm53_mtp_request not in ("0", "1"):
@@ -2620,6 +2635,11 @@ class EngineManager:
                 and mtype != "qwen4_exp"):
             raise RequestValidationError(
                 "VMODEL_QWEN4_NATIVE_FP8_DEQUANT requires a Qwen4-Exp "
+                "fine-grained-FP8 checkpoint")
+        if (qwen4_fp8_direct_qmv_request == "1"
+                and mtype != "qwen4_exp"):
+            raise RequestValidationError(
+                "VMODEL_QWEN4_FP8_DIRECT_QMV requires a Qwen4-Exp "
                 "fine-grained-FP8 checkpoint")
         if (qwen_rerank_lm_head_rank_capture_path
                 and mtype != "qwen3_5"):
@@ -9497,6 +9517,8 @@ def _vision_protocol_timing(result: dict) -> dict:
         "glm53_native_fp8_prefetch",
         "qwen4_native_fp8_dequant",
         "qwen4_per_expert_fp8",
+        "qwen4_fp8_direct_qmv",
+        "qwen4_fp8_direct_qmv_decode_only",
         "glm53_fp8_transform_ns",
         "glm53_fp8_transform_calls",
         "glm53_fp8_native_calls",
@@ -9513,6 +9535,14 @@ def _vision_protocol_timing(result: dict) -> dict:
         "glm53_fp8_direct_fallback_positions",
         "glm53_fp8_direct_fallback_reconstruct_ns",
         "glm53_fp8_direct_fallback_reconstruct_bytes",
+        "qwen4_fp8_direct_pages",
+        "qwen4_fp8_direct_resident_bytes",
+        "qwen4_fp8_direct_qmv_calls",
+        "qwen4_fp8_direct_qmv_positions",
+        "qwen4_fp8_direct_fallback_calls",
+        "qwen4_fp8_direct_fallback_positions",
+        "qwen4_fp8_direct_fallback_reconstruct_ns",
+        "qwen4_fp8_direct_fallback_reconstruct_bytes",
         "weight_cache_hits",
         "weight_cache_misses",
         "weight_cache_evictions",
@@ -10348,6 +10378,10 @@ def _execution_profile_fields(engine) -> dict[str, object]:
         weight_profile += "+glm53-fp8-direct-qmv"
         if getattr(store, "glm53_fp8_direct_qmv_decode_only", False):
             weight_profile += "-decode-only"
+    if getattr(store, "qwen4_fp8_direct_qmv", False):
+        weight_profile += "+qwen4-fp8-direct-qmv"
+        if getattr(store, "qwen4_fp8_direct_qmv_decode_only", False):
+            weight_profile += "-decode-only"
     if rc is not None and getattr(rc, "kimi_k3_scale_sidecar_dir", ""):
         weight_profile += "+k3-scale-sidecar"
     if rc is not None and getattr(rc, "bf16_nf12_sidecar_dir", ""):
@@ -10369,6 +10403,10 @@ def _execution_profile_fields(engine) -> dict[str, object]:
         fields["vmodel_glm53_fp8_direct_qmv"] = 1
         if getattr(store, "glm53_fp8_direct_qmv_decode_only", False):
             fields["vmodel_glm53_fp8_direct_qmv_decode_only"] = 1
+    if getattr(store, "qwen4_fp8_direct_qmv", False):
+        fields["vmodel_qwen4_fp8_direct_qmv"] = 1
+        if getattr(store, "qwen4_fp8_direct_qmv_decode_only", False):
+            fields["vmodel_qwen4_fp8_direct_qmv_decode_only"] = 1
     if rc is not None and getattr(rc, "qwen35_prefill_chunk_ceiling", 0):
         fields["vmodel_qwen35_prefill_chunk_ceiling"] = int(
             rc.qwen35_prefill_chunk_ceiling)

@@ -371,7 +371,7 @@ class SpeculativeDecoder:
             if tgt.rc.execution_profile else None)
         if tgt._request_profiler is not None:
             tgt._request_profiler.set_phase("prefill")
-        tgt._set_glm53_fp8_direct_phase("prefill")
+        tgt._set_finegrained_fp8_direct_phase("prefill")
         from .engine import (
             _cache_io_snapshot,
             _direct_io_snapshot,
@@ -632,7 +632,7 @@ class SpeculativeDecoder:
         draft_fed = prompt_cache_matched
         # Number of all_tokens already absorbed by the draft KV.
         decode_t0 = time.perf_counter()
-        tgt._set_glm53_fp8_direct_phase("decode")
+        tgt._set_finegrained_fp8_direct_phase("decode")
         if tgt._request_profiler is not None:
             tgt._request_profiler.set_phase("decode")
 
@@ -1024,6 +1024,12 @@ class SpeculativeDecoder:
             path_stats["glm53_fp8_direct_qmv_decode_only"] = int(bool(
                 getattr(
                     tgt.store, "glm53_fp8_direct_qmv_decode_only", False)))
+        if tgt.cfg.model_type == "qwen4_exp":
+            path_stats["qwen4_fp8_direct_qmv"] = int(bool(getattr(
+                tgt.store, "qwen4_fp8_direct_qmv", False)))
+            path_stats["qwen4_fp8_direct_qmv_decode_only"] = int(bool(
+                getattr(
+                    tgt.store, "qwen4_fp8_direct_qmv_decode_only", False)))
         if tgt.cfg.model_type == "glm5_next":
             layer_stats = getattr(
                 tgt, "_glm53_layer_stationary_stats", {}) or {}

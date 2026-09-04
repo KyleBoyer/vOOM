@@ -278,10 +278,12 @@ class WeightStore:
         self.native_glm53_fp8_dequant = (
             os.environ.get("VMODEL_GLM53_NATIVE_FP8_DEQUANT") == "1"
             or os.environ.get("VMODEL_QWEN4_NATIVE_FP8_DEQUANT") == "1")
-        # Explicit GLM-only lossless experiment: retain routed-expert E4M3
-        # bytes and F32 block multipliers in cache, then consume singleton
-        # projections with an exact direct QMV. Non-singleton calls reconstruct
-        # the existing BF16 carrier on demand and use the ordinary matmul.
+        # Explicit lossless experiments: retain routed-expert E4M3 bytes and
+        # F32 block multipliers in cache, then consume singleton projections
+        # with an exact direct QMV. Non-singleton calls reconstruct the existing
+        # BF16 carrier on demand and use the ordinary matmul. GLM and Qwen have
+        # separate policy/telemetry identities even though their published
+        # 128x128 fine-grained FP8 representation is the same.
         self.glm53_fp8_direct_qmv = (
             os.environ.get("VMODEL_GLM53_FP8_DIRECT_QMV") == "1")
         self.glm53_fp8_direct_qmv_decode_only = (
@@ -298,6 +300,19 @@ class WeightStore:
         self.glm53_fp8_direct_qmv_active = bool(
             self.glm53_fp8_direct_qmv
             and not self.glm53_fp8_direct_qmv_decode_only)
+        self.qwen4_fp8_direct_qmv = (
+            os.environ.get("VMODEL_QWEN4_FP8_DIRECT_QMV") == "1")
+        self.qwen4_fp8_direct_qmv_decode_only = (
+            os.environ.get(
+                "VMODEL_QWEN4_FP8_DIRECT_QMV_DECODE_ONLY", "0") == "1")
+        if (self.qwen4_fp8_direct_qmv_decode_only
+                and not self.qwen4_fp8_direct_qmv):
+            raise ValueError(
+                "VMODEL_QWEN4_FP8_DIRECT_QMV_DECODE_ONLY requires "
+                "VMODEL_QWEN4_FP8_DIRECT_QMV=1")
+        self.qwen4_fp8_direct_qmv_active = bool(
+            self.qwen4_fp8_direct_qmv
+            and not self.qwen4_fp8_direct_qmv_decode_only)
         # The fused decoder is exact, but medium layer-stationary profiling
         # showed that dispatching it from expert-prefetch workers can contend
         # with the foreground expert GEMM on Metal.  Keep today's all-native
@@ -322,6 +337,14 @@ class WeightStore:
         self.glm53_fp8_direct_fallback_positions = 0
         self.glm53_fp8_direct_fallback_reconstruct_ns = 0
         self.glm53_fp8_direct_fallback_reconstruct_bytes = 0
+        self.qwen4_fp8_direct_pages = 0
+        self.qwen4_fp8_direct_resident_bytes = 0
+        self.qwen4_fp8_direct_qmv_calls = 0
+        self.qwen4_fp8_direct_qmv_positions = 0
+        self.qwen4_fp8_direct_fallback_calls = 0
+        self.qwen4_fp8_direct_fallback_positions = 0
+        self.qwen4_fp8_direct_fallback_reconstruct_ns = 0
+        self.qwen4_fp8_direct_fallback_reconstruct_bytes = 0
         self.k3_scale_sidecar = None
         self.k3_scale_sidecar_read_bytes = 0
         self.k3_scale_sidecar_output_bytes = 0
@@ -841,6 +864,15 @@ class WeightStore:
                     name, scale, (int(block[0]), int(block[1])))
                 quant_aux_names.add(scale)
 
+        if self.qwen4_fp8_direct_qmv and (
+            self.config.model_type != "qwen4_exp"
+            or self.qwen4_expert_layout != "per-expert-fp8"
+            or not self._glm53_fp8_aux
+        ):
+            raise ValueError(
+                "VMODEL_QWEN4_FP8_DIRECT_QMV requires a Qwen4-Exp "
+                "per-expert fine-grained-FP8 checkpoint")
+
         self.on_disk_quantized = bool(self._quant_aux)
         if self.on_disk_quantized:
             identity = {
@@ -940,8 +972,15 @@ class WeightStore:
                     "weight_block_size")
             self.expert_storage_bytes_per_weight = (
                 1.0 + 4.0 / (int(block[0]) * int(block[1])))
-            if (self.glm53_fp8_direct_qmv
-                    and not self.glm53_fp8_direct_qmv_decode_only):
+            direct_all_phases = (
+                (self.config.model_type in ("glm_moe_dsa", "glm5_next")
+                 and self.glm53_fp8_direct_qmv
+                 and not self.glm53_fp8_direct_qmv_decode_only)
+                or (self.config.model_type == "qwen4_exp"
+                    and self.qwen4_fp8_direct_qmv
+                    and not self.qwen4_fp8_direct_qmv_decode_only)
+            )
+            if direct_all_phases:
                 self.expert_resident_bytes_per_weight = (
                     self.expert_storage_bytes_per_weight)
         elif (self.quantization and self.config.model_type != "gpt_oss"
@@ -1048,23 +1087,36 @@ class WeightStore:
                     # intended dequant operation remains FP8->FP32, FP32
                     # multiply, and final BF16 rounding in both decoders.
                     scale = scale.astype(mx.float32)
-                direct_expert = (
+                is_glm_direct = (
                     self.glm53_fp8_direct_qmv_active
-                    and self.config.model_type in ("glm_moe_dsa", "glm5_next")
-                    and ".mlp.experts." in name
-                )
+                    and self.config.model_type in ("glm_moe_dsa", "glm5_next"))
+                is_qwen_direct = (
+                    self.qwen4_fp8_direct_qmv_active
+                    and self.config.model_type == "qwen4_exp")
+                direct_expert = bool(
+                    (is_glm_direct or is_qwen_direct)
+                    and ".mlp.experts." in name)
                 if direct_expert:
+                    recorder = (
+                        self._record_qwen4_fp8_direct_matmul
+                        if is_qwen_direct
+                        else self._record_glm53_fp8_direct_matmul)
                     joined[name] = FineGrainedFP8Tensor(
                         weight,
                         scale,
                         tuple(glm53.block_shape),
                         native_fallback=self.native_glm53_fp8_dequant,
-                        recorder=self._record_glm53_fp8_direct_matmul,
+                        recorder=recorder,
                     )
                     with self._stage_lock:
-                        self.glm53_fp8_direct_pages += 1
-                        self.glm53_fp8_direct_resident_bytes += int(
-                            joined[name].nbytes)
+                        if is_qwen_direct:
+                            self.qwen4_fp8_direct_pages += 1
+                            self.qwen4_fp8_direct_resident_bytes += int(
+                                joined[name].nbytes)
+                        else:
+                            self.glm53_fp8_direct_pages += 1
+                            self.glm53_fp8_direct_resident_bytes += int(
+                                joined[name].nbytes)
                     continue
                 is_expert_prefetch = threading.current_thread().name.startswith(
                     "vmodel-expert-batch")
@@ -1182,6 +1234,37 @@ class WeightStore:
                 int(self.glm53_fp8_direct_fallback_positions),
                 int(self.glm53_fp8_direct_fallback_reconstruct_ns),
                 int(self.glm53_fp8_direct_fallback_reconstruct_bytes),
+            )
+
+    def _record_qwen4_fp8_direct_matmul(
+        self, *, direct: bool, positions: int,
+        fallback_reconstruct_ns: int = 0,
+        fallback_reconstruct_bytes: int = 0,
+    ) -> None:
+        with self._stage_lock:
+            if direct:
+                self.qwen4_fp8_direct_qmv_calls += 1
+                self.qwen4_fp8_direct_qmv_positions += max(0, int(positions))
+            else:
+                self.qwen4_fp8_direct_fallback_calls += 1
+                self.qwen4_fp8_direct_fallback_positions += max(
+                    0, int(positions))
+                self.qwen4_fp8_direct_fallback_reconstruct_ns += max(
+                    0, int(fallback_reconstruct_ns))
+                self.qwen4_fp8_direct_fallback_reconstruct_bytes += max(
+                    0, int(fallback_reconstruct_bytes))
+
+    def qwen4_fp8_direct_snapshot(self) -> tuple[int, ...]:
+        with self._stage_lock:
+            return (
+                int(self.qwen4_fp8_direct_pages),
+                int(self.qwen4_fp8_direct_resident_bytes),
+                int(self.qwen4_fp8_direct_qmv_calls),
+                int(self.qwen4_fp8_direct_qmv_positions),
+                int(self.qwen4_fp8_direct_fallback_calls),
+                int(self.qwen4_fp8_direct_fallback_positions),
+                int(self.qwen4_fp8_direct_fallback_reconstruct_ns),
+                int(self.qwen4_fp8_direct_fallback_reconstruct_bytes),
             )
 
     def parallel_tier_snapshot(self) -> tuple[int, ...]:

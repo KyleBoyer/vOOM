@@ -418,6 +418,13 @@ def _cache_io_snapshot(engine) -> tuple[int, ...]:
         if callable(glm53_fp8_direct_snapshot)
         else (0, 0, 0, 0, 0, 0, 0, 0)
     )
+    qwen4_fp8_direct_snapshot = getattr(
+        engine.store, "qwen4_fp8_direct_snapshot", None)
+    qwen4_fp8_direct_stages = (
+        qwen4_fp8_direct_snapshot()
+        if callable(qwen4_fp8_direct_snapshot)
+        else (0, 0, 0, 0, 0, 0, 0, 0)
+    )
     scale_snapshot = getattr(
         engine.store, "k3_scale_sidecar_snapshot", None
     )
@@ -518,6 +525,7 @@ def _cache_io_snapshot(engine) -> tuple[int, ...]:
         *store_stages,
         *glm53_fp8_stages,
         *glm53_fp8_direct_stages,
+        *qwen4_fp8_direct_stages,
         *scale_stages,
         *nf12_stages,
     )
@@ -625,6 +633,14 @@ def _record_cache_io_delta(
         "glm53_fp8_direct_fallback_positions",
         "glm53_fp8_direct_fallback_reconstruct_ns",
         "glm53_fp8_direct_fallback_reconstruct_bytes",
+        "qwen4_fp8_direct_pages",
+        "qwen4_fp8_direct_resident_bytes",
+        "qwen4_fp8_direct_qmv_calls",
+        "qwen4_fp8_direct_qmv_positions",
+        "qwen4_fp8_direct_fallback_calls",
+        "qwen4_fp8_direct_fallback_positions",
+        "qwen4_fp8_direct_fallback_reconstruct_ns",
+        "qwen4_fp8_direct_fallback_reconstruct_bytes",
         "k3_scale_sidecar_read_bytes", "k3_scale_sidecar_output_bytes",
         "k3_scale_sidecar_decode_ns", "k3_scale_sidecar_decode_calls",
         "bf16_nf12_read_bytes", "bf16_nf12_output_bytes",
@@ -720,6 +736,10 @@ def _quantization_cache_identity(rc: "RuntimeConfig", store) -> str:
     if getattr(store, "glm53_fp8_direct_qmv", False):
         identity += "+glm53-fp8-direct-qmv"
         if getattr(store, "glm53_fp8_direct_qmv_decode_only", False):
+            identity += "-decode-only"
+    if getattr(store, "qwen4_fp8_direct_qmv", False):
+        identity += "+qwen4-fp8-direct-qmv"
+        if getattr(store, "qwen4_fp8_direct_qmv_decode_only", False):
             identity += "-decode-only"
     return identity
 
@@ -2209,7 +2229,8 @@ class StreamingEngine:
             # into a new automatic public-server path.
             self._auto_compact_expert_batch = 0
             if (self.store.native_ct_mxfp4
-                    or getattr(self.store, "glm53_fp8_direct_qmv", False)):
+                    or getattr(self.store, "glm53_fp8_direct_qmv", False)
+                    or getattr(self.store, "qwen4_fp8_direct_qmv", False)):
                 inter = (
                     getattr(self.cfg, "moe_intermediate_size", None)
                     or self.cfg.intermediate_size)
@@ -2338,7 +2359,8 @@ class StreamingEngine:
         elif self.store.on_disk_quantized:
             resident_bytes_per_weight = self.store.quantized_bytes_per_weight
         elif (self.store.native_ct_mxfp4
-              or getattr(self.store, "glm53_fp8_direct_qmv", False)):
+              or getattr(self.store, "glm53_fp8_direct_qmv", False)
+              or getattr(self.store, "qwen4_fp8_direct_qmv", False)):
             resident_bytes_per_weight = (
                 self.store.expert_resident_bytes_per_weight)
         elif self.rc.quant_bits:
@@ -2405,6 +2427,7 @@ class StreamingEngine:
             if (self.store.on_disk_quantized
                 or self.store.native_ct_mxfp4
                 or getattr(self.store, "glm53_fp8_direct_qmv", False)
+                or getattr(self.store, "qwen4_fp8_direct_qmv", False)
                 or not self.rc.quant_bits)
             else dense_expert_page_bytes + self._expert_page_bytes
         )
@@ -5122,7 +5145,7 @@ class StreamingEngine:
         kv.dsv4_cstate = states
         kv.dsv4_pos = snapshot["pos"]
 
-    def _set_glm53_fp8_direct_phase(self, phase: str) -> None:
+    def _set_finegrained_fp8_direct_phase(self, phase: str) -> None:
         """Select the released expert representation at a safe phase boundary.
 
         A decode-only direct-QMV profile materializes ordinary BF16 expert
@@ -5131,25 +5154,34 @@ class StreamingEngine:
         representation, so a page produced in one phase can never be consumed
         under the other phase's arithmetic contract.
         """
-        store = self.store
-        if not getattr(store, "glm53_fp8_direct_qmv", False):
-            return
         if phase not in ("prefill", "decode"):
             raise ValueError(f"unsupported direct-QMV phase {phase!r}")
-        decode_only = bool(getattr(
-            store, "glm53_fp8_direct_qmv_decode_only", False))
-        store.glm53_fp8_direct_qmv_active = bool(
-            not decode_only or phase == "decode")
+        store = self.store
+        for family in ("glm53", "qwen4"):
+            requested = bool(getattr(
+                store, f"{family}_fp8_direct_qmv", False))
+            if not requested:
+                continue
+            decode_only = bool(getattr(
+                store, f"{family}_fp8_direct_qmv_decode_only", False))
+            setattr(
+                store,
+                f"{family}_fp8_direct_qmv_active",
+                bool(not decode_only or phase == "decode"),
+            )
 
     def _expert_cache_key(
         self, layer: int, expert: int, module_base: str | None = None,
     ) -> str:
         scope = module_base.replace(".", "_") if module_base else f"layer.{layer}"
         store = self.store
-        if getattr(store, "glm53_fp8_direct_qmv_decode_only", False):
+        family = (
+            "qwen4" if getattr(store, "qwen4_fp8_direct_qmv", False)
+            else "glm53")
+        if getattr(store, f"{family}_fp8_direct_qmv_decode_only", False):
             representation = (
                 "fp8direct" if getattr(
-                    store, "glm53_fp8_direct_qmv_active", False)
+                    store, f"{family}_fp8_direct_qmv_active", False)
                 else "bf16")
             scope = f"{scope}.{representation}"
         return f"{scope}.expert.{expert}"
@@ -10619,7 +10651,7 @@ class StreamingEngine:
             self._dspark_tap_collector.begin_attempt()
         if self._request_profiler is not None:
             self._request_profiler.set_phase("prefill")
-        self._set_glm53_fp8_direct_phase("prefill")
+        self._set_finegrained_fp8_direct_phase("prefill")
         sampling = sampling or SamplingParams()
         sampling.seed_rng()
         stop = stop or []
@@ -12453,7 +12485,7 @@ class StreamingEngine:
         prefill_cache_after = _cache_io_snapshot(self)
         prefill_s = (time.perf_counter() - t0
                      + path_stats["tool_pic_prefill_s"])
-        self._set_glm53_fp8_direct_phase("decode")
+        self._set_finegrained_fp8_direct_phase("decode")
         if self._request_profiler is not None:
             self._request_profiler.set_phase("decode")
         if (self.cfg.model_type == "deepseek_v4"
@@ -12912,6 +12944,11 @@ class StreamingEngine:
             path_stats["qwen4_per_expert_fp8"] = int(
                 getattr(self.store, "qwen4_expert_layout", "")
                 == "per-expert-fp8")
+            path_stats["qwen4_fp8_direct_qmv"] = int(
+                bool(getattr(self.store, "qwen4_fp8_direct_qmv", False)))
+            path_stats["qwen4_fp8_direct_qmv_decode_only"] = int(bool(
+                getattr(
+                    self.store, "qwen4_fp8_direct_qmv_decode_only", False)))
         dsa_state = getattr(kv, "dsa", None)
         if dsa_state is not None:
             path_stats["dsa_observations"] = dsa_state.stats["observations"]

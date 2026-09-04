@@ -152,9 +152,12 @@ def _run(
                 if key.startswith("qwen4_mtp_")
                 or key.startswith("qwen4_serial_verify_")
                 or key.startswith("qwen4_phase_lm_head")
+                or key.startswith("qwen4_fp8_direct_")
                 or key in {
                     "weight_store_bytes_read", "weight_archive_bytes",
                     "weight_fast_tier_bytes", "cache_source",
+                    "qwen4_fp8_direct_qmv",
+                    "qwen4_fp8_direct_qmv_decode_only",
                 }
             },
             "decode_route_overlap": {

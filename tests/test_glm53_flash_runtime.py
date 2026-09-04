@@ -281,29 +281,30 @@ def test_glm53_compressed_mla_factory_uses_exact_stepped_cache():
     assert pooled.dsa.incremental_pool_cache is True
 
 
-def test_glm53_decode_only_direct_qmv_qualifies_cache_representation():
+@pytest.mark.parametrize("family", ["glm53", "qwen4"])
+def test_decode_only_direct_qmv_qualifies_cache_representation(family):
     from runtime.engine import StreamingEngine
 
     engine = StreamingEngine.__new__(StreamingEngine)
-    engine.store = SimpleNamespace(
-        glm53_fp8_direct_qmv=True,
-        glm53_fp8_direct_qmv_decode_only=True,
-        glm53_fp8_direct_qmv_active=True,
-    )
+    engine.store = SimpleNamespace(**{
+        f"{family}_fp8_direct_qmv": True,
+        f"{family}_fp8_direct_qmv_decode_only": True,
+        f"{family}_fp8_direct_qmv_active": True,
+    })
 
-    engine._set_glm53_fp8_direct_phase("prefill")
-    assert engine.store.glm53_fp8_direct_qmv_active is False
+    engine._set_finegrained_fp8_direct_phase("prefill")
+    assert getattr(engine.store, f"{family}_fp8_direct_qmv_active") is False
     assert engine._expert_cache_key(3, 7) == "layer.3.bf16.expert.7"
     assert engine._expert_cache_key(
         0, 2, "mtp.layers.0") == "mtp_layers_0.bf16.expert.2"
 
-    engine._set_glm53_fp8_direct_phase("decode")
-    assert engine.store.glm53_fp8_direct_qmv_active is True
+    engine._set_finegrained_fp8_direct_phase("decode")
+    assert getattr(engine.store, f"{family}_fp8_direct_qmv_active") is True
     assert engine._expert_cache_key(3, 7) == "layer.3.fp8direct.expert.7"
     assert engine._expert_cache_key(
         0, 2, "mtp.layers.0") == "mtp_layers_0.fp8direct.expert.2"
 
-    engine.store.glm53_fp8_direct_qmv_decode_only = False
+    setattr(engine.store, f"{family}_fp8_direct_qmv_decode_only", False)
     assert engine._expert_cache_key(3, 7) == "layer.3.expert.7"
 
 

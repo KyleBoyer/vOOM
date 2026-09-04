@@ -106,6 +106,13 @@ def exact_verify_bf16_rejection_reason(
 
     if _EXACT_VERIFY_BF16_GEMV is None:
         return "unavailable"
+    # Packed lossless carriers deliberately implement only their own matmul
+    # contract; they are not MLX arrays and have no rank/dtype attributes.
+    # Reject them here so the verifier's existing singleton fallback can
+    # dispatch each row through that carrier's exact QMV instead of crashing
+    # while probing dense-kernel geometry.
+    if not hasattr(weight, "ndim") or not hasattr(weight, "dtype"):
+        return "weight_representation"
     if x.ndim != 3 or weight.ndim != 2:
         return "rank"
     if x.dtype != mx.bfloat16 or weight.dtype != mx.bfloat16:

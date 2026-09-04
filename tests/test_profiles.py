@@ -232,6 +232,19 @@ def test_builtin_profiles_resolve_complete_agent_group():
     assert glm_decode_direct_settings[
         "VMODEL_GLM53_FP8_DIRECT_QMV_DECODE_ONLY"] == "1"
 
+    qwen_direct_order, qwen_direct_settings = resolve_runtime_profiles((
+        "qwen38-flash-next-uncensored-fp8-fast-tier-mtp-"
+        "direct-fp8-qmv-decode-only",
+    ), catalog)
+    assert qwen_direct_order[-2:] == (
+        "qwen38-flash-next-uncensored-fp8-fast-tier-mtp",
+        "qwen38-flash-next-uncensored-fp8-fast-tier-mtp-"
+        "direct-fp8-qmv-decode-only",
+    )
+    assert qwen_direct_settings["VMODEL_QWEN4_FP8_DIRECT_QMV"] == "1"
+    assert qwen_direct_settings[
+        "VMODEL_QWEN4_FP8_DIRECT_QMV_DECODE_ONLY"] == "1"
+
     glm_absorbed_order, glm_absorbed_settings = resolve_runtime_profiles(
         ("glm53-flash-e-compact-mla",), catalog)
     assert glm_absorbed_order == (

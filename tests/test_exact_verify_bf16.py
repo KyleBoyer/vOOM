@@ -11,6 +11,17 @@ from runtime.exact_verify_bf16 import (
 )
 
 
+def test_non_array_weight_representation_falls_back_cleanly():
+    class PackedWeight:
+        pass
+
+    x = mx.zeros((1, 2, 8), dtype=mx.bfloat16)
+    weight = PackedWeight()
+    assert exact_verify_bf16_rejection_reason(
+        x, weight) == "weight_representation"
+    assert exact_verify_bf16_matmul(x, weight) is None
+
+
 @pytest.mark.parametrize(
     ("length", "inputs", "outputs"),
     [
