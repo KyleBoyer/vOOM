@@ -47,15 +47,19 @@ Evidence:
 `logs/qwen_uncensored_fp8_fast_tier_plex_max32_20260903.json`, and
 `logs/qwen_uncensored_fp8_fast_tier_cache256_plex_max32_20260903.json`.
 
-The Hub search also found a same-layout uncensored GLM-5.3-Flash candidate:
-`dealignai/GLM-5.3-Flash-UNCENSORED-FP8` at immutable revision
-`d21b19569d30e6f471c433b11e672b3bbb80552a`.  Metadata says 74 files,
-62 safetensor shards, and 328,337,456,936 safetensor bytes; its 76,108 tensor
-names, shard mapping, and total tensor bytes exactly match the installed
-official tree.  It retains vision and native MTP.  The publisher reports the
-corrected checkpoint at MMLU 87.33 versus base 86.74, but that is not local
-acceptance evidence.  Pin/size/hash planning and the same local quality gates
-are required before any in-place replacement.
+The refreshed Hub search reconfirmed the uncensored GLM releases already
+installed earlier in this same session; no second replacement is needed.
+`models/GLM-5.3-Flash` has a finalized, marker-free receipt for
+`dealignai/GLM-5.3-Flash-UNCENSORED-FP8` revision
+`d21b19569d30e6f471c433b11e672b3bbb80552a`: 74 files, 62 shards, and
+328,366,192,129 verified candidate bytes.  Its 76,108 tensor names and shard
+mapping match the base layout, and it retains vision and native MTP.  The
+publisher reports MMLU 87.33 versus base 86.74, but that remains a publisher
+claim rather than local acceptance evidence.  `models/GLM-5.3` likewise has a
+finalized, marker-free receipt for `dealignai/GLM-5.3-UNCENSORED-FP8` revision
+`aff05d054bf581b95bdfd87ba9792dbf1e4365b2`, with 282 shards and
+755,663,675,562 verified candidate bytes.  Both current trees still require
+the same local harness/pressure gates; neither should be downloaded again.
 
 ## 2026-09-03: public uncensored Qwen FP8 replacement is live; quality gate pending
 
