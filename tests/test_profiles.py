@@ -383,6 +383,24 @@ def test_builtin_profiles_resolve_complete_agent_group():
     assert glm_full_native_settings[
         "VMODEL_GLM_DSA_PREFILL_TILE_WIDTH"] == "32"
 
+    glm_full_tile16_order, glm_full_tile16_settings = (
+        resolve_runtime_profiles(
+            ("glm53-full-lossless-long-context-native-fp8-tile16",),
+            catalog))
+    assert glm_full_tile16_order == (
+        "glm53-full-lossless-long-context",
+        "glm53-full-lossless-long-context-native-fp8",
+        "glm53-full-lossless-long-context-native-fp8-tile16",
+    )
+    assert glm_full_tile16_settings[
+        "VMODEL_GLM53_NATIVE_FP8_DEQUANT"] == "1"
+    assert glm_full_tile16_settings[
+        "VMODEL_GLM_DSA_PREFILL_TILE_WIDTH"] == "16"
+    assert glm_full_tile16_settings[
+        "VMODEL_GLM_DSA_SELECTION_QUERY_TILE_SIZE"] == "64"
+    assert glm_full_tile16_settings[
+        "VMODEL_GLM53_EXPERT_BATCH_PREFETCH"] == "0"
+
     glm_preallocate_order, glm_preallocate_settings = resolve_runtime_profiles(
         ("glm53-full-lossless-index-preallocate",), catalog)
     assert glm_preallocate_order == (

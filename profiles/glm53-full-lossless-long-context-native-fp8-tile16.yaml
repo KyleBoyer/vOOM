@@ -1,0 +1,11 @@
+schema: voom.runtime-profile.v1
+name: glm53-full-lossless-long-context-native-fp8-tile16
+description: Exact lower-residency full GLM-5.3 long-context capacity profile.
+notes:
+  - "Extends the released-weight native-FP8 long-context route and halves only the outer layer-stationary attention tile from 32 to 16 positions. Released tensors, DSA selection, attention rows, expert order, matmuls, and reductions are unchanged."
+  - "This is a capacity experiment for the 46,849-token replay, where tile 32 narrowly refused a 2.18GB attention reservation. It is expected to trade throughput for lower live attention/index residency."
+  - "Keep explicit/default-off. Require a complete temperature-zero identity gate plus the F22/F33 long-context conformance rungs before promotion. Width 8 was already rejected as catastrophically slow."
+extends:
+  - glm53-full-lossless-long-context-native-fp8
+settings:
+  VMODEL_GLM_DSA_PREFILL_TILE_WIDTH: 16
