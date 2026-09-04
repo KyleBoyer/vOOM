@@ -1,5 +1,62 @@
 # STATUS — 2026-09-03 (current corrections first; dated chronology below is history)
 
+## 2026-09-03: uncensored Qwen FP8 gets an exact route-hot tier
+
+The Qwen fast-tier builder and loader now support the replacement checkpoint's
+real per-expert FP8 layout.  A placement unit is indivisible: three E4M3
+matrices plus their three published BF16 inverse-scale grids.  New schema
+`voom.qwen4-per-expert-fp8-fast-tier.v1` binds the immutable candidate
+revision, complete config/index hashes, layout, trace digest, source shard and
+offset, dtype, shape, and every copied extent.  A new fixture proves exact
+runtime reconstruction from the tier; 338 focused tests pass.
+
+The privacy-safe trace came from the real focused Plex request with its full
+released tool schema: 2,358 input tokens, one tool, and 32 requested outputs.
+It records only route IDs and coarse request shape.  The resulting internal
+tier contains 20,498,886,000 exact source bytes / 25,020 tensors / 4,170
+complete experts (86-87 per layer, with the 24 trace-hot experts placed first).
+The full post-build comparison against candidate revision
+`2d9a479...` passed every byte.  Total internal fast-tier use is 62.50GB and
+root free space remained 22.67GB, within the 90GB/10GB policies.
+
+Candidate-native MTP over the tier passed the four-token state oracle: tokens,
+text, and all 121 KV/KDA/QSA/PLE arrays matched plain target generation; peak
+Metal was 1.834GB and swap-out growth 4.817MB.  The unrelated tiny prompt was
+slightly slower, so this is explicitly workload-scoped.  On the identical
+2,358-input/32-output Plex shape, however, the tier preserved the exact output
+prefix and improved wall 338.095 -> 301.675s (-10.77%), engine 324.839 ->
+287.657s (-11.44%), prefill 180.681 -> 164.779s (-8.80%), and decode 144.155
+-> 122.876s (-14.76%).  It moved 54.280GB to the internal SSD and hid 29.550s
+of 31.041s fast-device service behind 132.209s of archive service.  A 256MB
+scan-cache repeat took 303.099s, lowered peak Metal 4.430 -> 4.292GB, and held
+swap-out growth to 11.960MB; that safer setting is selected despite the 1.424s
+cost.  The 32-token run ends mid-tool-call, so its rubric score is not a valid
+quality measurement.
+
+Explicit profiles:
+`qwen38-flash-next-uncensored-fp8-fast-tier-mtp` and its exact in-memory
+continuation variant
+`qwen38-flash-next-uncensored-fp8-fast-tier-mtp-hot-kv`.  The latter applies
+FreeToken's semantic-anchor idea only on an exact candidate-token prefix and
+uses no stale official endpoint or persistent journal.  It remains pending a
+full 256-token multi-turn Plex quality/pressure gate.
+
+Evidence:
+`logs/qwen_uncensored_fp8_plex_trace_max32_20260903.json`,
+`logs/qwen_uncensored_fp8_fast_tier_mtp_depth3_oracle_20260903.json`,
+`logs/qwen_uncensored_fp8_fast_tier_plex_max32_20260903.json`, and
+`logs/qwen_uncensored_fp8_fast_tier_cache256_plex_max32_20260903.json`.
+
+The Hub search also found a same-layout uncensored GLM-5.3-Flash candidate:
+`dealignai/GLM-5.3-Flash-UNCENSORED-FP8` at immutable revision
+`d21b19569d30e6f471c433b11e672b3bbb80552a`.  Metadata says 74 files,
+62 safetensor shards, and 328,337,456,936 safetensor bytes; its 76,108 tensor
+names, shard mapping, and total tensor bytes exactly match the installed
+official tree.  It retains vision and native MTP.  The publisher reports the
+corrected checkpoint at MMLU 87.33 versus base 86.74, but that is not local
+acceptance evidence.  Pin/size/hash planning and the same local quality gates
+are required before any in-place replacement.
+
 ## 2026-09-03: public uncensored Qwen FP8 replacement is live; quality gate pending
 
 `models/Qwen3.8-Flash-Next` now contains the complete pinned

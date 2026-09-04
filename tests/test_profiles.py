@@ -504,6 +504,41 @@ def test_builtin_profiles_resolve_complete_agent_group():
     assert "VMODEL_QWEN4_FAST_TIER_DIR" not in uncensored_mtp_settings
     assert uncensored_mtp_settings["VMODEL_QWEN4_HOT_PROMPT_KV"] == "0"
 
+    uncensored_fast_order, uncensored_fast_settings = (
+        resolve_runtime_profiles(
+            ("qwen38-flash-next-uncensored-fp8-fast-tier-mtp",),
+            catalog))
+    assert uncensored_fast_order == (
+        "qwen38-flash-next-candidate-bf16",
+        "qwen38-flash-next-uncensored-fp8",
+        "qwen38-flash-next-uncensored-fp8-mtp",
+        "qwen38-flash-next-uncensored-fp8-fast-tier-mtp",
+    )
+    assert uncensored_fast_settings[
+        "VMODEL_QWEN4_FAST_TIER_DIR"].endswith(
+            "Qwen3.8-Flash-Next-uncensored-fp8-plex-hot24")
+    assert uncensored_fast_settings[
+        "VMODEL_QWEN4_PARALLEL_STORAGE_READS"] == "1"
+    assert uncensored_fast_settings[
+        "VMODEL_QWEN4_FAST_TIER_DECODE_ONLY"] == "0"
+    assert uncensored_fast_settings[
+        "VMODEL_QWEN4_WEIGHT_CACHE_MB"] == "256"
+    assert uncensored_fast_settings["VMODEL_QWEN4_MTP_DEPTH"] == "3"
+
+    uncensored_hot_order, uncensored_hot_settings = (
+        resolve_runtime_profiles(
+            ("qwen38-flash-next-uncensored-fp8-fast-tier-mtp-hot-kv",),
+            catalog))
+    assert uncensored_hot_order[-2:] == (
+        "qwen38-flash-next-uncensored-fp8-fast-tier-mtp",
+        "qwen38-flash-next-uncensored-fp8-fast-tier-mtp-hot-kv",
+    )
+    assert uncensored_hot_settings["VMODEL_QWEN4_HOT_PROMPT_KV"] == "1"
+    assert uncensored_hot_settings["VMODEL_QWEN4_HOT_KV_SLOTS"] == "2"
+    assert uncensored_hot_settings[
+        "VMODEL_QWEN4_HOT_KV_MIN_TOKENS"] == "16"
+    assert uncensored_hot_settings["VMODEL_QWEN4_HOT_KV_PERSIST_DIR"] == ""
+
     candidate_fast_order, candidate_fast_settings = resolve_runtime_profiles(
         ("qwen38-flash-next-candidate-fast-tier",), catalog)
     assert candidate_fast_order == (

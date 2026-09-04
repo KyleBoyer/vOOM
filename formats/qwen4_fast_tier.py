@@ -1,9 +1,12 @@
-"""Exact, balanced Qwen4 fused-expert ranges for a second local SSD.
+"""Exact, balanced Qwen4 expert ranges for a second local SSD.
 
-Qwen4-Exp stores all 512 experts of a layer in two multi-gigabyte tensors.
-The generic whole-tensor mirror cannot balance a small fast-tier budget across
-48 layers. This builder copies complete per-expert gate/up/down byte ranges,
-unchanged, and emits the ordinary raw fast-tier map plus a source binding.
+Official Qwen4-Exp stores all 512 experts of a layer in two multi-gigabyte
+tensors. Published FP8 derivatives may instead store one weight and scale grid
+per projection and expert.  The generic whole-tensor mirror cannot balance a
+small fast-tier budget across 48 layers. This builder copies complete expert
+groups unchanged and emits the ordinary raw fast-tier map plus a source
+binding. A group is three BF16 matrix slices for the fused layout, or all three
+FP8 weights and their three released scale grids for the per-expert layout.
 """
 
 from __future__ import annotations
@@ -31,6 +34,7 @@ from .kimi_k3_fast_tier import (
 
 
 SCHEMA = "voom.qwen4-fused-expert-fast-tier.v1"
+PER_EXPERT_FP8_SCHEMA = "voom.qwen4-per-expert-fp8-fast-tier.v1"
 TRUNK_FIRST_SCHEMA = "voom.qwen4-trunk-first-fast-tier.v2"
 BINDING_NAME = "qwen4_fused_expert_fast_tier.json"
 MANIFEST_NAME = "fast_tier_manifest.json"
@@ -103,47 +107,146 @@ def _catalog(model_dir: Path) -> tuple[list[dict], dict]:
             raise ValueError(f"unexpected fused expert bytes: {raw_name}")
         return shard, payload_base + start
 
-    matrix_bytes = hidden * width * 2
+    def tensor_entry(name: str, dtype: str, shape: tuple[int, ...]) -> dict:
+        physical_names = [
+            name,
+            "model.language_model." + name[len("model."):],
+            "language_model." + name,
+            "language_model." + name[len("model."):],
+        ]
+        matches = [candidate for candidate in physical_names
+                   if candidate in weight_map]
+        if len(matches) != 1:
+            raise ValueError(
+                f"Qwen4 checkpoint expected one physical tensor for {name}, "
+                f"found {matches}")
+        physical_name = matches[0]
+        shard = weight_map[physical_name]
+        if shard not in header_cache:
+            header_cache[shard] = _header(model_dir / shard)
+        header, payload_base = header_cache[shard]
+        metadata = header.get(physical_name)
+        if not (
+            isinstance(metadata, dict)
+            and str(metadata.get("dtype", "")).upper() == dtype
+            and tuple(int(value) for value in metadata.get("shape", ()))
+            == shape
+        ):
+            raise ValueError(
+                f"unexpected per-expert FP8 metadata: {physical_name}")
+        start, end = (int(value) for value in metadata["data_offsets"])
+        item_size = {"F8_E4M3": 1, "BF16": 2, "F32": 4}[dtype]
+        expected = item_size
+        for value in shape:
+            expected *= value
+        if end - start != expected:
+            raise ValueError(
+                f"unexpected per-expert FP8 bytes: {physical_name}")
+        return {
+            "name": name,
+            "source_file": shard,
+            "source_offset": payload_base + start,
+            "nbytes": expected,
+            "dtype": dtype,
+            "shape": list(shape),
+        }
+
     groups: list[dict] = []
-    for layer in range(layers):
-        gate_shard, gate_start = physical(
-            layer, "gate_up_proj", (experts, 2 * width, hidden))
-        down_shard, down_start = physical(
-            layer, "down_proj", (experts, hidden, width))
-        for expert in range(experts):
-            prefix = f"model.layers.{layer}.mlp.experts.{expert}"
-            gate_expert = gate_start + expert * 2 * matrix_bytes
-            groups.append({
-                "layer": layer,
-                "expert": expert,
-                "nbytes": 3 * matrix_bytes,
-                "entries": (
-                    {
-                        "name": f"{prefix}.gate_proj.weight",
-                        "source_file": gate_shard,
-                        "source_offset": gate_expert,
-                        "nbytes": matrix_bytes,
-                        "dtype": "BF16",
-                        "shape": [width, hidden],
-                    },
-                    {
-                        "name": f"{prefix}.up_proj.weight",
-                        "source_file": gate_shard,
-                        "source_offset": gate_expert + matrix_bytes,
-                        "nbytes": matrix_bytes,
-                        "dtype": "BF16",
-                        "shape": [width, hidden],
-                    },
-                    {
-                        "name": f"{prefix}.down_proj.weight",
-                        "source_file": down_shard,
-                        "source_offset": down_start + expert * matrix_bytes,
-                        "nbytes": matrix_bytes,
-                        "dtype": "BF16",
-                        "shape": [hidden, width],
-                    },
-                ),
-            })
+    fused_probe = (
+        "model.language_model.layers.0.mlp.experts.gate_up_proj"
+        in weight_map)
+    canonical_fp8_probe = "model.layers.0.mlp.experts.0.gate_proj.weight"
+    fp8_probe = any(candidate in weight_map for candidate in (
+        canonical_fp8_probe,
+        "model.language_model." + canonical_fp8_probe[len("model."):],
+        "language_model." + canonical_fp8_probe,
+        "language_model." + canonical_fp8_probe[len("model."):],
+    ))
+    if fused_probe == fp8_probe:
+        raise ValueError(
+            "Qwen4 checkpoint must contain exactly one supported expert layout")
+
+    scale_dtypes: set[str] = set()
+    if fused_probe:
+        matrix_bytes = hidden * width * 2
+        for layer in range(layers):
+            gate_shard, gate_start = physical(
+                layer, "gate_up_proj", (experts, 2 * width, hidden))
+            down_shard, down_start = physical(
+                layer, "down_proj", (experts, hidden, width))
+            for expert in range(experts):
+                prefix = f"model.layers.{layer}.mlp.experts.{expert}"
+                gate_expert = gate_start + expert * 2 * matrix_bytes
+                groups.append({
+                    "layer": layer,
+                    "expert": expert,
+                    "nbytes": 3 * matrix_bytes,
+                    "entries": (
+                        {
+                            "name": f"{prefix}.gate_proj.weight",
+                            "source_file": gate_shard,
+                            "source_offset": gate_expert,
+                            "nbytes": matrix_bytes,
+                            "dtype": "BF16",
+                            "shape": [width, hidden],
+                        },
+                        {
+                            "name": f"{prefix}.up_proj.weight",
+                            "source_file": gate_shard,
+                            "source_offset": gate_expert + matrix_bytes,
+                            "nbytes": matrix_bytes,
+                            "dtype": "BF16",
+                            "shape": [width, hidden],
+                        },
+                        {
+                            "name": f"{prefix}.down_proj.weight",
+                            "source_file": down_shard,
+                            "source_offset": down_start + expert * matrix_bytes,
+                            "nbytes": matrix_bytes,
+                            "dtype": "BF16",
+                            "shape": [hidden, width],
+                        },
+                    ),
+                })
+        expert_layout = "fused-bf16"
+    else:
+        block = (raw.get("quantization_config") or {}).get(
+            "weight_block_size")
+        if block != [128, 128]:
+            raise ValueError(
+                "Qwen4 per-expert FP8 fast tier requires 128x128 scales")
+        for layer in range(layers):
+            for expert in range(experts):
+                prefix = f"model.layers.{layer}.mlp.experts.{expert}"
+                entries = []
+                for projection, shape in (
+                    ("gate_proj", (width, hidden)),
+                    ("up_proj", (width, hidden)),
+                    ("down_proj", (hidden, width)),
+                ):
+                    stem = f"{prefix}.{projection}"
+                    weight = tensor_entry(
+                        f"{stem}.weight", "F8_E4M3", shape)
+                    scale_shape = tuple(
+                        (extent + 127) // 128 for extent in shape)
+                    scale_name = f"{stem}.weight_scale_inv"
+                    try:
+                        scale = tensor_entry(scale_name, "BF16", scale_shape)
+                        scale_dtypes.add("BF16")
+                    except ValueError as bf16_error:
+                        try:
+                            scale = tensor_entry(scale_name, "F32", scale_shape)
+                            scale_dtypes.add("F32")
+                        except ValueError:
+                            raise bf16_error
+                    entries.extend((weight, scale))
+                groups.append({
+                    "layer": layer,
+                    "expert": expert,
+                    "nbytes": sum(item["nbytes"] for item in entries),
+                    "entries": tuple(entries),
+                })
+        expert_layout = "per-expert-fp8"
     return groups, {
         "source_index_sha256": _sha256(index_bytes),
         "source_config_sha256": _sha256(config_bytes),
@@ -152,7 +255,20 @@ def _catalog(model_dir: Path) -> tuple[list[dict], dict]:
         "expert_width": width,
         "experts": experts,
         "layers": layers,
+        "expert_layout": expert_layout,
+        "expert_scale_dtypes": sorted(scale_dtypes),
     }
+
+
+def _schema_for(identity: dict, placement: str) -> str:
+    if placement == "trunk-first":
+        if identity["expert_layout"] != "fused-bf16":
+            raise ValueError(
+                "per-expert FP8 trunk-first placement is not implemented")
+        return TRUNK_FIRST_SCHEMA
+    if identity["expert_layout"] == "per-expert-fp8":
+        return PER_EXPERT_FP8_SCHEMA
+    return SCHEMA
 
 
 def _canonical_name(name: str) -> str:
@@ -423,6 +539,7 @@ def build_qwen4_fast_tier(
     if candidate_max_bytes:
         available = min(available, candidate_max_bytes)
     groups, identity = _catalog(model_dir)
+    schema = _schema_for(identity, placement)
     trunk = (
         _trunk_catalog(model_dir, identity["layers"])
         if placement == "trunk-first" else []
@@ -521,9 +638,7 @@ def build_qwen4_fast_tier(
                 output.flush()
                 os.fsync(output.fileno())
             binding = {
-                "schema": (
-                    TRUNK_FIRST_SCHEMA
-                    if placement == "trunk-first" else SCHEMA),
+                "schema": schema,
                 "target_model": model_dir.name,
                 **identity,
                 "placement": placement,
@@ -551,17 +666,19 @@ def build_qwen4_fast_tier(
         raise
 
     return {
-        "schema": (
-            TRUNK_FIRST_SCHEMA if placement == "trunk-first" else SCHEMA),
+        "schema": schema,
         "placement": placement,
         **trace_metadata,
         "source_revision": identity["source_revision"],
+        "expert_layout": identity["expert_layout"],
+        "expert_scale_dtypes": identity["expert_scale_dtypes"],
         "candidate_experts": len(groups),
         "candidate_bytes": sum(item["nbytes"] for item in groups),
         "selected_experts": len(selected),
         "selected_trunk_tensors": len(trunk),
         "selected_trunk_bytes": trunk_bytes,
-        "selected_tensors": len(trunk) + 3 * len(selected),
+        "selected_tensors": len(trunk) + sum(
+            len(item["entries"]) for item in selected),
         "selected_bytes": selected_bytes,
         "selected_experts_per_layer": {
             str(layer): layer_counts.get(layer, 0)
@@ -641,6 +758,10 @@ def build_qwen4_fast_tier_clone(
     if schema == TRUNK_FIRST_SCHEMA and placement == "trunk-first":
         trunk = _trunk_catalog(model_dir, identity["layers"])
     elif schema == SCHEMA and placement == "experts":
+        trunk = []
+    elif (schema == PER_EXPERT_FP8_SCHEMA
+          and placement == "experts"
+          and identity["expert_layout"] == "per-expert-fp8"):
         trunk = []
     else:
         raise ValueError("Qwen4 cloned tier source schema is unsupported")
@@ -783,6 +904,10 @@ def validate_qwen4_fast_tier(
         trunk = _trunk_catalog(model_dir, identity["layers"])
     elif schema == SCHEMA and placement == "experts":
         trunk = []
+    elif (schema == PER_EXPERT_FP8_SCHEMA
+          and placement == "experts"
+          and identity["expert_layout"] == "per-expert-fp8"):
+        trunk = []
     else:
         raise ValueError("Qwen4 fast-tier schema/placement mismatch")
     specs = {
@@ -794,8 +919,15 @@ def validate_qwen4_fast_tier(
     index_bytes = (model_dir / "model.safetensors.index.json").read_bytes()
     config_bytes = (model_dir / "config.json").read_bytes()
     if not (
-        binding.get("schema") in (SCHEMA, TRUNK_FIRST_SCHEMA)
+        binding.get("schema") in (
+            SCHEMA, PER_EXPERT_FP8_SCHEMA, TRUNK_FIRST_SCHEMA)
         and binding.get("target_model") == model_dir.name
+        and (
+            binding.get("expert_layout", identity["expert_layout"])
+            == identity["expert_layout"])
+        and (
+            schema != PER_EXPERT_FP8_SCHEMA
+            or binding.get("expert_layout") == "per-expert-fp8")
         and binding.get("source_index_sha256") == _sha256(index_bytes)
         and binding.get("source_config_sha256") == _sha256(config_bytes)
         and binding.get("fast_manifest_sha256") == _sha256(manifest_bytes)

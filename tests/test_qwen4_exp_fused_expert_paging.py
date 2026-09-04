@@ -344,6 +344,50 @@ def test_qwen4_virtual_fast_tier_is_byte_exact_and_source_bound(tmp_path):
     assert store.archive_bytes == 0
 
 
+def test_qwen4_per_expert_fp8_fast_tier_keeps_weight_scale_groups_exact(
+        tmp_path, monkeypatch):
+    from formats.qwen4_fast_tier import (
+        PER_EXPERT_FP8_SCHEMA,
+        build_qwen4_fast_tier,
+        validate_qwen4_fast_tier,
+    )
+
+    root, _expected = _per_expert_fp8_fixture(tmp_path, bf16_scale=True)
+    fast_root = tmp_path / "fast"
+    # Three 3x4 FP8 matrices plus three 1x1 BF16 scale grids.
+    expert_bytes = 3 * (12 + 2)
+    report = build_qwen4_fast_tier(
+        root, fast_root, max_bytes=2_000_000 + expert_bytes)
+
+    assert report["schema"] == PER_EXPERT_FP8_SCHEMA
+    assert report["expert_layout"] == "per-expert-fp8"
+    assert report["expert_scale_dtypes"] == ["BF16"]
+    assert report["selected_experts"] == 1
+    assert report["selected_tensors"] == 6
+    assert report["selected_bytes"] == expert_bytes
+    target = fast_root / root.name
+    manifest = json.loads((target / "fast_tier_manifest.json").read_text())
+    assert len(manifest) == 6
+    assert all(".experts.0." in name for name in manifest)
+    assert sum(entry["nbytes"] for entry in manifest.values()) == expert_bytes
+    assert validate_qwen4_fast_tier(root, target)["verdict"] == "PASS"
+
+    names = [
+        f"model.layers.0.mlp.experts.0.{projection}.weight"
+        for projection in ("gate_proj", "up_proj", "down_proj")
+    ]
+    monkeypatch.setenv("VMODEL_QWEN4_NATIVE_FP8_DEQUANT", "1")
+    slow = WeightStore(root)
+    expected, _seconds, slow_bytes = slow.fetch(names)
+    fast = WeightStore(root, fast_dirs=[fast_root])
+    actual, _seconds, fast_bytes = fast.fetch(names)
+    for name in names:
+        np.testing.assert_array_equal(_bits(actual[name]), _bits(expected[name]))
+    assert slow_bytes == fast_bytes == expert_bytes
+    assert fast.fast_tier_bytes == expert_bytes
+    assert fast.archive_bytes == 0
+
+
 def test_qwen4_trunk_first_fast_tier_serves_all_target_trunk_exactly(tmp_path):
     from formats.qwen4_fast_tier import (
         build_qwen4_fast_tier,

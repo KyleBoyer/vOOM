@@ -1,0 +1,14 @@
+schema: voom.runtime-profile.v1
+name: qwen38-flash-next-uncensored-fp8-fast-tier-mtp-hot-kv
+description: Exact in-memory recurrent-state reuse for uncensored Qwen tool continuations.
+notes:
+  - "Extends the candidate-bound FP8 fast-tier/MTP profile. A continuation reuses state only when the complete retained candidate-token endpoint is an exact prefix of the next rendered request; edited or unrelated requests run cold."
+  - "Two in-memory slots tolerate one interleaved side request. Tiny prompts below 16 tokens cannot evict an agent conversation, and no official/BF16 endpoint or persistent journal is admitted."
+  - "This transfers FreeToken's semantic-anchor idea through vOOM's already state-gated Qwen hybrid KV/KDA/QSA/PLE implementation. It changes scheduling only and remains explicit until a multi-turn candidate Plex run proves cache hits, state integrity, pressure, and answer quality."
+extends:
+  - qwen38-flash-next-uncensored-fp8-fast-tier-mtp
+settings:
+  VMODEL_QWEN4_HOT_PROMPT_KV: true
+  VMODEL_QWEN4_HOT_KV_SLOTS: 2
+  VMODEL_QWEN4_HOT_KV_MIN_TOKENS: 16
+  VMODEL_QWEN4_HOT_KV_PERSIST_DIR: ""

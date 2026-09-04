@@ -2119,10 +2119,25 @@ class WeightStore:
                 name for name in manifest
                 if name in qwen4_slices
             ]
-            if not qwen4_virtual_names and has_checkpoint_receipt(self.dir):
+            qwen4_fp8_physical_names: set[str] = set()
+            if getattr(self, "qwen4_expert_layout", "") == "per-expert-fp8":
+                for name, aux in self._glm53_fp8_aux.items():
+                    if ".mlp.experts." in name and name.startswith(
+                            "model.layers."):
+                        qwen4_fp8_physical_names.update((aux.weight, aux.scale))
+            qwen4_fp8_names = [
+                name for name in manifest
+                if name in qwen4_fp8_physical_names
+            ]
+            if qwen4_fp8_names and len(qwen4_fp8_names) != len(manifest):
+                raise ValueError(
+                    "Qwen4 per-expert FP8 fast tier contains a non-expert "
+                    "tensor")
+            qwen4_bound_names = qwen4_virtual_names or qwen4_fp8_names
+            if not qwen4_bound_names and has_checkpoint_receipt(self.dir):
                 validate_raw_fast_tier_binding(
                     self.dir, candidate, manifest_bytes)
-            if qwen4_virtual_names:
+            if qwen4_bound_names:
                 binding_path = candidate / "qwen4_fused_expert_fast_tier.json"
                 try:
                     binding = json.loads(binding_path.read_text())
@@ -2138,6 +2153,7 @@ class WeightStore:
                     "schema": isinstance(binding, dict) and binding.get(
                         "schema") in (
                         "voom.qwen4-fused-expert-fast-tier.v1",
+                        "voom.qwen4-per-expert-fp8-fast-tier.v1",
                         "voom.qwen4-trunk-first-fast-tier.v2",
                     ),
                     # ``path_resolver`` preserves a caller's stable symlink
@@ -2170,6 +2186,61 @@ class WeightStore:
                     raise ValueError(
                         "Qwen4 virtual fast-tier source identity mismatch: "
                         f"{failed}")
+                if qwen4_fp8_names:
+                    if not (
+                        binding.get("schema")
+                        == "voom.qwen4-per-expert-fp8-fast-tier.v1"
+                        and binding.get("placement") == "experts"
+                        and binding.get("expert_layout") == "per-expert-fp8"
+                    ):
+                        raise ValueError(
+                            "Qwen4 per-expert FP8 fast tier has invalid "
+                            "schema or layout")
+                    for name in qwen4_fp8_names:
+                        entry = manifest[name]
+                        metadata = self._safetensors_entry(name)
+                        shard = self.weight_map.get(name)
+                        filename = (
+                            entry.get("file")
+                            if isinstance(entry, dict) else None)
+                        if metadata is None or shard is None:
+                            raise ValueError(
+                                "Qwen4 per-expert FP8 fast-tier tensor is "
+                                f"unknown: {name}")
+                        shape = tuple(
+                            int(value) for value in metadata.get("shape", ()))
+                        start, end = (
+                            int(value) for value in metadata["data_offsets"])
+                        with (self.dir / shard).open("rb") as source:
+                            header_length_raw = source.read(8)
+                        if len(header_length_raw) != 8:
+                            raise EOFError(
+                                f"truncated safetensors shard {shard}")
+                        source_offset = (
+                            8 + struct.unpack("<Q", header_length_raw)[0]
+                            + start)
+                        if not (
+                            isinstance(filename, str)
+                            and Path(filename).name == filename
+                            and (candidate / filename).is_file()
+                            and str(entry.get("dtype", "")).upper()
+                            == str(metadata.get("dtype", "")).upper()
+                            and tuple(int(value) for value in entry.get(
+                                "shape", ())) == shape
+                            and int(entry.get("nbytes", -1)) == end - start
+                            and entry.get("source_file") == shard
+                            and int(entry.get("source_offset", -1))
+                            == source_offset
+                        ):
+                            raise ValueError(
+                                "Qwen4 per-expert FP8 fast-tier metadata "
+                                f"mismatch: {name}")
+                        file_size = (candidate / filename).stat().st_size
+                        offset = int(entry.get("offset", -1))
+                        if offset < 0 or offset + end - start > file_size:
+                            raise ValueError(
+                                "Qwen4 per-expert FP8 fast-tier extent "
+                                f"mismatch: {name}")
                 for name in qwen4_virtual_names:
                     entry = manifest[name]
                     spec = qwen4_slices[name]
