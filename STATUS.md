@@ -4,8 +4,8 @@
 
 The uncensored search found a materially better replacement candidate than the
 previous incomplete or oversized options:
-`dealignai/Qwen3.8-Flash-Next-ABLITERATED-FP8` revision
-`8d5a44586872fe3a22cfd14398894bc0fd054e29`.  Its pinned Hub tree has 131
+`dealignai/Qwen3.8-Flash-Next-UNCENSORED-FP8` revision
+`2d9a479fd8643c394f1602b4ef1c8757dda4c518`.  Its pinned Hub tree has 131
 safetensor shards and 185,502,232,570 indexed tensor bytes, retains the full
 27-block vision tower and native MTP block, and uses per-expert E4M3 weights
 with FP32 128x128 inverse scales.  The normalized model architecture matches
@@ -30,7 +30,11 @@ hash-checks every base and candidate object, uses atomic per-file replacement,
 and leaves a loader-blocking marker throughout the mixed-layout interval.  No
 NAS backup is created.  Focused replacement, layout, FP8, profile, and server
 tests pass 357/357.  The actual replacement/download and independent final
-attestation are the next step.
+attestation are the next step.  The repository's `ABLITERATED-FP8` alias at
+revision `8d5a445...` has byte-identical model/config/tokenizer objects; only
+its README differs.  OrcaRouter's separately authored FP8 release reports a
+smaller benchmark drop, but remains approval-gated and inaccessible from this
+machine, so it is not a viable replacement source tonight.
 
 ## 2026-09-03: full GLM native FP8 and recurring admission pass matched medium gate
 
