@@ -139,6 +139,7 @@ def _fixture(
 
 def _per_expert_fp8_fixture(
     tmp_path: Path, *, omit_scale: bool = False,
+    bf16_scale: bool = False,
 ) -> tuple[Path, dict[str, np.ndarray]]:
     root, _expected = _fixture(tmp_path)
     config = json.loads((root / "config.json").read_text())
@@ -166,10 +167,15 @@ def _per_expert_fp8_fixture(
         ):
             stem = f"{prefix}.experts.{expert}.{projection}"
             packed = np.full(shape, 56 + expert, dtype=np.uint8)
-            scale = np.array([[1.25 + expert]], dtype=np.float32)
+            scale = (
+                np.array([[0x3F80 + expert * 0x80]], dtype=np.uint16)
+                if bf16_scale
+                else np.array([[1.25 + expert]], dtype=np.float32)
+            )
             tensors[f"{stem}.weight"] = (packed, "F8_E4M3")
             if not (omit_scale and expert == 1 and projection == "down_proj"):
-                tensors[f"{stem}.weight_scale_inv"] = (scale, "F32")
+                tensors[f"{stem}.weight_scale_inv"] = (
+                    scale, "BF16" if bf16_scale else "F32")
             expected[f"model.layers.0.mlp.experts.{expert}.{projection}.weight"] = (
                 packed)
     shard = root / "model.safetensors"
@@ -287,6 +293,26 @@ def test_per_expert_fp8_layout_requires_every_scale(tmp_path):
     root, _expected = _per_expert_fp8_fixture(tmp_path, omit_scale=True)
     with pytest.raises(ValueError, match="per-expert FP8 layout is incomplete"):
         WeightStore(root)
+
+
+def test_per_expert_fp8_bf16_scales_widen_exactly_and_keep_physical_count(
+        tmp_path, monkeypatch):
+    from runtime.quant import dequantize_finegrained_fp8
+
+    root, expected = _per_expert_fp8_fixture(tmp_path, bf16_scale=True)
+    monkeypatch.setenv("VMODEL_QWEN4_NATIVE_FP8_DEQUANT", "1")
+    store = WeightStore(root)
+    name = "model.layers.0.mlp.experts.1.gate_proj.weight"
+    values, _seconds, nbytes = store.fetch([name])
+    scale = mx.array(np.array([[0x4000]], dtype=np.uint16)).view(
+        mx.bfloat16).astype(mx.float32)
+    want = dequantize_finegrained_fp8(
+        mx.array(expected[name]), scale, block_shape=(128, 128))
+    mx.eval(values[name], want)
+
+    assert bool(mx.all(values[name] == want))
+    assert nbytes == expected[name].size + 2
+    assert store.glm53_fp8_snapshot()[2] == 1
 
 
 def test_qwen4_virtual_fast_tier_is_byte_exact_and_source_bound(tmp_path):

@@ -1,5 +1,41 @@
 # STATUS — 2026-09-03 (current corrections first; dated chronology below is history)
 
+## 2026-09-03: public uncensored Qwen FP8 replacement is live; quality gate pending
+
+`models/Qwen3.8-Flash-Next` now contains the complete pinned
+`dealignai/Qwen3.8-Flash-Next-UNCENSORED-FP8` revision
+`2d9a479fd8643c394f1602b4ef1c8757dda4c518`.  The resumable in-place operation
+replaced all 131 shards without a NAS backup; its independent final pass
+attested 145 files / 185,563,799,107 bytes and published
+`voom.checkpoint.receipt.json`.  The mixed-tree marker is gone.  Header
+inspection found 152,089 tensors / 185,502,232,570 tensor bytes, 333 vision
+tensors, native MTP, no unknown dtypes, and the candidate's two distinct FP8
+layouts: 75,264 routed/MTP `weight_scale_inv` pairs use BF16 scales, while the
+128-shard 51.2GB PLE table uses E4M3 rows plus one global BF16 `weight_scale`.
+
+Both layouts now run without widening whole tables or checkpoints.  Routed
+scales are widened exactly from BF16 to FP32 before the existing eager/native
+128x128 decoder.  PLE reads only requested 160-byte FP8 rows, converts them
+through a fixed 256-entry table tied to the published BF16 scale, and returns
+the expected 320-byte BF16 rows.  All 256 E4M3 storage values match MLX's BF16
+result exactly.  The PLE provider also recognizes the new replacement receipt
+only when its committed revision/path, full indexed shard set, sizes, and
+post-attestation modification times agree; later edits fail closed.
+
+The first saved-profile-only 45-input/max-1 HTTP run passed in **52.572s wall /
+41.941s engine**, read 40.298GB, peaked at 1.478GB Metal, and grew physical
+swap-out by 2.982MB.  Its eager control passed in 58.524s / 47.685s with the
+same output SHA `b344d80e...21a67`, exact read set, and exact peak. Native
+reconstruction cut transform time 16.262 -> 10.069s, engine 12.04%, and HTTP
+wall 10.17%.  The profile remains explicit and **not quality-accepted**: the
+publisher reports MMLU -2.50 points, and local Plex, varied-shape, sustained
+output, and vision gates are still required before preference or defaulting.
+
+Evidence:
+`logs/qwen_uncensored_fp8_checkpoint_format_20260903.txt`,
+`logs/qwen_uncensored_fp8_http_eager_control_20260903.json`, and
+`logs/qwen_uncensored_fp8_http_smoke3_20260903.json`.
+
 ## 2026-09-03: complete uncensored Qwen FP8 candidate is replacement-ready
 
 The uncensored search found a materially better replacement candidate than the
@@ -8,7 +44,7 @@ previous incomplete or oversized options:
 `2d9a479fd8643c394f1602b4ef1c8757dda4c518`.  Its pinned Hub tree has 131
 safetensor shards and 185,502,232,570 indexed tensor bytes, retains the full
 27-block vision tower and native MTP block, and uses per-expert E4M3 weights
-with FP32 128x128 inverse scales.  The normalized model architecture matches
+with BF16 128x128 inverse scales.  The normalized model architecture matches
 the current official tree.  It is much smaller than the current 360GB BF16
 checkpoint but is a semantic/quality trade: the publisher reports MMLU 86.36
 -> 83.86.  It must pass the local Plex and varied-shape gates before being
@@ -29,8 +65,8 @@ the identical safetensor shard filename set, pins both immutable revisions,
 hash-checks every base and candidate object, uses atomic per-file replacement,
 and leaves a loader-blocking marker throughout the mixed-layout interval.  No
 NAS backup is created.  Focused replacement, layout, FP8, profile, and server
-tests pass 357/357.  The actual replacement/download and independent final
-attestation are the next step.  The repository's `ABLITERATED-FP8` alias at
+tests passed 357/357 before the live operation.  The completed replacement and
+first live measurements are recorded above.  The repository's `ABLITERATED-FP8` alias at
 revision `8d5a445...` has byte-identical model/config/tokenizer objects; only
 its README differs.  OrcaRouter's separately authored FP8 release reports a
 smaller benchmark drop, but remains approval-gated and inaccessible from this

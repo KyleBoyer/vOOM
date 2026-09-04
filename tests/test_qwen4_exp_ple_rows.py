@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 from pathlib import Path
 import shutil
 import struct
@@ -22,6 +23,27 @@ def _write_safetensor(path: Path, tensors: dict[str, np.ndarray]) -> None:
         header[name] = {
             "dtype": "BF16",
             "shape": list(value.shape),
+            "data_offsets": [start, len(payload)],
+        }
+    encoded = json.dumps(header, separators=(",", ":")).encode()
+    encoded += b" " * ((8 - len(encoded) % 8) % 8)
+    path.write_bytes(struct.pack("<Q", len(encoded)) + encoded + payload)
+
+
+def _write_typed_safetensor(
+    path: Path, tensors: dict[str, tuple[str, np.ndarray]],
+) -> None:
+    header = {}
+    payload = bytearray()
+    for name, (dtype, value) in tensors.items():
+        storage = np.asarray(
+            value, dtype=np.uint8 if dtype == "F8_E4M3" else np.uint16)
+        raw = storage.tobytes()
+        start = len(payload)
+        payload.extend(raw)
+        header[name] = {
+            "dtype": dtype,
+            "shape": list(storage.shape),
             "data_offsets": [start, len(payload)],
         }
     encoded = json.dumps(header, separators=(",", ":")).encode()
@@ -84,6 +106,70 @@ def _fixture(tmp_path: Path) -> tuple[Path, int]:
     (cache / "download" / f"{shard.name}.metadata").write_text(
         f"{revision}\n{sha}\n")
     return root, rows_per_part
+
+
+def _fp8_fixture(tmp_path: Path) -> tuple[Path, np.ndarray]:
+    root = tmp_path / "qwen4-exp-fp8"
+    root.mkdir()
+    config = {
+        "model_type": "qwen4_exp",
+        "text_config": {
+            "model_type": "qwen4_exp_text",
+            "vocab_size": 64,
+            "hidden_size": 8,
+            "eos_token_id": 63,
+            "ngram_size": 3,
+            "heads_per_ngram": 2,
+            "ngram_vocab_size_base": 11,
+            "make_ngram_vocab_size_divisible_by": 4,
+            "split_ngram_parts": 4,
+        },
+    }
+    (root / "config.json").write_text(json.dumps(config))
+    prefix = (
+        "model.language_model.layers.1.ple.ple_embedding.ngram_embedding")
+    rows_per_part = 15
+    # Each row contains +1 and -1 in E4M3. The global published BF16 scale is
+    # 0.5 (0x3f00), so the exact output BF16 bits are +/-0.5.
+    packed = np.tile(
+        np.array([[0x38, 0xB8]], dtype=np.uint8),
+        (rows_per_part * 4, 1),
+    )
+    tensors = {}
+    weight_map = {}
+    for part in range(4):
+        name = f"{prefix}.shard_{part}.weight"
+        tensors[name] = (
+            "F8_E4M3",
+            packed[part * rows_per_part:(part + 1) * rows_per_part],
+        )
+        weight_map[name] = "model.safetensors"
+    scale_name = f"{prefix}.weight_scale"
+    tensors[scale_name] = ("BF16", np.array([0x3F00], dtype=np.uint16))
+    weight_map[scale_name] = "model.safetensors"
+    shard = root / "model.safetensors"
+    _write_typed_safetensor(shard, tensors)
+    (root / "model.safetensors.index.json").write_text(json.dumps({
+        "weight_map": weight_map,
+    }))
+
+    revision = "c" * 40
+    sha = hashlib.sha256(shard.read_bytes()).hexdigest()
+    cache = root / ".cache" / "huggingface"
+    (cache / "trees").mkdir(parents=True)
+    (cache / "download").mkdir()
+    (cache / "trees" / f"{revision}.json").write_text(json.dumps({
+        "format_version": 1,
+        "files": {
+            shard.name: {
+                "lfs_sha256": sha,
+                "lfs_size": shard.stat().st_size,
+            },
+        },
+    }))
+    (cache / "download" / f"{shard.name}.metadata").write_text(
+        f"{revision}\n{sha}\n")
+    return root, packed
 
 
 def _overlay_fixture(base: Path, root: Path, *, download_shard: bool) -> Path:
@@ -195,6 +281,68 @@ def test_parallel_exact_rows_preserve_bits_order_and_extent_accounting(tmp_path)
     assert parallel_stats["read_microseconds"] >= 0
 
 
+def test_fp8_rows_selectively_dequantize_with_global_bf16_scale(tmp_path):
+    root, _packed = _fp8_fixture(tmp_path)
+    requested = np.array([[0, 14, 15], [16, 31, 59]])
+    with Qwen4ExpPLERowStore(root, row_cache=0, read_workers=4) as store:
+        actual = store.read_rows(requested)
+        expected_row = np.array([0x3F00, 0xBF00], dtype=np.uint16)
+        expected = np.tile(expected_row, (requested.size, 1)).reshape(2, 3, 2)
+        np.testing.assert_array_equal(actual, expected)
+        assert store.identity.storage_dtype == "F8_E4M3"
+        assert store.identity.storage_row_bytes == 2
+        assert store.identity.scale_bf16_bits == 0x3F00
+        stats = store.telemetry()
+        assert stats["scale_bytes_read"] == 2
+        assert stats["bytes_read"] == requested.size * 2
+        assert stats["output_row_bytes"] == 4
+
+
+def test_fp8_bf16_lookup_matches_mlx_all_storage_values():
+    import mlx.core as mx
+
+    from runtime.qwen4_exp_ple_rows import _fp8_bf16_lookup
+
+    packed = np.arange(256, dtype=np.uint8)
+    scale_bits = 0x3951  # Real candidate PLE scale: 0.00019931793212890625.
+    scale = mx.array(
+        np.array([scale_bits], dtype=np.uint16)).view(mx.bfloat16)
+    expected = np.asarray(
+        (mx.from_fp8(mx.array(packed), mx.bfloat16) * scale)
+        .view(mx.uint16))
+    np.testing.assert_array_equal(_fp8_bf16_lookup(scale_bits), expected)
+
+
+def test_finalized_replacement_receipt_binds_rows_and_rejects_later_edit(
+        tmp_path):
+    root, _packed = _fp8_fixture(tmp_path)
+    tree = next((root / ".cache" / "huggingface" / "trees").iterdir())
+    tree.unlink()
+    shard = root / "model.safetensors"
+    completed = shard.stat().st_mtime + 10
+    revision = "d" * 40
+    (root / "voom.checkpoint.receipt.json").write_text(json.dumps({
+        "schema": "voom.hf-checkpoint-replacement-receipt.v1",
+        "status": "verified",
+        "model_dir": str(root.resolve()),
+        "candidate": {"repo": "Example/fp8", "revision": revision},
+        "plan_sha256": "e" * 64,
+        "completed_unix": completed,
+        "candidate_files": 3,
+        "safetensor_shards": 1,
+        "changed_safetensor_shards": 1,
+        "verified_candidate_bytes": shard.stat().st_size + 1_000,
+    }))
+    with Qwen4ExpPLERowStore(root, row_cache=0) as store:
+        assert store.identity.revision == revision
+        assert store.identity.verified_release_hash
+        assert store.read_rows([[0]]).shape == (1, 1, 2)
+
+    os.utime(shard, (completed + 1, completed + 1))
+    with pytest.raises(ValueError, match="release witness"):
+        Qwen4ExpPLERowStore(root, row_cache=0)
+
+
 def test_missing_release_witness_and_bad_rows_fail_closed(tmp_path):
     root, _ = _fixture(tmp_path)
     tree = next((root / ".cache" / "huggingface" / "trees").iterdir())
@@ -235,18 +383,22 @@ REAL_MODEL = Path(__file__).resolve().parent.parent / "models" / "Qwen3.8-Flash-
     not (REAL_MODEL / "model.safetensors.index.json").is_file(),
     reason="Qwen3.8-Flash-Next is not downloaded locally",
 )
-def test_real_flash_next_reads_only_requested_bf16_rows():
+def test_real_flash_next_reads_only_requested_rows_as_bf16():
     with Qwen4ExpPLERowStore(REAL_MODEL, row_cache=64) as store:
         ids = store.layout.row_ids([17, 23, 29])
         rows = store.read_rows(ids)
         assert rows.shape == (3, 16, 160)
         assert rows.dtype == np.uint16
-        assert store.identity.revision == (
-            "f5d08274bafd880402bd16f5e3e6c514136ec06c")
+        receipt_path = REAL_MODEL / "voom.checkpoint.receipt.json"
+        expected_revision = (
+            json.loads(receipt_path.read_text())["candidate"]["revision"]
+            if receipt_path.is_file()
+            else "f5d08274bafd880402bd16f5e3e6c514136ec06c")
+        assert store.identity.revision == expected_revision
         assert store.identity.verified_release_hash
         assert store.identity.split_parts == 128
         assert store.identity.unique_shards == 33
         stats = store.telemetry()
         assert stats["rows_requested"] == 48
         assert stats["unique_rows_read"] == 48
-        assert stats["bytes_read"] == 48 * 320
+        assert stats["bytes_read"] == 48 * store.storage_row_bytes

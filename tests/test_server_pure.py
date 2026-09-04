@@ -286,6 +286,10 @@ def test_vision_protocol_timing_exposes_qwen4_spool_phases():
             "qwen4_host_spool_experts_seconds": 5.25,
             "qwen4_host_spool_output_seconds": 6.25,
             "qwen4_ple_bytes_read": 15,
+            "qwen4_ple_storage_dtype": "F8_E4M3",
+            "qwen4_ple_storage_row_bytes": 160,
+            "qwen4_ple_output_row_bytes": 320,
+            "qwen4_ple_scale_bytes_read": 2,
             "qwen4_fused_expert_bytes": 16,
             "qwen4_native_fp8_dequant": 1,
             "qwen4_per_expert_fp8": 1,
@@ -310,6 +314,10 @@ def test_vision_protocol_timing_exposes_qwen4_spool_phases():
     assert timing["qwen4_host_spool_experts_seconds"] == 5.25
     assert timing["qwen4_host_spool_output_seconds"] == 6.25
     assert timing["qwen4_ple_bytes_read"] == 15
+    assert timing["qwen4_ple_storage_dtype"] == "F8_E4M3"
+    assert timing["qwen4_ple_storage_row_bytes"] == 160
+    assert timing["qwen4_ple_output_row_bytes"] == 320
+    assert timing["qwen4_ple_scale_bytes_read"] == 2
     assert timing["qwen4_fused_expert_bytes"] == 16
     assert timing["qwen4_native_fp8_dequant"] == 1
     assert timing["qwen4_per_expert_fp8"] == 1

@@ -82,7 +82,12 @@ class _DSV4Aux:
 
 @dataclass(frozen=True)
 class _FineGrainedFP8Aux:
-    """HF fine-grained FP8 ``weight`` + float32 ``weight_scale_inv`` pair."""
+    """HF fine-grained FP8 ``weight`` + exact dequant-multiplier pair.
+
+    Official GLM stores the multiplier grid as FP32. Some published Qwen4-Exp
+    FP8 derivatives store the same values as BF16; the fetch path widens those
+    exact BF16 values to FP32 before executing the unchanged decoder.
+    """
 
     weight: str
     scale: str
@@ -999,10 +1004,17 @@ class WeightStore:
                 # The released GLM checkpoint contains no packed FP4 expert
                 # payloads; accepting int8 here would double the logical width
                 # and quietly execute a different model.
-                if weight.dtype != mx.uint8 or scale.dtype != mx.float32:
+                if (weight.dtype != mx.uint8
+                        or scale.dtype not in (mx.float32, mx.bfloat16)):
                     raise ValueError(
                         "fine-grained FP8 pair has unexpected dtypes: "
                         f"weight={weight.dtype}, scale={scale.dtype}")
+                physical_input_bytes = int(weight.nbytes + scale.nbytes)
+                if scale.dtype == mx.bfloat16:
+                    # Widening an already-rounded BF16 value is exact. The
+                    # intended dequant operation remains FP8->FP32, FP32
+                    # multiply, and final BF16 rounding in both decoders.
+                    scale = scale.astype(mx.float32)
                 is_expert_prefetch = threading.current_thread().name.startswith(
                     "vmodel-expert-batch")
                 use_native = (
@@ -1020,7 +1032,7 @@ class WeightStore:
                 mx.eval(joined[name])
                 self._record_glm53_fp8_transform(
                     elapsed_ns=time.perf_counter_ns() - started_ns,
-                    input_bytes=int(weight.nbytes + scale.nbytes),
+                    input_bytes=physical_input_bytes,
                     resident_bytes=int(joined[name].nbytes),
                     native=use_native,
                     expert_prefetch=is_expert_prefetch,

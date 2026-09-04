@@ -2,7 +2,7 @@ schema: voom.runtime-profile.v1
 name: qwen38-flash-next-uncensored-fp8
 description: Exact-serving baseline for the dealignai uncensored Qwen3.8-Flash-Next FP8 checkpoint.
 notes:
-  - "Pinned candidate: dealignai/Qwen3.8-Flash-Next-UNCENSORED-FP8 revision 2d9a479fd8643c394f1602b4ef1c8757dda4c518. Its 128x128 E4M3/FP32 pairs are served exactly as published and widened to BF16 for the unchanged target matmuls."
+  - "Pinned candidate: dealignai/Qwen3.8-Flash-Next-UNCENSORED-FP8 revision 2d9a479fd8643c394f1602b4ef1c8757dda4c518. Its routed experts use 128x128 E4M3/BF16 scale pairs; exact BF16-to-FP32 scale widening feeds the unchanged target dequantization and BF16 matmuls. Its separate E4M3 PLE table uses one published BF16 scale and is reconstructed only after selective row reads."
   - "This is lossless relative to the candidate representation, not relative to Qwen's official BF16 checkpoint. The publisher reports a 2.50-point MMLU drop, so the local Plex, varied-shape, long-output, and vision gates must pass before this becomes a preferred quality profile."
   - "Native one-dispatch FP8 reconstruction is byte-identical to the eager decoder over all E4M3 values and arbitrary FP32 scales. It is explicit here so the first real candidate timing measures the likely fast route; eager reconstruction remains the control."
   - "Official/candidate BF16 fast tiers and prompt-state journals are checkpoint-bound and intentionally disabled. Build new candidate-bound artifacts only after plain target quality and pressure pass."

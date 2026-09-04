@@ -13410,6 +13410,12 @@ class StreamingEngine:
                 qwen4_ple_after["source_revision"])
             path_stats["qwen4_ple_source_verified_release_hash"] = int(
                 qwen4_ple_after["source_verified_release_hash"])
+            path_stats["qwen4_ple_storage_dtype"] = str(
+                qwen4_ple_after["storage_dtype"])
+            for key in (
+                "storage_row_bytes", "output_row_bytes", "scale_bytes_read",
+            ):
+                path_stats[f"qwen4_ple_{key}"] = int(qwen4_ple_after[key])
             for key, value in self._qwen4_host_spool_stats.items():
                 path_stats[f"qwen4_host_spool_{key}"] = value
             path_stats["qwen4_phase_lm_head"] = int(

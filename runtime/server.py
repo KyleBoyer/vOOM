@@ -9971,6 +9971,9 @@ def _vision_protocol_timing(result: dict) -> dict:
         "qwen4_ple_unique_rows_read",
         "qwen4_ple_bytes_read",
         "qwen4_ple_cache_hits",
+        "qwen4_ple_storage_row_bytes",
+        "qwen4_ple_output_row_bytes",
+        "qwen4_ple_scale_bytes_read",
         "qwen4_fused_expert_calls",
         "qwen4_fused_expert_extents",
         "qwen4_fused_expert_requested_tensors",
@@ -10199,6 +10202,7 @@ def _vision_protocol_timing(result: dict) -> dict:
         "qwen4_mtp_truncation_probabilities",
         "qwen4_mtp_proposal_sources",
         "qwen4_mtp_q_calibration",
+        "qwen4_ple_storage_dtype",
         "glm53_mtp_fallback_reason",
     ):
         if key in stats or key in result:

@@ -1,5 +1,13 @@
 # Qwen3.8-Flash-Next local bring-up
 
+> Current-tree correction (2026-09-03): the path below was atomically replaced
+> with pinned `dealignai/Qwen3.8-Flash-Next-UNCENSORED-FP8` revision
+> `2d9a479fd8643c394f1602b4ef1c8757dda4c518`.  Its independently attested
+> payload is 185.564GB, with per-expert E4M3/BF16-scale pairs and an E4M3 PLE
+> table using one global BF16 scale.  Historical official-BF16 measurements in
+> this document remain labeled history; current bring-up evidence is at the top
+> of `STATUS.md` and `docs/benchmark_results.md`.
+
 Status: the pinned checkpoint download and checksum gate completed on
 2026-08-27. Exact released-BF16 text serving, the PLE direct-row provider,
 hybrid prompt-state persistence, and target-authoritative Lightning-MTP are
