@@ -26,8 +26,18 @@ intelligence score.  Both profiles remain explicit/default-off.
 
 The same fused Qwen kernel separately passed the installed uncensored-FP8
 checkpoint: token/text plus all 121 KV/KDA/QSA/PLE arrays and component hashes
-were byte-identical with 0.672MB page-out.  This is independent-checkpoint
-evidence that the recurrence optimization is not fitted to JANG's weights.
+were byte-identical with 0.672MB page-out.  The fully composed fast-tier,
+direct-QMV, prefill-expert-pipeline profile then passed another token/text/
+component/**all-121-array** state oracle.  On the same 2,358-token focused Plex
+shape used by the selected pipeline, it preserved the exact 32-token prefix and
+20/34 MTP acceptance while reducing wall **266.199 -> 243.096s (-8.68%)** and
+first token **144.020 -> 119.693s (-16.89%)**.  Recurrence/attention fell
+40.413 -> 13.354 seconds; decode was essentially flat at 107.470 -> 109.364
+seconds.  Peak Metal fell 4.292 -> 1.830GB, but 17.924MB physical page-out was
+1.924MB above the strict diagnostic gate.  This is independent-checkpoint and
+composed-pipeline evidence that the recurrence optimization is not fitted to
+JANG's weights; the truncated focused shape remains a latency/identity gate,
+not an untouched-capture or intelligence score.
 
 GLM-5.3-Flash uses a related KDA recurrence with per-channel decay and the
 distinct released grouping `(beta * key) * residual`.  A second striped kernel
@@ -56,6 +66,8 @@ Evidence:
 `logs/qwen_striped_delta_prefill_bench_20260904.json`,
 `logs/qwen38_flash_jang6s_{striped_exact_oracle,exact_fused_plex_max1,exact_fused_prefetch_plex_max1}_20260904.json`,
 `logs/qwen_uncensored_fp8_exact_fused_delta_oracle_20260904.json`,
+`logs/qwen_uncensored_fp8_exact_fused_pipeline_oracle_20260904.json`,
+`logs/qwen_uncensored_fp8_exact_fused_pipeline_plex_focused_max32_20260904.json`,
 `logs/glm53_exact_striped_kda_h64_l1024_v3_20260904.json`,
 `logs/glm53_flash_striped_kda_real_{control_state4,candidate_state4_v2}_20260904.json`,
 and `logs/glm53_flash_exact_striped_kda_long2123_20260904.json`.

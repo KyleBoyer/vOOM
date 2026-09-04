@@ -4,7 +4,8 @@ description: Exact SIMD-fused DeltaNet prefill composed with the uncensored FP8 
 notes:
   - "The native scan mirrors MLX 0.32's 32-lane strided K-axis reduction and disables floating-point contraction, preserving the released FP32 recurrence while replacing thousands of per-position graph operations with one Metal dispatch per tile."
   - "A second-checkpoint four-token oracle on dealignai/Qwen3.8-Flash-Next-UNCENSORED-FP8 revision 2d9a479fd8643c394f1602b4ef1c8757dda4c518 matched token, text, aggregate state, and all 121 KV/KDA/QSA/PLE arrays byte-for-byte with 0.672MB maximum swap-out growth."
-  - "This profile remains explicit pending a composed state gate and untouched Plex replay. It is lossless relative to the installed uncensored FP8 target, not Qwen's official BF16 release."
+  - "The fully composed pipeline separately matched token, text, aggregate/component state, and all 121 endpoint arrays, then preserved the exact 32-token focused-Plex output and 20/34 MTP acceptance while reducing wall 266.199 -> 243.096 seconds and first-token time 144.020 -> 119.693 seconds. That focused 2,358-token shape is a latency/identity gate, not an untouched-capture or intelligence result; physical page-out grew 17.924MB, just above the strict 16MB diagnostic threshold."
+  - "This profile remains explicit/default-off pending heterogeneous complete-output and untouched-capture gates. It is lossless relative to the installed uncensored FP8 target, not Qwen's official BF16 release."
 extends:
   - qwen38-flash-next-uncensored-fp8-fast-tier-mtp-direct-fp8-qmv-prefill-pipeline
 settings:
