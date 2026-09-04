@@ -3678,10 +3678,10 @@ class StreamingEngine:
                 # keep a small pad for container/alignment accounting.
                 return math.ceil(resident_bytes * 1.05)
         # GLM-5.3-Flash is ``glm5_next`` while full GLM-5.3 intentionally
-        # keeps the GLM-5.2 ``glm_moe_dsa`` architecture id.  Detect the
-        # released fine-grained-FP8 representation from the store rather than
-        # from the architecture name so old BF16 GLM-5.2 retains its existing
-        # path and the full 5.3 page is priced at its widened BF16 lifetime.
+        # keeps the GLM-5.2 ``glm_moe_dsa`` architecture id. Qwen4-Exp FP8
+        # derivatives share the same weight+scale representation. Detect it
+        # from the store so BF16 releases retain their existing path and every
+        # FP8 page is priced at its widened BF16 lifetime.
         if getattr(store, "_glm53_fp8_aux", None):
             logical_names = (
                 self._layer_names(layer) if names is None else names)
@@ -3689,7 +3689,7 @@ class StreamingEngine:
                 logical_names)
             if resident_bytes <= 0:
                 raise ValueError(
-                    f"GLM-5.3 layer {layer} has incomplete FP8 resident "
+                    f"layer {layer} has incomplete fine-grained FP8 resident "
                     "metadata")
             return math.ceil(resident_bytes * 1.05)
         if self.cfg.model_type != "kimi_k25":
@@ -12828,6 +12828,12 @@ class StreamingEngine:
                 bool(getattr(self.store, "native_glm53_fp8_dequant", False)))
             path_stats["glm53_native_fp8_prefetch"] = int(
                 bool(getattr(self.store, "native_glm53_fp8_prefetch", True)))
+        if self.cfg.model_type == "qwen4_exp":
+            path_stats["qwen4_native_fp8_dequant"] = int(
+                bool(getattr(self.store, "native_glm53_fp8_dequant", False)))
+            path_stats["qwen4_per_expert_fp8"] = int(
+                getattr(self.store, "qwen4_expert_layout", "")
+                == "per-expert-fp8")
         dsa_state = getattr(kv, "dsa", None)
         if dsa_state is not None:
             path_stats["dsa_observations"] = dsa_state.stats["observations"]

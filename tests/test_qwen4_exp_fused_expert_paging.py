@@ -137,6 +137,49 @@ def _fixture(
     }
 
 
+def _per_expert_fp8_fixture(
+    tmp_path: Path, *, omit_scale: bool = False,
+) -> tuple[Path, dict[str, np.ndarray]]:
+    root, _expected = _fixture(tmp_path)
+    config = json.loads((root / "config.json").read_text())
+    config["quantization_config"] = {
+        "quant_method": "fp8",
+        "activation_scheme": "dynamic",
+        "weight_block_size": [128, 128],
+    }
+    (root / "config.json").write_text(json.dumps(config))
+    hidden, width, experts = 4, 3, 2
+    prefix = "model.language_model.layers.0.mlp"
+    tensors: dict[str, tuple[np.ndarray, str]] = {
+        f"{prefix}.gate.weight": (
+            np.arange(experts * hidden, dtype=np.uint16).reshape(
+                experts, hidden),
+            "BF16",
+        ),
+    }
+    expected = {}
+    for expert in range(experts):
+        for projection, shape in (
+            ("gate_proj", (width, hidden)),
+            ("up_proj", (width, hidden)),
+            ("down_proj", (hidden, width)),
+        ):
+            stem = f"{prefix}.experts.{expert}.{projection}"
+            packed = np.full(shape, 56 + expert, dtype=np.uint8)
+            scale = np.array([[1.25 + expert]], dtype=np.float32)
+            tensors[f"{stem}.weight"] = (packed, "F8_E4M3")
+            if not (omit_scale and expert == 1 and projection == "down_proj"):
+                tensors[f"{stem}.weight_scale_inv"] = (scale, "F32")
+            expected[f"model.layers.0.mlp.experts.{expert}.{projection}.weight"] = (
+                packed)
+    shard = root / "model.safetensors"
+    _write_safetensor(shard, tensors)
+    (root / "model.safetensors.index.json").write_text(json.dumps({
+        "weight_map": {name: shard.name for name in tensors},
+    }))
+    return root, expected
+
+
 def _bits(value: mx.array) -> np.ndarray:
     return np.asarray(value.view(mx.uint16))
 
@@ -221,6 +264,28 @@ def test_mtp_fused_experts_are_direct_paged_without_materializing_all_experts(
 def test_unexpected_fused_expert_shape_fails_closed(tmp_path):
     root, _expected = _fixture(tmp_path, bad_gate_shape=True)
     with pytest.raises(ValueError, match="unexpected Qwen4-Exp fused"):
+        WeightStore(root)
+
+
+def test_per_expert_fp8_layout_is_joined_without_virtual_fused_slices(tmp_path):
+    root, expected = _per_expert_fp8_fixture(tmp_path)
+    store = WeightStore(root)
+    name = "model.layers.0.mlp.experts.1.gate_proj.weight"
+
+    assert store.qwen4_expert_layout == "per-expert-fp8"
+    assert store.qwen4_fused_expert_snapshot()["virtual_tensors"] == 0
+    assert name in store._glm53_fp8_aux
+    values, _seconds, nbytes = store.fetch([name])
+
+    assert values[name].dtype == mx.bfloat16
+    assert tuple(values[name].shape) == tuple(expected[name].shape)
+    assert nbytes == expected[name].size + 4
+    assert store.glm53_fp8_snapshot()[1] == 1
+
+
+def test_per_expert_fp8_layout_requires_every_scale(tmp_path):
+    root, _expected = _per_expert_fp8_fixture(tmp_path, omit_scale=True)
+    with pytest.raises(ValueError, match="per-expert FP8 layout is incomplete"):
         WeightStore(root)
 
 

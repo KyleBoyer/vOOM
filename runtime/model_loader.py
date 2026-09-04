@@ -226,6 +226,7 @@ class WeightStore:
         self._qwen4_fused_expert_slices: dict[
             str, _Qwen4FusedExpertSlice] = {}
         self._qwen4_fused_physical_names: set[str] = set()
+        self.qwen4_expert_layout = ""
         self.qwen4_fused_read_calls = 0
         self.qwen4_fused_read_extents = 0
         self.qwen4_fused_requested_tensors = 0
@@ -270,7 +271,8 @@ class WeightStore:
         # Metal dispatch; these counters make its real share of weight-wait
         # time and its actual coverage visible per request.
         self.native_glm53_fp8_dequant = (
-            os.environ.get("VMODEL_GLM53_NATIVE_FP8_DEQUANT") == "1")
+            os.environ.get("VMODEL_GLM53_NATIVE_FP8_DEQUANT") == "1"
+            or os.environ.get("VMODEL_QWEN4_NATIVE_FP8_DEQUANT") == "1")
         # The fused decoder is exact, but medium layer-stationary profiling
         # showed that dispatching it from expert-prefetch workers can contend
         # with the foreground expert GEMM on Metal.  Keep today's all-native
@@ -675,13 +677,12 @@ class WeightStore:
             self._real_name["model.norm.weight"] = self._real_name.get(
                 "model.embedding_norm.weight", "model.embedding_norm.weight")
 
-        # Qwen3.8 Flash-Next stores each layer's 512 routed experts as two
-        # enormous fused BF16 tensors.  Register exact virtual matrix names so
-        # the existing expert pager can address selected experts directly from
-        # their contiguous safetensor extents.  No rewritten checkpoint, copy,
-        # or quantization is involved; the released bytes are returned exactly.
+        # Official Qwen3.8 Flash-Next stores routed experts in two enormous
+        # fused BF16 tensors. Published FP8 derivatives may instead expose one
+        # weight+scale pair per expert matrix. Detect and validate either exact
+        # physical layout before the ordinary expert pager addresses it.
         if self.config.model_type == "qwen4_exp":
-            self._register_qwen4_fused_expert_slices()
+            self._configure_qwen4_expert_layout()
 
         # Standard MLX quantized checkpoints store one logical matrix as
         # ``name.weight`` plus row/group metadata in ``name.scales`` and,
@@ -777,10 +778,10 @@ class WeightStore:
                 self._dsv4_aux[name] = _DSV4Aux(name, scale)
                 quant_aux_names.add(scale)
 
-        # Both released GLM-5.3 checkpoints use Hugging Face's fine-grained
-        # FP8 layout: the hybrid ``glm5_next`` Flash model and the full
-        # ``glm_moe_dsa`` model.  The latter deliberately retains GLM-5.2's
-        # architecture identifier because 5.3 changes only post-training.
+        # Both released GLM-5.3 checkpoints and supported Qwen4-Exp FP8
+        # derivatives use Hugging Face's fine-grained FP8 layout. The full GLM
+        # deliberately retains GLM-5.2's architecture identifier because 5.3
+        # changes only post-training.
         # Its float32 ``weight_scale_inv`` is a dequant multiplier over
         # 128x128 blocks, not DeepSeek-V4's E8M0 exponent-byte ``.scale``.
         # Register a separate pair type so the two encodings can never be
@@ -789,7 +790,7 @@ class WeightStore:
         self._glm53_fp8_aux: dict[str, _FineGrainedFP8Aux] = {}
         if (not self.packed
                 and str(self.config.model_type) in (
-                    "glm5_next", "glm_moe_dsa")):
+                    "glm5_next", "glm_moe_dsa", "qwen4_exp")):
             block = self.quantization.get("weight_block_size")
             for name in list(self.weight_map):
                 if not name.endswith(".weight") or name in quant_aux_names:
@@ -801,7 +802,7 @@ class WeightStore:
                         or any(not isinstance(v, int) or isinstance(v, bool)
                                or v <= 0 for v in block)):
                     raise ValueError(
-                        "GLM-5.3 fine-grained FP8 requires a positive 2-D "
+                        "fine-grained FP8 requires a positive 2-D "
                         "weight_block_size")
                 self._glm53_fp8_aux[name] = _FineGrainedFP8Aux(
                     name, scale, (int(block[0]), int(block[1])))
@@ -902,7 +903,7 @@ class WeightStore:
                     or any(not isinstance(v, int) or isinstance(v, bool)
                            or v <= 0 for v in block)):
                 raise ValueError(
-                    "GLM-5.3 fine-grained FP8 requires a positive 2-D "
+                    "fine-grained FP8 requires a positive 2-D "
                     "weight_block_size")
             self.expert_storage_bytes_per_weight = (
                 1.0 + 4.0 / (int(block[0]) * int(block[1])))
@@ -1000,7 +1001,7 @@ class WeightStore:
                 # and quietly execute a different model.
                 if weight.dtype != mx.uint8 or scale.dtype != mx.float32:
                     raise ValueError(
-                        "GLM-5.3 FP8 pair has unexpected dtypes: "
+                        "fine-grained FP8 pair has unexpected dtypes: "
                         f"weight={weight.dtype}, scale={scale.dtype}")
                 is_expert_prefetch = threading.current_thread().name.startswith(
                     "vmodel-expert-batch")
@@ -1192,6 +1193,65 @@ class WeightStore:
                 f"{real_name!r} missing from safetensors header {shard}"
             )
         return int(metadata["data_offsets"][0])
+
+    def _configure_qwen4_expert_layout(self) -> None:
+        """Validate and expose one supported Qwen4-Exp expert layout.
+
+        Mixed or partial representations fail before any model tensor is
+        served. The per-expert FP8 branch is metadata-only here; the generic
+        fine-grained pair registration below owns dtype/scale joining.
+        """
+        cfg = self.config
+        prefixes = [
+            f"model.layers.{layer}.mlp.experts"
+            for layer in range(cfg.num_hidden_layers)
+        ]
+        if any(name.startswith("mtp.") for name in self.weight_map):
+            prefixes.append("mtp.layers.0.mlp.experts")
+        fused_probes = {
+            f"{prefix}.{projection}"
+            for prefix in prefixes
+            for projection in ("gate_up_proj", "down_proj")
+        }
+        per_expert_probes = {
+            f"{prefix}.0.{projection}.weight"
+            for prefix in prefixes
+            for projection in ("gate_proj", "up_proj", "down_proj")
+        }
+        has_fused = any(name in self.weight_map for name in fused_probes)
+        has_per_expert = any(
+            name in self.weight_map for name in per_expert_probes)
+        if has_fused and has_per_expert:
+            raise ValueError(
+                "Qwen4-Exp checkpoint mixes fused and per-expert layouts")
+        if has_fused:
+            self._register_qwen4_fused_expert_slices()
+            self.qwen4_expert_layout = "fused-bf16"
+            return
+        if not has_per_expert:
+            raise ValueError("Qwen4-Exp checkpoint has no supported expert layout")
+
+        missing = []
+        for prefix in prefixes:
+            for expert in range(int(cfg.num_experts)):
+                for projection in ("gate_proj", "up_proj", "down_proj"):
+                    weight = f"{prefix}.{expert}.{projection}.weight"
+                    scale = f"{prefix}.{expert}.{projection}.weight_scale_inv"
+                    if weight not in self.weight_map:
+                        missing.append(weight)
+                    if scale not in self.weight_map:
+                        missing.append(scale)
+                    if len(missing) >= 4:
+                        break
+                if len(missing) >= 4:
+                    break
+            if len(missing) >= 4:
+                break
+        if missing:
+            raise ValueError(
+                "Qwen4-Exp per-expert FP8 layout is incomplete: "
+                + ", ".join(missing))
+        self.qwen4_expert_layout = "per-expert-fp8"
 
     def _register_qwen4_fused_expert_slices(self) -> None:
         """Expose released fused expert rows as ordinary logical matrices.

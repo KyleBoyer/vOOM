@@ -1,11 +1,17 @@
 """Resumable, hash-attested in-place Hugging Face checkpoint replacement.
 
-This is for same-layout releases that are too large to duplicate locally.  A
+This is for same-shard releases that are too large to duplicate locally.  A
 durable marker is published before the first changed byte; WeightStore refuses
 that marker.  Each file is verified as the pinned base, downloaded and verified
 as the pinned candidate, then atomically renamed on the checkpoint filesystem.
 There is deliberately no hidden NAS backup.  The pinned Hub base revision is
 the recovery source.
+
+The default remains strict: serving config and tensor index must be identical.
+An explicit ``--allow-layout-change`` plan may replace those files too when the
+candidate deliberately changes representation while retaining the same shard
+filenames.  The loader-blocking marker spans the entire mixed-layout interval,
+so no partially converted checkpoint can be opened.
 """
 
 from __future__ import annotations
@@ -51,8 +57,9 @@ def build_plan(
     base_records: dict[str, dict[str, Any]], candidate_repo: str,
     candidate_revision: str,
     candidate_records: dict[str, dict[str, Any]], model_dir: Path,
+    allow_layout_change: bool = False,
 ) -> dict[str, Any]:
-    """Build a strict same-layout replacement plan from pinned Hub records."""
+    """Build a same-shard replacement plan from pinned Hub records."""
     base_shards = {
         name for name in base_records if name.endswith(".safetensors")}
     candidate_shards = {
@@ -63,13 +70,18 @@ def build_plan(
             f"missing={sorted(base_shards - candidate_shards)[:4]}, "
             f"extra={sorted(candidate_shards - base_shards)[:4]}"
         )
-    # Same-layout replacement is intentionally narrower than an overlay.  The
-    # runtime architecture and tensor-to-shard map must remain byte-identical;
-    # only weights and non-serving metadata may differ.
+    # Strict replacement is intentionally narrower than an overlay.  An
+    # explicit representation migration may change both serving files, but
+    # they must still exist as pinned candidate objects and every shard name
+    # must remain one-for-one so each old shard can be atomically overwritten.
     for required in ("config.json", "model.safetensors.index.json"):
         base = base_records.get(required)
         candidate = candidate_records.get(required)
-        if base is None or candidate is None or not _same_record(base, candidate):
+        if base is None or candidate is None:
+            raise ValueError(
+                f"replacement requires both releases to publish {required}"
+            )
+        if not allow_layout_change and not _same_record(base, candidate):
             raise ValueError(
                 f"same-layout replacement requires identical {required}"
             )
@@ -99,6 +111,9 @@ def build_plan(
         "base": {"repo": base_repo, "revision": base_revision},
         "candidate": {
             "repo": candidate_repo, "revision": candidate_revision},
+        "replacement_mode": (
+            "same-shards-layout-change"
+            if allow_layout_change else "same-layout"),
         "files": {
             "candidate_total": len(candidate_records),
             "safetensor_shards": len(candidate_shards),
@@ -410,6 +425,7 @@ def plan_command(args: argparse.Namespace) -> None:
         candidate_revision=candidate_info.sha,
         candidate_records=candidate_records,
         model_dir=model_dir,
+        allow_layout_change=args.allow_layout_change,
     )
     _atomic_json(marker, plan)
     _fsync_directory(model_dir)
@@ -426,6 +442,12 @@ def main() -> None:
     plan_parser.add_argument("--candidate-revision", required=True)
     plan_parser.add_argument("--model-dir", type=Path, required=True)
     plan_parser.add_argument("--resume", action="store_true")
+    plan_parser.add_argument(
+        "--allow-layout-change", action="store_true",
+        help=(
+            "explicitly allow candidate config/index changes while requiring "
+            "the identical safetensor shard filename set"),
+    )
 
     audit_parser = subparsers.add_parser("audit")
     audit_parser.add_argument("--model-dir", type=Path, required=True)

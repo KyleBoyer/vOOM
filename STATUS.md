@@ -1,5 +1,37 @@
 # STATUS — 2026-09-03 (current corrections first; dated chronology below is history)
 
+## 2026-09-03: complete uncensored Qwen FP8 candidate is replacement-ready
+
+The uncensored search found a materially better replacement candidate than the
+previous incomplete or oversized options:
+`dealignai/Qwen3.8-Flash-Next-ABLITERATED-FP8` revision
+`8d5a44586872fe3a22cfd14398894bc0fd054e29`.  Its pinned Hub tree has 131
+safetensor shards and 185,502,232,570 indexed tensor bytes, retains the full
+27-block vision tower and native MTP block, and uses per-expert E4M3 weights
+with FP32 128x128 inverse scales.  The normalized model architecture matches
+the current official tree.  It is much smaller than the current 360GB BF16
+checkpoint but is a semantic/quality trade: the publisher reports MMLU 86.36
+-> 83.86.  It must pass the local Plex and varied-shape gates before being
+called quality-accepted.
+
+The runtime now fails closed across both Qwen physical layouts: it either
+registers the official fused-BF16 expert slices or validates every per-expert
+FP8 weight+scale pair before exposing the checkpoint.  The existing exact
+fine-grained FP8 decoder and its one-dispatch Metal implementation are shared
+without changing the candidate's published values, with a Qwen-specific
+default-off native switch and protocol evidence.  A new explicit profile,
+`qwen38-flash-next-uncensored-fp8`, disables all old checkpoint-bound fast tiers
+and journals for first-pass isolation.
+
+The in-place Hub replacement tool also gained an explicit layout-change mode.
+Its default still rejects any changed config/index; the new mode still requires
+the identical safetensor shard filename set, pins both immutable revisions,
+hash-checks every base and candidate object, uses atomic per-file replacement,
+and leaves a loader-blocking marker throughout the mixed-layout interval.  No
+NAS backup is created.  Focused replacement, layout, FP8, profile, and server
+tests pass 357/357.  The actual replacement/download and independent final
+attestation are the next step.
+
 ## 2026-09-03: full GLM native FP8 and recurring admission pass matched medium gate
 
 The current full-GLM tile-32 baseline is now re-established on one code

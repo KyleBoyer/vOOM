@@ -476,6 +476,16 @@ def test_builtin_profiles_resolve_complete_agent_group():
     assert candidate_settings["VMODEL_QWEN4_MTP_DEPTH"] == "0"
     assert "VMODEL_QWEN4_FAST_TIER_DIR" not in candidate_settings
 
+    uncensored_fp8_order, uncensored_fp8_settings = resolve_runtime_profiles(
+        ("qwen38-flash-next-uncensored-fp8",), catalog)
+    assert uncensored_fp8_order == (
+        "qwen38-flash-next-candidate-bf16",
+        "qwen38-flash-next-uncensored-fp8",
+    )
+    assert uncensored_fp8_settings[
+        "VMODEL_QWEN4_NATIVE_FP8_DEQUANT"] == "1"
+    assert "VMODEL_QWEN4_FAST_TIER_DIR" not in uncensored_fp8_settings
+
     candidate_fast_order, candidate_fast_settings = resolve_runtime_profiles(
         ("qwen38-flash-next-candidate-fast-tier",), catalog)
     assert candidate_fast_order == (

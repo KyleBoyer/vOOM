@@ -121,6 +121,49 @@ def test_same_layout_replacement_requires_identical_serving_metadata(tmp_path):
         )
 
 
+def test_explicit_layout_change_keeps_same_shard_names_fail_closed(tmp_path):
+    root = tmp_path / "model"
+    base = _checkpoint(root)
+    candidate = dict(base)
+    candidate["config.json"] = b'{"model_type":"test","quantized":true}'
+    candidate["model.safetensors.index.json"] = json.dumps({
+        "weight_map": {
+            "model.weight": "model.safetensors",
+            "model.weight_scale_inv": "model.safetensors",
+        },
+    }, sort_keys=True).encode()
+    candidate["model.safetensors"] = b"candidate-fp8"
+
+    plan = build_plan(
+        base_repo="org/base", base_revision="a" * 40,
+        base_records={name: _record(name, data) for name, data in base.items()},
+        candidate_repo="org/candidate", candidate_revision="b" * 40,
+        candidate_records={
+            name: _record(name, data) for name, data in candidate.items()},
+        model_dir=root,
+        allow_layout_change=True,
+    )
+    assert plan["replacement_mode"] == "same-shards-layout-change"
+    assert {item["candidate"]["path"] for item in plan["files"]["replace"]} == {
+        "config.json", "model.safetensors.index.json", "model.safetensors",
+    }
+
+    renamed = dict(candidate)
+    renamed.pop("model.safetensors")
+    renamed["model-00001-of-00001.safetensors"] = b"candidate-fp8"
+    with pytest.raises(ValueError, match="safetensor layout differs"):
+        build_plan(
+            base_repo="org/base", base_revision="a" * 40,
+            base_records={
+                name: _record(name, data) for name, data in base.items()},
+            candidate_repo="org/candidate", candidate_revision="b" * 40,
+            candidate_records={
+                name: _record(name, data) for name, data in renamed.items()},
+            model_dir=root,
+            allow_layout_change=True,
+        )
+
+
 def test_raw_fast_tier_binding_detects_checkpoint_or_manifest_change(tmp_path):
     root = tmp_path / "model"
     _checkpoint(root)
@@ -141,4 +184,3 @@ def test_raw_fast_tier_binding_detects_checkpoint_or_manifest_change(tmp_path):
     (root / "model.safetensors").touch()
     with pytest.raises(ValueError, match="source identity mismatch"):
         validate_raw_fast_tier_binding(root, tier, manifest)
-

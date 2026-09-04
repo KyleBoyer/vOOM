@@ -2035,6 +2035,11 @@ class EngineManager:
         if glm53_native_fp8_prefetch_request not in ("0", "1"):
             raise RequestValidationError(
                 "VMODEL_GLM53_NATIVE_FP8_PREFETCH must be 0 or 1")
+        qwen4_native_fp8_dequant_request = os.environ.get(
+            "VMODEL_QWEN4_NATIVE_FP8_DEQUANT", "0").strip()
+        if qwen4_native_fp8_dequant_request not in ("0", "1"):
+            raise RequestValidationError(
+                "VMODEL_QWEN4_NATIVE_FP8_DEQUANT must be 0 or 1")
         glm53_mtp_request = os.environ.get(
             "VMODEL_GLM53_MTP", "0").strip()
         if glm53_mtp_request not in ("0", "1"):
@@ -2389,6 +2394,7 @@ class EngineManager:
             glm53_hot_kv_min_tokens,
             glm53_native_fp8_dequant_request,
             glm53_native_fp8_prefetch_request,
+            qwen4_native_fp8_dequant_request,
             glm53_mtp_request,
             glm53_mtp_depth,
             glm53_mtp_max_prompt_tokens,
@@ -2537,6 +2543,7 @@ class EngineManager:
             glm53_hot_kv_min_tokens,
             glm53_native_fp8_dequant_request,
             glm53_native_fp8_prefetch_request,
+            qwen4_native_fp8_dequant_request,
             glm53_mtp_request,
             glm53_mtp_depth,
             glm53_mtp_max_prompt_tokens,
@@ -2585,6 +2592,11 @@ class EngineManager:
             raise RequestValidationError(
                 "VMODEL_GLM53_NATIVE_FP8_PREFETCH=0 requires "
                 "VMODEL_GLM53_NATIVE_FP8_DEQUANT=1")
+        if (qwen4_native_fp8_dequant_request == "1"
+                and mtype != "qwen4_exp"):
+            raise RequestValidationError(
+                "VMODEL_QWEN4_NATIVE_FP8_DEQUANT requires a Qwen4-Exp "
+                "fine-grained-FP8 checkpoint")
         if (qwen_rerank_lm_head_rank_capture_path
                 and mtype != "qwen3_5"):
             raise RequestValidationError(
@@ -9456,6 +9468,8 @@ def _vision_protocol_timing(result: dict) -> dict:
         "weight_archive_bytes",
         "glm53_native_fp8_dequant",
         "glm53_native_fp8_prefetch",
+        "qwen4_native_fp8_dequant",
+        "qwen4_per_expert_fp8",
         "glm53_fp8_transform_ns",
         "glm53_fp8_transform_calls",
         "glm53_fp8_native_calls",

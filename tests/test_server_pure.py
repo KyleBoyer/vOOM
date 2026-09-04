@@ -287,6 +287,8 @@ def test_vision_protocol_timing_exposes_qwen4_spool_phases():
             "qwen4_host_spool_output_seconds": 6.25,
             "qwen4_ple_bytes_read": 15,
             "qwen4_fused_expert_bytes": 16,
+            "qwen4_native_fp8_dequant": 1,
+            "qwen4_per_expert_fp8": 1,
         },
     })
 
@@ -309,6 +311,8 @@ def test_vision_protocol_timing_exposes_qwen4_spool_phases():
     assert timing["qwen4_host_spool_output_seconds"] == 6.25
     assert timing["qwen4_ple_bytes_read"] == 15
     assert timing["qwen4_fused_expert_bytes"] == 16
+    assert timing["qwen4_native_fp8_dequant"] == 1
+    assert timing["qwen4_per_expert_fp8"] == 1
 
 
 def test_vision_protocol_timing_exposes_qwen4_verifier_pipeline_and_q_calibration():
@@ -2764,6 +2768,7 @@ def test_glm53_hot_prompt_kv_is_opt_in_exact_and_in_engine_identity():
         ("VMODEL_GLM53_HOT_PROMPT_KV", "auto", "must be 0 or 1"),
         ("VMODEL_GLM53_NATIVE_FP8_DEQUANT", "auto", "must be 0 or 1"),
         ("VMODEL_GLM53_NATIVE_FP8_PREFETCH", "auto", "must be 0 or 1"),
+        ("VMODEL_QWEN4_NATIVE_FP8_DEQUANT", "auto", "must be 0 or 1"),
         ("VMODEL_GLM53_HOT_KV_SLOTS", "0", "must be in \\[1, 4\\]"),
         ("VMODEL_GLM53_HOT_KV_MIN_TOKENS", "-1", "non-negative"),
         ("VMODEL_GLM53_MTP", "auto", "must be 0 or 1"),
