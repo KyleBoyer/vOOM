@@ -1,9 +1,10 @@
 schema: voom.runtime-profile.v1
 name: glm53-full-exact-host-spool-candidate
-description: Default-off full GLM-5.3 BF16-bit activation-spool capacity candidate.
+description: Default-off full GLM-5.3 BF16 inter-layer spool capacity candidate.
 notes:
-  - "Extends the released-weight native-FP8 long-context route at the proven outer tile width 32. The prompt-wide BF16 hidden state is copied to CPU-owned memory as raw uint16 bits between attention and MLP phases; the same tile and full-MLP shapes are restored, while weights, values, operators, router/expert order, and reductions remain unchanged."
-  - "At 46,849 tokens this targets roughly 0.58GB of the measured 4.23GB live set without repeating the rejected tile-16 arithmetic. Telemetry records H2D/D2H bytes, copy time, host bytes, and per-phase Metal peaks."
+  - "Extends the released-weight native-FP8 long-context route at the proven outer tile width 32. The prompt-wide BF16 hidden state is copied to CPU-owned memory as raw uint16 bits only between layers, so the next released weight page is admitted without that Metal owner. It is restored once per layer; the original attention tile views, concatenations, whole-MLP shape, router/expert order, and reductions are unchanged."
+  - "A rejected first version restored each attention tile independently: its BF16 payloads were exact, but fresh contiguous tile allocations changed the real Metal path and reproduced the rejected tile-16 output/read identity. This narrower candidate specifically avoids that layout change."
+  - "At 46,849 tokens this can remove roughly 0.58GB from layer-page admission without repeating the rejected tile-16 arithmetic. Telemetry records H2D/D2H bytes, copy time, host bytes, and per-phase Metal peaks."
   - "Candidate means unpromoted: require byte-identical output/state/read gates and healthy unified-memory pressure before the real 46.8K replay. Keep default-off."
 extends:
   - glm53-full-lossless-long-context-native-fp8

@@ -1301,10 +1301,10 @@ class RuntimeConfig:
     # numerical error is far below the greedy-token gate.
     glm53_native_fused_kda_prefill: bool = False
     # Exact-capacity candidate for GLM-5.3 layer-stationary activations.
-    # Materialized BF16 tiles are copied to host as raw uint16 payloads between
-    # attention/MLP phases, then restored at the identical operator shapes. No
-    # floating-point conversion; default-off until real output/state/read gates
-    # prove the full and Flash compositions independently.
+    # Materialized BF16 activations are copied to host as raw uint16 payloads
+    # at explicitly bounded phase boundaries, then restored at the original
+    # operator shapes. No floating-point conversion; default-off until real
+    # output/state/read gates prove the full and Flash compositions independently.
     glm53_layer_stationary_host_spool: bool = False
     # Exact F75 query/key tiling for the official glm_moe_dsa indexer. The
     # score reduction dimension is unchanged; only the bounded candidate merge
@@ -7459,6 +7459,16 @@ class StreamingEngine:
             weight_wait_s = time.perf_counter() - t0
             self.timer.add("weights_wait", weight_wait_s)
 
+            if host_spool:
+                # Keep the prompt-wide hidden state off Metal while the next
+                # released weight page is admitted and fetched. Restore it
+                # ONCE for the layer so all original tile views, concatenates,
+                # and GEMM layouts remain unchanged. Restoring every tile as a
+                # fresh contiguous allocation failed the real tile-32 identity
+                # gate even though its BF16 payloads were bit-exact.
+                x = metal_bits(hidden_host)
+                hidden_host = None
+
             active_before = mx.get_active_memory()
             mx.reset_peak_memory()
             t0 = time.perf_counter()
@@ -7477,13 +7487,9 @@ class StreamingEngine:
                 and indexer_type == "full"
                 and selection_width > tile_width
             ):
-                preselect_input = (
-                    metal_bits(hidden_host) if host_spool else x)
                 dsa.preselect_full_layer(
-                    i, preselect_input, w, f"model.layers.{i}", offset,
+                    i, x, w, f"model.layers.{i}", offset,
                     attention_tile_width=tile_width)
-                if host_spool:
-                    del preselect_input
                 # All query-sized selections are now external-spilled; return
                 # score graphs/allocator cache before compact MLA expansion.
                 mx.clear_cache()
@@ -7501,7 +7507,6 @@ class StreamingEngine:
             tiles = []
             dense_attention_tiles = []
             dense_attention_positions = 0
-            dense_output_position = 0
             dense_mlp_s = 0.0
             pos = 0
             while pos < total:
@@ -7511,9 +7516,7 @@ class StreamingEngine:
                         self._layer_transient,
                         margin=self._layer_transient_margin,
                         reason="glm53-full-attention-transient")
-                xt = (
-                    metal_bits(hidden_host[:, pos:end])
-                    if host_spool else x[:, pos:end, :])
+                xt = x[:, pos:end, :]
                 attention_t0 = time.perf_counter()
                 yt = _glm_attention_residual(
                     xt, w, f"model.layers.{i}", self.cfg, kv, i, offset + pos,
@@ -7525,23 +7528,15 @@ class StreamingEngine:
                         time.perf_counter() - attention_t0,
                         positions=end - pos)
                 if tile_dense_mlp:
-                    dense_attention_tiles.append(
-                        host_bits(
-                            yt,
-                            retained_host_bytes=int(hidden_host.nbytes))
-                        if host_spool else yt)
+                    dense_attention_tiles.append(yt)
                     dense_attention_positions += end - pos
                     if (dense_attention_positions >= dense_mlp_tile_size
                             or end == total):
-                        dense_attention_metal = (
-                            [metal_bits(tile)
-                             for tile in dense_attention_tiles]
-                            if host_spool else dense_attention_tiles)
                         dense_input = (
-                            dense_attention_metal[0]
-                            if len(dense_attention_metal) == 1
+                            dense_attention_tiles[0]
+                            if len(dense_attention_tiles) == 1
                             else mx.concatenate(
-                                dense_attention_metal, axis=1))
+                                dense_attention_tiles, axis=1))
                         dense_mlp_t0 = time.perf_counter()
                         dense_output = _glm_mlp_residual(
                             dense_input, w, f"model.layers.{i}", self.cfg, i,
@@ -7550,64 +7545,26 @@ class StreamingEngine:
                             profile=profiler)
                         mx.eval(dense_output)
                         dense_mlp_s += time.perf_counter() - dense_mlp_t0
-                        if host_spool:
-                            dense_bits = host_bits(
-                                dense_output,
-                                retained_host_bytes=int(hidden_host.nbytes))
-                            dense_end = (
-                                dense_output_position
-                                + int(dense_output.shape[1]))
-                            hidden_host[
-                                :, dense_output_position:dense_end] = dense_bits
-                            dense_output_position = dense_end
-                            dense_attention_metal = dense_input = None
-                            dense_output = dense_bits = None
-                            mx.clear_cache()
-                            note_memory(
-                                "dense_mlp_tile", i, dense_output_position,
-                                publish=(dense_output_position == total))
-                        else:
-                            tiles.append(dense_output)
+                        tiles.append(dense_output)
                         dense_attention_tiles = []
                         dense_attention_positions = 0
                 else:
-                    if host_spool:
-                        attention_bits = host_bits(
-                            yt,
-                            retained_host_bytes=int(hidden_host.nbytes))
-                        hidden_host[:, pos:end] = attention_bits
-                        attention_bits = yt = xt = None
-                        mx.clear_cache()
-                        note_memory(
-                            "attention_tile", i, end,
-                            publish=(pos == 0 or end == total
-                                     or end % (tile_width * 64) == 0))
-                    else:
-                        tiles.append(yt)
+                    tiles.append(yt)
                 pos = end
             mlp_t0 = time.perf_counter()
             if tile_dense_mlp:
                 if dense_attention_tiles or dense_attention_positions:
                     raise AssertionError(
                         "dense GLM MLP tile buffer was not flushed")
-                if host_spool:
-                    if dense_output_position != total:
-                        raise AssertionError(
-                            "dense GLM host spool did not cover every row")
-                    x = metal_bits(hidden_host)
-                else:
-                    x = (
-                        tiles[0]
-                        if len(tiles) == 1
-                        else mx.concatenate(tiles, axis=1))
+                x = (
+                    tiles[0]
+                    if len(tiles) == 1
+                    else mx.concatenate(tiles, axis=1))
             else:
-                if host_spool:
-                    x_after_attn = metal_bits(hidden_host)
-                else:
-                    x_after_attn = (
-                        tiles[0]
-                        if len(tiles) == 1
-                        else mx.concatenate(tiles, axis=1))
+                x_after_attn = (
+                    tiles[0]
+                    if len(tiles) == 1
+                    else mx.concatenate(tiles, axis=1))
                 x = _glm_mlp_residual(
                     x_after_attn, w, f"model.layers.{i}", self.cfg, i,
                     self._get_experts,
@@ -7616,9 +7573,7 @@ class StreamingEngine:
             mx.eval(x)
             note_memory("routed_mlp", i, total, publish=host_spool)
             if host_spool and i + 1 < n:
-                if not tile_dense_mlp:
-                    hidden_host = host_bits(
-                        x, retained_host_bytes=int(hidden_host.nbytes))
+                hidden_host = host_bits(x)
                 del x
                 if not tile_dense_mlp:
                     del x_after_attn

@@ -6,11 +6,10 @@ The explicit `glm53-full-exact-host-spool-candidate` now runs inside full
 GLM-5.3's actual `glm_moe_dsa` layer-stationary sweep.  The first implementation
 was correctly rejected as evidence because it was attached only to the
 `glm5_next` (Flash) sweep and therefore produced zero spool telemetry.  The
-corrected path preserves every evaluated BF16 activation as raw `uint16` bits,
-restores the proven attention-tile and whole-MoE shapes unchanged, and keeps the
-feature default-off.  It moves activations between MLX-owned Metal buffers and
-CPU-owned memory; it is placement, not CPU inference, and unified-memory
-pressure remains part of the acceptance gate.
+real-path implementation preserved every evaluated BF16 activation as raw
+`uint16` bits and kept the feature default-off.  It moves activations between
+MLX-owned Metal buffers and CPU-owned memory; it is placement, not CPU
+inference, and unified-memory pressure remains part of the acceptance gate.
 
 The real 17-input/max-1 released-checkpoint gate passed: output SHA remained
 `3fee95da...1043`, exact model reads remained 214,903,702,080 bytes, and wall
@@ -22,10 +21,20 @@ availability was 5.822GB and swap-outs grew 8.274MB.  Governor failures now
 include their named reservation phase in the error text, while full-GLM layer
 page and attention-transient admissions have distinct reason labels.
 
-The candidate is not promoted by this short proof.  The 2,123-input identity,
-read, peak, pressure, and timing gate is next; only a byte-identical medium
-result can justify attempting the 46,849-token captured replay.  Focused DSA,
-GLM-Flash, server, profile, and governor suites pass 377/377.
+The first real 2,123-input phase-spool gate was rejected as lossless.  It
+finished in 700.958 seconds engine / 704.838 seconds wall and reduced the
+tile-32 control peak from 1.070GB to 0.982GB, but produced the already-rejected
+tile-16 output SHA `706e47ac...f33a4` and its exact 707,720,491,584-byte read
+identity instead of tile-32's `d12fe7f6...68f7c4` / 708,060,313,152 bytes.
+Restoring each attention tile into a fresh contiguous allocation changed the
+Metal execution path despite the copy itself being bit-exact.
+
+The implementation is now narrowed to spool only *between layers*: the hidden
+state is absent while the next weight page is admitted, then restored once so
+the layer uses its original tile views, concatenations, whole-MoE shape, and
+reductions.  That narrower candidate must repeat the medium identity gate
+before any 46,849-token replay.  Focused DSA, GLM-Flash, server, profile, and
+governor suites pass 377/377.
 
 ## 2026-09-03: isolated native-KDA speedup is real but remains lossy and unpromoted
 
