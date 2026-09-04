@@ -311,6 +311,22 @@ def test_builtin_profiles_resolve_complete_agent_group():
     assert glm_native_settings[
         "VMODEL_GLM53_NATIVE_FUSED_KDA_PREFILL"] == "1"
 
+    glm_isolated_kda_order, glm_isolated_kda_settings = (
+        resolve_runtime_profiles(
+            ("glm53-flash-lossy-native-kda-isolated",), catalog))
+    assert glm_isolated_kda_order[-2:] == (
+        "glm53-flash-lossless-expert-prefetch-batch8-workers2",
+        "glm53-flash-lossy-native-kda-isolated",
+    )
+    assert glm_isolated_kda_settings[
+        "VMODEL_GLM53_COMPILED_KDA_PREFILL"] == "0"
+    assert glm_isolated_kda_settings[
+        "VMODEL_GLM53_NATIVE_FUSED_KDA_PREFILL"] == "1"
+    assert "VMODEL_GLM53_SPARSE_FUSED_KV_INT8" not in (
+        glm_isolated_kda_settings)
+    assert "VMODEL_GLM53_COALESCED_EXPERT_POSITIONS" not in (
+        glm_isolated_kda_settings)
+
     glm_fp8_hybrid_order, glm_fp8_hybrid_settings = resolve_runtime_profiles(
         ("glm53-flash-lossless-expert-prefetch-batch8-workers2-"
          "native-fp8-foreground",), catalog)

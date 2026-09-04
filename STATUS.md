@@ -1,5 +1,41 @@
 # STATUS — 2026-09-03 (current corrections first; dated chronology below is history)
 
+## 2026-09-03: isolated native-KDA speedup is real but remains lossy and unpromoted
+
+The one-dispatch Metal KDA recurrence is now isolated from every other lossy
+GLM-5.3-Flash switch.  The explicit
+`glm53-flash-lossy-native-kda-isolated` profile starts from the released-weight
+exact expert-prefetch route and changes only KDA prefill; compact MLA, int8
+K/V, fused sparse attention, coalesced expert-position GEMMs, and native FP8
+reconstruction all remain off.
+
+On the deterministic 2,123-input/max-1 request it completed in **400.823
+seconds engine / 403.616 seconds HTTP wall**, versus 428.728 / 431.801 seconds
+for the two eager exact controls' means: **6.51% / 6.53% faster**.  KDA wall
+fell from a 47.247-second control mean to 21.091 seconds while MLP stayed
+effectively flat.  Peak Metal was unchanged at 3,935,685,604 bytes and the
+one greedy output retained SHA `58bb119c...09cb5`.
+
+This is not lossless.  The released-geometry operator gate already measured
+2.61e-8 output and 5.96e-8 recurrent-state error.  In the real medium run that
+small difference changed routing by five expert misses and increased exact
+weight reads by 125,859,840 bytes.  A separate 12-input/four-output gate kept
+tokens `[3555, 374, 279, 3476]` but changed 156/159 saved tensors and showed
+no wall benefit (74.678 seconds).  A different JSON-shaped 16-input/six-output
+MTP gate likewise kept all six target tokens and accepted 2/2 proposals, but
+changed target state and finished in 92.993 seconds, essentially level with
+the 93.187-second exact control.  The profile is therefore a credible
+medium-context lossy speed lever, not a quality-approved fast profile.  It
+must pass the real Plex tool-quality and longer-output gates before promotion.
+
+FreeToken's CPU/GPU `q*` split remains rejected on this machine.  The existing
+released-shape Qwen probe was byte-identical at every split, but 12.5%, 25%,
+50%, and 100% CPU rows reached only 0.719x, 0.543x, 0.373x, and 0.259x the
+full-Metal speed.  Apple CPU and Metal share the same memory fabric, so CPU
+GEMMs add contention rather than hiding PCIe transfers.  CPU work remains
+appropriate for request orchestration, hashes, decompression, and asynchronous
+storage workers.
+
 ## 2026-09-03: exact FP8 prefetch scheduling recovers medium Flash overlap; MLX upgrade rejected
 
 The native GLM fine-grained-FP8 decoder's 2,123-input regression is now

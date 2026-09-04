@@ -282,6 +282,23 @@ arm, but only 0.49% faster than the two eager controls' engine mean, so it is a
 confirmed scheduling mechanism and explicit medium experiment—not an
 automatic threshold or replacement for the all-native short/vision leader.
 
+The native Metal KDA recurrence also has an isolated lossy research profile,
+`glm53-flash-lossy-native-kda-isolated`.  Unlike the earlier composite fast
+profiles, it begins with the released-weight exact expert-prefetch route and
+changes only KDA prefill.  On the deterministic 2,123-input/max-1 request it
+finished in 400.823 seconds engine / 403.616 seconds HTTP wall, 6.51% / 6.53%
+faster than the two eager exact controls' means.  KDA fell from a 47.247-second
+mean to 21.091 seconds and peak Metal stayed at 3.936GB.
+
+The matching output token is not an exactness proof.  Five expert routes
+changed, exact weight traffic grew by 125,859,840 bytes, and the low-level
+released-geometry oracle has nonzero error.  Four-output and varied six-output
+gates kept every greedy target token but changed the persisted state; they
+also showed no meaningful short-context speedup at 74.678 and 92.993 seconds.
+Keep this profile default-off and call it lossy.  It needs a real Plex tool
+quality gate and a longer-output gate before it can become a recommended fast
+profile.
+
 Those real gates now pass. On the 16-output full-state gate, batch 8 preserved
 all tokens, text, aggregate state, and each attention/DSA/recurrent/convolution/
 hidden hash while improving wall 368.970 to 351.396 seconds (-4.76%). Peak rose
