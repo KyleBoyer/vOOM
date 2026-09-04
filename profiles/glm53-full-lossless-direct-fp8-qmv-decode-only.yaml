@@ -1,0 +1,11 @@
+schema: voom.runtime-profile.v1
+name: glm53-full-lossless-direct-fp8-qmv-decode-only
+description: Exact full GLM-5.3 eager-BF16 prefill with packed-FP8 singleton decode.
+notes:
+  - "Extends the exact full-model direct-QMV profile but keeps ordinary released BF16 expert carriers throughout multi-position prefill, switching to packed E4M3/F32-block pages only for singleton decode."
+  - "Representation-qualified expert cache keys prevent cross-phase cache aliasing. The target checkpoint, DSA routing and selection, reductions, sampling, and output semantics are unchanged."
+  - "The phase machinery and Flash checkpoint are gated, but this full-model profile remains explicit/default-off pending its own token/state identity, medium and long prompt timing, DSA conformance, pressure, and real Plex gates."
+extends:
+  - glm53-full-lossless-direct-fp8-qmv
+settings:
+  VMODEL_GLM53_FP8_DIRECT_QMV_DECODE_ONLY: 1

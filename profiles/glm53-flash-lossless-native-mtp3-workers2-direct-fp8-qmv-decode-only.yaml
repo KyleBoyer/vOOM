@@ -1,0 +1,14 @@
+schema: voom.runtime-profile.v1
+name: glm53-flash-lossless-native-mtp3-workers2-direct-fp8-qmv-decode-only
+description: Exact GLM-5.3-Flash eager-BF16 prefill with packed-FP8 singleton decode.
+notes:
+  - "Extends the exact direct-QMV profile but applies its packed expert representation only after the authoritative prefill endpoint. Multi-position prefill reconstructs each released FP8 expert once on fetch and retains the exact BF16 carrier, avoiding repeated wider fallback reconstruction."
+  - "Decode retains the released E4M3 payload and FP32 block multipliers and uses the already-oracled exact singleton Metal QMV. Target weights, router choices, BF16 values, accumulation order, MTP verification, and emitted tokens are unchanged."
+  - "BF16 and packed expert pages use representation-qualified cache keys, so a page admitted in one phase cannot be consumed under the other phase's contract. The phase transition occurs only after prefill has completed and all authoritative expert batches have been consumed."
+  - "A 28-input/four-output checkpoint A/B matched all tokens, text, five state components, and all 159 endpoint tensors. It was 1.41% slower than all-phase direct QMV on the tiny prefill, which exposes the fixed eager-transform cost."
+  - "On the unmodified focused Plex capture (2,187 input tokens, full real schema, greedy, one-token cap), prefill was 471.639s versus the earlier all-phase-direct 1,540.515s and performed zero wider FP8 reconstructions. This is a historical same-input phase-policy comparison, not a simultaneous cold A/B or intelligence result; the cap intentionally cannot complete the tool call."
+  - "The real Plex gate peaked at 3.970GB Metal but observed 18.285MB external swap-out growth. This profile remains explicit/default-off pending a longer-decode identity/timing gate, a replay corpus, and lower-pressure confirmation."
+extends:
+  - glm53-flash-lossless-native-mtp3-workers2-direct-fp8-qmv
+settings:
+  VMODEL_GLM53_FP8_DIRECT_QMV_DECODE_ONLY: 1

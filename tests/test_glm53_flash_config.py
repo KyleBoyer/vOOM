@@ -434,6 +434,55 @@ def test_glm53_direct_fp8_qmv_is_exact_and_falls_back_for_wider_rows(
     assert direct_stats[7] == dense.nbytes
 
 
+def test_glm53_direct_fp8_qmv_decode_only_keeps_prefill_dense(
+    tmp_path, monkeypatch,
+):
+    import mlx.core as mx
+
+    from runtime.model_loader import WeightStore
+    from runtime.quant import FineGrainedFP8Tensor
+
+    config = _config()
+    config["quantization_config"] = {
+        "quant_method": "fp8",
+        "activation_scheme": "dynamic",
+        "weight_block_size": [128, 128],
+    }
+    (tmp_path / "config.json").write_text(json.dumps(config))
+    codes = np.resize(
+        np.arange(256, dtype=np.uint8), 128 * 128).reshape(128, 128)
+    scale = np.array([[0.03125]], dtype=np.float32)
+    physical = "model.language_model.layers.1.mlp.experts.0.gate_proj"
+    _write_safetensor(tmp_path, {
+        f"{physical}.weight": (codes, "F8_E4M3"),
+        f"{physical}.weight_scale_inv": (scale, "F32"),
+    })
+    monkeypatch.setenv("VMODEL_GLM53_FP8_DIRECT_QMV", "1")
+    monkeypatch.setenv("VMODEL_GLM53_FP8_DIRECT_QMV_DECODE_ONLY", "1")
+    store = WeightStore(tmp_path)
+    logical = "model.layers.1.mlp.experts.0.gate_proj.weight"
+
+    prefill, _seconds, _physical_bytes = store.fetch([logical])
+    assert not isinstance(prefill[logical], FineGrainedFP8Tensor)
+    assert prefill[logical].dtype == mx.bfloat16
+    assert store.expert_resident_bytes_per_weight == 2.0
+
+    store.glm53_fp8_direct_qmv_active = True
+    decode, _seconds, _physical_bytes = store.fetch([logical])
+    assert isinstance(decode[logical], FineGrainedFP8Tensor)
+
+
+def test_glm53_direct_fp8_qmv_decode_only_requires_direct(
+    tmp_path, monkeypatch,
+):
+    from runtime.model_loader import WeightStore
+
+    (tmp_path / "config.json").write_text(json.dumps(_config()))
+    monkeypatch.setenv("VMODEL_GLM53_FP8_DIRECT_QMV_DECODE_ONLY", "1")
+    with pytest.raises(ValueError, match="requires.*DIRECT_QMV=1"):
+        WeightStore(tmp_path)
+
+
 def test_glm53_fp8_scale_dtype_mismatch_fails_closed():
     import mlx.core as mx
 

@@ -1,5 +1,42 @@
 # STATUS — 2026-09-04 (current corrections first; dated chronology below is history)
 
+## 2026-09-04: phase-aware FP8 QMV removes the medium-prefill regression
+
+The exact direct-QMV path now has an explicit decode-only policy.  GLM prefill
+continues to materialize and retain the released experts' ordinary BF16 carrier,
+then the engine switches only at the completed-prefill boundary to packed
+E4M3/F32-block pages for singleton decode.  BF16 and packed pages have different
+cache identities, including for MTP experts and every prefetch source, so an
+asynchronous page from one arithmetic contract cannot be consumed as the other.
+Speculative and plain generation share the same boundary.  The phase setting is
+also part of engine, response, cache, and timing identity.
+
+On the 28-input/four-output real-checkpoint oracle, decode-only and all-phase
+direct QMV matched all four tokens, text, five state-component hashes, and all
+159 endpoint tensor hashes.  Decode-only took 84.012s versus 82.841s all-phase
+(+1.41%) on that tiny prefill, establishing the expected fixed transformation
+cost rather than a short-prompt win.
+
+The important real captured-schema gate used the unmodified focused Plex request:
+2,187 input tokens, full real tool schema, greedy decoding, and a one-token output
+cap.  Decode-only prefill completed in **471.639s**, versus **1,540.515s** for the
+prior all-phase-direct first turn (**-69.39%, 3.27x faster** on this historical
+same-input comparison).  It performed zero direct-QMV calls and zero wider
+fallback reconstructions during prefill; the earlier path spent 1,056.383s in
+491,043 wider fallbacks.  The one-token cap intentionally cannot score quality,
+and this is not a simultaneous cold A/B.  It is therefore a phase-policy timing
+gate, not a promoted Plex/intelligence result.  The run peaked at 3.970GB Metal,
+read 310.926GB physically, and observed 18.285MB external swap-out growth, so the
+profiles remain explicit/default-off pending a longer decode and broader pressure
+gate.  The previously completed 256-token all-phase request remains rejected at
+55/100 despite semantically finding the right media: its first tool call omitted
+required filters.
+
+Evidence:
+`logs/glm53_flash_direct_{decode_only,all_phases}_default_max4_20260904.json`,
+`logs/glm53_flash_direct_decode_only_plex_max1_20260904.json`, and
+`logs/glm53_flash_direct_qmv_plex_focused_max256_20260904.json`.
+
 ## 2026-09-04: released FP8 stays packed through exact singleton expert QMV
 
 GLM's routed-expert cache no longer has to widen every released E4M3/F32-block

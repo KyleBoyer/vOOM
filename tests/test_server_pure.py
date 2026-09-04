@@ -2776,6 +2776,8 @@ def test_glm53_hot_prompt_kv_is_opt_in_exact_and_in_engine_identity():
         ("VMODEL_GLM53_HOT_PROMPT_KV", "auto", "must be 0 or 1"),
         ("VMODEL_GLM53_NATIVE_FP8_DEQUANT", "auto", "must be 0 or 1"),
         ("VMODEL_GLM53_NATIVE_FP8_PREFETCH", "auto", "must be 0 or 1"),
+        ("VMODEL_GLM53_FP8_DIRECT_QMV", "auto", "must be 0 or 1"),
+        ("VMODEL_GLM53_FP8_DIRECT_QMV_DECODE_ONLY", "auto", "must be 0 or 1"),
         ("VMODEL_QWEN4_NATIVE_FP8_DEQUANT", "auto", "must be 0 or 1"),
         ("VMODEL_GLM53_HOT_KV_SLOTS", "0", "must be in \\[1, 4\\]"),
         ("VMODEL_GLM53_HOT_KV_MIN_TOKENS", "-1", "non-negative"),
@@ -2807,6 +2809,54 @@ def test_glm53_hot_prompt_kv_settings_fail_closed(variable, value, message):
     with patch.dict("os.environ", {variable: value}, clear=False):
         with pytest.raises(RequestValidationError, match=message):
             EngineManager().get(Path("/tmp/not-opened-glm53"), "lossless")
+
+
+def test_glm53_decode_only_direct_qmv_requires_direct():
+    from unittest.mock import patch
+
+    from runtime.server import EngineManager, RequestValidationError
+
+    with patch.dict("os.environ", {
+        "VMODEL_GLM53_FP8_DIRECT_QMV": "0",
+        "VMODEL_GLM53_FP8_DIRECT_QMV_DECODE_ONLY": "1",
+    }, clear=False):
+        with pytest.raises(RequestValidationError, match="requires.*DIRECT_QMV=1"):
+            EngineManager().get(Path("/tmp/not-opened-glm53"), "lossless")
+
+
+def test_glm53_decode_only_direct_qmv_is_in_engine_identity():
+    from unittest.mock import patch
+
+    from runtime.server import EngineManager
+
+    captured = []
+
+    class FakeEngine:
+        def __init__(self, _path, rc):
+            captured.append(rc)
+
+        def close(self):
+            pass
+
+    cfg = SimpleNamespace(
+        model_type="glm5_next", tie_word_embeddings=False,
+        index_topk=2048, vision_config=None, num_experts_per_tok=8,
+    )
+    settings = {
+        "VMODEL_GLM53_FP8_DIRECT_QMV": "1",
+        "VMODEL_GLM53_FP8_DIRECT_QMV_DECODE_ONLY": "0",
+    }
+    with patch.dict("os.environ", settings, clear=False), \
+         patch("runtime.config.ModelConfig.from_dir", return_value=cfg), \
+         patch("runtime.path_resolver.resolve_model_dir",
+               side_effect=lambda path: path), \
+         patch("runtime.engine.StreamingEngine", FakeEngine):
+        manager = EngineManager()
+        manager.get(Path("/tmp/fake-glm53-direct-phase"), "lossless")
+        os.environ["VMODEL_GLM53_FP8_DIRECT_QMV_DECODE_ONLY"] = "1"
+        manager.get(Path("/tmp/fake-glm53-direct-phase"), "lossless")
+
+    assert len(captured) == 2
 
 
 @pytest.mark.parametrize("model_type", ["glm5_next", "glm_moe_dsa"])

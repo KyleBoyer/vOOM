@@ -2040,6 +2040,16 @@ class EngineManager:
         if glm53_fp8_direct_qmv_request not in ("0", "1"):
             raise RequestValidationError(
                 "VMODEL_GLM53_FP8_DIRECT_QMV must be 0 or 1")
+        glm53_fp8_direct_qmv_decode_only_request = os.environ.get(
+            "VMODEL_GLM53_FP8_DIRECT_QMV_DECODE_ONLY", "0").strip()
+        if glm53_fp8_direct_qmv_decode_only_request not in ("0", "1"):
+            raise RequestValidationError(
+                "VMODEL_GLM53_FP8_DIRECT_QMV_DECODE_ONLY must be 0 or 1")
+        if (glm53_fp8_direct_qmv_decode_only_request == "1"
+                and glm53_fp8_direct_qmv_request != "1"):
+            raise RequestValidationError(
+                "VMODEL_GLM53_FP8_DIRECT_QMV_DECODE_ONLY=1 requires "
+                "VMODEL_GLM53_FP8_DIRECT_QMV=1")
         qwen4_native_fp8_dequant_request = os.environ.get(
             "VMODEL_QWEN4_NATIVE_FP8_DEQUANT", "0").strip()
         if qwen4_native_fp8_dequant_request not in ("0", "1"):
@@ -2400,6 +2410,7 @@ class EngineManager:
             glm53_native_fp8_dequant_request,
             glm53_native_fp8_prefetch_request,
             glm53_fp8_direct_qmv_request,
+            glm53_fp8_direct_qmv_decode_only_request,
             qwen4_native_fp8_dequant_request,
             glm53_mtp_request,
             glm53_mtp_depth,
@@ -2549,6 +2560,8 @@ class EngineManager:
             glm53_hot_kv_min_tokens,
             glm53_native_fp8_dequant_request,
             glm53_native_fp8_prefetch_request,
+            glm53_fp8_direct_qmv_request,
+            glm53_fp8_direct_qmv_decode_only_request,
             qwen4_native_fp8_dequant_request,
             glm53_mtp_request,
             glm53_mtp_depth,
@@ -9480,6 +9493,7 @@ def _vision_protocol_timing(result: dict) -> dict:
         "weight_archive_bytes",
         "glm53_native_fp8_dequant",
         "glm53_fp8_direct_qmv",
+        "glm53_fp8_direct_qmv_decode_only",
         "glm53_native_fp8_prefetch",
         "qwen4_native_fp8_dequant",
         "qwen4_per_expert_fp8",
@@ -10332,6 +10346,8 @@ def _execution_profile_fields(engine) -> dict[str, object]:
         weight_profile += "+ct-mxfp4-native"
     if getattr(store, "glm53_fp8_direct_qmv", False):
         weight_profile += "+glm53-fp8-direct-qmv"
+        if getattr(store, "glm53_fp8_direct_qmv_decode_only", False):
+            weight_profile += "-decode-only"
     if rc is not None and getattr(rc, "kimi_k3_scale_sidecar_dir", ""):
         weight_profile += "+k3-scale-sidecar"
     if rc is not None and getattr(rc, "bf16_nf12_sidecar_dir", ""):
@@ -10351,6 +10367,8 @@ def _execution_profile_fields(engine) -> dict[str, object]:
     }
     if getattr(store, "glm53_fp8_direct_qmv", False):
         fields["vmodel_glm53_fp8_direct_qmv"] = 1
+        if getattr(store, "glm53_fp8_direct_qmv_decode_only", False):
+            fields["vmodel_glm53_fp8_direct_qmv_decode_only"] = 1
     if rc is not None and getattr(rc, "qwen35_prefill_chunk_ceiling", 0):
         fields["vmodel_qwen35_prefill_chunk_ceiling"] = int(
             rc.qwen35_prefill_chunk_ceiling)

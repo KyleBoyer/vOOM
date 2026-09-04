@@ -284,6 +284,20 @@ class WeightStore:
         # the existing BF16 carrier on demand and use the ordinary matmul.
         self.glm53_fp8_direct_qmv = (
             os.environ.get("VMODEL_GLM53_FP8_DIRECT_QMV") == "1")
+        self.glm53_fp8_direct_qmv_decode_only = (
+            os.environ.get(
+                "VMODEL_GLM53_FP8_DIRECT_QMV_DECODE_ONLY", "0") == "1")
+        if (self.glm53_fp8_direct_qmv_decode_only
+                and not self.glm53_fp8_direct_qmv):
+            raise ValueError(
+                "VMODEL_GLM53_FP8_DIRECT_QMV_DECODE_ONLY requires "
+                "VMODEL_GLM53_FP8_DIRECT_QMV=1")
+        # The engine changes this only at a proven prefill/decode boundary.
+        # Keeping the requested policy separate from its current phase avoids
+        # relabeling a BF16 cache page as packed FP8 (or vice versa).
+        self.glm53_fp8_direct_qmv_active = bool(
+            self.glm53_fp8_direct_qmv
+            and not self.glm53_fp8_direct_qmv_decode_only)
         # The fused decoder is exact, but medium layer-stationary profiling
         # showed that dispatching it from expert-prefetch workers can contend
         # with the foreground expert GEMM on Metal.  Keep today's all-native
@@ -926,7 +940,8 @@ class WeightStore:
                     "weight_block_size")
             self.expert_storage_bytes_per_weight = (
                 1.0 + 4.0 / (int(block[0]) * int(block[1])))
-            if self.glm53_fp8_direct_qmv:
+            if (self.glm53_fp8_direct_qmv
+                    and not self.glm53_fp8_direct_qmv_decode_only):
                 self.expert_resident_bytes_per_weight = (
                     self.expert_storage_bytes_per_weight)
         elif (self.quantization and self.config.model_type != "gpt_oss"
@@ -1034,7 +1049,7 @@ class WeightStore:
                     # multiply, and final BF16 rounding in both decoders.
                     scale = scale.astype(mx.float32)
                 direct_expert = (
-                    self.glm53_fp8_direct_qmv
+                    self.glm53_fp8_direct_qmv_active
                     and self.config.model_type in ("glm_moe_dsa", "glm5_next")
                     and ".mlp.experts." in name
                 )

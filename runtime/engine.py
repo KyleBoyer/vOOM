@@ -719,6 +719,8 @@ def _quantization_cache_identity(rc: "RuntimeConfig", store) -> str:
             identity += "-foreground-only"
     if getattr(store, "glm53_fp8_direct_qmv", False):
         identity += "+glm53-fp8-direct-qmv"
+        if getattr(store, "glm53_fp8_direct_qmv_decode_only", False):
+            identity += "-decode-only"
     return identity
 
 
@@ -2965,7 +2967,7 @@ class StreamingEngine:
             for (l, e), _ in top:
                 if l < self.cfg.num_hidden_layers:
                     self.prefetcher.schedule(
-                        f"layer.{l}.expert.{e}",
+                        self._expert_cache_key(l, e),
                         self.store.names_with_prefix(
                             f"model.layers.{l}.{self.cfg.moe_expert_prefix}.{e}."),
                     )
@@ -3970,7 +3972,7 @@ class StreamingEngine:
             if self.prefetcher and self.rc.expert_predictive_prefetch:
                 for e in self.predictor.predict(layer, expert_ids, top_m=self.cfg.num_experts_per_tok):
                     self.prefetcher.schedule(
-                        f"layer.{layer + 1}.expert.{e}",
+                        self._expert_cache_key(layer + 1, e),
                         self.store.names_with_prefix(
                             f"model.layers.{layer + 1}.{self.cfg.moe_expert_prefix}.{e}."),
                         only_if_idle=self.rc.expert_prefetch_idle_only,
@@ -5120,6 +5122,38 @@ class StreamingEngine:
         kv.dsv4_cstate = states
         kv.dsv4_pos = snapshot["pos"]
 
+    def _set_glm53_fp8_direct_phase(self, phase: str) -> None:
+        """Select the released expert representation at a safe phase boundary.
+
+        A decode-only direct-QMV profile materializes ordinary BF16 expert
+        pages during multi-position prefill, then retains packed E4M3/F32
+        pages for singleton decode.  The cache key below includes the active
+        representation, so a page produced in one phase can never be consumed
+        under the other phase's arithmetic contract.
+        """
+        store = self.store
+        if not getattr(store, "glm53_fp8_direct_qmv", False):
+            return
+        if phase not in ("prefill", "decode"):
+            raise ValueError(f"unsupported direct-QMV phase {phase!r}")
+        decode_only = bool(getattr(
+            store, "glm53_fp8_direct_qmv_decode_only", False))
+        store.glm53_fp8_direct_qmv_active = bool(
+            not decode_only or phase == "decode")
+
+    def _expert_cache_key(
+        self, layer: int, expert: int, module_base: str | None = None,
+    ) -> str:
+        scope = module_base.replace(".", "_") if module_base else f"layer.{layer}"
+        store = self.store
+        if getattr(store, "glm53_fp8_direct_qmv_decode_only", False):
+            representation = (
+                "fp8direct" if getattr(
+                    store, "glm53_fp8_direct_qmv_active", False)
+                else "bf16")
+            scope = f"{scope}.{representation}"
+        return f"{scope}.expert.{expert}"
+
     def _fetch_experts(self, layer: int, expert_ids: list[int],
                        module_base: str | None = None) -> dict[int, dict]:
         """Fetch one lifetime-bounded expert batch; routing was recorded already.
@@ -5131,9 +5165,8 @@ class StreamingEngine:
         items = []
         n_missing = 0
         base = module_base or f"model.layers.{layer}"
-        cache_scope = module_base.replace(".", "_") if module_base else f"layer.{layer}"
         for e in expert_ids:
-            key = f"{cache_scope}.expert.{e}"
+            key = self._expert_cache_key(layer, e, module_base)
             if self.cache.contains(key):
                 self.expert_hits += 1
             else:
@@ -5166,7 +5199,10 @@ class StreamingEngine:
             profiler.record_expert_fetch(
                 layer, pages=len(expert_ids), misses=n_missing,
                 wall_s=elapsed)
-        return {e: pages[f"{cache_scope}.expert.{e}"] for e in expert_ids}
+        return {
+            e: pages[self._expert_cache_key(layer, e, module_base)]
+            for e in expert_ids
+        }
 
     def _get_experts(self, layer: int, expert_ids: list[int],
                      positions: dict[int, list[int]] | None = None) -> dict[int, dict]:
@@ -5367,7 +5403,7 @@ class StreamingEngine:
         mx.eval(idx)
         for e in sorted({int(i) for i in idx.reshape(-1).tolist()}):
             self.prefetcher.schedule(
-                f"layer.{nxt}.expert.{e}",
+                self._expert_cache_key(nxt, e),
                 self.store.names_with_prefix(
                     f"model.layers.{nxt}.{self.cfg.moe_expert_prefix}.{e}."),
                 only_if_idle=self.rc.expert_prefetch_idle_only,
@@ -10583,6 +10619,7 @@ class StreamingEngine:
             self._dspark_tap_collector.begin_attempt()
         if self._request_profiler is not None:
             self._request_profiler.set_phase("prefill")
+        self._set_glm53_fp8_direct_phase("prefill")
         sampling = sampling or SamplingParams()
         sampling.seed_rng()
         stop = stop or []
@@ -12416,6 +12453,7 @@ class StreamingEngine:
         prefill_cache_after = _cache_io_snapshot(self)
         prefill_s = (time.perf_counter() - t0
                      + path_stats["tool_pic_prefill_s"])
+        self._set_glm53_fp8_direct_phase("decode")
         if self._request_profiler is not None:
             self._request_profiler.set_phase("decode")
         if (self.cfg.model_type == "deepseek_v4"
@@ -12863,6 +12901,9 @@ class StreamingEngine:
                 bool(getattr(self.store, "native_glm53_fp8_dequant", False)))
             path_stats["glm53_fp8_direct_qmv"] = int(
                 bool(getattr(self.store, "glm53_fp8_direct_qmv", False)))
+            path_stats["glm53_fp8_direct_qmv_decode_only"] = int(bool(
+                getattr(
+                    self.store, "glm53_fp8_direct_qmv_decode_only", False)))
             path_stats["glm53_native_fp8_prefetch"] = int(
                 bool(getattr(self.store, "native_glm53_fp8_prefetch", True)))
         if self.cfg.model_type == "qwen4_exp":
