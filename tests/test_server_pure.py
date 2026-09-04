@@ -3099,6 +3099,7 @@ def test_glm53_sparse_absorbed_mla_is_explicit_and_in_engine_identity():
     settings = {
         "VMODEL_GLM53_MTP": "0",
         "VMODEL_GLM53_SPARSE_ABSORBED_MLA": "0",
+        "VMODEL_GLM53_SPARSE_ABSORBED_QUERY_TILE_SIZE": "32",
         "VMODEL_GLM53_SPARSE_FUSED_ATTENTION": "0",
         "VMODEL_GLM53_SPARSE_FUSED_KV_INT8": "0",
         "VMODEL_GLM53_COALESCED_EXPERT_POSITIONS": "0",
@@ -3148,9 +3149,12 @@ def test_glm53_sparse_absorbed_mla_is_explicit_and_in_engine_identity():
         os.environ["VMODEL_GLM53_SPARSE_FUSED_KV_INT8"] = "0"
         os.environ["VMODEL_GLM53_EXPANDED_KV_HOST_SPOOL"] = "1"
         manager.get(Path("/tmp/fake-glm53-sparse-absorbed"), "lossless")
+        os.environ["VMODEL_GLM53_SPARSE_ABSORBED_QUERY_TILE_SIZE"] = "64"
+        manager.get(Path("/tmp/fake-glm53-sparse-absorbed"), "lossless")
 
-    assert len(captured) == 13
+    assert len(captured) == 14
     assert captured[0].glm53_sparse_absorbed_mla is False
+    assert captured[0].glm53_sparse_absorbed_query_tile_size == 32
     assert captured[1].glm53_sparse_absorbed_mla is True
     assert captured[2].glm53_sparse_absorbed_mla is False
     assert captured[2].glm53_sparse_fused_attention is True
@@ -3183,6 +3187,23 @@ def test_glm53_sparse_absorbed_mla_is_explicit_and_in_engine_identity():
         "/Volumes/Test/glm53-activation-spool")
     assert captured[11].glm53_expanded_kv_host_spool is False
     assert captured[12].glm53_expanded_kv_host_spool is True
+    assert captured[12].glm53_sparse_absorbed_query_tile_size == 32
+    assert captured[13].glm53_sparse_absorbed_query_tile_size == 64
+
+
+@pytest.mark.parametrize("value", ["auto", "0", "4", "256"])
+def test_glm53_sparse_absorbed_query_tile_rejects_invalid_env(value):
+    from unittest.mock import patch
+
+    from runtime.server import EngineManager, RequestValidationError
+
+    with patch.dict("os.environ", {
+        "VMODEL_GLM53_SPARSE_ABSORBED_QUERY_TILE_SIZE": value,
+    }, clear=False):
+        with pytest.raises(
+                RequestValidationError,
+                match="VMODEL_GLM53_SPARSE_ABSORBED_QUERY_TILE_SIZE"):
+            EngineManager().get(Path("/tmp/unused-glm53"), "lossless")
 
 
 def test_glm53_sparse_attention_candidates_are_mutually_exclusive():

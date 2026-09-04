@@ -1,0 +1,13 @@
+schema: voom.runtime-profile.v1
+name: glm53-flash-e-compact-mla-tile128
+description: Explicit GLM-5.3-Flash compact sparse MLA with coordinated 128-row outer and attention tiles.
+notes:
+  - "Extends the measured 64-row compact-MLA winner and doubles both the layer-stationary outer tile and absorbed selected-attention tile. Every outer tile remains one bounded attention launch, while exact per-expert arithmetic is still performed independently in ascending expert order."
+  - "The wider whole-layer shape can change router and GEMM kernel boundaries and inherits the absorbed parent's floating-point reassociation, so this is E-class/default-off. It deliberately excludes coalesced expert GEMMs."
+  - "Require the same 2,123-token request/output hash, lower wall than tile 64, bounded peak/swap, and then multi-token state and varied-shape quality gates. Reject on neutral/slower wall or unsafe pressure."
+  - "The deterministic 2,123-input/max-1 gate preserved request/output hashes. Versus tile 64, wall fell 360.056 -> 346.052 seconds (-3.89%) and engine 357.284 -> 343.242 (-3.93%); versus the original tile-32 compact/batch-eight control, wall improved 18.99%. MLA was 7.283 seconds, MLP 281.612, peak Metal 2.872GB, and physical swap-out growth 11.846MB. Reads rose 0.04% versus tile 64 to 301.864GB as the E-class outer shape changed a few routed pages. This is a finite equality/timing pass, not an answer-quality promotion."
+extends:
+  - glm53-flash-e-compact-mla-tile64
+settings:
+  VMODEL_GLM53_PREFILL_TILE_WIDTH: 128
+  VMODEL_GLM53_SPARSE_ABSORBED_QUERY_TILE_SIZE: 128

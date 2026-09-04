@@ -948,7 +948,8 @@ def glm5_next_mla_attention(
             output = _glm5_next_sparse_absorbed_mla_attention(
                 query, latent_all, selection, w, prefix,
                 heads=heads, key_dim=key_dim, value_dim=value_dim,
-                query_tile_size=32)
+                query_tile_size=int(getattr(
+                    kv, "glm53_sparse_absorbed_query_tile_size", 32)))
         elif (expanded_keys is not None
               and getattr(kv, "glm53_sparse_fused_attention", False)):
             from .glm5_next_sparse_fused import (

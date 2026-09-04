@@ -1360,6 +1360,11 @@ class RuntimeConfig:
     # algebra: no prompt, tool, subject, route, or request-shape branch enters
     # either decision.
     glm53_sparse_absorbed_mla: bool = False
+    # Query rows per selected sparse absorbed-MLA materialization. Query rows
+    # are independent (no cross-row reduction), so changing this width only
+    # changes bounded scheduling/launch shape. Keep 32 as the historical
+    # default and require explicit profile gates for wider shapes.
+    glm53_sparse_absorbed_query_tile_size: int = 32
     # Fused selected-row K/V attention removes the gather but uses online
     # softmax/SIMD reductions, so it is an explicit lossy Metal candidate.
     glm53_sparse_fused_attention: bool = False
@@ -1696,6 +1701,8 @@ class RuntimeConfig:
             mla_absorbed_decode=run.get("mla_absorbed_decode", False),
             glm53_sparse_absorbed_mla=run.get(
                 "glm53_sparse_absorbed_mla", False),
+            glm53_sparse_absorbed_query_tile_size=run.get(
+                "glm53_sparse_absorbed_query_tile_size", 32),
             glm53_sparse_fused_attention=run.get(
                 "glm53_sparse_fused_attention", False),
             glm53_sparse_fused_kv_int8=run.get(
@@ -10588,6 +10595,8 @@ class StreamingEngine:
             arithmetic = (
                 f"abs{int(self.rc.mla_absorbed_decode)}"
                 f"glm53sparseabs{int(self.rc.glm53_sparse_absorbed_mla)}"
+                f"glm53sparseabsqt{
+                    self.rc.glm53_sparse_absorbed_query_tile_size}"
                 f"glm53sparsefused{int(self.rc.glm53_sparse_fused_attention)}"
                 f"glm53sparsekvint8{int(self.rc.glm53_sparse_fused_kv_int8)}"
                 f"glm53coalexpert{int(
@@ -10739,6 +10748,8 @@ class StreamingEngine:
             if self.cfg.model_type == "glm5_next":
                 kv.glm53_sparse_absorbed_mla = bool(
                     self.rc.glm53_sparse_absorbed_mla)
+                kv.glm53_sparse_absorbed_query_tile_size = int(
+                    self.rc.glm53_sparse_absorbed_query_tile_size)
                 kv.glm53_sparse_fused_attention = bool(
                     self.rc.glm53_sparse_fused_attention)
                 kv.glm53_sparse_fused_kv_int8 = bool(
@@ -13324,6 +13335,8 @@ class StreamingEngine:
                 self, "_glm53_layer_stationary_stats", {}) or {}
             path_stats["glm53_sparse_absorbed_mla"] = int(
                 self.rc.glm53_sparse_absorbed_mla)
+            path_stats["glm53_sparse_absorbed_query_tile_size"] = int(
+                self.rc.glm53_sparse_absorbed_query_tile_size)
             path_stats["glm53_sparse_fused_attention"] = int(
                 self.rc.glm53_sparse_fused_attention)
             path_stats["glm53_sparse_fused_kv_int8"] = int(

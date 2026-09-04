@@ -341,6 +341,48 @@ def test_builtin_profiles_resolve_complete_agent_group():
     assert "VMODEL_GLM53_SPARSE_FUSED_KV_INT8" not in (
         glm_compact_coalesced_settings)
 
+    glm_compact_tile64_order, glm_compact_tile64_settings = (
+        resolve_runtime_profiles(
+            ("glm53-flash-e-compact-mla-tile64",), catalog))
+    assert glm_compact_tile64_order[-2:] == (
+        "glm53-flash-e-compact-mla-prefetch-batch8",
+        "glm53-flash-e-compact-mla-tile64",
+    )
+    assert glm_compact_tile64_settings[
+        "VMODEL_GLM53_SPARSE_ABSORBED_QUERY_TILE_SIZE"] == "64"
+    assert glm_compact_tile64_settings[
+        "VMODEL_GLM53_PREFILL_TILE_WIDTH"] == "64"
+    assert "VMODEL_GLM53_COALESCED_EXPERT_POSITIONS" not in (
+        glm_compact_tile64_settings)
+
+    glm_compact_tile128_query_order, glm_compact_tile128_query_settings = (
+        resolve_runtime_profiles(
+            ("glm53-flash-e-compact-mla-tile128",), catalog))
+    assert glm_compact_tile128_query_order[-2:] == (
+        "glm53-flash-e-compact-mla-tile64",
+        "glm53-flash-e-compact-mla-tile128",
+    )
+    assert glm_compact_tile128_query_settings[
+        "VMODEL_GLM53_SPARSE_ABSORBED_QUERY_TILE_SIZE"] == "128"
+    assert glm_compact_tile128_query_settings[
+        "VMODEL_GLM53_PREFILL_TILE_WIDTH"] == "128"
+    assert "VMODEL_GLM53_COALESCED_EXPERT_POSITIONS" not in (
+        glm_compact_tile128_query_settings)
+
+    tile128_workers2_order, tile128_workers2_settings = (
+        resolve_runtime_profiles(
+            ("glm53-flash-e-compact-mla-tile128-workers2",), catalog))
+    assert tile128_workers2_order[-2:] == (
+        "glm53-flash-e-compact-mla-tile128",
+        "glm53-flash-e-compact-mla-tile128-workers2",
+    )
+    assert tile128_workers2_settings[
+        "VMODEL_GLM53_EXPERT_BATCH_PREFETCH_DEPTH"] == "2"
+    assert tile128_workers2_settings[
+        "VMODEL_GLM53_EXPERT_BATCH_PREFETCH_WORKERS"] == "2"
+    assert "VMODEL_GLM53_COALESCED_EXPERT_POSITIONS" not in (
+        tile128_workers2_settings)
+
     glm_prefetch2_order, glm_prefetch2_settings = resolve_runtime_profiles(
         ("glm53-flash-e-compact-mla-coalesced-prefetch2",), catalog)
     assert glm_prefetch2_order[-2:] == (

@@ -1,0 +1,13 @@
+schema: voom.runtime-profile.v1
+name: glm53-flash-e-compact-mla-tile64
+description: Explicit GLM-5.3-Flash compact sparse MLA with coordinated 64-row outer and attention tiles.
+notes:
+  - "Extends the isolated compact sparse-MLA plus exact expert-I/O pipeline and changes the layer-stationary outer tile from 32 to 64 rows. The absorbed selected-attention tile changes with it so every outer tile remains one bounded attention launch."
+  - "Each query retains its own released top-k selection and reduction. The absorbed parent still reassociates floating-point products and this wider whole-layer shape can select different GEMM kernels, so the profile remains E-class/default-off."
+  - "This profile deliberately excludes coalesced expert GEMMs so its result cannot inherit or obscure that profile's rejected 57.5/100 focused Plex quality result. Require deterministic output/state equality, lower wall, bounded Metal/swap, and then varied-shape quality gates."
+  - "The deterministic 2,123-input/max-1 gate preserved request/output hashes. Versus the tile-32 compact/batch-eight control, wall fell 427.193 -> 360.056 seconds (-15.72%), engine 424.406 -> 357.284 (-15.82%), MLA 8.869 -> 7.597 (-14.34%), MLP 355.563 -> 294.884 (-17.07%), and peak Metal 3.165 -> 2.763GB (-12.72%). Physical swap-out grew 22.233MB and reads rose 0.37% to 301.738GB as the wider E-class shape changed a small number of routed pages. This is a finite equality/timing pass, not an answer-quality promotion."
+extends:
+  - glm53-flash-e-compact-mla-prefetch-batch8
+settings:
+  VMODEL_GLM53_PREFILL_TILE_WIDTH: 64
+  VMODEL_GLM53_SPARSE_ABSORBED_QUERY_TILE_SIZE: 64

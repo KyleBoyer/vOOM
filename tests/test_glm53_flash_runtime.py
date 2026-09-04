@@ -259,6 +259,7 @@ def test_glm53_compressed_mla_factory_uses_exact_stepped_cache():
     assert kv.compressed_mla is True
     assert kv.mla_absorbed is False
     assert kv.glm53_sparse_absorbed_mla is False
+    assert kv.glm53_sparse_absorbed_query_tile_size == 32
     assert kv.glm53_sparse_fused_attention is False
     assert kv.glm53_sparse_fused_kv_int8 is False
     assert kv.dsa.incremental_pool_cache is False
@@ -266,8 +267,10 @@ def test_glm53_compressed_mla_factory_uses_exact_stepped_cache():
     assert hasattr(kv, "kda_cache")
 
     engine.rc.glm53_sparse_absorbed_mla = True
+    engine.rc.glm53_sparse_absorbed_query_tile_size = 64
     absorbed = engine.new_kv()
     assert absorbed.glm53_sparse_absorbed_mla is True
+    assert absorbed.glm53_sparse_absorbed_query_tile_size == 64
 
     engine.rc.glm53_sparse_absorbed_mla = False
     engine.rc.glm53_sparse_fused_attention = True

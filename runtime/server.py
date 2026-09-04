@@ -2118,6 +2118,17 @@ class EngineManager:
         if glm53_sparse_absorbed_mla_request not in ("0", "1"):
             raise RequestValidationError(
                 "VMODEL_GLM53_SPARSE_ABSORBED_MLA must be 0 or 1")
+        try:
+            glm53_sparse_absorbed_query_tile_size = int(os.environ.get(
+                "VMODEL_GLM53_SPARSE_ABSORBED_QUERY_TILE_SIZE", "32"))
+        except ValueError as error:
+            raise RequestValidationError(
+                "VMODEL_GLM53_SPARSE_ABSORBED_QUERY_TILE_SIZE must be an "
+                "integer") from error
+        if glm53_sparse_absorbed_query_tile_size not in (8, 16, 32, 64, 128):
+            raise RequestValidationError(
+                "VMODEL_GLM53_SPARSE_ABSORBED_QUERY_TILE_SIZE must be one "
+                "of 8, 16, 32, 64, 128")
         glm53_sparse_fused_attention_request = os.environ.get(
             "VMODEL_GLM53_SPARSE_FUSED_ATTENTION", "0").strip()
         if glm53_sparse_fused_attention_request not in ("0", "1"):
@@ -2481,6 +2492,7 @@ class EngineManager:
             glm53_mtp_confidence_telemetry_request,
             glm53_mtp_min_logit_margin.hex(),
             glm53_sparse_absorbed_mla_request,
+            glm53_sparse_absorbed_query_tile_size,
             glm53_sparse_fused_attention_request,
             glm53_sparse_fused_kv_int8_request,
             glm53_coalesced_expert_positions_request,
@@ -2636,6 +2648,7 @@ class EngineManager:
             glm53_mtp_confidence_telemetry_request,
             glm53_mtp_min_logit_margin.hex(),
             glm53_sparse_absorbed_mla_request,
+            glm53_sparse_absorbed_query_tile_size,
             glm53_sparse_fused_attention_request,
             glm53_sparse_fused_kv_int8_request,
             glm53_coalesced_expert_positions_request,
@@ -3035,6 +3048,8 @@ class EngineManager:
                 rc.adaptive_chunk_size = False
                 rc.glm53_sparse_absorbed_mla = (
                     glm53_sparse_absorbed_mla_request == "1")
+                rc.glm53_sparse_absorbed_query_tile_size = (
+                    glm53_sparse_absorbed_query_tile_size)
                 rc.glm53_sparse_fused_attention = (
                     glm53_sparse_fused_attention_request == "1")
                 rc.glm53_sparse_fused_kv_int8 = (
@@ -9718,6 +9733,7 @@ def _vision_protocol_timing(result: dict) -> dict:
         "planned_trunk_pin_layers",
         "planned_trunk_pin_bytes",
         "glm53_sparse_absorbed_mla",
+        "glm53_sparse_absorbed_query_tile_size",
         "glm53_sparse_fused_attention",
         "glm53_sparse_fused_kv_int8",
         "glm53_coalesced_expert_positions",

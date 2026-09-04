@@ -1,5 +1,50 @@
 # STATUS — 2026-09-04 (current corrections first; dated chronology below is history)
 
+## 2026-09-04: wider compact-MLA tiles plus exact dual-reader I/O cut the 2,123-token gate 39%
+
+GLM-5.3-Flash's selected absorbed-MLA query tile is now an explicit,
+identity-bearing, instrumented setting. The historical value remains 32 and
+the server accepts only 8/16/32/64/128. Query rows have independent reductions,
+but a useful wider attention tile also requires a wider layer-stationary outer
+tile; the first query-64-only draft was corrected before measurement rather
+than reporting a no-op.
+
+On the identical deterministic 2,123-input/max-1 request, coordinated
+outer/query width 64 preserved request SHA `dbc7247b...b15ae` and output SHA
+`58bb119c...09cb5`. Versus the tile-32 compact-MLA/exact-batch-eight control,
+wall fell **427.193 -> 360.056s (-15.72%)**, engine **424.406 -> 357.284s
+(-15.82%)**, MLA 8.869 -> 7.597s, MLP 355.563 -> 294.884s, and peak Metal
+3.165 -> 2.763GB. Width 128 preserved the same hashes and improved again to
+**346.052s wall / 343.242s engine**, at 2.872GB peak and 11.846MB physical
+swap-out growth.
+
+Adding the already exact ordered dual-reader expert pipeline to width 128 was
+the large result: **258.955s wall / 256.153s engine**, 25.17% faster than the
+one-reader width-128 parent and **39.38% faster than the original width-32
+control**. The exact 301.864GB read count matched its parent; expert-I/O wait
+fell 119.515 -> 28.377s, MLP 281.612 -> 194.254s, peak Metal was 3.095GB, and
+physical swap-out grew 10.125MB. Coalesced expert GEMMs remain off, so this
+result does not inherit that older profile's rejected Plex answer-quality
+behavior. The absorbed-MLA parent still reassociates floating-point products,
+so `glm53-flash-e-compact-mla-tile128-workers2` remains explicit/E-class until
+multi-token state, semantic retrieval, varied tool shapes, and untouched Plex
+gates clear it.
+
+The stricter raw-BF16 host-expanded full 46,849-token run was stopped after
+13m15s on the first sparse layer when macOS expanded swap to 6GB, server CPU
+fell to 6%, and internal free space approached the mandatory 10GiB reserve.
+Metal stayed bounded, proving placement worked, but resident host K/V merely
+moved the bottleneck into VM paging. Its 1.535GB run-owned activation spool was
+removed after shutdown. Do not promote resident host-expanded K/V for long
+context; exact disk-backed K/V would also face multi-terabyte selected-row
+traffic and is not a credible speed path without a fused/absorbed formulation.
+
+Evidence:
+`logs/glm53_flash_e_compact_mla_tile64_long2123_20260904.json`,
+`logs/glm53_flash_e_compact_mla_tile128_long2123_20260904.json`,
+`logs/glm53_flash_e_compact_mla_tile128_workers2_long2123_20260904.json`, and
+`logs/glm53_flash_exact_host_kv_prefetch_actual_server_20260904.log`.
+
 ## 2026-09-04: exact F_NOCACHE activation carrier passes the real GLM-5.3-Flash state gate
 
 The long-context GLM-5.3-Flash bottleneck was isolated to simultaneous Metal
