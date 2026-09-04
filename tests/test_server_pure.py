@@ -348,12 +348,19 @@ def test_vision_protocol_timing_exposes_qwen4_verifier_pipeline_and_q_calibratio
             "qwen4_qsa_pool_cache_invalidations": 3,
             "qwen4_qsa_pool_cache_bytes": 37_800_000,
             "expert_batch_prefetch": 1,
+            "expert_batch_prefetch_prefill_only": 1,
             "expert_batch_prefetch_submitted": 96,
+            "expert_batch_prefetch_prefill_submitted": 48,
+            "expert_batch_prefetch_decode_submitted": 48,
             "expert_batch_prefetch_depth": 2,
             "expert_batch_prefetch_workers": 2,
             "expert_batch_prefetch_max_futures": 2,
             "expert_batch_prefetch_wait_s": 7.25,
             "expert_batch_prefetch_hidden_s": 8.25,
+            "expert_batch_prefetch_prefill_wait_s": 3.25,
+            "expert_batch_prefetch_decode_wait_s": 4.0,
+            "expert_batch_prefetch_prefill_hidden_s": 5.25,
+            "expert_batch_prefetch_decode_hidden_s": 3.0,
             "expert_compute_batches": 144,
             "max_experts_per_compute_batch": 4,
         },
@@ -380,12 +387,19 @@ def test_vision_protocol_timing_exposes_qwen4_verifier_pipeline_and_q_calibratio
     assert timing["qwen4_qsa_pool_cache_invalidations"] == 3
     assert timing["qwen4_qsa_pool_cache_bytes"] == 37_800_000
     assert timing["expert_batch_prefetch"] == 1
+    assert timing["expert_batch_prefetch_prefill_only"] == 1
     assert timing["expert_batch_prefetch_submitted"] == 96
+    assert timing["expert_batch_prefetch_prefill_submitted"] == 48
+    assert timing["expert_batch_prefetch_decode_submitted"] == 48
     assert timing["expert_batch_prefetch_depth"] == 2
     assert timing["expert_batch_prefetch_workers"] == 2
     assert timing["expert_batch_prefetch_max_futures"] == 2
     assert timing["expert_batch_prefetch_wait_s"] == 7.25
     assert timing["expert_batch_prefetch_hidden_s"] == 8.25
+    assert timing["expert_batch_prefetch_prefill_wait_s"] == 3.25
+    assert timing["expert_batch_prefetch_decode_wait_s"] == 4.0
+    assert timing["expert_batch_prefetch_prefill_hidden_s"] == 5.25
+    assert timing["expert_batch_prefetch_decode_hidden_s"] == 3.0
     assert timing["expert_compute_batches"] == 144
     assert timing["max_experts_per_compute_batch"] == 4
 
@@ -3636,6 +3650,7 @@ def test_qwen4_instrumented_profile_is_exact_bounded_and_in_engine_identity():
         "VMODEL_QWEN4_MTP_MIN_DRAFT_PROBABILITY": "0",
         "VMODEL_QWEN4_MTP_NGRAM_FIRST": "0",
         "VMODEL_QWEN4_MTP_Q_CALIBRATION_SCALES": "",
+        "VMODEL_QWEN4_EXPERT_BATCH_PREFETCH_PREFILL_ONLY": "0",
     }
     with patch.dict(os.environ, settings, clear=False), \
          patch("runtime.config.ModelConfig.from_dir", return_value=cfg), \
@@ -3645,12 +3660,18 @@ def test_qwen4_instrumented_profile_is_exact_bounded_and_in_engine_identity():
         manager.get(Path("/tmp/fake-qwen4"), "lossless")
         os.environ["VMODEL_QWEN4_WEIGHT_CACHE_MB"] = "301"
         manager.get(Path("/tmp/fake-qwen4"), "lossless")
+        os.environ[
+            "VMODEL_QWEN4_EXPERT_BATCH_PREFETCH_PREFILL_ONLY"] = "1"
+        manager.get(Path("/tmp/fake-qwen4"), "lossless")
 
-    assert len(captured) == 2
-    baseline, changed = captured
+    assert len(captured) == 3
+    baseline, changed, prefill_pipeline = captured
     assert baseline.max_weight_cache_mb == 300
     assert changed.max_weight_cache_mb == 301
-    for rc in captured:
+    assert prefill_pipeline.max_weight_cache_mb == 301
+    assert prefill_pipeline.qwen4_expert_batch_prefetch_prefill_only
+    assert prefill_pipeline.expert_batch_prefetch
+    for rc in (baseline, changed):
         assert rc.min_weight_cache_mb == 64
         assert rc.mlx_cache_limit_mb == 128
         assert rc.prefill_chunk_size == 8192
@@ -3664,6 +3685,7 @@ def test_qwen4_instrumented_profile_is_exact_bounded_and_in_engine_identity():
         assert not rc.qwen4_global_expert_rows
         assert rc.qwen4_expert_tile_eval_batch == 1
         assert not rc.qwen4_fast_tier_decode_only
+        assert not rc.qwen4_expert_batch_prefetch_prefill_only
         assert not rc.qwen4_phase_lm_head
         assert not rc.qwen4_qsa_pool_cache
         assert not rc.pin_lm_head

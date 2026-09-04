@@ -131,14 +131,18 @@ def _run(
     native_fused_delta: bool = False,
     max_tokens: int = 1,
     fp8_direct_qmv_decode_only: bool = False,
+    expert_batch_prefetch: bool = False,
+    expert_batch_prefetch_prefill_only: bool = False,
+    expert_fetch_batch: int = 16,
+    mlx_cache_mb: int = 128,
 ) -> dict:
     before = _pressure()
     rc = RuntimeConfig(
         max_weight_cache_mb=300,
         min_weight_cache_mb=64,
-        mlx_cache_limit_mb=128,
+        mlx_cache_limit_mb=mlx_cache_mb,
         prefill_chunk_size=chunk,
-        expert_fetch_batch=16,
+        expert_fetch_batch=expert_fetch_batch,
         decode_expert_fetch_batch=16,
         pin_lm_head=False,
         stream_lm_head=True,
@@ -156,6 +160,12 @@ def _run(
         fast_dirs=((fast_tier_dir,) if fast_tier_dir else ()),
         parallel_storage_reads=parallel_storage_reads,
         qwen4_fast_tier_decode_only=fast_tier_decode_only,
+        expert_batch_prefetch=(
+            expert_batch_prefetch or expert_batch_prefetch_prefill_only),
+        qwen4_expert_batch_prefetch_prefill_only=(
+            expert_batch_prefetch_prefill_only),
+        expert_batch_prefetch_depth=1,
+        expert_batch_prefetch_workers=1,
         governor=True,
     )
     started = time.perf_counter()
@@ -201,6 +211,11 @@ def _run(
             "parallel_storage_reads": parallel_storage_reads,
             "fast_tier_decode_only": fast_tier_decode_only,
             "fp8_direct_qmv_decode_only": fp8_direct_qmv_decode_only,
+            "expert_batch_prefetch": expert_batch_prefetch,
+            "expert_batch_prefetch_prefill_only": (
+                expert_batch_prefetch_prefill_only),
+            "expert_fetch_batch": expert_fetch_batch,
+            "mlx_cache_mb": mlx_cache_mb,
             "max_tokens": max_tokens,
             "startup_seconds": round(initialized - started, 6),
             "generation_seconds": round(completed - initialized, 6),
@@ -234,6 +249,15 @@ def _run(
                 for key in (
                     "fetches", "fast_bytes", "archive_bytes", "wall_s",
                     "fast_service_s", "archive_service_s", "hidden_s")
+            },
+            "expert_batch_prefetch_stats": {
+                key: result["path_stats"].get(
+                    f"expert_batch_prefetch_{key}", 0)
+                for key in (
+                    "submitted", "max_futures", "wait_s", "hidden_s",
+                    "prefill_submitted", "decode_submitted",
+                    "prefill_wait_s", "decode_wait_s",
+                    "prefill_hidden_s", "decode_hidden_s")
             },
             "expert_read_bytes": int(
                 result["path_stats"].get("qwen4_fused_expert_bytes", 0)),
@@ -291,6 +315,15 @@ def main() -> int:
     parser.add_argument("--max-tokens", type=int, default=1)
     parser.add_argument(
         "--candidate-direct-fp8-qmv-decode-only", action="store_true")
+    parser.add_argument(
+        "--candidate-expert-batch-prefetch", action="store_true")
+    parser.add_argument(
+        "--candidate-expert-batch-prefetch-prefill-only",
+        action="store_true")
+    parser.add_argument(
+        "--candidate-expert-fetch-batch", type=int, default=16)
+    parser.add_argument(
+        "--candidate-mlx-cache-mb", type=int, default=128)
     parser.add_argument("--result", type=Path)
     args = parser.parse_args()
     if args.chunk <= 0:
@@ -303,6 +336,10 @@ def main() -> int:
         parser.error("candidate-expert-tile-eval-batch must be in [1, 16]")
     if args.max_tokens <= 0:
         parser.error("max-tokens must be positive")
+    if not 1 <= args.candidate_expert_fetch_batch <= 64:
+        parser.error("candidate-expert-fetch-batch must be in [1, 64]")
+    if not 64 <= args.candidate_mlx_cache_mb <= 1024:
+        parser.error("candidate-mlx-cache-mb must be in [64, 1024]")
     prompt = (
         args.prompt
         if args.prompt is not None
@@ -322,7 +359,7 @@ def main() -> int:
         "", False, False,
         (args.candidate_native_fused_delta
          if args.compare_layer_stationary else False),
-        args.max_tokens, False)
+        args.max_tokens, False, False, False, 16, 128)
     candidate = _run(
         args.model, prompt, args.chunk, True,
         (args.candidate_compiled
@@ -335,7 +372,11 @@ def main() -> int:
         args.candidate_fast_tier_decode_only,
         args.candidate_native_fused_delta,
         args.max_tokens,
-        args.candidate_direct_fp8_qmv_decode_only)
+        args.candidate_direct_fp8_qmv_decode_only,
+        args.candidate_expert_batch_prefetch,
+        args.candidate_expert_batch_prefetch_prefill_only,
+        args.candidate_expert_fetch_batch,
+        args.candidate_mlx_cache_mb)
     matched = {
         "tokens": candidate["tokens"] == baseline["tokens"],
         "text": candidate["text_sha256"] == baseline["text_sha256"],

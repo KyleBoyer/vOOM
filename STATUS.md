@@ -1,5 +1,42 @@
 # STATUS — 2026-09-04 (current corrections first; dated chronology below is history)
 
+## 2026-09-04: phase-scoped Qwen expert pipeline clears the pressure gate
+
+Qwen4 expert-batch prefetch is now phase-aware and fully instrumented.  A new
+Qwen-specific, engine-identity-bound opt-in submits only authoritative sorted
+routed batches during layer-stationary prefill, then disables its worker at the
+completed-prefill boundary before native-MTP draft/verification.  Response
+telemetry now separates prefill/decode submissions, wait, and hidden time.  A
+real worker-thread crash also exposed a lazy BF16-to-FP32 scale cast crossing
+MLX's thread-local stream boundary; packed weights/scales are now materialized
+on their creating worker, with a cross-thread Metal regression test.
+
+The first 16-expert candidate matched the real-checkpoint token/text digest and
+all 121 KV/KDA/QSA/PLE state arrays.  On the unmodified 2,358-input focused Plex
+capture with all 134 real tools, it submitted 1,414 prefill batches and zero
+decode batches, reduced first token **161.754 -> 141.607s**, and wall **276.138
+-> 263.516s (-4.57%)** while preserving the exact 32-token output prefix and
+20/34 MTP acceptance.  It was rejected because swap-out grew 32.260MB.
+
+Two pressure variants then isolated the useful composition.  Fetch batch eight
+passed the same 121-array oracle and reduced swap-out to 12.157MB, but doubled
+expert uploads/materialization and regressed wall to 278.105s.  Keeping batch
+16 while lowering MLX's disposable cache from 128MB to its supported 64MB floor
+retained the win: first token **144.020s**, wall **266.199s (-3.60%)**, exact
+output/MTP counters, zero decode submissions, 4.292GB peak Metal, and 12.698MB
+swap-out.  It is saved as the explicit/default-off
+`qwen38-flash-next-uncensored-fp8-fast-tier-mtp-direct-fp8-qmv-prefill-pipeline`
+profile.  The 32-token truncation makes this a shape/latency/identity gate, not
+an intelligence score; complete-output and heterogeneous replay remain gates
+before any automatic promotion.
+
+Evidence:
+`logs/qwen_uncensored_fp8_direct_qmv_expert_prefetch_prefill_only_{oracle,batch8_oracle,mlx64_oracle}_20260904.json`,
+`logs/qwen_uncensored_fp8_fast_tier_direct_qmv_expert_prefetch_prefill_only_plex_max32_retry_20260904.json`,
+`logs/qwen_uncensored_fp8_fast_tier_direct_qmv_expert_prefetch_prefill_only_batch8_plex_max32_20260904.json`,
+and
+`logs/qwen_uncensored_fp8_fast_tier_direct_qmv_expert_prefetch_prefill_only_mlx64_plex_max32_20260904.json`.
+
 ## 2026-09-04: Qwen fast-tier capacity cliff measured; safe tier restored
 
 The MLX-free Qwen placement planner can now score a prospective complete-expert

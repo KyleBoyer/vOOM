@@ -879,6 +879,11 @@ class RuntimeConfig:
     # prefill on the archive device only and enable the two-device overlay for
     # decode. This avoids competing OS read caches at the 49K memory peak.
     qwen4_fast_tier_decode_only: bool = False
+    # Exact I/O-only overlap for Qwen4's long prefill. Routed expert batches
+    # are fetched on the existing bounded worker during prefill, then decode
+    # returns to the validated synchronous schedule. This avoids carrying the
+    # measured decode/swap regression of globally enabled expert prefetch.
+    qwen4_expert_batch_prefetch_prefill_only: bool = False
     # Keep the exact untied Qwen4 output head absent during host-spooled
     # prefill, then load and pin it at the first post-prefill projection.  The
     # next request releases it before touching the target trunk.  This keeps
@@ -1698,6 +1703,8 @@ class RuntimeConfig:
             expert_compute_batch=run.get("expert_compute_batch", 0),
             decode_expert_fetch_batch=run.get("decode_expert_fetch_batch", 0),
             expert_batch_prefetch=run.get("expert_batch_prefetch", False),
+            qwen4_expert_batch_prefetch_prefill_only=run.get(
+                "qwen4_expert_batch_prefetch_prefill_only", False),
             expert_batch_prefetch_depth=run.get(
                 "expert_batch_prefetch_depth", 1),
             expert_batch_prefetch_workers=run.get(
@@ -2824,6 +2831,16 @@ class StreamingEngine:
         self._expert_batch_prefetch_wait_s = 0.0
         self._expert_batch_prefetch_hidden_s = 0.0
         self._expert_batch_prefetch_max_futures = 0
+        self._expert_batch_prefetch_phase = "prefill"
+        self._expert_batch_prefetch_submitted_by_phase = {
+            "prefill": 0, "decode": 0,
+        }
+        self._expert_batch_prefetch_wait_s_by_phase = {
+            "prefill": 0.0, "decode": 0.0,
+        }
+        self._expert_batch_prefetch_hidden_s_by_phase = {
+            "prefill": 0.0, "decode": 0.0,
+        }
         self._expert_shared_overlap_layers = 0
         self._resident_fast_decode_sweeps = 0
         self._resident_fast_prefill_sweeps = 0
@@ -2974,6 +2991,8 @@ class StreamingEngine:
             if self.rc.expert_batch_prefetch and self.cfg.num_experts
             else None
         )
+        self._expert_batch_prefetch_active = (
+            self._expert_batch_executor is not None)
 
         # F19: deliberate warm-start — preload the historically hottest expert
         # pages (heat derived from the persisted transition counts) onto the
@@ -5156,6 +5175,14 @@ class StreamingEngine:
         """
         if phase not in ("prefill", "decode"):
             raise ValueError(f"unsupported direct-QMV phase {phase!r}")
+        self._expert_batch_prefetch_phase = phase
+        self._expert_batch_prefetch_active = bool(
+            self._expert_batch_executor is not None
+            and (
+                not self.rc.qwen4_expert_batch_prefetch_prefill_only
+                or phase == "prefill"
+            )
+        )
         store = self.store
         for family in ("glm53", "qwen4"):
             requested = bool(getattr(
@@ -5336,6 +5363,9 @@ class StreamingEngine:
         if not expert_ids:
             return iter(())
         executor = getattr(self, "_expert_batch_executor", None)
+        if not getattr(
+                self, "_expert_batch_prefetch_active", executor is not None):
+            executor = None
         if executor is None:
             def synchronous_batches():
                 start = 0
@@ -5357,6 +5387,12 @@ class StreamingEngine:
                 pending.append((
                     queued_ids, executor.submit(timed_fetch, queued_ids)))
                 self._expert_batch_prefetch_submitted += 1
+                submitted_by_phase = getattr(
+                    self, "_expert_batch_prefetch_submitted_by_phase", None)
+                if submitted_by_phase is not None:
+                    phase = getattr(
+                        self, "_expert_batch_prefetch_phase", "prefill")
+                    submitted_by_phase[phase] += 1
                 self._expert_batch_prefetch_max_futures = max(
                     self._expert_batch_prefetch_max_futures, len(pending))
             return start
@@ -5373,8 +5409,18 @@ class StreamingEngine:
                     pages, fetch_s = future.result()
                     wait_s = time.perf_counter() - wait_started
                     self._expert_batch_prefetch_wait_s += wait_s
-                    self._expert_batch_prefetch_hidden_s += max(
-                        0.0, fetch_s - wait_s)
+                    hidden_s = max(0.0, fetch_s - wait_s)
+                    self._expert_batch_prefetch_hidden_s += hidden_s
+                    phase = getattr(
+                        self, "_expert_batch_prefetch_phase", "prefill")
+                    wait_by_phase = getattr(
+                        self, "_expert_batch_prefetch_wait_s_by_phase", None)
+                    hidden_by_phase = getattr(
+                        self, "_expert_batch_prefetch_hidden_s_by_phase", None)
+                    if wait_by_phase is not None:
+                        wait_by_phase[phase] += wait_s
+                    if hidden_by_phase is not None:
+                        hidden_by_phase[phase] += hidden_s
                     yield from compute_chunks(current_ids, pages)
                     # The consumer deletes its reference before resuming us.
                     # Drop the producer's reference before advancing.
@@ -9971,7 +10017,10 @@ class StreamingEngine:
                         positions_by_expert.setdefault(expert, []).append(
                             position)
                 expert_ids = sorted(positions_by_expert)
-                if self._expert_batch_executor is not None:
+                expert_batch_prefetch_active = bool(
+                    self._expert_batch_executor is not None
+                    and self._expert_batch_prefetch_active)
+                if expert_batch_prefetch_active:
                     expert_wait_before = float(
                         self.timer.totals.get("expert_wait", 0.0))
                     next_positions = qwen4_mlp_from_group_batches(
@@ -10036,7 +10085,7 @@ class StreamingEngine:
                             self._qwen4_serial_verify_exact_bf16_fallback_reasons)
                         reasons[reason] = reasons.get(reason, 0) + value
                 mx.eval(*next_positions)
-                if self._expert_batch_executor is None:
+                if not expert_batch_prefetch_active:
                     del experts
                 del routes, attn_positions
             else:
@@ -10715,6 +10764,15 @@ class StreamingEngine:
         self._expert_batch_prefetch_wait_s = 0.0
         self._expert_batch_prefetch_hidden_s = 0.0
         self._expert_batch_prefetch_max_futures = 0
+        self._expert_batch_prefetch_submitted_by_phase = {
+            "prefill": 0, "decode": 0,
+        }
+        self._expert_batch_prefetch_wait_s_by_phase = {
+            "prefill": 0.0, "decode": 0.0,
+        }
+        self._expert_batch_prefetch_hidden_s_by_phase = {
+            "prefill": 0.0, "decode": 0.0,
+        }
         self._expert_shared_overlap_layers = 0
         self.expert_route_overlap_trace = []
         self._expert_route_last_by_layer = {}
@@ -13169,6 +13227,8 @@ class StreamingEngine:
         path_stats["min_adaptive_expert_batch"] = self._min_adaptive_expert_batch
         path_stats["expert_batch_prefetch"] = int(
             self._expert_batch_executor is not None)
+        path_stats["expert_batch_prefetch_prefill_only"] = int(
+            self.rc.qwen4_expert_batch_prefetch_prefill_only)
         path_stats["expert_batch_prefetch_submitted"] = (
             self._expert_batch_prefetch_submitted)
         path_stats["expert_batch_prefetch_wait_s"] = (
@@ -13181,6 +13241,13 @@ class StreamingEngine:
             self.rc, "expert_batch_prefetch_workers", 1))
         path_stats["expert_batch_prefetch_max_futures"] = (
             self._expert_batch_prefetch_max_futures)
+        for phase in ("prefill", "decode"):
+            path_stats[f"expert_batch_prefetch_{phase}_submitted"] = (
+                self._expert_batch_prefetch_submitted_by_phase[phase])
+            path_stats[f"expert_batch_prefetch_{phase}_wait_s"] = (
+                self._expert_batch_prefetch_wait_s_by_phase[phase])
+            path_stats[f"expert_batch_prefetch_{phase}_hidden_s"] = (
+                self._expert_batch_prefetch_hidden_s_by_phase[phase])
         path_stats["expert_shared_overlap_layers"] = (
             self._expert_shared_overlap_layers)
         path_stats["qwen4_serial_verify_union_layers"] = (

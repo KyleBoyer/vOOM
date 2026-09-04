@@ -1,0 +1,14 @@
+schema: voom.runtime-profile.v1
+name: qwen38-flash-next-uncensored-fp8-fast-tier-mtp-direct-fp8-qmv-prefill-pipeline
+description: Exact Qwen3.8-Flash-Next prefill expert-I/O overlap with synchronous packed-FP8 decode.
+notes:
+  - "Extends the candidate-bound uncensored FP8 fast-tier, native-MTP, and decode-only direct-QMV path. Only authoritative routed batches are submitted, in the same sorted order and with depth one; output arithmetic and decode remain unchanged."
+  - "Prefetch is active only during long layer-stationary prefill. The completed-prefill boundary disables the worker before native-MTP draft and target verification, avoiding the measured decode regression of global expert prefetch. Phase-specific submitted/wait/hidden counters make that contract observable."
+  - "The 64MB MLX cache floor preserves the 16-expert fetch/compute geometry while releasing enough disposable cache headroom to pass pressure. An exact batch-eight alternative also passed all state hashes and pressure, but doubled upload/materialization work and regressed the real Plex wall time, so it is not retained."
+  - "The real-checkpoint state oracle matched the token/text digest and all 121 KV/KDA/QSA/PLE arrays. The unmodified 2,358-input focused Plex capture with all 134 real tools preserved the exact 32-token output prefix and 20/34 MTP acceptance while improving wall 276.138s -> 266.199s and first token 161.754s -> 144.020s; swap-out growth was 12.698MB."
+  - "The 32-token cap truncates the tool call and cannot score intelligence. This profile remains explicit/default-off pending a complete-output Plex quality gate and heterogeneous replay corpus; it is lossless relative to the installed uncensored FP8 checkpoint, not Qwen's official BF16 release."
+extends:
+  - qwen38-flash-next-uncensored-fp8-fast-tier-mtp-direct-fp8-qmv-decode-only
+settings:
+  VMODEL_QWEN4_MLX_CACHE_MB: 64
+  VMODEL_QWEN4_EXPERT_BATCH_PREFETCH_PREFILL_ONLY: true

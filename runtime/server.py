@@ -1249,6 +1249,7 @@ class EngineManager:
                 ("VMODEL_QWEN4_MTP_COMPACT_KDA_ROLLBACK", "0"),
                 ("VMODEL_QWEN4_FP8_DIRECT_QMV", "0"),
                 ("VMODEL_QWEN4_FP8_DIRECT_QMV_DECODE_ONLY", "0"),
+                ("VMODEL_QWEN4_EXPERT_BATCH_PREFETCH_PREFILL_ONLY", "0"),
             )
         )
         dspark_request_identity = tuple(
@@ -2059,6 +2060,8 @@ class EngineManager:
                 "VMODEL_QWEN4_NATIVE_FP8_DEQUANT must be 0 or 1")
         qwen4_fp8_direct_qmv_request = qwen4_request_identity[32]
         qwen4_fp8_direct_qmv_decode_only_request = qwen4_request_identity[33]
+        qwen4_expert_batch_prefetch_prefill_only_request = (
+            qwen4_request_identity[34])
         if qwen4_fp8_direct_qmv_request not in ("0", "1"):
             raise RequestValidationError(
                 "VMODEL_QWEN4_FP8_DIRECT_QMV must be 0 or 1")
@@ -2070,6 +2073,10 @@ class EngineManager:
             raise RequestValidationError(
                 "VMODEL_QWEN4_FP8_DIRECT_QMV_DECODE_ONLY=1 requires "
                 "VMODEL_QWEN4_FP8_DIRECT_QMV=1")
+        if qwen4_expert_batch_prefetch_prefill_only_request not in ("0", "1"):
+            raise RequestValidationError(
+                "VMODEL_QWEN4_EXPERT_BATCH_PREFETCH_PREFILL_ONLY must be 0 "
+                "or 1")
         glm53_mtp_request = os.environ.get(
             "VMODEL_GLM53_MTP", "0").strip()
         if glm53_mtp_request not in ("0", "1"):
@@ -3416,6 +3423,10 @@ class EngineManager:
                     raise RequestValidationError(
                         "VMODEL_QWEN4_FAST_TIER_DECODE_ONLY requires "
                         "VMODEL_QWEN4_FAST_TIER_DIR")
+                rc.qwen4_expert_batch_prefetch_prefill_only = (
+                    qwen4_request_identity[34] == "1")
+                if rc.qwen4_expert_batch_prefetch_prefill_only:
+                    rc.expert_batch_prefetch = True
                 if qwen4_request_identity[23] not in ("0", "1"):
                     raise RequestValidationError(
                         "VMODEL_QWEN4_PHASE_LM_HEAD must be 0 or 1")
@@ -9773,7 +9784,10 @@ def _vision_protocol_timing(result: dict) -> dict:
         "adaptive_expert_batch_clamps",
         "min_adaptive_expert_batch",
         "expert_batch_prefetch",
+        "expert_batch_prefetch_prefill_only",
         "expert_batch_prefetch_submitted",
+        "expert_batch_prefetch_prefill_submitted",
+        "expert_batch_prefetch_decode_submitted",
         "expert_batch_prefetch_depth",
         "expert_batch_prefetch_workers",
         "expert_batch_prefetch_max_futures",
@@ -10143,6 +10157,10 @@ def _vision_protocol_timing(result: dict) -> dict:
         "weight_prefetch_hidden_lower_bound_s",
         "expert_batch_prefetch_wait_s",
         "expert_batch_prefetch_hidden_s",
+        "expert_batch_prefetch_prefill_wait_s",
+        "expert_batch_prefetch_decode_wait_s",
+        "expert_batch_prefetch_prefill_hidden_s",
+        "expert_batch_prefetch_decode_hidden_s",
         "glm53_dsa_pool_build_s",
         "glm53_dsa_selection_s",
         "glm53_mtp_min_logit_margin",

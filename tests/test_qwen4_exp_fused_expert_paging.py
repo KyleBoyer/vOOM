@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import concurrent.futures as cf
 import json
 from pathlib import Path
 import shutil
@@ -342,6 +343,26 @@ def test_qwen4_decode_only_direct_qmv_switches_exact_representation(
     assert qwen[0] == 1
     assert qwen[4:6] == (1, 1)
     assert store.glm53_fp8_direct_snapshot() == (0,) * 8
+
+
+def test_qwen4_direct_qmv_prefetch_crosses_thread_stream_safely(
+        tmp_path, monkeypatch):
+    from runtime.quant import FineGrainedFP8Tensor, matmul
+
+    root, _expected = _per_expert_fp8_fixture(tmp_path, bf16_scale=True)
+    monkeypatch.setenv("VMODEL_QWEN4_FP8_DIRECT_QMV", "1")
+    store = WeightStore(root)
+    name = "model.layers.0.mlp.experts.1.gate_proj.weight"
+
+    with cf.ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="vmodel-expert-batch") as pool:
+        prefetched = pool.submit(store.fetch, [name]).result()[0][name]
+
+    assert isinstance(prefetched, FineGrainedFP8Tensor)
+    x = mx.ones((1, 1, 4), dtype=mx.bfloat16)
+    output = matmul(x, prefetched)
+    mx.eval(output)
+    assert tuple(output.shape) == (1, 1, 3)
 
 
 def test_qwen4_decode_only_direct_qmv_requires_direct(tmp_path, monkeypatch):

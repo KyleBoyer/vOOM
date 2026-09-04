@@ -409,6 +409,75 @@ def test_exact_expert_batch_prefetch_depth_two_queues_two_ordered_futures():
     assert engine._expert_batch_prefetch_max_futures == 2
 
 
+def test_qwen4_prefill_only_expert_prefetch_disables_worker_for_decode():
+    import concurrent.futures as cf
+    import threading
+    from types import SimpleNamespace
+
+    from runtime.engine import StreamingEngine
+
+    fetch_threads = []
+
+    class FakeEngine:
+        rc = SimpleNamespace(
+            expert_fetch_batch=1,
+            decode_expert_fetch_batch=1,
+            expert_batch_prefetch_depth=1,
+            qwen4_expert_batch_prefetch_prefill_only=True,
+        )
+        store = SimpleNamespace(
+            glm53_fp8_direct_qmv=False,
+            qwen4_fp8_direct_qmv=False,
+        )
+        governor = None
+        _expert_compute_batches = 0
+        _max_experts_per_compute_batch = 0
+        _adaptive_expert_batch_clamps = 0
+        _min_adaptive_expert_batch = 0
+        _expert_batch_prefetch_submitted = 0
+        _expert_batch_prefetch_wait_s = 0.0
+        _expert_batch_prefetch_hidden_s = 0.0
+        _expert_batch_prefetch_max_futures = 0
+        _expert_batch_prefetch_phase = "prefill"
+        _expert_batch_prefetch_submitted_by_phase = {
+            "prefill": 0, "decode": 0,
+        }
+        _expert_batch_prefetch_wait_s_by_phase = {
+            "prefill": 0.0, "decode": 0.0,
+        }
+        _expert_batch_prefetch_hidden_s_by_phase = {
+            "prefill": 0.0, "decode": 0.0,
+        }
+
+        def _record_expert_route(self, *_args, **_kwargs):
+            pass
+
+        def _fetch_experts(self, _layer, expert_ids):
+            fetch_threads.append(threading.current_thread().name)
+            return {expert: f"page-{expert}" for expert in expert_ids}
+
+    engine = FakeEngine()
+    engine._expert_batch_executor = cf.ThreadPoolExecutor(
+        max_workers=1, thread_name_prefix="vmodel-expert-batch")
+    engine._expert_batch_prefetch_active = True
+    try:
+        StreamingEngine._set_finegrained_fp8_direct_phase(engine, "prefill")
+        list(StreamingEngine._iter_expert_batches(
+            engine, 4, [0], positions={0: [0, 1]}))
+        StreamingEngine._set_finegrained_fp8_direct_phase(engine, "decode")
+        list(StreamingEngine._iter_expert_batches(
+            engine, 4, [1], positions={1: [0]}))
+    finally:
+        engine._expert_batch_executor.shutdown(
+            wait=True, cancel_futures=True)
+
+    assert fetch_threads[0].startswith("vmodel-expert-batch")
+    assert fetch_threads[1] == threading.current_thread().name
+    assert engine._expert_batch_prefetch_submitted_by_phase == {
+        "prefill": 1, "decode": 0,
+    }
+
+
 def test_k25_layer_page_estimate_distinguishes_dense_and_sparse_pages():
     from types import SimpleNamespace
 

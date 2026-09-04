@@ -1099,6 +1099,13 @@ class WeightStore:
                     (is_glm_direct or is_qwen_direct)
                     and ".mlp.experts." in name)
                 if direct_expert:
+                    # Expert-batch prefetch may construct the exact BF16->FP32
+                    # scale widening on a worker. MLX streams are thread-local;
+                    # leaving that cast lazy makes the main request thread fail
+                    # later with "There is no Stream(gpu, N)". Materialize the
+                    # immutable packed carrier and widened scale on their
+                    # creating thread before crossing the cache boundary.
+                    mx.eval(weight, scale)
                     recorder = (
                         self._record_qwen4_fp8_direct_matmul
                         if is_qwen_direct
