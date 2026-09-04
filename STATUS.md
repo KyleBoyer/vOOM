@@ -36,6 +36,17 @@ Evidence:
 `logs/qwen_uncensored_fp8_http_eager_control_20260903.json`, and
 `logs/qwen_uncensored_fp8_http_smoke3_20260903.json`.
 
+Candidate-native Lightning-MTP is now independently state-gated in the explicit
+`qwen38-flash-next-uncensored-fp8-mtp` profile.  On a four-output real-weight
+oracle it matched every token, final text, and all 121 retained KV/KDA/QSA/PLE
+arrays; it accepted 2/4 proposals and reduced three plain-equivalent target
+sweeps to two.  Generation improved 39.318 -> 37.860s and total wall 49.920 ->
+48.148s without any fast tier, while model reads fell 44.120 -> 43.833GB.  Peak
+Metal rose 0.639 -> 1.444GB and swap-out growth was 2.851MB, all within gates.
+This proves exact target-authoritative verification for the candidate but is
+not yet a broad quality or automatic-promotion result.  Evidence:
+`logs/qwen_uncensored_fp8_mtp_depth3_oracle_20260903.json`.
+
 ## 2026-09-03: complete uncensored Qwen FP8 candidate is replacement-ready
 
 The uncensored search found a materially better replacement candidate than the

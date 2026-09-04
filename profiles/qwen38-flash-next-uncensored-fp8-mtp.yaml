@@ -1,0 +1,14 @@
+schema: voom.runtime-profile.v1
+name: qwen38-flash-next-uncensored-fp8-mtp
+description: Candidate-native Lightning-MTP with authoritative uncensored FP8 target verification.
+notes:
+  - "Extends only the pinned uncensored FP8 baseline. Drafts come from this candidate's own published MTP block and every emitted token is authoritatively verified by the full candidate target."
+  - "The four-token released-checkpoint oracle matched every greedy token and all 121 KV/KDA/QSA/PLE arrays, accepted 2/4 proposals, and reduced three plain-equivalent target sweeps to two."
+  - "Depth three, phase-scoped head suspension, and exact BF16 verifier GEMV are scheduling changes. No official-model endpoint, fast tier, or calibration is reused."
+  - "This remains explicit until candidate-specific tool, varied-shape, sustained-output, vision, and pressure gates pass. It is lossless relative to the candidate, not relative to Qwen's official BF16 model."
+extends:
+  - qwen38-flash-next-uncensored-fp8
+settings:
+  VMODEL_QWEN4_MTP_DEPTH: 3
+  VMODEL_QWEN4_SERIAL_VERIFY_SUSPEND_LM_HEAD: true
+  VMODEL_QWEN4_SERIAL_VERIFY_EXACT_BF16_GEMV: true

@@ -486,6 +486,24 @@ def test_builtin_profiles_resolve_complete_agent_group():
         "VMODEL_QWEN4_NATIVE_FP8_DEQUANT"] == "1"
     assert "VMODEL_QWEN4_FAST_TIER_DIR" not in uncensored_fp8_settings
 
+    uncensored_mtp_order, uncensored_mtp_settings = resolve_runtime_profiles(
+        ("qwen38-flash-next-uncensored-fp8-mtp",), catalog)
+    assert uncensored_mtp_order == (
+        "qwen38-flash-next-candidate-bf16",
+        "qwen38-flash-next-uncensored-fp8",
+        "qwen38-flash-next-uncensored-fp8-mtp",
+    )
+    assert uncensored_mtp_settings[
+        "VMODEL_QWEN4_NATIVE_FP8_DEQUANT"] == "1"
+    assert uncensored_mtp_settings["VMODEL_QWEN4_MTP_DEPTH"] == "3"
+    assert uncensored_mtp_settings[
+        "VMODEL_QWEN4_SERIAL_VERIFY_SUSPEND_LM_HEAD"] == "1"
+    assert uncensored_mtp_settings[
+        "VMODEL_QWEN4_SERIAL_VERIFY_EXACT_BF16_GEMV"] == "1"
+    assert uncensored_mtp_settings["VMODEL_QWEN4_FAST_TIER_DECODE_ONLY"] == "0"
+    assert "VMODEL_QWEN4_FAST_TIER_DIR" not in uncensored_mtp_settings
+    assert uncensored_mtp_settings["VMODEL_QWEN4_HOT_PROMPT_KV"] == "0"
+
     candidate_fast_order, candidate_fast_settings = resolve_runtime_profiles(
         ("qwen38-flash-next-candidate-fast-tier",), catalog)
     assert candidate_fast_order == (
