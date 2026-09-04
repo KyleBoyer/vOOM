@@ -108,9 +108,30 @@ def _memory_retry_diagnostic(error: MemoryError) -> dict[str, object]:
     }
 
 
-def _glm53_expanded_prefill_cache(kv):
+class _GLM53ExpandedPrefillCache(dict):
+    """Request-local exact expanded K/V policy plus content-free counters."""
+
+    def __init__(self, *, host_spool: bool = False, capacity_rows: int = 0):
+        super().__init__()
+        self.host_spool = bool(host_spool)
+        self.capacity_rows = max(0, int(capacity_rows))
+        self.capacity_grows = 0
+        self.capacity_rows_peak = 0
+        self.rows_copied = 0
+        self.rows_written = 0
+        self.host_logical_bytes_peak = 0
+        self.host_bytes_written = 0
+        self.host_bytes_uploaded = 0
+        self.host_upload_calls = 0
+        self.host_sparse_gather_rows = 0
+
+
+def _glm53_expanded_prefill_cache(
+        kv, *, host_spool: bool = False,
+        capacity_rows: int = 0) -> _GLM53ExpandedPrefillCache:
     """Create exact dense-prefix K/V; sparse absorbed MLA drops it per layer."""
-    return {}
+    return _GLM53ExpandedPrefillCache(
+        host_spool=host_spool, capacity_rows=capacity_rows)
 
 
 def _glm53_release_expanded_prefill_layer(kv, layer: int) -> None:
@@ -1361,6 +1382,11 @@ class RuntimeConfig:
     # Metal greedy/state oracle confirms that outer-shape changes do not alter
     # any released BF16 result.
     glm53_incremental_dsa_pool: bool = False
+    # Keep exact expanded BF16 DSA K/V as raw uint16 host arrays during
+    # layer-stationary prefill, uploading only the current selected rows.
+    # This changes placement only, remains explicit/default-off, and exists
+    # for contexts where a complete expanded layer cannot fit below Metal cap.
+    glm53_expanded_kv_host_spool: bool = False
     # Compile the ordinary GLM-5.3 KDA recurrence in bounded 32-position
     # segments. The implementation retains the reference MLX operators,
     # reduction order, and state materialization cadence; explicit until a
@@ -1680,6 +1706,8 @@ class RuntimeConfig:
                 "glm53_coalesced_expert_max_positions", 512),
             glm53_incremental_dsa_pool=run.get(
                 "glm53_incremental_dsa_pool", False),
+            glm53_expanded_kv_host_spool=run.get(
+                "glm53_expanded_kv_host_spool", False),
             glm53_compiled_kda_prefill=run.get(
                 "glm53_compiled_kda_prefill", False),
             glm53_compiled_kda_segment=run.get(
@@ -8463,7 +8491,11 @@ class StreamingEngine:
         # reprojects the same growing latent prefix once per position, matching
         # canonical one-token decode while still loading each layer only once.
         kv._glm53_expanded_prefill = (
-            _glm53_expanded_prefill_cache(kv)
+            _glm53_expanded_prefill_cache(
+                kv,
+                host_spool=self.rc.glm53_expanded_kv_host_spool,
+                capacity_rows=offset + total,
+            )
             if incremental_expanded_mla else None)
 
         probe_positions = min(total, tile_width)
@@ -8809,6 +8841,7 @@ class StreamingEngine:
             disk_spool.stats() if disk_spool is not None else {})
         if disk_spool is not None:
             disk_spool.close()
+        expanded_prefill_stats = kv._glm53_expanded_prefill
         previous_stats = dict(getattr(
             self, "_glm53_layer_stationary_stats", {}) or {})
         self._glm53_layer_stationary_stats = {
@@ -8857,6 +8890,28 @@ class StreamingEngine:
                     "bytes_written", "bytes_read", "write_calls",
                     "read_calls", "uncached_descriptors")
             },
+            "expanded_kv_host_spool": int(bool(
+                getattr(expanded_prefill_stats, "host_spool", False))),
+            **{
+                f"expanded_kv_{metric}": (
+                    int(previous_stats.get(f"expanded_kv_{metric}", 0))
+                    + int(getattr(expanded_prefill_stats, metric, 0)))
+                for metric in (
+                    "capacity_grows", "rows_copied", "rows_written",
+                    "host_bytes_written", "host_bytes_uploaded",
+                    "host_upload_calls", "host_sparse_gather_rows")
+            },
+            "expanded_kv_capacity_rows_peak": max(
+                int(previous_stats.get(
+                    "expanded_kv_capacity_rows_peak", 0)),
+                int(getattr(
+                    expanded_prefill_stats, "capacity_rows_peak", 0))),
+            "expanded_kv_host_logical_bytes_peak": max(
+                int(previous_stats.get(
+                    "expanded_kv_host_logical_bytes_peak", 0)),
+                int(getattr(
+                    expanded_prefill_stats,
+                    "host_logical_bytes_peak", 0))),
             "sparse_fused_calls": int(previous_stats.get(
                 "sparse_fused_calls", 0)) + int(getattr(
                     kv, "_glm53_sparse_fused_calls", 0)) - fused_calls_before,
@@ -10540,6 +10595,8 @@ class StreamingEngine:
                 f"glm53coalexpertmax{
                     self.rc.glm53_coalesced_expert_max_positions}"
                 f"glm53poolcache{int(self.rc.glm53_incremental_dsa_pool)}"
+                f"glm53hostexpandedkv{int(
+                    self.rc.glm53_expanded_kv_host_spool)}"
                 f"glm53compiledkda{int(self.rc.glm53_compiled_kda_prefill)}"
                 f"glm53compiledkdaseg{self.rc.glm53_compiled_kda_segment}"
                 f"glm53nativekda{int(
@@ -13297,6 +13354,15 @@ class StreamingEngine:
                     glm53_memory.get(f"exact_expert_{metric}", 0))
             path_stats["glm53_incremental_dsa_pool"] = int(
                 self.rc.glm53_incremental_dsa_pool)
+            path_stats["glm53_expanded_kv_host_spool"] = int(
+                self.rc.glm53_expanded_kv_host_spool)
+            for metric in (
+                    "capacity_grows", "capacity_rows_peak", "rows_copied",
+                    "rows_written", "host_logical_bytes_peak",
+                    "host_bytes_written", "host_bytes_uploaded",
+                    "host_upload_calls", "host_sparse_gather_rows"):
+                path_stats[f"glm53_expanded_kv_{metric}"] = int(
+                    glm53_memory.get(f"expanded_kv_{metric}", 0))
             path_stats["glm53_compiled_kda_prefill"] = int(
                 self.rc.glm53_compiled_kda_prefill)
             path_stats["glm53_compiled_kda_segment"] = int(

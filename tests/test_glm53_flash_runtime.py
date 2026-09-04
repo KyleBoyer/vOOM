@@ -703,6 +703,80 @@ def test_glm53_exact_prefill_kv_projects_each_row_once_byte_exact():
     assert cache[3][0].shape[2] == 256
 
 
+def test_glm53_host_expanded_kv_preserves_bits_and_sparse_attention():
+    import mlx.core as mx
+
+    from runtime.engine import _glm53_expanded_prefill_cache
+    from runtime.glm5_next import (
+        _glm5_next_sparse_expanded_attention,
+        _glm5_next_update_expanded_prefill_kv,
+        _glm5_next_update_host_expanded_prefill_kv,
+    )
+    from runtime.layer_runner import _linear
+
+    prefix = "model.layers.3"
+    heads, queries = 2, 5
+    key_dim, value_dim, latent_dim = 3, 2, 4
+    weights = {
+        f"{prefix}.self_attn.kv_b_proj.weight": (
+            mx.arange(
+                heads * (key_dim + value_dim) * latent_dim,
+                dtype=mx.float32).reshape(
+                    heads * (key_dim + value_dim), latent_dim) / 31
+        ).astype(mx.bfloat16),
+    }
+    tiles = [
+        (mx.arange(length * latent_dim, dtype=mx.float32).reshape(
+            1, length, latent_dim) + shift).astype(mx.bfloat16)
+        for length, shift in ((5, 0), (8, 100))
+    ]
+    cache = _glm53_expanded_prefill_cache(
+        None, host_spool=True, capacity_rows=13)
+    host_keys = host_values = None
+    _glm5_next_update_expanded_prefill_kv(
+        tiles[0], weights, prefix, layer=3, cache=cache,
+        heads=heads, key_dim=key_dim, value_dim=value_dim)
+    host_keys, host_values = _glm5_next_update_host_expanded_prefill_kv(
+        tiles[1], weights, prefix, layer=3, cache=cache,
+        heads=heads, key_dim=key_dim, value_dim=value_dim)
+
+    latent = mx.concatenate(tiles, axis=1)
+    expanded = _linear(
+        latent, weights, f"{prefix}.self_attn.kv_b_proj").reshape(
+            1, latent.shape[1], heads, key_dim + value_dim).transpose(
+                0, 2, 1, 3)
+    mx.eval(expanded)
+    np.testing.assert_array_equal(
+        host_keys, np.asarray(expanded[..., :key_dim].view(mx.uint16)))
+    np.testing.assert_array_equal(
+        host_values, np.asarray(expanded[..., key_dim:].view(mx.uint16)))
+
+    query = (mx.arange(
+        heads * queries * key_dim, dtype=mx.float32).reshape(
+            1, heads, queries, key_dim) / 17).astype(mx.bfloat16)
+    selection = mx.array([[
+        [-1, *range(row, row + 6)] for row in range(queries)
+    ]], dtype=mx.int32)
+    reference = _glm5_next_sparse_expanded_attention(
+        query, expanded[..., :key_dim], expanded[..., key_dim:], selection,
+        key_dim=key_dim, query_tile_size=2)
+    candidate = _glm5_next_sparse_expanded_attention(
+        query, host_keys, host_values, selection,
+        key_dim=key_dim, query_tile_size=2, host_stats=cache)
+    mx.eval(reference, candidate)
+
+    assert bool(mx.all(reference == candidate))
+    assert cache.capacity_grows == 1
+    assert cache.capacity_rows_peak == 13
+    assert cache.rows_copied == 5
+    assert cache.rows_written == 13
+    assert cache.host_logical_bytes_peak == (
+        1 * heads * 13 * (key_dim + value_dim) * 2)
+    assert cache.host_bytes_written == cache.host_logical_bytes_peak
+    assert cache.host_upload_calls == 6
+    assert cache.host_sparse_gather_rows == queries * 7
+
+
 def test_glm53_int8_prefill_kv_is_bounded_and_row_scaled():
     import mlx.core as mx
     import numpy as np

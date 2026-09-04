@@ -1,0 +1,13 @@
+schema: voom.runtime-profile.v1
+name: glm53-flash-lossless-striped-kda-disk-spool-prefetch-long-context
+description: Exact bounded-memory GLM-5.3-Flash long-context route with pipelined expert reads.
+notes:
+  - "Extends the exact disk-carrier/host-expanded-K/V route with the already proven batch-eight, depth-two, two-worker expert storage pipeline. Expert arithmetic remains one-at-a-time and in released order."
+  - "The deterministic 2,123-token gate preserved the established request/output SHA and exact 300.933GB read witness. Versus the no-prefetch host-K/V arm, wall fell 798.198s to 438.568s; peak was 3.003GB. It remained 8.7% slower than the non-spooled striped control and physical swap-outs grew 207MB, so the untouched captured-request gate is required before any promotion."
+extends:
+  - glm53-flash-lossless-striped-kda-disk-spool-long-context
+settings:
+  VMODEL_GLM53_EXPERT_FETCH_BATCH: 8
+  VMODEL_GLM53_EXPERT_BATCH_PREFETCH: true
+  VMODEL_GLM53_EXPERT_BATCH_PREFETCH_DEPTH: 2
+  VMODEL_GLM53_EXPERT_BATCH_PREFETCH_WORKERS: 2

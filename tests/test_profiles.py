@@ -445,6 +445,8 @@ def test_builtin_profiles_resolve_complete_agent_group():
         "VMODEL_GLM53_LAYER_STATIONARY_DISK_SPOOL_DIR"] == (
             "/Volumes/Workspace NVME/vmodel-spill/glm53-flash-activations")
     assert glm_disk_spool_settings[
+        "VMODEL_GLM53_EXPANDED_KV_HOST_SPOOL"] == "1"
+    assert glm_disk_spool_settings[
         "VMODEL_GLM53_NATIVE_FUSED_KDA_PREFILL"] == "1"
     assert glm_disk_spool_settings[
         "VMODEL_GLM53_COMPILED_KDA_PREFILL"] == "0"
@@ -453,6 +455,31 @@ def test_builtin_profiles_resolve_complete_agent_group():
             "VMODEL_GLM53_SPARSE_FUSED_KV_INT8",
             "VMODEL_GLM53_COALESCED_EXPERT_POSITIONS"):
         assert lossy_setting not in glm_disk_spool_settings
+
+    glm_disk_prefetch_order, glm_disk_prefetch_settings = (
+        resolve_runtime_profiles((
+            "glm53-flash-lossless-striped-kda-disk-spool-prefetch-"
+            "long-context",
+        ), catalog))
+    assert glm_disk_prefetch_order[-2:] == (
+        "glm53-flash-lossless-striped-kda-disk-spool-long-context",
+        "glm53-flash-lossless-striped-kda-disk-spool-prefetch-long-context",
+    )
+    assert glm_disk_prefetch_settings[
+        "VMODEL_GLM53_EXPANDED_KV_HOST_SPOOL"] == "1"
+    assert glm_disk_prefetch_settings[
+        "VMODEL_GLM53_EXPERT_FETCH_BATCH"] == "8"
+    assert glm_disk_prefetch_settings[
+        "VMODEL_GLM53_EXPERT_BATCH_PREFETCH"] == "1"
+    assert glm_disk_prefetch_settings[
+        "VMODEL_GLM53_EXPERT_BATCH_PREFETCH_DEPTH"] == "2"
+    assert glm_disk_prefetch_settings[
+        "VMODEL_GLM53_EXPERT_BATCH_PREFETCH_WORKERS"] == "2"
+    for lossy_setting in (
+            "VMODEL_GLM53_SPARSE_FUSED_ATTENTION",
+            "VMODEL_GLM53_SPARSE_FUSED_KV_INT8",
+            "VMODEL_GLM53_COALESCED_EXPERT_POSITIONS"):
+        assert lossy_setting not in glm_disk_prefetch_settings
 
     glm_isolated_kda_order, glm_isolated_kda_settings = (
         resolve_runtime_profiles(

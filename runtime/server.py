@@ -2155,6 +2155,17 @@ class EngineManager:
         if glm53_incremental_dsa_pool_request not in ("0", "1"):
             raise RequestValidationError(
                 "VMODEL_GLM53_INCREMENTAL_DSA_POOL must be 0 or 1")
+        glm53_expanded_kv_host_spool_request = os.environ.get(
+            "VMODEL_GLM53_EXPANDED_KV_HOST_SPOOL", "0").strip()
+        if glm53_expanded_kv_host_spool_request not in ("0", "1"):
+            raise RequestValidationError(
+                "VMODEL_GLM53_EXPANDED_KV_HOST_SPOOL must be 0 or 1")
+        if (glm53_expanded_kv_host_spool_request == "1"
+                and (glm53_sparse_fused_attention_request == "1"
+                     or glm53_sparse_fused_kv_int8_request == "1")):
+            raise RequestValidationError(
+                "GLM-5.3 host-expanded K/V is incompatible with fused "
+                "sparse attention and int8 K/V")
         glm53_compiled_kda_prefill_request = os.environ.get(
             "VMODEL_GLM53_COMPILED_KDA_PREFILL", "0").strip()
         if glm53_compiled_kda_prefill_request not in ("0", "1"):
@@ -2475,6 +2486,7 @@ class EngineManager:
             glm53_coalesced_expert_positions_request,
             glm53_coalesced_expert_max_positions,
             glm53_incremental_dsa_pool_request,
+            glm53_expanded_kv_host_spool_request,
             glm53_compiled_kda_prefill_request,
             glm53_compiled_kda_segment,
             glm53_native_fused_kda_prefill_request,
@@ -2629,10 +2641,12 @@ class EngineManager:
             glm53_coalesced_expert_positions_request,
             glm53_coalesced_expert_max_positions,
             glm53_incremental_dsa_pool_request,
+            glm53_expanded_kv_host_spool_request,
             glm53_compiled_kda_prefill_request,
             glm53_compiled_kda_segment,
             glm53_native_fused_kda_prefill_request,
             glm53_layer_stationary_host_spool_request,
+            glm53_layer_stationary_disk_spool_request,
             glm_dsa_long_context_request,
             glm_dsa_index_preallocate_request,
             glm_dsa_sparse_absorbed_request,
@@ -3031,6 +3045,8 @@ class EngineManager:
                     glm53_coalesced_expert_max_positions)
                 rc.glm53_incremental_dsa_pool = (
                     glm53_incremental_dsa_pool_request == "1")
+                rc.glm53_expanded_kv_host_spool = (
+                    glm53_expanded_kv_host_spool_request == "1")
                 rc.glm53_compiled_kda_prefill = (
                     glm53_compiled_kda_prefill_request == "1")
                 rc.glm53_compiled_kda_segment = glm53_compiled_kda_segment
@@ -9730,6 +9746,16 @@ def _vision_protocol_timing(result: dict) -> dict:
         "glm53_exact_expert_rows_17_32_calls",
         "glm53_exact_expert_rows_33_plus_calls",
         "glm53_incremental_dsa_pool",
+        "glm53_expanded_kv_host_spool",
+        "glm53_expanded_kv_capacity_grows",
+        "glm53_expanded_kv_capacity_rows_peak",
+        "glm53_expanded_kv_rows_copied",
+        "glm53_expanded_kv_rows_written",
+        "glm53_expanded_kv_host_logical_bytes_peak",
+        "glm53_expanded_kv_host_bytes_written",
+        "glm53_expanded_kv_host_bytes_uploaded",
+        "glm53_expanded_kv_host_upload_calls",
+        "glm53_expanded_kv_host_sparse_gather_rows",
         "glm53_compiled_kda_prefill",
         "glm53_native_fused_kda_prefill",
         "glm53_layer_stationary_host_spool",

@@ -10,6 +10,7 @@ independently tested implementations.
 from __future__ import annotations
 
 import mlx.core as mx
+import numpy as np
 
 from . import quant
 from .config import ModelConfig
@@ -555,6 +556,116 @@ def _glm5_next_update_expanded_prefill_kv(
     return keys[..., :end, :], values[..., :end, :]
 
 
+def _glm5_next_update_host_expanded_prefill_kv(
+        latent: mx.array, w: dict, prefix: str, *, layer: int,
+        cache: dict, heads: int, key_dim: int, value_dim: int,
+        step: int = 256) -> tuple[np.ndarray, np.ndarray]:
+    """Project once, then retain the exact BF16 payload outside Metal.
+
+    Host arrays contain raw uint16 bits.  Capacity is allocated once for the
+    known request length, while only written pages become resident.  Returned
+    slices are views over initialized rows; no floating-point conversion is
+    involved.
+    """
+    batch, incoming, _ = latent.shape
+    expanded = _linear(
+        latent, w, f"{prefix}.self_attn.kv_b_proj").reshape(
+            batch, incoming, heads, key_dim + value_dim).transpose(0, 2, 1, 3)
+    new_keys = expanded[..., :key_dim]
+    new_values = expanded[..., key_dim:]
+    if new_keys.dtype != mx.bfloat16 or new_values.dtype != mx.bfloat16:
+        raise TypeError(
+            "GLM-5.3 expanded K/V host spool requires BF16 projections")
+    mx.eval(new_keys, new_values)
+    entry = cache.get(layer)
+    previous = 0 if entry is None else int(entry[2])
+    end = previous + incoming
+    migrated_key_bits = migrated_value_bits = None
+    if entry is not None and not isinstance(entry[0], np.ndarray):
+        # Dense attention is cheap enough to keep its <=top-k expanded prefix
+        # on Metal. At the first genuinely sparse tile, migrate those already
+        # projected BF16 bits once, then append only new rows on the host.
+        migrated_key_bits = np.array(
+            np.asarray(entry[0][..., :previous, :].view(mx.uint16)),
+            dtype=np.uint16, copy=True)
+        migrated_value_bits = np.array(
+            np.asarray(entry[1][..., :previous, :].view(mx.uint16)),
+            dtype=np.uint16, copy=True)
+        entry = None
+    if entry is None:
+        requested = int(getattr(cache, "capacity_rows", 0) or 0)
+        capacity = (
+            max(end, requested)
+            if requested > 0
+            else max(end, ((incoming + step - 1) // step) * step)
+        )
+        keys = np.empty(
+            (batch, heads, capacity, key_dim), dtype=np.uint16)
+        values = np.empty(
+            (batch, heads, capacity, value_dim), dtype=np.uint16)
+        cache.capacity_grows = int(getattr(
+            cache, "capacity_grows", 0)) + 1
+        if previous:
+            keys[..., :previous, :] = migrated_key_bits
+            values[..., :previous, :] = migrated_value_bits
+            migrated_bytes = int(
+                migrated_key_bits.nbytes + migrated_value_bits.nbytes)
+            cache.rows_copied = int(getattr(
+                cache, "rows_copied", 0)) + previous
+            cache.rows_written = int(getattr(
+                cache, "rows_written", 0)) + previous
+            cache.host_bytes_written = int(getattr(
+                cache, "host_bytes_written", 0)) + migrated_bytes
+    else:
+        keys, values, _ = entry
+        capacity = int(keys.shape[2])
+        if end > capacity:
+            added = ((end - capacity + step - 1) // step) * step
+            grown_keys = np.empty(
+                (batch, heads, capacity + added, key_dim), dtype=np.uint16)
+            grown_values = np.empty(
+                (batch, heads, capacity + added, value_dim), dtype=np.uint16)
+            grown_keys[..., :previous, :] = keys[..., :previous, :]
+            grown_values[..., :previous, :] = values[..., :previous, :]
+            cache.rows_copied = int(getattr(
+                cache, "rows_copied", 0)) + previous
+            cache.capacity_grows = int(getattr(
+                cache, "capacity_grows", 0)) + 1
+            keys, values = grown_keys, grown_values
+            capacity += added
+    key_bits = np.asarray(new_keys.view(mx.uint16))
+    value_bits = np.asarray(new_values.view(mx.uint16))
+    keys[..., previous:end, :] = key_bits
+    values[..., previous:end, :] = value_bits
+    written = int(key_bits.nbytes + value_bits.nbytes)
+    cache.rows_written = int(getattr(
+        cache, "rows_written", 0)) + incoming
+    cache.host_bytes_written = int(getattr(
+        cache, "host_bytes_written", 0)) + written
+    cache.capacity_rows_peak = max(
+        int(getattr(cache, "capacity_rows_peak", 0)), capacity)
+    cache.host_logical_bytes_peak = max(
+        int(getattr(cache, "host_logical_bytes_peak", 0)),
+        int(keys.nbytes + values.nbytes))
+    cache[layer] = [keys, values, end]
+    return keys[..., :end, :], values[..., :end, :]
+
+
+def _glm5_next_restore_host_bf16(
+        value: np.ndarray, *, cache=None) -> mx.array:
+    """Upload one raw host payload and restore its BF16 interpretation."""
+    if value.dtype != np.uint16:
+        raise TypeError("GLM-5.3 host K/V payload must be raw uint16")
+    result = mx.array(value, dtype=mx.uint16).view(mx.bfloat16)
+    mx.eval(result)
+    if cache is not None:
+        cache.host_bytes_uploaded = int(getattr(
+            cache, "host_bytes_uploaded", 0)) + int(value.nbytes)
+        cache.host_upload_calls = int(getattr(
+            cache, "host_upload_calls", 0)) + 1
+    return result
+
+
 def _glm5_next_quantize_expanded_rows_int8(
         value: mx.array) -> tuple[mx.array, mx.array]:
     """Symmetric per-row int8 storage for explicitly lossy fused DSA K/V."""
@@ -631,7 +742,7 @@ def _glm5_next_update_expanded_prefill_kv_int8(
 def _glm5_next_sparse_expanded_attention(
         query: mx.array, keys_all: mx.array, values_all: mx.array,
         selection: mx.array, *, key_dim: int,
-        query_tile_size: int = 4) -> mx.array:
+        query_tile_size: int = 4, host_stats=None) -> mx.array:
     """Row-specific exact attention over already projected K/V."""
     batch, _heads, length, _ = query.shape
     if selection.shape[:2] != (batch, length):
@@ -644,14 +755,40 @@ def _glm5_next_sparse_expanded_attention(
         end = min(start + tile_size, length)
         selected = selection[:, start:end]
         safe = mx.where(selected >= 0, selected, 0)
-        gathered_keys = mx.stack([
-            mx.take(keys_all[b], safe[b], axis=1)
-            for b in range(batch)
-        ], axis=0)
-        gathered_values = mx.stack([
-            mx.take(values_all[b], safe[b], axis=1)
-            for b in range(batch)
-        ], axis=0)
+        if isinstance(keys_all, np.ndarray):
+            if not isinstance(values_all, np.ndarray):
+                raise TypeError("host-expanded GLM K/V placement is inconsistent")
+            safe_host = np.asarray(safe, dtype=np.int32)
+            if batch == 1:
+                key_bits = np.take(keys_all[0], safe_host[0], axis=1)[None]
+                value_bits = np.take(
+                    values_all[0], safe_host[0], axis=1)[None]
+            else:
+                key_bits = np.stack([
+                    np.take(keys_all[b], safe_host[b], axis=1)
+                    for b in range(batch)
+                ], axis=0)
+                value_bits = np.stack([
+                    np.take(values_all[b], safe_host[b], axis=1)
+                    for b in range(batch)
+                ], axis=0)
+            gathered_keys = _glm5_next_restore_host_bf16(
+                key_bits, cache=host_stats)
+            gathered_values = _glm5_next_restore_host_bf16(
+                value_bits, cache=host_stats)
+            if host_stats is not None:
+                host_stats.host_sparse_gather_rows = int(getattr(
+                    host_stats, "host_sparse_gather_rows", 0)) + int(
+                        safe_host.size)
+        else:
+            gathered_keys = mx.stack([
+                mx.take(keys_all[b], safe[b], axis=1)
+                for b in range(batch)
+            ], axis=0)
+            gathered_values = mx.stack([
+                mx.take(values_all[b], safe[b], axis=1)
+                for b in range(batch)
+            ], axis=0)
         scores = mx.sum(
             query[:, :, start:end, None, :].astype(mx.float32)
             * gathered_keys.astype(mx.float32), axis=-1) * scale
@@ -724,6 +861,7 @@ def glm5_next_mla_attention(
         expanded_prefill = None
     expanded_keys = expanded_values = None
     expanded_key_scales = expanded_value_scales = None
+    host_expanded_kv = False
     if expanded_prefill is not None:
         # A stable-boundary/hot-prefix continuation begins with an already
         # populated compact latent cache but a new request-local expanded
@@ -735,11 +873,24 @@ def glm5_next_mla_attention(
             if layer not in expanded_prefill and int(offset) > 0
             else latent
         )
+        host_expanded_kv = bool(getattr(
+            expanded_prefill, "host_spool", False))
+        if host_expanded_kv and getattr(
+                kv, "glm53_sparse_fused_attention", False):
+            raise ValueError(
+                "GLM-5.3 host-expanded K/V is incompatible with fused "
+                "sparse attention")
         if getattr(kv, "glm53_sparse_fused_kv_int8", False):
             (expanded_keys, expanded_values,
              expanded_key_scales,
              expanded_value_scales) = (
                 _glm5_next_update_expanded_prefill_kv_int8(
+                    expanded_input, w, prefix, layer=layer,
+                    cache=expanded_prefill, heads=heads,
+                    key_dim=key_dim, value_dim=value_dim))
+        elif host_expanded_kv and selection is not None:
+            expanded_keys, expanded_values = (
+                _glm5_next_update_host_expanded_prefill_kv(
                     expanded_input, w, prefix, layer=layer,
                     cache=expanded_prefill, heads=heads,
                     key_dim=key_dim, value_dim=value_dim))
@@ -753,6 +904,11 @@ def glm5_next_mla_attention(
     if selection is None:
         if expanded_keys is not None:
             keys, values = expanded_keys, expanded_values
+            if isinstance(keys, np.ndarray):
+                keys = _glm5_next_restore_host_bf16(
+                    keys, cache=expanded_prefill)
+                values = _glm5_next_restore_host_bf16(
+                    values, cache=expanded_prefill)
             if expanded_key_scales is not None:
                 keys = keys.astype(query.dtype) * expanded_key_scales.astype(
                     query.dtype)
@@ -822,7 +978,8 @@ def glm5_next_mla_attention(
                     "GLM-5.3 int8 expanded K/V requires fused sparse attention")
             output = _glm5_next_sparse_expanded_attention(
                 query, expanded_keys, expanded_values, selection,
-                key_dim=key_dim, query_tile_size=4)
+                key_dim=key_dim, query_tile_size=4,
+                host_stats=expanded_prefill)
         else:
             output = _glm5_next_sparse_mla_attention(
                 query, latent_all, selection, w, prefix,

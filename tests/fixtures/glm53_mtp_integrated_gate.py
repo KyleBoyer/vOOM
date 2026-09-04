@@ -291,6 +291,18 @@ def main() -> None:
                     stats.get(
                         "glm53_layer_stationary_disk_spool_uncached_descriptors",
                         0)),
+                "glm53_expanded_kv_host_spool": stats.get(
+                    "glm53_expanded_kv_host_spool", 0),
+                **{
+                    f"glm53_expanded_kv_{metric}": stats.get(
+                        f"glm53_expanded_kv_{metric}", 0)
+                    for metric in (
+                        "capacity_grows", "capacity_rows_peak",
+                        "rows_copied", "rows_written",
+                        "host_logical_bytes_peak", "host_bytes_written",
+                        "host_bytes_uploaded", "host_upload_calls",
+                        "host_sparse_gather_rows")
+                },
                 "direct_io_fd_cache_enabled": stats.get(
                     "direct_io_fd_cache_enabled", 0),
                 "direct_io_fd_opens": stats.get("direct_io_fd_opens", 0),

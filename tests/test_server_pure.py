@@ -224,6 +224,16 @@ def test_protocol_timing_exposes_glm53_phase_active_peaks():
         "glm53_layer_stationary_disk_spool_uncached_descriptors": 1,
         "glm53_layer_stationary_disk_spool_write_s": 2.25,
         "glm53_layer_stationary_disk_spool_read_s": 3.,
+        "glm53_expanded_kv_host_spool": 1,
+        "glm53_expanded_kv_capacity_grows": 11,
+        "glm53_expanded_kv_capacity_rows_peak": 46_849,
+        "glm53_expanded_kv_rows_copied": 0,
+        "glm53_expanded_kv_rows_written": 515_339,
+        "glm53_expanded_kv_host_logical_bytes_peak": 1_535_148_032,
+        "glm53_expanded_kv_host_bytes_written": 1_535_148_032,
+        "glm53_expanded_kv_host_bytes_uploaded": 999,
+        "glm53_expanded_kv_host_upload_calls": 100,
+        "glm53_expanded_kv_host_sparse_gather_rows": 200,
         "glm53_layer_stationary_transient_reservation_calls": 109,
         "glm53_layer_stationary_transient_reservation_bytes": 110,
         "glm53_layer_stationary_transient_reservation_margin_bytes": 111,
@@ -3094,6 +3104,7 @@ def test_glm53_sparse_absorbed_mla_is_explicit_and_in_engine_identity():
         "VMODEL_GLM53_COALESCED_EXPERT_POSITIONS": "0",
         "VMODEL_GLM53_COALESCED_EXPERT_MAX_POSITIONS": "512",
         "VMODEL_GLM53_INCREMENTAL_DSA_POOL": "0",
+        "VMODEL_GLM53_EXPANDED_KV_HOST_SPOOL": "0",
         "VMODEL_GLM53_COMPILED_KDA_PREFILL": "0",
         "VMODEL_GLM53_COMPILED_KDA_SEGMENT": "32",
         "VMODEL_GLM53_NATIVE_FUSED_KDA_PREFILL": "0",
@@ -3133,8 +3144,12 @@ def test_glm53_sparse_absorbed_mla_is_explicit_and_in_engine_identity():
         os.environ["VMODEL_GLM53_LAYER_STATIONARY_DISK_SPOOL_DIR"] = (
             "/Volumes/Test/glm53-activation-spool")
         manager.get(Path("/tmp/fake-glm53-sparse-absorbed"), "lossless")
+        os.environ["VMODEL_GLM53_SPARSE_FUSED_ATTENTION"] = "0"
+        os.environ["VMODEL_GLM53_SPARSE_FUSED_KV_INT8"] = "0"
+        os.environ["VMODEL_GLM53_EXPANDED_KV_HOST_SPOOL"] = "1"
+        manager.get(Path("/tmp/fake-glm53-sparse-absorbed"), "lossless")
 
-    assert len(captured) == 12
+    assert len(captured) == 13
     assert captured[0].glm53_sparse_absorbed_mla is False
     assert captured[1].glm53_sparse_absorbed_mla is True
     assert captured[2].glm53_sparse_absorbed_mla is False
@@ -3166,6 +3181,8 @@ def test_glm53_sparse_absorbed_mla_is_explicit_and_in_engine_identity():
     assert captured[11].glm53_layer_stationary_host_spool is False
     assert captured[11].glm53_layer_stationary_disk_spool_dir == (
         "/Volumes/Test/glm53-activation-spool")
+    assert captured[11].glm53_expanded_kv_host_spool is False
+    assert captured[12].glm53_expanded_kv_host_spool is True
 
 
 def test_glm53_sparse_attention_candidates_are_mutually_exclusive():
@@ -3203,6 +3220,32 @@ def test_glm53_incremental_dsa_pool_rejects_untyped_env():
         "VMODEL_GLM53_INCREMENTAL_DSA_POOL": "auto",
     }, clear=False):
         with pytest.raises(RequestValidationError, match="must be 0 or 1"):
+            EngineManager().get(Path("/tmp/unused-glm53"), "lossless")
+
+
+def test_glm53_expanded_kv_host_spool_rejects_untyped_env():
+    from unittest.mock import patch
+
+    from runtime.server import EngineManager, RequestValidationError
+
+    with patch.dict("os.environ", {
+        "VMODEL_GLM53_EXPANDED_KV_HOST_SPOOL": "auto",
+    }, clear=False):
+        with pytest.raises(RequestValidationError, match="must be 0 or 1"):
+            EngineManager().get(Path("/tmp/unused-glm53"), "lossless")
+
+
+def test_glm53_expanded_kv_host_spool_rejects_fused_sparse_path():
+    from unittest.mock import patch
+
+    from runtime.server import EngineManager, RequestValidationError
+
+    with patch.dict("os.environ", {
+        "VMODEL_GLM53_EXPANDED_KV_HOST_SPOOL": "1",
+        "VMODEL_GLM53_SPARSE_FUSED_ATTENTION": "1",
+        "VMODEL_GLM53_SPARSE_FUSED_KV_INT8": "0",
+    }, clear=False):
+        with pytest.raises(RequestValidationError, match="incompatible"):
             EngineManager().get(Path("/tmp/unused-glm53"), "lossless")
 
 

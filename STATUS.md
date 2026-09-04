@@ -23,6 +23,32 @@ default. The untouched 46,849-token pressure/timing gate remains pending.
 Evidence: `logs/glm53_flash_exact_striped_disk_spool_state4_20260904.json` and
 `logs/preflight_glm53_flash_exact_disk_spool_state4_retry_20260904.json`.
 
+The first untouched 46,849-token/134-tool activation-spool run advanced to
+layer 3 token 44,512 before the remaining full expanded DSA K/V allocation hit
+**8,500,833,340 bytes**, 0.83MB above the hard cap. It aborted rather than
+retrying, and pressure failed (208MB swap-used growth; 509MB physical
+swap-outs). This precisely isolated the residual allocation.
+
+An additional explicit path now keeps the <=2,048-row dense K/V prefix on
+Metal, then migrates its BF16 bits once into exact-sized host uint16 arrays at
+the first sparse tile. Later tiles project each new row once and upload only
+the selected rows into the unchanged score/softmax/value operators. Synthetic
+gates preserve every projected bit and the sparse attention output. An
+all-host real four-output gate again matched tokens/text, all five state
+components, all 159 tensor hashes, and exact model reads. The hybrid
+2,123-token released-model witness preserved request SHA, output SHA, and the
+exact 300.933GB read count. Composed with the proven exact batch-eight,
+depth-two, two-worker expert pipeline, it completed in **438.568s** versus
+798.198s without prefetch, at 3.003GB peak Metal. This is still 8.69% slower
+than the non-spooled 403.515s medium control and produced 207MB physical
+swap-outs, so it is a long-context capacity candidate only. The untouched
+capture is the next gate.
+
+Additional evidence:
+`logs/glm53_flash_exact_disk_spool_actual_20260904.json`,
+`logs/glm53_flash_exact_host_expanded_kv_state4_20260904.json`, and
+`logs/glm53_flash_exact_hybrid_host_kv_prefetch_long2123_20260904.json`.
+
 ## 2026-09-04: exact SIMD recurrence cuts real Qwen prefill 39%; GLM KDA is exact too
 
 MLX 0.32's strided K-axis reduction was transcribed into a one-dispatch Metal
