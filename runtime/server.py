@@ -5476,7 +5476,8 @@ class EngineManager:
                     raise RequestValidationError(
                         "could not initialize explicit Qwen4 Lightning-MTP: "
                         f"{error}") from error
-            elif mtype == "glm5_next" and glm53_mtp_request == "1":
+            elif (mtype in ("glm5_next", "glm_moe_dsa")
+                  and glm53_mtp_request == "1"):
                 from .speculative import NativeMTPEngine
 
                 try:
@@ -9560,6 +9561,18 @@ def _vision_protocol_timing(result: dict) -> dict:
         "glm53_coalesced_expert_max_expert_routes",
         "glm53_coalesced_expert_gemm_input_positions",
         "glm53_coalesced_expert_gemm_full_chunks",
+        "glm53_exact_expert_layers",
+        "glm53_exact_expert_tiles",
+        "glm53_exact_expert_swiglu_calls",
+        "glm53_exact_expert_rows",
+        "glm53_exact_expert_max_rows",
+        "glm53_exact_expert_rows_1_calls",
+        "glm53_exact_expert_rows_2_calls",
+        "glm53_exact_expert_rows_3_4_calls",
+        "glm53_exact_expert_rows_5_8_calls",
+        "glm53_exact_expert_rows_9_16_calls",
+        "glm53_exact_expert_rows_17_32_calls",
+        "glm53_exact_expert_rows_33_plus_calls",
         "glm53_incremental_dsa_pool",
         "glm53_compiled_kda_prefill",
         "glm53_native_fused_kda_prefill",

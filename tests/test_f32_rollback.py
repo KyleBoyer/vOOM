@@ -9,12 +9,33 @@ first if models/glm-fixture-tiny/ is missing.
 
   .venv/bin/python tests/test_f32_rollback.py
 """
+import hashlib
 import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 FIXTURE = Path(__file__).resolve().parent.parent / "models" / "glm-fixture-tiny"
+
+
+def _dsa_rows(kv):
+    """Return privacy-safe per-position hashes for each full indexer layer."""
+    import mlx.core as mx
+    import numpy as np
+
+    result = {}
+    for layer, value in sorted(kv.dsa.k_idx.items()):
+        rows = []
+        for position in range(int(value.shape[1])):
+            row = value[:, position:position + 1, :]
+            mx.eval(row)
+            payload = (
+                np.asarray(row.view(mx.uint16)).tobytes()
+                if row.dtype == mx.bfloat16 else np.asarray(row).tobytes()
+            )
+            rows.append(hashlib.sha256(payload).hexdigest())
+        result[int(layer)] = rows
+    return result
 
 
 def _ensure_fixture():
@@ -75,6 +96,45 @@ def test_rollback_accept_none():
     truth = _true_greedy(prompt, max_tokens)
     emitted = _forced_boundary(0, k, prompt, max_tokens, truth)
     assert emitted == truth, f"accept-none: {emitted} != {truth}"
+
+
+def test_rollback_accept_none_preserves_dsa_rows():
+    """Rejected verifier rows leave the same DSA endpoint as plain decode."""
+    from runtime.engine import RuntimeConfig, StreamingEngine
+    from runtime.speculative import SpeculativeDecoder
+
+    _ensure_fixture()
+    prompt, max_tokens, k = "DSA row rollback", 6, 3
+    plain = StreamingEngine(str(FIXTURE), RuntimeConfig(
+        max_weight_cache_mb=200, pin_lm_head=True, mla_compressed_kv=True))
+    truth = plain.generate(prompt, max_tokens)
+    plain_rows = _dsa_rows(plain.last_kv)
+
+    target = StreamingEngine(str(FIXTURE), RuntimeConfig(
+        max_weight_cache_mb=200, pin_lm_head=True, mla_compressed_kv=True))
+    decoder = SpeculativeDecoder(
+        target, "mtp", k=k, _unsafe_allow_moe_verify=True)
+    decoder._diagnostic_retain_generation_endpoint = True
+    call_count = [0]
+
+    def reject_all(h_last, last_token, kk, mtp_kv, offset):
+        decoder.mtp.__class__.draft_tokens(
+            decoder.mtp, h_last, last_token, kk, mtp_kv, offset)
+        start = call_count[0] + 1
+        call_count[0] += 1
+        return [
+            (token + 12345) % 49000
+            for token in truth["tokens"][start:start + kk]
+        ]
+
+    decoder.mtp.draft_tokens = reject_all
+    measured = decoder.generate(prompt, max_tokens=max_tokens)
+    spec_rows = _dsa_rows(decoder._diagnostic_generation_endpoint)
+
+    assert measured["tokens"] == truth["tokens"]
+    assert spec_rows == plain_rows
+    plain.close()
+    target.close()
 
 
 def test_rollback_partial_one():

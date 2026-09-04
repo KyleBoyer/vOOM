@@ -434,6 +434,17 @@ def test_glm53_layer_stationary_moe_preserves_tile_shapes_and_expert_order():
     assert coalesced_stats["max_expert_routes"] >= 1
     assert coalesced_stats["gemm_input_positions"] == 6
     assert coalesced_stats["gemm_full_chunks"] == 6
+    assert coalesced_stats["exact_expert_layers"] == 1
+    assert coalesced_stats["exact_expert_tiles"] == 2
+    assert coalesced_stats["exact_expert_rows"] == 6
+    assert coalesced_stats["exact_expert_swiglu_calls"] >= len(requested)
+    assert coalesced_stats["exact_expert_max_rows"] >= 1
+    assert sum(
+        coalesced_stats[f"exact_expert_{bucket}_calls"]
+        for bucket in (
+            "rows_1", "rows_2", "rows_3_4", "rows_5_8",
+            "rows_9_16", "rows_17_32", "rows_33_plus")
+    ) == coalesced_stats["exact_expert_swiglu_calls"]
 
 
 def test_glm53_serial_verifier_reprojects_growing_mla_prefix():

@@ -2809,7 +2809,8 @@ def test_glm53_hot_prompt_kv_settings_fail_closed(variable, value, message):
             EngineManager().get(Path("/tmp/not-opened-glm53"), "lossless")
 
 
-def test_glm53_native_mtp_is_explicit_and_in_engine_identity():
+@pytest.mark.parametrize("model_type", ["glm5_next", "glm_moe_dsa"])
+def test_glm53_native_mtp_is_explicit_and_in_engine_identity(model_type):
     from unittest.mock import patch
 
     from runtime.server import EngineManager
@@ -2840,7 +2841,7 @@ def test_glm53_native_mtp_is_explicit_and_in_engine_identity():
             self.target.close()
 
     cfg = SimpleNamespace(
-        model_type="glm5_next", tie_word_embeddings=False,
+        model_type=model_type, tie_word_embeddings=False,
         index_topk=2048, vision_config=None, num_experts_per_tok=8,
     )
     settings = {
@@ -2866,6 +2867,34 @@ def test_glm53_native_mtp_is_explicit_and_in_engine_identity():
     assert not mtp.capture_logit_margin
     assert mtp.min_logit_margin == 0.0
     assert len(targets) == 2
+
+
+def test_full_glm_native_mtp_requires_dsa_elided_bounded_target():
+    from unittest.mock import MagicMock, patch
+
+    from runtime.speculative import NativeMTPEngine
+
+    def target(*, dsa_elided, context_bound):
+        return SimpleNamespace(
+            cfg=SimpleNamespace(
+                model_type="glm_moe_dsa", index_topk=2048),
+            rc=SimpleNamespace(context_bound=context_bound),
+            _dsa_elided=dsa_elided,
+        )
+
+    decoder = MagicMock()
+    decoder.mtp = MagicMock()
+    with patch("runtime.speculative.SpeculativeDecoder", return_value=decoder):
+        admitted = NativeMTPEngine(
+            target(dsa_elided=True, context_bound=2048))
+        assert admitted.target._dsa_elided
+
+        with pytest.raises(ValueError, match="DSA-elided"):
+            NativeMTPEngine(
+                target(dsa_elided=False, context_bound=1_048_576))
+        with pytest.raises(ValueError, match="DSA-elided"):
+            NativeMTPEngine(
+                target(dsa_elided=True, context_bound=4096))
 
 
 def test_glm53_expert_storage_batch_and_pipeline_are_explicit_identity():

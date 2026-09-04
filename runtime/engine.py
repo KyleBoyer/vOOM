@@ -8602,6 +8602,20 @@ class StreamingEngine:
                 "mlp_s", 0.0)) + mlp_s,
             "ffn_hc_post_s": float(previous_stats.get(
                 "ffn_hc_post_s", 0.0)) + ffn_hc_post_s,
+            **{
+                f"exact_expert_{metric}": int(previous_stats.get(
+                    f"exact_expert_{metric}", 0)) + int(
+                        coalesced_stats.get(
+                            f"exact_expert_{metric}", 0))
+                for metric in (
+                    "layers", "tiles", "swiglu_calls", "rows",
+                    "rows_1_calls", "rows_2_calls", "rows_3_4_calls",
+                    "rows_5_8_calls", "rows_9_16_calls",
+                    "rows_17_32_calls", "rows_33_plus_calls")
+            },
+            "exact_expert_max_rows": max(
+                int(previous_stats.get("exact_expert_max_rows", 0)),
+                int(coalesced_stats.get("exact_expert_max_rows", 0))),
             "coalesced_expert_gemm_calls": int(previous_stats.get(
                 "coalesced_expert_gemm_calls", 0)) + int(
                     coalesced_stats["gemm_calls"]),
@@ -12960,6 +12974,13 @@ class StreamingEngine:
                     "gemm_full_chunks"):
                 path_stats[f"glm53_coalesced_expert_{metric}"] = int(
                     glm53_memory.get(f"coalesced_expert_{metric}", 0))
+            for metric in (
+                    "layers", "tiles", "swiglu_calls", "rows", "max_rows",
+                    "rows_1_calls", "rows_2_calls", "rows_3_4_calls",
+                    "rows_5_8_calls", "rows_9_16_calls",
+                    "rows_17_32_calls", "rows_33_plus_calls"):
+                path_stats[f"glm53_exact_expert_{metric}"] = int(
+                    glm53_memory.get(f"exact_expert_{metric}", 0))
             path_stats["glm53_incremental_dsa_pool"] = int(
                 self.rc.glm53_incremental_dsa_pool)
             path_stats["glm53_compiled_kda_prefill"] = int(

@@ -1,5 +1,58 @@
 # STATUS — 2026-09-04 (current corrections first; dated chronology below is history)
 
+## 2026-09-04: exact route-shape telemetry rejects per-call compiled SwiGLU
+
+GLM-5.3-Flash's exact layer-stationary expert loop now reports its real outer
+shapes without retaining activations: layers, tiles, calls, routed rows,
+maximum width, and width buckets from one row through 33+. On the matched
+28-input/eight-output native-MTP trace, 5,198 of 7,081 routed SwiGLU calls
+(73.4%) had one row, while only 32 exceeded 16 rows. This confirms that tiny
+expert GEMMs are a dominant kernel shape and gives future fused-kernel work a
+content-independent target instead of inferring it from one prompt.
+
+An unchanged, shape-specialized `mx.compile` SwiGLU candidate was exact for
+one-to-three-row random BF16 microbenchmarks and improved isolated width one
+by 11.65%. The matched real checkpoint gate was nevertheless decisive: all
+eight tokens and all 159 endpoint tensors matched, but 6,527 compiled calls
+increased wall **123.237 -> 210.600s (+70.9%)**, prefill 68.742 -> 118.881s,
+and decode 54.492 -> 91.715s. Expert-prefetch waits rose from 99.130 to
+159.206 cumulative seconds. The execution switch and profile were removed;
+only the arithmetic-neutral shape telemetry remains. BF16 `gather_mm` was
+also rejected for lossless use because even its isolated width-one result was
+not byte-identical, while wider tested shapes were slower.
+
+Evidence:
+`logs/glm53_flash_uncensored_mtp_depth3_max8_20260903.json`,
+`logs/glm53_flash_uncensored_mtp_depth3_compiled_expert_small_prefetch_max8_20260904.json`,
+`logs/preflight_glm53_exact_gather_mm_probe_20260904.json`, and
+`logs/preflight_glm53_specialized_compiled_swiglu_probe_20260904.json`.
+
+## 2026-09-04: full GLM bounded native MTP is exact but slower
+
+The full uncensored GLM-5.3 target can now use its released layer-78 MTP block
+only when DSA was provably elided by a positive context bound no larger than
+the released 2,048-row index top-k. Larger or DSA-bearing runs fail closed.
+The 28-input/four-output oracle matched every token, text, final hidden row,
+and all 78 compressed-MLA tensors. It was not a speed win: zero accepted
+proposals increased wall **362.018 -> 411.465s (+13.66%)**, decode 78.917 ->
+127.160s, and reads 399.423 -> 448.798GB. A content-blind minimum-margin-one
+gate withheld the weak proposal and reduced the regression to +7.70%, but it
+still performed three target sweeps and grew physical swap-out by 22.446MB.
+The bounded profile therefore remains an explicit correctness/experimentation
+route, not a recommended speed profile.
+
+State diagnostics now optionally hash each logical DSA row so future verifier
+rollback failures identify the first divergent position without storing
+activation data. A forced-rejection tiny-model oracle proves row-for-row DSA
+identity, and full short-context production runs correctly report no DSA
+state because their 2,048 context bound elides it.
+
+Evidence:
+`logs/glm53_full_lossless_workers2_plain_dsa_rows_prompt4_20260904.json`,
+`logs/glm53_full_lossless_workers2_mtp3_bounded_state_prompt4_20260904.json`,
+`logs/glm53_full_lossless_mtp3_confidence1_bounded_state_prompt4_20260904.json`,
+and `logs/preflight_glm_tiny_dsa_row_oracle_20260904.json`.
+
 ## 2026-09-04: route-capacity rebalance is exact and improves real Qwen Plex decode
 
 The uncensored Qwen FP8 tier had inherited a policy intended for a different

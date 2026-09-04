@@ -32,11 +32,12 @@ Old local Kimi K2.5, Kimi Linear, GLM-4.7-Flash, and remaining GLM-4 Hugging
 Face cache entries were removed at the user's direction. GLM-5.3-Flash and
 its 328 GB source remain on Workspace NVMe, not NAS.
 
-## Full official GLM-5.3 target
+## Full uncensored GLM-5.3 target
 
-The complete official `zai-org/GLM-5.3` revision
-`e0b07fd2751b42d5efa199cc02c2b271deadc516` is separately local on Workspace
-NVMe: 141 shards and 755,617,140,416 released tensor bytes. Its 78-layer
+The complete attested `dealignai/GLM-5.3-UNCENSORED-FP8` revision
+`aff05d054bf581b95bdfd87ba9792dbf1e4365b2` is separately local on Workspace
+NVMe: 282 shards and 755,663,675,562 verified candidate bytes. Its architecture
+and indexed tensor names match the official `zai-org/GLM-5.3` layout. Its 78-layer
 `glm_moe_dsa` runtime now completes the unmodified 178,616-byte / 134-tool
 captured harness request at 46,849 rendered input tokens. Only the model alias
 and max-output-one capacity cap differ from the capture. Exact released
@@ -405,6 +406,27 @@ listed rejected titles in the visible answer, and truncated. It is rejected as
 a quality/speed profile. The generic deterministic Plex policy renderer's
 100/100 score is not counted as model intelligence.
 
+## Latest verifier and expert-kernel instrumentation
+
+The full target's released layer-78 native MTP is now executable only for a
+DSA-elided context bound no larger than the released index top-k of 2,048.
+The deterministic four-output oracle matched tokens, text, the final hidden
+row, and all 78 MLA endpoint tensors, but zero accepted proposals regressed
+wall from 362.018 to 411.465 seconds and reads by 12.36%. A minimum-margin-one
+controller reduced the regression to 7.70% but remained slower and failed the
+pressure gate. `glm53-full-lossless-native-mtp3-bounded` is consequently an
+explicit correctness profile, not a recommended speed profile. Diagnostic
+state gates can now emit privacy-safe hashes for each logical DSA row, and a
+forced-rejection tiny-model oracle proves exact row rollback.
+
+Flash layer-stationary execution now reports exact routed-expert shape
+histograms. On the matched eight-output MTP gate, 5,198/7,081 calls had one
+row. Shape-specialized compilation of the unchanged SwiGLU was state-exact,
+but 6,527 compiled calls regressed wall 123.237 -> 210.600 seconds (+70.9%).
+That execution path was removed; the arithmetic-neutral counters remain to
+guide future fused kernels. BF16 `gather_mm` is not a lossless substitute
+because its output failed the byte gate.
+
 ## Explicit controls
 
 All new narrow speed paths remain opt-in pending the heterogeneous real-request
@@ -481,7 +503,7 @@ expert-prefetch residency rejection.
 ## Scope still to prove
 
 - The unmodified captured request renders to 46,849 input tokens and all 134
-  real tools. Full official GLM-5.3 now completes its lossless one-token
+  real tools. Full uncensored GLM-5.3 now completes its lossless one-token
   capacity gate in 59.46 minutes of prefill, while the explicit lossy Flash
   composition takes 46.21 minutes. Both fail pressure; a complete tool/Plex
   workflow is still outstanding and cannot be inferred from max-1.

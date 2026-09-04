@@ -59,7 +59,8 @@ def _array_payload(value: mx.array) -> bytes:
 
 def _state_digest(
         engine, *, kv=None, hidden=None,
-        require_recurrent: bool = True) -> dict[str, object]:
+        require_recurrent: bool = True,
+        dsa_row_digest: bool = False) -> dict[str, object]:
     kv = engine.last_kv if kv is None else kv
     if kv is None:
         raise RuntimeError("target did not retain a generation endpoint")
@@ -71,6 +72,7 @@ def _state_digest(
             "conv_history", "hidden")
     }
     tensor_sha256: dict[str, str] = {}
+    dsa_row_sha256: dict[str, list[str]] = {}
     tensors = 0
     payload_bytes = 0
 
@@ -118,6 +120,17 @@ def _state_digest(
             # Both DSA implementations expose ``k_idx`` as an authoritative
             # logical view even when a private stepped backing has spare rows.
             add("dsa_index", f"dsa.{layer}.k_idx", value)
+            if dsa_row_digest:
+                # Diagnostic-only localization for a failed whole-state gate.
+                # Hash each logical temporal row independently so an A/B can
+                # identify the first divergent position without serializing
+                # checkpoint-derived activations into the result artifact.
+                dsa_row_sha256[str(layer)] = [
+                    hashlib.sha256(
+                        _array_payload(value[:, row:row + 1, :])
+                    ).hexdigest()
+                    for row in range(int(value.shape[1]))
+                ]
         for layer, value in sorted(
                 getattr(dsa, "pool_keys", {}).items()):
             add("dsa_index", f"dsa.{layer}.pool", value)
@@ -135,7 +148,7 @@ def _state_digest(
                 for index, value in enumerate(history):
                     add("conv_history", f"kda.{layer}.conv.{index}", value)
     add("hidden", "hidden.last", engine._h_last if hidden is None else hidden)
-    return {
+    result = {
         "sha256": digest.hexdigest(),
         "tensors": tensors,
         "payload_bytes": payload_bytes,
@@ -147,6 +160,9 @@ def _state_digest(
         },
         "tensor_sha256": tensor_sha256,
     }
+    if dsa_row_digest:
+        result["dsa_row_sha256"] = dsa_row_sha256
+    return result
 
 
 def _configure_profile(profile: str) -> None:

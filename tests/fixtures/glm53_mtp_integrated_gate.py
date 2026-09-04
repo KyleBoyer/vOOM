@@ -8,6 +8,8 @@ import os
 import sys
 from pathlib import Path
 
+import psutil
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from tests.fixtures.glm53_mtp_real_probe import DEFAULT_PROMPT
@@ -34,11 +36,17 @@ def main() -> None:
     parser.add_argument("--trunk-prefetch-workers", type=int, default=1)
     parser.add_argument("--state-digest", action="store_true")
     parser.add_argument(
+        "--dsa-row-digest", action="store_true",
+        help=("include per-position hashes for DSA index-key caches; "
+              "requires --state-digest and is diagnostic-only"))
+    parser.add_argument(
         "--probe-every", type=int, default=0,
         help="fixture-only adaptive-controller probe interval (0 keeps default)")
     parser.add_argument("--expected-tokens", default="")
     parser.add_argument("--result", type=Path)
     args = parser.parse_args()
+    if args.dsa_row_digest and not args.state_digest:
+        parser.error("--dsa-row-digest requires --state-digest")
 
     os.environ["VMODEL_GLM53_MTP"] = "0" if args.plain else "1"
     os.environ["VMODEL_GLM53_MTP_DEPTH"] = str(args.depth)
@@ -102,8 +110,10 @@ def main() -> None:
             engine.rc.execution_profile = (
                 args.execution_profile
                 if args.runs == 1 or run_index == args.runs - 1 else "")
+            pressure_before = psutil.swap_memory()
             result = engine.generate(
                 args.prompt, max_tokens=args.max_tokens, stop=[])
+            pressure_after = psutil.swap_memory()
             stats = result["path_stats"]
             runs.append({
                 "run_index": run_index,
@@ -114,6 +124,23 @@ def main() -> None:
                 "first_token_s": result["first_token_s"],
                 "total_s": result["total_s"],
                 "true_peak_metal_bytes": result["true_peak_metal_bytes"],
+                "swap_used_growth_bytes": max(
+                    0, int(pressure_after.used) - int(pressure_before.used)),
+                "swap_out_growth_bytes": max(
+                    0, int(pressure_after.sout) - int(pressure_before.sout)),
+                "governor_swap_pressure_events": stats.get(
+                    "governor_swap_pressure_events", 0),
+                "governor_swap_used_growth_bytes": stats.get(
+                    "governor_swap_used_growth_bytes", 0),
+                "governor_swap_out_growth_bytes": stats.get(
+                    "governor_swap_out_growth_bytes", 0),
+                "governor_reservation_failures": stats.get(
+                    "governor_reservation_failures", 0),
+                "glm53_exact_expert_shape": {
+                    key.removeprefix("glm53_exact_expert_"): value
+                    for key, value in stats.items()
+                    if key.startswith("glm53_exact_expert_")
+                },
                 "prompt_cache_exact_hit": stats.get(
                     "prompt_cache_exact_hit", 0),
                 "prompt_cache_source": stats.get(
@@ -248,7 +275,8 @@ def main() -> None:
                         "plain decoder did not retain its committed hidden row")
                 endpoint_state = _state_digest(
                     target, hidden=hidden,
-                    require_recurrent=require_recurrent)
+                    require_recurrent=require_recurrent,
+                    dsa_row_digest=args.dsa_row_digest)
             else:
                 endpoint = engine.decoder._diagnostic_generation_endpoint
                 hidden = engine.decoder._diagnostic_generation_hidden
@@ -257,7 +285,8 @@ def main() -> None:
                         "native MTP verifier did not retain its committed endpoint")
                 endpoint_state = _state_digest(
                     target, kv=endpoint, hidden=hidden,
-                    require_recurrent=require_recurrent)
+                    require_recurrent=require_recurrent,
+                    dsa_row_digest=args.dsa_row_digest)
         document = {
             "schema": "voom.glm53-mtp-integrated-gate.v1",
             "tokens": runs[-1]["tokens"],
@@ -269,6 +298,18 @@ def main() -> None:
             "first_token_s": runs[-1]["first_token_s"],
             "total_s": runs[-1]["total_s"],
             "true_peak_metal_bytes": runs[-1]["true_peak_metal_bytes"],
+            "swap_used_growth_bytes": runs[-1][
+                "swap_used_growth_bytes"],
+            "swap_out_growth_bytes": runs[-1][
+                "swap_out_growth_bytes"],
+            "governor_swap_pressure_events": runs[-1][
+                "governor_swap_pressure_events"],
+            "governor_swap_used_growth_bytes": runs[-1][
+                "governor_swap_used_growth_bytes"],
+            "governor_swap_out_growth_bytes": runs[-1][
+                "governor_swap_out_growth_bytes"],
+            "governor_reservation_failures": runs[-1][
+                "governor_reservation_failures"],
             "mtp_enabled": stats.get("glm53_mtp_enabled", 0),
             "mtp_used": stats.get("glm53_mtp_used", 0),
             "mtp_depth": stats.get("glm53_mtp_depth", 0),

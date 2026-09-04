@@ -356,6 +356,7 @@ class SpeculativeDecoder:
         stats = SpecStats()
         if tgt.cfg.model_type == "glm5_next":
             tgt._glm53_mtp_state_only_prefill_tokens = 0
+            tgt._glm53_layer_stationary_stats = {}
         eos = set(tgt.cfg.eos_token_ids)
         stop = stop or []
 
@@ -1016,6 +1017,16 @@ class SpeculativeDecoder:
         if tgt.cfg.model_type in ("glm_moe_dsa", "glm5_next"):
             path_stats["glm53_native_fp8_dequant"] = int(bool(getattr(
                 tgt.store, "native_glm53_fp8_dequant", False)))
+        if tgt.cfg.model_type == "glm5_next":
+            layer_stats = getattr(
+                tgt, "_glm53_layer_stationary_stats", {}) or {}
+            for metric in (
+                    "layers", "tiles", "swiglu_calls", "rows", "max_rows",
+                    "rows_1_calls", "rows_2_calls", "rows_3_4_calls",
+                    "rows_5_8_calls", "rows_9_16_calls",
+                    "rows_17_32_calls", "rows_33_plus_calls"):
+                path_stats[f"glm53_exact_expert_{metric}"] = int(
+                    layer_stats.get(f"exact_expert_{metric}", 0))
         request_cache_after = _cache_io_snapshot(tgt)
         _record_cache_io_delta(
             tgt, request_cache_before, path_stats,
@@ -1199,8 +1210,28 @@ class NativeMTPEngine:
         if not 1 <= max_prompt_tokens <= 65_536:
             raise ValueError(
                 "native MTP prompt limit must be in [1, 65536]")
-        if target.cfg.model_type != "glm5_next":
-            raise ValueError("NativeMTPEngine currently requires GLM-5.3")
+        model_type = target.cfg.model_type
+        if model_type == "glm_moe_dsa":
+            # Full GLM-5.3 carries the same released iterative MTP block, but
+            # speculative execution above its DSA boundary needs the separate
+            # index-sharing/rollback proof.  The ordinary bounded profile
+            # proves that no key can be deselected and therefore elides the
+            # indexer completely.  Admit that exact path only; a long-context
+            # engine with live DSA state continues to fail closed.
+            index_topk = int(target.cfg.index_topk or 0)
+            context_bound = int(target.rc.context_bound or 0)
+            bounded_full_glm = bool(
+                getattr(target, "_dsa_elided", False)
+                and index_topk > 0
+                and 0 < context_bound <= index_topk
+            )
+            if not bounded_full_glm:
+                raise ValueError(
+                    "full GLM-5.3 native MTP requires a DSA-elided context "
+                    "bound no larger than index_topk")
+        elif model_type != "glm5_next":
+            raise ValueError(
+                "NativeMTPEngine requires GLM-5.3 or GLM-5.3-Flash")
         self.target = target
         self.decoder = SpeculativeDecoder(
             target, "mtp", k=k, prompt_cache_min_tokens=1)

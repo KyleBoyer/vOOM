@@ -1,0 +1,12 @@
+schema: voom.runtime-profile.v1
+name: glm53-full-lossless-native-mtp3-bounded
+description: Explicit exact native-MTP experiment for full GLM-5.3 below its DSA boundary.
+notes:
+  - "The full checkpoint's released iterative layer-78 MTP block is admitted only when RuntimeConfig.context_bound is positive and no larger than index_topk, and the engine has therefore elided DSA weights/state. Long-context full GLM-5.3 remains fail-closed."
+  - "On the attested uncensored FP8 checkpoint, the 28-input/four-output gate matched every token, the final hidden row, and all 78 compressed-MLA endpoint tensors byte-for-byte."
+  - "The measured zero-acceptance trace regressed wall 362.018 -> 411.465 seconds, increased reads 12.36%, and triggered memory pressure. This profile is a correctness/experimentation route, not a recommended speed profile."
+  - "Keep explicit/default-off. A confidence-gated or otherwise content-independent controller must clear varied prompts, pressure, and the unmodified harness before promotion."
+settings:
+  VMODEL_GLM53_MTP: true
+  VMODEL_GLM53_MTP_DEPTH: 3
+  VMODEL_GLM53_MTP_MAX_PROMPT_TOKENS: 2048

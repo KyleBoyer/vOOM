@@ -150,6 +150,36 @@ def glm5_next_mlp_layer_stationary_tiles(
 
     expert_ids = sorted(global_positions)
     routed = [mx.zeros_like(tile) for tile in hidden_tiles]
+    route_widths = [
+        len(placements)
+        for groups in groups_by_tile
+        for placements in groups.values()
+    ]
+    if coalesced_stats is not None:
+        coalesced_stats["exact_expert_layers"] = int(
+            coalesced_stats.get("exact_expert_layers", 0)) + 1
+        coalesced_stats["exact_expert_tiles"] = int(
+            coalesced_stats.get("exact_expert_tiles", 0)) + len(hidden_tiles)
+        coalesced_stats["exact_expert_swiglu_calls"] = int(
+            coalesced_stats.get("exact_expert_swiglu_calls", 0)
+        ) + len(route_widths)
+        coalesced_stats["exact_expert_rows"] = int(
+            coalesced_stats.get("exact_expert_rows", 0)
+        ) + sum(route_widths)
+        coalesced_stats["exact_expert_max_rows"] = max(
+            int(coalesced_stats.get("exact_expert_max_rows", 0)),
+            max(route_widths, default=0))
+        for label, lower, upper in (
+                ("rows_1", 1, 1), ("rows_2", 2, 2),
+                ("rows_3_4", 3, 4), ("rows_5_8", 5, 8),
+                ("rows_9_16", 9, 16), ("rows_17_32", 17, 32),
+                ("rows_33_plus", 33, None)):
+            matches = sum(
+                width >= lower and (upper is None or width <= upper)
+                for width in route_widths)
+            key = f"exact_expert_{label}_calls"
+            coalesced_stats[key] = int(
+                coalesced_stats.get(key, 0)) + matches
     if coalesced_stats is not None and coalesce_expert_positions:
         route_assignments = sum(
             len(positions) for positions in global_positions.values())
