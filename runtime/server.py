@@ -2181,6 +2181,25 @@ class EngineManager:
         if glm53_layer_stationary_host_spool_request not in ("0", "1"):
             raise RequestValidationError(
                 "VMODEL_GLM53_LAYER_STATIONARY_HOST_SPOOL must be 0 or 1")
+        glm53_layer_stationary_disk_spool_request = os.environ.get(
+            "VMODEL_GLM53_LAYER_STATIONARY_DISK_SPOOL_DIR", "").strip()
+        if glm53_layer_stationary_disk_spool_request:
+            disk_spool_path = Path(
+                glm53_layer_stationary_disk_spool_request).expanduser()
+            if not disk_spool_path.is_absolute():
+                raise RequestValidationError(
+                    "VMODEL_GLM53_LAYER_STATIONARY_DISK_SPOOL_DIR must be "
+                    "an absolute external-volume path under /Volumes")
+            disk_spool_path = disk_spool_path.resolve()
+            if Path("/Volumes") not in disk_spool_path.parents:
+                raise RequestValidationError(
+                    "VMODEL_GLM53_LAYER_STATIONARY_DISK_SPOOL_DIR must be "
+                    "an absolute external-volume path under /Volumes")
+            glm53_layer_stationary_disk_spool_request = str(disk_spool_path)
+            if glm53_layer_stationary_host_spool_request == "1":
+                raise RequestValidationError(
+                    "GLM-5.3 host and disk activation spools are mutually "
+                    "exclusive")
         if (glm53_compiled_kda_prefill_request == "1"
                 and glm53_native_fused_kda_prefill_request == "1"):
             raise RequestValidationError(
@@ -2460,6 +2479,7 @@ class EngineManager:
             glm53_compiled_kda_segment,
             glm53_native_fused_kda_prefill_request,
             glm53_layer_stationary_host_spool_request,
+            glm53_layer_stationary_disk_spool_request,
             glm_dsa_long_context_request,
             glm_dsa_index_preallocate_request,
             glm_dsa_sparse_absorbed_request,
@@ -3018,6 +3038,8 @@ class EngineManager:
                     glm53_native_fused_kda_prefill_request == "1")
                 rc.glm53_layer_stationary_host_spool = (
                     glm53_layer_stationary_host_spool_request == "1")
+                rc.glm53_layer_stationary_disk_spool_dir = (
+                    glm53_layer_stationary_disk_spool_request)
                 # Exact request-to-request prefix reuse is deliberately
                 # opt-in until it clears the heterogeneous real-request
                 # corpus.  GLM-5.3's layer-stationary prefill uses a fixed
@@ -3185,6 +3207,8 @@ class EngineManager:
                         glm_dsa_mla_kv_spill_request)
                     rc.glm53_layer_stationary_host_spool = (
                         glm53_layer_stationary_host_spool_request == "1")
+                    rc.glm53_layer_stationary_disk_spool_dir = (
+                        glm53_layer_stationary_disk_spool_request)
             elif mtype == "kimi_k25":
                 # 2026-07-19: K2.5's vocab_size (163840) x hidden_size (7168)
                 # combination makes its untied lm_head unusually large
@@ -9712,6 +9736,13 @@ def _vision_protocol_timing(result: dict) -> dict:
         "glm53_layer_stationary_host_spool_h2d_bytes",
         "glm53_layer_stationary_host_spool_d2h_bytes",
         "glm53_layer_stationary_host_spool_peak_host_bytes",
+        "glm53_layer_stationary_disk_spool",
+        "glm53_layer_stationary_disk_spool_logical_bytes",
+        "glm53_layer_stationary_disk_spool_bytes_written",
+        "glm53_layer_stationary_disk_spool_bytes_read",
+        "glm53_layer_stationary_disk_spool_write_calls",
+        "glm53_layer_stationary_disk_spool_read_calls",
+        "glm53_layer_stationary_disk_spool_uncached_descriptors",
         "glm53_layer_stationary_memory_samples",
         "glm53_layer_stationary_peak_metal_bytes",
         "glm53_layer_stationary_initial_carrier_active_peak_bytes",
@@ -10232,6 +10263,8 @@ def _vision_protocol_timing(result: dict) -> dict:
         "glm53_layer_stationary_mlp_s",
         "glm53_layer_stationary_ffn_hc_post_s",
         "glm53_layer_stationary_host_spool_copy_s",
+        "glm53_layer_stationary_disk_spool_write_s",
+        "glm53_layer_stationary_disk_spool_read_s",
         "glm53_layer_stationary_transient_reservation_s",
         "dsa_selection_spill_write_s",
         "dsa_selection_spill_read_s",

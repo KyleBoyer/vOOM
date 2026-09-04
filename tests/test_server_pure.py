@@ -215,6 +215,15 @@ def test_protocol_timing_exposes_glm53_phase_active_peaks():
         "glm53_layer_stationary_host_spool_d2h_bytes": 107,
         "glm53_layer_stationary_host_spool_peak_host_bytes": 108,
         "glm53_layer_stationary_host_spool_copy_s": 1.25,
+        "glm53_layer_stationary_disk_spool": 1,
+        "glm53_layer_stationary_disk_spool_logical_bytes": 112,
+        "glm53_layer_stationary_disk_spool_bytes_written": 113,
+        "glm53_layer_stationary_disk_spool_bytes_read": 114,
+        "glm53_layer_stationary_disk_spool_write_calls": 115,
+        "glm53_layer_stationary_disk_spool_read_calls": 116,
+        "glm53_layer_stationary_disk_spool_uncached_descriptors": 1,
+        "glm53_layer_stationary_disk_spool_write_s": 2.25,
+        "glm53_layer_stationary_disk_spool_read_s": 3.,
         "glm53_layer_stationary_transient_reservation_calls": 109,
         "glm53_layer_stationary_transient_reservation_bytes": 110,
         "glm53_layer_stationary_transient_reservation_margin_bytes": 111,
@@ -3089,6 +3098,7 @@ def test_glm53_sparse_absorbed_mla_is_explicit_and_in_engine_identity():
         "VMODEL_GLM53_COMPILED_KDA_SEGMENT": "32",
         "VMODEL_GLM53_NATIVE_FUSED_KDA_PREFILL": "0",
         "VMODEL_GLM53_LAYER_STATIONARY_HOST_SPOOL": "0",
+        "VMODEL_GLM53_LAYER_STATIONARY_DISK_SPOOL_DIR": "",
     }
     with patch.dict("os.environ", settings, clear=False), \
          patch("runtime.config.ModelConfig.from_dir", return_value=cfg), \
@@ -3119,8 +3129,12 @@ def test_glm53_sparse_absorbed_mla_is_explicit_and_in_engine_identity():
         manager.get(Path("/tmp/fake-glm53-sparse-absorbed"), "lossless")
         os.environ["VMODEL_GLM53_LAYER_STATIONARY_HOST_SPOOL"] = "1"
         manager.get(Path("/tmp/fake-glm53-sparse-absorbed"), "lossless")
+        os.environ["VMODEL_GLM53_LAYER_STATIONARY_HOST_SPOOL"] = "0"
+        os.environ["VMODEL_GLM53_LAYER_STATIONARY_DISK_SPOOL_DIR"] = (
+            "/Volumes/Test/glm53-activation-spool")
+        manager.get(Path("/tmp/fake-glm53-sparse-absorbed"), "lossless")
 
-    assert len(captured) == 11
+    assert len(captured) == 12
     assert captured[0].glm53_sparse_absorbed_mla is False
     assert captured[1].glm53_sparse_absorbed_mla is True
     assert captured[2].glm53_sparse_absorbed_mla is False
@@ -3148,6 +3162,10 @@ def test_glm53_sparse_absorbed_mla_is_explicit_and_in_engine_identity():
     assert captured[9].glm53_layer_stationary_host_spool is False
     assert captured[10].glm53_native_fused_kda_prefill is True
     assert captured[10].glm53_layer_stationary_host_spool is True
+    assert captured[10].glm53_layer_stationary_disk_spool_dir == ""
+    assert captured[11].glm53_layer_stationary_host_spool is False
+    assert captured[11].glm53_layer_stationary_disk_spool_dir == (
+        "/Volumes/Test/glm53-activation-spool")
 
 
 def test_glm53_sparse_attention_candidates_are_mutually_exclusive():
@@ -3234,6 +3252,34 @@ def test_glm53_layer_stationary_host_spool_rejects_untyped_env():
         "VMODEL_GLM53_LAYER_STATIONARY_HOST_SPOOL": "auto",
     }, clear=False):
         with pytest.raises(RequestValidationError, match="must be 0 or 1"):
+            EngineManager().get(Path("/tmp/unused-glm53"), "lossless")
+
+
+@pytest.mark.parametrize("value", ["relative/path", "/tmp/internal-spool"])
+def test_glm53_layer_stationary_disk_spool_requires_external_path(value):
+    from unittest.mock import patch
+
+    from runtime.server import EngineManager, RequestValidationError
+
+    with patch.dict("os.environ", {
+        "VMODEL_GLM53_LAYER_STATIONARY_HOST_SPOOL": "0",
+        "VMODEL_GLM53_LAYER_STATIONARY_DISK_SPOOL_DIR": value,
+    }, clear=False):
+        with pytest.raises(RequestValidationError, match="external-volume"):
+            EngineManager().get(Path("/tmp/unused-glm53"), "lossless")
+
+
+def test_glm53_layer_stationary_spools_are_mutually_exclusive():
+    from unittest.mock import patch
+
+    from runtime.server import EngineManager, RequestValidationError
+
+    with patch.dict("os.environ", {
+        "VMODEL_GLM53_LAYER_STATIONARY_HOST_SPOOL": "1",
+        "VMODEL_GLM53_LAYER_STATIONARY_DISK_SPOOL_DIR": (
+            "/Volumes/Test/glm53-activation-spool"),
+    }, clear=False):
+        with pytest.raises(RequestValidationError, match="mutually exclusive"):
             EngineManager().get(Path("/tmp/unused-glm53"), "lossless")
 
 

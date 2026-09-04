@@ -431,6 +431,29 @@ def test_builtin_profiles_resolve_complete_agent_group():
     assert glm_striped_long_settings[
         "VMODEL_GLM53_NATIVE_FUSED_KDA_PREFILL"] == "1"
 
+    glm_disk_spool_order, glm_disk_spool_settings = (
+        resolve_runtime_profiles((
+            "glm53-flash-lossless-striped-kda-disk-spool-long-context",
+        ), catalog))
+    assert glm_disk_spool_order[-2:] == (
+        "glm53-flash-lossless-striped-kda-long-context",
+        "glm53-flash-lossless-striped-kda-disk-spool-long-context",
+    )
+    assert glm_disk_spool_settings[
+        "VMODEL_GLM53_LAYER_STATIONARY_HOST_SPOOL"] == "0"
+    assert glm_disk_spool_settings[
+        "VMODEL_GLM53_LAYER_STATIONARY_DISK_SPOOL_DIR"] == (
+            "/Volumes/Workspace NVME/vmodel-spill/glm53-flash-activations")
+    assert glm_disk_spool_settings[
+        "VMODEL_GLM53_NATIVE_FUSED_KDA_PREFILL"] == "1"
+    assert glm_disk_spool_settings[
+        "VMODEL_GLM53_COMPILED_KDA_PREFILL"] == "0"
+    for lossy_setting in (
+            "VMODEL_GLM53_SPARSE_FUSED_ATTENTION",
+            "VMODEL_GLM53_SPARSE_FUSED_KV_INT8",
+            "VMODEL_GLM53_COALESCED_EXPERT_POSITIONS"):
+        assert lossy_setting not in glm_disk_spool_settings
+
     glm_isolated_kda_order, glm_isolated_kda_settings = (
         resolve_runtime_profiles(
             ("glm53-flash-lossy-native-kda-isolated",), catalog))

@@ -1,0 +1,13 @@
+schema: voom.runtime-profile.v1
+name: glm53-flash-lossless-striped-kda-disk-spool-long-context
+description: Exact SIMD-striped GLM-5.3-Flash KDA with an uncached NVMe activation carrier.
+notes:
+  - "Extends the exact long-context striped-KDA route and moves only the prompt-wide four-stream BF16 carrier to a temporary raw-bit file on Workspace NVMe between bounded tile operations."
+  - "The descriptor requests Darwin F_NOCACHE, the file is pre-sized and reused in place, and it is deleted after each sweep. There is no floating-point conversion, quantization, pruning, or changed model arithmetic."
+  - "The real four-output checkpoint gate matched tokens/text, aggregate and component state, all 159 endpoint tensor hashes, and the exact 178.250GB model-read witness. Its 0.918MB carrier requested F_NOCACHE and performed the expected 91 writes/136 reads."
+  - "The short gate lowered peak Metal 2.887GB to 2.631GB but regressed total time 124.483s to 156.625s, so this remains an explicit long-context capacity experiment and must never replace the short/medium profile automatically. Captured-request pressure and timing remain pending."
+extends:
+  - glm53-flash-lossless-striped-kda-long-context
+settings:
+  VMODEL_GLM53_LAYER_STATIONARY_HOST_SPOOL: false
+  VMODEL_GLM53_LAYER_STATIONARY_DISK_SPOOL_DIR: "/Volumes/Workspace NVME/vmodel-spill/glm53-flash-activations"

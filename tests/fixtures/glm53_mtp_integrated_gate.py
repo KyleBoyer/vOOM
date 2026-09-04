@@ -271,6 +271,26 @@ def main() -> None:
                     "expert_batch_prefetch_wait_s", 0.0),
                 "expert_batch_prefetch_hidden_s": stats.get(
                     "expert_batch_prefetch_hidden_s", 0.0),
+                "glm53_layer_stationary_disk_spool": stats.get(
+                    "glm53_layer_stationary_disk_spool", 0),
+                "glm53_layer_stationary_disk_spool_logical_bytes": stats.get(
+                    "glm53_layer_stationary_disk_spool_logical_bytes", 0),
+                "glm53_layer_stationary_disk_spool_bytes_written": stats.get(
+                    "glm53_layer_stationary_disk_spool_bytes_written", 0),
+                "glm53_layer_stationary_disk_spool_bytes_read": stats.get(
+                    "glm53_layer_stationary_disk_spool_bytes_read", 0),
+                "glm53_layer_stationary_disk_spool_write_calls": stats.get(
+                    "glm53_layer_stationary_disk_spool_write_calls", 0),
+                "glm53_layer_stationary_disk_spool_read_calls": stats.get(
+                    "glm53_layer_stationary_disk_spool_read_calls", 0),
+                "glm53_layer_stationary_disk_spool_write_s": stats.get(
+                    "glm53_layer_stationary_disk_spool_write_s", 0.0),
+                "glm53_layer_stationary_disk_spool_read_s": stats.get(
+                    "glm53_layer_stationary_disk_spool_read_s", 0.0),
+                "glm53_layer_stationary_disk_spool_uncached_descriptors": (
+                    stats.get(
+                        "glm53_layer_stationary_disk_spool_uncached_descriptors",
+                        0)),
                 "direct_io_fd_cache_enabled": stats.get(
                     "direct_io_fd_cache_enabled", 0),
                 "direct_io_fd_opens": stats.get("direct_io_fd_opens", 0),

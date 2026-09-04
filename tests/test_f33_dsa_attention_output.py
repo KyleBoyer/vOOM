@@ -89,9 +89,9 @@ INDEXER_WEIGHT_NAMES = [
 ]
 
 
-@pytest.mark.parametrize("host_spool", [False, True])
+@pytest.mark.parametrize("spool_mode", ["none", "host", "disk"])
 def test_glm_layer_stationary_scheduler_preselects_before_attention(
-        monkeypatch, host_spool):
+        monkeypatch, tmp_path, spool_mode):
     """Guard the engine integration, not only DSAState's isolated helper."""
     from runtime.engine import StreamingEngine
     import runtime.glm as glm_mod
@@ -143,7 +143,10 @@ def test_glm_layer_stationary_scheduler_preselects_before_attention(
         glm_dsa_mla_kv_spill_dir="",
         glm_dsa_dense_mlp_tile_size=4,
         glm_dsa_index_preallocate=False,
-        glm53_layer_stationary_host_spool=host_spool,
+        glm53_layer_stationary_host_spool=spool_mode == "host",
+        glm53_layer_stationary_disk_spool_dir=(
+            str(tmp_path / "activation-spool")
+            if spool_mode == "disk" else ""),
         metal_limit_mb=8500,
     )
     engine.prefetcher = None
@@ -166,19 +169,30 @@ def test_glm_layer_stationary_scheduler_preselects_before_attention(
     kv = SimpleNamespace(dsa=FakeDSA(), latent_spill_enabled=False)
     x = mx.zeros(
         (1, 6, 3),
-        dtype=mx.bfloat16 if host_spool else mx.float32)
+        dtype=mx.bfloat16 if spool_mode != "none" else mx.float32)
     out = engine._layer_stationary_glm_sweep(
         x, kv, offset=7, tile_width=2)
     mx.eval(out)
 
-    if host_spool:
+    if spool_mode != "none":
         assert np.array_equal(
             np.asarray(out.view(mx.uint16)),
             np.zeros((1, 6, 3), dtype=np.uint16))
         stats = engine._glm53_layer_stationary_stats
-        assert stats["host_spool"] == 1
-        assert stats["host_spool_h2d_bytes"] > 0
-        assert stats["host_spool_d2h_bytes"] > 0
+        if spool_mode == "host":
+            assert stats["host_spool"] == 1
+            assert stats["host_spool_h2d_bytes"] > 0
+            assert stats["host_spool_d2h_bytes"] > 0
+            assert stats["disk_spool"] == 0
+        else:
+            assert stats["host_spool"] == 0
+            assert stats["disk_spool"] == 1
+            assert stats["disk_spool_logical_bytes"] == 36
+            assert stats["disk_spool_bytes_written"] == 36
+            assert stats["disk_spool_bytes_read"] == 36
+            assert stats["disk_spool_write_calls"] == 1
+            assert stats["disk_spool_read_calls"] == 1
+            assert not list((tmp_path / "activation-spool").iterdir())
 
     assert events == [
         ("preselect", 0, 6, 7, 2),
@@ -235,6 +249,7 @@ def test_glm_layer_stationary_reuses_proven_signature_without_extra_margin(
         glm_dsa_dense_mlp_tile_size=0,
         glm_dsa_index_preallocate=False,
         glm53_layer_stationary_host_spool=False,
+        glm53_layer_stationary_disk_spool_dir="",
         metal_limit_mb=8500,
     )
     engine.prefetcher = None

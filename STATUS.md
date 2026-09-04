@@ -1,5 +1,28 @@
 # STATUS — 2026-09-04 (current corrections first; dated chronology below is history)
 
+## 2026-09-04: exact F_NOCACHE activation carrier passes the real GLM-5.3-Flash state gate
+
+The long-context GLM-5.3-Flash bottleneck was isolated to simultaneous Metal
+residency of the four-stream mHC carrier and incremental expanded BF16 DSA K/V.
+An explicit/default-off activation spool now stores the carrier's raw uint16
+payload in one pre-sized temporary Workspace-NVMe file and requests Darwin
+`F_NOCACHE`; it restores BF16 by bit view, not numeric conversion, and removes
+the file after the sweep. Unit coverage round-trips every possible 16-bit
+payload as both FP16 and BF16 and exercises the full-GLM scheduler integration.
+
+The real GLM-5.3-Flash four-output gate matched tokens/text, aggregate state,
+all five component hashes, **all 159 endpoint tensor hashes**, and the exact
+178.250GB model-read witness against the non-spooled striped-KDA control. The
+0.918MB carrier performed exactly 91 writes and 136 reads, and telemetry
+confirmed `F_NOCACHE` on the descriptor. Peak Metal fell **2.887 -> 2.631GB
+(-8.86%)**, but the repeated synchronization/copy boundary increased total
+time **124.483 -> 156.625s (+25.82%)**; actual spool I/O was only 0.043s. This
+therefore remains a long-context capacity lever, not a short/medium latency
+default. The untouched 46,849-token pressure/timing gate remains pending.
+
+Evidence: `logs/glm53_flash_exact_striped_disk_spool_state4_20260904.json` and
+`logs/preflight_glm53_flash_exact_disk_spool_state4_retry_20260904.json`.
+
 ## 2026-09-04: exact SIMD recurrence cuts real Qwen prefill 39%; GLM KDA is exact too
 
 MLX 0.32's strided K-axis reduction was transcribed into a one-dispatch Metal
