@@ -30,6 +30,15 @@ so `glm53-flash-e-compact-mla-tile128-workers2` remains explicit/E-class until
 multi-token state, semantic retrieval, varied tool shapes, and untouched Plex
 gates clear it.
 
+The next semantic-output gate cleared one of those requirements. With the same
+2,123-token archive and a real 32-token greedy budget, the profile recovered
+both canaries placed at 13% and 73% depth, began with the exact required pair,
+emitted the `VALIDATION` marker, and continued through three consecutive
+integers. Wall was **784.748s** (256.301s first token, 525.620s decode), peak
+Metal 3.076GB, physical swap-out growth 42.500MB, and there was no retry. This
+is a genuine multi-token retrieval pass, not a first-token proxy; real
+multi-turn Plex/tool behavior remains the next quality gate.
+
 The stricter raw-BF16 host-expanded full 46,849-token run was stopped after
 13m15s on the first sparse layer when macOS expanded swap to 6GB, server CPU
 fell to 6%, and internal free space approached the mandatory 10GiB reserve.
@@ -42,7 +51,8 @@ traffic and is not a credible speed path without a fused/absorbed formulation.
 Evidence:
 `logs/glm53_flash_e_compact_mla_tile64_long2123_20260904.json`,
 `logs/glm53_flash_e_compact_mla_tile128_long2123_20260904.json`,
-`logs/glm53_flash_e_compact_mla_tile128_workers2_long2123_20260904.json`, and
+`logs/glm53_flash_e_compact_mla_tile128_workers2_long2123_20260904.json`,
+`logs/glm53_flash_e_compact_mla_tile128_workers2_semantic32_20260904.json`, and
 `logs/glm53_flash_exact_host_kv_prefetch_actual_server_20260904.log`.
 
 ## 2026-09-04: exact F_NOCACHE activation carrier passes the real GLM-5.3-Flash state gate
