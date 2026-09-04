@@ -613,7 +613,7 @@ def test_qwen4_virtual_fast_tier_can_be_disabled_for_prefill(tmp_path):
     build_qwen4_fast_tier(root, fast_root, max_bytes=2_000_000 + 72)
     store = WeightStore(
         root, fast_dirs=[fast_root], parallel_storage_reads=True)
-    store.qwen4_virtual_fast_tier_enabled = False
+    store.raw_fast_tier_enabled = False
     names = [
         f"model.layers.0.mlp.experts.0.{projection}.weight"
         for projection in ("gate_proj", "up_proj", "down_proj")
@@ -630,5 +630,34 @@ def test_qwen4_virtual_fast_tier_can_be_disabled_for_prefill(tmp_path):
     assert nbytes == 72
     assert store.fast_tier_bytes == 0
     assert store.archive_bytes == 72
+    assert store.parallel_tier_snapshot()[0] == 0
+    store.close()
+
+
+def test_qwen4_per_expert_fp8_fast_tier_can_be_disabled_for_prefill(
+        tmp_path):
+    """The uncensored FP8 conversion uses real tensors, not virtual rows."""
+    from formats.qwen4_fast_tier import build_qwen4_fast_tier
+
+    root, expected = _per_expert_fp8_fixture(tmp_path)
+    fast_root = tmp_path / "fast"
+    report = build_qwen4_fast_tier(
+        root, fast_root, max_bytes=2_000_000 + 72)
+    assert report["selected_experts"] == 1
+    store = WeightStore(
+        root, fast_dirs=[fast_root], parallel_storage_reads=True)
+    store.raw_fast_tier_enabled = False
+    names = [
+        f"model.layers.0.mlp.experts.0.{projection}.weight"
+        for projection in ("gate_proj", "up_proj", "down_proj")
+    ]
+
+    values, _seconds, nbytes = store.fetch(names)
+
+    for name in names:
+        assert tuple(values[name].shape) == tuple(expected[name].shape)
+    assert nbytes == sum(expected[name].size + 4 for name in names)
+    assert store.fast_tier_bytes == 0
+    assert store.archive_bytes == nbytes
     assert store.parallel_tier_snapshot()[0] == 0
     store.close()

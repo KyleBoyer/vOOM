@@ -123,7 +123,12 @@ def _service_rates(documents: list[dict]) -> tuple[float, float] | None:
     return fast_bytes * 1e9 / fast_ns, archive_bytes * 1e9 / archive_ns
 
 
-def plan(fast_dir: Path, trace_paths: list[Path]) -> dict:
+def plan(
+    fast_dir: Path,
+    trace_paths: list[Path],
+    *,
+    evaluated_selected_experts: int = 0,
+) -> dict:
     fast_dir = fast_dir.expanduser().resolve()
     trace_paths = [path.expanduser().resolve() for path in trace_paths]
     if len(trace_paths) < 2:
@@ -138,6 +143,12 @@ def plan(fast_dir: Path, trace_paths: list[Path]) -> dict:
     current, capacity = _selected_pairs(manifest)
     layers = int(binding["layers"])
     experts = int(binding["experts"])
+    evaluated_selected_experts = int(evaluated_selected_experts)
+    if evaluated_selected_experts == 0:
+        evaluated_selected_experts = capacity["selected_experts"]
+    if not 1 <= evaluated_selected_experts <= layers * experts:
+        raise ValueError(
+            "evaluated selected experts must be in [1, layers * experts]")
     model_name = str(binding["target_model"])
     if capacity["storage_expert_bytes"] * capacity["selected_experts"] != int(
             binding["selected_bytes"]):
@@ -156,7 +167,9 @@ def plan(fast_dir: Path, trace_paths: list[Path]) -> dict:
 
     current_stats = [_route_stats(current, document) for document in documents]
     fixed: list[tuple[int, int] | None] = []
-    for document, stats in zip(documents, current_stats, strict=True):
+    incompatible_calibration_traces = []
+    for path, document, stats in zip(
+            trace_paths, documents, current_stats, strict=True):
         io = document.get("baseline_io") or {}
         if min(
             int(io.get("parallel_tier_fast_bytes", 0)),
@@ -171,19 +184,25 @@ def plan(fast_dir: Path, trace_paths: list[Path]) -> dict:
         fixed_fast = int(io["parallel_tier_fast_bytes"]) - hit_bytes
         fixed_archive = int(io["parallel_tier_archive_bytes"]) - miss_bytes
         if min(fixed_fast, fixed_archive) < 0:
-            raise ValueError("trace counters cannot calibrate fixed I/O")
+            # A route trace remains valid for placement scoring after the
+            # active tier changes, but its measured fast/archive byte split
+            # belongs to the older placement. Refuse only that timing
+            # calibration rather than inventing negative fixed traffic.
+            fixed.append(None)
+            incompatible_calibration_traces.append(path.name)
+            continue
         fixed.append((fixed_fast, fixed_archive))
 
     maximum_hot = min(
         experts,
-        (capacity["selected_experts"] + layers - 1) // layers,
+        (evaluated_selected_experts + layers - 1) // layers,
     )
     ladder = []
     for hot in [0, *range(1, maximum_hot + 1)]:
         selected = _candidate_pairs(
             rankings, layers=layers, experts=experts,
             storage_expert_bytes=capacity["storage_expert_bytes"],
-            selected_experts=capacity["selected_experts"], hot=hot)
+            selected_experts=evaluated_selected_experts, hot=hot)
         request_rows = []
         calibrated_seconds = []
         for path, document, fixed_io in zip(
@@ -247,7 +266,7 @@ def plan(fast_dir: Path, trace_paths: list[Path]) -> dict:
             selected = _candidate_pairs(
                 held_rankings, layers=layers, experts=experts,
                 storage_expert_bytes=capacity["storage_expert_bytes"],
-                selected_experts=capacity["selected_experts"],
+                selected_experts=evaluated_selected_experts,
                 hot=recommended_hot)
             leave_one_out.append({
                 "held_out_trace": held_path.name,
@@ -264,10 +283,14 @@ def plan(fast_dir: Path, trace_paths: list[Path]) -> dict:
         "layers": layers,
         "experts": experts,
         **capacity,
+        "evaluated_selected_experts": evaluated_selected_experts,
+        "evaluated_selected_bytes": (
+            evaluated_selected_experts * capacity["storage_expert_bytes"]),
         "trace_expert_page_bytes": trace_expert_page_bytes,
         "measured_service_bytes_per_second": (
             {"fast": rates[0], "archive": rates[1]} if rates else None
         ),
+        "incompatible_calibration_traces": incompatible_calibration_traces,
         "ranking": ranking_metadata,
         "current": {
             "trace_hot_experts_per_layer": binding.get(
@@ -287,9 +310,16 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("fast_dir", type=Path)
     parser.add_argument("--trace", action="append", type=Path, required=True)
+    parser.add_argument(
+        "--evaluated-selected-experts", type=int, default=0,
+        help=("score a different complete-expert capacity while calibrating "
+              "fixed I/O from the active tier; zero keeps active capacity"),
+    )
     parser.add_argument("--result", type=Path)
     args = parser.parse_args()
-    result = plan(args.fast_dir, args.trace)
+    result = plan(
+        args.fast_dir, args.trace,
+        evaluated_selected_experts=args.evaluated_selected_experts)
     if args.result:
         _atomic_json(args.result, result)
     print(json.dumps(result, indent=2, sort_keys=True))

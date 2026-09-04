@@ -213,11 +213,13 @@ class WeightStore:
         self.fast_tier_tensors = 0
         self.archive_bytes = 0
         self.parallel_storage_reads = bool(parallel_storage_reads)
-        # Engine phase hint for Qwen4's exact virtual expert overlay. The
-        # released archive remains authoritative when false; decode-only tier
-        # profiles use this to avoid a second device/page-cache stream during
-        # the already memory-dominant long prefill, then restore it for decode.
-        self.qwen4_virtual_fast_tier_enabled = True
+        # Engine phase hint for exact raw-safetensors overlays.  The released
+        # archive remains authoritative when false; decode-only tier profiles
+        # use this to avoid a second device/page-cache stream during the
+        # already memory-dominant long prefill, then restore it for decode.
+        # This must gate BOTH Qwen4's released fused-BF16 virtual rows and the
+        # ordinary raw-tensor path used by per-expert FP8 conversions.
+        self.raw_fast_tier_enabled = True
         self.parallel_tier_fetches = 0
         self.parallel_tier_fast_bytes = 0
         self.parallel_tier_archive_bytes = 0
@@ -2721,7 +2723,7 @@ class WeightStore:
         self._ensure_raw_fast_tier_loaded()
         fast_names = [
             name for name in names
-            if self.qwen4_virtual_fast_tier_enabled
+            if self.raw_fast_tier_enabled
             and name in (self._raw_fast_tier_manifest or {})
         ]
         fast_set = set(fast_names)
@@ -3081,7 +3083,8 @@ class WeightStore:
         self._ensure_raw_fast_tier_loaded()
         fast_names = [
             n for n in source_physical_names
-            if (n in self._raw_fast_tier_manifest
+            if (self.raw_fast_tier_enabled
+                and n in self._raw_fast_tier_manifest
                 and n not in self._mtp_proposal_plain_names
                 and (
                     n not in self._mtplx_mtp_sidecar_names

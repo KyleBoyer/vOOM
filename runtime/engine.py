@@ -6911,13 +6911,13 @@ class StreamingEngine:
             expert_ids = sorted(global_positions)
 
             def archive_only_prefill_batches():
-                prior = self.store.qwen4_virtual_fast_tier_enabled
-                self.store.qwen4_virtual_fast_tier_enabled = False
+                prior = self.store.raw_fast_tier_enabled
+                self.store.raw_fast_tier_enabled = False
                 try:
                     yield from self._iter_expert_batches(
                         i, expert_ids, positions=global_positions)
                 finally:
-                    self.store.qwen4_virtual_fast_tier_enabled = prior
+                    self.store.raw_fast_tier_enabled = prior
 
             batches = (
                 archive_only_prefill_batches()

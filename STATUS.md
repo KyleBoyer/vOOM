@@ -1,5 +1,52 @@
 # STATUS — 2026-09-04 (current corrections first; dated chronology below is history)
 
+## 2026-09-04: Qwen fast-tier capacity cliff measured; safe tier restored
+
+The MLX-free Qwen placement planner can now score a prospective complete-expert
+capacity without first building it. It preserves the active manifest as the
+source-byte oracle, reports the evaluated expert/byte capacity separately, and
+refuses stale fast/archive timing calibration when a trace's byte split cannot
+belong to the active placement. Route coverage remains usable in that case;
+the planner does not invent negative fixed traffic. A six-rung, three-request
+ladder measured 4,170/4,600/5,000/5,400/5,800/6,306 complete experts. Mean
+corpus coverage rose 79.32/82.31/84.78/86.96/88.88/91.00%, and worst
+leave-one-request-out coverage rose 69.48/72.48/75.04/77.49/79.45/81.98%.
+
+The largest 30.999GB rung passed a full 37,836-tensor byte comparison and
+preserved the exact 32-token Plex prefix plus 20/34 MTP acceptance. Against the
+20.499GB direct-QMV result it improved wall **276.138 -> 261.295s (-5.37%)**,
+prefill 161.754 -> 155.865s, and decode **99.670 -> 90.401s**, moving 17.323GB
+more traffic to the internal device. It is rejected because the run grew
+swap-out by 356.205MB. Applying Darwin `F_NOCACHE` to all 5,142 model
+descriptors reduced growth to 104.972MB but slowed wall to 265.438s, so that
+policy is also rejected.
+
+Instrumentation then exposed a real phase-control bug: the reported
+`VMODEL_QWEN4_FAST_TIER_DECODE_ONLY=1` gated only fused-BF16 virtual rows, while
+the uncensored checkpoint's ordinary per-expert FP8 tensors still read the
+internal tier. The shared raw-tier boundary now obeys the phase gate for both
+layouts, with separate regression tests. On the corrected real replay,
+prefill parallel fast-tier bytes fell **30.724GB -> 0** and output/MTP counters
+remained exact, but wall regressed to 288.601s and swap-out still grew 112.820MB;
+the temporary profile was removed.
+
+A conservative 22.613GB / 4,600-expert rung also passed all 27,600 source-byte
+checks and exact output identity. It improved wall only **276.138 -> 275.580s
+(-0.20%)** while swap-out grew 33.538MB, above the 16MB gate. It was deleted
+without backup. The established 20.499GB / 4,170-expert tier has been rebuilt
+at the same path and revalidated over all 25,020 tensors; total internal tiers
+are 62.499GB and root free space is about 22.5GB. Thus 20.499GB remains the
+recommended explicit lossless placement on this 16GB machine; the larger
+rungs are useful evidence, not promoted defaults.
+
+Evidence:
+`logs/qwen_uncensored_fp8_fast_tier_capacity_{4170,4600,5000,5400,5800,6306}_plan_20260904.json`,
+`logs/qwen_uncensored_fp8_fast_tier_31gb_{validation,direct_qmv_plex_max32}_20260904.json`,
+`logs/qwen_uncensored_fp8_fast_tier_31gb_direct_qmv_{nocache,decode_only_tier}_plex_max32_20260904.json`,
+`logs/qwen_uncensored_fp8_fast_tier_31gb_decode_only_fixed_plex_max32_20260904.json`,
+`logs/qwen_uncensored_fp8_fast_tier_22gb_{validation,direct_qmv_plex_max32}_20260904.json`,
+and `logs/qwen_uncensored_fp8_fast_tier_20gb_restore_validation_20260904.json`.
+
 ## 2026-09-04: exact two-row FP8 QMV improves Qwen and full GLM decode
 
 The packed fine-grained-FP8 singleton kernel now maps two output rows to each
