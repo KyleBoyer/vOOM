@@ -7328,6 +7328,12 @@ class StreamingEngine:
         spool_peak_host_bytes = 0
         memory_samples = 0
         memory_peak = 0
+        transient_reservation_calls = 0
+        transient_reservation_bytes = 0
+        transient_reservation_margin_bytes = 0
+        transient_reservation_s = 0.0
+        transient_reservation_first_margin_calls = 0
+        transient_reservation_recurring_calls = 0
         memory_phase_active = {
             "initial_carrier": 0,
             "attention": 0,
@@ -7512,10 +7518,41 @@ class StreamingEngine:
             while pos < total:
                 end = min(pos + tile_width, total)
                 if self.governor is not None and self._layer_transient:
-                    self.governor.reserve(
-                        self._layer_transient,
-                        margin=self._layer_transient_margin,
-                        reason="glm53-full-attention-transient")
+                    signature = self._transient_layer_signature(i)
+                    observations = int(getattr(
+                        self, "_layer_transient_observation_counts", {}
+                    ).get((total, signature), 0))
+                    reserve_margin = (
+                        _recurring_layer_transient_reserve_margin(
+                            total, observations))
+                    reservation_t0 = time.perf_counter()
+                    transient_reservation_calls += 1
+                    transient_reservation_bytes += int(self._layer_transient)
+                    transient_reservation_margin_bytes += int(reserve_margin)
+                    transient_reservation_first_margin_calls += int(
+                        reserve_margin > 0)
+                    transient_reservation_recurring_calls += int(
+                        reserve_margin == 0)
+                    try:
+                        self.governor.reserve(
+                            self._layer_transient,
+                            margin=reserve_margin,
+                            reason="glm53-full-attention-transient")
+                    except MemoryError:
+                        print(
+                            "[glm53-full-prefill-admission] "
+                            f"layer={i} signature={signature} "
+                            f"tile={end - pos} position={pos}/{total} "
+                            f"active={int(mx.get_active_memory())} "
+                            f"scratch={int(self._layer_transient)} "
+                            f"observations={observations} "
+                            f"margin={int(reserve_margin)}",
+                            flush=True,
+                        )
+                        raise
+                    finally:
+                        transient_reservation_s += (
+                            time.perf_counter() - reservation_t0)
                 xt = x[:, pos:end, :]
                 attention_t0 = time.perf_counter()
                 yt = _glm_attention_residual(
@@ -7646,6 +7683,25 @@ class StreamingEngine:
             "sweep_positions": int(previous_stats.get(
                 "sweep_positions", 0)) + total,
             "sweeps": int(previous_stats.get("sweeps", 0)) + 1,
+            "transient_reservation_calls": int(previous_stats.get(
+                "transient_reservation_calls", 0)
+                ) + transient_reservation_calls,
+            "transient_reservation_bytes": int(previous_stats.get(
+                "transient_reservation_bytes", 0)
+                ) + transient_reservation_bytes,
+            "transient_reservation_margin_bytes": int(previous_stats.get(
+                "transient_reservation_margin_bytes", 0)
+                ) + transient_reservation_margin_bytes,
+            "transient_reservation_s": float(previous_stats.get(
+                "transient_reservation_s", 0.0)
+                ) + transient_reservation_s,
+            "transient_reservation_first_margin_calls": int(
+                previous_stats.get(
+                    "transient_reservation_first_margin_calls", 0)
+                ) + transient_reservation_first_margin_calls,
+            "transient_reservation_recurring_calls": int(previous_stats.get(
+                "transient_reservation_recurring_calls", 0)
+                ) + transient_reservation_recurring_calls,
             "host_spool": int(host_spool),
             "host_spool_h2d_bytes": int(previous_stats.get(
                 "host_spool_h2d_bytes", 0)) + spool_h2d_bytes,
@@ -12852,6 +12908,18 @@ class StreamingEngine:
                 glm53_memory.get("sweep_positions", 0))
             path_stats["glm53_layer_stationary_sweeps"] = int(
                 glm53_memory.get("sweeps", 0))
+            for metric in (
+                    "transient_reservation_calls",
+                    "transient_reservation_bytes",
+                    "transient_reservation_margin_bytes",
+                    "transient_reservation_first_margin_calls",
+                    "transient_reservation_recurring_calls"):
+                path_stats[f"glm53_layer_stationary_{metric}"] = int(
+                    glm53_memory.get(metric, 0))
+            path_stats[
+                "glm53_layer_stationary_transient_reservation_s"
+            ] = float(glm53_memory.get(
+                "transient_reservation_s", 0.0))
             for metric in (
                     "host_spool_h2d_bytes", "host_spool_d2h_bytes",
                     "host_spool_peak_host_bytes"):

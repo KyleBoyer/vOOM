@@ -215,6 +215,12 @@ def test_protocol_timing_exposes_glm53_phase_active_peaks():
         "glm53_layer_stationary_host_spool_d2h_bytes": 107,
         "glm53_layer_stationary_host_spool_peak_host_bytes": 108,
         "glm53_layer_stationary_host_spool_copy_s": 1.25,
+        "glm53_layer_stationary_transient_reservation_calls": 109,
+        "glm53_layer_stationary_transient_reservation_bytes": 110,
+        "glm53_layer_stationary_transient_reservation_margin_bytes": 111,
+        "glm53_layer_stationary_transient_reservation_s": 1.5,
+        "glm53_layer_stationary_transient_reservation_first_margin_calls": 2,
+        "glm53_layer_stationary_transient_reservation_recurring_calls": 107,
         "memory_prefill_retry_cleanup": [{
             "chunk": 8, "released_bytes": 700_000_000}],
         "memory_prefill_retry_failures": [

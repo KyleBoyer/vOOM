@@ -1,5 +1,39 @@
 # STATUS — 2026-09-03 (current corrections first; dated chronology below is history)
 
+## 2026-09-03: full GLM native FP8 and recurring admission pass matched medium gate
+
+The current full-GLM tile-32 baseline is now re-established on one code
+revision.  Eager released-FP8 reconstruction completed the deterministic
+2,123-input/max-1 request in 814.145 seconds engine / 818.069 seconds wall;
+the exact native-FP8 transform completed it in 693.058 / 697.011 seconds.
+Both returned output SHA `706e47ac...f33a4`, read exactly
+707,720,491,584 checkpoint bytes, and peaked at 1,039,263,300 Metal bytes.
+Native reconstruction is therefore an exact **14.87% engine / 14.80% wall
+speedup** for this current medium full-model path.  The earlier
+`d12fe7f6...68f7c4` / 708,060,313,152 attribution came from stale code and is
+not a valid tile-32 control; the historical conclusion that native FP8 itself
+changed full-model output was wrong.
+
+The narrowed between-layer host spool also matched the current native control
+exactly: 692.290 seconds engine / 696.192 seconds wall, the same output SHA,
+same read count, and same 1,039,263,300-byte peak.  It moved 2.034GB in each
+direction for only 0.277 seconds of measured copy time, but provided no
+capacity or repeatable speed benefit, so its profile has been removed.  The
+lower-level default-off instrumentation remains available for diagnosis.
+
+Full GLM now distinguishes first-observation and recurring transient
+admissions.  Once the exact same position count and layer signature has
+completed, the redundant 400MB secondary pad is omitted while the governor's
+independent 1.2GB system-availability floor remains enforced.  The matched
+medium gate again produced SHA `706e47ac...f33a4`, exact reads
+707,720,491,584, 1,039,263,300-byte peak, and 692.953 seconds engine / 696.822
+seconds wall.  It recorded 5,025 recurring reservations totaling 723.084GB,
+zero secondary-margin bytes, and just 0.112 seconds of admission overhead.
+This is arithmetic-neutral instrumentation plus capacity policy, not a speed
+claim at medium length; its purpose is to clear the former 46,849-token
+near-failure without relaxing the actual system floor.  Focused DSA, server,
+profile, and governor suites pass 349/349.
+
 ## 2026-09-03: full GLM activation-spool instrumentation reaches the real path
 
 The explicit `glm53-full-exact-host-spool-candidate` now runs inside full
@@ -21,20 +55,18 @@ availability was 5.822GB and swap-outs grew 8.274MB.  Governor failures now
 include their named reservation phase in the error text, while full-GLM layer
 page and attention-transient admissions have distinct reason labels.
 
-The first real 2,123-input phase-spool gate was rejected as lossless.  It
-finished in 700.958 seconds engine / 704.838 seconds wall and reduced the
-tile-32 control peak from 1.070GB to 0.982GB, but produced the already-rejected
-tile-16 output SHA `706e47ac...f33a4` and its exact 707,720,491,584-byte read
-identity instead of tile-32's `d12fe7f6...68f7c4` / 708,060,313,152 bytes.
-Restoring each attention tile into a fresh contiguous allocation changed the
-Metal execution path despite the copy itself being bit-exact.
+The first real 2,123-input per-tile spool gate finished in 700.958 seconds
+engine / 704.838 seconds wall and reduced peak Metal from 1.039GB to 0.982GB.
+It also produced current control SHA `706e47ac...f33a4` and exact current
+707,720,491,584-byte read identity.  Nevertheless it was not promoted:
+restoring every tile as a fresh contiguous allocation changes the evaluated
+outer layout, and the measured result was slower than the narrower matched
+control rather than a credible capacity win.
 
-The implementation is now narrowed to spool only *between layers*: the hidden
-state is absent while the next weight page is admitted, then restored once so
-the layer uses its original tile views, concatenations, whole-MoE shape, and
-reductions.  That narrower candidate must repeat the medium identity gate
-before any 46,849-token replay.  Focused DSA, GLM-Flash, server, profile, and
-governor suites pass 377/377.
+The implementation was then narrowed to spool only *between layers*: the
+hidden state is absent while the next weight page is admitted, then restored
+once so the layer uses its original tile views, concatenations, whole-MoE
+shape, and reductions.  Its matched result and removal are recorded above.
 
 ## 2026-09-03: isolated native-KDA speedup is real but remains lossy and unpromoted
 
@@ -72,14 +104,14 @@ GEMMs add contention rather than hiding PCIe transfers.  CPU work remains
 appropriate for request orchestration, hashes, decompression, and asynchronous
 storage workers.
 
-A proposed full-GLM tile-16 lossless capacity profile was removed immediately
-after its first real identity gate.  The deterministic 2,123-input request
-completed without retry in 715.243 seconds engine / 719.205 seconds wall and
-reduced peak Metal from 1.070GB to 0.967GB, but output SHA changed from the
-tile-32 target's `d12fe7f6...68f7c4` to `706e47ac...f33a4`.  Total exact reads
-also changed 708,060,313,152 -> 707,720,491,584 bytes.  Halving the outer
-layer-stationary tile changes batched arithmetic and expert routing; it is not
-a lossless capacity lever and will not be run on the 46,849-token proof path.
+A proposed full-GLM tile-16 capacity profile was removed after its first real
+gate.  The deterministic 2,123-input request completed without retry in
+715.243 seconds engine / 719.205 seconds wall and reduced peak Metal from
+1.039GB to 0.967GB.  Its output SHA and reads happen to match the current
+tile-32 control, but halving the outer layer-stationary batch still changes
+evaluated operation shapes and was slower.  It therefore is not claimed as a
+structurally lossless speed/capacity lever and will not be used for the
+46,849-token proof path.
 
 ## 2026-09-03: exact FP8 prefetch scheduling recovers medium Flash overlap; MLX upgrade rejected
 

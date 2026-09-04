@@ -191,6 +191,95 @@ def test_glm_layer_stationary_scheduler_preselects_before_attention(
     ]
 
 
+def test_glm_layer_stationary_reuses_proven_signature_without_extra_margin(
+        monkeypatch):
+    """A recurring GLM shape retains the governor floor, not a second pad."""
+    from runtime.engine import StreamingEngine
+    import runtime.glm as glm_mod
+
+    reservations = []
+
+    class FakeCache:
+        def contains(self, _key):
+            return True
+
+        def get(self, _key, _names):
+            return {"sentinel": mx.array([1], dtype=mx.int32)}
+
+    class FakeGovernor:
+        def reserve(self, incoming, margin=400_000_000, *, reason=""):
+            reservations.append((int(incoming), int(margin), reason))
+
+    monkeypatch.setattr(
+        glm_mod, "_glm_attention_residual",
+        lambda x, *_args, **_kwargs: x)
+    monkeypatch.setattr(
+        glm_mod, "_glm_mlp_residual",
+        lambda x, *_args, **_kwargs: x)
+
+    engine = StreamingEngine.__new__(StreamingEngine)
+    engine.cfg = SimpleNamespace(
+        num_hidden_layers=1,
+        model_type="glm_moe_dsa",
+        indexer_types=["shared"],
+        mlp_layer_types=["dense"],
+        first_k_dense_replace=1,
+        num_experts=256,
+        layer_types=(),
+        kda_layers=(),
+        full_attn_layers=(),
+    )
+    engine.rc = SimpleNamespace(
+        prefetch_depth=0,
+        glm_dsa_mla_kv_spill_dir="",
+        glm_dsa_dense_mlp_tile_size=0,
+        glm_dsa_index_preallocate=False,
+        glm53_layer_stationary_host_spool=False,
+        metal_limit_mb=8500,
+    )
+    engine.prefetcher = None
+    engine.cache = FakeCache()
+    engine.governor = FakeGovernor()
+    engine._dsv4_packed_trunk = False
+    engine._prefill_layer_transient_by_positions = {6: 123}
+    engine._decode_layer_transient = 0
+    engine._layer_transient = 0
+    engine._layer_transient_margin = 0
+    signature = "mla_shared+dense"
+    engine._layer_transient_by_signature = {(6, signature): 123}
+    engine._layer_transient_observation_counts = {(6, signature): 1}
+    engine._request_profiler = None
+    engine.timer = SimpleNamespace(add=lambda *_args: None)
+    engine._get_experts = lambda *_args, **_kwargs: {}
+    engine._iter_expert_batches = lambda *_args, **_kwargs: iter(())
+    engine._layer_key = lambda layer: f"layer.{layer}"
+    engine._layer_names = lambda _layer: []
+    engine._record_layer_transient = lambda *_args: 0
+    engine._restore_aggregate_layer_transient = lambda *_args: 0
+    engine._note_true_peak = lambda: None
+
+    out = engine._layer_stationary_glm_sweep(
+        mx.zeros((1, 6, 3), dtype=mx.float32),
+        SimpleNamespace(dsa=None, latent_spill_enabled=False),
+        offset=0,
+        tile_width=2,
+    )
+    mx.eval(out)
+
+    assert reservations == [
+        (123, 0, "glm53-full-attention-transient"),
+        (123, 0, "glm53-full-attention-transient"),
+        (123, 0, "glm53-full-attention-transient"),
+    ]
+    stats = engine._glm53_layer_stationary_stats
+    assert stats["transient_reservation_calls"] == 3
+    assert stats["transient_reservation_bytes"] == 369
+    assert stats["transient_reservation_margin_bytes"] == 0
+    assert stats["transient_reservation_first_margin_calls"] == 0
+    assert stats["transient_reservation_recurring_calls"] == 3
+    assert stats["transient_reservation_s"] >= 0.0
+
+
 def _build_hf_attention(seed: int):
     torch.manual_seed(seed)
     hf_cfg = GlmMoeDsaConfig(
