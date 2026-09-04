@@ -360,6 +360,15 @@ live ceiling. Its artifact records 4.07GB available and 141.84MB physical
 swap-out growth. That exhausts the exact prefetch-width ladder for this shape;
 long context returns to preallocation with prefetch off.
 
+Halving the full model's outer layer-stationary tile from 32 to 16 is also
+rejected as a lossless capacity technique. It completed the deterministic
+2,123-input gate without retry in 715.243 seconds engine / 719.205 seconds wall
+and lowered peak Metal from 1.070GB to 0.967GB, but changed the exact output
+SHA (`d12fe7f6...68f7c4` -> `706e47ac...f33a4`) and total weight reads. The
+outer tile therefore changes batched arithmetic and downstream routing. The
+briefly-created lossless profile was removed and will not be used for the
+46.8K conformance run.
+
 The same trace identified a host-side governor cost: 626 shrink steps released
 zero cache bytes. Named reversible reservations were repeatedly lowering an
 already-empty cache limit, clearing MLX, then restoring the ineffective cut.

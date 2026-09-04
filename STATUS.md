@@ -36,6 +36,15 @@ GEMMs add contention rather than hiding PCIe transfers.  CPU work remains
 appropriate for request orchestration, hashes, decompression, and asynchronous
 storage workers.
 
+A proposed full-GLM tile-16 lossless capacity profile was removed immediately
+after its first real identity gate.  The deterministic 2,123-input request
+completed without retry in 715.243 seconds engine / 719.205 seconds wall and
+reduced peak Metal from 1.070GB to 0.967GB, but output SHA changed from the
+tile-32 target's `d12fe7f6...68f7c4` to `706e47ac...f33a4`.  Total exact reads
+also changed 708,060,313,152 -> 707,720,491,584 bytes.  Halving the outer
+layer-stationary tile changes batched arithmetic and expert routing; it is not
+a lossless capacity lever and will not be run on the 46,849-token proof path.
+
 ## 2026-09-03: exact FP8 prefetch scheduling recovers medium Flash overlap; MLX upgrade rejected
 
 The native GLM fine-grained-FP8 decoder's 2,123-input regression is now
