@@ -203,6 +203,20 @@ def test_builtin_profiles_resolve_complete_agent_group():
     assert "VMODEL_GLM53_COALESCED_EXPERT_POSITIONS" not in (
         glm_flash_batch8_settings)
 
+    glm_direct_order, glm_direct_settings = resolve_runtime_profiles(
+        ("glm53-flash-lossless-native-mtp3-workers2-direct-fp8-qmv",),
+        catalog,
+    )
+    assert glm_direct_order[-2:] == (
+        "glm53-flash-lossless-native-mtp3-workers2",
+        "glm53-flash-lossless-native-mtp3-workers2-direct-fp8-qmv",
+    )
+    assert glm_direct_settings["VMODEL_GLM53_FP8_DIRECT_QMV"] == "1"
+    assert glm_direct_settings["VMODEL_GLM53_EXPERT_FETCH_BATCH"] == "8"
+    assert glm_direct_settings[
+        "VMODEL_GLM53_EXPERT_BATCH_PREFETCH_DEPTH"] == "2"
+    assert glm_direct_settings["VMODEL_GLM53_MTP_DEPTH"] == "3"
+
     glm_absorbed_order, glm_absorbed_settings = resolve_runtime_profiles(
         ("glm53-flash-e-compact-mla",), catalog)
     assert glm_absorbed_order == (
@@ -368,6 +382,19 @@ def test_builtin_profiles_resolve_complete_agent_group():
         "VMODEL_GLM_DSA_SELECTION_QUERY_TILE_SIZE"] == "64"
     assert glm_full_settings["VMODEL_GLM53_EXPERT_FETCH_BATCH"] == "1"
     assert glm_full_settings["VMODEL_GLM53_EXPERT_BATCH_PREFETCH"] == "0"
+
+    glm_full_direct_order, glm_full_direct_settings = (
+        resolve_runtime_profiles(
+            ("glm53-full-lossless-direct-fp8-qmv",), catalog))
+    assert glm_full_direct_order == (
+        "glm53-full-lossless-direct-fp8-qmv",)
+    assert glm_full_direct_settings[
+        "VMODEL_GLM53_FP8_DIRECT_QMV"] == "1"
+    assert glm_full_direct_settings[
+        "VMODEL_GLM53_TRUNK_PREFETCH_DEPTH"] == "1"
+    assert "VMODEL_GLM53_MTP" not in glm_full_direct_settings
+    assert "VMODEL_GLM53_EXPERT_BATCH_PREFETCH" not in (
+        glm_full_direct_settings)
 
     glm_full_native_order, glm_full_native_settings = (
         resolve_runtime_profiles(

@@ -411,6 +411,13 @@ def _cache_io_snapshot(engine) -> tuple[int, ...]:
         glm53_fp8_snapshot()
         if callable(glm53_fp8_snapshot) else (0, 0, 0, 0, 0, 0, 0, 0)
     )
+    glm53_fp8_direct_snapshot = getattr(
+        engine.store, "glm53_fp8_direct_snapshot", None)
+    glm53_fp8_direct_stages = (
+        glm53_fp8_direct_snapshot()
+        if callable(glm53_fp8_direct_snapshot)
+        else (0, 0, 0, 0, 0, 0, 0, 0)
+    )
     scale_snapshot = getattr(
         engine.store, "k3_scale_sidecar_snapshot", None
     )
@@ -510,6 +517,7 @@ def _cache_io_snapshot(engine) -> tuple[int, ...]:
         *parallel_stages,
         *store_stages,
         *glm53_fp8_stages,
+        *glm53_fp8_direct_stages,
         *scale_stages,
         *nf12_stages,
     )
@@ -609,6 +617,14 @@ def _record_cache_io_delta(
         "glm53_fp8_prefetch_transform_ns",
         "glm53_fp8_prefetch_transform_calls",
         "glm53_fp8_prefetch_native_calls",
+        "glm53_fp8_direct_pages",
+        "glm53_fp8_direct_resident_bytes",
+        "glm53_fp8_direct_qmv_calls",
+        "glm53_fp8_direct_qmv_positions",
+        "glm53_fp8_direct_fallback_calls",
+        "glm53_fp8_direct_fallback_positions",
+        "glm53_fp8_direct_fallback_reconstruct_ns",
+        "glm53_fp8_direct_fallback_reconstruct_bytes",
         "k3_scale_sidecar_read_bytes", "k3_scale_sidecar_output_bytes",
         "k3_scale_sidecar_decode_ns", "k3_scale_sidecar_decode_calls",
         "bf16_nf12_read_bytes", "bf16_nf12_output_bytes",
@@ -701,6 +717,8 @@ def _quantization_cache_identity(rc: "RuntimeConfig", store) -> str:
         identity += "+glm53-fp8-dequant-native"
         if not getattr(store, "native_glm53_fp8_prefetch", True):
             identity += "-foreground-only"
+    if getattr(store, "glm53_fp8_direct_qmv", False):
+        identity += "+glm53-fp8-direct-qmv"
     return identity
 
 
@@ -2188,7 +2206,8 @@ class StreamingEngine:
             # remains explicit opt-in, so this does not turn a narrow result
             # into a new automatic public-server path.
             self._auto_compact_expert_batch = 0
-            if self.store.native_ct_mxfp4:
+            if (self.store.native_ct_mxfp4
+                    or getattr(self.store, "glm53_fp8_direct_qmv", False)):
                 inter = (
                     getattr(self.cfg, "moe_intermediate_size", None)
                     or self.cfg.intermediate_size)
@@ -2316,7 +2335,8 @@ class StreamingEngine:
             resident_bytes_per_weight = 0.5 + 1.0 / 32.0
         elif self.store.on_disk_quantized:
             resident_bytes_per_weight = self.store.quantized_bytes_per_weight
-        elif self.store.native_ct_mxfp4:
+        elif (self.store.native_ct_mxfp4
+              or getattr(self.store, "glm53_fp8_direct_qmv", False)):
             resident_bytes_per_weight = (
                 self.store.expert_resident_bytes_per_weight)
         elif self.rc.quant_bits:
@@ -2382,6 +2402,7 @@ class StreamingEngine:
             self._expert_page_bytes
             if (self.store.on_disk_quantized
                 or self.store.native_ct_mxfp4
+                or getattr(self.store, "glm53_fp8_direct_qmv", False)
                 or not self.rc.quant_bits)
             else dense_expert_page_bytes + self._expert_page_bytes
         )
@@ -12840,6 +12861,8 @@ class StreamingEngine:
         if self.cfg.model_type in ("glm_moe_dsa", "glm5_next"):
             path_stats["glm53_native_fp8_dequant"] = int(
                 bool(getattr(self.store, "native_glm53_fp8_dequant", False)))
+            path_stats["glm53_fp8_direct_qmv"] = int(
+                bool(getattr(self.store, "glm53_fp8_direct_qmv", False)))
             path_stats["glm53_native_fp8_prefetch"] = int(
                 bool(getattr(self.store, "native_glm53_fp8_prefetch", True)))
         if self.cfg.model_type == "qwen4_exp":

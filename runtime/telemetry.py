@@ -93,6 +93,12 @@ class RequestProfiler:
         "glm53_fp8_prefetch_transform_ns",
         "glm53_fp8_prefetch_transform_calls",
         "glm53_fp8_prefetch_native_calls",
+        "glm53_fp8_direct_pages", "glm53_fp8_direct_resident_bytes",
+        "glm53_fp8_direct_qmv_calls", "glm53_fp8_direct_qmv_positions",
+        "glm53_fp8_direct_fallback_calls",
+        "glm53_fp8_direct_fallback_positions",
+        "glm53_fp8_direct_fallback_reconstruct_ns",
+        "glm53_fp8_direct_fallback_reconstruct_bytes",
         "k3_scale_sidecar_read_bytes", "k3_scale_sidecar_output_bytes",
         "k3_scale_sidecar_decode_ns", "k3_scale_sidecar_decode_calls",
         "bf16_nf12_read_bytes", "bf16_nf12_output_bytes",
@@ -147,6 +153,14 @@ class RequestProfiler:
             "glm53_fp8_prefetch_transform_ns": 0,
             "glm53_fp8_prefetch_transform_calls": 0,
             "glm53_fp8_prefetch_native_calls": 0,
+            "glm53_fp8_direct_pages": 0,
+            "glm53_fp8_direct_resident_bytes": 0,
+            "glm53_fp8_direct_qmv_calls": 0,
+            "glm53_fp8_direct_qmv_positions": 0,
+            "glm53_fp8_direct_fallback_calls": 0,
+            "glm53_fp8_direct_fallback_positions": 0,
+            "glm53_fp8_direct_fallback_reconstruct_ns": 0,
+            "glm53_fp8_direct_fallback_reconstruct_bytes": 0,
             "k3_scale_sidecar_read_bytes": 0,
             "k3_scale_sidecar_output_bytes": 0,
             "k3_scale_sidecar_decode_ns": 0,
@@ -193,6 +207,16 @@ class RequestProfiler:
             if callable(glm53_fp8_snapshot)
             else (0, 0, 0, 0, 0, 0, 0, 0)
         )
+        glm53_fp8_direct_snapshot = getattr(
+            getattr(cache, "store", None),
+            "glm53_fp8_direct_snapshot",
+            None,
+        )
+        glm53_fp8_direct_stages = (
+            glm53_fp8_direct_snapshot()
+            if callable(glm53_fp8_direct_snapshot)
+            else (0, 0, 0, 0, 0, 0, 0, 0)
+        )
         scale_snapshot = getattr(
             getattr(cache, "store", None),
             "k3_scale_sidecar_snapshot",
@@ -225,6 +249,7 @@ class RequestProfiler:
             *parallel_stages,
             *store_stages,
             *glm53_fp8_stages,
+            *glm53_fp8_direct_stages,
             *scale_stages,
             *nf12_stages,
         )
@@ -261,6 +286,12 @@ class RequestProfiler:
          glm53_fp8_prefetch_transform_ns,
          glm53_fp8_prefetch_transform_calls,
          glm53_fp8_prefetch_native_calls,
+         glm53_fp8_direct_pages, glm53_fp8_direct_resident_bytes,
+         glm53_fp8_direct_qmv_calls, glm53_fp8_direct_qmv_positions,
+         glm53_fp8_direct_fallback_calls,
+         glm53_fp8_direct_fallback_positions,
+         glm53_fp8_direct_fallback_reconstruct_ns,
+         glm53_fp8_direct_fallback_reconstruct_bytes,
          scale_read_bytes, scale_output_bytes,
          scale_decode_ns, scale_decode_calls,
          nf12_read_bytes, nf12_output_bytes,
@@ -297,6 +328,21 @@ class RequestProfiler:
             glm53_fp8_prefetch_transform_calls)
         bucket["glm53_fp8_prefetch_native_calls"] += int(
             glm53_fp8_prefetch_native_calls)
+        bucket["glm53_fp8_direct_pages"] += int(glm53_fp8_direct_pages)
+        bucket["glm53_fp8_direct_resident_bytes"] += int(
+            glm53_fp8_direct_resident_bytes)
+        bucket["glm53_fp8_direct_qmv_calls"] += int(
+            glm53_fp8_direct_qmv_calls)
+        bucket["glm53_fp8_direct_qmv_positions"] += int(
+            glm53_fp8_direct_qmv_positions)
+        bucket["glm53_fp8_direct_fallback_calls"] += int(
+            glm53_fp8_direct_fallback_calls)
+        bucket["glm53_fp8_direct_fallback_positions"] += int(
+            glm53_fp8_direct_fallback_positions)
+        bucket["glm53_fp8_direct_fallback_reconstruct_ns"] += int(
+            glm53_fp8_direct_fallback_reconstruct_ns)
+        bucket["glm53_fp8_direct_fallback_reconstruct_bytes"] += int(
+            glm53_fp8_direct_fallback_reconstruct_bytes)
         bucket["k3_scale_sidecar_read_bytes"] += int(scale_read_bytes)
         bucket["k3_scale_sidecar_output_bytes"] += int(scale_output_bytes)
         bucket["k3_scale_sidecar_decode_ns"] += int(scale_decode_ns)
@@ -459,6 +505,23 @@ class RequestProfiler:
                     raw["glm53_fp8_prefetch_transform_calls"]),
                 "glm53_fp8_prefetch_native_calls": int(
                     raw["glm53_fp8_prefetch_native_calls"]),
+                "glm53_fp8_direct_pages": int(
+                    raw["glm53_fp8_direct_pages"]),
+                "glm53_fp8_direct_resident_bytes": int(
+                    raw["glm53_fp8_direct_resident_bytes"]),
+                "glm53_fp8_direct_qmv_calls": int(
+                    raw["glm53_fp8_direct_qmv_calls"]),
+                "glm53_fp8_direct_qmv_positions": int(
+                    raw["glm53_fp8_direct_qmv_positions"]),
+                "glm53_fp8_direct_fallback_calls": int(
+                    raw["glm53_fp8_direct_fallback_calls"]),
+                "glm53_fp8_direct_fallback_positions": int(
+                    raw["glm53_fp8_direct_fallback_positions"]),
+                "glm53_fp8_direct_fallback_reconstruct_s": self._round(
+                    raw["glm53_fp8_direct_fallback_reconstruct_ns"]
+                    / 1_000_000_000),
+                "glm53_fp8_direct_fallback_reconstruct_bytes": int(
+                    raw["glm53_fp8_direct_fallback_reconstruct_bytes"]),
                 "k3_scale_sidecar_read_bytes": int(
                     raw["k3_scale_sidecar_read_bytes"]),
                 "k3_scale_sidecar_output_bytes": int(
@@ -529,6 +592,13 @@ class RequestProfiler:
                     "subset of glm53_fp8_transform_s executed by "
                     "vmodel-expert-batch background workers; do not add it "
                     "to the total"),
+                "glm53_fp8_direct_qmv_calls": (
+                    "singleton BF16 projections consumed directly from the "
+                    "released E4M3/F32-block representation; wider calls are "
+                    "reported separately as exact BF16 fallbacks"),
+                "glm53_fp8_direct_fallback_reconstruct_s": (
+                    "nested inside layer compute; exact BF16 reconstruction "
+                    "paid only by wider direct-page fallbacks"),
                 "k3_scale_sidecar_decode_s": (
                     "nested inside store_disk_s/weight wait; exact fused "
                     "E8M0 scale reconstruction, excluding sidecar file reads"),

@@ -1,0 +1,14 @@
+schema: voom.runtime-profile.v1
+name: glm53-flash-lossless-native-mtp3-workers2-direct-fp8-qmv
+description: Experimental exact GLM-5.3-Flash MTP profile with packed routed-expert singleton QMV.
+notes:
+  - "Retains routed-expert E4M3 payloads and released FP32 128x128 block multipliers instead of widening every fetched page to BF16. It does not requantize or alter a checkpoint value."
+  - "Only a true one-position BF16 projection uses the direct Metal QMV, whose lane partition and shuffle reduction mirror MLX's ordinary singleton BF16 GEMV after the same FP8-times-scale-to-BF16 rounding boundary."
+  - "Every wider or otherwise unsupported shape reconstructs the released BF16 carrier and calls the existing matmul. Direct and fallback call/position counts plus packed page bytes are reported per request."
+  - "Two fresh real-checkpoint gates preserved every token, text, aggregate/component state hash, and all 159 endpoint tensor hashes: 28-in/8-out improved 123.311 -> 115.600 seconds (-6.25%), while an unrelated 12-in/4-out coding prompt improved 81.331 -> 73.199 seconds (-10.00%)."
+  - "The coding gate exercised 9,933 singleton direct calls and 2,355 exact wider fallbacks, reduced peak Metal residency 3.030 -> 2.860 GB (-5.59%), and read 25.2 MB fewer physical bytes through better compact-page reuse."
+  - "Explicit/default-off pending unmodified real tool/Plex, streaming, sampling, long-context, and vision gates; it must not become an automatic path from these short greedy witnesses."
+extends:
+  - glm53-flash-lossless-native-mtp3-workers2
+settings:
+  VMODEL_GLM53_FP8_DIRECT_QMV: 1

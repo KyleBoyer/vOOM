@@ -1017,6 +1017,8 @@ class SpeculativeDecoder:
         if tgt.cfg.model_type in ("glm_moe_dsa", "glm5_next"):
             path_stats["glm53_native_fp8_dequant"] = int(bool(getattr(
                 tgt.store, "native_glm53_fp8_dequant", False)))
+            path_stats["glm53_fp8_direct_qmv"] = int(bool(getattr(
+                tgt.store, "glm53_fp8_direct_qmv", False)))
         if tgt.cfg.model_type == "glm5_next":
             layer_stats = getattr(
                 tgt, "_glm53_layer_stationary_stats", {}) or {}

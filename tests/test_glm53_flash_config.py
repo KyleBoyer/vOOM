@@ -375,6 +375,65 @@ def test_glm53_native_fp8_can_leave_expert_prefetch_on_exact_eager_path(
     assert prefetch_ns > 0
 
 
+def test_glm53_direct_fp8_qmv_is_exact_and_falls_back_for_wider_rows(
+    tmp_path, monkeypatch,
+):
+    import mlx.core as mx
+
+    from runtime.model_loader import WeightStore
+    from runtime.quant import (
+        FineGrainedFP8Tensor,
+        dequantize_finegrained_fp8,
+        matmul,
+    )
+
+    if not mx.metal.is_available():
+        pytest.skip("direct fine-grained FP8 QMV requires Metal")
+    config = _config()
+    config["quantization_config"] = {
+        "quant_method": "fp8",
+        "activation_scheme": "dynamic",
+        "weight_block_size": [128, 128],
+    }
+    (tmp_path / "config.json").write_text(json.dumps(config))
+    codes = np.resize(
+        np.arange(256, dtype=np.uint8), 128 * 128).reshape(128, 128)
+    scale = np.array([[0.03125]], dtype=np.float32)
+    physical = "model.language_model.layers.1.mlp.experts.0.gate_proj"
+    _write_safetensor(tmp_path, {
+        f"{physical}.weight": (codes, "F8_E4M3"),
+        f"{physical}.weight_scale_inv": (scale, "F32"),
+    })
+    monkeypatch.setenv("VMODEL_GLM53_NATIVE_FP8_DEQUANT", "1")
+    monkeypatch.setenv("VMODEL_GLM53_FP8_DIRECT_QMV", "1")
+    store = WeightStore(tmp_path)
+    logical = "model.layers.1.mlp.experts.0.gate_proj.weight"
+    fetched, _seconds, physical_bytes = store.fetch([logical])
+    packed = fetched[logical]
+
+    assert isinstance(packed, FineGrainedFP8Tensor)
+    assert packed.nbytes == physical_bytes == codes.nbytes + scale.nbytes
+    assert store.expert_resident_bytes_per_weight == pytest.approx(
+        1.0 + 4.0 / (128 * 128))
+
+    dense = dequantize_finegrained_fp8(
+        mx.array(codes), mx.array(scale), block_shape=(128, 128))
+    singleton = mx.arange(128, dtype=mx.bfloat16).reshape(1, 1, 128)
+    wider = mx.stack((singleton.reshape(-1), singleton.reshape(-1)), axis=0)
+    want_singleton = singleton @ dense.T
+    got_singleton = matmul(singleton, packed)
+    want_wider = wider @ dense.T
+    got_wider = matmul(wider, packed)
+    mx.eval(want_singleton, got_singleton, want_wider, got_wider)
+
+    assert bool(mx.all(want_singleton == got_singleton))
+    assert bool(mx.all(want_wider == got_wider))
+    direct_stats = store.glm53_fp8_direct_snapshot()
+    assert direct_stats[:6] == (1, physical_bytes, 1, 1, 1, 2)
+    assert direct_stats[6] > 0
+    assert direct_stats[7] == dense.nbytes
+
+
 def test_glm53_fp8_scale_dtype_mismatch_fails_closed():
     import mlx.core as mx
 

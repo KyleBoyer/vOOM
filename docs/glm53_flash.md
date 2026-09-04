@@ -1,5 +1,40 @@
 # GLM-5.3-Flash on the 16 GB M4
 
+## Exact packed routed-expert QMV (2026-09-04)
+
+`VMODEL_GLM53_FP8_DIRECT_QMV=1` is a new explicit lossless representation and
+kernel path for both attested GLM-5.3 targets. Routed-expert pages remain in the
+checkpoint's released E4M3 bytes plus FP32 128x128 multipliers while cached. A
+one-position BF16 projection uses a Metal QMV that mirrors MLX's singleton BF16
+GEMV reduction partition; wider shapes reconstruct the existing exact BF16
+carrier and call the ordinary matmul. Trunk, shared-expert, embedding, and head
+weights stay on their existing paths.
+
+| target / prompt | control wall | packed-QMV wall | prefill | decode | peak Metal | exactness |
+|---|---:|---:|---:|---:|---:|---|
+| Flash, 28 in / 8 out | 123.311 s | **115.600 s (-6.25%)** | 68.932 -> 67.405 s | 54.371 -> **48.189 s** | 3.276 -> 3.087 GB | tokens + 159/159 tensors |
+| Flash coding, 12 in / 4 out | 81.331 s | **73.199 s (-10.00%)** | 41.748 -> 40.543 s | 39.575 -> **32.650 s** | 3.030 -> 2.860 GB | tokens + 159/159 tensors |
+| Full, 28 in / 4 out | 362.018 s | **295.689 s (-18.32%)** | 283.101 -> **235.301 s** | 78.917 -> **60.387 s** | 6.426 -> 6.022 GB | tokens + 79/79 tensors |
+
+The coding trace recorded 9,933 direct calls and 2,355 wider fallbacks; the full
+trace recorded 16,452 and 10,095 respectively. Per-request telemetry also
+separates fallback BF16 reconstruction seconds/bytes from ordinary fetch-time
+FP8 transformation, preventing the packed path from hiding that remaining
+cost. The full trace had one 20.1MB pressure-growth event. Consequently both
+profiles remain opt-in: `glm53-flash-lossless-native-mtp3-workers2-direct-fp8-qmv`
+and `glm53-full-lossless-direct-fp8-qmv`.
+
+An exact width-one gate/up fusion was also tested and rejected (0.8523 ->
+0.8565ms, plus 33.6MB output). The direct kernel therefore stays projection
+granular; there is no retained fusion switch. A compact-page scheduling sweep
+also retained batch 8 / depth 2. Depth 3 was neutral/slower (73.298 -> 73.360s).
+Batch 16 cut expert-prefetch wait by 12.169s but made exact wider reconstruction
+5.313s slower under I/O/Metal contention, regressed total wall to 75.327s, and
+raised peak Metal by 227MB; its temporary validator expansion was reverted.
+Applying the singleton QMV independently to wider rows was not exact against
+MLX's wider GEMM at any tested width from 2 through 16, so that tempting
+shortcut was also rejected before a runtime switch was added.
+
 Status date: 2026-09-04
 
 > Current-tree correction: `models/GLM-5.3-Flash` is the attested

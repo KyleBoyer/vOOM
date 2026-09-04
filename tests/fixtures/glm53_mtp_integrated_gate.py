@@ -190,6 +190,24 @@ def main() -> None:
                     "weight_store_bytes_read", 0),
                 "glm53_native_fp8_dequant": stats.get(
                     "glm53_native_fp8_dequant", 0),
+                "glm53_fp8_direct_qmv": stats.get(
+                    "glm53_fp8_direct_qmv", 0),
+                "glm53_fp8_direct_pages": stats.get(
+                    "glm53_fp8_direct_pages", 0),
+                "glm53_fp8_direct_resident_bytes": stats.get(
+                    "glm53_fp8_direct_resident_bytes", 0),
+                "glm53_fp8_direct_qmv_calls": stats.get(
+                    "glm53_fp8_direct_qmv_calls", 0),
+                "glm53_fp8_direct_qmv_positions": stats.get(
+                    "glm53_fp8_direct_qmv_positions", 0),
+                "glm53_fp8_direct_fallback_calls": stats.get(
+                    "glm53_fp8_direct_fallback_calls", 0),
+                "glm53_fp8_direct_fallback_positions": stats.get(
+                    "glm53_fp8_direct_fallback_positions", 0),
+                "glm53_fp8_direct_fallback_reconstruct_s": stats.get(
+                    "glm53_fp8_direct_fallback_reconstruct_ns", 0) / 1e9,
+                "glm53_fp8_direct_fallback_reconstruct_bytes": stats.get(
+                    "glm53_fp8_direct_fallback_reconstruct_bytes", 0),
                 "glm53_fp8_transform_s": stats.get(
                     "glm53_fp8_transform_ns", 0) / 1e9,
                 "glm53_fp8_transform_calls": stats.get(
@@ -334,6 +352,23 @@ def main() -> None:
                 "weight_store_bytes_read", 0),
             "glm53_native_fp8_dequant": runs[-1][
                 "glm53_native_fp8_dequant"],
+            "glm53_fp8_direct_qmv": runs[-1]["glm53_fp8_direct_qmv"],
+            "glm53_fp8_direct_pages": runs[-1][
+                "glm53_fp8_direct_pages"],
+            "glm53_fp8_direct_resident_bytes": runs[-1][
+                "glm53_fp8_direct_resident_bytes"],
+            "glm53_fp8_direct_qmv_calls": runs[-1][
+                "glm53_fp8_direct_qmv_calls"],
+            "glm53_fp8_direct_qmv_positions": runs[-1][
+                "glm53_fp8_direct_qmv_positions"],
+            "glm53_fp8_direct_fallback_calls": runs[-1][
+                "glm53_fp8_direct_fallback_calls"],
+            "glm53_fp8_direct_fallback_positions": runs[-1][
+                "glm53_fp8_direct_fallback_positions"],
+            "glm53_fp8_direct_fallback_reconstruct_s": runs[-1][
+                "glm53_fp8_direct_fallback_reconstruct_s"],
+            "glm53_fp8_direct_fallback_reconstruct_bytes": runs[-1][
+                "glm53_fp8_direct_fallback_reconstruct_bytes"],
             "glm53_fp8_transform_s": runs[-1]["glm53_fp8_transform_s"],
             "glm53_fp8_transform_calls": runs[-1][
                 "glm53_fp8_transform_calls"],

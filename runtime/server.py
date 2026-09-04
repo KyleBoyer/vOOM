@@ -2035,6 +2035,11 @@ class EngineManager:
         if glm53_native_fp8_prefetch_request not in ("0", "1"):
             raise RequestValidationError(
                 "VMODEL_GLM53_NATIVE_FP8_PREFETCH must be 0 or 1")
+        glm53_fp8_direct_qmv_request = os.environ.get(
+            "VMODEL_GLM53_FP8_DIRECT_QMV", "0").strip()
+        if glm53_fp8_direct_qmv_request not in ("0", "1"):
+            raise RequestValidationError(
+                "VMODEL_GLM53_FP8_DIRECT_QMV must be 0 or 1")
         qwen4_native_fp8_dequant_request = os.environ.get(
             "VMODEL_QWEN4_NATIVE_FP8_DEQUANT", "0").strip()
         if qwen4_native_fp8_dequant_request not in ("0", "1"):
@@ -2394,6 +2399,7 @@ class EngineManager:
             glm53_hot_kv_min_tokens,
             glm53_native_fp8_dequant_request,
             glm53_native_fp8_prefetch_request,
+            glm53_fp8_direct_qmv_request,
             qwen4_native_fp8_dequant_request,
             glm53_mtp_request,
             glm53_mtp_depth,
@@ -2592,6 +2598,11 @@ class EngineManager:
             raise RequestValidationError(
                 "VMODEL_GLM53_NATIVE_FP8_PREFETCH=0 requires "
                 "VMODEL_GLM53_NATIVE_FP8_DEQUANT=1")
+        if (glm53_fp8_direct_qmv_request == "1"
+                and mtype not in ("glm_moe_dsa", "glm5_next")):
+            raise RequestValidationError(
+                "VMODEL_GLM53_FP8_DIRECT_QMV requires a GLM-5.3 "
+                "fine-grained-FP8 checkpoint")
         if (qwen4_native_fp8_dequant_request == "1"
                 and mtype != "qwen4_exp"):
             raise RequestValidationError(
@@ -9468,6 +9479,7 @@ def _vision_protocol_timing(result: dict) -> dict:
         "weight_fast_tier_bytes",
         "weight_archive_bytes",
         "glm53_native_fp8_dequant",
+        "glm53_fp8_direct_qmv",
         "glm53_native_fp8_prefetch",
         "qwen4_native_fp8_dequant",
         "qwen4_per_expert_fp8",
@@ -9479,6 +9491,14 @@ def _vision_protocol_timing(result: dict) -> dict:
         "glm53_fp8_prefetch_transform_ns",
         "glm53_fp8_prefetch_transform_calls",
         "glm53_fp8_prefetch_native_calls",
+        "glm53_fp8_direct_pages",
+        "glm53_fp8_direct_resident_bytes",
+        "glm53_fp8_direct_qmv_calls",
+        "glm53_fp8_direct_qmv_positions",
+        "glm53_fp8_direct_fallback_calls",
+        "glm53_fp8_direct_fallback_positions",
+        "glm53_fp8_direct_fallback_reconstruct_ns",
+        "glm53_fp8_direct_fallback_reconstruct_bytes",
         "weight_cache_hits",
         "weight_cache_misses",
         "weight_cache_evictions",
@@ -10310,6 +10330,8 @@ def _execution_profile_fields(engine) -> dict[str, object]:
         )
     if rc is not None and getattr(rc, "native_ct_mxfp4", False):
         weight_profile += "+ct-mxfp4-native"
+    if getattr(store, "glm53_fp8_direct_qmv", False):
+        weight_profile += "+glm53-fp8-direct-qmv"
     if rc is not None and getattr(rc, "kimi_k3_scale_sidecar_dir", ""):
         weight_profile += "+k3-scale-sidecar"
     if rc is not None and getattr(rc, "bf16_nf12_sidecar_dir", ""):
@@ -10327,6 +10349,8 @@ def _execution_profile_fields(engine) -> dict[str, object]:
         "vmodel_weight_profile": weight_profile,
         "vmodel_backend": str(getattr(engine, "backend_name", "voom")),
     }
+    if getattr(store, "glm53_fp8_direct_qmv", False):
+        fields["vmodel_glm53_fp8_direct_qmv"] = 1
     if rc is not None and getattr(rc, "qwen35_prefill_chunk_ceiling", 0):
         fields["vmodel_qwen35_prefill_chunk_ceiling"] = int(
             rc.qwen35_prefill_chunk_ceiling)

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from dataclasses import dataclass
+import time
 
 import mlx.core as mx
 import numpy as np
@@ -48,6 +49,37 @@ class QTensor:
         return (self.scales.dtype
                 if mx.issubdtype(self.scales.dtype, mx.floating)
                 else mx.bfloat16)
+
+
+@dataclass
+class FineGrainedFP8Tensor:
+    """Released E4M3/F32-block weight retained in its physical form.
+
+    The direct path is deliberately narrow: a singleton BF16 projection uses
+    a Metal QMV whose reduction order matches MLX's ordinary BF16 GEMV. Wider
+    inputs reconstruct the exact BF16 carrier and call the existing matmul.
+    Keeping this representation explicit prevents a packed page from being
+    mistaken for a lossy quantization and lets WeightCache price its real
+    resident bytes.
+    """
+
+    packed: mx.array
+    weight_scale_inv: mx.array
+    block_shape: tuple[int, int]
+    native_fallback: bool = False
+    recorder: object | None = None
+
+    @property
+    def nbytes(self) -> int:
+        return int(self.packed.nbytes + self.weight_scale_inv.nbytes)
+
+    @property
+    def shape(self) -> tuple[int, ...]:
+        return tuple(self.packed.shape)
+
+    @property
+    def dtype(self):
+        return mx.bfloat16
 
 
 @dataclass
@@ -607,6 +639,8 @@ def matmul(x: mx.array, w) -> mx.array:
         return w.matmul(x)
     if isinstance(w, RerankedQHead):
         return reranked_matmul(x, w)
+    if isinstance(w, FineGrainedFP8Tensor):
+        return finegrained_fp8_matmul(x, w)
     if isinstance(w, QTensor):
         return mx.quantized_matmul(
             x, w.wq, scales=w.scales, biases=w.biases,
@@ -1054,6 +1088,180 @@ def dequantize_finegrained_fp8_metal(
         output_shapes=[(rows, cols)],
         output_dtypes=[mx.bfloat16],
     )[0]
+
+
+_FINEGRAINED_FP8_QMV_SOURCE = r"""
+    constexpr uint OUTPUTS_PER_SIMD = 4u;
+    uint lane = thread_index_in_simdgroup;
+    uint row0 = threadgroup_position_in_grid.x * OUTPUTS_PER_SIMD;
+    float accum[OUTPUTS_PER_SIMD] = {0.0f, 0.0f, 0.0f, 0.0f};
+
+    // MLX's singleton BF16 GEMV assigns four adjacent K values to each SIMD
+    // lane and advances by a 128-value block. Matching that partition and the
+    // shuffle-down tree is what makes the result byte-identical, rather than
+    // merely numerically close, after direct FP8 reconstruction.
+    for (uint k0 = lane * 4u; k0 < COLS; k0 += 128u) {
+        #pragma unroll
+        for (uint i = 0; i < 4u; ++i) {
+            uint col = k0 + i;
+            float input_value = float(x[col]);
+            #pragma unroll
+            for (uint r = 0; r < OUTPUTS_PER_SIMD; ++r) {
+                uint row = row0 + r;
+                if (row < ROWS) {
+                    uint index = row * COLS + col;
+                    uint scale_index =
+                        (row / BLOCK_ROWS) * SCALE_COLS
+                        + (col / BLOCK_COLS);
+                    float decoded = voom_e4m3fn_to_float(packed[index])
+                        * weight_scale_inv[scale_index];
+                    float rounded = float(T(decoded));
+                    accum[r] += rounded * input_value;
+                }
+            }
+        }
+    }
+
+    #pragma unroll
+    for (uint r = 0; r < OUTPUTS_PER_SIMD; ++r) {
+        #pragma unroll
+        for (ushort offset = 16; offset >= 1; offset >>= 1) {
+            accum[r] += simd_shuffle_down(accum[r], offset);
+        }
+    }
+    if (lane == 0) {
+        #pragma unroll
+        for (uint r = 0; r < OUTPUTS_PER_SIMD; ++r) {
+            uint row = row0 + r;
+            if (row < ROWS) out[row] = T(accum[r]);
+        }
+    }
+"""
+
+_finegrained_fp8_qmv_kernel_cache: dict[
+    tuple[int, int, int, int], "mx.fast.metal_kernel"
+] = {}
+
+
+def _finegrained_fp8_qmv_kernel(
+    rows: int, cols: int, block_rows: int, block_cols: int,
+):
+    key = (rows, cols, block_rows, block_cols)
+    kernel = _finegrained_fp8_qmv_kernel_cache.get(key)
+    if kernel is None:
+        scale_cols = (cols + block_cols - 1) // block_cols
+        source = (_FINEGRAINED_FP8_QMV_SOURCE
+                  .replace("SCALE_COLS", str(scale_cols))
+                  .replace("BLOCK_ROWS", str(block_rows))
+                  .replace("BLOCK_COLS", str(block_cols))
+                  .replace("ROWS", str(rows))
+                  .replace("COLS", str(cols)))
+        kernel = mx.fast.metal_kernel(
+            name=(f"voom_finegrained_fp8_qmv_r{rows}_c{cols}_"
+                  f"br{block_rows}_bc{block_cols}"),
+            input_names=["x", "packed", "weight_scale_inv"],
+            output_names=["out"],
+            header=_FINEGRAINED_FP8_METAL_HEADER,
+            source=source,
+            ensure_row_contiguous=False,
+        )
+        _finegrained_fp8_qmv_kernel_cache[key] = kernel
+    return kernel
+
+
+def finegrained_fp8_qmv(
+    x: mx.array,
+    packed: mx.array,
+    weight_scale_inv: mx.array,
+    *,
+    block_shape: tuple[int, int],
+) -> mx.array:
+    """Exact singleton BF16 QMV over released E4M3/F32-block weights."""
+    if not mx.metal.is_available():
+        raise RuntimeError("fine-grained FP8 direct QMV requires Metal")
+    if x.dtype != mx.bfloat16 or x.ndim != 1:
+        raise ValueError("fine-grained FP8 direct QMV requires BF16 x[K]")
+    if packed.dtype != mx.uint8 or packed.ndim != 2:
+        raise ValueError(
+            "fine-grained FP8 direct QMV requires a rank-2 uint8 weight")
+    if weight_scale_inv.dtype != mx.float32 or weight_scale_inv.ndim != 2:
+        raise ValueError(
+            "fine-grained FP8 direct QMV requires a rank-2 float32 scale")
+    rows, cols = map(int, packed.shape)
+    if int(x.shape[0]) != cols or cols % 128:
+        raise ValueError(
+            "fine-grained FP8 direct QMV requires matching K divisible by 128")
+    block_rows, block_cols = map(int, block_shape)
+    if block_rows <= 0 or block_cols <= 0:
+        raise ValueError("fine-grained FP8 direct QMV block shape must be positive")
+    expected = (
+        (rows + block_rows - 1) // block_rows,
+        (cols + block_cols - 1) // block_cols,
+    )
+    if tuple(map(int, weight_scale_inv.shape)) != expected:
+        raise ValueError(
+            "fine-grained FP8 direct QMV scale grid does not match weight")
+    return _finegrained_fp8_qmv_kernel(
+        rows, cols, block_rows, block_cols,
+    )(
+        inputs=[x, packed, weight_scale_inv],
+        template=[("T", mx.bfloat16)],
+        grid=(((rows + 3) // 4) * 32, 1, 1),
+        threadgroup=(32, 1, 1),
+        output_shapes=[(rows,)],
+        output_dtypes=[mx.bfloat16],
+    )[0]
+
+
+def finegrained_fp8_matmul(
+    x: mx.array, weight: FineGrainedFP8Tensor,
+) -> mx.array:
+    """Dispatch exact direct QMV or the materialized-BF16 fallback."""
+    positions = 1
+    for extent in x.shape[:-1]:
+        positions *= int(extent)
+    direct = (
+        positions == 1
+        and x.dtype == mx.bfloat16
+        and x.ndim >= 1
+        and int(x.shape[-1]) == int(weight.packed.shape[1])
+        and int(x.shape[-1]) % 128 == 0
+    )
+    if direct:
+        reconstruct_ns = 0
+        reconstruct_bytes = 0
+        result = finegrained_fp8_qmv(
+            x.reshape(-1),
+            weight.packed,
+            weight.weight_scale_inv,
+            block_shape=weight.block_shape,
+        ).reshape(*x.shape[:-1], int(weight.packed.shape[0]))
+    else:
+        reconstruct_started_ns = time.perf_counter_ns()
+        decoder = (
+            dequantize_finegrained_fp8_metal
+            if weight.native_fallback
+            else dequantize_finegrained_fp8
+        )
+        dense = decoder(
+            weight.packed,
+            weight.weight_scale_inv,
+            block_shape=weight.block_shape,
+        )
+        # Match WeightStore's released path: the BF16 rounding boundary is
+        # materialized before the ordinary MLX GEMM is constructed.
+        mx.eval(dense)
+        reconstruct_ns = time.perf_counter_ns() - reconstruct_started_ns
+        reconstruct_bytes = int(dense.nbytes)
+        result = x @ dense.T
+    if callable(weight.recorder):
+        weight.recorder(
+            direct=direct,
+            positions=positions,
+            fallback_reconstruct_ns=reconstruct_ns,
+            fallback_reconstruct_bytes=reconstruct_bytes,
+        )
+    return result
 
 
 def dequantize_deepseek_v4_fp4(packed: mx.array, scale: mx.array

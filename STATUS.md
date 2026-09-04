@@ -1,5 +1,62 @@
 # STATUS — 2026-09-04 (current corrections first; dated chronology below is history)
 
+## 2026-09-04: released FP8 stays packed through exact singleton expert QMV
+
+GLM's routed-expert cache no longer has to widen every released E4M3/F32-block
+page to BF16 before knowing its projection shape.  A new explicit lossless path
+retains the published bytes and scales, dispatches true one-position BF16
+projections to a Metal QMV with MLX's singleton GEMV lane partition/reduction
+order, and reconstructs the same BF16 carrier before the existing GEMM for every
+wider or unsupported shape.  It is GLM-only, opt-in, fingerprinted in cache and
+response identity, and reports packed pages/bytes, direct calls/positions, wider
+fallbacks, plus their BF16 reconstruction time and byte volume.
+
+Two independent GLM-5.3-Flash prompts matched every greedy token, text,
+aggregate/component hash, and all 159 endpoint tensor hashes.  The 28-in/8-out
+gate improved wall **123.311 -> 115.600s (-6.25%)**, prefill 68.932 -> 67.405s,
+decode **54.371 -> 48.189s (-11.37%)**, and peak Metal 3.276 -> 3.087GB.  An
+unrelated 12-in/4-out coding prompt, with zero accepted MTP drafts, improved wall
+**81.331 -> 73.199s (-10.00%)**, decode **39.575 -> 32.650s (-17.50%)**, and
+peak Metal 3.030 -> 2.860GB while exercising 9,933 direct calls and 2,355 exact
+wider fallbacks.  That varied-shape result rejects a one-prompt speed claim but
+does not replace the still-required unmodified Plex/tool, sampling, streaming,
+long-context, and vision gates.
+
+Full uncensored GLM-5.3 also matched four tokens, text, all state components,
+and all 79 endpoint tensors.  Its plain-target wall improved **362.018 ->
+295.689s (-18.32%)**, prefill **283.101 -> 235.301s (-16.88%)**, decode
+**78.917 -> 60.387s (-23.48%)**, peak Metal 6.426 -> 6.022GB, and physical
+reads fell by 1.381GB through compact-page reuse.  It exercised 16,452 direct
+calls and 10,095 wider fallbacks.  One 20.1MB pressure-growth event keeps the
+new full profile explicit/default-off and out of long-context recommendations.
+
+A separate exact gate/up fused kernel was rejected: width-one latency regressed
+0.8523 -> 0.8565ms and required another 33.6MB output.  No runtime switch was
+kept. Compact-page expert lookahead was also swept on the unrelated coding
+prompt. Depth three was neutral/slower (**73.298 -> 73.360s**) and increased
+swap-out growth. A temporary batch-16 prefill group reduced expert-prefetch
+wait 48.788 -> 36.619s but contended with exact wider reconstruction, whose
+wall rose 6.217 -> 11.530s; total regressed to **75.327s (+2.77%)** and peak
+Metal rose 227MB. The validator was restored to its batch-eight ceiling.
+Stacking the exact singleton QMV for wider calls was rejected even earlier:
+against a 2,048x6,144 exact BF16 oracle it differed at widths 2, 3, 4, 8, 12,
+and 16 (1--17 BF16 values per matrix). The discrepancies are sparse but can
+feed routing, so wider calls continue through the exact MLX GEMM reduction.
+
+Hub receipts were also rechecked: the local Qwen3.8-Flash-Next,
+GLM-5.3-Flash, and full GLM-5.3 trees are already the public dealignai uncensored
+FP8 revisions.  Gated copies with matching layouts and lossy conversions provide
+no verified replacement benefit.
+
+Evidence:
+`logs/glm53_flash_direct_qmv_{control,candidate}_max8_20260904.json`,
+`logs/glm53_flash_direct_qmv_code_{control,candidate}_max4_20260904.json`,
+`logs/glm53_full_{lossless_workers2_plain_dsa_rows_prompt4,direct_qmv_plain_max4}_20260904.json`,
+`logs/glm53_flash_fp8_direct_qmv_20260904.json`, and
+`logs/glm53_flash_gate_up_fusion_row1_20260904.json`, plus
+`logs/glm53_flash_direct_qmv_code_{depth2_instrumented,depth3,batch16}_max4_20260904.json`
+and `logs/glm53_fp8_rowwise_qmv_wider_probe_20260904.json`.
+
 ## 2026-09-04: exact route-shape telemetry rejects per-call compiled SwiGLU
 
 GLM-5.3-Flash's exact layer-stationary expert loop now reports its real outer
