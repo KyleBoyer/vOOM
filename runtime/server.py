@@ -2338,6 +2338,12 @@ class EngineManager:
             raise RequestValidationError(
                 "VMODEL_GLM53_EXPERT_BATCH_PREFETCH_PREFILL_ONLY must be "
                 "0 or 1")
+        glm53_serial_verify_coalesced_barriers_request = os.environ.get(
+            "VMODEL_GLM53_SERIAL_VERIFY_COALESCED_BARRIERS", "0").strip()
+        if glm53_serial_verify_coalesced_barriers_request not in ("0", "1"):
+            raise RequestValidationError(
+                "VMODEL_GLM53_SERIAL_VERIFY_COALESCED_BARRIERS must be "
+                "0 or 1")
         glm53_short_stream_lm_head_request = os.environ.get(
             "VMODEL_GLM53_SHORT_STREAM_LM_HEAD", "0").strip()
         if glm53_short_stream_lm_head_request not in ("0", "1"):
@@ -2523,6 +2529,7 @@ class EngineManager:
             glm53_expert_fetch_batch,
             glm53_expert_batch_prefetch_request,
             glm53_expert_batch_prefetch_prefill_only_request,
+            glm53_serial_verify_coalesced_barriers_request,
             glm53_expert_batch_prefetch_depth,
             glm53_expert_batch_prefetch_workers,
             glm53_short_stream_lm_head_request,
@@ -2680,6 +2687,7 @@ class EngineManager:
             glm53_expert_fetch_batch,
             glm53_expert_batch_prefetch_request,
             glm53_expert_batch_prefetch_prefill_only_request,
+            glm53_serial_verify_coalesced_barriers_request,
             glm53_expert_batch_prefetch_depth,
             glm53_expert_batch_prefetch_workers,
             glm53_short_stream_lm_head_request,
@@ -2698,6 +2706,11 @@ class EngineManager:
             raise RequestValidationError(
                 "VMODEL_GLM53_NATIVE_FP8_DEQUANT requires a GLM-5.3 "
                 "fine-grained-FP8 checkpoint")
+        if (glm53_serial_verify_coalesced_barriers_request == "1"
+                and mtype != "glm5_next"):
+            raise RequestValidationError(
+                "VMODEL_GLM53_SERIAL_VERIFY_COALESCED_BARRIERS requires "
+                "GLM-5.3-Flash")
         if (glm53_native_fp8_prefetch_request == "0"
                 and glm53_native_fp8_dequant_request != "1"):
             raise RequestValidationError(
@@ -3051,6 +3064,8 @@ class EngineManager:
                     glm53_expert_batch_prefetch_prefill_only_request == "1")
                 if rc.glm53_expert_batch_prefetch_prefill_only:
                     rc.expert_batch_prefetch = True
+                rc.glm53_serial_verify_coalesced_barriers = (
+                    glm53_serial_verify_coalesced_barriers_request == "1")
                 rc.expert_batch_prefetch_depth = (
                     glm53_expert_batch_prefetch_depth)
                 rc.expert_batch_prefetch_workers = (
@@ -9781,6 +9796,9 @@ def _vision_protocol_timing(result: dict) -> dict:
         "glm53_exact_expert_rows_9_16_calls",
         "glm53_exact_expert_rows_17_32_calls",
         "glm53_exact_expert_rows_33_plus_calls",
+        "glm53_serial_verify_coalesced_barriers",
+        "glm53_serial_verify_coalesced_barrier_groups",
+        "glm53_serial_verify_coalesced_barrier_positions",
         "glm53_incremental_dsa_pool",
         "glm53_expanded_kv_host_spool",
         "glm53_expanded_kv_capacity_grows",
@@ -10328,6 +10346,7 @@ def _vision_protocol_timing(result: dict) -> dict:
         "glm53_layer_stationary_disk_spool_write_s",
         "glm53_layer_stationary_disk_spool_read_s",
         "glm53_layer_stationary_transient_reservation_s",
+        "glm53_serial_verify_coalesced_eval_s",
         "dsa_selection_spill_write_s",
         "dsa_selection_spill_read_s",
         "dsa_selection_score_s",
@@ -10483,6 +10502,10 @@ def _vision_protocol_timing(result: dict) -> dict:
         "speculative_round_draft_s",
         "speculative_round_verify_s",
         "speculative_round_context_s",
+        "speculative_rounds",
+        "speculative_round_details",
+        "speculative_round_detail_total",
+        "speculative_round_detail_dropped",
         "memory_prefill_retry_cleanup",
         "memory_prefill_retry_failures",
         "memory_prefill_retry_coalesced_limits",

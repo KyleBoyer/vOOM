@@ -20,6 +20,7 @@ def main() -> None:
     parser.add_argument("--positions", type=int, default=2)
     parser.add_argument("--result", type=Path)
     parser.add_argument("--diagnostic", action="store_true")
+    parser.add_argument("--coalesced-barriers", action="store_true")
     args = parser.parse_args()
     if args.positions < 2:
         parser.error("positions must be at least two")
@@ -27,6 +28,9 @@ def main() -> None:
     import mlx.core as mx
 
     from runtime.server import EngineManager
+
+    os.environ["VMODEL_GLM53_SERIAL_VERIFY_COALESCED_BARRIERS"] = (
+        "1" if args.coalesced_barriers else "0")
 
     def array_equal(left, right) -> bool:
         if left is None or right is None:
@@ -163,6 +167,7 @@ def main() -> None:
         mx.eval(reference_logits)
         result = {
             "schema": "voom.glm53-serial-verifier-oracle.v1",
+            "coalesced_barriers": bool(args.coalesced_barriers),
             "tokens": token_ids,
             "greedy_reference": [
                 int(value) for value in mx.argmax(reference_logits, axis=-1)

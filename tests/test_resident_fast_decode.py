@@ -296,11 +296,46 @@ def test_dense_speculation_matches_target_only_with_serial_verifier(tmp_path):
         assert speculative["prompt_tokens"] > 0
         assert speculative["termination_reason"] in ("eos", "length")
         assert speculative["path_stats"]["speculative_used"] == 1
+        details = speculative["path_stats"]["speculative_round_details"]
+        assert len(details) == len(speculative["stats"].rounds)
+        assert all({
+            "chosen_k", "effective_k", "proposed", "accepted",
+            "planned_commit", "emitted_commit",
+            "draft_s", "verify_s", "draft_bytes", "verify_bytes",
+            "draft_prefetch_submitted", "draft_prefetch_wait_s",
+            "draft_prefetch_hidden_s", "verify_prefetch_submitted",
+            "verify_prefetch_wait_s", "verify_prefetch_hidden_s",
+        } <= row.keys() for row in details)
+        assert speculative["path_stats"][
+            "speculative_round_detail_total"] == len(
+                speculative["stats"].rounds)
+        assert speculative["path_stats"][
+            "speculative_round_detail_dropped"] == 0
+        assert speculative["path_stats"][
+            "expert_batch_prefetch_prefill_submitted"] == 0
+        assert speculative["path_stats"][
+            "expert_batch_prefetch_decode_submitted"] == 0
         assert speculative["kv_positions"] == (
             speculative["prompt_tokens"] + len(speculative["tokens"]) - 1)
     finally:
         target.close()
         draft.close()
+
+
+def test_speculative_round_detail_trace_is_hard_capped():
+    from runtime.speculative import (
+        SpecStats, _MAX_SPECULATIVE_ROUND_DETAILS,
+    )
+
+    stats = SpecStats()
+    for index in range(_MAX_SPECULATIVE_ROUND_DETAILS + 7):
+        stats.record_round_detail({"round": index})
+
+    assert len(stats.round_details) == _MAX_SPECULATIVE_ROUND_DETAILS
+    assert stats.round_detail_total == _MAX_SPECULATIVE_ROUND_DETAILS + 7
+    assert stats.round_detail_dropped == 7
+    assert stats.round_details[-1]["round"] == (
+        _MAX_SPECULATIVE_ROUND_DETAILS - 1)
 
 
 def test_dense_speculation_falls_back_exactly_when_prompt_exceeds_draft_vocab(tmp_path):

@@ -492,9 +492,14 @@ def test_glm53_serial_verifier_reprojects_growing_mla_prefix():
         sweep_signature.parameters["incremental_expanded_mla"].default
         is True
     )
+    assert (
+        sweep_signature.parameters["coalesce_serial_barriers"].default
+        is False
+    )
     serial_source = inspect.getsource(
         StreamingEngine.forward_tokens_serial_positions)
     assert "incremental_expanded_mla=False" in serial_source
+    assert "glm53_serial_verify_coalesced_barriers" in serial_source
 
 
 def test_glm53_coalesced_expert_position_limit_must_be_positive():

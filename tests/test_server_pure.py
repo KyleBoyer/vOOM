@@ -382,6 +382,17 @@ def test_vision_protocol_timing_exposes_qwen4_verifier_pipeline_and_q_calibratio
             "expert_batch_prefetch_decode_hidden_s": 3.0,
             "expert_compute_batches": 144,
             "max_experts_per_compute_batch": 4,
+            "glm53_serial_verify_coalesced_barriers": 1,
+            "glm53_serial_verify_coalesced_barrier_groups": 144,
+            "glm53_serial_verify_coalesced_barrier_positions": 432,
+            "glm53_serial_verify_coalesced_eval_s": 1.75,
+            "speculative_rounds": [[3, 2, 123]],
+            "speculative_round_details": [{
+                "chosen_k": 3, "effective_k": 3,
+                "proposed": 3, "accepted": 2,
+            }],
+            "speculative_round_detail_total": 1,
+            "speculative_round_detail_dropped": 0,
         },
     })
 
@@ -421,6 +432,14 @@ def test_vision_protocol_timing_exposes_qwen4_verifier_pipeline_and_q_calibratio
     assert timing["expert_batch_prefetch_decode_hidden_s"] == 3.0
     assert timing["expert_compute_batches"] == 144
     assert timing["max_experts_per_compute_batch"] == 4
+    assert timing["glm53_serial_verify_coalesced_barriers"] == 1
+    assert timing["glm53_serial_verify_coalesced_barrier_groups"] == 144
+    assert timing["glm53_serial_verify_coalesced_barrier_positions"] == 432
+    assert timing["glm53_serial_verify_coalesced_eval_s"] == 1.75
+    assert timing["speculative_rounds"] == [[3, 2, 123]]
+    assert timing["speculative_round_details"][0]["accepted"] == 2
+    assert timing["speculative_round_detail_total"] == 1
+    assert timing["speculative_round_detail_dropped"] == 0
 
 
 def test_vision_protocol_timing_exposes_qwen_mtp_round_trace():
@@ -2829,6 +2848,8 @@ def test_glm53_hot_prompt_kv_is_opt_in_exact_and_in_engine_identity():
         ("VMODEL_GLM53_EXPERT_BATCH_PREFETCH", "auto", "must be 0 or 1"),
         ("VMODEL_GLM53_EXPERT_BATCH_PREFETCH_PREFILL_ONLY", "auto",
          "must be 0 or 1"),
+        ("VMODEL_GLM53_SERIAL_VERIFY_COALESCED_BARRIERS", "auto",
+         "must be 0 or 1"),
         ("VMODEL_GLM53_SHORT_STREAM_LM_HEAD", "auto", "must be 0 or 1"),
         ("VMODEL_GLM53_EXPERT_BATCH_PREFETCH_DEPTH", "4",
          "must be in \\[1, 3\\]"),
@@ -3027,6 +3048,7 @@ def test_glm53_expert_storage_batch_and_pipeline_are_explicit_identity(
         "VMODEL_GLM53_EXPERT_FETCH_BATCH": "1",
         "VMODEL_GLM53_EXPERT_BATCH_PREFETCH": "0",
         "VMODEL_GLM53_EXPERT_BATCH_PREFETCH_PREFILL_ONLY": "0",
+        "VMODEL_GLM53_SERIAL_VERIFY_COALESCED_BARRIERS": "0",
         "VMODEL_GLM53_EXPERT_BATCH_PREFETCH_DEPTH": "1",
         "VMODEL_GLM53_EXPERT_BATCH_PREFETCH_WORKERS": "1",
         "VMODEL_GLM53_TRUNK_PREFETCH_DEPTH": "0",
@@ -3072,6 +3094,7 @@ def test_glm53_expert_storage_batch_and_pipeline_are_explicit_identity(
     assert candidate.prefetch_depth == 1
     assert candidate.prefetch_workers == 2
     assert not candidate.glm53_expert_batch_prefetch_prefill_only
+    assert not candidate.glm53_serial_verify_coalesced_barriers
     assert prefill_only.glm53_expert_batch_prefetch_prefill_only
     assert prefill_only.expert_batch_prefetch
     assert candidate.max_weight_cache_mb == (
@@ -3084,6 +3107,60 @@ def test_glm53_expert_storage_batch_and_pipeline_are_explicit_identity(
         assert not candidate.pin_lm_head and candidate.stream_lm_head
     # Storage grouping never changes the verified arithmetic grouping.
     assert candidate.expert_compute_batch == 1
+
+
+def test_glm53_serial_verify_coalesced_barriers_are_flash_only_identity():
+    from unittest.mock import patch
+
+    from runtime.server import EngineManager, RequestValidationError
+
+    captured = []
+
+    class FakeEngine:
+        def __init__(self, _path, rc):
+            self.rc = rc
+            captured.append(rc)
+
+        def close(self):
+            pass
+
+    flash = SimpleNamespace(
+        model_type="glm5_next", tie_word_embeddings=False,
+        index_topk=2048, max_position_embeddings=1_048_576,
+        vision_config=None, num_experts_per_tok=8,
+    )
+    settings = {
+        "VMODEL_GLM53_MTP": "0",
+        "VMODEL_GLM53_SERIAL_VERIFY_COALESCED_BARRIERS": "0",
+    }
+    with patch.dict("os.environ", settings, clear=False), \
+         patch("runtime.config.ModelConfig.from_dir", return_value=flash), \
+         patch("runtime.path_resolver.resolve_model_dir",
+               side_effect=lambda path: path), \
+         patch("runtime.engine.StreamingEngine", FakeEngine):
+        manager = EngineManager()
+        manager.get(Path("/tmp/fake-glm53-flash-barriers"), "lossless")
+        os.environ[
+            "VMODEL_GLM53_SERIAL_VERIFY_COALESCED_BARRIERS"] = "1"
+        manager.get(Path("/tmp/fake-glm53-flash-barriers"), "lossless")
+
+    assert len(captured) == 2
+    assert not captured[0].glm53_serial_verify_coalesced_barriers
+    assert captured[1].glm53_serial_verify_coalesced_barriers
+
+    full = SimpleNamespace(**{
+        **flash.__dict__, "model_type": "glm_moe_dsa",
+    })
+    with patch.dict(
+            "os.environ", {
+                "VMODEL_GLM53_SERIAL_VERIFY_COALESCED_BARRIERS": "1",
+            }, clear=False), \
+         patch("runtime.config.ModelConfig.from_dir", return_value=full), \
+         patch("runtime.path_resolver.resolve_model_dir",
+               side_effect=lambda path: path):
+        with pytest.raises(RequestValidationError, match="requires GLM-5.3-Flash"):
+            EngineManager().get(
+                Path("/tmp/fake-full-glm53-barriers"), "lossless")
 
 
 def test_glm53_sparse_absorbed_mla_is_explicit_and_in_engine_identity():

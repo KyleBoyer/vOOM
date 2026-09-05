@@ -1,0 +1,12 @@
+schema: voom.runtime-profile.v1
+name: glm53-flash-e-compact-mla-tile128-workers2-direct-fp8-qmv-mtp3-coalesced-barriers
+description: Explicit native-MTP profile with exact one-row verifier graphs sharing bounded evaluation barriers.
+notes:
+  - "Extends the semantic-gated direct-QMV/native-MTP composition. The target verifier retains each canonical one-position operator graph, recurrent dependency, expert order, released weight, and greedy decision; only the materialization roots of up to eight rows are submitted at one mx.eval boundary after their causal graph dependencies are preserved."
+  - "Inspired by SD-aware MoE pipelines that reduce synchronization and communication bubbles. This predicts no token or route and changes no target verification rule."
+  - "The path fails closed outside <=8 one-row in-memory verifier positions with canonical MLA reprojection. Require exact logits, every endpoint tensor, target tokens, reads, lower end-to-end wall, bounded Metal/swap, and a second request shape before recommending it."
+  - "This remains E-class/default-off because it inherits compact absorbed MLA even if the barrier-only scheduling change passes."
+extends:
+  - glm53-flash-e-compact-mla-tile128-workers2-direct-fp8-qmv-mtp3
+settings:
+  VMODEL_GLM53_SERIAL_VERIFY_COALESCED_BARRIERS: 1

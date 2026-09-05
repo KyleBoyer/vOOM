@@ -42,6 +42,7 @@ def main() -> None:
     parser.add_argument("--expert-fetch-batch", type=int, default=8)
     parser.add_argument("--expert-batch-prefetch-depth", type=int, default=2)
     parser.add_argument("--expert-batch-prefetch-workers", type=int, default=2)
+    parser.add_argument("--coalesced-barriers", action="store_true")
     parser.add_argument(
         "--trace-layer", type=int, default=-1,
         help="capture the reduced input/output of one MLA attention layer")
@@ -64,6 +65,8 @@ def main() -> None:
         args.expert_batch_prefetch_depth)
     os.environ["VMODEL_GLM53_EXPERT_BATCH_PREFETCH_WORKERS"] = str(
         args.expert_batch_prefetch_workers)
+    os.environ["VMODEL_GLM53_SERIAL_VERIFY_COALESCED_BARRIERS"] = (
+        "1" if args.coalesced_barriers else "0")
 
     from runtime.server import EngineManager
 
@@ -173,6 +176,7 @@ def main() -> None:
             "model": str(args.model),
             "prompt_tokens": seed["prompt_tokens"],
             "window": window,
+            "coalesced_barriers": bool(args.coalesced_barriers),
             "sequential_s": sequential_s,
             "serial_s": serial_s,
             "sequential_reads": sequential_reads,

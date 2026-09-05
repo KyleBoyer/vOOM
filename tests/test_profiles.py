@@ -343,6 +343,19 @@ def test_builtin_profiles_resolve_complete_agent_group():
     assert glm_compact_pipeline_settings[
         "VMODEL_GLM53_EXPERT_BATCH_PREFETCH"] == "1"
 
+    glm_barrier_order, glm_barrier_settings = resolve_runtime_profiles((
+        "glm53-flash-e-compact-mla-tile128-workers2-"
+        "direct-fp8-qmv-mtp3-coalesced-barriers",
+    ), catalog)
+    assert glm_barrier_order[-2:] == (
+        "glm53-flash-e-compact-mla-tile128-workers2-"
+        "direct-fp8-qmv-mtp3",
+        "glm53-flash-e-compact-mla-tile128-workers2-"
+        "direct-fp8-qmv-mtp3-coalesced-barriers",
+    )
+    assert glm_barrier_settings[
+        "VMODEL_GLM53_SERIAL_VERIFY_COALESCED_BARRIERS"] == "1"
+
     qwen_direct_order, qwen_direct_settings = resolve_runtime_profiles((
         "qwen38-flash-next-uncensored-fp8-fast-tier-mtp-"
         "direct-fp8-qmv-decode-only",

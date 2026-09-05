@@ -28,6 +28,9 @@ from .engine import StreamingEngine
 from .sampler import SamplingParams
 
 
+_MAX_SPECULATIVE_ROUND_DETAILS = 256
+
+
 @dataclass
 class SpecStats:
     sweeps: int = 0  # target calls; MoE store-accounted bytes depend on lane unions
@@ -41,6 +44,19 @@ class SpecStats:
     resident_draft_rounds: int = 0
     resident_draft_tokens: int = 0
     rounds: list = field(default_factory=list)  # F01: (k_eff, m_accepted, verify_bytes) per round
+    # Bounded, request-local cost attribution for adaptive/offload research.
+    # No token IDs, expert IDs, or prompt content are retained.
+    round_details: list[dict] = field(default_factory=list)
+    round_detail_total: int = 0
+    round_detail_dropped: int = 0
+
+    def record_round_detail(self, detail: dict) -> None:
+        """Retain a fixed-size diagnostic prefix and count omitted rounds."""
+        self.round_detail_total += 1
+        if len(self.round_details) < _MAX_SPECULATIVE_ROUND_DETAILS:
+            self.round_details.append(detail)
+        else:
+            self.round_detail_dropped += 1
 
     def summary(self) -> str:
         acc = self.accepted / self.proposed * 100 if self.proposed else 0.0
@@ -381,11 +397,35 @@ class SpeculativeDecoder:
 
         request_cache_before = _cache_io_snapshot(tgt)
         request_direct_io_before = _direct_io_snapshot(tgt)
-        expert_pipeline_before = (
-            int(getattr(tgt, "_expert_batch_prefetch_submitted", 0) or 0),
-            float(getattr(tgt, "_expert_batch_prefetch_wait_s", 0.0) or 0.0),
-            float(getattr(tgt, "_expert_batch_prefetch_hidden_s", 0.0) or 0.0),
-        )
+
+        def expert_pipeline_snapshot(engine) -> dict:
+            snapshot = {
+                "submitted": int(getattr(
+                    engine, "_expert_batch_prefetch_submitted", 0) or 0),
+                "wait_s": float(getattr(
+                    engine, "_expert_batch_prefetch_wait_s", 0.0) or 0.0),
+                "hidden_s": float(getattr(
+                    engine, "_expert_batch_prefetch_hidden_s", 0.0) or 0.0),
+            }
+            for phase in ("prefill", "decode"):
+                for metric, attribute in (
+                    ("submitted", "_expert_batch_prefetch_submitted_by_phase"),
+                    ("wait_s", "_expert_batch_prefetch_wait_s_by_phase"),
+                    ("hidden_s", "_expert_batch_prefetch_hidden_s_by_phase"),
+                ):
+                    values = getattr(engine, attribute, {}) or {}
+                    cast = int if metric == "submitted" else float
+                    snapshot[f"{phase}_{metric}"] = cast(
+                        values.get(phase, 0) or 0)
+            return snapshot
+
+        def expert_pipeline_delta(before: dict, after: dict) -> dict:
+            return {
+                key: max(0, after[key] - before[key])
+                for key in before
+            }
+
+        expert_pipeline_before = expert_pipeline_snapshot(tgt)
 
         if isinstance(max_tokens, bool) or not isinstance(max_tokens, int) or max_tokens <= 0:
             raise ValueError("max_tokens must be a positive integer")
@@ -641,13 +681,18 @@ class SpeculativeDecoder:
                and not bool(constraint is not None and constraint.completed)):
             # --- propose k tokens: draft model, or F11 prompt-lookup (zero-model) ---
             t0 = time.perf_counter()
+            emitted_before = len(emitted)
+            draft_pipeline_engine = drf if drf is not None else tgt
+            draft_pipeline_before = expert_pipeline_snapshot(
+                draft_pipeline_engine)
             draft_cache = drf.cache if drf is not None else tgt.cache
             b_draft0 = draft_cache.stats.bytes_read  # F01 telemetry
             # A verify round commits up to k proposals plus one target token.
             # Bound k by the caller's remaining output budget so the final
             # round cannot leave target KV/routing state past the returned text.
+            chosen_k = self._choose_k()
             k = min(
-                self._choose_k(),
+                chosen_k,
                 max(0, max_tokens - len(emitted) - 1),
             )  # F48: byte-marginal adaptive draft length
             if k == 0:  # speculation not paying this round — plain step
@@ -719,14 +764,19 @@ class SpeculativeDecoder:
                             draft_fed += 1  # cur is now absorbed in draft KV
                             cur = int(mx.argmax(dl[-1]))
                             proposals.append(cur)
-            stats.draft_s += time.perf_counter() - t0
-            stats.draft_bytes += draft_cache.stats.bytes_read - b_draft0
+            draft_elapsed = time.perf_counter() - t0
+            draft_read_bytes = draft_cache.stats.bytes_read - b_draft0
+            stats.draft_s += draft_elapsed
+            stats.draft_bytes += draft_read_bytes
+            draft_pipeline_after = expert_pipeline_snapshot(
+                draft_pipeline_engine)
             k_eff = len(proposals)  # lookup may propose fewer (or zero) tokens
 
             # --- target verifies all proposals in ONE sweep ---
             base = t_kv.offset  # == len(all_tokens) - 1
             t0 = time.perf_counter()
             b_verify0 = tgt.cache.stats.bytes_read  # F01 telemetry
+            verify_pipeline_before = expert_pipeline_snapshot(tgt)
             tgt.begin_provisional()  # F55: routing stats commit post-acceptance
             verify_tokens = [all_tokens[-1]] + proposals
             glm5_recurrent = tgt.cfg.model_type == "glm5_next"
@@ -757,7 +807,8 @@ class SpeculativeDecoder:
                 # if verification is interrupted or fails.
                 tgt._provisional = None
                 raise
-            stats.verify_s += time.perf_counter() - t0
+            verify_elapsed = time.perf_counter() - t0
+            stats.verify_s += verify_elapsed
             round_bytes = tgt.cache.stats.bytes_read - b_verify0
             stats.sweeps += 1
             if constraint is None:
@@ -801,6 +852,34 @@ class SpeculativeDecoder:
             stats.proposed += k_eff
             stats.accepted += m
             stats.rounds.append((k_eff, m, round_bytes))  # F01 per-round physical bytes
+            verify_pipeline_after = expert_pipeline_snapshot(tgt)
+            draft_pipeline_delta = expert_pipeline_delta(
+                draft_pipeline_before, draft_pipeline_after)
+            verify_pipeline_delta = expert_pipeline_delta(
+                verify_pipeline_before, verify_pipeline_after)
+            round_detail = {
+                "chosen_k": int(chosen_k),
+                "effective_k": int(k),
+                "proposed": int(k_eff),
+                "accepted": int(m),
+                "planned_commit": int(len(new)),
+                "draft_s": float(draft_elapsed),
+                "verify_s": float(verify_elapsed),
+                "draft_bytes": int(draft_read_bytes),
+                "verify_bytes": int(round_bytes),
+                "draft_prefetch_submitted": int(
+                    draft_pipeline_delta["submitted"]),
+                "draft_prefetch_wait_s": float(
+                    draft_pipeline_delta["wait_s"]),
+                "draft_prefetch_hidden_s": float(
+                    draft_pipeline_delta["hidden_s"]),
+                "verify_prefetch_submitted": int(
+                    verify_pipeline_delta["submitted"]),
+                "verify_prefetch_wait_s": float(
+                    verify_pipeline_delta["wait_s"]),
+                "verify_prefetch_hidden_s": float(
+                    verify_pipeline_delta["hidden_s"]),
+            }
             # F48 v2: fit the marginal cost from live telemetry
             if k_eff == 0:
                 self._plain_bytes.append(round_bytes)
@@ -893,6 +972,9 @@ class SpeculativeDecoder:
             if self.mtp is not None and self._mtp_kv.offset > endpoint - 1:
                 self._mtp_kv.trim(endpoint - 1)
             stats.emitted = len(emitted)
+            round_detail["emitted_commit"] = int(
+                len(emitted) - emitted_before)
+            stats.record_round_detail(round_detail)
 
         stats.emitted = len(emitted)
         final_text = (stop_text if stop_text is not None
@@ -994,6 +1076,9 @@ class SpeculativeDecoder:
                 0.0, stats.verify_s - prefill_s),
             "speculative_draft_bytes": stats.draft_bytes,
             "speculative_rounds": [list(values) for values in stats.rounds],
+            "speculative_round_details": list(stats.round_details),
+            "speculative_round_detail_total": stats.round_detail_total,
+            "speculative_round_detail_dropped": stats.round_detail_dropped,
             "speculative_draft_oov_fallbacks": stats.draft_oov_fallbacks,
             "speculative_resident_draft_rounds": stats.resident_draft_rounds,
             "speculative_resident_draft_tokens": stats.resident_draft_tokens,
@@ -1040,6 +1125,19 @@ class SpeculativeDecoder:
                     "rows_17_32_calls", "rows_33_plus_calls"):
                 path_stats[f"glm53_exact_expert_{metric}"] = int(
                     layer_stats.get(f"exact_expert_{metric}", 0))
+            path_stats["glm53_serial_verify_coalesced_barriers"] = int(
+                layer_stats.get("serial_verify_coalesced_barriers", 0))
+            path_stats[
+                "glm53_serial_verify_coalesced_barrier_groups"] = int(
+                    layer_stats.get(
+                        "serial_verify_coalesced_barrier_groups", 0))
+            path_stats[
+                "glm53_serial_verify_coalesced_barrier_positions"] = int(
+                    layer_stats.get(
+                        "serial_verify_coalesced_barrier_positions", 0))
+            path_stats["glm53_serial_verify_coalesced_eval_s"] = float(
+                layer_stats.get(
+                    "serial_verify_coalesced_eval_s", 0.0))
         request_cache_after = _cache_io_snapshot(tgt)
         _record_cache_io_delta(
             tgt, request_cache_before, path_stats,
@@ -1051,17 +1149,22 @@ class SpeculativeDecoder:
             tgt, prefill_cache_after, path_stats,
             prefix="decode_", after=request_cache_after)
         _record_direct_io_delta(tgt, request_direct_io_before, path_stats)
-        expert_pipeline_after = (
-            int(getattr(tgt, "_expert_batch_prefetch_submitted", 0) or 0),
-            float(getattr(tgt, "_expert_batch_prefetch_wait_s", 0.0) or 0.0),
-            float(getattr(tgt, "_expert_batch_prefetch_hidden_s", 0.0) or 0.0),
-        )
-        path_stats["expert_batch_prefetch_submitted"] = max(
-            0, expert_pipeline_after[0] - expert_pipeline_before[0])
-        path_stats["expert_batch_prefetch_wait_s"] = max(
-            0.0, expert_pipeline_after[1] - expert_pipeline_before[1])
-        path_stats["expert_batch_prefetch_hidden_s"] = max(
-            0.0, expert_pipeline_after[2] - expert_pipeline_before[2])
+        expert_pipeline_after = expert_pipeline_snapshot(tgt)
+        request_pipeline_delta = expert_pipeline_delta(
+            expert_pipeline_before, expert_pipeline_after)
+        path_stats["expert_batch_prefetch_submitted"] = int(
+            request_pipeline_delta["submitted"])
+        path_stats["expert_batch_prefetch_wait_s"] = float(
+            request_pipeline_delta["wait_s"])
+        path_stats["expert_batch_prefetch_hidden_s"] = float(
+            request_pipeline_delta["hidden_s"])
+        for phase in ("prefill", "decode"):
+            path_stats[f"expert_batch_prefetch_{phase}_submitted"] = int(
+                request_pipeline_delta[f"{phase}_submitted"])
+            path_stats[f"expert_batch_prefetch_{phase}_wait_s"] = float(
+                request_pipeline_delta[f"{phase}_wait_s"])
+            path_stats[f"expert_batch_prefetch_{phase}_hidden_s"] = float(
+                request_pipeline_delta[f"{phase}_hidden_s"])
         execution_profile = (
             tgt._request_profiler.result(total_s)
             if tgt._request_profiler is not None else None)

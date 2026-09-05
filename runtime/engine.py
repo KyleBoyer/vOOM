@@ -933,6 +933,12 @@ class RuntimeConfig:
     # returns to the synchronous demand path. This is a scheduling-only
     # experiment; expert bytes and arithmetic are unchanged.
     glm53_expert_batch_prefetch_prefill_only: bool = False
+    # Exact GLM-5.3-Flash verifier scheduling experiment. Serial target
+    # verification keeps every one-position operator graph and recurrent
+    # dependency unchanged, but may submit the <=8 independent row outputs at
+    # one shared mx.eval boundary instead of synchronizing after every row.
+    # This is explicit/default-off until real target state and timing gates.
+    glm53_serial_verify_coalesced_barriers: bool = False
     # Exact I/O-only overlap for Qwen4's long prefill. Routed expert batches
     # are fetched on the existing bounded worker during prefill, then decode
     # returns to the validated synchronous schedule. This avoids carrying the
@@ -1782,6 +1788,8 @@ class RuntimeConfig:
             expert_batch_prefetch=run.get("expert_batch_prefetch", False),
             glm53_expert_batch_prefetch_prefill_only=run.get(
                 "glm53_expert_batch_prefetch_prefill_only", False),
+            glm53_serial_verify_coalesced_barriers=run.get(
+                "glm53_serial_verify_coalesced_barriers", False),
             qwen4_expert_batch_prefetch_prefill_only=run.get(
                 "qwen4_expert_batch_prefetch_prefill_only", False),
             expert_batch_prefetch_depth=run.get(
@@ -8389,7 +8397,8 @@ class StreamingEngine:
     def _layer_stationary_glm5_next_sweep(
             self, x: mx.array, kv, offset: int, tile_width: int,
             on_progress=None, tap_layers=None, *,
-            incremental_expanded_mla: bool = True) -> mx.array:
+            incremental_expanded_mla: bool = True,
+            coalesce_serial_barriers: bool = False) -> mx.array:
         """Layer-major bounded prefill for GLM-5.3's mHC/KDA/DSA stack.
 
         The released block is separable by position around its two stateful
@@ -8420,6 +8429,13 @@ class StreamingEngine:
         total = int(x.shape[1])
         if total <= 0:
             return x
+        if coalesce_serial_barriers and (
+                tile_width != 1 or total > 8 or incremental_expanded_mla
+                or self.rc.glm53_layer_stationary_host_spool
+                or self.rc.glm53_layer_stationary_disk_spool_dir):
+            raise ValueError(
+                "GLM-5.3 serial barrier coalescing requires <=8 one-row "
+                "in-memory verifier positions and canonical MLA reprojection")
         spans = [
             (start, min(start + tile_width, total))
             for start in range(0, total, tile_width)
@@ -8546,6 +8562,9 @@ class StreamingEngine:
         ffn_hc_pre_s = 0.0
         mlp_s = 0.0
         ffn_hc_post_s = 0.0
+        serial_barrier_groups = 0
+        serial_barrier_positions = 0
+        serial_coalesced_eval_s = 0.0
         coalesced_stats = {
             "layers": 0,
             "input_positions": 0,
@@ -8608,6 +8627,15 @@ class StreamingEngine:
                     f"tokens={completed_tokens} observed={observed} "
                     f"limit={metal_limit_bytes}")
 
+        def reserve_serial_group(reason: str) -> None:
+            """Reserve the bounded lazy roots before one coalesced eval."""
+            if (coalesce_serial_barriers and self.governor is not None
+                    and self._layer_transient):
+                self.governor.reserve(
+                    self._layer_transient * total,
+                    margin=self._layer_transient_margin,
+                    reason=reason)
+
         note_memory("initial_carrier", 0, total, publish=True)
         if profiler is not None:
             profiler.begin_sweep(
@@ -8661,12 +8689,14 @@ class StreamingEngine:
             mx.reset_peak_memory()
             compute_started = time.perf_counter()
 
+            reserve_serial_group("glm53-attention-coalesced-transient")
             for index, (start, end) in enumerate(spans):
                 if self.governor is not None and self._layer_transient:
-                    self.governor.reserve(
-                        self._layer_transient,
-                        margin=self._layer_transient_margin,
-                        reason="glm53-attention-transient")
+                    if not coalesce_serial_barriers:
+                        self.governor.reserve(
+                            self._layer_transient,
+                            margin=self._layer_transient_margin,
+                            reason="glm53-attention-transient")
                 here = offset + start
 
                 def attention(hidden, *, _here=here):
@@ -8698,7 +8728,8 @@ class StreamingEngine:
                 tile = deepseek_v4_attention_residual(
                     source_tile, hc, norms, attention, **common)
                 tile = tile.astype(mx.bfloat16)
-                mx.eval(tile)
+                if not coalesce_serial_barriers:
+                    mx.eval(tile)
                 attention_tile_s = (
                     time.perf_counter() - attention_tile_started)
                 attention_residual_s += attention_tile_s
@@ -8716,6 +8747,22 @@ class StreamingEngine:
                     publish=(index == 0 or end == total
                              or index % 64 == 0))
 
+            if coalesce_serial_barriers:
+                eval_started = time.perf_counter()
+                mx.eval(*tiles)
+                eval_s = time.perf_counter() - eval_started
+                serial_coalesced_eval_s += eval_s
+                attention_residual_s += eval_s
+                if layer in self.cfg.kda_layers:
+                    kda_attention_s += eval_s
+                else:
+                    mla_attention_s += eval_s
+                serial_barrier_groups += 1
+                serial_barrier_positions += total
+                note_memory(
+                    "attention_coalesced_eval", layer, total,
+                    publish=False)
+
             if layer in self.cfg.full_attn_layers:
                 _glm53_release_expanded_prefill_layer(kv, layer)
                 mx.clear_cache()
@@ -8724,6 +8771,7 @@ class StreamingEngine:
             # row group separately. The MLP helper preserves those exact GEMM
             # shapes while sharing each routed expert page across the tiles.
             hidden_tiles, posts, combs = [], [], []
+            reserve_serial_group("glm53-ffn-hc-pre-coalesced-transient")
             for index, (tile, (_start, end)) in enumerate(zip(tiles, spans)):
                 hc_pre_started = time.perf_counter()
                 source_tile = (
@@ -8743,7 +8791,8 @@ class StreamingEngine:
                 # 14.0-GB active Metal peak). Materialize and sever each tile's
                 # graph here; arithmetic and per-tile operator order are
                 # unchanged, while live scratch is O(tile_width), not O(S).
-                mx.eval(hidden, post, comb)
+                if not coalesce_serial_barriers:
+                    mx.eval(hidden, post, comb)
                 ffn_hc_pre_s += time.perf_counter() - hc_pre_started
                 hidden_tiles.append(hidden)
                 posts.append(post)
@@ -8755,6 +8804,18 @@ class StreamingEngine:
                     "ffn_hc_pre_tile", layer, end,
                     publish=(index == 0 or end == total
                              or index % 64 == 0))
+
+            if coalesce_serial_barriers:
+                eval_started = time.perf_counter()
+                mx.eval(*hidden_tiles, *posts, *combs)
+                eval_s = time.perf_counter() - eval_started
+                serial_coalesced_eval_s += eval_s
+                ffn_hc_pre_s += eval_s
+                serial_barrier_groups += 1
+                serial_barrier_positions += total
+                note_memory(
+                    "ffn_hc_pre_coalesced_eval", layer, total,
+                    publish=False)
 
             if self.governor is not None and self._layer_transient:
                 self.governor.reserve(
@@ -8780,6 +8841,7 @@ class StreamingEngine:
                 step_before, mx.get_active_memory(), mx.get_peak_memory())
             del hidden_tiles
 
+            reserve_serial_group("glm53-ffn-hc-post-coalesced-transient")
             for index, (start, end) in enumerate(spans):
                 hc_post_started = time.perf_counter()
                 source_tile = (
@@ -8788,7 +8850,8 @@ class StreamingEngine:
                 merged = hc_post(
                     mlp_tiles[index], source_tile,
                     posts[index], combs[index]).astype(mx.bfloat16)
-                mx.eval(merged)
+                if not coalesce_serial_barriers:
+                    mx.eval(merged)
                 ffn_hc_post_s += time.perf_counter() - hc_post_started
                 tiles[index] = (
                     store_bits(index, merged) if spooled else merged)
@@ -8799,6 +8862,17 @@ class StreamingEngine:
                     "ffn_hc_post_tile", layer, end,
                     publish=(index == 0 or end == total
                              or index % 64 == 0))
+            if coalesce_serial_barriers:
+                eval_started = time.perf_counter()
+                mx.eval(*tiles)
+                eval_s = time.perf_counter() - eval_started
+                serial_coalesced_eval_s += eval_s
+                ffn_hc_post_s += eval_s
+                serial_barrier_groups += 1
+                serial_barrier_positions += total
+                note_memory(
+                    "ffn_hc_post_coalesced_eval", layer, total,
+                    publish=False)
             del mlp_tiles, posts, combs
 
             if layer in tapset:
@@ -8952,6 +9026,20 @@ class StreamingEngine:
                 "mlp_s", 0.0)) + mlp_s,
             "ffn_hc_post_s": float(previous_stats.get(
                 "ffn_hc_post_s", 0.0)) + ffn_hc_post_s,
+            "serial_verify_coalesced_barriers": int(
+                bool(coalesce_serial_barriers)),
+            "serial_verify_coalesced_barrier_groups": int(
+                previous_stats.get(
+                    "serial_verify_coalesced_barrier_groups", 0)
+            ) + serial_barrier_groups,
+            "serial_verify_coalesced_barrier_positions": int(
+                previous_stats.get(
+                    "serial_verify_coalesced_barrier_positions", 0)
+            ) + serial_barrier_positions,
+            "serial_verify_coalesced_eval_s": float(
+                previous_stats.get(
+                    "serial_verify_coalesced_eval_s", 0.0)
+            ) + serial_coalesced_eval_s,
             **{
                 f"exact_expert_{metric}": int(previous_stats.get(
                     f"exact_expert_{metric}", 0)) + int(
@@ -9842,7 +9930,9 @@ class StreamingEngine:
             x_all = self._layer_stationary_glm5_next_sweep(
                 embedded, kv, offset, tile_width=1,
                 tap_layers=tap_layers,
-                incremental_expanded_mla=False)
+                incremental_expanded_mla=False,
+                coalesce_serial_barriers=(
+                    self.rc.glm53_serial_verify_coalesced_barriers))
             positions = [
                 x_all[:, position:position + 1, :]
                 for position in range(x_all.shape[1])

@@ -1,4 +1,52 @@
-# STATUS — 2026-09-04 (current corrections first; dated chronology below is history)
+# STATUS — 2026-09-05 (current corrections first; dated chronology below is history)
+
+## 2026-09-05: verifier-round cost traces and exact bounded barrier coalescing
+
+Native-MTP requests now report bounded per-round draft/verify seconds, model
+bytes, chosen/effective proposal widths, accepted/planned/emitted positions,
+and expert-prefetch submitted/wait/hidden time, plus request-level
+prefill/decode expert-prefetch attribution. Detailed records are capped at 256
+rows with explicit total/dropped counters.
+The records contain no token IDs, routes, expert IDs, or prompt content. This
+separates an expensive draft, target sweep, and I/O bubble instead of inferring
+the bottleneck from a single aggregate acceptance ratio.
+
+An explicit GLM-5.3-Flash verifier experiment also keeps the canonical
+one-position graph and recurrent dependencies but submits each group of at
+most eight independent row outputs at one shared `mx.eval` boundary. It fails
+closed for wider, spooled, incremental-MLA, or non-Flash execution. Against
+the released uncensored checkpoint and the current three-position window
+`[17815, 1172, 279]`, both control and candidate matched every top-1, every
+logit row, all 48 layer taps, aggregate state, and all 159 endpoint tensor
+hashes. Serial verification improved **23.6044 -> 23.3657s (1.01%)** with the
+same 31,391,203,576 model bytes; total oracle wall moved 155.512 -> 154.580s.
+This proves arithmetic/state exactness for the full retained endpoint. The
+serial timing is ordering-biased because it followed the sequential arm in one
+engine, and the original fixture did not exercise partial-prefix KDA rollback.
+It is therefore not a clean speed A/B or end-to-end promotion. A second oracle
+now covers every strict rollback prefix: all three reconstructed endpoints
+matched 157 attention/DSA/KDA/convolution checks apiece, all 45 layers matched
+at all three positions, logits were array-equal, and peak Metal was 2.365GB.
+The profile proceeds next to a counterbalanced semantic request and unrelated
+shape.
+
+Fresh primary-source review reinforces that transfer-only expert prediction
+is the credible next research direction: SpecPrefetch keeps native routing
+authoritative while predicting only future transfers; MoE-SpeQ uses a small
+draft for future expert demand; SP-MoE makes prefetch conditional on measured
+speculative behavior; EcoSpec chooses drafts partly to reuse already activated
+experts. None is imported as a claim here: this runtime still needs an offline
+route-prediction trace and a measured I/O/Metal overlap gate before adding a
+predictor or sidecar.
+
+Evidence:
+`logs/glm53_flash_serial_barrier_{control,candidate}_window3_retry_20260905.json`,
+`logs/gate_glm53_flash_serial_barrier_{control,candidate}_window3_retry_20260905/`,
+`logs/glm53_flash_serial_barrier_rollback_oracle_20260905.json`,
+and
+`logs/preflight_glm53_serial_barrier_rollback_oracle_20260905.json`.
+Primary sources: arXiv 2607.24787 (SpecPrefetch), arXiv 2511.14102 (MoE-SpeQ),
+arXiv 2510.10302 (SP-MoE), and arXiv 2607.12696 (EcoSpec).
 
 ## 2026-09-04: packed decode plus released native MTP cuts the semantic gate 45%
 

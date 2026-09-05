@@ -26,6 +26,7 @@ def test_exact_expert_batch_pipeline_remains_explicit_opt_in():
 
     assert not RuntimeConfig().expert_batch_prefetch
     assert not RuntimeConfig().glm53_expert_batch_prefetch_prefill_only
+    assert not RuntimeConfig().glm53_serial_verify_coalesced_barriers
     assert not RuntimeConfig().expert_route_overlap_telemetry
 
 

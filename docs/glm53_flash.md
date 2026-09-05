@@ -1,5 +1,35 @@
 # GLM-5.3-Flash on the 16 GB M4
 
+## Native-MTP verifier instrumentation (2026-09-05)
+
+`VMODEL_GLM53_SERIAL_VERIFY_COALESCED_BARRIERS=1` is an explicit scheduling
+experiment for native-MTP target verification. It preserves each canonical
+one-row operator graph, recurrence, expert order, target token decision, and
+released representation while sharing three `mx.eval` boundaries across at
+most eight independent verifier rows. It rejects wider, spooled,
+incremental-MLA, and non-Flash execution.
+
+The released-checkpoint three-position oracle matched all top-1 tokens, every
+logit row, all 48 layer taps, aggregate state, and all 159 endpoint tensor
+hashes. Its isolated serial phase improved 23.6044 -> 23.3657 seconds (1.01%)
+with unchanged model bytes. This is too small for promotion without an
+end-to-end semantic A/B and an unrelated request shape, so the derived
+`glm53-flash-e-compact-mla-tile128-workers2-direct-fp8-qmv-mtp3-coalesced-barriers`
+profile remains explicit/E-class.
+
+The stricter rollback oracle also retained compact KDA factors and rebuilt all
+three possible accepted prefixes. Every prefix matched 157 attention, DSA,
+KDA-state, and convolution-history checks; logits and every layer tap were
+array-equal, with a 2.365GB peak. This closes the verifier rollback correctness
+gap but is still not a counterbalanced end-to-end latency result.
+
+Native speculative requests also expose content-free per-round cost records:
+chosen/effective/proposed/accepted/planned/emitted counts, draft and verify
+seconds/bytes, and draft/verify expert-prefetch submitted/wait/hidden time.
+Detailed records are capped at 256 rows with total/dropped counters. Request-level
+expert-prefetch cost is split into prefill and decode. These counters are the
+decision input for future adaptive I/O work; they do not alter generation.
+
 ## Exact packed routed-expert QMV (2026-09-04)
 
 `VMODEL_GLM53_FP8_DIRECT_QMV=1` is a new explicit lossless representation and
