@@ -1,5 +1,47 @@
 # STATUS — 2026-09-05 (current corrections first; dated chronology below is history)
 
+## 2026-09-05: Qwen idle cleanup matches baseline outputs, no meaningful speed win
+
+The cleanup-disabled parent profile completed the same two **modified two-tool,
+short-system/history, developer-role, streaming/progress, greedy/seed64001,
+reasoning-unspecified** workspace requests. Each rendered1,611 input tokens,
+used zero cached tokens and naturally completed at70 output tokens below the
+512 budget, with one correct read-file call plus message. No tool was executed.
+Both transmitted-wire hashes match the prior arm's explicitly reconstructed
+`e5e51779...9bf34b` (5,543bytes). All four stable decoded-output hashes match
+`0d9db4d2...f60e6`; both arms have identical MTP47/67 acceptance,23 sweeps,
+118.877GB prefill/352.581GB decode/471.458GB total store reads per request.
+This is completed-call, decoded-content equivalence on this shape, not a raw
+token-ID/state oracle, untouched134-tool capture or broad intelligence proof.
+
+| request state (OS caches not purged) | baseline wall | cleanup wall |
+|---|---:|---:|
+| fresh server, uncached prompt | 357.1221s | 356.6331s |
+| model already loaded, uncached prompt | 341.3728s | 341.2937s |
+
+Total HTTP wall698.4949 ->697.9268s is only0.081% lower, **not a meaningful
+speed win**. Baseline engine prefill117.0513/115.3618s,
+decode225.5141/225.9338s, first token117.0515/115.3638s, totals342.5676/341.3000s.
+Both arms still **FAIL pressure**. Baseline available memory started6.303GB
+versus7.290GB in the cleanup arm, ending4.693/4.669GB; that different starting
+state confounds any claimed physical-reclamation comparison. Baseline swap-out
+grew11.321MB first/25.625MB cumulative and usage0.524MB, with no prefill retries.
+Reported baseline peak2.107GB on both calls; cleanup's second peak was2.255GB,
+so endpoint release has not demonstrated a lower peak either. It stays opt-in.
+
+Baseline source`744fcfb`, parent FAIL/exit1, wall701.5142s, no timeout/source
+drift, root free minimum18.968GB; all model processes ended. Evidence:
+`logs/qwen_flash_idle_baseline_workspace_stream512_20260905.json` and its
+`.done.json` envelope. The21:41 retry preflight passed at6.084/6.120GB with
+zero swap growth/churn, superseding the earlier deferred launch below.
+
+Next credible lever: audit exact hot-prompt-KV composition with the current
+native-MTP/exact-fused prefill pipeline. Both completed-tool repeats currently
+pay approximately116s of prefill despite identical prompts. Existing hot-KV
+has older uncensored-FP8 continuation evidence but no sufficient-output proof
+with this newer composition. Preserve ownership/correctness and frozen pressure
+gates; do not promote it or infer cache hits until a real gate measures them.
+
 ## 2026-09-05: Qwen cleanup survives completed streaming workspace calls; pressure fails
 
 The opt-in idle-release profile completed two consecutive **modified two-real-
