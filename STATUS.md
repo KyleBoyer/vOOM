@@ -1,5 +1,42 @@
 # STATUS — 2026-09-05 (current corrections first; dated chronology below is history)
 
+## 2026-09-05: prepare exact hot-KV composition with independent output-hash gate
+
+New explicit profile `qwen38-flash-next-uncensored-fp8-exact-pipeline-hot-kv`
+extends only the current exact-fused pipeline and changes the four existing
+hot-KV controls: enabled, two slots, minimum16 tokens and empty persistence
+directory. It does not enable idle disposal. The resolved-settings regression
+checks every other setting remains unchanged. Do not combine the older hot-KV
+group with the newer pipeline as separate selections: ancestor reapplication
+can reset compiled-Delta/allocator settings or disable hot KV, depending on order.
+
+Read-only audit found no topology prohibition at the1611-token workspace shape.
+The server supplies a scaffold-free stable token boundary; the engine forks
+its matching KV/KDA/QSA/PLE state, and MTP preserves that distinct cache owner.
+An identical repeat can take the exact-prefix extension path. Expect `cold`
+then `memory`, with fewer than1611 cached tokens; the precise boundary has not
+yet been measured for this shape. Qwen4 currently splits the initial boundary
+and scaffold into separate prefill sweeps, so a cold-start cost or output
+divergence must be measured, not assumed away.
+
+The replay fixture now supports an optional independent stable-output SHA256
+expectation and fails on mismatch or absent hash. No request construction or
+runtime arithmetic changed. **88 pure tests passed in2.55s**:14 profiles,
+42 cleanup ownership,32 replay checks, including complete mocked-run hash/peak
+pass/fail cases and malformed expected-hash rejection before capture access.
+This does not constitute a model state-equivalence proof.
+
+Next bounded run uses the same modified two-real-workspace-tool, short-history,
+developer-role, streaming/progress, greedy/seed64001, reasoning-unspecified
+requests, max512 and two repeats. Require completed calls, the existing
+baseline's decoded-output hash on both, first cache source cold, second memory
+with at least1500 cached tokens, unchanged backend/profile identity and frozen
+8.5GB Metal/5.3GB final available/16MB swap gates. No tool execution and no
+full-capture or broad-corpus claim. Planned result:
+`logs/qwen_flash_exact_hotkv_workspace_stream512_20260905.json`, supervised
+by the matching `logs/gates/` envelope. Launch only after a fresh passing
+30-second preflight; inspect live jobs first and do not edit during measurement.
+
 ## 2026-09-05: Qwen idle cleanup matches baseline outputs, no meaningful speed win
 
 The cleanup-disabled parent profile completed the same two **modified two-tool,

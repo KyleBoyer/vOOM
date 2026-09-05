@@ -756,6 +756,9 @@ def main() -> int:
     parser.add_argument("--expected-min-text-deltas", type=int)
     parser.add_argument("--expected-output-type", choices=("message", "function_call"))
     parser.add_argument(
+        "--expected-output-sha256",
+        help="require the stable decoded-output hash from an independent baseline")
+    parser.add_argument(
         "--expected-gateway-phase", choices=("direct", "search", "enable"))
     parser.add_argument("--expected-execution-outcome")
     parser.add_argument("--expected-min-output-tokens", type=int)
@@ -841,6 +844,11 @@ def main() -> int:
     args = parser.parse_args()
     if args.repeats <= 0 or args.max_output_tokens <= 0 or args.timeout <= 0:
         parser.error("repeats, max-output-tokens, and timeout must be positive")
+    if (args.expected_output_sha256 is not None
+            and (len(args.expected_output_sha256) != 64
+                 or any(char not in "0123456789abcdef"
+                        for char in args.expected_output_sha256))):
+        parser.error("expected-output-sha256 must be 64 lowercase hexadecimal characters")
     if args.temperature is not None and args.temperature < 0:
         parser.error("temperature must be non-negative")
     expected_function_arguments = None
@@ -1104,6 +1112,10 @@ def main() -> int:
             failures.append(
                 f"repeat {index + 1}: hidden gateway marker reached public output")
         output_types = row.get("output_types") or []
+        if (args.expected_output_sha256 is not None
+                and row.get("output_sha256") != args.expected_output_sha256):
+            failures.append(
+                f"repeat {index + 1}: output SHA256 does not match independent baseline")
         if (args.expected_output_type is not None
                 and args.expected_output_type not in output_types):
             failures.append(
@@ -1311,6 +1323,7 @@ def main() -> int:
             "fail_on_memory_retry": args.fail_on_memory_retry,
         },
         "expectations": {
+            "output_sha256": args.expected_output_sha256,
             "max_first_wall_seconds": args.expected_max_first_wall_seconds,
             "max_repeat_wall_seconds": args.expected_max_repeat_wall_seconds,
             "first_cache_source": args.expected_first_cache_source,

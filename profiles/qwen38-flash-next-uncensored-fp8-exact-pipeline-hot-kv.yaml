@@ -1,0 +1,15 @@
+schema: voom.runtime-profile.v1
+name: qwen38-flash-next-uncensored-fp8-exact-pipeline-hot-kv
+description: Opt-in exact in-memory prompt reuse for the current uncensored FP8 fused pipeline.
+notes:
+  - "Extends only the current exact-fused prefill/native-MTP profile and changes four hot-KV settings. Selecting the older hot-KV group separately would replay its ancestors and could reset unrelated kernel/cache settings."
+  - "Reuses only an exact retained candidate-token prefix with its matching KV/KDA/QSA/PLE state. Two slots, minimum16 tokens, no persistent journal and no idle-state-disposal override."
+  - "Lossless target intent is relative to the installed uncensored FP8 checkpoint, not the official BF16 release. The older composition demonstrated a2351-token continuation hit but failed its capped Plex quality/pressure gate."
+  - "Explicit/default-off until the current composition passes completed-output, state-equivalence, heterogeneous real-request and pressure gates. Cache-hit speed and physical-memory benefits are not yet measured for this composition."
+extends:
+  - qwen38-flash-next-uncensored-fp8-fast-tier-mtp-direct-fp8-qmv-prefill-pipeline-exact-fused-delta
+settings:
+  VMODEL_QWEN4_HOT_PROMPT_KV: true
+  VMODEL_QWEN4_HOT_KV_SLOTS: 2
+  VMODEL_QWEN4_HOT_KV_MIN_TOKENS: 16
+  VMODEL_QWEN4_HOT_KV_PERSIST_DIR: ""

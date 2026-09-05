@@ -101,10 +101,13 @@ def test_unrequested_peak_gate_does_not_impose_new_telemetry_requirement():
     assert _peak_metal_failure({}, None) is None
 
 
-@pytest.mark.parametrize("peak,passes", [(None, False), (True, False),
-                                       (2_000_000_000, True)])
+@pytest.mark.parametrize("peak,output_hash,passes", [
+    (None, "a" * 64, False), (True, "a" * 64, False),
+    (2_000_000_000, "a" * 64, True),
+    (2_000_000_000, "b" * 64, False), (2_000_000_000, None, False),
+])
 def test_main_records_each_actual_payload_and_fails_closed_on_peak(
-        monkeypatch, tmp_path, peak, passes):
+        monkeypatch, tmp_path, peak, output_hash, passes):
     raw = b'{"model":"test","input":[],"tools":[],"stream":true}'
     capture = tmp_path / "capture.json"
     capture.write_bytes(raw)
@@ -119,13 +122,15 @@ def test_main_records_each_actual_payload_and_fails_closed_on_peak(
         payloads.append(payload)
         assert stream is False
         return {"http_status": 200, "wall_seconds": 1,
+                "output_sha256": output_hash,
                 "timing": {"true_peak_metal_bytes": peak}}
 
     monkeypatch.setattr(gate, "_post", post)
     monkeypatch.setattr(gate, "_write", lambda path, report: reports.append(report))
     monkeypatch.setattr(sys, "argv", ["gate", str(capture), "--repeats", "2",
                                      "--max-output-tokens", "512",
-                                     "--expected-max-peak-metal-gb", "8.5"])
+                                     "--expected-max-peak-metal-gb", "8.5",
+                                     "--expected-output-sha256", "a" * 64])
     assert gate.main() == (0 if passes else 1)
     report, = reports
     assert report["passed"] is passes
@@ -135,4 +140,15 @@ def test_main_records_each_actual_payload_and_fails_closed_on_peak(
         assert row["request_bytes"] == len(payload)
         assert row["request_changed_fields"] == ["max_output_tokens", "stream"]
     assert len(report["failures"]) == (0 if passes else 2)
-    assert all("peak Metal" in failure for failure in report["failures"])
+    assert all("peak Metal" in failure or "output SHA256" in failure
+               for failure in report["failures"])
+    assert report["expectations"]["output_sha256"] == "a" * 64
+
+
+@pytest.mark.parametrize("invalid", ["", "a" * 63, "G" * 64, "a" * 65])
+def test_bad_expected_output_digest_is_rejected_before_capture_read(monkeypatch, invalid):
+    monkeypatch.setattr(sys, "argv", ["gate", "unused-capture.json",
+                                     "--expected-output-sha256", invalid])
+    with pytest.raises(SystemExit) as error:
+        gate.main()
+    assert error.value.code == 2
