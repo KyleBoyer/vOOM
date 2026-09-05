@@ -1,5 +1,52 @@
 # STATUS — 2026-09-05 (current corrections first; dated chronology below is history)
 
+## 2026-09-05: confirmation replay repairs final metadata, repeats state match and pressure FAIL
+
+The source`077ad02` rerun of the **modified two-real-workspace-tool / short
+system-history / developer / stream-progress / greedy-seed64001 / max1**
+diagnostic now returns HTTP200 with the expected final`response.incomplete`
+object. Profile/effective digest`cd5ef35a...85337`, voom backend, no overrides,
+2 selected tools,1611 uncached input/1 output token and positive peak telemetry
+all pass. The text boundary reason is correctly serialized; the prior adapter
+exception does not recur. The5,541-byte wire SHA`533f9f45...89900`, actual prompt/
+generated-ID and raw-text witnesses match the control and observer. Again,
+all121 observed state arrays/component hashes at1611 and BF16 hidden bits
+match no-hot, with actual fork1024 from requested1606. No tool was executed.
+
+This remains **overall FAIL**, solely on the frozen pressure gates: available
+2.766GB just after generation,4.161GB after hashing and HTTP final4.165GB<5.3GB;
+swap-out grew22.118MB>16MB, no used-swap growth. Reported generation peak2.825GB,
+zero memory retries. The observer's allocator sample is3.012GB; its separate
+endpoint host reads cost0.1332s and materially change available memory, so this
+is not an uninstrumented pressure/latency proof. Higher physical pressure than
+the previous run is not evidence of a leak or an operator change.
+
+Instrumented HTTP wall218.2704s, first token204.2225s, prefill204.2221s,
+decode0s, engine204.2648s. Now-recovered I/O telemetry shows **219,916,717,280
+prefill bytes**, versus118,877,180,840 for no-hot: the split costs an additional
+101.040GB of store reads. This substantiates the next fused-capture lever;
+no serving speed improvement, complete-answer/Plex, cache-repeat/extension,
+varied-request or full134-tool acceptance is claimed.
+
+Parent FAIL/exit1/220.2992s,23:43:57.916384 ->23:47:38.215291UTC, no timeout or
+source drift; all processes ended. Fresh30-second preflight passed at
+7.990/7.941GB with zero swap growth/churn, root minimum18.960GB and external
+minimum99.157GB during the job. Private endpoint and HTTP artifacts:
+`logs/qwen4_boundary_aligned_httpfix_first_20260905.json` and
+`logs/qwen4_boundary_aligned_httpfix_first_http_20260905.json`, with matching
+supervised `.done.json` envelope. Do not rerun this same cold diagnostic without
+a new hypothesis; its intended adapter/state confirmation is finished.
+
+Next bounded preparation: strengthen fork-state/metadata coverage and retained-
+prefix memory accounting before implementing per-layer fused capture. In
+particular,`fork_hybrid_kv_endpoint()` synchronizes KV and KDA but not the
+forked Qwen4 auxiliary companion. Instrument whether materializing that companion
+or detaching small retained views releases live graphs/backing allocations;
+this is an unproven memory hypothesis, not a diagnosed leak. The Qwen4 projection
+also ignores stable-boundary payload, so an additional retained prefix must be
+budgeted. Preserve bit hashes and default-off behavior. Then pursue fused cold
+capture plus real repeated/extended and sufficient-output raw-token gates.
+
 ## 2026-09-05: aligned prefill matches observed no-hot state; serving/pressure FAIL
 
 On source`9806818`, the cold aligned candidate actually retained1,024 tokens

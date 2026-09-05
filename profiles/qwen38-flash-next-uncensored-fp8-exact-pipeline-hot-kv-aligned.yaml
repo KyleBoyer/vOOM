@@ -2,6 +2,7 @@ schema: voom.runtime-profile.v1
 name: qwen38-flash-next-uncensored-fp8-exact-pipeline-hot-kv-aligned
 description: Experimental complete-tile retention; cold max1 state matches, serving unproven.
 notes:
+  - "2026-09-05 confirmation on077ad02: HTTP final metadata repaired; cold max1 observed state/hidden/ID equality repeats. Still pressureFAIL (final4.165GB available,22.118MB swap-out), prefill204.222s and219.917GB reads versus116.970s/118.877GB no-hot. No serving-speed, repeated-cache or completed-answer proof."
   - "2026-09-05: cold1611-token/max1 diagnostic matched no-hot first ID, hidden BF16 and121 observed state arrays, but prefill regressed116.970s to204.282s and pressure failed. HTTP final serialization failed on reason telemetry; adapter fix has600 passing tests and awaits real replay. This is not a completed-answer, repeated-cache or serving-speed pass."
   - "Rounds the scaffold-free prefix down to an original fixed prefill tile, using token counts only. Does not change prompt IDs, tools, target weights or sampling. At the1611-token diagnostic this retains1024 and recomputes587, instead of splitting the final tile into582+5."
   - "No complete admissible stable tile or an unsupported execution/persistence mode disables hot eligibility for that request, avoiding raw endpoint fallback. Engine identity includes the policy; persistence is disabled."
