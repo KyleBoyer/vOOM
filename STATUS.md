@@ -1,5 +1,34 @@
 # STATUS — 2026-09-05 (current corrections first; dated chronology below is history)
 
+## 2026-09-05: answer-hidden Qwen 32K retrieval succeeds, pressure gate fails
+
+The current uncensored-FP8 exact-fused pipeline processed **32,797 rendered
+input tokens and 256 output tokens in 1,260.900s (21.02min)** on a synthetic
+no-tool, greedy/non-streaming/no-reasoning retrieval-and-sequence request. Both
+canaries were recovered in the exact requested prefix, with57 consecutive
+validation integers; neither answer was exposed in the final prompt suffix.
+The output intentionally reached its cap (`incomplete/max_output_tokens`).
+This is retrieval plus sustained-output evidence, not a completed answer,
+untouched captured harness, broad intelligence score or GLM DSA ladder proof.
+
+Overall **FAILED**: available memory after the response was4.335GB below the
+5.3GB diagnostic floor, and swap-out grew33.636MB above the16MB ceiling.
+Reported true peak Metal4.494GB remained below8.5GB; zero prefill retries.
+Do not weaken those pressure gates to promote this result. A read-only lifetime
+audit is checking whether uncached serving retains an unusable1.031GB endpoint
+after the response; this is not yet a measured reclamation or speed improvement.
+
+Cold prefill477.2144s, first token477.2147s, decode771.8955s, engine1249.1138s.
+Native MTP accepted183/216 drafts in72 target sweeps (verifier746.778s,
+drafter23.619s). The repaired phase counter is now exercised by a real model:
+117,525,335,840 prefill bytes +1,143,358,348,392 decode bytes =
+1,260,883,684,232 total store-accounted bytes. These are not physical-device
+traffic. Parent FAIL/exit1, no timeout/source drift, all model processes ended.
+Initial wire167,530bytes, request hash`065add7c...671d6`, source`6752c92`.
+Evidence: `logs/qwen_flash_hidden_retrieval32k_out256_20260905.json` and its
+`.done.json` envelope. Next: safe idle-endpoint lifetime review, then a completed
+held-out workspace-tool response with developer-role/streaming/two-tool shape.
+
 ## 2026-09-05: prepare answer-hidden 32K retrieval and sustained-output gate
 
 The corrected retrieval fixture retains both canaries only in distant records
