@@ -48,19 +48,41 @@ def _pressure() -> Pressure:
 
 def _response_text(response: dict) -> str:
     parts: list[str] = []
-    top = response.get("output_text")
-    if isinstance(top, str):
-        parts.append(top)
     for item in response.get("output") or ():
-        if not isinstance(item, dict):
+        if not isinstance(item, dict) or item.get("type") != "message":
             continue
         for part in item.get("content") or ():
-            if not isinstance(part, dict):
+            if not isinstance(part, dict) or part.get("type") != "output_text":
                 continue
             text = part.get("text")
             if isinstance(text, str):
                 parts.append(text)
-    return "".join(parts)
+    if parts:
+        return "".join(parts)
+    top = response.get("output_text")
+    return top if isinstance(top, str) else ""
+
+
+def _response_integrity_failures(response: dict) -> list[str]:
+    """This is an intentionally output-capped diagnostic, not completion proof."""
+    failures = []
+    if response.get("error"):
+        failures.append("response contains a protocol error")
+    status = response.get("status")
+    details = response.get("incomplete_details") or {}
+    if status != "completed" and not (
+            status == "incomplete" and isinstance(details, dict)
+            and details.get("reason") == "max_output_tokens"):
+        failures.append("response neither completed nor reached its output cap")
+    if any(isinstance(item, dict) and item.get("type") not in (
+            "message", "reasoning") for item in response.get("output") or ()):
+        failures.append("no-tool diagnostic returned an unexpected output item")
+    timing = response.get("vmodel_timing") or {}
+    peak = timing.get("true_peak_metal_bytes") if isinstance(timing, dict) else None
+    if (isinstance(peak, bool) or not isinstance(peak, (int, float))
+            or not 0 < peak < float("inf")):
+        failures.append("true peak Metal telemetry is missing or invalid")
+    return failures
 
 
 def _build_user_text(
@@ -123,6 +145,8 @@ def main() -> int:
     parser.add_argument("--min-output-tokens", type=int, default=96)
     parser.add_argument("--min-consecutive-integers", type=int, default=8)
     parser.add_argument("--temperature", type=float, default=0.0)
+    parser.add_argument("--reasoning-effort", choices=(
+        "none", "minimal", "low", "medium", "high", "xhigh"))
     parser.add_argument("--seed", type=int, default=64001)
     parser.add_argument("--timeout", type=float, default=1800.0)
     parser.add_argument("--max-peak-metal-gb", type=float, default=8.5)
@@ -172,6 +196,8 @@ def main() -> int:
         "max_output_tokens": args.max_output_tokens,
         "stream": False,
     }
+    if args.reasoning_effort is not None:
+        request_value["reasoning"] = {"effort": args.reasoning_effort}
     private_request = json.dumps(
         request_value, ensure_ascii=False, separators=(",", ":"),
     ).encode()
@@ -185,6 +211,9 @@ def main() -> int:
             headers={"Content-Type": "application/json"}, method="POST")
         with urllib.request.urlopen(request, timeout=args.timeout) as response:
             response_value = json.loads(response.read())
+            if not isinstance(response_value, dict):
+                response_value = {}
+                raise TypeError("response is not a JSON object")
     except urllib.error.HTTPError as caught:
         error = f"HTTP {caught.code}: {caught.read()[:1000]!r}"
     except Exception as caught:  # artifact must survive timeout/connection failure
@@ -208,7 +237,7 @@ def main() -> int:
             break
         consecutive_prefix += 1
 
-    failures: list[str] = []
+    failures = _response_integrity_failures(response_value)
     if error is not None:
         failures.append(error)
     if input_tokens < int(args.target_user_tokens * 0.95):
@@ -239,7 +268,7 @@ def main() -> int:
         failures.append("swap growth exceeded the configured ceiling")
 
     report = {
-        "schema": "voom.qwen-large-context-output-gate.v2",
+        "schema": "voom.qwen-large-context-output-gate.v3",
         "request": {
             "model": args.model,
             "target_user_tokens": args.target_user_tokens,
@@ -249,6 +278,11 @@ def main() -> int:
             "min_output_tokens": args.min_output_tokens,
             "min_consecutive_integers": args.min_consecutive_integers,
             "temperature": args.temperature,
+            "reasoning_effort": args.reasoning_effort,
+            "tool_count": 0,
+            "stream": False,
+            "canonical_bytes": len(private_request),
+            "completed_answer_benchmark": False,
             "seed": args.seed,
             "request_sha256": hashlib.sha256(private_request).hexdigest(),
             "canary_depths": [0.13, 0.73],
@@ -259,6 +293,12 @@ def main() -> int:
         "result": {
             "wall_seconds": round(wall, 4),
             "response_status": response_value.get("status"),
+            "incomplete_details": response_value.get("incomplete_details"),
+            "checkpoint": response_value.get("vmodel_checkpoint"),
+            "backend": response_value.get("vmodel_backend"),
+            "runtime_profiles": response_value.get("vmodel_runtime_profiles"),
+            "runtime_profile_digest": response_value.get("vmodel_runtime_profile_digest"),
+            "runtime_effective_digest": response_value.get("vmodel_runtime_effective_digest"),
             "output_tokens": output_tokens,
             "output_bytes": len(output_text.encode()),
             "output_sha256": hashlib.sha256(output_text.encode()).hexdigest(),

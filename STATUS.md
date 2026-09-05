@@ -1,5 +1,27 @@
 # STATUS — 2026-09-05 (current corrections first; dated chronology below is history)
 
+## 2026-09-05: prepare answer-hidden 32K retrieval and sustained-output gate
+
+The corrected retrieval fixture retains both canaries only in distant records
+(13% and 73% filler positions), not in the final task suffix. Its v3 artifact
+now records explicit reasoning mode, wire bytes, no-tool/non-streaming shape,
+checkpoint/profile identity and incomplete details. It rejects missing/invalid
+peak telemetry, protocol errors, unexpected output items and invalid termination;
+only completed or explicit max-output-token termination is allowed. Duplicate
+top-level/structured visible text is no longer concatenated, and reasoning text
+does not count as the answer. **16 pure fixture tests passed.** No runtime math,
+model weights or Plex rubric changed.
+
+Next bounded run: current uncensored-FP8 exact-fused Qwen pipeline,
+32,768 target user tokens, no tools, greedy/no reasoning, max256/min128 output
+tokens and at least32 consecutive validation integers. This is a synthetic
+retrieval plus deliberately output-capped decode diagnostic, not a completed
+answer, unmodified capture, general intelligence score or GLM context-ladder
+conformance proof. Planned artifacts:
+`logs/qwen_flash_hidden_retrieval32k_out256_20260905.json` and its supervised
+`logs/gates/qwen_flash_hidden_retrieval32k_out256_20260905` envelope. Check live
+process/result state before doing anything else; do not edit sources during it.
+
 ## 2026-09-05: fixed Qwen pipeline completes focused Plex, strict rubric still fails
 
 The uncensored-FP8 exact-fused prefill/native-MTP pipeline after `4db37b5`
