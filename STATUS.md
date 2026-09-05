@@ -1,5 +1,54 @@
 # STATUS — 2026-09-05 (current corrections first; dated chronology below is history)
 
+## 2026-09-05: aligned prefill matches observed no-hot state; serving/pressure FAIL
+
+On source`9806818`, the cold aligned candidate actually retained1,024 tokens
+from the1,606-token stable hint and used the original1024+587 tile geometry.
+The **modified two-real-workspace-tool / short-system-history / developer /
+stream-progress / greedy-seed64001 / max1** wire and prepared IDs are identical
+to both earlier arms. All121 observed KV/KDA/QSA/PLE arrays at position1611,
+aggregate/component hashes, BF16 hidden-row bits, first emitted ID and raw
+engine text **match the independent no-hot artifact**. The supervised wrapper
+printed`INDEPENDENT_ENDPOINT_MISMATCHES []`. This supports tile partitioning
+as the source of the original prefill divergence on this request; it is not
+complete-output, repeated-cache, varied-request or full-harness proof.
+
+However, cold instrumented prefill regressed116.9699 ->204.2816s (+74.64%);
+HTTP elapsed218.4824s ended **without a final response object**. A newly added
+text reason(`tile-aligned`) was mistakenly placed in the protocol's integer
+telemetry projection, raising ValueError after the endpoint observer succeeded.
+That adapter bug is now corrected to the string projection. Six real-projection
+regressions cover both result/path-stat sources and policy/actual eligibility.
+**600 tests passed in4.88s**, supervised PASS/exit0/no source drift/timeout after
+a fresh30-second preflight. This does not retroactively turn the failed HTTP
+run into a pass; the same endpoint/HTTP oracle must be repeated on the fix.
+
+The model run also **FAILS pressure**: available3.884GB immediately after
+generation,5.243GB after hashing, HTTP final5.247GB<5.3GB. Swap-out grew
+16.876MB>16MB with zero usage growth. Generation peak2.825GB; endpoint hashing
+adds0.1270s/160.261MB state reads plus20,480 hidden bytes and changes pressure.
+Parent FAIL/exit1/221.3361s,23:35:10 ->23:38:51UTC; no timeout/source drift,
+all processes ended. Endpoint`logs/qwen4_boundary_aligned_first_20260905.json`
+remains valid scoped state evidence; separate HTTP artifact has no final
+timing/I/O/profile object because of the adapter error. Do not infer missing
+store-byte counters or call this a speed/serving pass. Candidate stays opt-in.
+
+Next bounded job: repeat the same cold max1 wire on the telemetry fix under
+fresh preflight, endpoint`logs/qwen4_boundary_aligned_httpfix_first_20260905.json`
+and separate HTTP artifact/supervised envelope. Require independent no-hot
+state/hidden hashes AND final HTTP metadata; leave pressure thresholds frozen.
+
+Next large lever after that: capture the aligned prefix layer-by-layer inside
+the unchanged full Qwen4 host-spooled sweep, eliminating the second complete
+trunk/expert sweep while preserving all original tile/GEMM shapes. A whole-cache
+fork midway through a layer-major sweep is invalid: layers represent different
+positions. Require per-layer capture coverage, immutable KV/KDA/QSA/PLE owners,
+separate retained-prefix equality, repeated/extended state and complete-token
+proof. Extend diagnostics to KV start/window metadata and pooled QSA keys
+(pool caching was off in the no-hot control). Also account for the additional
+retained-prefix payload: Qwen4's current projection ignores the supplied stable
+boundary. No fused implementation or memory benefit is claimed yet.
+
 ## 2026-09-05: complete-tile hot-prefix candidate ready for first endpoint oracle
 
 Explicit profile`qwen38-flash-next-uncensored-fp8-exact-pipeline-hot-kv-aligned`

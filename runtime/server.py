@@ -10373,7 +10373,6 @@ def _vision_protocol_timing(result: dict) -> dict:
         "qwen4_hot_boundary_tile",
         "qwen4_hot_boundary_eligible",
         "qwen4_hot_boundary_policy_eligible",
-        "qwen4_hot_boundary_reason",
         "qwen4_host_spool_h2d_bytes",
         "qwen4_host_spool_d2h_bytes",
         "qwen4_host_spool_peak_host_bytes",
@@ -10641,6 +10640,7 @@ def _vision_protocol_timing(result: dict) -> dict:
         "qwen4_mtp_proposal_sources",
         "qwen4_mtp_q_calibration",
         "qwen4_ple_storage_dtype",
+        "qwen4_hot_boundary_reason",
         "glm53_mtp_fallback_reason",
     ):
         if key in stats or key in result:

@@ -116,3 +116,28 @@ def test_empty_generation_is_distinct_from_missing_generation(api, monkeypatch):
     api._attach_generation_witness(SimpleNamespace(token_ids=()), result)
     assert result["generation_witness"]["available"] is True
     assert result["generation_witness"]["generated_token_count"] == 0
+
+
+@pytest.mark.parametrize("source", ["path_stats", "top_level"])
+@pytest.mark.parametrize("reason,eligible,policy_eligible", [
+    ("tile-aligned", True, True),
+    ("no-admissible-complete-tile", False, False),
+    ("tile-aligned", False, True),
+])
+def test_aligned_boundary_protocol_keeps_reason_string_and_typed_counts(
+        api, source, reason, eligible, policy_eligible):
+    fields = {
+        "qwen4_hot_boundary_requested": 1606,
+        "qwen4_hot_boundary_effective": 1024 if policy_eligible else 0,
+        "qwen4_hot_boundary_tile": 1024,
+        "qwen4_hot_boundary_eligible": eligible,
+        "qwen4_hot_boundary_policy_eligible": policy_eligible,
+        "qwen4_hot_boundary_reason": reason,
+    }
+    result = {"path_stats": fields} if source == "path_stats" else fields
+    timing = api._vision_protocol_timing(result)
+    assert timing["qwen4_hot_boundary_reason"] == reason
+    for key, value in fields.items():
+        if key != "qwen4_hot_boundary_reason":
+            assert type(timing[key]) is int
+            assert timing[key] == int(value)
