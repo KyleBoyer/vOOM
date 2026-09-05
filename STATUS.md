@@ -50,6 +50,15 @@ Compare output and real wire hashes, timing, read counts and pressure; do not
 claim precise physical reclamation from the immediate client pressure sample.
 Inspect live jobs first and make no source edits during the control run.
 
+Control launch **DEFERRED_PRECONDITION**: the required 30.010s preflight fell
+from6.101GB to5.991GB available, below the6GB stable-stale-swap admission
+minimum, despite zero swap growth/churn and18.967GB root free. Evidence:
+`logs/preflight_qwen_idle_baseline_workspace_stream512_20260905.json`.
+No model job was launched and no user applications/data were removed. The
+next heartbeat may retry with a fresh passing sample; do not reuse this failed
+preflight or weaken the threshold. The control result named above does not
+exist yet.
+
 ## 2026-09-05: opt-in Qwen idle endpoint disposal passes ownership regressions
 
 The uncached Qwen MTP serving wrapper can now release otherwise unreusable
