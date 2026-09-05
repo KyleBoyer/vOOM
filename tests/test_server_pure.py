@@ -2827,6 +2827,8 @@ def test_glm53_hot_prompt_kv_is_opt_in_exact_and_in_engine_identity():
         ("VMODEL_GLM53_COALESCED_EXPERT_POSITIONS", "auto",
          "must be 0 or 1"),
         ("VMODEL_GLM53_EXPERT_BATCH_PREFETCH", "auto", "must be 0 or 1"),
+        ("VMODEL_GLM53_EXPERT_BATCH_PREFETCH_PREFILL_ONLY", "auto",
+         "must be 0 or 1"),
         ("VMODEL_GLM53_SHORT_STREAM_LM_HEAD", "auto", "must be 0 or 1"),
         ("VMODEL_GLM53_EXPERT_BATCH_PREFETCH_DEPTH", "4",
          "must be in \\[1, 3\\]"),
@@ -3024,6 +3026,7 @@ def test_glm53_expert_storage_batch_and_pipeline_are_explicit_identity(
         "VMODEL_GLM53_MTP": "0",
         "VMODEL_GLM53_EXPERT_FETCH_BATCH": "1",
         "VMODEL_GLM53_EXPERT_BATCH_PREFETCH": "0",
+        "VMODEL_GLM53_EXPERT_BATCH_PREFETCH_PREFILL_ONLY": "0",
         "VMODEL_GLM53_EXPERT_BATCH_PREFETCH_DEPTH": "1",
         "VMODEL_GLM53_EXPERT_BATCH_PREFETCH_WORKERS": "1",
         "VMODEL_GLM53_TRUNK_PREFETCH_DEPTH": "0",
@@ -3047,9 +3050,12 @@ def test_glm53_expert_storage_batch_and_pipeline_are_explicit_identity(
         os.environ["VMODEL_GLM53_SHORT_WEIGHT_CACHE_MB"] = "4500"
         os.environ["VMODEL_GLM53_SHORT_STREAM_LM_HEAD"] = "1"
         manager.get(Path("/tmp/fake-glm53-expert-pipeline"), "lossless")
+        os.environ[
+            "VMODEL_GLM53_EXPERT_BATCH_PREFETCH_PREFILL_ONLY"] = "1"
+        manager.get(Path("/tmp/fake-glm53-expert-pipeline"), "lossless")
 
-    assert len(captured) == 2
-    baseline, candidate = captured
+    assert len(captured) == 3
+    baseline, candidate, prefill_only = captured
     assert baseline.expert_fetch_batch == 1
     assert not baseline.expert_batch_prefetch
     assert baseline.expert_batch_prefetch_depth == 1
@@ -3065,6 +3071,9 @@ def test_glm53_expert_storage_batch_and_pipeline_are_explicit_identity(
     assert candidate.expert_batch_prefetch_workers == 2
     assert candidate.prefetch_depth == 1
     assert candidate.prefetch_workers == 2
+    assert not candidate.glm53_expert_batch_prefetch_prefill_only
+    assert prefill_only.glm53_expert_batch_prefetch_prefill_only
+    assert prefill_only.expert_batch_prefetch
     assert candidate.max_weight_cache_mb == (
         1500 if model_type == "glm5_next" else 4500)
     if model_type == "glm_moe_dsa":

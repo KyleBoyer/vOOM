@@ -24,6 +24,16 @@ occurred.  Existing heterogeneous depth-three/four evidence still rejects a
 blanket depth-four change: depth four won one accepted trace but regressed an
 independent zero-acceptance coding trace.
 
+A phase-specific I/O experiment then tested whether MTP made background expert
+reads during decode redundant.  It did not.  Restricting the same two bounded
+workers to prefill preserved the request/output hashes, all semantic checks,
+22/24 accepted proposals, nine target sweeps, and the exact 633.994GB read
+count, but regressed wall **428.803 -> 445.193s (+3.82%)** and decode
+**175.399 -> 191.652s (+9.27%)**.  Reported prefetch wait fell 149.968 ->
+28.102 seconds only because useful decode overlap was removed.  The generic
+phase control remains explicit/default-off for diagnosis and capacity work;
+the selected speed profile keeps its two readers active through decode.
+
 The preceding focused Plex gate is an important quality warning and is not an
 untouched-capture result: it retained the captured user intent and full real
 Plex function schema but reduced the 134-tool catalog to Plex, replaced the
@@ -42,7 +52,9 @@ Evidence:
 `logs/glm53_flash_e_compact_mla_tile128_workers2_plex128_20260904.json`,
 `logs/glm53_flash_e_compact_mla_tile128_workers2_direct_qmv_semantic32_20260904.json`,
 and
-`logs/glm53_flash_e_compact_mla_tile128_workers2_direct_qmv_mtp3_semantic32_20260904.json`.
+`logs/glm53_flash_e_compact_mla_tile128_workers2_direct_qmv_mtp3_semantic32_20260904.json`,
+and
+`logs/glm53_flash_e_compact_mla_tile128_workers2_direct_qmv_mtp3_prefill_pipeline_semantic32_20260904.json`.
 
 ## 2026-09-04: wider compact-MLA tiles plus exact dual-reader I/O cut the 2,123-token gate 39%
 

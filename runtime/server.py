@@ -2332,6 +2332,12 @@ class EngineManager:
         if glm53_expert_batch_prefetch_request not in ("0", "1"):
             raise RequestValidationError(
                 "VMODEL_GLM53_EXPERT_BATCH_PREFETCH must be 0 or 1")
+        glm53_expert_batch_prefetch_prefill_only_request = os.environ.get(
+            "VMODEL_GLM53_EXPERT_BATCH_PREFETCH_PREFILL_ONLY", "0").strip()
+        if glm53_expert_batch_prefetch_prefill_only_request not in ("0", "1"):
+            raise RequestValidationError(
+                "VMODEL_GLM53_EXPERT_BATCH_PREFETCH_PREFILL_ONLY must be "
+                "0 or 1")
         glm53_short_stream_lm_head_request = os.environ.get(
             "VMODEL_GLM53_SHORT_STREAM_LM_HEAD", "0").strip()
         if glm53_short_stream_lm_head_request not in ("0", "1"):
@@ -2516,6 +2522,7 @@ class EngineManager:
             glm53_prefill_tile_width,
             glm53_expert_fetch_batch,
             glm53_expert_batch_prefetch_request,
+            glm53_expert_batch_prefetch_prefill_only_request,
             glm53_expert_batch_prefetch_depth,
             glm53_expert_batch_prefetch_workers,
             glm53_short_stream_lm_head_request,
@@ -2672,6 +2679,7 @@ class EngineManager:
             glm53_prefill_tile_width,
             glm53_expert_fetch_batch,
             glm53_expert_batch_prefetch_request,
+            glm53_expert_batch_prefetch_prefill_only_request,
             glm53_expert_batch_prefetch_depth,
             glm53_expert_batch_prefetch_workers,
             glm53_short_stream_lm_head_request,
@@ -3039,6 +3047,10 @@ class EngineManager:
                 rc.expert_fetch_batch = glm53_expert_fetch_batch
                 rc.expert_batch_prefetch = (
                     glm53_expert_batch_prefetch_request == "1")
+                rc.glm53_expert_batch_prefetch_prefill_only = (
+                    glm53_expert_batch_prefetch_prefill_only_request == "1")
+                if rc.glm53_expert_batch_prefetch_prefill_only:
+                    rc.expert_batch_prefetch = True
                 rc.expert_batch_prefetch_depth = (
                     glm53_expert_batch_prefetch_depth)
                 rc.expert_batch_prefetch_workers = (
@@ -3165,6 +3177,10 @@ class EngineManager:
                 rc.expert_compute_batch = 1
                 rc.expert_batch_prefetch = (
                     glm53_expert_batch_prefetch_request == "1")
+                rc.glm53_expert_batch_prefetch_prefill_only = (
+                    glm53_expert_batch_prefetch_prefill_only_request == "1")
+                if rc.glm53_expert_batch_prefetch_prefill_only:
+                    rc.expert_batch_prefetch = True
                 rc.expert_batch_prefetch_depth = (
                     glm53_expert_batch_prefetch_depth)
                 rc.expert_batch_prefetch_workers = (
@@ -3221,6 +3237,10 @@ class EngineManager:
                     rc.expert_fetch_batch = glm53_expert_fetch_batch
                     rc.expert_batch_prefetch = (
                         glm53_expert_batch_prefetch_request == "1")
+                    rc.glm53_expert_batch_prefetch_prefill_only = (
+                        glm53_expert_batch_prefetch_prefill_only_request == "1")
+                    if rc.glm53_expert_batch_prefetch_prefill_only:
+                        rc.expert_batch_prefetch = True
                     rc.expert_batch_prefetch_depth = (
                         glm53_expert_batch_prefetch_depth)
                     rc.expert_batch_prefetch_workers = (

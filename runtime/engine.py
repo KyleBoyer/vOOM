@@ -928,6 +928,11 @@ class RuntimeConfig:
     # prefill on the archive device only and enable the two-device overlay for
     # decode. This avoids competing OS read caches at the 49K memory peak.
     qwen4_fast_tier_decode_only: bool = False
+    # Exact I/O-only overlap for GLM-5.3 prefill. Routed expert batches are
+    # fetched on the existing bounded workers during prefill, then decode
+    # returns to the synchronous demand path. This is a scheduling-only
+    # experiment; expert bytes and arithmetic are unchanged.
+    glm53_expert_batch_prefetch_prefill_only: bool = False
     # Exact I/O-only overlap for Qwen4's long prefill. Routed expert batches
     # are fetched on the existing bounded worker during prefill, then decode
     # returns to the validated synchronous schedule. This avoids carrying the
@@ -1775,6 +1780,8 @@ class RuntimeConfig:
             expert_compute_batch=run.get("expert_compute_batch", 0),
             decode_expert_fetch_batch=run.get("decode_expert_fetch_batch", 0),
             expert_batch_prefetch=run.get("expert_batch_prefetch", False),
+            glm53_expert_batch_prefetch_prefill_only=run.get(
+                "glm53_expert_batch_prefetch_prefill_only", False),
             qwen4_expert_batch_prefetch_prefill_only=run.get(
                 "qwen4_expert_batch_prefetch_prefill_only", False),
             expert_batch_prefetch_depth=run.get(
@@ -5251,12 +5258,15 @@ class StreamingEngine:
         if phase not in ("prefill", "decode"):
             raise ValueError(f"unsupported direct-QMV phase {phase!r}")
         self._expert_batch_prefetch_phase = phase
+        prefill_only = bool(
+            getattr(
+                self.rc, "glm53_expert_batch_prefetch_prefill_only", False)
+            or getattr(
+                self.rc, "qwen4_expert_batch_prefetch_prefill_only", False)
+        )
         self._expert_batch_prefetch_active = bool(
             self._expert_batch_executor is not None
-            and (
-                not self.rc.qwen4_expert_batch_prefetch_prefill_only
-                or phase == "prefill"
-            )
+            and (not prefill_only or phase == "prefill")
         )
         store = self.store
         for family in ("glm53", "qwen4"):
@@ -13472,7 +13482,10 @@ class StreamingEngine:
         path_stats["expert_batch_prefetch"] = int(
             self._expert_batch_executor is not None)
         path_stats["expert_batch_prefetch_prefill_only"] = int(
-            self.rc.qwen4_expert_batch_prefetch_prefill_only)
+            bool(getattr(
+                self.rc, "glm53_expert_batch_prefetch_prefill_only", False)
+                or getattr(
+                    self.rc, "qwen4_expert_batch_prefetch_prefill_only", False)))
         path_stats["expert_batch_prefetch_submitted"] = (
             self._expert_batch_prefetch_submitted)
         path_stats["expert_batch_prefetch_wait_s"] = (

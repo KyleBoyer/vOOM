@@ -14,6 +14,8 @@ import threading
 import weakref
 from pathlib import Path
 
+import pytest
+
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from runtime.expert_batching import consume_expert_batches
@@ -23,6 +25,7 @@ def test_exact_expert_batch_pipeline_remains_explicit_opt_in():
     from runtime.engine import RuntimeConfig
 
     assert not RuntimeConfig().expert_batch_prefetch
+    assert not RuntimeConfig().glm53_expert_batch_prefetch_prefill_only
     assert not RuntimeConfig().expert_route_overlap_telemetry
 
 
@@ -409,7 +412,8 @@ def test_exact_expert_batch_prefetch_depth_two_queues_two_ordered_futures():
     assert engine._expert_batch_prefetch_max_futures == 2
 
 
-def test_qwen4_prefill_only_expert_prefetch_disables_worker_for_decode():
+@pytest.mark.parametrize("family", ["qwen4", "glm53"])
+def test_prefill_only_expert_prefetch_disables_worker_for_decode(family):
     import concurrent.futures as cf
     import threading
     from types import SimpleNamespace
@@ -423,7 +427,8 @@ def test_qwen4_prefill_only_expert_prefetch_disables_worker_for_decode():
             expert_fetch_batch=1,
             decode_expert_fetch_batch=1,
             expert_batch_prefetch_depth=1,
-            qwen4_expert_batch_prefetch_prefill_only=True,
+            glm53_expert_batch_prefetch_prefill_only=family == "glm53",
+            qwen4_expert_batch_prefetch_prefill_only=family == "qwen4",
         )
         store = SimpleNamespace(
             glm53_fp8_direct_qmv=False,

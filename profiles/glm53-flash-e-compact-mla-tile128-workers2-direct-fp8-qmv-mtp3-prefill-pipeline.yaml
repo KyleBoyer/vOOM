@@ -1,0 +1,13 @@
+schema: voom.runtime-profile.v1
+name: glm53-flash-e-compact-mla-tile128-workers2-direct-fp8-qmv-mtp3-prefill-pipeline
+description: Explicit compact-QMV/MTP profile with routed-expert lookahead limited to prefill.
+notes:
+  - "Extends the semantic-gated direct-QMV/native-MTP composition. The same two bounded workers overlap authoritative routed-expert reads during prefill, then the completed-prefill boundary returns decode and MTP verification to synchronous demand fetches."
+  - "The switch changes only I/O scheduling. Released FP8 pages, exact singleton QMV arithmetic, target verification, router choices, and output sampling remain unchanged."
+  - "The parent semantic trace reported 149.968 seconds of aggregate expert-prefetch wait despite high MTP acceptance. Require the identical output hash, lower decode/end-to-end wall, bounded reads/Metal/swap, and zero retry; reject if synchronous decode loses useful overlap."
+  - "This remains E-class/default-off because it inherits compact absorbed MLA. A single semantic win cannot promote it to automatic serving."
+  - "Rejected on the identical 2,123-input/32-output semantic A/B: output/hash/checks, 22/24 accepted proposals, nine target sweeps, and 633.994GB reads matched, but wall regressed 428.803 -> 445.193s (+3.82%) and decode regressed 175.399 -> 191.652s (+9.27%). Limiting workers to prefill cut reported wait 149.968 -> 28.102s but removed useful decode overlap. Keep only as an explicit diagnostic/capacity experiment; do not select it for speed."
+extends:
+  - glm53-flash-e-compact-mla-tile128-workers2-direct-fp8-qmv-mtp3
+settings:
+  VMODEL_GLM53_EXPERT_BATCH_PREFETCH_PREFILL_ONLY: 1

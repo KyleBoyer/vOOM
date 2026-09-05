@@ -509,6 +509,12 @@ corpus required by the anti-overfit policy:
   content-blind layer-stationary tile (default 32).
 - `VMODEL_GLM53_EXPERT_FETCH_BATCH=1..8` (measured at 8; 16 regressed)
 - `VMODEL_GLM53_EXPERT_BATCH_PREFETCH=1`
+- `VMODEL_GLM53_EXPERT_BATCH_PREFETCH_PREFILL_ONLY=1` is an exact,
+  identity-bearing diagnostic that stops the bounded expert readers at the
+  prefill/decode boundary. It is rejected for the current direct-QMV/MTP
+  leader: the identical semantic trace regressed wall 3.82% and decode 9.27%
+  despite preserving output/hash/checks, proposal acceptance, target sweeps,
+  and reads. Leave it off for speed; it remains useful for phase attribution.
 - `VMODEL_GLM53_TRUNK_PREFETCH_DEPTH=0..2` (measured at 1)
 - `VMODEL_GLM53_TRUNK_PREFETCH_WORKERS=1..2` (measured at 1)
 - `VMODEL_GLM53_NATIVE_FP8_DEQUANT=1` fuses the released E4M3 decode,

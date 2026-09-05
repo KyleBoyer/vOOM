@@ -327,6 +327,22 @@ def test_builtin_profiles_resolve_complete_agent_group():
     assert glm_compact_mtp_settings[
         "VMODEL_GLM53_TRUNK_PREFETCH_DEPTH"] == "1"
 
+    glm_compact_pipeline_order, glm_compact_pipeline_settings = (
+        resolve_runtime_profiles((
+            "glm53-flash-e-compact-mla-tile128-workers2-"
+            "direct-fp8-qmv-mtp3-prefill-pipeline",
+        ), catalog))
+    assert glm_compact_pipeline_order[-2:] == (
+        "glm53-flash-e-compact-mla-tile128-workers2-"
+        "direct-fp8-qmv-mtp3",
+        "glm53-flash-e-compact-mla-tile128-workers2-"
+        "direct-fp8-qmv-mtp3-prefill-pipeline",
+    )
+    assert glm_compact_pipeline_settings[
+        "VMODEL_GLM53_EXPERT_BATCH_PREFETCH_PREFILL_ONLY"] == "1"
+    assert glm_compact_pipeline_settings[
+        "VMODEL_GLM53_EXPERT_BATCH_PREFETCH"] == "1"
+
     qwen_direct_order, qwen_direct_settings = resolve_runtime_profiles((
         "qwen38-flash-next-uncensored-fp8-fast-tier-mtp-"
         "direct-fp8-qmv-decode-only",
