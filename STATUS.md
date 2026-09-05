@@ -1,5 +1,44 @@
 # STATUS — 2026-09-05 (current corrections first; dated chronology below is history)
 
+## 2026-09-05: opt-in Qwen idle endpoint disposal passes ownership regressions
+
+The uncached Qwen MTP serving wrapper can now release otherwise unreusable
+request state after the final protocol/cache/telemetry consumer and before
+releasing `INFER_LOCK`. Enable only through
+`VMODEL_QWEN4_RELEASE_IDLE_REQUEST_STATE=1` or the explicit
+`qwen38-flash-next-uncensored-fp8-exact-pipeline-idle-release` overlay.
+The existing exact-fused profile and automatic defaults are unchanged.
+
+The helper requires the concrete Qwen4 MTP wrapper, disabled hot KV, known
+empty hot slots and no persistent/text/vision reuse owner. It clears endpoint,
+hidden/provisional and interrupted verifier-capture references. Direct-engine
+oracle endpoints are untouched; failures cannot invalidate an already-sent
+response. No model weights, arithmetic, sampling or allocator-cache policy
+changed. Logged logical bytes are not physical memory reclaimed, and disposal
+cannot undo earlier swap-out or reduce an already-recorded request peak.
+
+**118 tests passed in 2.71s**: 63 Qwen MTP controller tests, 42 pure cleanup
+ownership/HTTP ordering tests and 13 profile tests. The checked source hashes
+match `logs/gates/qwen_idle_release_verified_suite_20260905.done.json`,
+PASS/exit0 with no source drift or timeout after a passing 30-second preflight.
+This is controller/ownership evidence, not a real-checkpoint A/B or pressure win.
+
+Next bounded gate: two consecutive uncached requests in one fresh server using
+the overlay, streaming with progress events, greedy/seed64001, max512 output
+tokens and required completed function calls. The `developer-action` fixture
+replaces system/history/user text and retains two actual workspace schemas
+from the capture; it does not preserve the 134-tool captured request. Reasoning
+is left unspecified as in the source. Ask for lines 1–12 of `docs/ops_runbook.md`
+and require the read-file tool with path/offset/limit witnesses. No emitted tool
+is executed. Require backend/profile identity, cold cache source on both calls,
+peak Metal below 8.5GB, final available memory at least 5.3GB and swap growth/
+swap-out at most 16MB. Repeated output hashes test same-path determinism, not
+baseline token equivalence. Immediate client-side pressure samples can race
+post-response cleanup; physical reclamation still needs its own bracketed A/B.
+Planned result: `logs/qwen_flash_idle_release_workspace_stream512_20260905.json`
+and its supervised gate envelope. Inspect process/result state before launching
+anything else; no source edits during the measured job.
+
 ## 2026-09-05: answer-hidden Qwen 32K retrieval succeeds, pressure gate fails
 
 The current uncensored-FP8 exact-fused pipeline processed **32,797 rendered

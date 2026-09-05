@@ -7601,6 +7601,63 @@ def _persist_request_expert_trace(
     return destination
 
 
+def _release_qwen4_idle_request_state(engine) -> None:
+    """Opt-in serving-only disposal after the final protocol consumer.
+
+    The MTP controller retains its exact endpoint for direct-engine oracles.
+    An uncached HTTP request has no next-request consumer of that endpoint.
+    Call only under INFER_LOCK, after every generation/cache/telemetry/response
+    consumer has finished. Logical endpoint bytes are not physical reclamation
+    or a change to the already-recorded request peak/pressure measurements.
+    """
+    if os.environ.get("VMODEL_QWEN4_RELEASE_IDLE_REQUEST_STATE", "0").strip() != "1":
+        return
+    try:
+        if getattr(getattr(engine, "cfg", None), "model_type", None) != "qwen4_exp":
+            return
+        from .qwen4_mtp import Qwen4MTPSpeculativeEngine
+
+        # Never follow an arbitrary delegation proxy or change direct-engine
+        # endpoint semantics. Only this concrete serving wrapper is in scope.
+        if type(engine) is not Qwen4MTPSpeculativeEngine:
+            return
+        target = engine.target
+        slots = getattr(target, "_hot_prompt_slots", None)
+        if (getattr(getattr(target, "rc", None), "hot_prompt_kv", True)
+                or slots is None or slots
+                or getattr(target, "_hot_kv_persist", None) is not None
+                or getattr(target, "_prompt_kv_store", None) is not None
+                or getattr(target, "_vision_prompt_cache", None) is not None
+                or getattr(target, "_glm53_vision_prompt_cache", None) is not None
+                or getattr(target, "_vision_embedding_cache", None)
+                or getattr(target, "_glm53_vision_embedding_cache", None)):
+            print("[server] qwen4 idle request state: skipped=reuse-owner", flush=True)
+            return
+        endpoint = getattr(target, "last_kv", None)
+        endpoint_logical_bytes = int(endpoint.nbytes()) if endpoint is not None else 0
+        del endpoint
+        # Successful MTP consumes these immediately; an interrupted callback
+        # can leave strict-prefix captures owned by the target instead.
+        target.consume_serial_kda_endpoint(None)
+        target.consume_serial_kda_factors()
+        target.consume_serial_qwen4_endpoint(None)
+        target.release_request_state()
+        print(
+            "[server] qwen4 idle request state: released "
+            f"endpoint_logical_bytes={endpoint_logical_bytes} "
+            "physical_reclamation=unmeasured", flush=True)
+    except Exception as error:
+        # A sent response cannot become a second error response because idle
+        # disposal failed. Preserve the original serving outcome, even when
+        # the diagnostic log sink itself is unavailable.
+        try:
+            print(
+                "[server] qwen4 idle request state: cleanup_failed "
+                f"error_type={type(error).__name__}", flush=True)
+        except Exception:
+            pass
+
+
 def _engine_generate(engine, *args, expert_top_k: int = 0, **kwargs):
     """Use fail-slow prefill retry when the concrete engine supports it.
 
@@ -11878,6 +11935,11 @@ class Handler(BaseHTTPRequestHandler):
                 self._json(500, {"error": f"{type(e).__name__}: {e}"})
             except Exception:
                 pass
+        finally:
+            # Includes Responses/Anthropic delegates and all hidden-gateway
+            # sub-generations. do_POST still owns INFER_LOCK until this method
+            # returns; no response/cache consumer may use the endpoint later.
+            _release_qwen4_idle_request_state(locals().get("engine"))
 
     def _do_responses(self, req: dict, model_id: str, model_dir: Path, engine, mode: str,
                       max_output_tokens: int, stream: bool, stop: list,

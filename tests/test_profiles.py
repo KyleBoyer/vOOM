@@ -27,6 +27,19 @@ from runtime.profiles import (
 ROOT = Path(__file__).resolve().parent.parent
 
 
+def test_qwen_idle_release_overlay_changes_only_the_explicit_cleanup_flag():
+    catalog = discover_runtime_profiles((ROOT / "profiles",))
+    base = "qwen38-flash-next-uncensored-fp8-fast-tier-mtp-direct-fp8-qmv-prefill-pipeline-exact-fused-delta"
+    overlay = "qwen38-flash-next-uncensored-fp8-exact-pipeline-idle-release"
+    _, base_settings = resolve_runtime_profiles((base,), catalog)
+    _, settings = resolve_runtime_profiles((overlay,), catalog)
+    assert "VMODEL_QWEN4_RELEASE_IDLE_REQUEST_STATE" not in base_settings
+    assert settings == {
+        **base_settings, "VMODEL_QWEN4_RELEASE_IDLE_REQUEST_STATE": "1",
+    }
+    assert settings["VMODEL_QWEN4_HOT_PROMPT_KV"] == "0"
+
+
 def _write_profile(
     directory: Path,
     name: str,

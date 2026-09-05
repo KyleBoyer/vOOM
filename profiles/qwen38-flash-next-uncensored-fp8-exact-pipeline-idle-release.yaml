@@ -1,0 +1,12 @@
+schema: voom.runtime-profile.v1
+name: qwen38-flash-next-uncensored-fp8-exact-pipeline-idle-release
+description: Opt-in serving-boundary release of unreusable Qwen MTP request state.
+notes:
+  - "Extends the installed uncensored FP8 exact-fused/MTP pipeline without changing weights, arithmetic, sampling, prompts or tool schemas."
+  - "After final HTTP response consumers finish, release the Qwen MTP target request endpoint only when hot-KV is disabled, no hot slots exist and no persistent owner is active. Direct-engine endpoint/oracle semantics remain unchanged."
+  - "The previous 32797-input/256-output retrieval run retained 1.031GB of endpoint arrays after serving. Releasing ownership may improve idle headroom; it cannot undo that run's prior swap-out or lower its already-measured peak, and logical endpoint bytes are not a promised physical-memory gain."
+  - "Explicit/default-off experiment. A real continued-request equivalence and pressure comparison is still required before promotion."
+extends:
+  - qwen38-flash-next-uncensored-fp8-fast-tier-mtp-direct-fp8-qmv-prefill-pipeline-exact-fused-delta
+settings:
+  VMODEL_QWEN4_RELEASE_IDLE_REQUEST_STATE: true
