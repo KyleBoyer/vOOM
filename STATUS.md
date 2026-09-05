@@ -1,5 +1,56 @@
 # STATUS — 2026-09-05 (current corrections first; dated chronology below is history)
 
+## 2026-09-05: fixed Qwen pipeline completes focused Plex, strict rubric still fails
+
+The uncensored-FP8 exact-fused prefill/native-MTP pipeline after `4db37b5`
+finished the **modified focused one-tool, short-system/history, synthetic-page,
+greedy/non-streaming/no-reasoning, max-512-per-turn** Plex fixture in
+**2,826.627s (47.11 min)**. Score: **87.5/100, FAILED** under the unchanged
+whole-visible-output rubric. This is not the unmodified 134-tool capture or a
+paired speed comparison with the older, prematurely terminated max-256 run.
+
+All four responses completed; all three calls were parsed/accounted, with the
+required filters, Kids exclusion, limit50 and offsets0/50/100. The final table
+selected exactly the four eligible titles and correctly classified TV-PG as
+above TV-Y7. Unlike the GLM runs, it did not list that show as eligible. The
+rubric failed because its explicit exclusion explanation named five rejected
+titles. Keep that distinction: not a semantic misclassification, but not a
+passing strict-output result either. There was also an unnecessary third call
+after the final synthetic page, and its visible text leaked an invocation
+fragment; neither should be hidden by the successful final membership decision.
+
+| turn | input / cached / output tokens | wall | first token | decode |
+|---|---:|---:|---:|---:|
+| first call | 2,358 / 0 / 101 | 431.957s | 119.319s | 298.411s |
+| pagination | 2,690 / 0 / 87 | 402.234s | 122.237s | 279.921s |
+| extra call | 3,026 / 0 / 179 | 697.322s | 126.175s | 571.066s |
+| final answer | 3,363 / 0 / 314 | 1,295.112s | 128.040s | 1,166.997s |
+
+MTP accepted 69/93, 57/87, 121/170 and 202/336 proposals in 31/29/57/112
+target sweeps. All turns prefilling cold is expected here: the chosen composed
+profile does not enable the separate opt-in hot-KV profile. Store-accounted
+reads total 4.099TB (not physical-device traffic), reported peak Metal2.228GB,
+zero prefill retries, swap-out+95.928MB and final available4.554GB (not a
+5.3GB-floor pressure pass). Parent FAIL/exit1, no timeout/source drift, complete
+child artifact, all model processes ended. Initial effective wire request:
+8,519 bytes, hash `58b12069...ef00a`. Evidence:
+`logs/qwen_flash_fixed_mtp_plex512_20260905.json` and its `.done.json` envelope.
+
+Instrumentation defect repaired: the wrapper refreshed total store reads but
+left bootstrap-only decode phase counters at zero. It now snapshots the
+post-bootstrap boundary and adds later draft/verifier deltas to the existing
+bootstrap decode counters, preserving prefill and request totals. The derived
+prefetch-hidden bound is recomputed from combined counters, not summed across
+individually clamped intervals. **63 Qwen MTP tests passed in 0.29s**; four new
+counter cases cover max1/max4, with/without bootstrap decode, repeated requests
+and nonzero initial cumulative counters. Fresh 30-second preflight passed,
+zero swap growth/churn; `logs/gates/qwen_mtp_phase_io_regressions_20260905.done.json`
+is PASS/exit0 with no source drift. Arithmetic and emitted tokens are unchanged.
+The completed model artifact predates this repair; do not reinterpret its zero
+decode field as a new measurement. Next: corrected answer-hidden retrieval and
+varied-domain gates, without relaxing Plex's rubric or altering its request to
+manufacture a pass. No profile is promoted by this result.
+
 ## 2026-09-05: Qwen MTP grammar completion no longer drops verified suffix tokens
 
 The Qwen4 MTP verifier advances the authoritative grammar across an entire

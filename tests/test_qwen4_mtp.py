@@ -650,6 +650,106 @@ def test_speculative_controller_full_accept_emits_bonus_in_one_target_sweep(
     assert target.last_kv.offset == 5
 
 
+class _CounterTarget(_FakeTarget):
+    """Exercise the real cumulative cache-I/O helpers without checkpoint I/O."""
+
+    def __init__(self, *, bootstrap_decode):
+        super().__init__([11, 12, 13])
+        self.bootstrap_decode = bootstrap_decode
+        self.cache = SimpleNamespace(
+            stats=SimpleNamespace(
+                hits=100, misses=200, evictions=300, bytes_read=10_000,
+                prefetch_wait_s=19.0, prefetch_useful_load_s=20.0),
+            total_bytes=0, max_bytes=100, pinned_bytes=0)
+        self.store = SimpleNamespace(fast_tier_bytes=2_500, archive_bytes=7_500)
+        self.expert_hits = 400
+        self.expert_misses = 500
+        self._layer_transient = self._token_transient = 0
+
+    def add_work(self, byte_count, *, wait_s=0.0, useful_s=0.0):
+        self.cache.stats.bytes_read += byte_count
+        self.cache.stats.hits += 1
+        self.cache.stats.misses += 2
+        self.expert_misses += 3
+        self.store.fast_tier_bytes += byte_count // 5
+        self.store.archive_bytes += byte_count - byte_count // 5
+        self.cache.stats.prefetch_wait_s += wait_s
+        self.cache.stats.prefetch_useful_load_s += useful_s
+
+    def generate(self, prompt, max_tokens, **kwargs):
+        from runtime.engine import _cache_io_snapshot, _record_cache_io_delta
+
+        before = _cache_io_snapshot(self)
+        result = super().generate(prompt, max_tokens, **kwargs)
+        self.add_work(100, wait_s=0.5, useful_s=1.0)
+        prefill_after = _cache_io_snapshot(self)
+        if self.bootstrap_decode:
+            self.add_work(20, wait_s=0.3, useful_s=0.1)
+        after = _cache_io_snapshot(self)
+        stats = result["path_stats"]
+        _record_cache_io_delta(self, before, stats, after=after)
+        _record_cache_io_delta(
+            self, before, stats, prefix="prefill_", after=prefill_after)
+        _record_cache_io_delta(
+            self, prefill_after, stats, prefix="decode_", after=after)
+        return result
+
+    def forward_tokens_serial_positions(self, tokens, kv, **kwargs):
+        self.add_work(70, useful_s=0.1)
+        return super().forward_tokens_serial_positions(tokens, kv, **kwargs)
+
+
+class _CounterDrafter(_FakeDrafter):
+    def __init__(self, target):
+        super().__init__([11, 12])
+        self.target = target
+
+    def draft_step(self, hidden, token, cache, offset, *, weights):
+        self.target.add_work(5, useful_s=0.1)
+        return super().draft_step(hidden, token, cache, offset, weights=weights)
+
+
+@pytest.mark.parametrize("max_tokens", [1, 4])
+@pytest.mark.parametrize("bootstrap_decode", [False, True])
+def test_mtp_phase_io_preserves_bootstrap_and_counts_post_bootstrap_work(
+        max_tokens, bootstrap_decode):
+    target = _CounterTarget(bootstrap_decode=bootstrap_decode)
+    drafter = _CounterDrafter(target)
+    engine = Qwen4MTPSpeculativeEngine(target, depth=2, drafter=drafter)
+    decode_bootstrap_bytes = 20 if bootstrap_decode else 0
+    later_bytes = 80 if max_tokens > 1 else 0  # two drafts plus verification
+    decode_bytes = decode_bootstrap_bytes + later_bytes
+    decode_work_calls = int(bootstrap_decode) + (3 if max_tokens > 1 else 0)
+    # Nonzero initial cumulative counters and repeated requests must not leak
+    # into request-local totals or cause the bootstrap work to be added twice.
+    for _request in range(2):
+        result = engine.generate(
+            "prompt", max_tokens=max_tokens,
+            sampling=SamplingParams(temperature=0.0))
+        stats = result["path_stats"]
+        assert stats["prefill_weight_store_bytes_read"] == 100
+        assert stats["decode_weight_store_bytes_read"] == decode_bytes
+        assert stats["weight_store_bytes_read"] == 100 + decode_bytes
+        for key in ("weight_store_bytes_read", "weight_cache_hits",
+                    "weight_cache_misses", "expert_cache_misses",
+                    "weight_fast_tier_bytes", "weight_archive_bytes"):
+            assert stats[key] == stats[f"prefill_{key}"] + stats[f"decode_{key}"]
+        assert stats["decode_weight_cache_hits"] == decode_work_calls
+        assert stats["decode_expert_cache_misses"] == 3 * decode_work_calls
+        assert stats["decode_weight_fast_tier_bytes"] == decode_bytes // 5
+        assert stats["decode_weight_archive_bytes"] == decode_bytes * 4 // 5
+        expected_wait = 0.3 if bootstrap_decode else 0.0
+        expected_useful = ((0.1 if bootstrap_decode else 0.0)
+                           + (0.3 if max_tokens > 1 else 0.0))
+        assert stats["decode_weight_prefetch_wait_s"] == pytest.approx(expected_wait)
+        assert stats["decode_weight_prefetch_useful_load_s"] == pytest.approx(
+            expected_useful)
+        assert stats["decode_weight_prefetch_hidden_lower_bound_s"] == pytest.approx(
+            max(0.0, expected_useful - expected_wait), abs=3e-9)
+        assert stats["qwen4_mtp_used"] == int(max_tokens > 1)
+    assert drafter.proposal_steps == (4 if max_tokens > 1 else 0)
+
+
 class _TerminalConstraint:
     """Stateful terminal witness, including independent speculative forks."""
 

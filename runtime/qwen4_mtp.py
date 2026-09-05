@@ -569,6 +569,7 @@ class Qwen4MTPSpeculativeEngine:
             bootstrap_kwargs["constraint"] = constraint
         bootstrap = bootstrap_generate(
             _Qwen4MTPBootstrapPrompt(prompt, ids), 1, **bootstrap_kwargs)
+        bootstrap_cache_after = _cache_io_snapshot(target)
         path_stats = dict(bootstrap.get("path_stats") or {})
         if max_tokens == 1 or bootstrap.get("termination_reason") != "length":
             path_stats.update({
@@ -1274,6 +1275,22 @@ class Qwen4MTPSpeculativeEngine:
         _record_cache_io_delta(
             target, request_cache_before, path_stats,
             after=request_cache_after)
+        # Bootstrap owns the prefill/decode split through its first token.
+        # Attribute every subsequent draft/verifier fetch to decode while
+        # retaining any decode work already recorded by that bootstrap.
+        additional_decode_stats = {}
+        _record_cache_io_delta(
+            target, bootstrap_cache_after, additional_decode_stats,
+            prefix="decode_", after=request_cache_after)
+        for key, value in additional_decode_stats.items():
+            path_stats[key] = path_stats.get(key, 0) + value
+        # This derived bound is not additive across phases: one phase's wait
+        # may exceed its useful-load time. Recompute from the combined totals.
+        path_stats["decode_weight_prefetch_hidden_lower_bound_s"] = max(
+            0.0,
+            path_stats.get("decode_weight_prefetch_useful_load_s", 0.0)
+            - path_stats.get("decode_weight_prefetch_wait_s", 0.0),
+        )
         _record_direct_io_delta(
             target, request_direct_io_before, path_stats)
 
