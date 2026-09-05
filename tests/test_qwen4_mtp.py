@@ -650,6 +650,129 @@ def test_speculative_controller_full_accept_emits_bonus_in_one_target_sweep(
     assert target.last_kv.offset == 5
 
 
+class _TerminalConstraint:
+    """Stateful terminal witness, including independent speculative forks."""
+
+    def __init__(self, terminal, accepted=()):
+        self.terminal = terminal
+        self.accepted = list(accepted)
+        self.completed = bool(self.accepted and self.accepted[-1] == terminal)
+
+    def mask_logits(self, logits):
+        assert not self.completed
+        return logits
+
+    def accept_token(self, token):
+        assert not self.completed
+        self.accepted.append(int(token))
+        self.completed = token == self.terminal
+
+    def fork(self):
+        return _TerminalConstraint(self.terminal, self.accepted)
+
+
+class _ConstrainedTarget(_FakeTarget):
+    def generate(self, prompt, max_tokens, **kwargs):
+        result = super().generate(prompt, max_tokens, **kwargs)
+        # The real one-token bootstrap advances the authoritative grammar.
+        kwargs["constraint"].accept_token(result["tokens"][0])
+        return result
+
+    def _constraint_logits(self, logits, constraint, *, hidden):
+        return constraint.mask_logits(logits)
+
+
+@pytest.mark.parametrize("streaming", [False, True])
+@pytest.mark.parametrize("temperature", [0.0, 1.0])
+@pytest.mark.parametrize(
+    "depth,drafts,target_rows,terminal,expected,verified,outcome",
+    [
+        pytest.param(
+            3, [11, 12, 13], [11, 12, 13, 14], 12,
+            [10, 11, 12], (10, 11, 12), "A2", id="accepted-second"),
+        pytest.param(
+            3, [11, 12, 13], [11, 12, 13, 14], 13,
+            [10, 11, 12, 13], (10, 11, 12, 13), "A3", id="accepted-third"),
+        pytest.param(
+            2, [11, 12], [11, 12, 13], 13,
+            [10, 11, 12, 13], (10, 11, 12), "A2", id="terminal-bonus"),
+        pytest.param(
+            3, [11, 12, 13], [11, 77, 13, 14], 77,
+            [10, 11, 77], (10, 11, 12, 13), "A1R", id="terminal-correction"),
+    ],
+)
+def test_grammar_completion_emits_entire_verified_chunk_and_exact_endpoint(
+        _cache_io_noop, streaming, temperature, depth, drafts, target_rows,
+        terminal, expected, verified, outcome):
+    target = _ConstrainedTarget(target_rows)
+    constraint = _TerminalConstraint(terminal)
+    engine = Qwen4MTPSpeculativeEngine(
+        target, depth=depth, drafter=_FakeDrafter(drafts))
+    chunks = []
+
+    result = engine.generate(
+        "prompt", max_tokens=16,
+        sampling=SamplingParams(temperature=temperature, seed=73),
+        constraint=constraint,
+        on_token=chunks.append if streaming else None)
+
+    assert result["tokens"] == expected
+    assert result["text"] == target.tokenizer.decode(expected)
+    assert constraint.accepted == expected
+    assert constraint.completed
+    assert result["termination_reason"] == "grammar"
+    assert target.verify_calls == [verified]
+    stats = result["path_stats"]
+    assert stats["qwen4_mtp_constraint_verified"] == 1
+    assert stats["qwen4_mtp_round_outcomes"] == outcome
+    assert stats["qwen4_mtp_target_sweeps"] == 1
+    # The final emitted token remains unfed, exactly as ordinary generation.
+    endpoint = len(target.tokenizer.ids) + len(expected) - 1
+    assert target.last_kv.offset == result["kv_positions"] == endpoint
+    fed = len(expected) - 1
+    if fed < len(verified):
+        assert target.last_kv.kda_cache.marker == f"kda-{fed}"
+        assert target.last_kv.qwen4_cache.restores == [(f"aux-{fed}", endpoint)]
+    else:
+        assert not target.last_kv.qwen4_cache.restores
+    if streaming:
+        assert "".join(chunks) == result["text"]
+    else:
+        assert not chunks
+
+
+@pytest.mark.parametrize("streaming", [False, True])
+@pytest.mark.parametrize("boundary", ["eos", "text-stop", "budget"])
+def test_grammar_chunk_emission_preserves_other_stop_boundaries(
+        _cache_io_noop, streaming, boundary):
+    target = _ConstrainedTarget([11, 12, 13, 14])
+    constraint = _TerminalConstraint(13)
+    if boundary == "eos":
+        target.cfg.eos_token_ids = (12,)
+    engine = Qwen4MTPSpeculativeEngine(
+        target, depth=3, drafter=_FakeDrafter([11, 12, 13]))
+    chunks = []
+    result = engine.generate(
+        "prompt", max_tokens=3 if boundary == "budget" else 16,
+        sampling=SamplingParams(temperature=0.0), constraint=constraint,
+        stop=["12"] if boundary == "text-stop" else None,
+        on_token=chunks.append if streaming else None)
+
+    assert result["tokens"] == [10, 11, 12]
+    assert result["text"] == (
+        "10 11 " if boundary == "text-stop" else "10 11 12")
+    assert result["termination_reason"] == {
+        "eos": "eos", "text-stop": "stop_sequence", "budget": "length",
+    }[boundary]
+    endpoint = len(target.tokenizer.ids) + 2
+    assert target.last_kv.offset == result["kv_positions"] == endpoint
+    assert target.last_kv.kda_cache.marker == "kda-2"
+    assert target.last_kv.qwen4_cache.restores == [("aux-2", endpoint)]
+    assert result["path_stats"]["qwen4_mtp_target_sweeps"] == 1
+    if streaming:
+        assert "".join(chunks) == result["text"]
+
+
 def test_speculative_controller_returns_request_profiler_result(
         _cache_io_noop):
     class _Profiler:

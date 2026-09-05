@@ -1,5 +1,37 @@
 # STATUS — 2026-09-05 (current corrections first; dated chronology below is history)
 
+## 2026-09-05: Qwen MTP grammar completion no longer drops verified suffix tokens
+
+The Qwen4 MTP verifier advances the authoritative grammar across an entire
+accepted/corrected chunk before emission. The emitter incorrectly checked that
+chunk-final `constraint.completed` flag after each token, so a grammar-terminal
+chunk could return only its first token and discard its already-verified suffix.
+This is a concrete controller bug and a plausible cause of the earlier focused
+Plex response ending in `</tool`; that historical artifact lacks raw terminal
+token IDs, so the specific old failure is not yet conclusively attributed.
+
+The narrow fix removes only that premature emission guard. Verification still
+ends at grammar completion, the outer loop still stops, and EOS, text-stop and
+output-budget limits remain enforced. No target weights, logits, grammar rules,
+parser acceptance, prompt, or tool schema are changed. Read-only comparison
+found no equivalent emission guard in the generic GLM speculative controller.
+
+**59 Qwen MTP tests passed in 0.23s**, including 16 new full-controller
+fake-target cases for terminal accepted draft positions 2/3, bonus and
+correction, each with greedy/stochastic and streaming/non-streaming execution.
+They check exact output tokens, authoritative grammar state and hybrid target
+cache endpoints. Six additional cases check EOS/text-stop/budget boundaries
+and endpoint restoration with and without streaming. These are synthetic
+controller proofs, not full-checkpoint equivalence or a new speed/quality score.
+Fresh 30-second preflight passed with zero swap growth/churn; crash-visible
+gate: `logs/gates/qwen_mtp_grammar_and_stops_20260905.done.json`.
+
+Next: run the current explicit uncensored-FP8 exact-fused prefill/MTP pipeline
+through focused Plex with 512 output tokens per turn and no reasoning. This
+retains only one real tool, shortens system/history and supplies synthetic
+pages; it is not the unmodified 134-tool capture. Require a complete model-only
+answer under the unchanged rubric before advancing the wider replay corpus.
+
 ## 2026-09-05: canonical lossless GLM Flash control also fails completed Plex
 
 The existing canonical lossless native-MTP3/direct-QMV-decode-only profile

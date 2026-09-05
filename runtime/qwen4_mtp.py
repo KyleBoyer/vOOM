@@ -966,9 +966,14 @@ class Qwen4MTPSpeculativeEngine:
                     stop_text is not None
                     or token in eos
                     or len(emitted) >= max_tokens
-                    or bool(constraint is not None and constraint.completed)
                 ):
                     break
+
+            # Verification already advanced the constraint through new_tokens
+            # and ended that chunk at grammar completion. Its current flag
+            # describes the chunk's final token, not each token being emitted:
+            # checking it above would discard the rest of a verified tool-call
+            # closing delimiter after emitting only the chunk's first token.
 
             emitted_this_round = len(emitted) - emitted_before
             target_fed = min(len(verify_tokens), max(1, emitted_this_round))
