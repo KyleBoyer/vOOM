@@ -1,5 +1,35 @@
 # STATUS — 2026-09-05 (current corrections first; dated chronology below is history)
 
+## 2026-09-05: first-token boundary endpoint observer ready for paired diagnosis
+
+`tests/fixtures/qwen4_hot_boundary_http_probe.py` runs the ordinary server
+with explicit named profiles and observes exactly one concrete Qwen4-MTP
+max1 generation. It preserves original request arguments/result identity and
+hashes the actual prepared/emitted IDs, authoritative KV/KDA/QSA/PLE endpoint
+and BF16 hidden-row bits. It records profile/checkpoint identity, boundary
+hint, separate before/after-generation and after-hashing pressure/allocator
+samples, and hashing cost. No raw prompt/text/IDs/tensors are published.
+Private0600 artifacts are atomic, no-overwrite and directory-fsynced; invalid
+request shapes are rejected before generation and missing/misaligned endpoints
+are explicitly unavailable. **144 pure tests passed in3.62s**, including36
+new observer/schema/lifecycle/publication tests and existing witness/profile/
+replay/cleanup checks. No model test has run on this fixture yet.
+
+Next diagnostic arms: same1611-token modified workspace prompt, two actual
+tool schemas, developer role, streaming/progress, greedy/seed64001, unspecified
+reasoning, **max1**, first uncached exact-fused profile then first cold hot-KV
+profile, both plus `generation-witness`. Require matching prepared-token and
+checkpoint identities, one actual generated token, endpoint position1611 and
+121 state arrays; compare aggregate/component/hidden hashes. Preserve frozen
+8.5GB/5.3GB/16MB diagnostic gates and use a fresh30-second preflight for each
+arm. These are deliberately first-token prefill-correctness probes, not
+completed answers, quality scores or serving-speed evidence: endpoint hashing
+adds host reads/synchronization. Planned private endpoints
+`logs/qwen4_boundary_nohot_first_20260905.json` and
+`logs/qwen4_boundary_hot_first_20260905.json`, with separate HTTP artifacts and
+supervised `.done.json` envelopes. Inspect running/result state first and never
+edit sources during either model job.
+
 ## 2026-09-05: hot-KV saves repeat time but FAILS raw-token equivalence and pressure
 
 The new prefix-cache composition completed both **modified two-real-workspace-
