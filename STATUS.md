@@ -1,5 +1,46 @@
 # STATUS — 2026-09-05 (current corrections first; dated chronology below is history)
 
+## 2026-09-05: canonical lossless GLM Flash control also fails completed Plex
+
+The existing canonical lossless native-MTP3/direct-QMV-decode-only profile
+completed the same focused max-512 quality fixture in **4,432.078s (73.87 min)**
+and scored **55/100, FAILED**. The initial effective request hash is exactly
+the E-class arm's `c290b98a...c0e7`: 8,513 bytes, 2,187 tokens, one real Plex
+function, shortened system/history, forced non-streaming/greedy/low reasoning
+and synthetic pages. Neither arm is the unmodified 134-tool capture.
+
+All three turns completed with 82/155/237 output tokens, no protocol failure,
+truncation or unhandled call. Both tool calls omitted media type, rating
+operator and the required movie/TV rating filters; they supplied only the
+excluded path, limit and offsets 0/200. The final answer again incorrectly
+included a TV-PG show below the TV-Y7 ceiling, and named other rejected rows.
+Thus removing compact MLA and restoring the canonical outer tile did not
+eliminate the semantic error **within this runtime**. This does not isolate a
+checkpoint defect from a common-runtime defect without an independent reference.
+The E-class arm's higher score/faster wall still does not make its wrong answer
+acceptable, and neither profile is promoted.
+
+| turn | input / cached / output tokens | wall | first token | decode |
+|---|---:|---:|---:|---:|
+| first call | 2,187 / 0 / 82 | 1,138.047s | 489.854s | 642.930s |
+| pagination | 2,418 / 2,187 / 155 | 1,355.344s | 223.847s | 1,131.402s |
+| final answer | 2,654 / 2,418 / 237 | 1,938.685s | 225.544s | 1,713.058s |
+
+MTP accepted 42/60, 103/143 and 154/212 proposals in 40/52/83 target sweeps.
+Store-accounted reads were 7.105TB, peak Metal 4.511GB, zero prefill retries,
+physical swap-out +162.464MB, and immediate available memory 4.854GB (not a
+5.3GB-floor pressure pass). Root free remained above 18.960GB. Parent exit1,
+complete child artifact, no timeout or source drift, all model processes exited.
+Evidence: `logs/glm53_flash_lossless_mtp3_plex512_20260905.json` and its
+`logs/gates/glm53_flash_lossless_mtp3_plex512_20260905.done.json` envelope.
+
+Next: complete the same kind of sufficiently budgeted focused Plex test on
+the current exact-fused uncensored-FP8 Qwen Flash pipeline. Preserve its
+previous explicit no-reasoning mode and disclose that difference from GLM's
+low setting. Inspect the older malformed closing-tag failure rather than
+silently repairing model output. Then advance corrected retrieval/varied-domain
+tests; do not spend another GLM full-capture run before a credible quality fix.
+
 ## 2026-09-05: complete 512-budget GLM Flash Plex answer fails semantic quality
 
 The current explicit compact-MLA/tile-128/two-reader/direct-QMV/native-MTP3

@@ -9,6 +9,7 @@ notes:
   - "The two-output-row SIMD specialization matched the same four tokens and all 159 endpoint tensors. Its 84.138s wall was neutral to the preceding four-row kernel's 84.012s on this short trace, so the real-expert microbenchmark is not promoted as an end-to-end Flash speed claim."
   - "On the unmodified focused Plex capture (2,187 input tokens, full real schema, greedy, one-token cap), prefill was 471.639s versus the earlier all-phase-direct 1,540.515s and performed zero wider FP8 reconstructions. This is a historical same-input phase-policy comparison, not a simultaneous cold A/B or intelligence result; the cap intentionally cannot complete the tool call."
   - "The real Plex gate peaked at 3.970GB Metal but observed 18.285MB external swap-out growth. This profile remains explicit/default-off pending a longer-decode identity/timing gate, a replay corpus, and lower-pressure confirmation."
+  - "Completed focused max-512 quality control on 2026-09-05: one real Plex function, shortened system/history, greedy non-streaming/low reasoning and synthetic pages. All turns completed (82/155/237 outputs) in 4432.078s, but required call filters were omitted and a TV-PG title was wrongly included under the TV-Y7 ceiling. Strict rubric 55/100, failed. Peak Metal4.511GB, swap-out+162.464MB, final availability4.854GB. Not promoted; an independent reference is needed to distinguish checkpoint from common-runtime semantic errors."
 extends:
   - glm53-flash-lossless-native-mtp3-workers2-direct-fp8-qmv
 settings:
