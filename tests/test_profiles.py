@@ -59,6 +59,19 @@ def test_qwen_exact_pipeline_hot_kv_preserves_unrelated_kernel_and_cache_setting
     assert "VMODEL_QWEN4_RELEASE_IDLE_REQUEST_STATE" not in settings
 
 
+@pytest.mark.parametrize("base", [
+    "qwen38-flash-next-uncensored-fp8-fast-tier-mtp-direct-fp8-qmv-prefill-pipeline-exact-fused-delta",
+    "qwen38-flash-next-uncensored-fp8-exact-pipeline-hot-kv",
+])
+def test_generation_witness_profile_composes_without_reapplying_model_settings(base):
+    catalog = discover_runtime_profiles((ROOT / "profiles",))
+    base_order, base_settings = resolve_runtime_profiles((base,), catalog)
+    order, settings = resolve_runtime_profiles((base, "generation-witness"), catalog)
+    assert order == (*base_order, "generation-witness")
+    assert "VMODEL_GENERATION_WITNESS" not in base_settings
+    assert settings == {**base_settings, "VMODEL_GENERATION_WITNESS": "1"}
+
+
 def _write_profile(
     directory: Path,
     name: str,

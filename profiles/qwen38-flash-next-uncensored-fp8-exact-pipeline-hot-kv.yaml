@@ -1,7 +1,8 @@
 schema: voom.runtime-profile.v1
 name: qwen38-flash-next-uncensored-fp8-exact-pipeline-hot-kv
-description: Opt-in exact in-memory prompt reuse for the current uncensored FP8 fused pipeline.
+description: Experimental prefix-cache composition; raw token equivalence failed.
 notes:
+  - "2026-09-05: the completed two-tool workspace repeat reused1606/1611 tokens and took239.528s versus341.373s uncached, but both hot-enabled arms generated74 tokens versus70 in the baseline. Parsed visible output matched; raw generation and endpoint positions did not. This is NOT a validated token-lossless profile. Both pressure gates failed; keep explicit and unpromoted pending partition/state diagnosis."
   - "Extends only the current exact-fused prefill/native-MTP profile and changes four hot-KV settings. Selecting the older hot-KV group separately would replay its ancestors and could reset unrelated kernel/cache settings."
   - "Reuses only an exact retained candidate-token prefix with its matching KV/KDA/QSA/PLE state. Two slots, minimum16 tokens, no persistent journal and no idle-state-disposal override."
   - "Lossless target intent is relative to the installed uncensored FP8 checkpoint, not the official BF16 release. The older composition demonstrated a2351-token continuation hit but failed its capped Plex quality/pressure gate."

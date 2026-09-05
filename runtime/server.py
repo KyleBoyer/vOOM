@@ -7658,6 +7658,52 @@ def _release_qwen4_idle_request_state(engine) -> None:
             pass
 
 
+def _attach_generation_witness(prompt, result: dict) -> None:
+    """Opt-in hashes of engine output before protocol parsing/normalization.
+
+    Hash the actual emitted IDs, never re-encode visible text. Prepared IDs
+    may be absent for direct string callers; mark that witness unavailable
+    instead of guessing tokenization. No tensor evaluation or raw content is
+    introduced, and a diagnostic failure must not invalidate a sent response.
+    """
+    if os.environ.get("VMODEL_GENERATION_WITNESS", "0").strip() != "1":
+        return
+    schema = "voom.generation-witness.v1"
+    try:
+        def token_witness(values):
+            if not isinstance(values, (list, tuple)) or any(
+                    isinstance(value, bool) or not isinstance(value, int)
+                    or value < 0 for value in values):
+                raise ValueError("token IDs must be a nonnegative integer sequence")
+            encoded = json.dumps(list(values), separators=(",", ":")).encode("ascii")
+            return len(values), hashlib.sha256(encoded).hexdigest()
+
+        count, digest = token_witness(result.get("tokens"))
+        raw_text = result.get("text")
+        if not isinstance(raw_text, str):
+            raise ValueError("engine text must be a string")
+        raw_bytes = raw_text.encode("utf-8")
+        prepared_ids = getattr(prompt, "token_ids", None)
+        prompt_count, prompt_digest = (
+            token_witness(prepared_ids) if prepared_ids is not None else (None, None))
+        result["generation_witness"] = {
+            "schema": schema, "available": True,
+            "scope": "single_engine_generation_before_protocol_parsing",
+            "token_hash_encoding": "compact-json-integer-array-v1",
+            "generated_token_count": count,
+            "generated_token_ids_sha256": digest,
+            "engine_text_bytes": len(raw_bytes),
+            "engine_text_sha256": hashlib.sha256(raw_bytes).hexdigest(),
+            "prepared_prompt_token_count": prompt_count,
+            "prepared_prompt_token_ids_sha256": prompt_digest,
+        }
+    except Exception as error:
+        result["generation_witness"] = {
+            "schema": schema, "available": False,
+            "error_type": type(error).__name__,
+        }
+
+
 def _engine_generate(engine, *args, expert_top_k: int = 0, **kwargs):
     """Use fail-slow prefill retry when the concrete engine supports it.
 
@@ -7755,6 +7801,7 @@ def _engine_generate(engine, *args, expert_top_k: int = 0, **kwargs):
         print("[debug] engine.report():\n" + engine.report(), flush=True)
     prompt = args[0] if args else ""
     max_tokens = int(args[1] if len(args) > 1 else kwargs.get("max_tokens", 64))
+    _attach_generation_witness(prompt, result)
     _persist_request_expert_trace(
         engine,
         trace_start,
@@ -10592,6 +10639,7 @@ def _vision_protocol_timing(result: dict) -> dict:
     # its small structured rows, plus the normalized policy/step counters,
     # instead of silently dropping the evidence at the protocol boundary.
     for key in (
+        "generation_witness",
         "qwen_mtp_accepted_by_step",
         "qwen_mtp_verified_by_step",
         "qwen_mtp_entropy_stop_events_by_step",

@@ -1,5 +1,64 @@
 # STATUS — 2026-09-05 (current corrections first; dated chronology below is history)
 
+## 2026-09-05: hot-KV saves repeat time but FAILS raw-token equivalence and pressure
+
+The new prefix-cache composition completed both **modified two-real-workspace-
+tool, short system/history/user, developer-role, streaming/progress, greedy/
+seed64001, reasoning-unspecified** requests with the correct single read-file
+call plus message. Wire SHA256`e5e51779...9bf34b`/5,543bytes and parsed-output
+SHA256`0d9db4d2...f60e6` match the uncached control. The repeat reused an actual
+1,606/1,611-token exact prefix from memory, with only five scaffold tokens
+prefilled. Neither request executed a tool or reached its512-output budget.
+
+| state | uncached-control wall | hot-KV wall | hot prefill / decode |
+|---|---:|---:|---:|
+| fresh server | 357.1221s | 370.4544s | 126.5861 / 229.5478s |
+| model loaded | 341.3728s | 239.5282s | 11.0491 / 228.3802s |
+
+Repeat wall improved29.83%, first request regressed3.73%; two-request wall
+698.4949 ->609.9826s (-12.67%). These are **not lossless speed claims**:
+both hot arms emitted74 actual tokens versus70 in the baseline. Endpoints
+confirm1684 versus1680 positions (prompt+generated−1), and the110,784-byte KV
+increase equals exactly four positions. MTP changed from47/67 proposals to
+50/69, still23 sweeps. No accounting offset explains these independent
+witnesses. The fixture's older output hash covers parsed items, which normalize
+tool markup; identical hashes do not establish raw model-token equivalence.
+The profile description now explicitly warns that token equivalence failed.
+
+The likely cause is prefill partitioning: baseline1024+587 positions becomes
+1024+582 then a separate five-token scaffold. Exact fused Delta recurrence
+does not by itself make upstream GEMMs/expert gathers independent of shape.
+Same74-token behavior cold and cached points to boundary construction rather
+than a cache-only corruption, but endpoint/hidden-state proof is still needed.
+Do not enable/promote this as lossless or silently dismiss the extra tokens.
+
+Overall also **FAIL pressure**: after-call available4.373/4.858GB below5.3GB;
+swap-out15.532MB first/20.185MB cumulative above16MB, usage+0.066MB.
+Peaks2.796/2.800GB, zero retries, root minimum18.970GB. Store reads
+488,820,642,608 first and371,377,081,568 repeated; decode356,488,733,928 each.
+Parent source`7098f87`, FAIL/exit1, wall612.1353s, no timeout/source drift,
+all processes ended. Artifacts:
+`logs/qwen_flash_exact_hotkv_workspace_stream512_20260905.json` and its
+`.done.json` envelope. No full134-tool capture, broad intelligence or sub90s pass.
+
+New diagnostic: opt-in `generation-witness` profile /
+`VMODEL_GENERATION_WITNESS=1` attaches hashes/counts of the actual emitted ID
+sequence and engine text before protocol parsing, plus prepared prompt-ID
+identity when available. Missing/invalid data is explicitly unavailable, never
+re-tokenized from visible text. No raw prompt/text/IDs/tensors are emitted by
+this helper; scope is one engine generation, not an entire gateway workflow.
+**504 server/controller/profile/replay/witness tests passed in4.08s** after a
+passing30-second preflight; supervised envelope
+`logs/gates/generation_witness_server_suite_20260905.done.json` PASS/exit0,
+no source drift/timeout. The instrumentation is not yet exercised on-model.
+
+Next bounded diagnostic: compare max1 bootstrap endpoint/hidden-state and
+prepared-token witnesses between cold no-hot and cold hot arms of this same
+request, with separate preflights. This is explicitly a prefill-correctness
+probe, not a completed-answer timing benchmark. If the split is confirmed,
+test a content-blind tile-aligned retained prefix (1024 here), recomputing the
+original587-row tail; do not implement or claim that candidate proven yet.
+
 ## 2026-09-05: prepare exact hot-KV composition with independent output-hash gate
 
 New explicit profile `qwen38-flash-next-uncensored-fp8-exact-pipeline-hot-kv`
