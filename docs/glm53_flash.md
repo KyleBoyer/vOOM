@@ -44,6 +44,15 @@ Status date: 2026-09-04
 > found depth four 2.40% faster on one accepted-proposal trace but 0.96% slower
 > on a zero-acceptance coding trace; all tokens and 159 endpoint tensors matched.
 > Depth three therefore remains the general explicit profile.
+>
+> The current strongest sustained-output composition is
+> `glm53-flash-e-compact-mla-tile128-workers2-direct-fp8-qmv-mtp3`. On the
+> 2,123-input/32-output semantic gate it preserved the exact output hash,
+> accepted 22/24 native-MTP proposals, and reduced wall 784.748 -> 428.803s
+> versus the original compact control. It remains explicit/E-class because its
+> compact absorbed-MLA parent reassociates floating-point operations; Plex,
+> varied-shape, streaming/sampling, long-context, and vision promotion gates
+> remain open.
 
 ## Checkpoint and storage
 

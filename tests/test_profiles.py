@@ -287,6 +287,46 @@ def test_builtin_profiles_resolve_complete_agent_group():
     assert glm_decode_direct_settings[
         "VMODEL_GLM53_FP8_DIRECT_QMV_DECODE_ONLY"] == "1"
 
+    glm_compact_decode_direct_order, glm_compact_decode_direct_settings = (
+        resolve_runtime_profiles((
+            "glm53-flash-e-compact-mla-tile128-workers2-"
+            "direct-fp8-qmv-decode-only",
+        ), catalog))
+    assert glm_compact_decode_direct_order[-2:] == (
+        "glm53-flash-e-compact-mla-tile128-workers2",
+        "glm53-flash-e-compact-mla-tile128-workers2-"
+        "direct-fp8-qmv-decode-only",
+    )
+    assert glm_compact_decode_direct_settings[
+        "VMODEL_GLM53_PREFILL_TILE_WIDTH"] == "128"
+    assert glm_compact_decode_direct_settings[
+        "VMODEL_GLM53_SPARSE_ABSORBED_QUERY_TILE_SIZE"] == "128"
+    assert glm_compact_decode_direct_settings[
+        "VMODEL_GLM53_EXPERT_BATCH_PREFETCH_WORKERS"] == "2"
+    assert glm_compact_decode_direct_settings[
+        "VMODEL_GLM53_FP8_DIRECT_QMV"] == "1"
+    assert glm_compact_decode_direct_settings[
+        "VMODEL_GLM53_FP8_DIRECT_QMV_DECODE_ONLY"] == "1"
+    assert "VMODEL_GLM53_MTP" not in glm_compact_decode_direct_settings
+
+    glm_compact_mtp_order, glm_compact_mtp_settings = (
+        resolve_runtime_profiles((
+            "glm53-flash-e-compact-mla-tile128-workers2-"
+            "direct-fp8-qmv-mtp3",
+        ), catalog))
+    assert glm_compact_mtp_order[-2:] == (
+        "glm53-flash-e-compact-mla-tile128-workers2-"
+        "direct-fp8-qmv-decode-only",
+        "glm53-flash-e-compact-mla-tile128-workers2-"
+        "direct-fp8-qmv-mtp3",
+    )
+    assert glm_compact_mtp_settings[
+        "VMODEL_GLM53_FP8_DIRECT_QMV_DECODE_ONLY"] == "1"
+    assert glm_compact_mtp_settings["VMODEL_GLM53_MTP"] == "1"
+    assert glm_compact_mtp_settings["VMODEL_GLM53_MTP_DEPTH"] == "3"
+    assert glm_compact_mtp_settings[
+        "VMODEL_GLM53_TRUNK_PREFETCH_DEPTH"] == "1"
+
     qwen_direct_order, qwen_direct_settings = resolve_runtime_profiles((
         "qwen38-flash-next-uncensored-fp8-fast-tier-mtp-"
         "direct-fp8-qmv-decode-only",

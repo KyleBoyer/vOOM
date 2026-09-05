@@ -1,5 +1,49 @@
 # STATUS — 2026-09-04 (current corrections first; dated chronology below is history)
 
+## 2026-09-04: packed decode plus released native MTP cuts the semantic gate 45%
+
+The 128-row compact-MLA/two-reader profile now has two separately gated decode
+compositions.  The first switches routed-expert cache representation only after
+prefill, retaining the released E4M3 bytes and FP32 block multipliers for the
+already-oracled exact singleton QMV.  On the identical 2,123-input/32-output
+semantic request, both canaries, exact prefix, VALIDATION marker, integer
+sequence, and output SHA `442f64...1d04` matched the BF16-carrier control.
+Wall fell **784.748 -> 699.135s (-10.91%)**, decode **525.620 -> 439.549s
+(-16.37%)**, and decode expert-prefetch wait 249.803 -> 165.686s.  Prefill was
+flat at 256.301/256.788s, peak Metal was 3.091GB, physical swap-out grew
+31.293MB, and there was no retry.
+
+Composing the checkpoint's released native MTP block at depth three produced
+the large result.  It preserved the same semantic output SHA and every gate,
+accepted **22/24** proposals, and needed nine authoritative target sweeps for
+31 decode positions.  Wall fell again to **428.803s** (-38.66% versus direct
+QMV, **-45.36% versus the original control**), decode to **175.399s** (-60.09%
+versus direct QMV), and store-accounted reads 957.397 -> **633.994GB
+(-33.78%)**.  Peak Metal was 3.271GB, swap-out growth 18.760MB, and no retry
+occurred.  Existing heterogeneous depth-three/four evidence still rejects a
+blanket depth-four change: depth four won one accepted trace but regressed an
+independent zero-acceptance coding trace.
+
+The preceding focused Plex gate is an important quality warning and is not an
+untouched-capture result: it retained the captured user intent and full real
+Plex function schema but reduced the 134-tool catalog to Plex, replaced the
+surrounding input with focused system text, forced non-streaming/temperature
+zero/max-128, and used synthetic two-page tool results.  The compact
+tile-128/two-reader profile improved **57.5 -> 88.75/100**: both calls included
+all required filters, pagination advanced `0 -> 200`, and every ineligible
+title was excluded.  It still failed because all three turns exhausted long
+outputs (120/128/128 tokens) and the final visible answer was truncated after
+one of four eligible titles.  Total wall was 7,296.278s; do not promote it or
+claim a Plex pass.  The direct-QMV/MTP composition must clear the same tool
+quality gate with a sufficient final-answer budget before broader varied-shape
+replays.
+
+Evidence:
+`logs/glm53_flash_e_compact_mla_tile128_workers2_plex128_20260904.json`,
+`logs/glm53_flash_e_compact_mla_tile128_workers2_direct_qmv_semantic32_20260904.json`,
+and
+`logs/glm53_flash_e_compact_mla_tile128_workers2_direct_qmv_mtp3_semantic32_20260904.json`.
+
 ## 2026-09-04: wider compact-MLA tiles plus exact dual-reader I/O cut the 2,123-token gate 39%
 
 GLM-5.3-Flash's selected absorbed-MLA query tile is now an explicit,

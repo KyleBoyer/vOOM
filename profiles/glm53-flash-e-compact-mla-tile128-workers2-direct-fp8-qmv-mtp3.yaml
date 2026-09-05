@@ -1,0 +1,17 @@
+schema: voom.runtime-profile.v1
+name: glm53-flash-e-compact-mla-tile128-workers2-direct-fp8-qmv-mtp3
+description: Explicit compact-MLA/direct-QMV profile with released native-MTP verification.
+notes:
+  - "Extends the semantic-gated direct-QMV composition and enables the checkpoint's released iterative MTP block at depth three. Candidate tokens are never emitted directly: every visible token is greedily verified by the authoritative target, and rejected proposals are rolled back."
+  - "Depth-one deterministic trunk lookahead overlaps internal-tier reads with current target work. It changes scheduling only; authoritative weights, router choices, singleton QMV arithmetic, and sampling remain unchanged."
+  - "This first composition intentionally omits the experimental confidence threshold. On the identical 2,123-input/32-output semantic gate it passed both canaries and preserved output SHA 442f64...1d04. It accepted 22/24 proposals, needed nine target sweeps for 31 decode positions, and reduced wall 699.135 -> 428.803 seconds (-38.66%), decode 439.549 -> 175.399 (-60.09%), and reads 957.397 -> 633.994GB (-33.78%) versus direct QMV alone."
+  - "Peak Metal was 3.271GB, swap-out growth 18.760MB, and no retry occurred. This promotes depth three to longer varied-request gates; depth four remains rejected as a general setting because the existing independent coding trace regressed when it accepted no proposals."
+  - "The profile inherits the compact-MLA parent's floating-point reassociation and remains E-class/default-off regardless of MTP's exact target verification."
+extends:
+  - glm53-flash-e-compact-mla-tile128-workers2-direct-fp8-qmv-decode-only
+settings:
+  VMODEL_GLM53_MTP: true
+  VMODEL_GLM53_MTP_DEPTH: 3
+  VMODEL_GLM53_MTP_MAX_PROMPT_TOKENS: 65536
+  VMODEL_GLM53_TRUNK_PREFETCH_DEPTH: 1
+  VMODEL_GLM53_TRUNK_PREFETCH_WORKERS: 1
