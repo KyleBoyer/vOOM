@@ -37,6 +37,15 @@ full-capture or broad-corpus claim. Planned result:
 by the matching `logs/gates/` envelope. Launch only after a fresh passing
 30-second preflight; inspect live jobs first and do not edit during measurement.
 
+Audit caveats: host-spool progress currently labels even a reused-prefix suffix
+as `cold`; judge this gate from final timing/cache-token telemetry, not progress
+labels. Host-spool sub-sweep statistics overwrite on boundary/scaffold sweeps;
+whole-request phase I/O counters and wall times remain the cost witnesses.
+Separately, MTP rewrites direct endpoint slot tokens/KV/logits without refreshing
+`exact_hidden`; that raw exact-endpoint corner needs its own regression/fix and
+is not certified here. HTTP stable-fork slots carry no endpoint logits/hidden
+state and resume through a computed suffix, avoiding that unproven corner.
+
 ## 2026-09-05: Qwen idle cleanup matches baseline outputs, no meaningful speed win
 
 The cleanup-disabled parent profile completed the same two **modified two-tool,
