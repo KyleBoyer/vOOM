@@ -38,6 +38,9 @@ def main() -> None:
     parser.add_argument("--weight-cache-mb", type=int, default=5000)
     parser.add_argument("--state-digest", action="store_true")
     parser.add_argument(
+        "--shared-expert-overlap", action="store_true",
+        help="fixture-only singleton decode shared-compute/I/O overlap experiment")
+    parser.add_argument(
         "--head-residency-oracle", action="store_true",
         help="compare every real target/MTP head row; invalidates speed timings")
     parser.add_argument(
@@ -82,8 +85,12 @@ def main() -> None:
 
     manager = EngineManager()
     head_oracle = None
+    shared_overlap = None
     try:
         engine = manager.get(args.model, "lossless")
+        if args.shared_expert_overlap:
+            from tests.fixtures.glm53_shared_overlap_probe import SharedOverlapProbe
+            shared_overlap = SharedOverlapProbe(getattr(engine, "target", engine))
         if args.head_residency_oracle:
             from tests.fixtures.glm53_head_residency_oracle import HeadResidencyOracle
             head_oracle = HeadResidencyOracle(
@@ -117,6 +124,8 @@ def main() -> None:
             raise SystemExit("--runs must be positive")
         runs = []
         for run_index in range(args.runs):
+            if shared_overlap is not None:
+                shared_overlap.stats.clear()
             # Keep the cold cache-building call timing unperturbed; when a
             # repeat is requested, attribute only the decisive hot call.
             engine.rc.execution_profile = (
@@ -139,6 +148,8 @@ def main() -> None:
                               "weight_cache_resident_bytes",
                               "weight_cache_pinned_bytes")},
                 "run_index": run_index,
+                "shared_expert_overlap": (
+                    dict(shared_overlap.stats) if shared_overlap is not None else None),
                 "wall_s": wall_s,
                 "available_before_bytes": int(available_before),
                 "available_after_bytes": int(available_after),
@@ -473,6 +484,8 @@ def main() -> None:
             if not args.plain and not runs[-1]["prompt_cache_exact_hit"]:
                 raise SystemExit("native MTP repeat did not hit prompt cache")
     finally:
+        if shared_overlap is not None:
+            shared_overlap.close()
         if head_oracle is not None:
             head_oracle.close()
         manager.close()

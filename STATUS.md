@@ -1,5 +1,48 @@
 # STATUS — 2026-09-05 (current corrections first; dated chronology below is history)
 
+## 2026-09-05: shared-expert overlap is measurable but not a useful speed lever
+
+A fixture-only experiment submits authoritative routed-expert reads, computes
+the independent shared branch before waiting for the first batch, then keeps
+the existing ascending routed accumulation and final `routed + shared` order.
+It is restricted to decode and at most six BF16 singleton tiles; prefill stays
+unchanged. No serving environment knob, profile, or automatic path was added.
+The optional producer callback starts inside the generator's ownership scope.
+On failure it cancels queued reads, joins active reads before the request can
+change representation phase, drops payload-owning futures, and preserves the
+original error. Synchronous/disabled prefetch ignores the callback.
+
+On the same **direct-engine 28-input/8-output** prompt, the candidate preserved
+every token, all 159 endpoint tensors and exact store-accounted read bytes.
+Fresh/cached wall was **116.194/50.277s**, versus a following fresh-process
+control **116.544/50.541s**: just **0.30%/0.52%**, not a reliable material win.
+Decode was 48.367/50.269s versus 48.839/50.533s. Earlier controls also fall
+within this small spread. The candidate exposed only 1.626/1.786s total shared
+compute to overlap, across 134/175 calls. Peak extra retained shared output was
+32,768/16,384 bytes; total Metal peaks stayed about 3.082/3.001GB. Candidate
+swap-out grew 8.307/2.638MB, versus control 5.538/2.507MB. Immediate available
+memory was still below the existing 5.3GB fixture floor, so this is not a
+pressure or real-harness pass.
+
+**Decision: stop this speed experiment and keep it fixture-only.** The tiled
+target path preserves its existing shared-output evaluation boundary. The
+singleton/MTP path adds an earlier evaluation boundary; unchanged target tokens
+and state can hide proposal differences, so independent released-MTP
+MLP/residual bit equality is explicitly unproven. Do not promote it or invest
+an expensive harness replay based on these sub-percent pairs.
+
+Evidence: `logs/glm53_shared_overlap_{candidate,control}_max8_20260905.json`,
+their `gate_*.done.json` envelopes and fresh preflights. The timing candidate
+preceded a failure-only worker-join repair; that repair does not alter the
+successful measured schedule. Final ownership regressions are recorded in
+`logs/gate_glm53_shared_overlap_final_tests_20260905.log`: **453 focused tests
+passed**.
+
+Next: prioritize the corrected retrieval and sufficient-output/varied-request
+gates and use the existing per-phase read/compute traces to choose a lever with
+larger headroom. Do not repeatedly retest shared overlap or increase speculative
+width from one trace. The under-90s unmodified-harness objective remains open.
+
 ## 2026-09-05: exact request-scoped Flash head, modest timing gain, no promotion
 
 `VMODEL_GLM53_FLASH_PHASE_LM_HEAD=1` now admits the released 1,268,776,960-byte

@@ -9,6 +9,8 @@ independently tested implementations.
 
 from __future__ import annotations
 
+import time
+
 import mlx.core as mx
 import numpy as np
 
@@ -35,7 +37,9 @@ def glm5_next_swiglu(
 
 def glm5_next_mlp(
         h: mx.array, w: dict, prefix: str, cfg: ModelConfig, layer: int,
-        get_experts, *, iter_expert_batches=None, profile=None) -> mx.array:
+        get_experts, *, iter_expert_batches=None, profile=None,
+        shared_expert_overlap: bool = False,
+        shared_overlap_stats: dict | None = None) -> mx.array:
     """Dense/MoE sublayer output before mHC re-expansion."""
     is_dense = (
         cfg.mlp_layer_types[layer] == "dense"
@@ -61,13 +65,17 @@ def glm5_next_mlp(
         expert: [position for position, _ in groups[expert]]
         for expert in expert_ids
     }
+    shared, overlap = _shared_decode_overlap(
+        [h], w, prefix, cfg, enabled=shared_expert_overlap,
+        stats=shared_overlap_stats)
     if iter_expert_batches is None:
         experts = get_experts(
             layer, expert_ids, positions=positions_by_expert)
         batches = ((expert_ids, experts),)
     else:
         batches = iter_expert_batches(
-            layer, expert_ids, positions=positions_by_expert)
+            layer, expert_ids, positions=positions_by_expert,
+            **({"on_prefetch_started": overlap} if overlap is not None else {}))
 
     def consume_batch(batch_ids, experts):
         nonlocal out
@@ -87,8 +95,45 @@ def glm5_next_mlp(
         mx.eval(out)
 
     consume_expert_batches(batches, consume_batch)
-    return out + glm5_next_swiglu(
+    shared_value = shared[0] if shared else glm5_next_swiglu(
         h, w, f"{prefix}.mlp.shared_experts", cfg)
+    return out + shared_value
+
+
+def _shared_decode_overlap(
+        tiles, w, prefix, cfg, *, enabled, stats=None, memory_guard=None):
+    """Bound independent shared work to at most six singleton BF16 outputs.
+
+    Callers must select decode explicitly. The secondary shape bound prevents
+    retaining full-context shared outputs if a caller accidentally passes a
+    prefill tile. Shared computation moves, but routed accumulation and the
+    final routed-plus-shared addition do not.
+    """
+    shared = []
+    if not enabled or not 1 <= len(tiles) <= 6 or any(
+            len(tile.shape) != 3 or tuple(tile.shape[:2]) != (1, 1)
+            or tile.dtype != mx.bfloat16 for tile in tiles):
+        return shared, None
+
+    def evaluate():
+        started = time.perf_counter()
+        for tile in tiles:
+            value = glm5_next_swiglu(
+                tile, w, f"{prefix}.mlp.shared_experts", cfg)
+            mx.eval(value)
+            shared.append(value)
+            if memory_guard is not None:
+                memory_guard("shared_mlp_overlap_tile")
+        if stats is not None:
+            stats["calls"] = stats.get("calls", 0) + 1
+            stats["positions"] = stats.get("positions", 0) + len(tiles)
+            stats["compute_s"] = stats.get("compute_s", 0.0) + (
+                time.perf_counter() - started)
+            stats["retained_bytes_peak"] = max(
+                stats.get("retained_bytes_peak", 0),
+                sum(int(value.nbytes) for value in shared))
+
+    return shared, evaluate
 
 
 def glm5_next_mlp_layer_stationary_tiles(
@@ -97,7 +142,9 @@ def glm5_next_mlp_layer_stationary_tiles(
         iter_expert_batches=None, profile=None, memory_guard=None,
         coalesce_expert_positions: bool = False,
         coalesced_expert_max_positions: int = 512,
-        coalesced_stats: dict | None = None) -> list[mx.array]:
+        coalesced_stats: dict | None = None,
+        shared_expert_overlap: bool = False,
+        shared_overlap_stats: dict | None = None) -> list[mx.array]:
     """Run GLM-5.3 MLPs at their original tile GEMM shapes.
 
     For MoE layers, routing is still evaluated independently per tile. The
@@ -200,13 +247,17 @@ def glm5_next_mlp_layer_stationary_tiles(
             max((len(global_positions[expert]) for expert in expert_ids),
                 default=0))
 
+    shared, overlap = _shared_decode_overlap(
+        hidden_tiles, w, prefix, cfg, enabled=shared_expert_overlap,
+        stats=shared_overlap_stats, memory_guard=memory_guard)
     if iter_expert_batches is None:
         experts = get_experts(
             layer, expert_ids, positions=global_positions)
         batches = ((expert_ids, experts),)
     else:
         batches = iter_expert_batches(
-            layer, expert_ids, positions=global_positions)
+            layer, expert_ids, positions=global_positions,
+            **({"on_prefetch_started": overlap} if overlap is not None else {}))
 
     def consume_batch(batch_ids, experts):
         touched = []
@@ -337,12 +388,13 @@ def glm5_next_mlp_layer_stationary_tiles(
     consume_expert_batches(batches, consume_batch)
     for tile_index, (routed_value, tile) in enumerate(zip(
             routed, hidden_tiles)):
-        # Compute the independent shared expert only when this tile's routed
-        # accumulation is complete.  The released result is still exactly
+        # Except for the bounded experimental decode overlap, compute shared
+        # output only once this tile's routed accumulation is complete. The
+        # released result is still exactly
         # ``routed + shared`` with the same GEMM shapes and addition order, but
         # a 46,849-token prompt no longer retains every shared output at once
         # (about 384 MB of avoidable BF16 Metal storage on GLM-5.3-Flash).
-        shared_value = glm5_next_swiglu(
+        shared_value = shared[tile_index] if shared else glm5_next_swiglu(
             tile, w, f"{prefix}.mlp.shared_experts", cfg)
         mx.eval(shared_value)
         if memory_guard is not None:

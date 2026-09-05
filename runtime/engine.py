@@ -5401,7 +5401,8 @@ class StreamingEngine:
         return self._fetch_experts(layer, expert_ids)
 
     def _iter_expert_batches(self, layer: int, expert_ids: list[int],
-                             positions: dict[int, list[int]] | None = None):
+                             positions: dict[int, list[int]] | None = None,
+                             *, on_prefetch_started=None):
         """Return bounded expert pages for immediate compute and release.
 
         This is F74-v2's actual lifetime boundary. ``WeightCache.get_many`` may
@@ -5415,7 +5416,14 @@ class StreamingEngine:
         future batches run in order while the current batch computes. The
         explicit depth bounds queued/resident successors; one remains the
         default and previously proven schedule.
+
+        An optional independent-compute callback runs after the leading
+        submissions but before their first wait. In that opt-in case submission
+        is deferred into the generator's try/finally so a callback failure
+        cancels pending work. Synchronous/disabled prefetch never calls it.
         """
+        if on_prefetch_started is not None and not callable(on_prefetch_started):
+            raise TypeError("on_prefetch_started must be callable")
         self._record_expert_route(layer, expert_ids, positions)
         position_union = {
             position for expert_positions in (positions or {}).values()
@@ -5528,11 +5536,15 @@ class StreamingEngine:
                     self._expert_batch_prefetch_max_futures, len(pending))
             return start
 
-        start = fill_pending(0)
+        start = fill_pending(0) if on_prefetch_started is None else 0
 
         def pipelined_batches():
+            future = None
             try:
                 current_start = start
+                if on_prefetch_started is not None:
+                    current_start = fill_pending(0)
+                    on_prefetch_started()
                 while pending:
                     current_ids, future = pending.popleft()
                     current_start = fill_pending(current_start)
@@ -5556,6 +5568,28 @@ class StreamingEngine:
                     # The consumer deletes its reference before resuming us.
                     # Drop the producer's reference before advancing.
                     del pages
+            except BaseException:
+                if on_prefetch_started is not None:
+                    # cancel() cannot stop a running reader. Do not let an
+                    # independent-compute failure return to a caller that may
+                    # switch weight representation while those readers still
+                    # consult it or mutate the cache. Keep the original error.
+                    to_join = [item[1] for item in pending]
+                    if future is not None:
+                        to_join.append(future)
+                    pending.clear()
+                    future = pages = None
+                    for pending_future in to_join:
+                        pending_future.cancel()
+                    for pending_future in to_join:
+                        try:
+                            pending_future.result()
+                        except BaseException:
+                            pass  # cleanup must not replace the compute error
+                    if to_join:
+                        del pending_future
+                    to_join.clear()  # no payload-owning futures in traceback
+                raise
             finally:
                 for _batch_ids, future in pending:
                     future.cancel()
