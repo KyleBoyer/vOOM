@@ -1,5 +1,48 @@
 # STATUS — 2026-09-05 (current corrections first; dated chronology below is history)
 
+## 2026-09-05: complete 512-budget GLM Flash Plex answer fails semantic quality
+
+The current explicit compact-MLA/tile-128/two-reader/direct-QMV/native-MTP3
+profile completed all three focused Plex turns in **3,398.508s (56.64 min)**.
+This is deliberately **not** the untouched capture: the fixture replaces the
+system/history with focused text, reduces 134 tools to the one real Plex
+function, forces non-streaming/temperature zero/low reasoning with a 512-token
+budget per turn, and supplies two synthetic result pages. The actual initial
+wire request is 8,513 bytes / 2,187 rendered tokens, not the 178,616-byte source.
+
+Both calls had the required filters and offsets 0/200. All turns reported
+completed, with 120/61/246 output tokens; there was no ignored call, empty
+terminal response or truncation. The final answer included all four eligible
+titles but also incorrectly asserted a **TV-PG** show under the **TV-Y7**
+ceiling. It additionally named the other rejected rows in a visible exclusion
+paragraph, which the unchanged whole-visible-output rubric penalizes. Score:
+**85/100, FAILED**. The wrong included show independently proves a real semantic
+failure; this is not merely a strict-rubric disagreement about named exclusions.
+No host renderer repaired the answer and this E-class profile is not promoted.
+
+| turn | input / cached / output tokens | wall | first token | decode |
+|---|---:|---:|---:|---:|
+| first call | 2,187 / 0 / 120 | 1,085.726s | 282.726s | 797.752s |
+| pagination | 2,453 / 2,187 / 61 | 607.357s | 181.311s | 425.953s |
+| final answer | 2,724 / 2,453 / 246 | 1,705.423s | 180.809s | 1,524.522s |
+
+MTP accepted 71/87, 41/58 and 173/215 proposals, with 48/20/72 target
+sweeps. Store-accounted reads totaled 6.035TB, true Metal peak was 3.445GB,
+and there were zero prefill retries. Physical swap-out grew 159.678MB; immediate
+available memory was 4.770GB, below the 5.3GB diagnostic floor, so this is not a
+pressure promotion either. Root free stayed above 18.946GB. The runner exited
+1 with a complete child artifact, no timeout and no source drift; all model
+processes exited. Evidence:
+`logs/glm53_flash_mtp3_plex512_v2_20260905.json`, its server log and
+`logs/gates/glm53_flash_mtp3_plex512_v2_20260905.done.json`.
+
+Next: same focused 512-budget fixture against the existing canonical lossless
+`glm53-flash-lossless-native-mtp3-workers2-direct-fp8-qmv-decode-only` profile.
+It keeps the checkpoint/MTP/direct-QMV but removes compact MLA and restores the
+canonical outer tile. This control distinguishes released-checkpoint behavior
+from the E-class composition; it is still not a full-capture benchmark or a
+varied-domain proof. Preserve the rubric and do not tune to the failed title.
+
 ## 2026-09-05: Plex evaluation now distinguishes effective requests and completion
 
 The v2 Plex fixture records the effective request's canonical hash/size,
