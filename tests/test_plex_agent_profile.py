@@ -241,7 +241,8 @@ def test_effective_identity_is_order_independent_but_changes_with_content():
 ])
 def test_completion_gate_requires_terminal_success(status, error, calls, passed):
     result = completion_gate([{"turn": 1, "response_status": status,
-                               "error": error, "call_names": calls}])
+                               "error": error, "call_names": calls,
+                               "visible_text": "final answer"}])
     assert result["passed"] is passed
     assert not completion_gate([])["passed"]
 
@@ -273,6 +274,112 @@ def test_perfect_rubric_cannot_pass_an_incomplete_conversation(
     assert result["completion"]["non_completed_turns"] == (
         [] if incomplete_turn is None else [incomplete_turn])
     assert [t["effective_request"]["input_items"] for t in result["turns"]] == [0, 2, 4]
+
+
+def _response_fixture(*, offset=None, text="", extra_calls=()):
+    output = []
+    if offset is not None:
+        output.append({"type": "function_call", "name": PLEX_TOOL,
+                       "call_id": f"call_{offset}", "arguments": json.dumps({
+                           "mediaType": "all", "excludeRootFolderPath": "/Kids/",
+                           "ratingOperator": "lte", "movieRatingValue": "PG-13",
+                           "showRatingValue": "TV-Y7", "limit": 32,
+                           "offset": offset})})
+    output.extend(extra_calls)
+    if text:
+        output.append({"type": "message", "content": [
+            {"type": "output_text", "text": text}]})
+    return {"status": "completed", "output": output}
+
+
+def _run_fake_profile(monkeypatch, responses):
+    import plex_agent_profile as fixture
+    queue = iter(responses)
+    monkeypatch.setattr(fixture, "_post", lambda *_: (next(queue), 1.0))
+    monkeypatch.setattr(fixture, "_pressure", lambda: {})
+    return run_profile({"model": "test", "input": [], "tools": []},
+                       "unused", 1.0, 4)
+
+
+@pytest.mark.parametrize("extra_name", [PLEX_TOOL, "unsupported_tool"])
+def test_multiple_or_mixed_calls_are_rejected_without_ignoring_any(
+        monkeypatch, extra_name):
+    extra = {"type": "function_call", "name": extra_name,
+             "arguments": json.dumps({"offset": 32}), "call_id": "extra"}
+    result = _run_fake_profile(monkeypatch, [
+        _response_fixture(offset=0, extra_calls=[extra])])
+    assert not result["passed"]
+    assert result["completion"]["unhandled_call_turns"] == [1]
+    assert result["turns"][0]["handled_call_count"] == 0
+    assert result["protocol_failures"][0]["reason"] == (
+        "expected_one_supported_plex_call_per_tool_turn")
+
+
+def test_empty_terminal_answer_cannot_reuse_good_planning_text(monkeypatch):
+    good = "ALPHA_G BRAVO_PG13 CHARLIE_TVY DELTA_TVY7"
+    result = _run_fake_profile(monkeypatch, [
+        _response_fixture(offset=0, text=good),
+        _response_fixture(offset=32, text=good),
+        _response_fixture()])
+    assert result["final_text"] == ""
+    assert not result["completion"]["terminal_text_present"]
+    assert not result["passed"]
+
+
+def test_visible_intermediate_leaks_are_not_hidden_by_good_terminal_answer(monkeypatch):
+    result = _run_fake_profile(monkeypatch, [
+        _response_fixture(offset=0, text="ECHO_R"),
+        _response_fixture(offset=32),
+        _response_fixture(text="ALPHA_G BRAVO_PG13 CHARLIE_TVY DELTA_TVY7")])
+    assert result["rubric"]["score"] == 100
+    assert result["completion"]["passed"]
+    assert not result["visible_output_gate"]["ineligible_titles_absent"]["ECHO_R"]
+    assert not result["passed"]
+
+
+def test_export_wire_identity_includes_history_and_actual_tool_choice(monkeypatch):
+    import plex_agent_profile as fixture
+    request = {"model": "test", "input": [], "tools": [], "tool_choice": "required"}
+    export = [{"name": PLEX_TOOL, "arguments": {}, "result": {"media": []}}]
+    monkeypatch.setattr(fixture, "_post", lambda *_: (
+        _response_fixture(text="No matching titles"), 1.0))
+    monkeypatch.setattr(fixture, "_pressure", lambda: {})
+    monkeypatch.setattr(fixture, "score_actual_export", lambda *_: {
+        "inferred_catalog_match": True, "strict_evidence_passed": True})
+    result = fixture.run_export_terminal_profile(request, export, "unused", 1)
+    assert request["tool_choice"] == "required" and request["input"] == []
+    assert result["wire_request"]["input_items"] == 2
+    assert result["wire_request"] == result["turns"][0]["effective_request"]
+    assert result["wire_request"]["canonical_sha256"] != request_shape(
+        request)["canonical_sha256"]
+
+
+def test_export_repeat_cannot_hide_an_earlier_unhandled_call(monkeypatch):
+    import plex_agent_profile as fixture
+    queue = iter([_response_fixture(offset=0, text="Good answer"),
+                  _response_fixture(text="Good answer")])
+    monkeypatch.setattr(fixture, "_post", lambda *_: (next(queue), 1.0))
+    monkeypatch.setattr(fixture, "_pressure", lambda: {})
+    monkeypatch.setattr(fixture, "score_actual_export", lambda *_: {
+        "inferred_catalog_match": True, "strict_evidence_passed": True})
+    result = fixture.run_export_terminal_profile(
+        {"model": "test", "input": [], "tools": []}, [], "unused", 1, repeats=2)
+    assert not result["passed"]
+    assert not result["strict_evidence_passed"]
+    assert result["completion"]["unhandled_call_turns"] == [1]
+
+
+def test_export_repeat_requires_text_on_every_independent_answer(monkeypatch):
+    import plex_agent_profile as fixture
+    queue = iter([_response_fixture(), _response_fixture(text="Good answer")])
+    monkeypatch.setattr(fixture, "_post", lambda *_: (next(queue), 1.0))
+    monkeypatch.setattr(fixture, "_pressure", lambda: {})
+    monkeypatch.setattr(fixture, "score_actual_export", lambda *_: {
+        "inferred_catalog_match": True, "strict_evidence_passed": True})
+    result = fixture.run_export_terminal_profile(
+        {"model": "test", "input": [], "tools": []}, [], "unused", 1, repeats=2)
+    assert not result["passed"]
+    assert result["completion"]["empty_terminal_turns"] == [1]
 
 
 def test_profile_can_force_the_specific_plex_tool(tmp_path):

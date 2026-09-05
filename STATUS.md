@@ -18,6 +18,22 @@ are rejected. The three active compact-MLA/direct-QMV/MTP profile descriptions
 also withdraw the old answer-exposed retrieval claim. Runtime settings and
 arithmetic are unchanged. **38 Plex tests and 12 profile tests passed.**
 
+Independent review then found pre-existing false-pass cases: only the first
+of several emitted calls was handled, and an empty terminal response reused
+earlier nonempty planning text. The fixture now fails closed on unsupported
+multi-call turns, accounts for every handled/unhandled call, requires actual
+nonempty terminal text, and scans visible text from every turn for excluded
+titles. Each independent export replay must complete with its own answer;
+wire-request identity includes the appended export history. Strict exported
+root-path evidence now requires complete catalog coverage, rather than one
+rooted row falsely certifying all remaining proxy-only rows. Final pure gates:
+**45 Plex + 9 export-evidence + 12 profile tests passed (66 total).**
+
+The first max-512 attempt was manually canceled before any completed turn
+when review found those fixture defects. Its parent and server were verified
+stopped; it supplies no quality or timing result. The restart uses a fresh
+preflight and new `glm53_flash_mtp3_plex512_v2_20260905` artifact names.
+
 Next: run the current explicit compact-MLA/direct-QMV/native-MTP-depth-three
 GLM Flash composition on the focused Plex gate with 512 output tokens per turn.
 This deliberately shortens the source prompt, retains only the real Plex

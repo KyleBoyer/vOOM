@@ -229,8 +229,12 @@ def _actual_export_oracle(export_calls: list[dict]) -> dict:
         "TV-Y", "TV-Y7", "TV-Y7-FV", "TV-G", "TV-PG", "TV-14", "TV-MA")
     rows = [row for call in export_calls for row in call["result"]["media"]]
 
+    def root_path(row: dict) -> str:
+        value = row.get("rootFolderPath")
+        return value.strip() if isinstance(value, str) else ""
+
     def eligible(row: dict) -> bool:
-        root = str(row.get("rootFolderPath") or "")
+        root = root_path(row)
         excluded_by_location = (
             "/kids/" in root.casefold()
             if root else
@@ -249,9 +253,12 @@ def _actual_export_oracle(export_calls: list[dict]) -> dict:
     expected = tuple(str(row.get("title")) for row in rows
                      if row.get("title") and eligible(row))
     all_titles = tuple(str(row.get("title")) for row in rows if row.get("title"))
-    root_evidence = any(
-        isinstance(row.get("rootFolderPath"), str)
-        and bool(row.get("rootFolderPath")) for row in rows)
+    root_evidence_rows = sum(bool(root_path(row)) for row in rows)
+    root_evidence = bool(root_evidence_rows)
+    # A rooted row cannot certify the location predicate for different rows
+    # whose inclusion still depends on the section-name proxy. Keep strict
+    # evidence conservative: every catalog row must carry a usable root path.
+    root_evidence_complete = bool(rows) and root_evidence_rows == len(rows)
     return {
         "expected_titles": expected,
         "all_titles": all_titles,
@@ -260,8 +267,13 @@ def _actual_export_oracle(export_calls: list[dict]) -> dict:
         "expected_titles_sha256": hashlib.sha256(
             "\n".join(sorted(expected)).encode("utf-8")).hexdigest(),
         "root_path_evidence_available": root_evidence,
+        "root_path_evidence_complete": root_evidence_complete,
+        "root_path_evidence_rows": root_evidence_rows,
+        "root_path_evidence_missing_rows": len(rows) - root_evidence_rows,
         "exclusion_basis": (
-            "rootFolderPath" if root_evidence else
+            "rootFolderPath" if root_evidence_complete else
+            "mixed rootFolderPath and sectionName Kid/Kids proxy; "
+            "strict root predicate incomplete" if root_evidence else
             "sectionName Kid/Kids proxy; strict root predicate unavailable"),
     }
 
@@ -355,7 +367,7 @@ def score_actual_export(final_text: str, export_calls: list[dict]) -> dict:
     return {
         "inferred_catalog_match": inferred_match,
         "strict_evidence_passed": bool(
-            inferred_match and oracle["root_path_evidence_available"]),
+            inferred_match and oracle["root_path_evidence_complete"]),
         "expected_count": len(expected),
         "mentioned_expected_count": len(expected & mentioned),
         "mentioned_ineligible_count": len(unexpected),
@@ -366,6 +378,9 @@ def score_actual_export(final_text: str, export_calls: list[dict]) -> dict:
         "catalog_count": oracle["catalog_count"],
         "expected_titles_sha256": oracle["expected_titles_sha256"],
         "root_path_evidence_available": oracle["root_path_evidence_available"],
+        "root_path_evidence_complete": oracle["root_path_evidence_complete"],
+        "root_path_evidence_rows": oracle["root_path_evidence_rows"],
+        "root_path_evidence_missing_rows": oracle["root_path_evidence_missing_rows"],
         "exclusion_basis": oracle["exclusion_basis"],
     }
 
@@ -678,6 +693,7 @@ def load_profile_request(capture: Path, model: str, profile: str,
             "preserve_capture_shape may change only the model alias")
     identity = {
         "schema": "plex-capture-identity-v2",
+        "scope": "base_request_before_any_tool_result_history",
         "sha256": hashlib.sha256(raw).hexdigest(),
         "bytes": len(raw),
         "tools": len(tools),
@@ -962,6 +978,8 @@ def _response_turn(response: dict, wall: float, turn: int,
         "tool_selection": response.get("vmodel_tool_selection"),
         "constraint": response.get("vmodel_constraint"),
         "call_names": [call.get("name") for call in calls],
+        "handled_call_count": 0,
+        "visible_text": response_text(response),
         "error": response.get("error"),
         "response_status": response.get("status"),
         "incomplete_details": response.get("incomplete_details"),
@@ -969,6 +987,9 @@ def _response_turn(response: dict, wall: float, turn: int,
         "checkpoint": response.get("vmodel_checkpoint"),
         "backend": response.get("vmodel_backend"),
         "execution_profile": response.get("vmodel_execution_profile"),
+        "runtime_profiles": response.get("vmodel_runtime_profiles"),
+        "runtime_profile_digest": response.get("vmodel_runtime_profile_digest"),
+        "runtime_effective_digest": response.get("vmodel_runtime_effective_digest"),
     }
 
 
@@ -977,13 +998,21 @@ def completion_gate(turns: list[dict]) -> dict:
     incomplete = [turn["turn"] for turn in turns
                   if turn.get("response_status") != "completed"]
     errors = [turn["turn"] for turn in turns if turn.get("error")]
+    unhandled = [turn["turn"] for turn in turns
+                 if len(turn.get("call_names") or [])
+                 > turn.get("handled_call_count", 0)]
+    terminal_text_present = bool(
+        turns and str(turns[-1].get("visible_text") or "").strip())
     pending_calls = bool(turns and turns[-1].get("call_names"))
     return {
         "passed": bool(turns and not incomplete and not errors
-                       and not pending_calls),
+                       and not unhandled and not pending_calls
+                       and terminal_text_present),
         "non_completed_turns": incomplete,
         "error_turns": errors,
         "terminal_has_unhandled_calls": pending_calls,
+        "unhandled_call_turns": unhandled,
+        "terminal_text_present": terminal_text_present,
     }
 
 
@@ -1015,12 +1044,19 @@ def run_export_terminal_profile(request: dict, export_calls: list[dict],
     completion = completion_gate(turns)
     # Each export replay is an independent terminal-answer request, unlike
     # the successive tool turns of run_profile.
+    completion["empty_terminal_turns"] = [
+        turn["turn"] for turn in turns
+        if not str(turn.get("visible_text") or "").strip()]
+    if completion["empty_terminal_turns"]:
+        completion["passed"] = False
     if any(turn.get("call_names") for turn in turns):
         completion["terminal_has_unhandled_calls"] = True
         completion["passed"] = False
     return {
         "gate": "plex-agent-kai-export-terminal-v2",
         "model": request.get("model"),
+        "wire_request": request_shape(replay),
+        "tool_results_source": "private_export_appended_to_base_request",
         # The export itself lacks rootFolderPath, so this conservative top-level
         # pass means exact catalog inference only; strict evidence is reported
         # separately and cannot silently become true from section-name proxying.
@@ -1050,6 +1086,7 @@ def run_profile(request: dict, url: str, timeout: float,
     final_text = ""
     final_reasoning = ""
     page_index = 0
+    protocol_failures = []
     started = time.perf_counter()
     for turn_index in range(max_tool_rounds + 1):
         response, wall = _post(url, request, timeout)
@@ -1059,19 +1096,31 @@ def run_profile(request: dict, url: str, timeout: float,
         turns.append(_response_turn(response, wall, turn_index + 1, request))
         if response.get("error"):
             break
-        if text:
-            final_text = text
-            final_reasoning = reasoning if isinstance(reasoning, str) else ""
         all_calls.extend(calls)
         plex_calls = [
             call for call in calls
             if call.get("name") in PLEX_PAGINATION_TOOLS
         ]
-        if not plex_calls:
+        if not calls:
+            # Only the actual terminal turn owns the final answer; an empty
+            # terminal response must never inherit earlier planning prose.
+            final_text = text
+            final_reasoning = reasoning if isinstance(reasoning, str) else ""
+            break
+        if len(calls) != 1 or len(plex_calls) != 1:
+            protocol_failures.append({
+                "turn": turn_index + 1,
+                "reason": "expected_one_supported_plex_call_per_tool_turn",
+            })
+            break
+        if turn_index == max_tool_rounds:
+            protocol_failures.append({"turn": turn_index + 1,
+                                      "reason": "tool_round_limit"})
             break
         call = plex_calls[0]
         page = SYNTHETIC_PAGES[min(page_index, len(SYNTHETIC_PAGES) - 1)]
         _append_call_and_result(request, call, page)
+        turns[-1]["handled_call_count"] = 1
         # A forced choice governs the planning turn only. Keeping it on every
         # follow-up request would make a compliant model call forever even
         # after both HasMore flags are false, which tests the harness rather
@@ -1084,11 +1133,27 @@ def run_profile(request: dict, url: str, timeout: float,
     rubric = score_profile(all_calls, final_text, final_reasoning)
     pressure_after = _pressure()
     completion = completion_gate(turns)
+    visible_text = "\n".join(turn["visible_text"] for turn in turns)
+    visible_ineligible_absent = {
+        title: not bool(re.search(re.escape(title), visible_text,
+                                 flags=re.IGNORECASE))
+        for title in INELIGIBLE_TITLES
+    }
+    visible_passed = all(visible_ineligible_absent.values())
+    rubric["scope"] = "terminal_answer"
     return {
         "gate": "plex-agent-profile-v2",
         "model": request.get("model"),
-        "passed": rubric["passed"] and completion["passed"],
+        "passed": (rubric["passed"] and completion["passed"]
+                   and visible_passed and not protocol_failures),
         "completion": completion,
+        "protocol_failures": protocol_failures,
+        "tool_results_source": "synthetic_two_page_fixture",
+        "visible_output_gate": {
+            "passed": visible_passed,
+            "ineligible_titles_absent": visible_ineligible_absent,
+            "all_response_text_scanned": True,
+        },
         "rubric": rubric,
         "turns": turns,
         "calls": [{
