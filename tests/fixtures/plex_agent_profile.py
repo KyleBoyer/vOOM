@@ -14,8 +14,10 @@ Two prompt profiles are useful:
     enough for broad model sweeps.
 
 ``captured``
-    The complete 130+ tool request, with only ``model``, streaming, and output
-    budget overridden.  This measures the actual large-agent path.
+    The complete 130+ tool request. By default sampling, streaming, storage,
+    parallel calls and output budget are overridden; use
+    ``--preserve-capture-shape`` to change only the model alias. Effective
+    request metadata records the actual changes rather than just source size.
 
 ``captured-adapted``
     Preserve the 134-tool catalog and original messages, but replace only the
@@ -554,6 +556,30 @@ def _content_text(content) -> str:
         if isinstance(part, dict) and part.get("text"))
 
 
+def request_shape(request: dict) -> dict:
+    """Content-free identity of the effective request, not its source capture."""
+    encoded = json.dumps(
+        request, ensure_ascii=False, sort_keys=True,
+        separators=(",", ":")).encode("utf-8")
+    items = request.get("input") or []
+    return {
+        "canonical_sha256": hashlib.sha256(encoded).hexdigest(),
+        "canonical_bytes": len(encoded),
+        "tool_count": len(request.get("tools") or []),
+        "input_items": len(items),
+        "input_text_chars": sum(
+            len(_content_text(item.get("content")))
+            for item in items if isinstance(item, dict)),
+        "developer_messages": sum(
+            isinstance(item, dict) and item.get("role") == "developer"
+            for item in items),
+        "stream": request.get("stream", False),
+        "temperature": request.get("temperature"),
+        "output_cap": request.get(
+            "max_output_tokens", request.get("max_tokens")),
+    }
+
+
 def load_profile_request(capture: Path, model: str, profile: str,
                          max_output_tokens: int,
                          reasoning_effort: str | None = None,
@@ -562,6 +588,9 @@ def load_profile_request(capture: Path, model: str, profile: str,
                          tool_schema_profile: str = "full", *,
                          preserve_capture_shape: bool = False) -> tuple[dict, dict]:
     """Return a runnable request and non-sensitive capture identity."""
+    if preserve_capture_shape and profile != "captured":
+        raise ValueError(
+            "preserve_capture_shape requires the unadapted captured profile")
     if (tool_schema_profile != "full"
             and profile not in ("focused", "captured-adapted")):
         raise ValueError(
@@ -640,7 +669,15 @@ def load_profile_request(capture: Path, model: str, profile: str,
             "preserve_capture_shape cannot override the captured tool choice")
     if reasoning_effort is not None:
         request["reasoning"] = {"effort": reasoning_effort}
+    missing = object()
+    changed_fields = sorted(
+        key for key in value.keys() | request.keys()
+        if value.get(key, missing) != request.get(key, missing))
+    if preserve_capture_shape and set(changed_fields) - {"model"}:
+        raise ValueError(
+            "preserve_capture_shape may change only the model alias")
     identity = {
+        "schema": "plex-capture-identity-v2",
         "sha256": hashlib.sha256(raw).hexdigest(),
         "bytes": len(raw),
         "tools": len(tools),
@@ -654,6 +691,9 @@ def load_profile_request(capture: Path, model: str, profile: str,
         "effective_temperature": request.get("temperature"),
         "effective_output_cap": request.get(
             "max_output_tokens", request.get("max_tokens")),
+        "effective_request": request_shape(request),
+        "changed_top_level_fields": changed_fields,
+        "unchanged_except_model": not bool(set(changed_fields) - {"model"}),
     }
     return request, identity
 
@@ -910,7 +950,8 @@ def _append_export_history(request: dict, export_calls: list[dict]) -> None:
         _append_call_and_result(request, call, call["result"])
 
 
-def _response_turn(response: dict, wall: float, turn: int) -> dict:
+def _response_turn(response: dict, wall: float, turn: int,
+                   request: dict) -> dict:
     calls = response_calls(response)
     return {
         "turn": turn,
@@ -923,6 +964,26 @@ def _response_turn(response: dict, wall: float, turn: int) -> dict:
         "call_names": [call.get("name") for call in calls],
         "error": response.get("error"),
         "response_status": response.get("status"),
+        "incomplete_details": response.get("incomplete_details"),
+        "effective_request": request_shape(request),
+        "checkpoint": response.get("vmodel_checkpoint"),
+        "backend": response.get("vmodel_backend"),
+        "execution_profile": response.get("vmodel_execution_profile"),
+    }
+
+
+def completion_gate(turns: list[dict]) -> dict:
+    """A good rubric alone cannot certify truncated or unfinished work."""
+    incomplete = [turn["turn"] for turn in turns
+                  if turn.get("response_status") != "completed"]
+    errors = [turn["turn"] for turn in turns if turn.get("error")]
+    pending_calls = bool(turns and turns[-1].get("call_names"))
+    return {
+        "passed": bool(turns and not incomplete and not errors
+                       and not pending_calls),
+        "non_completed_turns": incomplete,
+        "error_turns": errors,
+        "terminal_has_unhandled_calls": pending_calls,
     }
 
 
@@ -944,22 +1005,29 @@ def run_export_terminal_profile(request: dict, export_calls: list[dict],
     started = time.perf_counter()
     for repeat in range(repeats):
         response, wall = _post(url, replay, timeout)
-        turns.append(_response_turn(response, wall, repeat + 1))
+        turns.append(_response_turn(response, wall, repeat + 1, replay))
         text = response_text(response)
         final_texts.append(text)
         scores.append(score_actual_export(text, export_calls))
         if response.get("error"):
             break
     pressure_after = _pressure()
+    completion = completion_gate(turns)
+    # Each export replay is an independent terminal-answer request, unlike
+    # the successive tool turns of run_profile.
+    if any(turn.get("call_names") for turn in turns):
+        completion["terminal_has_unhandled_calls"] = True
+        completion["passed"] = False
     return {
-        "gate": "plex-agent-kai-export-terminal-v1",
+        "gate": "plex-agent-kai-export-terminal-v2",
         "model": request.get("model"),
         # The export itself lacks rootFolderPath, so this conservative top-level
         # pass means exact catalog inference only; strict evidence is reported
         # separately and cannot silently become true from section-name proxying.
-        "passed": bool(scores and all(
+        "passed": bool(completion["passed"] and scores and all(
             score["inferred_catalog_match"] for score in scores)),
-        "strict_evidence_passed": bool(scores and all(
+        "completion": completion,
+        "strict_evidence_passed": bool(completion["passed"] and scores and all(
             score["strict_evidence_passed"] for score in scores)),
         "scores": scores,
         "turns": turns,
@@ -988,7 +1056,7 @@ def run_profile(request: dict, url: str, timeout: float,
         calls = response_calls(response)
         text = response_text(response)
         reasoning = response.get("vmodel_reasoning")
-        turns.append(_response_turn(response, wall, turn_index + 1))
+        turns.append(_response_turn(response, wall, turn_index + 1, request))
         if response.get("error"):
             break
         if text:
@@ -1015,10 +1083,12 @@ def run_profile(request: dict, url: str, timeout: float,
 
     rubric = score_profile(all_calls, final_text, final_reasoning)
     pressure_after = _pressure()
+    completion = completion_gate(turns)
     return {
-        "gate": "plex-agent-profile-v1",
+        "gate": "plex-agent-profile-v2",
         "model": request.get("model"),
-        "passed": rubric["passed"],
+        "passed": rubric["passed"] and completion["passed"],
+        "completion": completion,
         "rubric": rubric,
         "turns": turns,
         "calls": [{

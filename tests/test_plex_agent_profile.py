@@ -2,13 +2,17 @@ import json
 import sys
 from pathlib import Path
 
+import pytest
+
 sys.path.insert(0, str(Path(__file__).resolve().parent / "fixtures"))
 
 from plex_agent_profile import (PLEX_MEDIA_TOOL, PLEX_TOOL,
+                                completion_gate,
                                 compact_plex_planner_tool,
                                 evaluate_plex_policy_adapter,
                                 load_kai_tool_result_export,
-                                load_profile_request, score_actual_export,
+                                load_profile_request, request_shape,
+                                run_profile, score_actual_export,
                                 score_profile)
 
 
@@ -167,7 +171,108 @@ def test_profile_can_explicitly_enable_reasoning_without_mutating_capture(tmp_pa
     assert identity["temperature"] == 0.0
     assert identity["tool_choice"] == "capture"
     assert identity["tool_schema_profile"] == "full"
+    assert identity["tools"] == 131  # source, not effective catalog
+    assert identity["effective_request"]["tool_count"] == 1
+    assert identity["effective_request"] == request_shape(request)
+    assert {"input", "tools", "reasoning", "max_output_tokens"}.issubset(
+        identity["changed_top_level_fields"])
+    assert not identity["unchanged_except_model"]
     assert "reasoning" not in json.loads(capture.read_text())
+
+
+def _captured_request(tmp_path):
+    capture = tmp_path / "capture.json"
+    value = {
+        "model": "old", "stream": True, "temperature": 0.7,
+        "tools": [{"type": "function", "name": f"tool_{i}",
+                   "parameters": {"type": "object"}} for i in range(130)]
+                 + [{"type": "function", "name": PLEX_TOOL,
+                     "parameters": {"type": "object"}}],
+        "input": [{"role": "developer", "content": "Private directive"},
+                  {"role": "user", "content": "Use Plex movies/TV, not /Kids/."}],
+    }
+    capture.write_text(json.dumps(value))
+    return capture, value
+
+
+def test_preserved_capture_changes_only_model_and_records_effective_shape(tmp_path):
+    capture, original = _captured_request(tmp_path)
+    request, identity = load_profile_request(
+        capture, "new", "captured", 512, preserve_capture_shape=True)
+    assert request == dict(original, model="new")
+    assert identity["changed_top_level_fields"] == ["model"]
+    assert identity["unchanged_except_model"]
+    assert identity["effective_request"]["tool_count"] == 131
+    assert identity["effective_request"]["developer_messages"] == 1
+    assert identity["effective_request"]["output_cap"] is None
+    assert "Private directive" not in json.dumps(identity)
+
+
+@pytest.mark.parametrize("profile", ["focused", "captured-adapted"])
+def test_preserve_shape_rejects_rewritten_profiles(tmp_path, profile):
+    capture, _ = _captured_request(tmp_path)
+    with pytest.raises(ValueError, match="unadapted captured"):
+        load_profile_request(capture, "new", profile, 512,
+                             preserve_capture_shape=True)
+
+
+def test_preserve_shape_rejects_reasoning_override(tmp_path):
+    capture, _ = _captured_request(tmp_path)
+    with pytest.raises(ValueError, match="only the model"):
+        load_profile_request(capture, "new", "captured", 512, "low",
+                             preserve_capture_shape=True)
+
+
+def test_effective_identity_is_order_independent_but_changes_with_content():
+    first = {"input": [{"role": "user", "content": "alpha"}], "tools": []}
+    reordered = {"tools": [], "input": first["input"]}
+    assert request_shape(first) == request_shape(reordered)
+    changed = dict(first, input=[{"role": "user", "content": "bravo"}])
+    assert request_shape(first)["canonical_sha256"] != request_shape(
+        changed)["canonical_sha256"]
+
+
+@pytest.mark.parametrize("status,error,calls,passed", [
+    ("completed", None, [], True),
+    ("incomplete", None, [], False),
+    (None, None, [], False),
+    ("completed", {"message": "error"}, [], False),
+    ("completed", None, [PLEX_TOOL], False),
+])
+def test_completion_gate_requires_terminal_success(status, error, calls, passed):
+    result = completion_gate([{"turn": 1, "response_status": status,
+                               "error": error, "call_names": calls}])
+    assert result["passed"] is passed
+    assert not completion_gate([])["passed"]
+
+
+@pytest.mark.parametrize("incomplete_turn", [None, 1, 3])
+def test_perfect_rubric_cannot_pass_an_incomplete_conversation(
+        monkeypatch, incomplete_turn):
+    import plex_agent_profile as fixture
+
+    arguments = dict(mediaType="all", excludeRootFolderPath="/Kids/",
+                     ratingOperator="lte", movieRatingValue="PG-13",
+                     showRatingValue="TV-Y7", limit=32)
+    responses = [
+        {"output": [{"type": "function_call", "name": PLEX_TOOL,
+                     "arguments": json.dumps(dict(arguments, offset=offset)),
+                     "call_id": f"call_{offset}"}]}
+        for offset in (0, 32)] + [{"output": [{
+            "type": "message", "content": [{"type": "output_text", "text":
+                "ALPHA_G BRAVO_PG13 CHARLIE_TVY DELTA_TVY7"}]}]}]
+    for turn, response in enumerate(responses, 1):
+        response["status"] = "incomplete" if turn == incomplete_turn else "completed"
+    queue = iter(responses)
+    monkeypatch.setattr(fixture, "_post", lambda *_: (next(queue), 1.0))
+    monkeypatch.setattr(fixture, "_pressure", lambda: {})
+    result = run_profile({"model": "test", "input": [], "tools": []},
+                         "unused", 1.0, 4)
+    assert result["rubric"]["score"] == 100
+    assert result["passed"] is (incomplete_turn is None)
+    assert result["completion"]["non_completed_turns"] == (
+        [] if incomplete_turn is None else [incomplete_turn])
+    assert [t["effective_request"]["input_items"] for t in result["turns"]] == [0, 2, 4]
 
 
 def test_profile_can_force_the_specific_plex_tool(tmp_path):

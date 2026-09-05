@@ -1,5 +1,29 @@
 # STATUS — 2026-09-05 (current corrections first; dated chronology below is history)
 
+## 2026-09-05: Plex evaluation now distinguishes effective requests and completion
+
+The v2 Plex fixture records the effective request's canonical hash/size,
+actual tool count, input shape, sampling and output cap, both initially and
+per turn. Source-capture metadata remains separately labeled: its 134 tools
+must not be mistaken for the focused profile's **one** real Plex function.
+A changed-top-level-field ledger identifies request rewrites. The preservation
+flag now rejects focused/adapted profiles or reasoning overrides; it may change
+only the model alias. No source prompt or schema is copied into this metadata.
+
+A perfect content rubric no longer passes a truncated response, protocol
+error, missing completion status, or terminal unhandled tool call. Export-backed
+independent terminal replays apply the same completion requirement. Synthetic
+tests cover a 100/100 rubric with incomplete planning or final turns, and both
+are rejected. The three active compact-MLA/direct-QMV/MTP profile descriptions
+also withdraw the old answer-exposed retrieval claim. Runtime settings and
+arithmetic are unchanged. **38 Plex tests and 12 profile tests passed.**
+
+Next: run the current explicit compact-MLA/direct-QMV/native-MTP-depth-three
+GLM Flash composition on the focused Plex gate with 512 output tokens per turn.
+This deliberately shortens the source prompt, retains only the real Plex
+function, forces non-streaming/temperature zero, and supplies synthetic pages.
+It is a completed-answer prerequisite, not an untouched real-capture benchmark.
+
 ## 2026-09-05: shared-expert overlap is measurable but not a useful speed lever
 
 A fixture-only experiment submits authoritative routed-expert reads, computes
