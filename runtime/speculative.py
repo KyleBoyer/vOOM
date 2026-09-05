@@ -398,6 +398,29 @@ class SpeculativeDecoder:
         request_cache_before = _cache_io_snapshot(tgt)
         request_direct_io_before = _direct_io_snapshot(tgt)
 
+        def streamed_head_snapshot(engine) -> dict[str, int]:
+            head = getattr(engine, "_streamed_lm_head", None)
+            telemetry = getattr(head, "full_scan_telemetry", None)
+            if callable(telemetry):
+                return telemetry()
+            return {
+                "full_scan_calls": 0,
+                "full_read_extents": 0,
+                "full_bytes_read": 0,
+                "full_read_ns": 0,
+                "full_scan_ns": 0,
+            }
+
+        def streamed_head_delta(before: dict, after: dict) -> dict[str, int]:
+            return {
+                key: max(0, int(after[key]) - int(before[key]))
+                for key in before
+            }
+
+        target_head_before = streamed_head_snapshot(tgt)
+        draft_head_before = (
+            streamed_head_snapshot(drf) if drf is not None else None)
+
         def expert_pipeline_snapshot(engine) -> dict:
             snapshot = {
                 "submitted": int(getattr(
@@ -1149,6 +1172,40 @@ class SpeculativeDecoder:
             tgt, prefill_cache_after, path_stats,
             prefix="decode_", after=request_cache_after)
         _record_direct_io_delta(tgt, request_direct_io_before, path_stats)
+        target_head_delta = streamed_head_delta(
+            target_head_before, streamed_head_snapshot(tgt))
+        path_stats.update({
+            "streamed_lm_head_full_scan_calls": int(
+                target_head_delta["full_scan_calls"]),
+            "streamed_lm_head_full_read_extents": int(
+                target_head_delta["full_read_extents"]),
+            "streamed_lm_head_full_bytes_read": int(
+                target_head_delta["full_bytes_read"]),
+            "streamed_lm_head_full_read_s": float(
+                target_head_delta["full_read_ns"] / 1e9),
+            "streamed_lm_head_full_scan_s": float(
+                target_head_delta["full_scan_ns"] / 1e9),
+            "lm_head_pinned": int(bool(
+                getattr(tgt.rc, "pin_lm_head", False)
+                and getattr(tgt, "_lm_head_w", None) is not None)),
+            "lm_head_pinned_bytes": int(getattr(
+                getattr(tgt, "_lm_head_w", None), "nbytes", 0) or 0),
+        })
+        if drf is not None and draft_head_before is not None:
+            draft_head_delta = streamed_head_delta(
+                draft_head_before, streamed_head_snapshot(drf))
+            path_stats.update({
+                "draft_streamed_lm_head_full_scan_calls": int(
+                    draft_head_delta["full_scan_calls"]),
+                "draft_streamed_lm_head_full_read_extents": int(
+                    draft_head_delta["full_read_extents"]),
+                "draft_streamed_lm_head_full_bytes_read": int(
+                    draft_head_delta["full_bytes_read"]),
+                "draft_streamed_lm_head_full_read_s": float(
+                    draft_head_delta["full_read_ns"] / 1e9),
+                "draft_streamed_lm_head_full_scan_s": float(
+                    draft_head_delta["full_scan_ns"] / 1e9),
+            })
         expert_pipeline_after = expert_pipeline_snapshot(tgt)
         request_pipeline_delta = expert_pipeline_delta(
             expert_pipeline_before, expert_pipeline_after)
@@ -1191,6 +1248,82 @@ class SpeculativeDecoder:
         if execution_profile is not None:
             result["execution_profile"] = execution_profile
         return result
+
+
+def _release_glm53_phase_head(
+    target: StreamingEngine, result: dict | None,
+) -> float:
+    """Return GLM-5.3-Flash's exact head lease before server idle."""
+    if not bool(getattr(
+            getattr(target, "rc", None),
+            "glm53_phase_lm_head",
+            False)):
+        return 0.0
+    started = time.perf_counter()
+    release = getattr(target, "_suspend_glm53_phase_lm_head", None)
+    released = int(release() or 0) if callable(release) else 0
+    release_elapsed = time.perf_counter() - started
+    if result is not None:
+        path_stats = result.setdefault("path_stats", {})
+        resident_head = getattr(target, "_lm_head_w", None)
+        cache = getattr(target, "cache", None)
+        path_stats.update({
+            "glm53_phase_lm_head": 1,
+            "glm53_phase_lm_head_bytes": int(getattr(
+                target, "_glm53_phase_head_bytes", 0)),
+            "glm53_phase_lm_head_suspend_calls": int(getattr(
+                target, "_glm53_phase_head_suspend_calls", 0)),
+            "glm53_phase_lm_head_suspend_bytes": int(getattr(
+                target, "_glm53_phase_head_suspend_bytes", 0)),
+            "glm53_phase_lm_head_suspend_active_released_bytes": int(
+                getattr(
+                    target,
+                    "_glm53_phase_head_suspend_active_released_bytes",
+                    0,
+                )),
+            "glm53_phase_lm_head_suspend_s": float(getattr(
+                target, "_glm53_phase_head_suspend_s", 0.0)),
+            "glm53_phase_lm_head_restore_calls": int(getattr(
+                target, "_glm53_phase_head_restore_calls", 0)),
+            "glm53_phase_lm_head_restore_successes": int(getattr(
+                target, "_glm53_phase_head_restore_successes", 0)),
+            "glm53_phase_lm_head_restore_refusals": int(getattr(
+                target, "_glm53_phase_head_restore_refusals", 0)),
+            "glm53_phase_lm_head_restore_s": float(getattr(
+                target, "_glm53_phase_head_restore_s", 0.0)),
+            "glm53_phase_lm_head_restore_prepare_released_bytes": int(
+                getattr(
+                    target,
+                    "_glm53_phase_head_restore_prepare_released_bytes",
+                    0,
+                )),
+            "glm53_phase_lm_head_restore_reservation_calls": int(getattr(
+                target,
+                "_glm53_phase_head_restore_reservation_calls",
+                0,
+            )),
+            "glm53_phase_lm_head_restore_reservation_s": float(getattr(
+                target,
+                "_glm53_phase_head_restore_reservation_s",
+                0.0,
+            )),
+            "glm53_phase_lm_head_unpinned_cleanup_calls": int(getattr(
+                target, "_glm53_phase_head_unpinned_cleanup_calls", 0)),
+            "glm53_phase_lm_head_idle_release_calls": 1,
+            "glm53_phase_lm_head_idle_release_bytes": released,
+            "glm53_phase_lm_head_idle_release_s": release_elapsed,
+            # These generic/cache fields were first sampled inside the decoder,
+            # before the request-boundary release. Publish the post-cleanup
+            # state that protocol consumers actually observe at return.
+            "lm_head_pinned": int(resident_head is not None),
+            "lm_head_pinned_bytes": int(getattr(
+                resident_head, "nbytes", 0) or 0),
+            "weight_cache_resident_bytes": int(getattr(
+                cache, "total_bytes", 0) or 0),
+            "weight_cache_pinned_bytes": int(getattr(
+                cache, "pinned_bytes", 0) or 0),
+        })
+    return time.perf_counter() - started
 
 
 class SpeculativeEngine:
@@ -1394,6 +1527,39 @@ class NativeMTPEngine:
         return result
 
     def generate(self, prompt, max_tokens: int = 64, on_token=None,
+                 stop=None, on_progress=None,
+                 sampling: SamplingParams | None = None,
+                 constraint=None) -> dict:
+        if not bool(getattr(self.target.rc, "glm53_phase_lm_head", False)):
+            return self._generate(
+                prompt, max_tokens, on_token, stop, on_progress,
+                sampling, constraint)
+        self.target._reset_glm53_phase_head_request_stats()
+        result = None
+        generation_error = None
+        try:
+            result = self._generate(
+                prompt, max_tokens, on_token, stop, on_progress,
+                sampling, constraint)
+            return result
+        except BaseException as error:
+            generation_error = error
+            raise
+        finally:
+            # Preserve a generation error if cleanup itself fails. A cleanup
+            # failure after successful generation must still fail the request.
+            try:
+                cleanup_s = _release_glm53_phase_head(self.target, result)
+                if result is not None:
+                    result["total_s"] += cleanup_s
+            except Exception as cleanup_error:
+                if generation_error is None:
+                    raise
+                generation_error.add_note(
+                    "GLM head cleanup also failed: "
+                    f"{type(cleanup_error).__name__}: {cleanup_error}")
+
+    def _generate(self, prompt, max_tokens: int = 64, on_token=None,
                  stop=None, on_progress=None,
                  sampling: SamplingParams | None = None,
                  constraint=None) -> dict:

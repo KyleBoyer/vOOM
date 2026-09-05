@@ -356,6 +356,20 @@ def test_builtin_profiles_resolve_complete_agent_group():
     assert glm_barrier_settings[
         "VMODEL_GLM53_SERIAL_VERIFY_COALESCED_BARRIERS"] == "1"
 
+    glm_phase_head_order, glm_phase_head_settings = (
+        resolve_runtime_profiles((
+            "glm53-flash-e-compact-mla-tile128-workers2-"
+            "direct-fp8-qmv-mtp3-phase-head",
+        ), catalog))
+    assert glm_phase_head_order[-2:] == (
+        "glm53-flash-e-compact-mla-tile128-workers2-"
+        "direct-fp8-qmv-mtp3",
+        "glm53-flash-e-compact-mla-tile128-workers2-"
+        "direct-fp8-qmv-mtp3-phase-head",
+    )
+    assert glm_phase_head_settings[
+        "VMODEL_GLM53_FLASH_PHASE_LM_HEAD"] == "1"
+
     qwen_direct_order, qwen_direct_settings = resolve_runtime_profiles((
         "qwen38-flash-next-uncensored-fp8-fast-tier-mtp-"
         "direct-fp8-qmv-decode-only",

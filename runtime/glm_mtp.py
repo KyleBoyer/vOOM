@@ -29,11 +29,27 @@ import mlx.core as mx
 
 from . import quant
 from .glm import run_glm_block
-from .layer_runner import _linear
+from .layer_runner import _chunked_head_matmul, _linear
 
 MTP_LAYER = 78  # model.layers.78 on the RELEASED GLM-5.2 checkpoint specifically —
 # do not import this as a general constant; MTPDrafter derives the real index
 # from config so architecture-faithful fixtures with fewer trunk layers work.
+
+
+def _project_mtp_head(g, head, *, phase_resident: bool = False):
+    """Keep the phase-resident projection's vocabulary tiles canonical.
+
+    Weight residency must not silently change the MTP GEMM geometry. The
+    streamed default and target projection both use 16,384-row vocabulary
+    blocks. Preserve the historical non-phase path until separately gated.
+    """
+    from .lm_head_stream import StreamedLMHead
+
+    if isinstance(head, StreamedLMHead):
+        return head.logits(g)[0, -1]
+    if phase_resident and isinstance(head, mx.array):
+        return _chunked_head_matmul(g, head)[0, -1]
+    return quant.matmul(g, head)[0, -1]
 
 
 class MTPDrafter:
@@ -240,12 +256,9 @@ class MTPDrafter:
                 )
             g = mx.fast.rms_norm(h, w[f"{p}.shared_head.norm.weight"], cfg.rms_norm_eps)
             head = eng._lm_head_weight()
-            from .lm_head_stream import StreamedLMHead
-
-            logits = (
-                head.logits(g)[0, -1]
-                if isinstance(head, StreamedLMHead)
-                else quant.matmul(g, head)[0, -1])
+            logits = _project_mtp_head(
+                g, head, phase_resident=bool(getattr(
+                    eng.rc, "glm53_phase_lm_head", False)))
             if constraint is not None:
                 logits = constraint.mask_logits(logits)
             mx.eval(logits)

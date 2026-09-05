@@ -2,8 +2,10 @@
 """Large-context semantic retrieval plus sustained-output HTTP gate.
 
 The synthetic prompt is deterministic but intentionally not persisted.  Two
-unique canaries are placed far from the final suffix; the response must recover
-both before continuing a long, bounded sequence.  The result artifact contains
+unique canaries occur only in their distant records, never in the final suffix;
+the response must recover both before continuing a bounded sequence. An explicit
+legacy copy-output mode reproduces older timing bodies but is not retrieval
+evidence. The result artifact contains
 only hashes, counts, boolean quality witnesses, runtime telemetry, and pressure.
 """
 
@@ -61,16 +63,26 @@ def _response_text(response: dict) -> str:
     return "".join(parts)
 
 
-def _build_user_text(tokenizer: Tokenizer, target_tokens: int) -> tuple[str, int]:
+def _build_user_text(
+        tokenizer: Tokenizer, target_tokens: int, *,
+        legacy_copy_output_diagnostic: bool = False) -> tuple[str, int]:
     prefix = (
         "Read this synthetic archive carefully. Two TARGET RECORD lines contain "
         "the only authoritative retrieval values. Ordinary entries are filler.\n"
     )
     needle_a = f"\nTARGET RECORD A: retrieval_code={CANARY_A}.\n"
     needle_b = f"\nTARGET RECORD B: retrieval_code={CANARY_B}.\n"
-    suffix = (
+    answer_instruction = (
         "\nEnd of archive. Begin the answer with exactly: "
         f"A={CANARY_A} B={CANARY_B}\n"
+        if legacy_copy_output_diagnostic else
+        "\nEnd of archive. Retrieve the retrieval_code values from TARGET "
+        "RECORD A and TARGET RECORD B. Begin the answer with A= followed by "
+        "record A's code, a single space, and B= followed by record B's code.\n"
+    )
+    suffix = (
+        answer_instruction
+        +
         "Then write VALIDATION followed by consecutive three-digit integers "
         "starting at 001, separated by single spaces, and continue until the "
         "output limit. Do not discuss the archive and do not invent a code."
@@ -116,6 +128,9 @@ def main() -> int:
     parser.add_argument("--max-peak-metal-gb", type=float, default=8.5)
     parser.add_argument("--min-available-gb", type=float, default=5.3)
     parser.add_argument("--max-swap-growth-mb", type=float, default=64.0)
+    parser.add_argument(
+        "--legacy-copy-output-diagnostic", action="store_true",
+        help="reproduce the old answer-revealing timing body; NOT retrieval proof")
     parser.add_argument("--result-json", required=True, type=Path)
     args = parser.parse_args()
     if args.result_json.exists():
@@ -133,7 +148,8 @@ def main() -> int:
 
     tokenizer = Tokenizer.from_file(str(args.tokenizer))
     user_text, local_user_tokens = _build_user_text(
-        tokenizer, args.target_user_tokens)
+        tokenizer, args.target_user_tokens,
+        legacy_copy_output_diagnostic=args.legacy_copy_output_diagnostic)
     request_value = {
         "model": args.model,
         "input": [
@@ -223,7 +239,7 @@ def main() -> int:
         failures.append("swap growth exceeded the configured ceiling")
 
     report = {
-        "schema": "voom.qwen-large-context-output-gate.v1",
+        "schema": "voom.qwen-large-context-output-gate.v2",
         "request": {
             "model": args.model,
             "target_user_tokens": args.target_user_tokens,
@@ -236,6 +252,9 @@ def main() -> int:
             "seed": args.seed,
             "request_sha256": hashlib.sha256(private_request).hexdigest(),
             "canary_depths": [0.13, 0.73],
+            "task": ("copy-output-diagnostic" if args.legacy_copy_output_diagnostic
+                     else "retrieval-and-sustained-output"),
+            "answers_in_suffix": args.legacy_copy_output_diagnostic,
         },
         "result": {
             "wall_seconds": round(wall, 4),

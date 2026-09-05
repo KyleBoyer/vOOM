@@ -495,6 +495,11 @@ class WeightCache:
             release(tuple(released_names))
         return released_bytes
 
+    def suspended_pin_bytes(self, key: str) -> int:
+        """Snapshot a dormant lease, including after fallible device cleanup."""
+        with self._lock:
+            return int(self._suspended_pin_bytes.get(key, 0))
+
     def register_suspended_pin(
         self, key: str, nbytes: int, *, allow_over_capacity: bool = False,
     ) -> None:

@@ -6,6 +6,7 @@ import argparse
 import json
 import os
 import sys
+import time
 from pathlib import Path
 
 import psutil
@@ -36,6 +37,9 @@ def main() -> None:
     parser.add_argument("--trunk-prefetch-workers", type=int, default=1)
     parser.add_argument("--weight-cache-mb", type=int, default=5000)
     parser.add_argument("--state-digest", action="store_true")
+    parser.add_argument(
+        "--head-residency-oracle", action="store_true",
+        help="compare every real target/MTP head row; invalidates speed timings")
     parser.add_argument(
         "--dsa-row-digest", action="store_true",
         help=("include per-position hashes for DSA index-key caches; "
@@ -77,8 +81,13 @@ def main() -> None:
     from runtime.server import EngineManager
 
     manager = EngineManager()
+    head_oracle = None
     try:
         engine = manager.get(args.model, "lossless")
+        if args.head_residency_oracle:
+            from tests.fixtures.glm53_head_residency_oracle import HeadResidencyOracle
+            head_oracle = HeadResidencyOracle(
+                getattr(engine, "target", engine), args.model)
         if args.probe_every < 0:
             raise SystemExit("--probe-every must be nonnegative")
         if args.probe_every:
@@ -114,12 +123,25 @@ def main() -> None:
                 args.execution_profile
                 if args.runs == 1 or run_index == args.runs - 1 else "")
             pressure_before = psutil.swap_memory()
+            available_before = psutil.virtual_memory().available
+            wall_started = time.perf_counter()
             result = engine.generate(
                 args.prompt, max_tokens=args.max_tokens, stop=[])
+            wall_s = time.perf_counter() - wall_started
             pressure_after = psutil.swap_memory()
+            available_after = psutil.virtual_memory().available
             stats = result["path_stats"]
             runs.append({
+                **{key: value for key, value in stats.items()
+                   if key.startswith(("glm53_phase_lm_head",
+                                      "streamed_lm_head_"))
+                   or key in ("lm_head_pinned", "lm_head_pinned_bytes",
+                              "weight_cache_resident_bytes",
+                              "weight_cache_pinned_bytes")},
                 "run_index": run_index,
+                "wall_s": wall_s,
+                "available_before_bytes": int(available_before),
+                "available_after_bytes": int(available_after),
                 "tokens": result["tokens"],
                 "text": result["text"],
                 "prefill_s": result["prefill_s"],
@@ -424,6 +446,8 @@ def main() -> None:
             "glm53_fp8_resident_bytes": runs[-1][
                 "glm53_fp8_resident_bytes"],
             "state": endpoint_state,
+            "head_residency_oracle": (
+                head_oracle.snapshot() if head_oracle is not None else None),
         }
         rendered = json.dumps(document, indent=2, sort_keys=True)
         print(rendered)
@@ -449,6 +473,8 @@ def main() -> None:
             if not args.plain and not runs[-1]["prompt_cache_exact_hit"]:
                 raise SystemExit("native MTP repeat did not hit prompt cache")
     finally:
+        if head_oracle is not None:
+            head_oracle.close()
         manager.close()
 
 

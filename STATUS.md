@@ -1,5 +1,64 @@
 # STATUS — 2026-09-05 (current corrections first; dated chronology below is history)
 
+## 2026-09-05: exact request-scoped Flash head, modest timing gain, no promotion
+
+`VMODEL_GLM53_FLASH_PHASE_LM_HEAD=1` now admits the released 1,268,776,960-byte
+BF16 head after prefill, retains it across native-MTP decode, and releases it
+at the request boundary, including fallback and error paths. It requires native
+MTP and rejects vision, whose decoder has a different request owner. The normal
+streamed/vision paths are unchanged. Admission trims eligible cache pages and
+reserves the exact incoming bytes before loading; cleanup preserves cache
+accounting even when source/device cleanup fails after a pin is removed.
+Resident MTP projection uses the same 16,384-row vocabulary tiles as streaming.
+
+A real-weight diagnostic compared **7,898,880 logits in 51 checks** across
+fresh and cached requests, covering target rank-3, serial rank-2, and iterative
+MTP rows. All were array-equal; output and all **159 endpoint tensor hashes**
+matched the earlier streamed control. Each request physically released the full
+**1.269GB** in about **9ms**. Diagnostic extra reads invalidate its speed times.
+
+Separate fresh-process timing used the same direct-engine 28-input/8-output
+prompt and a cached repeat, with compiled canonical KDA and direct packed QMV,
+not compact MLA and not the captured harness. Request wall fell
+**116.784 -> 114.094s (-2.30%)** fresh and
+**50.753 -> 49.084s (-3.29%)** cached. Fresh decode fell
+48.945 -> 45.714s. Tokens and all 159 state tensors matched. Peak Metal rose
+3.082 -> 4.376GB; candidate swap-out growth was 22.069MB fresh/5.702MB cached.
+Immediate system-available memory was only 4.526/4.464GB for the candidate
+and 4.592/4.575GB for the control. Both miss the existing 5.3GB fixture floor:
+this is a bounded timing/equality witness, **not a pressure or serving promotion**.
+No threshold was weakened and no artificial idle wait was added.
+
+The named compact-MLA phase-head profile remains explicit/E-class. Earlier
+2,123-input/32-output phase-head diagnostics preserved output and improved
+decode around 6%, but also failed that availability gate. Current operator
+shape and cleanup fixes have not yet cleared a fresh unmodified capture or
+heterogeneous completed-output corpus. The sub-90s real-harness goal is open.
+**433 focused regression tests passed** after the ownership, projection,
+protocol, cache, and fixture changes.
+
+**Retrieval correction:** the older synthetic large-context fixture repeated
+both canary answers in its final instruction. All earlier “distant retrieval”
+claims based on that fixture, including the September 4 entries below, are
+withdrawn; those artifacts prove copy-output/sustained-generation behavior and
+same-body timing only. The default fixture now omits answers from the suffix.
+`--legacy-copy-output-diagnostic` reproduces the old body explicitly, and v2
+artifacts label the task and answer exposure. Real retrieval must be rerun;
+neither fixture is an untouched captured harness request.
+
+Evidence: `logs/glm53_phase_head_real_oracle_resume_20260905.json`,
+`logs/glm53_phase_head_timing_{control,candidate}_resume_20260905.json`,
+their `gate_*.done.json` envelopes and fresh `preflight_*.json` artifacts, and
+`logs/gate_glm53_phase_head_final_regressions_resume_20260905.log`.
+
+Next bounded lever: overlap the already-resident shared-expert branch with
+the first authoritative routed fetch for singleton decode only, keeping
+prefill and routed accumulation/addition order unchanged. First prove
+submission/evaluation/consumption order, real logits/state, bytes and peak;
+reject neutral or slower paired timing before an expensive replay. Separately
+clear the corrected retrieval, sufficient-output Plex, pressure, and untouched
+capture gates; do not promote any default from the short probes above.
+
 ## 2026-09-05: verifier-round cost traces and exact bounded barrier coalescing
 
 Native-MTP requests now report bounded per-round draft/verify seconds, model

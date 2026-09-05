@@ -939,6 +939,12 @@ class RuntimeConfig:
     # one shared mx.eval boundary instead of synchronizing after every row.
     # This is explicit/default-off until real target state and timing gates.
     glm53_serial_verify_coalesced_barriers: bool = False
+    # Keep GLM-5.3-Flash's exact released BF16 output head dormant throughout
+    # prompt prefill, load it once at the first post-prefill projection, reuse
+    # it for native-MTP decode, and release it before the request returns. The
+    # released bytes are unchanged; resident versus blocked-streamed projection
+    # still requires logit/token equivalence gates for each operator shape.
+    glm53_phase_lm_head: bool = False
     # Exact I/O-only overlap for Qwen4's long prefill. Routed expert batches
     # are fetched on the existing bounded worker during prefill, then decode
     # returns to the validated synchronous schedule. This avoids carrying the
@@ -2593,6 +2599,20 @@ class StreamingEngine:
         self._qwen4_serial_verify_head_suspend_calls = 0
         self._qwen4_serial_verify_head_suspend_bytes = 0
         self._qwen4_serial_verify_head_restore_trim_bytes = 0
+        self._glm53_lm_head_pin_suspended = False
+        self._glm53_phase_head_bytes = 0
+        self._glm53_phase_head_suspend_calls = 0
+        self._glm53_phase_head_suspend_bytes = 0
+        self._glm53_phase_head_suspend_active_released_bytes = 0
+        self._glm53_phase_head_suspend_s = 0.0
+        self._glm53_phase_head_restore_calls = 0
+        self._glm53_phase_head_restore_successes = 0
+        self._glm53_phase_head_restore_refusals = 0
+        self._glm53_phase_head_restore_s = 0.0
+        self._glm53_phase_head_restore_prepare_released_bytes = 0
+        self._glm53_phase_head_restore_reservation_calls = 0
+        self._glm53_phase_head_restore_reservation_s = 0.0
+        self._glm53_phase_head_unpinned_cleanup_calls = 0
         self._qwen4_serial_verify_exact_bf16_calls = 0
         self._qwen4_serial_verify_exact_bf16_rows = 0
         self._qwen4_serial_verify_exact_bf16_fallback_calls = 0
@@ -2668,6 +2688,7 @@ class StreamingEngine:
         phase_scoped_qwen35_head = bool(
             self.rc.qwen35_serial_verify_suspend_lm_head)
         phase_scoped_qwen4_head = bool(self.rc.qwen4_phase_lm_head)
+        phase_scoped_glm53_head = bool(self.rc.glm53_phase_lm_head)
         if phase_scoped_qwen35_head and (
                 self.cfg.model_type not in ("qwen3_5", "qwen3_5_moe")
                 or not self.rc.pin_lm_head
@@ -2695,8 +2716,20 @@ class StreamingEngine:
                 "qwen4_phase_lm_head")
         if phase_scoped_qwen35_head and phase_scoped_qwen4_head:
             raise ValueError("Qwen phase-scoped LM-head modes conflict")
-        phase_scoped_qwen_head = bool(
-            phase_scoped_qwen35_head or phase_scoped_qwen4_head)
+        if phase_scoped_glm53_head and (
+                self.cfg.model_type != "glm5_next"
+                or not self.rc.pin_lm_head
+                or self.rc.rerank_lm_head
+                or self._streamed_lm_head is not None
+                or self.cfg.tie_word_embeddings
+                or not self.store.has("lm_head.weight")):
+            raise ValueError(
+                "glm53_phase_lm_head requires an untied, non-streamed, "
+                "non-reranked pinned GLM-5.3-Flash LM head")
+        phase_scoped_lm_head = bool(
+            phase_scoped_qwen35_head
+            or phase_scoped_qwen4_head
+            or phase_scoped_glm53_head)
 
         if self.cfg.model_type == "qwen4_exp":
             pin_names = self.store.names_with_prefix(
@@ -2711,7 +2744,7 @@ class StreamingEngine:
                 and self._streamed_lm_head is None
                 and not self.cfg.tie_word_embeddings
                 and self.store.has("lm_head.weight")
-                and not phase_scoped_qwen_head):
+                and not phase_scoped_lm_head):
             pin_names.append("lm_head.weight")
         # F128: kimi_k3's AttnRes needs one final readout applied once after
         # ALL layers, before model.norm (real KimiLinearModel._apply_output_
@@ -2727,7 +2760,7 @@ class StreamingEngine:
             pin_names.extend(["model.hc_head_fn", "model.hc_head_scale",
                               "model.hc_head_base"])
         persistent = self.cache.pin("persistent", pin_names)
-        if phase_scoped_qwen_head:
+        if phase_scoped_lm_head:
             if phase_scoped_qwen35_head:
                 phase_head_bytes = self.store.mlx_quantized_resident_bytes(
                     ["lm_head.weight"])
@@ -2736,27 +2769,32 @@ class StreamingEngine:
                     ["lm_head.weight"])
             if phase_head_bytes <= 0:
                 raise ValueError(
-                    "phase-scoped Qwen LM head requires exactly sizeable "
+                    "phase-scoped LM head requires exactly sizeable "
                     "checkpoint metadata")
             if self.store.storage_bytes_unknown(["lm_head.weight"]):
                 raise ValueError(
-                    "phase-scoped Qwen LM head metadata is incomplete")
+                    "phase-scoped LM head metadata is incomplete")
             if phase_scoped_qwen35_head:
                 self.cache.register_suspended_pin(
                     "qwen35:lm_head:persistent", phase_head_bytes)
                 self._qwen35_lm_head_pin_suspended = True
-            else:
+            elif phase_scoped_qwen4_head:
                 self.cache.register_suspended_pin(
                     "qwen4:lm_head:persistent", phase_head_bytes,
                     allow_over_capacity=True)
                 self._qwen4_lm_head_pin_suspended = True
                 self._qwen4_phase_head_bytes = int(phase_head_bytes)
+            else:
+                self.cache.register_suspended_pin(
+                    "glm53:lm_head:persistent", phase_head_bytes)
+                self._glm53_lm_head_pin_suspended = True
+                self._glm53_phase_head_bytes = int(phase_head_bytes)
 
         self._embed_w = persistent.get("model.embed_tokens.weight")
         self._norm_w = persistent.get("model.norm.weight")
         self._lm_head_w = (
             None
-            if phase_scoped_qwen_head
+            if phase_scoped_lm_head
             else persistent.get("lm_head.weight")
         )
         self._hc_head_fn = persistent.get("model.hc_head_fn")
@@ -5637,13 +5675,131 @@ class StreamingEngine:
             # mutation, so the next round may prefetch normally again.
             self._qwen4_serial_verify_head_restore_trim_bytes += int(
                 self.cache.trim_to(0))
+        if bool(getattr(self, "_glm53_lm_head_pin_suspended", False)):
+            # A dormant lease does not itself reserve ordinary LRU capacity.
+            # Make its exact resident bytes available before fetching so the
+            # demand load cannot transiently stack a 1.27-GB head on a full
+            # 2.8-GB cache. Then ask the live governor to admit the remaining
+            # Metal allocation before WeightStore materializes it.
+            phase_bytes = int(self._glm53_phase_head_bytes)
+            target_cache_bytes = max(
+                0, int(self.cache.max_bytes) - phase_bytes)
+            self._glm53_phase_head_restore_prepare_released_bytes += int(
+                self.cache.trim_to(target_cache_bytes))
+            if self.governor is not None:
+                reservation_started = time.perf_counter()
+                self._glm53_phase_head_restore_reservation_calls += 1
+                self.governor.reserve(
+                    phase_bytes,
+                    reason="glm53-phase-lm-head",
+                )
+                self._glm53_phase_head_restore_reservation_s += (
+                    time.perf_counter() - reservation_started)
         head = self.cache.get(
             "lm_head", ["lm_head.weight"])["lm_head.weight"]
         if self._qwen35_lm_head_pin_suspended:
             self._restore_qwen35_serial_verify_lm_head(head)
         elif self._qwen4_lm_head_pin_suspended:
             self._restore_qwen4_phase_lm_head(head)
+        elif bool(getattr(self, "_glm53_lm_head_pin_suspended", False)):
+            self._restore_glm53_phase_lm_head(head)
         return head
+
+    def _suspend_glm53_phase_lm_head(self) -> int:
+        """Release GLM-5.3-Flash's exact head at the request boundary."""
+        if not bool(getattr(
+                getattr(self, "rc", None), "glm53_phase_lm_head", False)):
+            return 0
+        if self._lm_head_w is None:
+            if self._glm53_lm_head_pin_suspended:
+                # Promotion can fail softly when a synthetic/alternate cache
+                # refuses the exact lease. Drop the unpinned demand page at the
+                # same request boundary while preserving the dormant lease.
+                discard = getattr(self.cache, "discard", None)
+                if callable(discard) and discard(
+                        "lm_head", ["lm_head.weight"]):
+                    self._glm53_phase_head_unpinned_cleanup_calls += 1
+            return 0
+        started = time.perf_counter()
+        active_before = int(mx.get_active_memory())
+        head = self._lm_head_w
+        self._lm_head_w = None
+        try:
+            released = self.cache.release_pinned(
+                "glm53:lm_head:persistent", ["lm_head.weight"])
+        except Exception:
+            # release_pinned commits cache ownership before clearing device
+            # state/source mappings. If that later cleanup fails, restoring
+            # our reference would create an unaccounted resident allocation.
+            suspended_bytes = getattr(self.cache, "suspended_pin_bytes", None)
+            released_ownership = (
+                callable(suspended_bytes)
+                and suspended_bytes("glm53:lm_head:persistent")
+                == self._glm53_phase_head_bytes)
+            if released_ownership:
+                self._glm53_lm_head_pin_suspended = True
+                head = None  # also remove the exception traceback's reference
+            else:
+                self._lm_head_w = head
+            raise
+        if released:
+            self._glm53_lm_head_pin_suspended = True
+        else:
+            # A zero release means the cache did not own the claimed pinned
+            # page. Preserve the only known-good live reference and do not
+            # pretend that a dormant lease is available.
+            self._lm_head_w = head
+            self._glm53_lm_head_pin_suspended = False
+        # Drop the recovery reference before measuring reclamation. The cache
+        # already cleared its ownership; this local was its last consumer.
+        del head
+        if released:
+            mx.clear_cache()
+        active_after = int(mx.get_active_memory())
+        self._glm53_phase_head_suspend_calls += 1
+        self._glm53_phase_head_suspend_bytes += int(released)
+        self._glm53_phase_head_suspend_active_released_bytes += max(
+            0, active_before - active_after)
+        self._glm53_phase_head_suspend_s += time.perf_counter() - started
+        return int(released)
+
+    def _restore_glm53_phase_lm_head(self, head=None) -> bool:
+        """Promote the already-read post-prefill GLM head without a copy."""
+        if not self.rc.glm53_phase_lm_head:
+            return False
+        started = time.perf_counter()
+        self._glm53_phase_head_restore_calls += 1
+        promoted = self.cache.promote_to_pin(
+            "lm_head", "glm53:lm_head:persistent",
+            tensors=(
+                {"lm_head.weight": head}
+                if head is not None else None
+            ),
+        )
+        restored = promoted is not None
+        if restored:
+            self._lm_head_w = promoted["lm_head.weight"]
+            self._glm53_lm_head_pin_suspended = False
+            self._glm53_phase_head_restore_successes += 1
+        else:
+            self._glm53_phase_head_restore_refusals += 1
+        self._glm53_phase_head_restore_s += time.perf_counter() - started
+        return restored
+
+    def _reset_glm53_phase_head_request_stats(self) -> None:
+        """Reset request-local GLM head-lifetime attribution counters."""
+        self._glm53_phase_head_suspend_calls = 0
+        self._glm53_phase_head_suspend_bytes = 0
+        self._glm53_phase_head_suspend_active_released_bytes = 0
+        self._glm53_phase_head_suspend_s = 0.0
+        self._glm53_phase_head_restore_calls = 0
+        self._glm53_phase_head_restore_successes = 0
+        self._glm53_phase_head_restore_refusals = 0
+        self._glm53_phase_head_restore_s = 0.0
+        self._glm53_phase_head_restore_prepare_released_bytes = 0
+        self._glm53_phase_head_restore_reservation_calls = 0
+        self._glm53_phase_head_restore_reservation_s = 0.0
+        self._glm53_phase_head_unpinned_cleanup_calls = 0
 
     def _suspend_qwen4_phase_lm_head(self) -> int:
         """Release the prior request's exact head before Qwen4 prefill."""

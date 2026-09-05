@@ -45,6 +45,41 @@ def test_serial_rows_are_bit_exact_to_independent_streamed_matmuls(tmp_path):
             np.array(actual.view(mx.uint16)),
             np.array(expected.view(mx.uint16)),
         )
+        telemetry = head.full_scan_telemetry()
+        assert telemetry["full_scan_calls"] == 4
+        assert telemetry["full_read_extents"] == 4 * math.ceil(19 / 5)
+        assert telemetry["full_bytes_read"] == 4 * 19 * 8 * 2
+        assert telemetry["full_read_ns"] > 0
+        assert telemetry["full_scan_ns"] >= telemetry["full_read_ns"]
+    finally:
+        head.close()
+
+
+def test_phase_mtp_head_keeps_streamed_vocabulary_tiles(tmp_path, monkeypatch):
+    from runtime import glm_mtp
+
+    head = _make_head(tmp_path, vocab=16_391, hidden=32, block_rows=16_384)
+    resident = mx.load(str(tmp_path / "model.safetensors"))["lm_head.weight"]
+    hidden = mx.array(np.cos(np.arange(32, dtype=np.float32))).reshape(
+        1, 1, 32).astype(mx.bfloat16)
+    calls = []
+    original = glm_mtp.quant.matmul
+
+    def traced(g, weight):
+        calls.append(tuple(weight.shape))
+        return original(g, weight)
+
+    monkeypatch.setattr(glm_mtp.quant, "matmul", traced)
+    try:
+        expected = glm_mtp._project_mtp_head(hidden, head)
+        actual = glm_mtp._project_mtp_head(hidden, resident, phase_resident=True)
+        mx.eval(expected, actual)
+        assert calls == [(16_384, 32), (7, 32)]
+        assert np.array_equal(np.array(expected.view(mx.uint16)),
+                              np.array(actual.view(mx.uint16)))
+        calls.clear()
+        glm_mtp._project_mtp_head(hidden, resident)
+        assert calls == [(16_391, 32)]  # non-phase dispatch is unchanged
     finally:
         head.close()
 
@@ -71,6 +106,10 @@ def test_serial_rows_read_each_vocab_block_once(tmp_path, monkeypatch):
         head.close()
 
     assert calls == math.ceil(19 / block_rows)
+    telemetry = head.full_scan_telemetry()
+    assert telemetry["full_scan_calls"] == 1
+    assert telemetry["full_read_extents"] == calls
+    assert telemetry["full_bytes_read"] == 19 * 8 * 2
 
 
 def test_candidate_rows_are_sorted_coalesced_and_exact(tmp_path, monkeypatch):
@@ -173,6 +212,7 @@ def test_qwen_serial_verifier_reranks_every_target_position(tmp_path):
     engine._serial_kda_endpoint_retained_bytes = 0
     engine._serial_kda_factors = None
     engine._serial_kda_factor_retained_bytes = 0
+    engine._request_profiler = None
     engine._prefill_layer_transient = 0
     engine._decode_layer_transient = 0
     engine._serial_verify_layer_transient = {}

@@ -393,6 +393,30 @@ def test_vision_protocol_timing_exposes_qwen4_verifier_pipeline_and_q_calibratio
             }],
             "speculative_round_detail_total": 1,
             "speculative_round_detail_dropped": 0,
+            "streamed_lm_head_full_scan_calls": 34,
+            "streamed_lm_head_full_read_extents": 272,
+            "streamed_lm_head_full_bytes_read": 43_000_000_000,
+            "streamed_lm_head_full_read_s": 24.5,
+            "streamed_lm_head_full_scan_s": 30.5,
+            "lm_head_pinned": 0,
+            "lm_head_pinned_bytes": 0,
+            "glm53_phase_lm_head": 1,
+            "glm53_phase_lm_head_bytes": 1_268_776_960,
+            "glm53_phase_lm_head_suspend_calls": 1,
+            "glm53_phase_lm_head_suspend_bytes": 1_268_776_960,
+            "glm53_phase_lm_head_suspend_active_released_bytes": 1_250_000_000,
+            "glm53_phase_lm_head_suspend_s": 0.125,
+            "glm53_phase_lm_head_restore_calls": 1,
+            "glm53_phase_lm_head_restore_successes": 1,
+            "glm53_phase_lm_head_restore_refusals": 0,
+            "glm53_phase_lm_head_restore_s": 0.875,
+            "glm53_phase_lm_head_restore_prepare_released_bytes": 456,
+            "glm53_phase_lm_head_restore_reservation_calls": 1,
+            "glm53_phase_lm_head_restore_reservation_s": 0.0625,
+            "glm53_phase_lm_head_unpinned_cleanup_calls": 0,
+            "glm53_phase_lm_head_idle_release_calls": 1,
+            "glm53_phase_lm_head_idle_release_bytes": 1_268_776_960,
+            "glm53_phase_lm_head_idle_release_s": 0.25,
         },
     })
 
@@ -440,6 +464,32 @@ def test_vision_protocol_timing_exposes_qwen4_verifier_pipeline_and_q_calibratio
     assert timing["speculative_round_details"][0]["accepted"] == 2
     assert timing["speculative_round_detail_total"] == 1
     assert timing["speculative_round_detail_dropped"] == 0
+    assert timing["streamed_lm_head_full_scan_calls"] == 34
+    assert timing["streamed_lm_head_full_read_extents"] == 272
+    assert timing["streamed_lm_head_full_bytes_read"] == 43_000_000_000
+    assert timing["streamed_lm_head_full_read_s"] == 24.5
+    assert timing["streamed_lm_head_full_scan_s"] == 30.5
+    assert timing["lm_head_pinned"] == 0
+    assert timing["lm_head_pinned_bytes"] == 0
+    assert timing["glm53_phase_lm_head"] == 1
+    assert timing["glm53_phase_lm_head_bytes"] == 1_268_776_960
+    assert timing["glm53_phase_lm_head_suspend_calls"] == 1
+    assert timing["glm53_phase_lm_head_suspend_bytes"] == 1_268_776_960
+    assert timing[
+        "glm53_phase_lm_head_suspend_active_released_bytes"] == 1_250_000_000
+    assert timing["glm53_phase_lm_head_suspend_s"] == 0.125
+    assert timing["glm53_phase_lm_head_restore_calls"] == 1
+    assert timing["glm53_phase_lm_head_restore_successes"] == 1
+    assert timing["glm53_phase_lm_head_restore_refusals"] == 0
+    assert timing["glm53_phase_lm_head_restore_s"] == 0.875
+    assert timing["glm53_phase_lm_head_restore_prepare_released_bytes"] == 456
+    assert timing["glm53_phase_lm_head_restore_reservation_calls"] == 1
+    assert timing["glm53_phase_lm_head_restore_reservation_s"] == 0.0625
+    assert timing["glm53_phase_lm_head_unpinned_cleanup_calls"] == 0
+    assert timing["glm53_phase_lm_head_idle_release_calls"] == 1
+    assert timing[
+        "glm53_phase_lm_head_idle_release_bytes"] == 1_268_776_960
+    assert timing["glm53_phase_lm_head_idle_release_s"] == 0.25
 
 
 def test_vision_protocol_timing_exposes_qwen_mtp_round_trace():
@@ -2850,6 +2900,7 @@ def test_glm53_hot_prompt_kv_is_opt_in_exact_and_in_engine_identity():
          "must be 0 or 1"),
         ("VMODEL_GLM53_SERIAL_VERIFY_COALESCED_BARRIERS", "auto",
          "must be 0 or 1"),
+        ("VMODEL_GLM53_FLASH_PHASE_LM_HEAD", "auto", "must be 0 or 1"),
         ("VMODEL_GLM53_SHORT_STREAM_LM_HEAD", "auto", "must be 0 or 1"),
         ("VMODEL_GLM53_EXPERT_BATCH_PREFETCH_DEPTH", "4",
          "must be in \\[1, 3\\]"),
@@ -3049,6 +3100,7 @@ def test_glm53_expert_storage_batch_and_pipeline_are_explicit_identity(
         "VMODEL_GLM53_EXPERT_BATCH_PREFETCH": "0",
         "VMODEL_GLM53_EXPERT_BATCH_PREFETCH_PREFILL_ONLY": "0",
         "VMODEL_GLM53_SERIAL_VERIFY_COALESCED_BARRIERS": "0",
+        "VMODEL_GLM53_FLASH_PHASE_LM_HEAD": "0",
         "VMODEL_GLM53_EXPERT_BATCH_PREFETCH_DEPTH": "1",
         "VMODEL_GLM53_EXPERT_BATCH_PREFETCH_WORKERS": "1",
         "VMODEL_GLM53_TRUNK_PREFETCH_DEPTH": "0",
@@ -3161,6 +3213,85 @@ def test_glm53_serial_verify_coalesced_barriers_are_flash_only_identity():
         with pytest.raises(RequestValidationError, match="requires GLM-5.3-Flash"):
             EngineManager().get(
                 Path("/tmp/fake-full-glm53-barriers"), "lossless")
+
+
+def test_glm53_flash_phase_lm_head_is_explicit_and_preserves_cache_budget():
+    from unittest.mock import patch
+
+    from runtime.server import EngineManager, RequestValidationError
+
+    captured = []
+
+    class FakeEngine:
+        def __init__(self, _path, rc):
+            self.rc = rc
+            captured.append(rc)
+
+        def close(self):
+            pass
+
+    class FakeMTP:
+        def __init__(self, target, **kwargs):
+            self.target = target
+
+        def close(self):
+            self.target.close()
+
+    flash = SimpleNamespace(
+        model_type="glm5_next", tie_word_embeddings=False,
+        index_topk=2048, max_position_embeddings=1_048_576,
+        vision_config=None, num_experts_per_tok=8,
+    )
+    settings = {
+        "VMODEL_GLM53_MTP": "0",
+        "VMODEL_GLM53_FLASH_PHASE_LM_HEAD": "0",
+    }
+    with patch.dict("os.environ", settings, clear=False), \
+         patch("runtime.config.ModelConfig.from_dir", return_value=flash), \
+         patch("runtime.path_resolver.resolve_model_dir",
+               side_effect=lambda path: path), \
+         patch("runtime.engine.StreamingEngine", FakeEngine), \
+         patch("runtime.speculative.NativeMTPEngine", FakeMTP):
+        manager = EngineManager()
+        manager.get(Path("/tmp/fake-glm53-flash-head"), "lossless")
+        os.environ["VMODEL_GLM53_FLASH_PHASE_LM_HEAD"] = "1"
+        with pytest.raises(RequestValidationError, match="requires VMODEL_GLM53_MTP=1"):
+            manager.get(Path("/tmp/fake-glm53-flash-head"), "lossless")
+        os.environ["VMODEL_GLM53_MTP"] = "1"
+        wrapped = manager.get(Path("/tmp/fake-glm53-flash-head"), "lossless")
+        assert isinstance(wrapped, FakeMTP)
+        assert wrapped.target.rc.glm53_phase_lm_head
+        with pytest.raises(RequestValidationError, match="text-only"):
+            manager.get(Path("/tmp/fake-glm53-flash-head"), "lossless",
+                        requires_vision=True)
+        os.environ["VMODEL_GLM53_FLASH_PHASE_LM_HEAD"] = "0"
+        manager.get(Path("/tmp/fake-glm53-flash-head"), "lossless")
+
+    assert len(captured) == 3
+    streamed, phase, restored_streamed = captured
+    assert not restored_streamed.glm53_phase_lm_head
+    assert not streamed.pin_lm_head and streamed.stream_lm_head
+    assert not streamed.glm53_phase_lm_head
+    assert streamed.max_weight_cache_mb == 1500
+    assert streamed.min_weight_cache_mb == 150
+    assert phase.pin_lm_head and not phase.stream_lm_head
+    assert phase.glm53_phase_lm_head
+    assert phase.max_weight_cache_mb == 2800
+    assert phase.min_weight_cache_mb == 1450
+
+    full = SimpleNamespace(**{
+        **flash.__dict__, "model_type": "glm_moe_dsa",
+    })
+    with patch.dict(
+            "os.environ", {
+                "VMODEL_GLM53_FLASH_PHASE_LM_HEAD": "1",
+            }, clear=False), \
+         patch("runtime.config.ModelConfig.from_dir", return_value=full), \
+         patch("runtime.path_resolver.resolve_model_dir",
+               side_effect=lambda path: path):
+        with pytest.raises(RequestValidationError, match="requires GLM-5.3-Flash"):
+            EngineManager().get(
+                Path("/tmp/fake-full-glm53-phase-head"), "lossless")
 
 
 def test_glm53_sparse_absorbed_mla_is_explicit_and_in_engine_identity():

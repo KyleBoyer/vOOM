@@ -1,0 +1,14 @@
+schema: voom.runtime-profile.v1
+name: glm53-flash-e-compact-mla-tile128-workers2-direct-fp8-qmv-mtp3-phase-head
+description: Explicit native-MTP profile leasing the released BF16 output head only for post-prefill decode.
+notes:
+  - "Extends the direct-QMV/native-MTP composition tested on a copy-output diagnostic, not proven distant retrieval. It loads the exact published BF16 lm_head once at the first post-prefill projection, reuses it through target-verified decode, and releases it before returning the response."
+  - "The cache ceiling rises from 1.5GB to 2.8GB solely so the 1.27GB decode-phase lease does not displace the selected pageable expert-cache capacity; the hard Metal cap remains 8.5GB."
+  - "Streamed-head scans are measured directly because they bypass WeightStore accounting. Require byte-identical tokens/state, lower end-to-end wall, and clean post-request pressure on both the semantic trace and an unrelated request before recommending this profile."
+  - "This remains E-class/default-off because it inherits compact absorbed MLA."
+  - "Text-only until the vision decoder has its own verified lease boundary. Disable VMODEL_GLM53_FLASH_PHASE_LM_HEAD for vision."
+  - "Canonical-MLA direct-engine 28-in/8-out fresh/cached probes matched all 159 endpoint tensors and improved wall 2.30%/3.29%, but both control and candidate missed the existing 5.3GB immediate-availability floor. This is not a pressure-cleared or real-harness speed promotion."
+extends:
+  - glm53-flash-e-compact-mla-tile128-workers2-direct-fp8-qmv-mtp3
+settings:
+  VMODEL_GLM53_FLASH_PHASE_LM_HEAD: 1

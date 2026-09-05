@@ -3,11 +3,11 @@
 The LM head (GLM-5.2: 154,880 x 6144 bf16 ~= 1.9 GB) is only ever used as
 `normed_hidden @ lm_head.T` — a matvec (decode) or thin matmul (verify) whose
 CONTRACTION dimension is hidden, not vocab. Splitting the OUTPUT (vocab)
-dimension into row blocks therefore changes nothing about summation order:
-each output logit is an independent dot product over the same hidden-sized
-row, computed once, whichever block it lands in. Block-streamed logits are
-bit-identical to a single whole-tensor matmul — this is a real optimization,
-not an approximation.
+dimension into row blocks leaves each output's mathematical dot product
+unchanged. Backend kernel selection can still depend on matrix geometry, so
+bit identity to a whole-tensor projection requires an oracle for the actual
+dtype/shape/backend. Residency experiments use the same vocabulary block
+width and compare all logits, not just top-1.
 
 `mx.load(...)[name]` is lazy per-TENSOR but not per-SLICE: evaluating any
 slice of a lazy tensor forces the whole tensor to be read (measured directly
@@ -24,6 +24,7 @@ import hashlib
 import os
 import re
 import struct
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -271,6 +272,14 @@ class StreamedLMHead:
         self.candidate_bytes_read = 0
         self.candidate_recall_full_scan_calls = 0
         self.candidate_recall_full_scan_bytes = 0
+        # Full-vocabulary scans used by ordinary target and draft logits.
+        # These reads bypass WeightStore, so keep explicit cumulative counters
+        # for request-local delta attribution in the serving wrappers.
+        self.full_scan_calls = 0
+        self.full_read_extents = 0
+        self.full_bytes_read = 0
+        self.full_read_ns = 0
+        self.full_scan_ns = 0
         self._open()
 
     def _open(self):
@@ -292,12 +301,20 @@ class StreamedLMHead:
     def logits(self, h: mx.array) -> mx.array:
         """h: (..., hidden) already rms-normed. Returns (..., vocab). Peak
         Metal cost per block is O(block_rows * hidden), not O(vocab * hidden)."""
+        scan_started_ns = time.perf_counter_ns()
+        read_ns = 0
+        read_extents = 0
+        read_bytes = 0
         mx.eval(h)
         chunks = []
         for start in range(0, self.vocab, self.block_rows):
             n_rows = min(self.block_rows, self.vocab - start)
+            read_started_ns = time.perf_counter_ns()
             raw = _pread_exact(self._fd, n_rows * self.row_bytes,
                                self.data_start + start * self.row_bytes)
+            read_ns += time.perf_counter_ns() - read_started_ns
+            read_extents += 1
+            read_bytes += len(raw)
             block = np.frombuffer(
                 raw, dtype=_NP_STORAGE_DTYPE[self.dtype]
             ).reshape(n_rows, self.hidden)
@@ -305,6 +322,9 @@ class StreamedLMHead:
             c = h @ w_block.T
             mx.eval(c)
             chunks.append(c)
+        self._record_full_scan(
+            read_extents, read_bytes, read_ns,
+            time.perf_counter_ns() - scan_started_ns)
         return mx.concatenate(chunks, axis=-1)
 
     def logits_serial_rows(self, h: mx.array) -> mx.array:
@@ -331,14 +351,22 @@ class StreamedLMHead:
         if rows == 0:
             return mx.zeros((*leading_shape, self.vocab), dtype=h.dtype)
 
+        scan_started_ns = time.perf_counter_ns()
+        read_ns = 0
+        read_extents = 0
+        read_bytes = 0
         row_chunks: list[list[mx.array]] = [[] for _ in range(rows)]
         for start in range(0, self.vocab, self.block_rows):
             n_rows = min(self.block_rows, self.vocab - start)
+            read_started_ns = time.perf_counter_ns()
             raw = _pread_exact(
                 self._fd,
                 n_rows * self.row_bytes,
                 self.data_start + start * self.row_bytes,
             )
+            read_ns += time.perf_counter_ns() - read_started_ns
+            read_extents += 1
+            read_bytes += len(raw)
             block = np.frombuffer(
                 raw, dtype=_NP_STORAGE_DTYPE[self.dtype]
             ).reshape(n_rows, self.hidden)
@@ -356,7 +384,28 @@ class StreamedLMHead:
             for chunks in row_chunks
         ]
         result = mx.concatenate(result_rows, axis=0)
+        self._record_full_scan(
+            read_extents, read_bytes, read_ns,
+            time.perf_counter_ns() - scan_started_ns)
         return result.reshape(*leading_shape, self.vocab)
+
+    def _record_full_scan(
+            self, read_extents: int, read_bytes: int, read_ns: int,
+            scan_ns: int) -> None:
+        self.full_scan_calls += 1
+        self.full_read_extents += int(read_extents)
+        self.full_bytes_read += int(read_bytes)
+        self.full_read_ns += int(read_ns)
+        self.full_scan_ns += int(scan_ns)
+
+    def full_scan_telemetry(self) -> dict[str, int]:
+        return {
+            "full_scan_calls": int(self.full_scan_calls),
+            "full_read_extents": int(self.full_read_extents),
+            "full_bytes_read": int(self.full_bytes_read),
+            "full_read_ns": int(self.full_read_ns),
+            "full_scan_ns": int(self.full_scan_ns),
+        }
 
     def candidate_logits(
         self, h: mx.array, indices: mx.array,

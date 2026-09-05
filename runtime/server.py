@@ -2344,6 +2344,11 @@ class EngineManager:
             raise RequestValidationError(
                 "VMODEL_GLM53_SERIAL_VERIFY_COALESCED_BARRIERS must be "
                 "0 or 1")
+        glm53_flash_phase_lm_head_request = os.environ.get(
+            "VMODEL_GLM53_FLASH_PHASE_LM_HEAD", "0").strip()
+        if glm53_flash_phase_lm_head_request not in ("0", "1"):
+            raise RequestValidationError(
+                "VMODEL_GLM53_FLASH_PHASE_LM_HEAD must be 0 or 1")
         glm53_short_stream_lm_head_request = os.environ.get(
             "VMODEL_GLM53_SHORT_STREAM_LM_HEAD", "0").strip()
         if glm53_short_stream_lm_head_request not in ("0", "1"):
@@ -2530,6 +2535,7 @@ class EngineManager:
             glm53_expert_batch_prefetch_request,
             glm53_expert_batch_prefetch_prefill_only_request,
             glm53_serial_verify_coalesced_barriers_request,
+            glm53_flash_phase_lm_head_request,
             glm53_expert_batch_prefetch_depth,
             glm53_expert_batch_prefetch_workers,
             glm53_short_stream_lm_head_request,
@@ -2688,6 +2694,7 @@ class EngineManager:
             glm53_expert_batch_prefetch_request,
             glm53_expert_batch_prefetch_prefill_only_request,
             glm53_serial_verify_coalesced_barriers_request,
+            glm53_flash_phase_lm_head_request,
             glm53_expert_batch_prefetch_depth,
             glm53_expert_batch_prefetch_workers,
             glm53_short_stream_lm_head_request,
@@ -2711,6 +2718,19 @@ class EngineManager:
             raise RequestValidationError(
                 "VMODEL_GLM53_SERIAL_VERIFY_COALESCED_BARRIERS requires "
                 "GLM-5.3-Flash")
+        if (glm53_flash_phase_lm_head_request == "1"
+                and mtype != "glm5_next"):
+            raise RequestValidationError(
+                "VMODEL_GLM53_FLASH_PHASE_LM_HEAD requires GLM-5.3-Flash")
+        if (glm53_flash_phase_lm_head_request == "1"
+                and glm53_mtp_request != "1"):
+            raise RequestValidationError(
+                "VMODEL_GLM53_FLASH_PHASE_LM_HEAD requires VMODEL_GLM53_MTP=1 "
+                "to own the request-scoped head lease")
+        if glm53_flash_phase_lm_head_request == "1" and requires_vision:
+            raise RequestValidationError(
+                "VMODEL_GLM53_FLASH_PHASE_LM_HEAD is text-only; "
+                "disable it for vision requests")
         if (glm53_native_fp8_prefetch_request == "0"
                 and glm53_native_fp8_dequant_request != "1"):
             raise RequestValidationError(
@@ -3040,11 +3060,19 @@ class EngineManager:
                 # hybrid KDA/MLA state and layer scratch retain headroom.
                 rc.pin_embeddings = False
                 rc.embed_rows = True
-                rc.pin_lm_head = False
-                rc.stream_lm_head = True
+                rc.glm53_phase_lm_head = (
+                    glm53_flash_phase_lm_head_request == "1")
+                rc.pin_lm_head = rc.glm53_phase_lm_head
+                rc.stream_lm_head = not rc.pin_lm_head
                 rc.prompt_kv_dir = ""
-                rc.max_weight_cache_mb = 1500
-                rc.min_weight_cache_mb = 150
+                # Preserve the selected 1.5-GB pageable expert-cache budget
+                # while the exact 1.27-GB BF16 head is leased during decode.
+                # The lease is dormant during prefill and after the response;
+                # the minimum likewise keeps 150MB reclaimable headroom.
+                rc.max_weight_cache_mb = (
+                    2800 if rc.pin_lm_head else 1500)
+                rc.min_weight_cache_mb = (
+                    1450 if rc.pin_lm_head else 150)
                 rc.mlx_cache_limit_mb = 512
                 rc.metal_limit_mb = 8500
                 rc.prefetch_depth = glm53_trunk_prefetch_depth
@@ -9918,6 +9946,27 @@ def _vision_protocol_timing(result: dict) -> dict:
         "reranked_lm_head_candidate_bytes_read",
         "reranked_lm_head_candidate_recall_full_scan_calls",
         "reranked_lm_head_candidate_recall_full_scan_bytes",
+        "streamed_lm_head_full_scan_calls",
+        "streamed_lm_head_full_read_extents",
+        "streamed_lm_head_full_bytes_read",
+        "draft_streamed_lm_head_full_scan_calls",
+        "draft_streamed_lm_head_full_read_extents",
+        "draft_streamed_lm_head_full_bytes_read",
+        "lm_head_pinned",
+        "lm_head_pinned_bytes",
+        "glm53_phase_lm_head",
+        "glm53_phase_lm_head_bytes",
+        "glm53_phase_lm_head_suspend_calls",
+        "glm53_phase_lm_head_suspend_bytes",
+        "glm53_phase_lm_head_suspend_active_released_bytes",
+        "glm53_phase_lm_head_restore_calls",
+        "glm53_phase_lm_head_restore_successes",
+        "glm53_phase_lm_head_restore_refusals",
+        "glm53_phase_lm_head_restore_prepare_released_bytes",
+        "glm53_phase_lm_head_restore_reservation_calls",
+        "glm53_phase_lm_head_unpinned_cleanup_calls",
+        "glm53_phase_lm_head_idle_release_calls",
+        "glm53_phase_lm_head_idle_release_bytes",
         "reranked_lm_head_candidate_rank_capture_positions",
         "qwen_mtp_target_reranked_lm_head_calls",
         "qwen_mtp_target_reranked_lm_head_positions",
@@ -10347,6 +10396,10 @@ def _vision_protocol_timing(result: dict) -> dict:
         "glm53_layer_stationary_disk_spool_read_s",
         "glm53_layer_stationary_transient_reservation_s",
         "glm53_serial_verify_coalesced_eval_s",
+        "streamed_lm_head_full_read_s",
+        "streamed_lm_head_full_scan_s",
+        "draft_streamed_lm_head_full_read_s",
+        "draft_streamed_lm_head_full_scan_s",
         "dsa_selection_spill_write_s",
         "dsa_selection_spill_read_s",
         "dsa_selection_score_s",
@@ -10445,6 +10498,10 @@ def _vision_protocol_timing(result: dict) -> dict:
         "qwen4_serial_verify_head_s",
         "qwen4_phase_lm_head_suspend_s",
         "qwen4_phase_lm_head_restore_s",
+        "glm53_phase_lm_head_suspend_s",
+        "glm53_phase_lm_head_restore_s",
+        "glm53_phase_lm_head_restore_reservation_s",
+        "glm53_phase_lm_head_idle_release_s",
     )
     for key in optional_float_fields:
         if key in stats or key in result:
@@ -10615,6 +10672,8 @@ def _execution_profile_fields(engine) -> dict[str, object]:
         ))
     if rc is not None and getattr(rc, "qwen4_phase_lm_head", False):
         fields["vmodel_qwen4_phase_lm_head"] = 1
+    if rc is not None and getattr(rc, "glm53_phase_lm_head", False):
+        fields["vmodel_glm53_phase_lm_head"] = 1
     if rc is not None and getattr(
             rc, "qwen4_serial_verify_suspend_lm_head", False):
         fields["vmodel_qwen4_serial_verify_suspend_lm_head"] = 1
