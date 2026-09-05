@@ -199,6 +199,37 @@ def _pressure() -> Pressure:
     )
 
 
+def _request_wire_metadata(payload: bytes, captured_payload: bytes) -> dict:
+    """Fingerprint the actual transmitted bytes, not just the source capture.
+
+    Record changed field names without copying private prompt/tool values.
+    Presence is compared separately so an added/removed null is not hidden.
+    """
+    effective = json.loads(payload)
+    captured = json.loads(captured_payload)
+    changed = sorted(
+        key for key in effective.keys() | captured.keys()
+        if ((key in effective) != (key in captured)
+            or effective.get(key) != captured.get(key)))
+    return {
+        "request_sha256": hashlib.sha256(payload).hexdigest(),
+        "request_bytes": len(payload),
+        "request_changed_fields": changed,
+    }
+
+
+def _peak_metal_failure(timing: dict, ceiling_gb: float | None) -> str | None:
+    """A requested memory proof must not accept absent telemetry as zero."""
+    if ceiling_gb is None:
+        return None
+    peak_bytes = timing.get("true_peak_metal_bytes")
+    if isinstance(peak_bytes, bool) or not isinstance(peak_bytes, int) or peak_bytes <= 0:
+        return "true peak Metal telemetry is missing or not a positive integer"
+    if peak_bytes >= int(ceiling_gb * 1_000_000_000):
+        return f"true peak Metal {peak_bytes / 1e9:.4f}GB is not below {ceiling_gb}GB"
+    return None
+
+
 def _safe_selection(value) -> dict:
     value = value if isinstance(value, dict) else {}
     keys = (
@@ -1010,6 +1041,7 @@ def main() -> int:
             print_progress=args.print_progress,
             fail_on_memory_retry=args.fail_on_memory_retry)
         after = _pressure()
+        row.update(_request_wire_metadata(payload, raw))
         row["repeat"] = index + 1
         row["request_label"] = label
         row["pressure_before"] = asdict(before)
@@ -1199,14 +1231,9 @@ def main() -> int:
             failures.append(
                 f"repeat {index + 1}: cached_tokens {cached_tokens} is below "
                 f"{args.expected_min_repeat_cached_tokens}")
-        peak_bytes = int(timing.get("true_peak_metal_bytes", 0) or 0)
-        if (args.expected_max_peak_metal_gb is not None
-                and peak_bytes >= int(
-                    args.expected_max_peak_metal_gb * 1_000_000_000)):
-            failures.append(
-                f"repeat {index + 1}: true peak Metal "
-                f"{peak_bytes / 1e9:.4f}GB is not below "
-                f"{args.expected_max_peak_metal_gb}GB")
+        peak_failure = _peak_metal_failure(timing, args.expected_max_peak_metal_gb)
+        if peak_failure is not None:
+            failures.append(f"repeat {index + 1}: {peak_failure}")
         selection = row.get("tool_selection") or {}
         if args.expected_gateway_real_tool_required is not None:
             expected_required = (

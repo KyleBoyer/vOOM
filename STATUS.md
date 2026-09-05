@@ -1,5 +1,55 @@
 # STATUS — 2026-09-05 (current corrections first; dated chronology below is history)
 
+## 2026-09-05: Qwen cleanup survives completed streaming workspace calls; pressure fails
+
+The opt-in idle-release profile completed two consecutive **modified two-real-
+workspace-tool, replaced short system/history/user, developer-role, streaming
+with progress events, greedy/seed64001** requests. Reasoning stayed unspecified;
+the server reported zero reasoning tokens. Both used 1,611 input tokens, zero
+cached tokens and 70 output tokens, naturally completing below the 512 budget.
+Each returned one `mastra_workspace_read_file` call with the requested
+`docs/ops_runbook.md`, offset1 and limit12, plus a visible message. Streaming
+text matched final text and stable output hashes matched across requests.
+No tool was executed; this proves completed call selection/arguments in this
+shape, not a completed workspace investigation or broad intelligence score.
+
+| request state | HTTP wall | first token (engine) | prefill | decode |
+|---|---:|---:|---:|---:|
+| fresh server, uncached prompt | 356.6331s | 116.8021s | 116.8019s | 225.6998s |
+| model already loaded, uncached prompt | 341.2937s | 115.3978s | 115.3975s | 225.8368s |
+
+OS file caches were not purged. Both calls had MTP47/67 accepted proposals in
+23 target sweeps, zero prefill retries and identical store-accounted reads:
+118,877,180,840 prefill +352,580,672,928 decode =471,457,853,768 bytes each.
+The server logged disposal of162,171,648 logical endpoint bytes after each
+response. This is not measured physical reclamation or a baseline token A/B.
+
+Overall **FAIL**: available memory after the calls was4.839/5.016GB (below
+5.3GB); swap-out grew16.138MB after the first and24.625MB cumulatively (above
+16MB), with unchanged swap usage. Maximum reported true Metal peak2.255GB,
+root free minimum18.957GB. Parent exit1, no timeout/source drift, all processes
+ended; parent wall700.4091s. Source`2979a6f`, artifact
+`logs/qwen_flash_idle_release_workspace_stream512_20260905.json` and its
+`.done.json` envelope. Output SHA256`0d9db4d2...f60e6` is stable decoded content,
+not raw token-ID equivalence. No promotion or sub-90s/full-capture claim.
+
+Instrumentation follow-up: the replay fixture now fingerprints actual wire
+bytes and lists changed top-level fields separately from the original capture
+identity. A requested peak gate rejects absent/invalid/zero telemetry instead
+of treating it as zero. **81 pure tests passed in2.49s** (26 replay fixture,
+42 cleanup, 13 profiles), including mocked full-run pass/fail integration.
+These changes do not alter request construction or model execution. An offline
+reconstruction using the recorded command and both old/new fixture sources
+produced identical two-request bytes:5,543bytes, SHA256`e5e51779...9bf34b`.
+That digest is reconstructed, not an in-flight measurement of the prior run.
+
+Next: same two completed-call requests and frozen gates against the parent
+exact-fused profile with idle cleanup disabled, in a fresh server. Planned
+artifact `logs/qwen_flash_idle_baseline_workspace_stream512_20260905.json`.
+Compare output and real wire hashes, timing, read counts and pressure; do not
+claim precise physical reclamation from the immediate client pressure sample.
+Inspect live jobs first and make no source edits during the control run.
+
 ## 2026-09-05: opt-in Qwen idle endpoint disposal passes ownership regressions
 
 The uncached Qwen MTP serving wrapper can now release otherwise unreusable
