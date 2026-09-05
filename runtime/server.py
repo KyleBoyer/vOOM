@@ -1251,6 +1251,7 @@ class EngineManager:
                 ("VMODEL_QWEN4_FP8_DIRECT_QMV_DECODE_ONLY", "0"),
                 ("VMODEL_QWEN4_EXPERT_BATCH_PREFETCH_PREFILL_ONLY", "0"),
                 ("VMODEL_QWEN4_NATIVE_FUSED_DELTA_PREFILL", "0"),
+                ("VMODEL_QWEN4_HOT_KV_TILE_ALIGNED", "0"),
             )
         )
         dspark_request_identity = tuple(
@@ -3590,6 +3591,10 @@ class EngineManager:
                 if qwen4_request_identity[35] not in ("0", "1"):
                     raise RequestValidationError(
                         "VMODEL_QWEN4_NATIVE_FUSED_DELTA_PREFILL must be 0 or 1")
+                if qwen4_request_identity[36] not in ("0", "1"):
+                    raise RequestValidationError(
+                        "VMODEL_QWEN4_HOT_KV_TILE_ALIGNED must be 0 or 1")
+                rc.qwen4_hot_kv_tile_aligned = qwen4_request_identity[36] == "1"
                 if qwen4_request_identity[23] not in ("0", "1"):
                     raise RequestValidationError(
                         "VMODEL_QWEN4_PHASE_LM_HEAD must be 0 or 1")
@@ -10363,6 +10368,12 @@ def _vision_protocol_timing(result: dict) -> dict:
         "kimi_k3_prefill_tile_width",
         "kimi_k3_dense_mlp_tile_size",
         "kimi_k3_prefill_long_context_tokens",
+        "qwen4_hot_boundary_requested",
+        "qwen4_hot_boundary_effective",
+        "qwen4_hot_boundary_tile",
+        "qwen4_hot_boundary_eligible",
+        "qwen4_hot_boundary_policy_eligible",
+        "qwen4_hot_boundary_reason",
         "qwen4_host_spool_h2d_bytes",
         "qwen4_host_spool_d2h_bytes",
         "qwen4_host_spool_peak_host_bytes",

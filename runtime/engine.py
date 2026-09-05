@@ -919,6 +919,9 @@ class RuntimeConfig:
     # only the union of positions routed to that batch. Every individual
     # expert still receives the same rows, order, shape, and accumulation.
     qwen4_sparse_expert_batch_rows: bool = False
+    # Experimental retained recurrent prefix rounded down to a complete
+    # original prefill tile. Off until real endpoint/token/pressure gates pass.
+    qwen4_hot_kv_tile_aligned: bool = False
     # Evaluate this many already-independent routed tile accumulators in one
     # mx.eval call. Each expert GEMM retains its original per-tile shape and
     # every tile retains ascending expert accumulation; only the host/device
@@ -1564,6 +1567,7 @@ class RuntimeConfig:
         return cls(
             max_weight_cache_mb=mem.get("max_weight_cache_mb", 6000),
             mlx_cache_limit_mb=mem.get("mlx_cache_limit_mb", 1024),
+            qwen4_hot_kv_tile_aligned=run.get("qwen4_hot_kv_tile_aligned", False),
             execution_profile=run.get("execution_profile", ""),
             native_ct_mxfp4=run.get("native_ct_mxfp4", False),
             kimi_k3_scale_sidecar_dir=run.get(
@@ -1881,6 +1885,9 @@ class _HotPromptSlot:
     # ordinary source remains ``memory``; this provenance bit lets production
     # telemetry prove that the first post-restart hit really crossed disk.
     persisted_preload: bool = False
+    # RAM-only provenance for complete forks under the Qwen4 alignment policy.
+    # Old, interrupted and raw endpoint slots deliberately have no marker.
+    qwen4_retention_tile: int = 0
 
 
 # Trunk weights MLX's fused MXFP8 kernel can read directly, so the dequant
@@ -11615,6 +11622,24 @@ class StreamingEngine:
             and not bool(getattr(prompt, "disable_hot_prompt_kv", False)))
         stable_boundary_positions = int(
             getattr(prompt, "stable_boundary_tokens", 0) or 0)
+        aligned_qwen4_retention = bool(
+            self.cfg.model_type == "qwen4_exp"
+            and getattr(self.rc, "qwen4_hot_kv_tile_aligned", False))
+        if aligned_qwen4_retention:
+            from .qwen4_hot_boundary import (
+                plan_tile_retention, slot_matches_tile_retention)
+
+            boundary_plan = plan_tile_retention(
+                self.rc, requested_boundary=stable_boundary_positions,
+                prompt_tokens=len(tokens), force_paged=force_adaptive_paged)
+            # Do not merely clear the hint: that would allow the historical
+            # raw endpoint-slot path on sub-tile/unsupported requests.
+            hot_eligible = hot_eligible and boundary_plan["eligible"]
+            stable_boundary_positions = boundary_plan["effective"]
+            for key, value in boundary_plan.items():
+                path_stats[f"qwen4_hot_boundary_{key}"] = value
+            path_stats["qwen4_hot_boundary_policy_eligible"] = boundary_plan["eligible"]
+            path_stats["qwen4_hot_boundary_eligible"] = bool(hot_eligible)
         resident_prompt_kv_bytes = self._project_dense_text_kv_bytes(
             len(tokens),
             stable_boundary_positions=(stable_boundary_positions or None))
@@ -11766,6 +11791,11 @@ class StreamingEngine:
             # needed only to derive the correct disk-persistence parent chain below
 
             for idx, slot in enumerate(self._hot_prompt_slots):
+                if (aligned_qwen4_retention
+                        and not slot_matches_tile_retention(
+                            slot, effective_boundary=stable_boundary_positions,
+                            tile=boundary_plan["tile"])):
+                    continue
                 if (
                     self.cfg.model_type == "kimi_k3"
                     and not kimi_k3_prefill_schedule_compatible(
@@ -12434,8 +12464,7 @@ class StreamingEngine:
             if (recurrent_exact_only and hot_eligible
                     and (type(kv) in (KVCache, SteppedKVCache)
                          or self.rc.paged_kv_persist)):
-                stable_boundary = int(
-                    getattr(prompt, "stable_boundary_tokens", 0) or 0)
+                stable_boundary = stable_boundary_positions
                 matched_boundary_fork = _fork_matched_hybrid_stable_boundary(
                     kv,
                     matched_tokens=pos,
@@ -14654,6 +14683,12 @@ class StreamingEngine:
                 tool_capsules=(),
                 segment_chain=tuple(boundary_segment_chain),
                 cache_namespace=cache_namespace,
+                qwen4_retention_tile=(
+                    self.rc.prefill_chunk_size
+                    if (getattr(getattr(self, "cfg", None), "model_type", "")
+                        == "qwen4_exp"
+                        and getattr(self.rc, "qwen4_hot_kv_tile_aligned", False))
+                    else 0),
             )
         return _HotPromptSlot(
             tokens=full_tokens,

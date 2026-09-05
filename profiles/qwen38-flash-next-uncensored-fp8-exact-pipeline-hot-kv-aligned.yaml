@@ -1,0 +1,11 @@
+schema: voom.runtime-profile.v1
+name: qwen38-flash-next-uncensored-fp8-exact-pipeline-hot-kv-aligned
+description: Experimental complete-tile prefix retention; equivalence unproven.
+notes:
+  - "Rounds the scaffold-free prefix down to an original fixed prefill tile, using token counts only. Does not change prompt IDs, tools, target weights or sampling. At the1611-token diagnostic this retains1024 and recomputes587, instead of splitting the final tile into582+5."
+  - "No complete admissible stable tile or an unsupported execution/persistence mode disables hot eligibility for that request, avoiding raw endpoint fallback. Engine identity includes the policy; persistence is disabled."
+  - "Default-off. Must pass actual endpoint/hidden-state, completed raw-token, varied-request and pressure gates before any lossless or serving-speed claim."
+extends:
+  - qwen38-flash-next-uncensored-fp8-exact-pipeline-hot-kv
+settings:
+  VMODEL_QWEN4_HOT_KV_TILE_ALIGNED: true

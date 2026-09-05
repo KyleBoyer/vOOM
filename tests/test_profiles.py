@@ -59,6 +59,16 @@ def test_qwen_exact_pipeline_hot_kv_preserves_unrelated_kernel_and_cache_setting
     assert "VMODEL_QWEN4_RELEASE_IDLE_REQUEST_STATE" not in settings
 
 
+def test_qwen_aligned_hot_kv_changes_only_explicit_boundary_policy():
+    catalog = discover_runtime_profiles((ROOT / "profiles",))
+    base = "qwen38-flash-next-uncensored-fp8-exact-pipeline-hot-kv"
+    overlay = base + "-aligned"
+    base_order, base_settings = resolve_runtime_profiles((base,), catalog)
+    order, settings = resolve_runtime_profiles((overlay,), catalog)
+    assert order == (*base_order, overlay)
+    assert settings == {**base_settings, "VMODEL_QWEN4_HOT_KV_TILE_ALIGNED": "1"}
+
+
 @pytest.mark.parametrize("base", [
     "qwen38-flash-next-uncensored-fp8-fast-tier-mtp-direct-fp8-qmv-prefill-pipeline-exact-fused-delta",
     "qwen38-flash-next-uncensored-fp8-exact-pipeline-hot-kv",

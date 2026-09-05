@@ -1,5 +1,84 @@
 # STATUS — 2026-09-05 (current corrections first; dated chronology below is history)
 
+## 2026-09-05: complete-tile hot-prefix candidate ready for first endpoint oracle
+
+Explicit profile`qwen38-flash-next-uncensored-fp8-exact-pipeline-hot-kv-aligned`
+adds only`VMODEL_QWEN4_HOT_KV_TILE_ALIGNED=1` to the experimental hot parent.
+The core engine rounds a valid stable hint down to a fixed complete tile,
+records requested/effective boundaries and policy/actual eligibility separately,
+and disables hot lookup AND slot retention when no admissible complete tile
+exists or the schedule is unsupported. No prompt, schema, token ID, target
+weight or sampling operator is edited. The default and other-model paths are
+unchanged; the manager's engine identity includes the flag.
+
+Retention remains a separate immutable hybrid-state fork. A RAM-only tile
+marker prevents old/raw/interrupted/other-tile slots from matching. Even a
+byte-identical longer cached prefix is rejected when it exceeds the current
+stable boundary, avoiding a subsequent raw-endpoint fallback. Persistence,
+adaptive/paged/checkpoint schedules, final-token separation and global/sparse
+expert-row modes are initially excluded. This preserves proposed tile geometry,
+**not an assertion of floating-point state equivalence**.
+
+Independent read-only review found no launch blocker. **594 tests passed
+in4.48s**, including actual call-site eligibility, AST-executed boundary/raw
+slot constructors, MTP bootstrap, profile identity, observer, witness, replay,
+cleanup and server/controller regression. Final supervised unit envelope
+`logs/gates/qwen4_aligned_boundary_final_suite_20260905.done.json` PASS/exit0,
+no source drift/timeout, after a fresh passing30-second preflight. No model
+test has run on the aligned candidate yet.
+
+Next: fresh-preflight cold max1 observer with the same5,541-byte modified
+workspace request, plus generation-witness. Require actual boundary1024,
+prepared1611 IDs,121 state arrays/position1611, matching checkpoint identity,
+and independent aggregate/component/hidden hashes from the no-hot artifact.
+Planned artifact`logs/qwen4_boundary_aligned_first_20260905.json`, separate
+HTTP artifact and supervised envelope. This is a prefill-only diagnostic;
+matching it would still require repeated/extended cache-state and sufficient-
+output raw-token/pressure gates before any lossless serving claim.
+
+## 2026-09-05: endpoint witness locates hot-KV divergence in prefill, before MTP
+
+Both first-token observers completed on source`53b6e8f`, with the same modified
+two-real-workspace-tool / short-system-history / developer / streaming-progress /
+greedy-seed64001 request, **max1**. Both actually prepared1,611 identical token
+IDs (SHA256`13415b07...9f956`) from identical5,541-byte wire requests
+(`533f9f45...89900`) and used installed revision`2d9a479f...c518`. Neither
+request executed a tool or supplied completed-answer/quality/full-harness proof.
+
+Both emitted the same first token and raw engine text, but the BF16 hidden row
+and **all four KV/KDA/QSA/PLE component hashes differ** at the identical
+1,611-position endpoint:121 arrays,160,260,624 bytes. Aggregate no-hot state
+`ef35e7f3...7ac77` versus hot`b03e2073...67604`; hidden`0c79bfd3...97d65`
+versus`06404a90...afdf8`. The observer and serving generation-witness agree on
+actual prompt/emitted-ID and raw-text hashes. **One matching first token is
+not a state-equivalence proof.** Both use the max1 single-token fallback, so
+the divergence already exists before speculative verification/decoding and
+protocol parsing. This narrows the prior70-versus74-token failure to prefill
+state construction; it does not yet identify the first divergent operator.
+
+No-hot uses the original1024+587 tile schedule; hot retains boundary1606 and
+performs1024+582 plus a separate5-position sweep. Native fused Delta is on,
+compiled Delta/global-expert-rows/sparse-expert-batch-rows are off in both.
+Observed prefill116.9699/126.6246s, store reads118.877/132.332GB; endpoint
+hashing separately adds0.1678/0.1233s and reads160.261MB of state plus20,480
+hidden bytes. **These are instrumented correctness diagnostics, not serving
+timing or pressure improvements.** Hashing changed no-hot available memory
+from4.382GB just after generation to5.791GB after host reads, illustrating why
+its HTTP pressure PASS is not an uninstrumented serving-pressure proof.
+
+No-hot parent PASS/exit0/134.2637s; hot parent FAIL/exit1/143.3648s for final
+available4.336GB<5.3GB. Hot swap-out grew13.992MB and swap usage0.393MB;
+no-hot swap-out6.373MB, zero usage growth. Generation peaks2.025/2.218GB.
+Both fresh30-second preflights passed; no timeout or source drift; all model
+processes ended. Private endpoints`logs/qwen4_boundary_{nohot,hot}_first_20260905.json`,
+separate`..._first_http_...` artifacts, and matching supervised gate envelopes.
+
+Next candidate is content-blind tile-aligned retention,1024 here, recomputing
+the original587-row tail. Preserve original operator shapes and cache-owner
+isolation, disable caching when no complete stable tile exists, and keep this
+strictly opt-in until raw endpoint/hidden, completed-output and pressure gates
+pass. No current hot profile is promoted as lossless.
+
 ## 2026-09-05: first-token boundary endpoint observer ready for paired diagnosis
 
 `tests/fixtures/qwen4_hot_boundary_http_probe.py` runs the ordinary server
