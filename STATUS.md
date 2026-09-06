@@ -1,5 +1,53 @@
 # STATUS — 2026-09-06 (current corrections first; dated chronology below is history)
 
+## 2026-09-06 UTC: full40K state control captured; wire-pin ordering audited, pressure still FAIL
+
+The sourcefe489d2 unfused aligned-compact control has ended. All131 original
+tools/messages/streaming retained; diagnostic overrides are model/max1/temp0/
+seed64012, NOT an untouched or completed-answer benchmark. Full40,432 and retained
+39,936 positions each expose121 hashed arrays, complete position metadata and
+BF16 final hidden bits. No fused capture, mutation diagnostic or prefill retry.
+This establishes a comparison control, not equality with a candidate yet.
+
+Diagnostic HTTP767.1545s, prefill750.0486s, decode0, engine750.0514s;
+220,963,782,680 store-accounted bytes, not physical disk traffic. HTTP200/incomplete,
+one emitted token, length termination, streaming/final equality. True peak
+5,676,593,800B; ordinary compactor copies37 histories/2,396,160B in0.038198s,
+scratch4,792,320B. Retained admission1,221,709,824 +12,582,912B QSA allowance.
+Read-only host hashing adds1.984806s and reads1,235,447,040B full state,
+1,221,709,824B retained state and20,480B hidden. Generation-end available3.393GB
+versus post-hash5.923GB /HTTP-end5.909GB: this instrumented endpoint cannot prove
+normal serving pressure. Active Metal stays2,847,621,160B across hashing.
+HTTP swap-outs64,372,736B fail16MB; swap-used remains1,507,590,144B. Do not waive.
+
+The original combined control also correctly failed its incorrectly planned wire
+hash. Cause independently reproduced on CPU: the plan inserted the NEW max-output
+key before seed; the CLI inserts seed before max-output. Parsed requests are
+exactly equal, including all tools/history. Actual148306B wire SHA is
+5b45b707c3413d31ddb7e54a88bf09902aa552818f7c1c7cff29175c165d03ec,
+not the earlier858abfc2... pin. A separate supervised provenance audit passes,
+verifies all711 source hashes and all artifacts, and makes the captured state
+usable for comparison. Original failed artifacts are NOT rewritten or relabeled
+PASS; the pressure failure remains. Future arms must pin the actual CLI ordering.
+
+Full-state SHAbd838d25...c47528; retained5b4744ec...8d8583;
+hidden78c3fe12...9fff0d; first-IDa9cf0c5b...d755554. Parent exit1/770.2130s,
+14:54:04.733151->15:06:54.946153UTC; no timeout/signal/missing result/drift.
+Child result SHAf7e3e0938e46d67b1bd9510c27ea9e5feb8a9ae42974e88185bef5689e882fee;
+parent log385ef445e2a984158004f6b28fe21ccf7ecee4c4ec6802bd79c5cc40e6d44fd9.
+Root/external minima16.708/98.390GB; max child-tree RSS4.706GB; all job PIDs gone.
+CPU wire audit exit0/2.4180s, result SHA
+cbe0a08518c42160534282adef11b78a0d0ada0dccb00bb2f2d3e1ab9c9c3958.
+Private logs/qwen4_full131_unfused_state_control*_20260906.json and gate files.
+
+Next ONE model job: identical diagnostic wire/instrumentation with explicit fused
+profile; only VMODEL_QWEN4_FUSED_ALIGNED_PREFIX=1 differs. Check cold capture48
+layers/37 copied histories, complete full/prefix state and metadata, BF16 hidden,
+first raw ID/text and profile identity against this audited unfused control.
+Require fresh30s preflight; preserve all pressure failures. No serving-speed or
+completed-output claim from either max1 arm. Full131 max1024 cold/repeat/recorded
+continuation and varied-domain/Plex acceptance remain separate subsequent gates.
+
 ## 2026-09-06 UTC: full40K fused-prefill proof starts with an unfused state control
 
 Next supervised job `qwen4_full131_unfused_state_control_20260906` captures the
