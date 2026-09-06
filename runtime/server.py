@@ -7717,6 +7717,21 @@ def _attach_generation_witness(prompt, result: dict) -> None:
             "schema": schema, "available": False,
             "error_type": type(error).__name__,
         }
+    # Separate from the stable ID/text equivalence witness. These optional
+    # observations diagnose repeated calls without persisting raw output or
+    # changing the existing witness hashes, parsing, sampling or generated IDs.
+    try:
+        observation_started = time.perf_counter()
+        from .tool_call_witness import hermes_text_witness
+
+        result["tool_call_text_witness"] = hermes_text_witness(result.get("text"))
+        result["tool_call_text_witness"]["observation_seconds"] = (
+            time.perf_counter() - observation_started)
+    except Exception as error:
+        result["tool_call_text_witness"] = {
+            "schema": "voom.hermes-text-witness.v1", "available": False,
+            "error_type": type(error).__name__,
+        }
 
 
 def _engine_generate(engine, *args, expert_top_k: int = 0, **kwargs):
@@ -10677,6 +10692,7 @@ def _vision_protocol_timing(result: dict) -> dict:
     # instead of silently dropping the evidence at the protocol boundary.
     for key in (
         "generation_witness",
+        "tool_call_text_witness",
         "qwen_mtp_accepted_by_step",
         "qwen_mtp_verified_by_step",
         "qwen_mtp_entropy_stop_events_by_step",

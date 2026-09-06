@@ -5,6 +5,7 @@ import copy
 import hashlib
 import json
 import os
+import time
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -20,7 +21,8 @@ def api(monkeypatch):
     nodes = [node for node in tree.body
              if isinstance(node, ast.FunctionDef) and node.name in names]
     assert len(nodes) == len(names)
-    namespace = {"os": os, "hashlib": hashlib, "json": json,
+    namespace = {"os": os, "hashlib": hashlib, "json": json, "time": time,
+                 "__package__": "runtime",
                  "_request_expert_trace_target": lambda engine: None,
                  "_persist_request_expert_trace": lambda *args: None}
     exec(compile(ast.Module(body=nodes, type_ignores=[]), str(source), "exec"), namespace)
@@ -46,6 +48,8 @@ def test_witness_hashes_real_ids_and_preserves_result(api, monkeypatch):
     before = copy.deepcopy(result)
     api._attach_generation_witness(prompt, result)
     witness = result.pop("generation_witness")
+    raw_calls = result.pop("tool_call_text_witness")
+    assert raw_calls["available"] is True and raw_calls["framed_call_objects"] == 0
     assert result == before
     assert witness["available"] is True
     assert witness["generated_token_count"] == 2
@@ -105,6 +109,7 @@ def test_real_generation_hook_and_protocol_projection_preserve_output(api, monke
     assert events == ["generated"]
     timing = api._vision_protocol_timing(result)
     assert ("generation_witness" in timing) is enabled
+    assert ("tool_call_text_witness" in timing) is enabled
     if enabled:
         assert timing["generation_witness"] == result["generation_witness"]
         assert timing["generation_witness"]["generated_token_count"] == 2
@@ -116,6 +121,37 @@ def test_empty_generation_is_distinct_from_missing_generation(api, monkeypatch):
     api._attach_generation_witness(SimpleNamespace(token_ids=()), result)
     assert result["generation_witness"]["available"] is True
     assert result["generation_witness"]["generated_token_count"] == 0
+
+
+def test_raw_tool_observer_projects_before_protocol_without_changing_ids_or_text(api, monkeypatch):
+    monkeypatch.setenv("VMODEL_GENERATION_WITNESS", "1")
+    text = '<tool_call>{"name":"private_tool","arguments":{"q":"PRIVATE"}}</tool_call>'
+    result = {"tokens": [10, 11], "text": text + text}
+    api._attach_generation_witness(SimpleNamespace(token_ids=[1]), result)
+    timing = api._vision_protocol_timing(result)
+    raw = timing["tool_call_text_witness"]
+    assert raw["framed_call_objects"] == 2 and raw["canonical_duplicate_count"] == 1
+    assert raw["observation_seconds"] >= 0
+    assert raw["raw_text_sha256"] == timing["generation_witness"]["engine_text_sha256"]
+    assert result["tokens"] == [10, 11] and result["text"] == text + text
+    assert "PRIVATE" not in json.dumps(raw) and "private_tool" not in json.dumps(raw)
+
+
+def test_raw_tool_observer_failure_cannot_invalidate_original_generation_witness(api, monkeypatch):
+    import runtime.tool_call_witness as observer
+    monkeypatch.setenv("VMODEL_GENERATION_WITNESS", "1")
+
+    def fail(text):
+        raise RuntimeError("private diagnostic failure")
+
+    monkeypatch.setattr(observer, "hermes_text_witness", fail)
+    result = {"tokens": [7], "text": "answer"}
+    api._attach_generation_witness(SimpleNamespace(token_ids=[1]), result)
+    assert result["generation_witness"]["available"] is True
+    assert result["tool_call_text_witness"] == {
+        "schema": "voom.hermes-text-witness.v1", "available": False,
+        "error_type": "RuntimeError"}
+    assert result["tokens"] == [7] and result["text"] == "answer"
 
 
 @pytest.mark.parametrize("source", ["path_stats", "top_level"])
