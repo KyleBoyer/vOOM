@@ -1,5 +1,66 @@
 # STATUS — 2026-09-05 (current corrections first; dated chronology below is history)
 
+## 2026-09-06 UTC: PLE detachment recovers 20 MiB, not the large retained-memory gap
+
+The new post-generation experiment completed on source `d5bff9d`. On the
+**modified two-real-workspace-tool / short-system-history / developer /
+stream-progress / greedy-seed64001 / max1** request, synchronizing the retained
+PLE history released **0 active Metal bytes**. Copying its one BF16
+`[1, 9, 10240]` history (184,320 bytes) into independent same-bit storage
+released **20,971,520 active bytes (20 MiB)**: 1,552,511,544 -> 1,531,540,024.
+This matches the excess padded backing size, not a large unevaluated-graph
+release. Synchronization alone did not support that hypothesis on this run;
+the much larger active-memory difference remains unexplained. Do not keep
+repeating this same PLE experiment or present it as the main memory fix.
+
+Both the 1,024-token retained fork (121 arrays / 144,003,072 logical bytes)
+and authoritative 1,611-token endpoint (121 arrays / 160,260,624 bytes) have
+identical before/after state and supplemental metadata hashes. The endpoint,
+BF16 hidden bits, actual first generated ID, raw text and prepared IDs also
+match the independent no-hot control. This is not an independent 1,024-token
+fork oracle, continued-cache proof, completed answer or Plex score.
+
+Stage costs: retained synchronization 0.000066s, before hashes 0.242130s,
+PLE copy 0.000110s, allocator clear 0.001056s, verification hashes 0.191033s.
+Detachment moved about 21.168MB into the allocator cache; the separately
+measured clear returned that cache counter to zero. Neither changed the
+immediate sampled system-available memory (3.916GB). Available memory rose
+to 5.444GB only at the later verification-hash sample; do not attribute that
+1.528GB change to the 20 MiB detach. The diagnostic reads 608,527,392 state
+bytes plus the 184,320-byte copy; ordinary endpoint/hidden hashing adds
+160,281,104 bytes. Total post-generation observation cost was 0.534650s.
+
+The instrumented HTTP gate and supervised envelope both PASS, with HTTP200 /
+expected `response.incomplete`, voom backend, unchanged profile digest
+`cd5ef35a...85337`, no overrides, 1,611 uncached input / 1 output token and
+the same 5,541-byte wire SHA `533f9f45...89900`. HTTP wall **218.6899s**, first
+token 203.9847s, engine prefill 203.9843s / decode 0s / total 204.0225s;
+219,916,717,280 store bytes, all prefill. No speed gain is established.
+
+The frozen endpoint checks passed at final available 5.442GB and swap-out
+growth 14.696MB (zero used-swap growth), generation peak 2.825GB and zero
+memory retries. This **does not establish a serving-pressure pass**: available
+was only 3.914GB immediately after generation, and the post-generation hashes
+and allocator manipulation alter the observation. Allocator peak remained
+3.012GB. The earlier pressure FAIL receipts remain failures.
+
+Parent PASS / exit0 / 221.3142s, 00:46:37.202272 -> 00:50:18.516437 UTC;
+no timeout, signal, spawn failure or source drift, all processes ended.
+Fresh 30-second preflight passed at 6.411/6.426GB, zero swap growth/churn.
+Root/external minimum free 18.973/99.137GB; child-tree RSS maximum 4.489GB.
+Private artifacts `logs/qwen4_retained_ple_memory_first_20260906.json`,
+`logs/qwen4_retained_ple_memory_first_http_20260906.json` and matching gate
+envelope. The diagnostic and its 628 passing regression tests are pushed;
+no production model/profile/default changed.
+
+Next substantive lever remains capturing the aligned prefix per layer inside
+the existing full host-spool sweep, avoiding the measured extra 101.040GB
+cold reads. First budget the additional retained payload and require complete
+per-layer ownership/metadata coverage; preserve original tile geometry,
+expert unions, GEMM shapes/order and full endpoint. Then independently verify
+the retained endpoint, repeat/extension and sufficient-output raw-token
+equivalence before any serving speed claim or default promotion.
+
 ## 2026-09-06 UTC: retained-PLE materialization diagnostic ready, no serving change
 
 New optional`--diagnose-retained-prefix 1024` on the dedicated max1 HTTP
