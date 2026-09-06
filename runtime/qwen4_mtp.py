@@ -19,6 +19,7 @@ from __future__ import annotations
 from dataclasses import replace
 import json
 import math
+import os
 import time
 from typing import Sequence
 
@@ -463,6 +464,17 @@ class Qwen4MTPSpeculativeEngine:
     def close(self) -> None:
         self.target.close()
 
+    def _idle_phase_head_memory_sample(self) -> dict:
+        """Best-effort observation; failure must not interfere with release."""
+        started = time.perf_counter()
+        try:
+            from .phase_head_witness import sample_phase_head_memory
+            observation = sample_phase_head_memory(self.target, mx)
+        except Exception:
+            observation = {"available": False, "reason": "observation-error"}
+        observation["observation_seconds"] = time.perf_counter() - started
+        return observation
+
     def _release_idle_phase_head(self, result: dict) -> None:
         """Drop the exact head after response state/logits are committed.
 
@@ -472,10 +484,50 @@ class Qwen4MTPSpeculativeEngine:
         the projection point.
         """
         release = getattr(self.target, "_suspend_qwen4_phase_lm_head", None)
+        observe = os.environ.get("VMODEL_GENERATION_WITNESS") == "1"
+        before = after = release_started = release_seconds = None
+        if observe:
+            try:
+                before = self._idle_phase_head_memory_sample()
+            except Exception:
+                pass  # null sample means unavailable, never zero memory
+            try:
+                release_started = time.perf_counter()
+            except Exception:
+                pass
+        # Never catch or replace the existing release operation's exception.
         released = int(release() or 0) if callable(release) else 0
+        if observe:
+            try:
+                if release_started is not None:
+                    release_seconds = time.perf_counter() - release_started
+            except Exception:
+                pass
+            try:
+                after = self._idle_phase_head_memory_sample()
+            except Exception:
+                pass
         stats = result.setdefault("path_stats", {})
         stats["qwen4_mtp_idle_head_release_calls"] = int(callable(release))
         stats["qwen4_mtp_idle_head_release_bytes"] = released
+        if observe:
+            # These samples are inside the generation return frame, while
+            # other locals may still own tensors. They are NOT post-serving
+            # idle memory, atomic samples, or proof of physical reclamation.
+            try:
+                stats["qwen4_mtp_idle_head_memory_witness"] = {
+                    "schema": "voom.phase-head-memory-witness.v1",
+                    "scope": "inside_generation_around_idle_head_release",
+                    "atomic": False,
+                    "synchronizes_device": False,
+                    "release_callable": callable(release),
+                    "released_logical_bytes": released,
+                    "release_seconds": release_seconds,
+                    "before": before,
+                    "after": after,
+                }
+            except Exception:
+                pass  # optional annotation cannot fail a completed generation
 
     def _fallback(
         self, reason, prompt, max_tokens, on_token, stop, on_progress,

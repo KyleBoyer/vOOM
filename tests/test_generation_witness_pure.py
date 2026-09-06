@@ -155,6 +155,26 @@ def test_raw_tool_observer_failure_cannot_invalidate_original_generation_witness
 
 
 @pytest.mark.parametrize("source", ["path_stats", "top_level"])
+def test_phase_head_memory_protocol_preserves_nested_unavailable_and_zero(api, source):
+    key = "qwen4_mtp_idle_head_memory_witness"
+    observation = {
+        "schema": "voom.phase-head-memory-witness.v1",
+        "atomic": False, "release_callable": True,
+        "before": {"available": False, "weight_cache_pinned_bytes": None},
+        "after": {"available": True, "weight_cache_pinned_bytes": 0,
+                  "observation_seconds": 0.001},
+    }
+    fields = {key: observation}
+    result = {"path_stats": fields} if source == "path_stats" else fields
+    original = copy.deepcopy(result)
+    timing = api._vision_protocol_timing(result)
+    assert timing[key] == observation
+    assert result == original
+    assert key not in api._vision_protocol_timing({"path_stats": {}})
+    json.dumps(timing[key], allow_nan=False)
+
+
+@pytest.mark.parametrize("source", ["path_stats", "top_level"])
 @pytest.mark.parametrize("reason,eligible,policy_eligible", [
     ("tile-aligned", True, True),
     ("no-admissible-complete-tile", False, False),

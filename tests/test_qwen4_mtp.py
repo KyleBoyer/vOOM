@@ -650,6 +650,34 @@ def test_speculative_controller_full_accept_emits_bonus_in_one_target_sweep(
     assert target.last_kv.offset == 5
 
 
+@pytest.mark.parametrize("path", ["normal", "single-token", "fallback"])
+def test_idle_head_memory_observer_covers_each_return_path(
+        _cache_io_noop, monkeypatch, path):
+    monkeypatch.setenv("VMODEL_GENERATION_WITNESS", "1")
+    target = _FakeTarget([11, 12, 13])
+    engine = Qwen4MTPSpeculativeEngine(
+        target, depth=2, drafter=_FakeDrafter([11, 12]))
+    result = engine.generate(
+        "prompt", max_tokens=4 if path == "normal" else 1,
+        sampling=SamplingParams(
+            temperature=0.0, repetition_penalty=1.1 if path == "fallback" else 1.0))
+    stats = result["path_stats"]
+    observation = stats["qwen4_mtp_idle_head_memory_witness"]
+    assert target.idle_head_releases == 1
+    assert observation["release_callable"] is True
+    assert observation["released_logical_bytes"] == 123
+    for sample in (observation["before"], observation["after"]):
+        # This synthetic target intentionally has no weight-cache accounting.
+        assert sample["available"] is False
+        assert sample["weight_cache_pinned_bytes"] is None
+        assert sample["metal_active_bytes"] >= 0
+    assert result["tokens"] == ([10, 11, 12, 13] if path == "normal" else [10])
+    if path == "single-token":
+        assert stats["qwen4_mtp_fallback_reason"] == "single-token-budget"
+    elif path == "fallback":
+        assert stats["qwen4_mtp_fallback_reason"] == "repetition-penalty"
+
+
 class _CounterTarget(_FakeTarget):
     """Exercise the real cumulative cache-I/O helpers without checkpoint I/O."""
 
