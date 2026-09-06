@@ -1,5 +1,61 @@
 # STATUS — 2026-09-05 (current corrections first; dated chronology below is history)
 
+## 2026-09-06 UTC: pre-suffix compaction lowers measured generation peak by 740 MiB
+
+The production opt-in `...hot-kv-aligned-compact` candidate on source `f40d04d`
+passed the first cold continuation gate. It copied all 37 retained histories
+(2,396,160 bytes) **before** suffix prefill, reserved 4,792,320 scratch bytes
+and charged the additional 156,585,984-byte retention projection. Copy time
+was 0.002530s. Immediate active memory rose 1,268,219,944 -> 1,270,775,848
+bytes because the active prefix still owned the original buffers: this is
+expected, not a missed release. After suffix continuation, active Metal was
+776,565,304 bytes both before and after the ordinary endpoint hashes; no
+post-generation compaction or allocator clear was performed by the observer.
+
+For the **modified two-real-workspace-tool / short-system-history / developer /
+stream-progress / greedy-seed64001 / max1** wire, measured generation peak
+fell **2,824,925,752 -> 2,048,979,512 bytes**, exactly **775,946,240 bytes
+(740 MiB / 27.47%)**. Observer allocator peak likewise fell 3,011,731,528 ->
+2,235,785,288 bytes. All observed121 state arrays, component hashes, BF16
+hidden bits, prepared IDs, actual first generated ID and raw text match the
+independent no-hot control at position1,611. The original1,024+587 arithmetic
+tiles and complete1,024-token retention boundary remain unchanged. This is
+now an earlier-lifetime memory improvement, not just a late diagnostic release.
+
+Instrumented HTTP wall **217.6032s** on that same modified max1 request;
+first token203.2793s, engine prefill203.2787s / decode0s / total203.3135s.
+Store reads remain219,916,717,280 bytes, all prefill. The prior ordinary
+aligned observer took218.2704s: that ~0.3% wall difference is not a credible
+speed gain. Removing the additional101.040GB split-prefix reads remains open.
+
+HTTP200 / expected `response.incomplete`, voom backend, new selected/effective
+profile digest `132737257ee9bc878b1b00f78d61e8915cdb829a2a39cb725b7f74c3d26505d4`,
+no overrides,1,611 uncached input / one output token, same5,541-byte wire
+SHA `533f9f45...89900`, and zero memory retries all pass. Frozen HTTP endpoint
+pressure checks pass at5.869GB available,11.682MB swap-out growth and no
+used-swap growth. Available memory was only4.468GB immediately after generation
+and5.869GB after0.124219s of endpoint hashing, so an uninterrupted serving-
+pressure pass still cannot be inferred from this observer. Earlier failures
+remain failures. No completed-output, repeated-cache/MTP, varied-domain,
+full134-tool harness, long-context or Plex quality claim is made.
+
+Parent PASS / exit0 /220.2219s,01:57:38.668750 ->02:01:18.890550 UTC;
+no timeout, signal, spawn failure or source drift, all jobs ended. Fresh
+30-second preflight passed at6.630/6.636GB with zero swap growth/churn.
+Root/external minimum free18.972/99.145GB; child-tree RSS maximum4.659GB.
+Private endpoint `logs/qwen4_compact_boundary_first_20260906.json`, separate
+`logs/qwen4_compact_boundary_first_http_20260906.json` and matching supervised
+envelope. The720-test regression suite and candidate are pushed to main;
+the optimization remains explicit opt-in, never auto-enabled.
+
+Next gate must use sufficient output, not repeat this finished max1 probe:
+fresh aligned-control versus aligned-compact HTTP runs with generation-witness,
+the same modified workspace request and max512, including cache repeat or
+extension. Compare actual completed raw token IDs/text and termination, not
+only parsed tool JSON; record memory/latency and the exact wire. Then add
+varied domains and the unmodified134-tool capture. The fused per-layer capture
+lever follows with these compact-ownership and memory-accounting guards.
+
 ## 2026-09-06 UTC: compact prefix histories integrated as an opt-in candidate
 
 New profile `qwen38-flash-next-uncensored-fp8-exact-pipeline-hot-kv-aligned-compact`
