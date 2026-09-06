@@ -1,5 +1,55 @@
 # STATUS — 2026-09-06 (current corrections first; dated chronology below is history)
 
+## 2026-09-06 UTC: Qwen4 stochastic zero-mass acceptance fixed; 236 regressions pass
+
+The next speculation audit found a correctness prerequisite, not a speed win:
+`_verify_stochastic_token` used `uniform <= min(1, p/q)`. MLX's installed RNG
+contract includes zero and excludes one. At p=0, q>0 and uniform=0, the old
+comparison accepted a target-impossible proposal, including a grammar-masked
+token. The verifier now uses strict `<`. Target/draft probability construction,
+residual sampling, RNG draw count, greedy paths, weights and profiles are unchanged.
+No new history source, wider verifier or automatic fast path has been enabled.
+
+Deterministic negative control reproduced9 failures/10 passes in0.61s before
+the one-line correction. The native and n-gram toy controllers wrongly emitted
+[10,11,5,13] instead of [10,11,255]; both streamed/nonstreamed grammar cases
+also caught forbidden-token acceptance. After correction, all86 Qwen4 MTP tests
+pass0.26s (seed64006), including19 new tests. These cover actual MLX masked,
+underflow, top-k and top-p zero probabilities; ratio0.5 equality/adjacent FP32
+draws; ratio1 with p=q and p>q; residual distributions; and native/n-gram
+rejection, terminal/streaming behavior and exact controller rollback bookkeeping.
+The controller KV/KDA/QSA/PLE objects are fakes: this is NOT full-model tensor
+identity, physical ownership, pressure, latency or Plex-quality proof. No archived
+full-model failure is attributed to this rare boundary without a recorded witness.
+
+Then236 related regressions pass1.28s (seed64007), covering sampler, speculation,
+Qwen4 hybrid persistence, head lifetime, components, retained/prefix histories
+and profiles. This is nine test files, not the entire repository suite. Three
+fresh30s preflights pass sequentially, each with zero swap-used/swap-out growth;
+no production weights read. Parent exits1/0/0, wall2.4309/2.3520/3.4037s, no
+timeout/signal/source drift; all707 final source hashes match before receipt
+editing. All parent log hashes independently verified. Final parent12:25:07.350042
+->12:25:10.753711UTC; log SHA
+7a049e8de4220334c19fbb59dfac95b10c553922ab10b9e13ca951218a945953.
+Private logs/gates/qwen4_uniform_boundary_{negative,fixed,related}_20260906.*
+and matching memory_preflight_qwen4_uniform_* reports. All jobs have ended.
+
+Next-lever audit: existing prompt n-gram-first already lost on an older BF16
+max16 diagnostic (one seven-token n-gram proposal accepted0/7 and added a sweep).
+Do not repeat that unchanged. A completed-output-only, bounded, namespace-isolated
+proposal source may reuse the existing target verifier, but is still unimplemented.
+Match only emitted suffixes against separate prior completed outputs, never tool
+schemas or across output boundaries; retain single-tenant timing/privacy warnings.
+Before wider trials, gate mixed N->M / M->N->M transitions and all rejection/stop
+positions: N rounds do not advance native drafter KV, so subsequent proposal
+history is not proven equivalent to native MTP catch-up. Width7 instead of3 may
+retain about463MB extra recurrent endpoints; increased acceptance must outweigh
+larger sweeps and pressure, not merely save the existing5-7s drafting time.
+Other literal boundary copies in qwen35_mtp.py and dspark.py are separate queued
+fixes. Both GLM5.3 native-MTP paths currently use greedy verification and fall
+back on stochastic requests; do not falsely attribute this bug/fix to GLM.
+Completed Plex, full-model A/B, long output/context and sub90s remain open.
+
 ## 2026-09-06 UTC: full131-tool cold/repeat/actual-continuation all complete; pressure still FAIL
 
 The source1918fff three-request sequence has FINISHED. Runtime is the tested

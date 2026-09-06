@@ -343,7 +343,9 @@ def _verify_stochastic_token(
     p_token = float(target_probabilities[int(proposal)].item())
     q_token = float(draft_probabilities[int(proposal)].item())
     ratio = 1.0 if q_token <= 0.0 else min(1.0, p_token / q_token)
-    if float(mx.random.uniform().item()) <= ratio:
+    # Uniform draws include zero: [0, ratio) must be empty when p(token)=0,
+    # including proposals excluded by a grammar mask or sampling filter.
+    if float(mx.random.uniform().item()) < ratio:
         return (
             True, int(proposal), target_probabilities, float(overlap.item()))
     replacement = sample_probabilities(

@@ -1175,6 +1175,156 @@ def test_stochastic_verifier_uses_positive_part_rejection_correction():
     assert overlap == pytest.approx(0.0)
 
 
+@pytest.mark.parametrize(
+    "logits, sampling",
+    [
+        ([-float("inf"), 0.0, -float("inf")],
+         SamplingParams(temperature=1.0)),
+        ([-100.0, 100.0, -100.0], SamplingParams(temperature=1.0)),
+        ([0.0, 2.0, 1.0], SamplingParams(temperature=1.0, top_k=2)),
+        ([0.0, 2.0, 1.0], SamplingParams(temperature=1.0, top_p=0.1)),
+    ],
+    ids=("masked", "underflow", "top-k", "top-p"),
+)
+def test_stochastic_verifier_rejects_zero_target_mass_at_zero_uniform(
+        monkeypatch, logits, sampling):
+    # A deterministic history proposal can be excluded by the target's grammar
+    # mask or sampling filters. Even the RNG's lower endpoint must reject it.
+    from runtime import qwen4_mtp
+
+    residuals = []
+    original_sample = qwen4_mtp.sample_probabilities
+
+    def sample_residual(probabilities):
+        residuals.append(probabilities.tolist())
+        return original_sample(probabilities)
+
+    monkeypatch.setattr(mx.random, "uniform", lambda: mx.array(0.0))
+    monkeypatch.setattr(qwen4_mtp, "sample_probabilities", sample_residual)
+    accepted, token, probabilities, overlap = _verify_stochastic_token(
+        0, mx.array([1.0, 0.0, 0.0]), mx.array(logits), sampling, history=[2])
+
+    assert not accepted
+    assert token in (1, 2)
+    assert probabilities[0].item() == 0.0
+    assert overlap == 0.0
+    assert len(residuals) == 1
+    assert residuals[0] == pytest.approx(probabilities.tolist())
+
+
+@pytest.mark.parametrize(
+    "uniform, expected_accept",
+    [(0.0, True), (0.49999997, True), (0.5, False),
+     (0.50000006, False), (0.99999994, False)],
+)
+def test_stochastic_verifier_acceptance_interval_is_half_open(
+        monkeypatch, uniform, expected_accept):
+    monkeypatch.setattr(mx.random, "uniform", lambda: mx.array(uniform))
+    accepted, token, probabilities, overlap = _verify_stochastic_token(
+        0, mx.array([1.0, 0.0]), mx.array([0.0, 0.0]),
+        SamplingParams(temperature=1.0), history=[])
+
+    assert accepted is expected_accept
+    assert token == (0 if expected_accept else 1)
+    assert probabilities.tolist() == [0.5, 0.5]
+    assert overlap == 0.5
+
+
+@pytest.mark.parametrize("uniform", [0.0, 0.5, 0.99999994])
+@pytest.mark.parametrize("draft, expected_overlap", [([0.5, 0.5], 1.0),
+                                                      ([0.25, 0.75], 0.75)])
+def test_stochastic_verifier_unit_ratio_accepts_entire_uniform_support(
+        monkeypatch, uniform, draft, expected_overlap):
+    from runtime import qwen4_mtp
+
+    def unexpected_residual(_probabilities):
+        pytest.fail("unit acceptance ratio must not sample a residual")
+
+    monkeypatch.setattr(mx.random, "uniform", lambda: mx.array(uniform))
+    monkeypatch.setattr(qwen4_mtp, "sample_probabilities", unexpected_residual)
+    accepted, token, probabilities, overlap = _verify_stochastic_token(
+        0, mx.array(draft), mx.array([0.0, 0.0]),
+        SamplingParams(temperature=1.0), history=[])
+
+    assert accepted
+    assert token == 0
+    assert probabilities.tolist() == [0.5, 0.5]
+    assert overlap == expected_overlap
+
+
+@pytest.mark.parametrize("ngram_first", [False, True], ids=("native", "ngram"))
+def test_stochastic_controller_zero_uniform_rejects_and_restores_target_prefix(
+        monkeypatch, _cache_io_noop, ngram_first):
+    target = _FakeTarget([11, 255, 13])
+    target.tokenizer = _FakeTokenizer((5, 10, 11, 5))
+    drafter = _FakeDrafter([11, 5])
+    engine = Qwen4MTPSpeculativeEngine(
+        target, depth=2, ngram_first=ngram_first,
+        ngram_max_draft_tokens=2, drafter=drafter)
+    monkeypatch.setattr(mx.random, "uniform", lambda: mx.array(0.0))
+
+    result = engine.generate(
+        "prompt", max_tokens=4, sampling=SamplingParams(temperature=1.0))
+
+    assert result["tokens"] == [10, 11, 255]
+    assert target.verify_calls == [(10, 11, 5)]
+    assert target.last_kv.offset == 6
+    assert target.last_kv.kda_cache.marker == "kda-2"
+    assert target.last_kv.qwen4_cache.restores == [("aux-2", 6)]
+    assert drafter.proposal_steps == (0 if ngram_first else 2)
+    stats = result["path_stats"]
+    assert stats["qwen4_mtp_accepted"] == 1
+    assert stats["qwen4_mtp_stochastic_verified"] == 2
+    assert stats["qwen4_mtp_round_outcomes"] == (
+        "N:A1R" if ngram_first else "A1R")
+    assert stats["qwen4_mtp_target_prefix_rollbacks"] == 1
+
+
+@pytest.mark.parametrize("streaming", [False, True])
+def test_ngram_zero_uniform_cannot_accept_grammar_masked_proposal(
+        monkeypatch, _cache_io_noop, streaming):
+    class MaskedConstraint(_TerminalConstraint):
+        def mask_logits(self, logits):
+            super().mask_logits(logits)
+            if self.accepted[-1:] == [11]:
+                return mx.where(mx.arange(logits.size) == 77, 0.0, -mx.inf)
+            return logits
+
+        def accept_token(self, token):
+            if self.accepted[-1:] == [11]:
+                assert token == 77, "verifier emitted a grammar-impossible token"
+            super().accept_token(token)
+
+        def fork(self):
+            return MaskedConstraint(self.terminal, self.accepted)
+
+    target = _ConstrainedTarget([11, 5, 13])
+    target.tokenizer = _FakeTokenizer((5, 10, 11, 5))
+    constraint = MaskedConstraint(77)
+    drafter = _FakeDrafter([99])
+    engine = Qwen4MTPSpeculativeEngine(
+        target, depth=2, ngram_first=True, ngram_max_draft_tokens=2,
+        drafter=drafter)
+    monkeypatch.setattr(mx.random, "uniform", lambda: mx.array(0.0))
+    chunks = []
+
+    result = engine.generate(
+        "prompt", max_tokens=4, sampling=SamplingParams(temperature=1.0),
+        constraint=constraint, on_token=chunks.append if streaming else None)
+
+    assert result["tokens"] == constraint.accepted == [10, 11, 77]
+    assert constraint.completed
+    assert result["termination_reason"] == "grammar"
+    assert target.verify_calls == [(10, 11, 5)]
+    assert target.last_kv.offset == result["kv_positions"] == 6
+    assert target.last_kv.kda_cache.marker == "kda-2"
+    assert target.last_kv.qwen4_cache.restores == [("aux-2", 6)]
+    assert drafter.proposal_steps == 0
+    assert result["path_stats"]["qwen4_mtp_round_outcomes"] == "N:A1R"
+    assert result["path_stats"]["qwen4_mtp_target_sweeps"] == 1
+    assert "".join(chunks) == (result["text"] if streaming else "")
+
+
 def test_stochastic_controller_full_accept_uses_exact_target_verifier(
         _cache_io_noop):
     target = _FakeTarget([11, 12, 13])
