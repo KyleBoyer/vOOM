@@ -177,6 +177,50 @@ SHORT_DIRECT_NO_TOOLS_INPUT = [
 ]
 
 
+MEDIA_SEARCH_ACTION_INPUT = [
+    {
+        "role": "system",
+        "content": (
+            "Use the available tools for live media-library information. "
+            "Never invent a library result."),
+    },
+    {
+        "role": "user",
+        "content": [{
+            "type": "input_text",
+            "text": (
+                "Search my Plex library for movies matching Arrival and return "
+                "at most three matches. Do not claim a match exists before "
+                "receiving the tool result."),
+        }],
+    },
+]
+
+
+def _media_search_scenario(request: dict, user_text: str | None) -> list[dict]:
+    """Explicitly modified domain case; retain two ORIGINAL captured schemas.
+
+    This is neither unmodified traffic nor the multi-turn Plex intelligence
+    rubric. It changes domain, available functions and developer-message shape
+    relative to the workspace case. No external tool is executed by this gate.
+    """
+    retained = {
+        "plugin__plex__plex_search_media",
+        "plugin__plex__plex_list_library_media",
+    }
+    tools = [tool for tool in request.get("tools", ())
+             if _tool_name(tool) in retained]
+    names = [_tool_name(tool) for tool in tools]
+    if len(names) != len(retained) or set(names) != retained:
+        raise ValueError("media-search-action requires both unique captured Plex tools")
+    turns = json.loads(json.dumps(MEDIA_SEARCH_ACTION_INPUT))
+    if user_text is not None:
+        turns[-1]["content"] = [{"type": "input_text", "text": user_text}]
+    request["input"] = turns
+    request["tools"] = tools
+    return turns
+
+
 def _tool_name(tool: dict) -> str:
     function = tool.get("function", tool) if isinstance(tool, dict) else {}
     return str(function.get("name", "")) if isinstance(function, dict) else ""
@@ -828,7 +872,7 @@ def main() -> int:
     parser.add_argument(
         "--scenario", choices=(
             "deferred-action", "tool-result-answer",
-            "developer-action", "short-direct-no-tools"),
+            "developer-action", "short-direct-no-tools", "media-search-action"),
         help="replace conversation turns with a tracked regression scenario")
     parser.add_argument(
         "--scenario-user-text",
@@ -902,7 +946,7 @@ def main() -> int:
         parser.error("scenario-user-text requires --scenario")
     if (args.scenario_user_text is not None
             and args.scenario not in (
-                "developer-action", "short-direct-no-tools")):
+                "developer-action", "short-direct-no-tools", "media-search-action")):
         parser.error(
             "scenario-user-text is supported only for scenarios whose final "
             "item is a user message")
@@ -941,6 +985,12 @@ def main() -> int:
         elif args.scenario == "tool-result-answer":
             scenario_turns = TOOL_RESULT_TURNS
             request_value["input"] = [*inputs[:-1], *scenario_turns]
+        elif args.scenario == "media-search-action":
+            try:
+                scenario_turns = _media_search_scenario(
+                    request_value, args.scenario_user_text)
+            except ValueError as error:
+                raise SystemExit(str(error)) from error
         elif args.scenario == "developer-action":
             scenario_turns = json.loads(json.dumps(DEVELOPER_ACTION_INPUT))
             if args.scenario_user_text is not None:

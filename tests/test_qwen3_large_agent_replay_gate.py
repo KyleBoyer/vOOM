@@ -152,3 +152,89 @@ def test_bad_expected_output_digest_is_rejected_before_capture_read(monkeypatch,
     with pytest.raises(SystemExit) as error:
         gate.main()
     assert error.value.code == 2
+
+
+def _media_tools():
+    return [
+        {"type": "function", "name": "plugin__plex__plex_list_library_media",
+         "description": "Original library schema", "parameters": {
+             "type": "object", "required": ["offset"],
+             "properties": {"offset": {"anyOf": [
+                 {"type": "number"}, {"type": "null"}]}},
+             "additionalProperties": False}},
+        {"type": "function", "name": "unrelated_tool", "parameters": {}},
+        {"type": "function", "name": "plugin__plex__plex_search_media",
+         "description": "Original search schema", "parameters": {
+             "type": "object", "required": ["query", "type", "limit"],
+             "properties": {"query": {"type": "string"}},
+             "x-optional": ["type", "limit"]}},
+    ]
+
+
+@pytest.mark.parametrize("user_text", [None, "Search for documentaries instead."])
+def test_media_scenario_preserves_original_tool_objects_order_and_schema(user_text):
+    tools = _media_tools()
+    before = json.dumps(tools, sort_keys=True)
+    request = {"tools": tools, "input": [{"role": "developer"}],
+               "tool_choice": "auto", "temperature": 0.7, "stream": True}
+    turns = gate._media_search_scenario(request, user_text)
+    assert request["tools"][0] is tools[0]
+    assert request["tools"][1] is tools[2]
+    assert json.dumps(tools, sort_keys=True) == before
+    assert request["input"] is turns
+    assert [turn["role"] for turn in turns] == ["system", "user"]
+    assert request["temperature"] == 0.7 and request["stream"] is True
+    assert request["tool_choice"] == "auto"
+    if user_text is not None:
+        assert turns[-1]["content"][0]["text"] == user_text
+    turns[0]["content"] = "changed"
+    assert gate.MEDIA_SEARCH_ACTION_INPUT[0]["content"] != "changed"
+
+
+@pytest.mark.parametrize("indices", [[], [0], [2], [0, 0], [2, 2], [0, 2, 2]])
+def test_media_scenario_rejects_missing_or_duplicate_tools_without_mutation(indices):
+    tools = _media_tools()
+    request = {"tools": [tools[index] for index in indices], "input": []}
+    before = json.dumps(request)
+    with pytest.raises(ValueError, match="both unique captured Plex tools"):
+        gate._media_search_scenario(request, None)
+    assert json.dumps(request) == before
+
+
+def test_media_scenario_cli_reports_modified_nonstream_request(monkeypatch, tmp_path):
+    original = {"model": "test", "input": [{"role": "user", "content": "PRIVATE_CAPTURE_SENTINEL"}],
+                "tools": _media_tools(), "stream": True, "tool_choice": "auto"}
+    raw = json.dumps(original).encode()
+    capture = tmp_path / "capture.json"
+    capture.write_bytes(raw)
+    monkeypatch.setattr(gate, "KNOWN_CAPTURES", {
+        "synthetic": {"sha256": hashlib.sha256(raw).hexdigest(),
+                      "bytes": len(raw), "tools": 3}})
+    monkeypatch.setattr(gate, "_pressure", lambda: gate.Pressure(7_000_000_000, 0, 0))
+    payloads, reports = [], []
+
+    def post(url, payload, timeout, stream, **kwargs):
+        payloads.append(payload)
+        assert stream is False
+        return {"http_status": 200, "wall_seconds": 1}
+
+    monkeypatch.setattr(gate, "_post", post)
+    monkeypatch.setattr(gate, "_write", lambda path, report: reports.append(report))
+    monkeypatch.setattr(sys, "argv", [
+        "gate", str(capture), "--scenario", "media-search-action",
+        "--scenario-user-text", "Search for Arrival movies, at most three.",
+        "--repeats", "1", "--max-output-tokens", "512"])
+    assert gate.main() == 0
+    payload, = payloads
+    request = json.loads(payload)
+    assert request["tools"] == [original["tools"][0], original["tools"][2]]
+    assert [turn["role"] for turn in request["input"]] == ["system", "user"]
+    assert request["input"][-1]["content"][0]["text"].startswith("Search for Arrival")
+    assert "vmodel_progress_events" not in request
+    report, = reports
+    assert report["request"]["scenario"] == "media-search-action"
+    assert report["request"]["scenario_user_sha256"]
+    row, = report["runs"]
+    assert row["request_changed_fields"] == ["input", "max_output_tokens", "stream", "tools"]
+    assert row["request_sha256"] == hashlib.sha256(payload).hexdigest()
+    assert "PRIVATE_CAPTURE_SENTINEL" not in json.dumps(report)
