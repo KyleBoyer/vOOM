@@ -77,6 +77,22 @@ All 632 related regressions pass in 2.90s, supervised without source drift.
 This gate is finished; a future head-reload reservation experiment must be
 justified separately and preserve both raw witnesses and unchanged pressure gates.
 
+That exact head-reservation experiment is now complete on source `802c42f`.
+The same modified two-Plex-tool/no-developer/nonstream/max512 request matches
+every pre-admission prepared/generated ID and raw-text/call hash. All43 exact
+1,271,398,400B reservations fast-path in a combined1.002ms with zero reclamation,
+allocator-clear-only calls or budget changes. This is safety-only: keep the
+before-fetch admission fix, but stop it as a speed lever. HTTP626.6329s versus
+prior632.8522s is not a demonstrated gain; identical874,946,336,192B total
+store reads. Duplicatecount2/expected1 and23.020MB swap-out>16MB still FAIL.
+The client also accidentally expected only the base profile, omitting the
+generation-witness profile that was actually enabled exactly as in baseline.
+Preserve that metadata error; future invocations must expect BOTH profiles,
+not repeat this expensive request to clean up its result. Parent exit1/no drift;
+all processes ended. No fused arm, new Plex score or broad generalization pass.
+Return to a frozen tool-result continuation/different real request shape and
+completed-output gates. No host deduplication or retuning of this failing case.
+
 ## Proven helper scope
 
 `runtime.qwen4_prefix_capture.AlignedPrefixCapture` requires exact concrete

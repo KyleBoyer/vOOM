@@ -1,5 +1,67 @@
 # STATUS — 2026-09-05 (current corrections first; dated chronology below is history)
 
+## 2026-09-06 UTC: exact head-admission model witness matches; safety-only, stop this speed lever
+
+The completed source `802c42f` gate confirms every prepared/generated token and
+raw-text/call hash matches the frozen pre-admission control. It is still the
+**modified two-original-Plex-tool / short system-user / no developer / nonstream /
+greedy seed64001 / max512** request, NOT unmodified134-tool traffic or a Plex
+intelligence score. Wire5983B SHA4af4867d...daf00;1839 prepared/146 naturally
+completed generated tokens,490B raw text. HTTP200 completed; no tool executed.
+Selected/effective digest13273725...6505d4, installed checkpoint, weight profile,
+and BOTH actually selected profiles match the control; no overrides or retries.
+Native MTP still accepts104/124 proposals over42 rounds; no fused-prefix arm ran.
+
+All **43 head reservations fast-path**. Requested bytes total54,670,131,200
+(43 x exact1,271,398,400B), reservation time **0.0010019s**, refusals0.
+Every measured head-specific reclamation, allocator-clear-only, budget reduction,
+budget restoration, unproductive shrink and slow-reservation counter is0.
+The no-prior-retry condition makes this complete for this request, despite the
+counter's explicitly narrower current-attempt scope. The repair is therefore
+verified safety plumbing here, NOT a pressure or speed mechanism. Keep the fix;
+do not repeat this same head-admission experiment seeking a latency improvement.
+
+For this modified completed request, HTTP wall **626.6329s**, first196.9276s,
+prefill196.9268s, decode415.2649s, engine612.2308s. Prior observer wall632.8522s;
+the small difference is not a demonstrated optimization. Prefill/decode/total
+store bytes are IDENTICAL216,200,372,480 /658,745,963,712 /874,946,336,192B.
+Peak Metal2,482,709,640B versus prior2,525,569,160B; no peak/pressure gain is
+attributed to admissions that performed no reclamation. Idle logical-pin and
+active-byte drops both remain exact1,271,398,400B. Release5.652ms; readonly
+before/after observer0.594ms. These are inside-generation, non-atomic samples,
+not a post-serving physical-reclamation proof.
+
+Acceptance remains **FAIL**: both correct search calls are still emitted twice
+where one is required; swap-out growth **23,019,520B >16MB**. Final available
+5,588,369,408B passes5.3GB and used swap stays1,927,020,544B, but neither cancels
+the churn failure. Also retain a separate **operator expectation error**: the
+client's expected-profile list accidentally omitted `generation-witness`, while
+the launched and actually reported profiles correctly included it exactly as
+the baseline did. Independent raw-witness/digest/profile comparison passes;
+this does NOT rewrite the failed child result or make its other failures pass.
+Future invocations must specify BOTH `--expected-runtime-profile` arguments;
+do not spend another full-model replay merely to remove this metadata mistake.
+
+Parent exit1/632.3115s,08:28:22.364324 ->08:38:54.675768UTC; no signal,
+timeout, spawn failure, missing output or source drift. Result SHA
+c56811b55e042aca54bf4fe41e6aea5dccb37dfd8d1de5ab2dd9ead76f359b01 and parent-log
+SHA5cde169c66fb1a96cfe2a412e067cf5ec8011fc17e5cc09a4d8dc1279305245a match the
+supervisor envelope. All model processes ended; port8073 is free. Root/external
+minima18.023/98.997GB; max child-tree RSS5.465GB. Fresh30s preflight passed
+7.129/7.080GB available, zero swap growth/out. Private
+`logs/qwen4_media_head_admission512_20260906.json` and matching server/gate logs.
+The source's695 regressions/3000 lifecycle stress checks remain valid; no runtime
+source has changed since those tests or the model gate.
+
+The raw-duplicate/MTP/parser/head-release/head-admission investigations are now
+finished for this case. Return to completed-output coverage: a frozen captured
+tool-result continuation/different real request shape, with sufficient output,
+then full capture/Plex. Any constructed continuation must be labeled modified;
+no easier prompt or host deduplication may conceal this known quality failure.
+Fused-prefix capture remains explicit/default-off and must match a fresh safe
+unfused control on new shapes. Large-context, sub90s and full-GLM storage-choice
+gates remain open. No new model score or broader generalization pass.
+
 ## 2026-09-06 UTC: exact Qwen head admission repaired; unit/stress gates pass, model proof pending
 
 The suspended Qwen4 head path now asks the live governor to admit its EXACT
