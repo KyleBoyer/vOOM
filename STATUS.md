@@ -1,5 +1,67 @@
 # STATUS — 2026-09-05 (current corrections first; dated chronology below is history)
 
+## 2026-09-06 UTC: varied media/nonstream control finds a real call-count failure; scorer hardened
+
+The next fresh cold **unfused aligned-compact control** on source `439faf7`
+tested a different domain/function and transport: two ORIGINAL captured Plex
+schemas (search plus library-list), replaced short system/user history, NO
+developer message, nonstream, greedy temperature0/seed64001, max512. This is
+an explicitly **modified request**, NOT the original134-tool traffic or the
+multi-turn Plex intelligence rubric. No external tool was executed. The new
+tracked `media-search-action` scenario preserves both complete tool objects and
+their captured order and fails closed on missing/duplicate selected tools.
+
+HTTP200 completed naturally at146 generated tokens from1839 prepared tokens,
+but returned **TWO `plugin__plex__plex_search_media` calls**, violating the
+frozen wrapper's exact-single-call assertion. At least one argument object
+matched query/type/limit; the old boolean does not establish that BOTH calls
+were correct or identical. Raw arguments were not persisted, so the origin
+(generation versus protocol parsing) and exact argument duplication remain
+unresolved. The parent correctly FAILed; the fused arm was NOT launched.
+This is a newly exposed baseline quality failure, not a demonstrated fused
+regression, completed A/B, generalization pass or new intelligence score.
+
+For this modified two-Plex-tool failed control, HTTP wall**633.0516s**,
+first token201.1752s, prefill201.1742s, decode417.6068s, engine618.8286s.
+Prefill/decoded/total store reads216,200,372,480 /658,745,963,712 /
+874,946,336,192B. Native MTP used42 verifier rounds,104/124 proposals accepted;
+draft14.4235s versus verifier401.9601s. Retained prefix1024,37 copied histories
+/2,396,160B, no fused capture and zero prefill retries. Peak Metal2,525,569,160B.
+Pressure also FAILed: final available4.573GB<5.3GB, swap-out54.133MB>16MB;
+used swap grew0.328MB. No pressure threshold was relaxed.
+
+Actual5,983B wireSHA `4af4867dc4b11734376a4b73111eadff59b28a6643751ca5292d014bf44daf00`;
+prepared-ID SHA `431b4df69971789f715cecf2f050a14089d933cf7e115a8567a619b7b881623b`;
+generated146-ID SHA `87ecd4945e6e7904fc12e1b299a18625a6e780b4c64b15e2a562d51d6aac8b90`;
+raw490B textSHA `650bc7c2b76dbbaebff4c27dedc68c7d65961e2bedd1b519b8c475d37619b5d4`.
+Selected/effective digest `13273725...6505d4`, no overrides. Parent exit1,
+635.7159s,04:53:26.789011 ->05:04:02.504860 UTC, no timeout/source drift;
+all jobs ended. Fresh30s preflight6.400/6.415GB available, zero swap growth/churn,
+root19.082GB. Parent root/external minima19.073/99.121GB, max tree RSS5.123GB.
+Private `logs/qwen4_media_control512_20260906.json`, matching server log and
+`logs/gates/qwen4_media_control512_20260906.done.json` retain the failed evidence.
+
+Review independently found that the shared replay gate could previously pair
+the requested function's NAME with an unrelated call's ARGUMENTS. The stricter
+wrapper protected this measured job. After all jobs ended, the tracked gate
+was hardened: all argument predicates bind to the expected function name,
+`--expected-function-call-count` records/enforces exact total call count, and
+privacy-safe canonical name+argument hashes distinguish identical calls from
+merely repeated names. Malformed/missing argument JSON is counted and cannot
+match an empty expected object. These are parsing/argument-subset witnesses,
+NOT full JSON-schema validation. Nonfinite JSON constants/numeric overflow are
+rejected; ASCII-escaped canonical hashing survives lone-surrogate arguments
+without losing the receipt. **112 pure regressions pass in1.96s**, including
+both HTTP transports, cross-call false positives, duplicate hashing, malformed
+arguments, CLI count enforcement and original-schema preservation. Runtime,
+weights, profiles, request text and all old artifacts are unchanged.
+
+Next isolate the two-call origin with privacy-safe raw-generation versus
+parsed-call instrumentation on this frozen failing request; do not rewrite
+the prompt to hide the failure. Then resume the fresh controlled fused A/B and
+actual extension. Full capture, completed Plex, large-context and sub90s gates
+remain open. Keep all new fast paths explicit. Full GLM storage choice unchanged.
+
 ## 2026-09-06 UTC: fused prefix completes cold/repeat with identical raw tokens and lower focused cold wall
 
 On source `a1f67e0` (runtime `eb1dc1a`), the new explicit fused profile

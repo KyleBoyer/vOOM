@@ -12,6 +12,16 @@ bytes for that split. The new focused candidate removes those reads and took
 two-tool comparison is not an achieved full-harness latency target. See the
 current STATUS entry for scope, pressure failures and complete receipts.
 
+The next varied-domain control (source439faf7) exposed a quality failure before
+the fused comparison: the modified two-original-Plex-tool/no-developer/nonstream
+case completed146 tokens in633.0516s but produced two search calls where exactly
+one was required. Both call-count and pressure gates FAIL. No fused arm ran;
+this is not evidence of a fused regression or generalized success. Diagnose
+raw-generation versus parser origin on that frozen request before proceeding;
+do not tune the prompt to conceal it. The replay gate now binds name/argument
+checks and accepts `--expected-function-call-count 1`; canonical per-call hashes
+will distinguish identical calls from repeated names without persisting text.
+
 ## Proven helper scope
 
 `runtime.qwen4_prefix_capture.AlignedPrefixCapture` requires exact concrete

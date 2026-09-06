@@ -34,6 +34,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import math
 import time
 import urllib.error
 import urllib.request
@@ -306,6 +307,14 @@ def _safe_selection(value) -> dict:
     return {key: value[key] for key in keys if key in value}
 
 
+def _finite_json_number(value: str) -> float:
+    """Reject non-JSON constants and float overflow before argument grading."""
+    number = float(value)
+    if not math.isfinite(number):
+        raise ValueError("nonfinite function argument number")
+    return number
+
+
 def _summary(response: dict, *, wall_s: float, events: list[str],
              progress: list[dict], deltas: list[str],
              expected_function_arguments: dict | None = None,
@@ -313,7 +322,8 @@ def _summary(response: dict, *, wall_s: float, events: list[str],
              expected_nonempty_function_arguments: tuple[str, ...] = (),
              expected_output_text_terms: tuple[str, ...] = (),
              expected_output_text_any_terms: tuple[str, ...] = (),
-             score_plex_profile: bool = False) -> dict:
+             score_plex_profile: bool = False,
+             expected_function_call_name: str | None = None) -> dict:
     output = response.get("output") or []
     stable_output = []
     for item in output:
@@ -334,21 +344,35 @@ def _summary(response: dict, *, wall_s: float, events: list[str],
     ).encode("utf-8")
     delta_sizes = [len(delta.encode("utf-8")) for delta in deltas]
     final_output_text = response.get("output_text", "")
-    parsed_function_arguments = []
     parsed_function_calls = []
     for item in output:
         if not isinstance(item, dict) or item.get("type") != "function_call":
             continue
         try:
-            arguments = json.loads(item.get("arguments") or "{}")
+            arguments = json.loads(
+                item.get("arguments"), parse_float=_finite_json_number,
+                parse_constant=_finite_json_number)
         except (TypeError, ValueError):
             continue
         if isinstance(arguments, dict):
-            parsed_function_arguments.append(arguments)
             parsed_function_calls.append({
                 "name": str(item.get("name") or ""),
                 "arguments": arguments,
             })
+    # Bind every argument predicate to the requested function. An unrelated
+    # call must never lend its arguments to a wrong-argument named call.
+    parsed_function_arguments = [
+        call["arguments"] for call in parsed_function_calls
+        if expected_function_call_name is None
+        or call["name"] == expected_function_call_name]
+    # ASCII escaping also makes escaped lone-surrogate arguments hashable;
+    # they must not crash receipt publication after successful HTTP transport.
+    call_digests = [hashlib.sha256(json.dumps(
+        call, ensure_ascii=True, sort_keys=True, separators=(",", ":"),
+    ).encode("utf-8")).hexdigest() for call in parsed_function_calls]
+    function_call_count = sum(
+        isinstance(item, dict) and item.get("type") == "function_call"
+        for item in output)
     argument_match = (
         None if expected_function_arguments is None else any(
             all(arguments.get(key) == value
@@ -466,6 +490,14 @@ def _summary(response: dict, *, wall_s: float, events: list[str],
         "function_call_names": [
             item.get("name") for item in output
             if isinstance(item, dict) and item.get("type") == "function_call"],
+        # Canonical name+argument hashes omit call IDs and private arguments.
+        # Distinguish repeated function names from actually identical calls.
+        "function_call_canonical_sha256": call_digests,
+        "function_call_duplicate_count": len(call_digests) - len(set(call_digests)),
+        "function_call_argument_parse_failures": (
+            function_call_count - len(parsed_function_calls)),
+        "function_call_argument_match_scope": (
+            "expected_name" if expected_function_call_name is not None else "any_name"),
         # Boolean-only semantic witness: expected values are operator-supplied
         # and the private response arguments remain absent from the artifact.
         "function_call_arguments_match": argument_match,
@@ -508,7 +540,8 @@ def _post(
         expected_output_text_any_terms: tuple[str, ...] = (),
         score_plex_profile: bool = False,
         print_progress: bool = False,
-        fail_on_memory_retry: bool = False) -> dict:
+        fail_on_memory_retry: bool = False,
+        expected_function_call_name: str | None = None) -> dict:
     request = urllib.request.Request(
         url, data=payload, headers={"Content-Type": "application/json"},
         method="POST")
@@ -659,6 +692,7 @@ def _post(
     return _summary(
         response_value, wall_s=time.perf_counter() - started,
         events=events, progress=progress, deltas=deltas,
+        expected_function_call_name=expected_function_call_name,
         expected_function_arguments=expected_function_arguments,
         expected_positive_function_arguments=(
             expected_positive_function_arguments),
@@ -808,6 +842,9 @@ def main() -> int:
     parser.add_argument("--expected-min-output-tokens", type=int)
     parser.add_argument("--expected-function-call-name")
     parser.add_argument(
+        "--expected-function-call-count", type=int,
+        help="require exactly this many total function calls, including malformed calls")
+    parser.add_argument(
         "--expected-function-arguments-json",
         help=(
             "require at least one function call to contain this JSON-object "
@@ -888,6 +925,8 @@ def main() -> int:
     args = parser.parse_args()
     if args.repeats <= 0 or args.max_output_tokens <= 0 or args.timeout <= 0:
         parser.error("repeats, max-output-tokens, and timeout must be positive")
+    if args.expected_function_call_count is not None and args.expected_function_call_count < 0:
+        parser.error("expected-function-call-count must be non-negative")
     if (args.expected_output_sha256 is not None
             and (len(args.expected_output_sha256) != 64
                  or any(char not in "0123456789abcdef"
@@ -1086,6 +1125,7 @@ def main() -> int:
         before = _pressure()
         row = _post(
             args.url, payload, args.timeout, request_stream,
+            expected_function_call_name=args.expected_function_call_name,
             expected_function_arguments=expected_function_arguments,
             expected_positive_function_arguments=tuple(
                 args.expected_positive_function_argument),
@@ -1172,6 +1212,11 @@ def main() -> int:
                 f"repeat {index + 1}: output types {output_types!r} do not "
                 f"include {args.expected_output_type!r}")
         function_names = row.get("function_call_names") or []
+        if (args.expected_function_call_count is not None
+                and len(function_names) != args.expected_function_call_count):
+            failures.append(
+                f"repeat {index + 1}: function call count {len(function_names)}, "
+                f"expected {args.expected_function_call_count}")
         if (args.expected_function_call_name is not None
                 and args.expected_function_call_name not in function_names):
             failures.append(
@@ -1382,6 +1427,7 @@ def main() -> int:
                 args.expected_min_repeat_cached_tokens),
             "max_peak_metal_gb": args.expected_max_peak_metal_gb,
             "function_call_name": args.expected_function_call_name,
+            "function_call_count": args.expected_function_call_count,
             "backend": args.expected_backend,
             "runtime_profiles": args.expected_runtime_profile,
             "runtime_profile_groups": args.expected_runtime_profile_group,

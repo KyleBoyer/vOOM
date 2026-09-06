@@ -1,4 +1,5 @@
 import hashlib
+import io
 import json
 import sys
 
@@ -238,3 +239,148 @@ def test_media_scenario_cli_reports_modified_nonstream_request(monkeypatch, tmp_
     assert row["request_changed_fields"] == ["input", "max_output_tokens", "stream", "tools"]
     assert row["request_sha256"] == hashlib.sha256(payload).hexdigest()
     assert "PRIVATE_CAPTURE_SENTINEL" not in json.dumps(report)
+
+
+def _call_summary(calls, **kwargs):
+    return gate._summary(
+        {"output": [{"type": "function_call", **call} for call in calls]},
+        wall_s=1, events=[], progress=[], deltas=[], **kwargs)
+
+
+@pytest.mark.parametrize("expected_name", ["search", "absent"])
+def test_unrelated_call_cannot_lend_arguments_to_expected_function(expected_name):
+    result = _call_summary([
+        {"name": "search", "arguments": '{"query":"wrong","limit":0}'},
+        {"name": "unrelated", "arguments": '{"query":"private-value","limit":3}'},
+    ], expected_function_call_name=expected_name,
+        expected_function_arguments={"query": "private-value", "limit": 3},
+        expected_positive_function_arguments=("limit",),
+        expected_nonempty_function_arguments=("query", "limit"))
+    assert result["function_call_arguments_match"] is False
+    assert result["function_call_positive_arguments_match"] is False
+    assert result["function_call_nonempty_arguments_match"] is False
+    assert result["function_call_argument_match_scope"] == "expected_name"
+    assert "private-value" not in json.dumps(result)
+
+
+def test_canonical_duplicate_witness_ignores_ids_and_json_spacing_but_not_arguments():
+    result = _call_summary([
+        {"name": "search", "call_id": "one", "arguments": '{"q":"PRIVATE_VALUE", "n":3}'},
+        {"name": "search", "call_id": "two", "arguments": '{"n": 3,"q": "PRIVATE_VALUE"}'},
+        {"name": "search", "arguments": '{"q":"different","n":3}'},
+    ], expected_function_call_name="search",
+        expected_function_arguments={"q": "PRIVATE_VALUE", "n": 3})
+    digests = result["function_call_canonical_sha256"]
+    assert len(digests) == 3 and digests[0] == digests[1] != digests[2]
+    assert result["function_call_duplicate_count"] == 1
+    assert result["function_call_argument_parse_failures"] == 0
+    assert result["function_call_arguments_match"] is True
+    assert "PRIVATE_VALUE" not in json.dumps(result)
+
+
+@pytest.mark.parametrize("arguments", [None, "", "not-json", "[]", "null", "true", "7"])
+def test_malformed_arguments_are_counted_and_cannot_match_empty_expected_object(arguments):
+    result = _call_summary([{"name": "search", "arguments": arguments}],
+                           expected_function_arguments={})
+    assert result["function_call_names"] == ["search"]
+    assert result["function_call_argument_parse_failures"] == 1
+    assert result["function_call_canonical_sha256"] == []
+    assert result["function_call_arguments_match"] is False
+
+
+@pytest.mark.parametrize("actual_count,expected_count,passes", [
+    (0, 0, True), (1, 1, True), (2, 1, False), (1, 0, False), (0, 1, False)])
+def test_cli_exact_call_count_is_a_persisted_gate(
+        monkeypatch, tmp_path, actual_count, expected_count, passes):
+    raw = b'{"input":[],"tools":[]}'
+    capture = tmp_path / "capture.json"
+    capture.write_bytes(raw)
+    monkeypatch.setattr(gate, "KNOWN_CAPTURES", {
+        "synthetic": {"sha256": hashlib.sha256(raw).hexdigest(),
+                      "bytes": len(raw), "tools": 0}})
+    monkeypatch.setattr(gate, "_pressure", lambda: gate.Pressure(7_000_000_000, 0, 0))
+    reports = []
+
+    def post(*args, **kwargs):
+        assert kwargs["expected_function_call_name"] == "search"
+        return {"http_status": 200, "wall_seconds": 1,
+                "function_call_names": ["search"] * actual_count}
+
+    monkeypatch.setattr(gate, "_post", post)
+    monkeypatch.setattr(gate, "_write", lambda path, report: reports.append(report))
+    # The name is passed to _post even when no calls are expected. For that
+    # one case keep the assertion about count separate from the name gate.
+    monkeypatch.setattr(sys, "argv", [
+        "gate", str(capture), "--repeats", "1", "--expected-function-call-name", "search",
+        "--expected-function-call-count", str(expected_count)])
+    exit_code = gate.main()
+    report, = reports
+    count_failures = [f for f in report["failures"] if "function call count" in f]
+    assert bool(count_failures) is (not passes)
+    assert report["expectations"]["function_call_count"] == expected_count
+    assert exit_code == (1 if report["failures"] else 0)
+
+
+def test_negative_expected_call_count_fails_before_reading_capture(monkeypatch):
+    monkeypatch.setattr(sys, "argv", ["gate", "unused", "--expected-function-call-count", "-1"])
+    with pytest.raises(SystemExit) as error:
+        gate.main()
+    assert error.value.code == 2
+
+
+@pytest.mark.parametrize("stream", [False, True])
+def test_http_post_binds_expected_name_through_nonstream_and_sse(monkeypatch, stream):
+    response = {"status": "completed", "output": [
+        {"type": "function_call", "name": "search", "arguments": '{"limit":0}'},
+        {"type": "function_call", "name": "other", "arguments": '{"limit":3}'},
+    ]}
+    body = ("data: " + json.dumps({"type": "response.completed", "response": response})
+            + "\n\n" if stream else json.dumps(response)).encode()
+    monkeypatch.setattr(gate.urllib.request, "urlopen", lambda *a, **kw: io.BytesIO(body))
+    row = gate._post(
+        "http://localhost/fixture", b"{}", 1, stream,
+        expected_function_call_name="search", expected_function_arguments={"limit": 3})
+    assert row["function_call_arguments_match"] is False
+    assert row["function_call_argument_match_scope"] == "expected_name"
+
+
+def test_unscoped_argument_matching_remains_explicitly_any_name():
+    row = _call_summary([{"name": "anything", "arguments": '{"limit":3}'}],
+                        expected_function_arguments={"limit": 3})
+    assert row["function_call_arguments_match"] is True
+    assert row["function_call_argument_match_scope"] == "any_name"
+
+
+@pytest.mark.parametrize("value", ["NaN", "Infinity", "-Infinity", "1e999", "-1e999"])
+def test_nonfinite_json_arguments_fail_closed_including_nested_values(value):
+    for argument_text in ('{"limit":' + value + '}', '{"nested":[' + value + ']}'):
+        row = _call_summary([{"name": "search", "arguments": argument_text}],
+                            expected_function_call_name="search",
+                            expected_function_arguments={},
+                            expected_positive_function_arguments=("limit",),
+                            expected_nonempty_function_arguments=("limit",))
+        assert row["function_call_argument_parse_failures"] == 1
+        assert row["function_call_canonical_sha256"] == []
+        assert row["function_call_arguments_match"] is False
+        assert row["function_call_positive_arguments_match"] is False
+        assert row["function_call_nonempty_arguments_match"] is False
+
+
+def test_escaped_lone_surrogate_cannot_crash_canonical_call_receipt():
+    row = _call_summary([{"name": "search", "arguments": r'{"q":"\ud800"}'}])
+    assert row["function_call_argument_parse_failures"] == 0
+    digest, = row["function_call_canonical_sha256"]
+    assert len(digest) == 64
+    assert "ud800" not in json.dumps(row)
+
+
+def test_canonical_call_hash_normalizes_unicode_escaping_and_accepts_finite_numbers():
+    row = _call_summary([
+        {"name": "search", "arguments": r'{"q":"\u00e9","limit":3.0}'},
+        {"name": "search", "arguments": '{"limit":3.0,"q":"é"}'},
+    ], expected_function_arguments={"limit": 3},
+        expected_positive_function_arguments=("limit",))
+    assert row["function_call_duplicate_count"] == 1
+    assert row["function_call_argument_parse_failures"] == 0
+    assert row["function_call_arguments_match"] is True
+    assert row["function_call_positive_arguments_match"] is True
