@@ -48,6 +48,15 @@ Require fresh30s preflight; preserve all pressure failures. No serving-speed or
 completed-output claim from either max1 arm. Full131 max1024 cold/repeat/recorded
 continuation and varied-domain/Plex acceptance remain separate subsequent gates.
 
+Pre-launch correction: the first fused supervisor exited1 in2.3805s BEFORE server
+startup/model I/O because its cross-run source guard allowed the STATUS receipt
+but not the local ignored benchmark receipt. Independent comparison confirms
+only STATUS.md and docs/benchmark_results.md changed; all709 other manifest
+files match the control. Preserve the failed envelope/missing-child-result error.
+The v2 launcher records these two explicit documentation deltas, still rejects
+any other source change, and requires a NEW passing30s preflight. It has not
+produced a fused-model result yet; no inference work is being repeated.
+
 ## 2026-09-06 UTC: full40K fused-prefill proof starts with an unfused state control
 
 Next supervised job `qwen4_full131_unfused_state_control_20260906` captures the
