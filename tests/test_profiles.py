@@ -87,6 +87,18 @@ def test_qwen_fused_aligned_profile_changes_only_explicit_capture_flag():
     assert settings == {**base_settings, "VMODEL_QWEN4_FUSED_ALIGNED_PREFIX": "1"}
 
 
+def test_qwen_ordinary_target_control_changes_only_native_mtp_depth():
+    catalog = discover_runtime_profiles((ROOT / "profiles",))
+    base = "qwen38-flash-next-uncensored-fp8-exact-pipeline-hot-kv-aligned-compact"
+    base_order, base_settings = resolve_runtime_profiles((base,), catalog)
+    order, settings = resolve_runtime_profiles((base + "-ar",), catalog)
+    assert order == (*base_order, base + "-ar")
+    assert base_settings["VMODEL_QWEN4_MTP_DEPTH"] == "3"
+    assert settings == {**base_settings, "VMODEL_QWEN4_MTP_DEPTH": "0"}
+    assert settings["VMODEL_QWEN4_SERIAL_VERIFY_SUSPEND_LM_HEAD"] == "1"
+    assert settings["VMODEL_QWEN4_SERIAL_VERIFY_EXACT_BF16_GEMV"] == "1"
+
+
 @pytest.mark.parametrize("base", [
     "qwen38-flash-next-uncensored-fp8-fast-tier-mtp-direct-fp8-qmv-prefill-pipeline-exact-fused-delta",
     "qwen38-flash-next-uncensored-fp8-exact-pipeline-hot-kv",

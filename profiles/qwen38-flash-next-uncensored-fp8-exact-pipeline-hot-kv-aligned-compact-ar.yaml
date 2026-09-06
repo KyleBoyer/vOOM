@@ -1,0 +1,10 @@
+schema: voom.runtime-profile.v1
+name: qwen38-flash-next-uncensored-fp8-exact-pipeline-hot-kv-aligned-compact-ar
+description: Ordinary-target decoding control for the aligned compact uncensored FP8 profile.
+notes:
+  - "Diagnostic only: disables native MTP and leaves every other target, kernel, head, cache and prefill setting unchanged. No speed or quality win is asserted."
+  - "Use unchanged request bytes and actual raw generation witnesses to separate target behavior from speculative-decoder behavior. Do not rewrite a failing request or discard extra calls."
+extends:
+  - qwen38-flash-next-uncensored-fp8-exact-pipeline-hot-kv-aligned-compact
+settings:
+  VMODEL_QWEN4_MTP_DEPTH: 0
