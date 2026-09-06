@@ -1,5 +1,65 @@
 # STATUS — 2026-09-05 (current corrections first; dated chronology below is history)
 
+## 2026-09-06 UTC: fused prefix completes cold/repeat with identical raw tokens and lower focused cold wall
+
+On source `a1f67e0` (runtime `eb1dc1a`), the new explicit fused profile
+completed BOTH the cold call and its1024-token memory-prefix repeat with a
+512-token budget. Each naturally stopped at70 generated tokens, HTTP200 /
+completed, correct `mastra_workspace_read_file` path/offset/limit; no tool was
+executed. This remains the **modified two-real-workspace-tool / short-history /
+developer / stream-progress / greedy-seed64001** request, NOT the full134-tool
+capture or a Plex evaluation. Both actual5,543B wire hashes match the earlier
+controls (`e5e51779...bf34b`), with1611 prepared tokens and no request substitutions
+beyond that explicitly declared fixture scenario.
+
+Cold/repeat generated-ID witnesses and raw engine text match each other AND
+both prior aligned-control and aligned-compact completed-output arms exactly:
+70-token SHA `381c8319...a9ae9b`,276B textSHA `a2d431a3...8356`. Native MTP
+is active in both calls. No endpoint hash observer, post-generation mutation,
+extra allocator clearing or host renderer was used. This confirms the new
+retained prefix can actually drive a complete cached continuation, not merely
+pass a max1 diagnostic. The independent full/prefix state proof is below.
+
+For this **modified two-tool completed request**, cold HTTP wall is
+**357.2660s**, versus the prior aligned-compact443.4725s (86.2065s /19.44%
+lower); memory-repeat wall is**324.1750s**, versus323.6819s (no repeat speed
+gain). This is a fresh cold candidate compared with historical controls, not
+a new randomized paired A/B and not an achieved full-harness latency target.
+Cold/repeat first-token times116.7829/97.9452s; decode226.1255/226.1258s.
+Cold prefill reads118,877,180,840B versus219,916,717,280B, exactly101.040GB
+removed. Repeat prefill remains109,502,750,240B; decode remains352,580,672,928B
+per call. Total store bytes471,457,853,768 cold /462,083,423,168 repeat.
+The unchanged decode cost is now the dominant measured wall component.
+
+Cold uses the new48-layer /1024-token capture,37 copied histories/2,396,160B,
+491,520B maximum copy scratch,0.030230s capture. Repeat uses the old complete
+fork compactor exactly once,37 histories/2,396,160B,0.001871s; no fused capture
+reruns on the hit. Both charge156,585,984 retained bytes and have zero memory
+retries. Expected selected/effective digest `4473f9eb...df8250`, no overrides.
+
+**Both calls and parent remain overall FAIL on unchanged pressure gates.**
+Final available4.651/4.659GB is below5.3GB. Swap-out growth21.234MB cold /
+33.112MB cumulative exceeds16MB; repeat-only churn11.878MB is lower but does
+not erase the cumulative failure. No used-swap growth. Peak Metal2,264,151,332B
+cold /2,307,404,068B repeat stays below8.5GB. No full-harness, long-context,
+new Plex score, varied-domain proof or sub90s completion is claimed.
+
+Parent exit1,684.1649s,04:04:45.819794 ->04:16:09.984678 UTC; no source drift
+or timeout, all jobs ended. Fresh30-second preflight passed8.053/8.010GB
+available with zero swap growth/churn. Root/external minimum18.923/99.105GB,
+max child-tree RSS4.653GB. Private
+`logs/qwen4_fused_candidate_workspace512_20260906.json`, matching server log
+and supervised envelope; raw-witness checks passed before the wrapper correctly
+propagated pressure FAIL. Code and prior866-test integration proof are pushed.
+
+This focused cold/repeat acceptance experiment is finished. Next vary actual
+request domains/functions and test a real extension, comparing raw witnesses
+against a fresh unfused control on the same source, then unmodified captured
+traffic/Plex. Investigate decode I/O/acceptance and memory pressure with existing
+instrumentation before another scheduling change. Keep fused capture explicit;
+do not repeat this identical focused gate or promote defaults without broader
+proof. Full GLM acquisition still needs its previously documented storage choice.
+
 ## 2026-09-06 UTC: fused cold prefill removes duplicate reads; both independent state oracles match
 
 The new default-off `...aligned-compact-fused` profile on source `eb1dc1a`

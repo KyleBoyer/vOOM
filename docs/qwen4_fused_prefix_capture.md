@@ -1,11 +1,16 @@
 # Qwen4 cold aligned-prefix capture: integration and proof contract
 
 As of2026-09-06 the helper is wired into an **explicit, default-off**
-`...hot-kv-aligned-compact-fused` profile;866 regressions pass. Real-model
-state and serving gates remain next. The objective is to avoid a separate cold
+`...hot-kv-aligned-compact-fused` profile;866 regressions pass. Independent
+real full/prefix state gates and the focused completed cold/repeat raw-token
+gate now pass; overall pressure gates still FAIL. Broader real-request,
+extension, full harness and Plex acceptance remain open. The objective is to avoid a separate cold
 prefix sweep while retaining the existing aligned1024-token hot checkpoint.
 The focused1611-token workload currently reads an additional101,039,536,440
-bytes for that split. This is an I/O hypothesis, not an achieved speed gain.
+bytes for that split. The new focused candidate removes those reads and took
+357.266s cold versus the historical compact control443.4725s. That modified
+two-tool comparison is not an achieved full-harness latency target. See the
+current STATUS entry for scope, pressure failures and complete receipts.
 
 ## Proven helper scope
 
@@ -81,14 +86,14 @@ They do not prove full-model arithmetic/scheduling or serving pressure.
 6. Add actual call-site/flag/profile/admission/cleanup regressions and run the
    combined suite under a new fresh30-second preflight and supervised gate.
 
-## Real-model proof order
+## Real-model proof order (first two focused stages completed)
 
 Keep every result explicit about the modified two-real-tool / short history /
 developer / streaming / greedy-seed64001 request. It is not the unmodified
 134-tool capture or Plex quality proof. No synthetic replacement of state or
 answer text is acceptable in a serving benchmark.
 
-First compare a fresh max1 endpoint diagnostic (not complete-answer latency)
+The first fresh max1 endpoint diagnostic (not complete-answer latency) matched
 against BOTH independent state oracles:
 
 - Full1611-token endpoint, hidden BF16 bits, actual prepared/generated IDs and
@@ -107,7 +112,9 @@ older post-generation detachment diagnostic or call its pressure numbers an
 uninterrupted serving pass. Check all component hashes, metadata and history
 coverage, not just first-token identity or parsed tool arguments.
 
-Then run fresh sufficient-output controls/candidates with generation witnesses,
+The sufficient-output fused cold/repeat run with generation witnesses also
+matched both historical aligned controls (see STATUS). Next use fresh unfused
+controls and varied-domain/actual-extension candidates with generation witnesses,
 no endpoint hashing/mutation or added allocator clearing: cold + identical
 repeat, then actual extension, varied domains/tool shapes, unmodified capture
 and Plex. The existing modified max512 workspace call naturally completes at
