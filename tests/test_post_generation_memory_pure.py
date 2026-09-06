@@ -49,7 +49,8 @@ def api(monkeypatch):
 
     monkeypatch.setattr(witness, "sample_phase_head_memory", sample)
     source = Path(__file__).resolve().parents[1] / "runtime/server.py"
-    names = {"_observe_qwen4_post_generation_memory", "_engine_generate", "_has_own_method"}
+    names = {"_observe_qwen4_post_generation_memory", "_engine_generate", "_has_own_method",
+             "_release_qwen4_unretained_endpoint"}
     nodes = [n for n in ast.parse(source.read_text()).body
              if isinstance(n, ast.FunctionDef) and n.name in names]
     assert len(nodes) == len(names)
@@ -59,6 +60,7 @@ def api(monkeypatch):
                  "_attach_generation_witness": lambda *args: events.append("tokens")}
     exec(compile(ast.Module(body=nodes, type_ignores=[]), str(source), "exec"), namespace)
     monkeypatch.delenv(FLAG, raising=False)
+    monkeypatch.delenv("VMODEL_QWEN4_RELEASE_UNRETAINED_ENDPOINT", raising=False)
     monkeypatch.delenv("VMODEL_DEBUG_ENGINE_REPORT", raising=False)
     target = SimpleNamespace(cfg=SimpleNamespace(model_type="qwen4_exp"),
                              last_kv=object(), _hot_prompt_slots=[object()],

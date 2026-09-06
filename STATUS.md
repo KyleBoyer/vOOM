@@ -1,5 +1,88 @@
 # STATUS — 2026-09-06 (current corrections first; dated chronology below is history)
 
+## 2026-09-06 UTC: guarded endpoint disposal halves terminal Metal active bytes; pressure still FAIL
+
+The supervised endpoint-ownership sequence has FINISHED. New explicit/default-off
+`qwen4-release-unretained-endpoint` detaches only target.last_kv after generation,
+report and trace consumers, before protocol completion under INFER_LOCK. It
+requires the concrete Qwen4 MTP wrapper, aligned hot-cache policy, known plain-RAM
+slots and a plain endpoint that aliases none of them; persistence/vision/
+provisional/serial owners block it. It never calls endpoint.release(), mutates
+retained slots/cache/hidden state or changes target math/RNG. Direct engine
+generation is unchanged. A single allocator-cache clear follows detachment;
+there is no synchronization or sleep. HTTP wall includes the cleanup cost.
+
+Installed uncensored Qwen FP8, all 131 original tools/system messages/histories
+and streaming retained; explicit wire overrides model/max1024/temp0/seed64013:
+
+| Request | Input / emitted | Cached | HTTP wall | Engine TTFT | Decode |
+|---|---:|---:|---:|---:|---:|
+| Initial, fresh server/prompt cache | 40,432 / 49 | 0 | 905.3061s | 678.0299s | 211.7272s |
+| Exact repeat | 40,432 / 49 | 39,936 | 294.4917s | 83.8978s | 210.1122s |
+| Actual recorded tool-result continuation | 40,536 / 31 | 39,936 | 207.7757s | 90.4269s | 116.7534s |
+
+All three HTTP200 responses naturally complete. Raw tokens/text, prepared IDs,
+usage/cache counts, canonical minimal whoami call and native proposal outcomes/
+widths/acceptance match the prior fused baseline exactly; 21/21/10 verifier
+sweeps, command-subset witness true, stream/final equality, no duplicate calls,
+argument parse failures, prefill retry or fallback. Retained 39,936-prefix reuse
+survives both warm requests. This finite greedy proof is NOT original-temperature
+traffic, untouched 134-tool replay, live tool execution, a Plex score, full
+decoded-state/official-BF16 proof, or broad-default validation. Seven old paths
+changed and seven new files were explicitly hashed relative to the prior fused
+711-file baseline; 704 old files unchanged. Not same-manifest/randomized speed A/B.
+
+Measured ownership win: terminal Metal active falls from
+2,474,213,416/2,474,213,416/2,476,408,872B to
+1,236,156,456/1,236,156,456/1,236,189,224B. The active-byte reductions are
+1,238,056,960/1,238,056,960/1,240,219,648B, approximately half. Detached endpoint
+LOGICAL sizes are separately 1,236,776,448/1,236,776,448/1,239,158,304B; neither
+logical size nor allocator-active reduction is a physical free-RAM guarantee.
+Allocator cache after detachment 90,886,564/90,886,564/101,908,024B clears to zero.
+Hook costs 61.888/70.953/102.512ms, including clear_cache 2.369/2.622/4.429ms.
+Non-atomic, nonsynchronizing immediate system-available changes are
+0/+1,095,598,080/0B. Delayed OS observations must not be treated as exact attribution.
+
+Overall FAIL nine unchanged pressure checks. HTTP-end available
+5,226,348,544/5,100,732,416/4,695,670,784B all fail 5.3GB. Actual per-request
+swap-outs 41,631,744/19,562,496/161,579,008B total 222,773,248B; swap-used changes
++25,952,256/-8,388,608/+1,231,880,192B. Repeat-client cumulative used growth
+17,563,648B and swap-outs 61,194,240B remain failures despite declining repeat
+net usage. Entire-sequence used growth is 1,249,443,840B. The continuation's
+material pressure event triggers governor cache-budget contraction to 64MB.
+All true Metal peaks 6.404/4.495/4.713GB pass 8.5GB; that does not waive system
+pressure. No evidence attributes global swap to this cleanup or another app.
+
+No latency win versus prior fused HTTP 899.3414/293.1196/189.2639s; continuation
+is 18.5118s slower with the pressure event, without causal attribution. Prefill
+678.0288/83.8964/90.4255s; engine total 889.7637/294.0152/207.1857s. Logical
+prefill/decode store bytes exactly match baseline (443206551896/407684981096/
+249672867800B total); not physical NVMe I/O. Keep the option OFF by default.
+
+597 pure regressions pass in 7.74s. Four real-MLX small-state tests pass in 0.07s
+after a fresh passing 30-second preflight, preserving all BF16/FP16 bit patterns,
+FP32 recurrent state, QSA/PLE metadata, retained aliases, subsequent fork/update
+and global RNG; these are not a full-model or physical-reclamation benchmark.
+Tiny parent exit0/2.5981s; result SHA
+13a5331c9938c0c714c8f386c9cabe0141e1aa89561247781e239332f9942305.
+Full parent exit1/1411.2318s, 19:30:55.484733 -> 19:54:26.716542UTC, no timeout,
+signal, missing result or source drift. All 718 source hashes and combined/log/
+two child report hashes verified before editing receipts. Root/external minima
+16.704/98.334GB, max child-tree RSS 5.198GB; no remaining gate/server/replay jobs.
+Private logs/qwen4_full131_greedy1024_unretained_endpoint_20260906.json plus
+initial/extension/server/gates artifacts. Result SHA
+cc566a0a7dd7bbdc7bd74fff3ba770b6fc1e7577f1157c82fcbe073814e86f34;
+parent log 3fc679f4686034929f951f67d9c402c372078be139fe9b1924708883717312d3.
+Profile digest e859fda5f81a790baa52d76e4359e2f0b9dc08730ec6ab282d191fa799cf83f7.
+
+Next bounded work: add/verify timestamped per-process footprint/compression/RSS
+observations alongside global swap/available memory before attributing the spike
+or repeating this capture. Read-only self-metrics should avoid new model tensors,
+synchronization, private payloads and threshold changes; measure observer overhead
+and missing-data behavior. Do not rerun unchanged, weaken pressure gates, close
+apps or assume background blame. Then resume heterogeneous real shapes and full
+Plex/context checks. Sub90s, full Plex pass and the long-context ladder remain OPEN.
+
 ## 2026-09-06 UTC: terminal allocator probe preserves completed outputs; no pressure or speed win
 
 The supervised terminal-barrier sequence has FINISHED. New default-off overlays

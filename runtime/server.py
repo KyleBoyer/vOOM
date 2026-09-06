@@ -7770,6 +7770,52 @@ def _observe_qwen4_post_generation_memory(engine, result) -> None:
         pass
 
 
+def _release_qwen4_unretained_endpoint(engine, result) -> None:
+    """Explicit plain-RAM ownership experiment after engine result consumers."""
+    if os.environ.get("VMODEL_QWEN4_RELEASE_UNRETAINED_ENDPOINT", "0") != "1":
+        return
+    from .qwen4_mtp import Qwen4MTPSpeculativeEngine
+
+    if type(engine) is not Qwen4MTPSpeculativeEngine:
+        return
+    from .kv_cache import KVCache
+    from .request_state import detach_unretained_qwen4_endpoint
+    from .phase_head_witness import sample_phase_head_memory
+    import mlx.core as mx
+
+    def sample():
+        try:
+            return sample_phase_head_memory(engine.target, mx)
+        except Exception:
+            return {"available": False, "reason": "observation-error"}
+
+    started = time.perf_counter()
+    before = sample()
+    decision = detach_unretained_qwen4_endpoint(engine.target, KVCache)
+    after_detach = sample()
+    clear_seconds = 0.0
+    if decision["detached"]:
+        clear_started = time.perf_counter()
+        mx.clear_cache()
+        clear_seconds = time.perf_counter() - clear_started
+    observation = {
+        "schema": "voom.unretained-endpoint-release.v1",
+        "scope": "server_after_engine_consumers_before_protocol_completion",
+        "atomic": False, "synchronizes_device": False,
+        "included_in_engine_total_s": False, "included_in_http_wall_s": True,
+        "before": before, "after_detach": after_detach,
+        "after_clear_cache": sample() if decision["detached"] else None,
+        "clear_cache_seconds": clear_seconds,
+        "decision": decision,
+        "wall_seconds": time.perf_counter() - started,
+    }
+    try:
+        result.setdefault("path_stats", {})[
+            "qwen4_unretained_endpoint_release"] = observation
+    except Exception:
+        pass
+
+
 def _engine_generate(engine, *args, expert_top_k: int = 0, **kwargs):
     """Use fail-slow prefill retry when the concrete engine supports it.
 
@@ -7878,6 +7924,7 @@ def _engine_generate(engine, *args, expert_top_k: int = 0, **kwargs):
         callable(kwargs.get("on_token")),
         result,
     )
+    _release_qwen4_unretained_endpoint(engine, result)
     return result
 
 _GATEWAY_CONFIRMATION_RE = re.compile(
@@ -10732,6 +10779,7 @@ def _vision_protocol_timing(result: dict) -> dict:
         "tool_call_text_witness",
         "qwen4_mtp_idle_head_memory_witness",
         "qwen4_post_generation_memory_witness",
+        "qwen4_unretained_endpoint_release",
         "qwen4_completed_history_shadow",
         "qwen4_phase_head_admission",
         "qwen_mtp_accepted_by_step",

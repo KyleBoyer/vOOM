@@ -1,0 +1,10 @@
+schema: voom.runtime-profile.v1
+name: qwen4-release-unretained-endpoint
+description: Experimental serving-only disposal of a non-slot plain-RAM Qwen4 endpoint.
+notes:
+  - "Default-off. Only aligned hot-cache Qwen4 MTP with known plain-RAM slots and no competing persistence/vision/provisional/serial state owners is eligible. A final endpoint that aliases any retained slot is never detached."
+  - "After generation/report/trace consumers, clears only target.last_kv. Never calls endpoint.release, mutates a slot/cache, clears hidden state, or changes sampling. Direct engine oracles are unchanged."
+  - "Scalar samples bracket detachment and allocator-cache clearing before protocol completion. No synchronization or sleep. Cost is in HTTP wall, not the completed engine timer. Logical endpoint bytes are not unique/physical bytes."
+  - "Requires retained-state alias/byte tests and completed cold/repeat/continuation gates with unchanged pressure limits. No broad default, speed or pressure-pass claim from helper tests."
+settings:
+  VMODEL_QWEN4_RELEASE_UNRETAINED_ENDPOINT: true

@@ -40,6 +40,16 @@ def test_qwen_post_generation_overlay_changes_only_explicit_boundary_mode(overla
     assert settings == {**baseline, "VMODEL_QWEN4_POST_GENERATION_MEMORY": mode}
 
 
+def test_unretained_endpoint_overlay_does_not_change_cache_or_target_settings():
+    catalog = discover_runtime_profiles((ROOT / "profiles",))
+    base = "qwen38-flash-next-uncensored-fp8-exact-pipeline-hot-kv-aligned-compact-fused"
+    _, baseline = resolve_runtime_profiles((base, "generation-witness"), catalog)
+    _, candidate = resolve_runtime_profiles(
+        (base, "generation-witness", "qwen4-release-unretained-endpoint"), catalog)
+    assert "VMODEL_QWEN4_RELEASE_UNRETAINED_ENDPOINT" not in baseline
+    assert candidate == {**baseline, "VMODEL_QWEN4_RELEASE_UNRETAINED_ENDPOINT": "1"}
+
+
 def test_completed_history_shadow_overlay_changes_only_observation_flag():
     catalog = discover_runtime_profiles((ROOT / "profiles",))
     base = "qwen38-flash-next-uncensored-fp8-exact-pipeline-hot-kv-aligned-compact"
