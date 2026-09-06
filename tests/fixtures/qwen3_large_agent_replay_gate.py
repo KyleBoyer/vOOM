@@ -76,6 +76,13 @@ KNOWN_CAPTURES = {
         "bytes": 148_584,
         "tools": 131,
     },
+    # Actual preceding request: its complete input list and tool catalog are
+    # an exact prefix/equal catalog of the captured tool-result continuation.
+    "qwen25_tool_result_initial_v1": {
+        "sha256": "57a8486aae5b3691284b8a6481dbc45a62083d7c7235ea18648a1bd4ec8601d4",
+        "bytes": 148_271,
+        "tools": 131,
+    },
 }
 
 

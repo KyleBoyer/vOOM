@@ -90,8 +90,17 @@ def test_real_continuation_identity_is_pinned_without_private_payload():
     }
 
 
+def test_real_initial_request_identity_is_pinned_without_private_payload():
+    assert gate.KNOWN_CAPTURES["qwen25_tool_result_initial_v1"] == {
+        "sha256": "57a8486aae5b3691284b8a6481dbc45a62083d7c7235ea18648a1bd4ec8601d4",
+        "bytes": 148_271,
+        "tools": 131,
+    }
+
+
+@pytest.mark.parametrize("with_tool_result", [False, True])
 def test_preserved_stream_continuation_changes_only_model_and_output_budget(
-        monkeypatch, tmp_path):
+        monkeypatch, tmp_path, with_tool_result):
     original = {
         "model": "old-model", "temperature": 0.3, "stream": True,
         "store": False, "tool_choice": "auto",
@@ -114,6 +123,8 @@ def test_preserved_stream_continuation_changes_only_model_and_output_budget(
             for index in range(131)
         ],
     }
+    if not with_tool_result:
+        original["input"] = original["input"][:3]
     raw = json.dumps(original, ensure_ascii=False).encode()
     capture = tmp_path / "continuation.json"
     capture.write_bytes(raw)
@@ -152,7 +163,7 @@ def test_preserved_stream_continuation_changes_only_model_and_output_budget(
     assert report["request"]["seed_override"] is None
     assert report["request"]["stream_preserved"] is True
     assert report["request"]["scenario"] is None
-    assert report["request"]["effective_input_items"] == 5
+    assert report["request"]["effective_input_items"] == (5 if with_tool_result else 3)
     assert report["request"]["effective_tool_count"] == 131
 
 

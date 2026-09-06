@@ -1,5 +1,38 @@
 # STATUS — 2026-09-06 (current corrections first; dated chronology below is history)
 
+## 2026-09-06 UTC: real initial/repeat/tool-result corpus pinned; full-size reuse evaluation pending
+
+The next bounded job uses TWO actual captured requests, not a constructed tool
+response. Initial1784119997289_6c7efd15.json is148271B, SHA
+57a8486aae5b3691284b8a6481dbc45a62083d7c7235ea18648a1bd4ec8601d4.
+Its complete three-item input is an exact prefix of the existing five-item
+1784120059489_a610054a.json continuation. All non-input fields are equal,
+including all131 original schemas, both original system messages, streaming
+and temperature0.3. The continuation adds the actual recorded function call and
+its matching call-ID tool output. No generated tool is executed; this remains
+a replay of the recorded history, not a live model/tool conversation.
+
+Plan one fresh server: initial cold, exact request repeat, then the actual
+captured tool-result continuation. Only model/max1024 change on the wire; no
+seed, tool pruning, prompt rewrite or forced temperature/stream mode. Initial
+wire148296B SHA93ac67153cd349dca623c91f2a01865e6e5178372832c0895dcc43b30193e465;
+continuation wire148609B SHA505c1996774ced855024c2c034be4bba5652212d72301d5c487573f9a0188509.
+Expected cold then memory/memory, with at least39936 retained tokens for both
+warm requests, natural completion and unchanged8.5GB peak/5.3GB available/16MB
+swap gates. Use aligned-compact + generation-witness; no fused arm. Preserve
+all failures; stop before the continuation if the initial/repeat generation
+fails, truncates or exceeds the Metal cap. Pressure failures are not waived.
+
+This advances actual cache-reuse/continuation coverage after the startup-owner
+fix, but is NOT an old/new latency A/B, greedy equivalence, full state oracle or
+Plex intelligence score; stochastic outputs may differ. Physical savings from
+the fix remain unmeasured. Replay registry now pins the real initial capture.
+71 pure replay tests pass0.11s;146 related pure regressions pass2.53s, seed64005,
+supervised without source drift. Runtime remains the tested a7c69e6 version.
+After freeze/push and a new passing30s preflight, run ONE supervised sequence
+logs/qwen4_real_captured_reuse1024_20260906.json, with separate initial/extension
+reports and server log. Finish it before any other model job or source edit.
+
 ## 2026-09-06 UTC: obsolete hot-startup owner fixed; 500 regressions pass, full-model benefit unmeasured
 
 The concrete lifetime bug from the 131-tool continuation audit is fixed with
