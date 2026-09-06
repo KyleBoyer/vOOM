@@ -1,5 +1,64 @@
 # STATUS — 2026-09-05 (current corrections first; dated chronology below is history)
 
+## 2026-09-06 UTC: identical duplicate Plex calls are already in engine text, not created by protocol parsing
+
+The new read-only observer on source `6e3a0d4` reproduced the frozen failed
+media case without changing its5,983B wire,1839 prepared IDs,146 generated IDs
+or490B raw engine text. This is still the **modified two-original-Plex-tool /
+short system-user history / no developer / nonstream / greedy seed64001 /
+max512** request, NOT unmodified134-tool traffic or a Plex intelligence score.
+The installed uncensored FP8 target and native MTP depth3 are unchanged.
+
+The raw text contains TWO disjoint complete Hermes JSON call frames. Both
+canonical name+argument hashes equal each other AND both returned protocol
+calls: `aa73d122a627ce6a2056d23695c1edcf1fca79d69fb088b25d9a67effd16068c`.
+That digest also equals the independently constructed expected search call
+(Arrival, movie, limit3). Thus BOTH calls have the correct requested arguments,
+but the same action is generated twice. The protocol parser did not introduce
+this duplication. This does **not** yet distinguish target-model behavior from
+a native-MTP generation bug; an ordinary greedy target control is still needed.
+No external tool executed; no deduplication, output rewriting or prompt retuning.
+
+The observer's measured cost is**0.0005421s**. It runs only under the existing
+explicit generation-witness flag, separately from the unchanged token/text
+witness. It hashes raw spans plus canonical call objects; no content is saved.
+JSONDecoder framing is independent of the serving regex; lexical marker counts
+are explicitly not invocation counts. Only Hermes JSON is observed: absent
+frames on another format cannot prove parser duplication. Text/frame/nesting/
+integer limits become unavailable, not truncated success; nonfinite numbers
+are rejected and escaped surrogates cannot crash canonical hashing. Failures
+cannot invalidate the original generation witness or serving response.
+**541 regressions passed in2.48s**, supervised PASS/no drift after a new30s
+preflight6.630/6.600GB, zero churn. Private
+`logs/gates/tool_call_witness_suite_v3_20260906.done.json`.
+
+The real request is still overall **FAIL**, now with exact count2/expected1
+recorded directly in its JSON, plus both unchanged pressure failures. HTTP200
+completed; wall635.2309s, first201.3118s, prefill201.3111s, decode419.6825s,
+engine621.0362s. No speed improvement: previous failed control633.0516s.
+Store reads are identical216,200,372,480B prefill /658,745,963,712B decode /
+874,946,336,192B total; native MTP still104/124 accepted across42 rounds.
+Peak Metal is identical2,525,569,160B, zero prefill retries. Final available
+4.608GB<5.3GB, swap-out32.211MB>16MB, no used-swap growth. Pressure variation
+is not a demonstrated optimization or leak. Selected/effective profile digest
+13273725...6505d4, no overrides; all original wire/token/text hashes below match.
+
+Parent exit1/637.7485s,05:30:27.167982 ->05:41:04.916462 UTC, no timeout/drift;
+all jobs ended. Separate fresh30s model preflight6.577/6.443GB, zero churn.
+Root/external minima19.082/99.113GB; max child-tree RSS4.526GB. Private
+`logs/qwen4_media_rawdiag512_20260906.json` and matching server/gate logs retain
+the full diagnostic alongside its failed acceptance result. No fused arm ran.
+
+Next compare ordinary greedy target generation with native MTP on this SAME
+frozen request to separate model behavior from speculative-decoder behavior;
+do not conceal the duplicate with a host filter or easier prompt. Separately,
+read-only pressure audit found the1.284GB pinned-cache snapshot is taken BEFORE
+the confirmed1.271GB idle head release, so it does not prove a retained-head
+leak. Add immediate post-release cache/pin/Metal/available scalars without
+moving existing HTTP pressure samples. Audit the Qwen-versus-GLM head-reload
+reservation asymmetry before inferring a fix. Completed full capture/Plex,
+extension, long-context, sub90s and full GLM storage-choice gates remain open.
+
 ## 2026-09-06 UTC: varied media/nonstream control finds a real call-count failure; scorer hardened
 
 The next fresh cold **unfused aligned-compact control** on source `439faf7`

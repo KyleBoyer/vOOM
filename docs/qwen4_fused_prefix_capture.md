@@ -22,6 +22,16 @@ do not tune the prompt to conceal it. The replay gate now binds name/argument
 checks and accepts `--expected-function-call-count 1`; canonical per-call hashes
 will distinguish identical calls from repeated names without persisting text.
 
+Follow-up on source6e3a0d4 confirms both identical search calls already exist
+as two disjoint Hermes frames in the raw generated text. Their canonical hashes
+match both protocol calls and the expected arguments; all146 emitted IDs and
+the entire raw text match the previous failed control. New diagnostic costs
+0.542ms,541 regressions pass. The635.2309s request still fails call count and
+memory gates. No fused comparison or speed/quality gain was established.
+Next compare native MTP with ordinary greedy target generation on that frozen
+case; raw-origin attribution alone does not prove the model, rather than its
+speculative decoder, is responsible. No host deduplication or prompt retuning.
+
 ## Proven helper scope
 
 `runtime.qwen4_prefix_capture.AlignedPrefixCapture` requires exact concrete
