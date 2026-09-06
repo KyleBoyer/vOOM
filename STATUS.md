@@ -1,5 +1,55 @@
 # STATUS — 2026-09-06 (current corrections first; dated chronology below is history)
 
+## 2026-09-06 UTC: fused full40K endpoint/prefix equality passes; diagnostic prefill -9.86%, pressure FAIL
+
+Source209bced v2 fused job FINISHED. All eight comparison groups match the audited
+unfused control exactly: model revision, prepared40,432 IDs, stable boundary,
+first greedy ID/raw text, complete121-array endpoint, BF16 hidden and retained
+39,936-prefix state INCLUDING complete prefix/authoritative-endpoint metadata.
+Full/prefix payloads1,235,447,040/1,221,709,824B. This extends the prior1,611-token
+state proof to the real131-tool context. It is still only a first-token endpoint
+proof against this runtime's unfused control, not an independent official-model
+oracle, completed-output MTP/continuation proof or Plex score.
+
+With all131 original tools/messages/streaming retained BUT model/max1/temp0/
+seed64012 overrides and read-only endpoint hashing, diagnostic prefill is
+676.0593s versus750.0486s control (-73.9893s,9.86%); HTTP693.2499s versus767.1545s.
+Store-accounted reads128,900,497,040 versus220,963,782,680B:92,063,285,640B fewer,
+not the smaller-context101.040GB reduction and not measured physical disk bytes.
+No serving-speed achievement is claimed from these instrumented one-token arms.
+HTTP200/incomplete, length termination, no decode or retries. All48 layers capture
+the prefix,37 histories/2,396,160B in0.005969s,491,520B scratch; ordinary separate
+compaction is bypassed. Retained admission remains1,234,292,736B including QSA.
+
+Tradeoff: true Metal peak grows5,676,593,800 ->6,404,273,968B (+727,680,168B),
+still below8.5GB. HTTP swap-outs23,298,048B FAIL16MB (control64,372,736B);
+used swap stays1,499,201,536B. Before-hash available4.160GB, after-hash5.859GB,
+HTTP-end5.850GB; do not count the post-hash floor pass as normal serving pressure.
+Hashing2.039461s reads the same full/prefix/hidden bytes as control; active Metal
+2,847,621,160B unchanged across hashing. Combined result stays FAIL, solely churn.
+
+All711 current source hashes and five result/log hashes verified;709 code/fixture/
+profile files match the control, with only the two recorded receipt-file changes.
+Identical148306B diagnostic wire5b45b707...5d03ec; only profile setting delta
+VMODEL_QWEN4_FUSED_ALIGNED_PREFIX=1, selected/effective4473f9eb...df8250, no overrides.
+Parentexit1/695.8999s15:27:58.131159->15:39:34.030633UTC; no timeout/signal/
+missing result/drift. Combined SHA
+368e71c62eb4733f701c83ba2a9eeffe98ab46d756f95e5d0a1df6ccb7c6637c;
+parent logce4157e1b80f4900e673ec9d240c6b769493083fd035699734fe28340faf6727.
+Root/externalmin16.744/98.380GB,maxRSS5.102GB; all four PIDs gone. Private
+logs/qwen4_full131_fused_state_candidate_v2_20260906.json, endpoint/http/server
+and gate artifacts. Initial pre-launch failure remains preserved separately.
+
+Next: fresh completed-output greedy A/B on cold initial, exact repeat and the
+actual recorded tool-result continuation, all131 tools/history intact. Both arms
+explicitly use model/max1024/temp0/seed64013 overrides and generation-witness;
+no endpoint hashing or history shadow. First run the unfused control, then the
+fused candidate, requiring complete raw-token/text and call equality, expected
+39,936-token reuse, no repeats/continuation fused capture, and unchanged pressure
+gates. These deterministic diagnostics do not replace original-temperature traffic;
+originaltemp0.3/no-seed serving validation remains a subsequent separate gate.
+Defaults stay unchanged; full Plex, varied-domain and sub90s objectives remain open.
+
 ## 2026-09-06 UTC: full40K state control captured; wire-pin ordering audited, pressure still FAIL
 
 The sourcefe489d2 unfused aligned-compact control has ended. All131 original
