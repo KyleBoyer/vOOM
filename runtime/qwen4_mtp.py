@@ -1270,6 +1270,8 @@ class Qwen4MTPSpeculativeEngine:
                 target, "_qwen4_phase_head_restore_refusals", 0)),
             "qwen4_phase_lm_head_restore_s": float(getattr(
                 target, "_qwen4_phase_head_restore_s", 0.0)),
+            "qwen4_phase_head_admission": dict(getattr(
+                target, "_qwen4_phase_head_admission_stats", {})),
             "qwen4_serial_verify_pipelined_expert_layers": int(getattr(
                 target,
                 "_qwen4_serial_verify_pipelined_expert_layers",

@@ -1,5 +1,58 @@
 # STATUS — 2026-09-05 (current corrections first; dated chronology below is history)
 
+## 2026-09-06 UTC: exact Qwen head admission repaired; unit/stress gates pass, model proof pending
+
+The suspended Qwen4 head path now asks the live governor to admit its EXACT
+metadata-derived bytes after the existing optional verifier-tail trim and BEFORE
+fetch/promotion. The installed head is 1,271,398,400B. Refusal cannot fetch or
+promote; owned, tied, streamed, no-governor and non-Qwen paths retain their
+existing behavior. An unpinned contains/get race cannot bypass admission.
+The precise `qwen4-phase-lm-head` reason uses the existing reversible admission
+policy: ineffective empty-cache reductions cannot permanently ratchet the
+budget down, and concurrent pressure reductions are not rolled back.
+Target weights, arithmetic, sampling and named-profile defaults are unchanged.
+
+New structured `qwen4_phase_head_admission` reports calls, exact requested bytes,
+time, refusals and per-reservation governor counter deltas. Missing/decreasing
+counters remain unavailable rather than false zero. Scope is explicitly the
+current target attempt plus following native MTP, EXCLUDING prior retry attempts;
+ordinary generation takes a copy and MTP refreshes it after verification.
+Require zero prefill retries before treating it as an all-request witness.
+This is a safety repair, not yet a speed/pressure improvement.
+
+**695 related regressions pass in 8.51s** (fixed randomized seed64002), including
+exact order/refusal/no-ratchet, real tiny BF16 lifecycle, GLM neutrality, MTP and
+serving projection. The initial combined suite's 694-pass/1-failure receipt is
+preserved: GLM's immediate observed release counter was zero despite the outer
+8MB drop. Isolation passed, and an unchanged seeded combined run also passed;
+neither alone explained that failure. A scalar-only 1000-iteration diagnostic
+then reproduced 12 failures with ordinary eval versus 0 with pre-release
+synchronization. Some ordinary samples retained the full 8MB through both
+release samples, then retired during the next allocation baseline. Engine/test
+getter identity matched; no Python trace/profile hook was active.
+
+The test fixtures now establish completed-consumer quiescence BEFORE baseline
+and release. BOTH exact 8MB observed-drop assertions remain; there is no
+post-release wait/GC/sync to force a pass, no substitution of logical bytes for
+observed bytes, and no GLM runtime synchronization change. This isolates Python
+ownership from deferred Metal command-buffer retirement, consistent with
+[MLX 0.32.0 completed-handler ownership](https://github.com/ml-explore/mlx/blob/v0.32.0/mlx/backend/metal/eval.cpp)
+and its [allocator's pool-only clear](https://github.com/ml-explore/mlx/blob/v0.32.0/mlx/backend/metal/allocator.cpp).
+The revised real GLM release, late-cleanup-error release, and Qwen two-cycle
+release tests each pass **1000 repeats** (0.475/0.319/0.950s). Fresh passing 30s
+preflights precede every MLX job; supervised exit/hash/source-drift receipts are
+under `logs/gates/head_admission_*_20260906` and
+`logs/gates/glm_head_retirement_probe_20260906`. Final suite preflight available
+7.231/7.194GB, zero swap growth/out; root 18.031GB free.
+
+Next freeze this source and replay the SAME modified two-Plex-tool / short
+system-user / no developer / nonstream / greedy seed64001 / max512 media request
+against the prior head-observer's full raw-generation witness. Keep exact count1,
+5.3GB available and 16MB swap gates: the known duplicate calls/pressure failures
+must not be hidden. Record whether all exact head reservations fast-path; if
+they do, stop this as a speed lever. No new model timing, Plex score, broad
+generalization, unmodified capture, large-context or sub-90s claim yet.
+
 ## 2026-09-06 UTC: phase-head observer confirms the exact head is released; no output or speed change
 
 Source `6f13991` adds an opt-in, read-only memory witness around the EXISTING

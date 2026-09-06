@@ -2607,6 +2607,7 @@ class StreamingEngine:
         self._qwen4_phase_head_restore_successes = 0
         self._qwen4_phase_head_restore_refusals = 0
         self._qwen4_phase_head_restore_s = 0.0
+        self._qwen4_phase_head_admission_stats = {}
         self._qwen4_serial_verify_head_suspend_calls = 0
         self._qwen4_serial_verify_head_suspend_bytes = 0
         self._qwen4_serial_verify_head_restore_trim_bytes = 0
@@ -5720,6 +5721,9 @@ class StreamingEngine:
             # mutation, so the next round may prefetch normally again.
             self._qwen4_serial_verify_head_restore_trim_bytes += int(
                 self.cache.trim_to(0))
+        if (self._qwen4_lm_head_pin_suspended and bool(getattr(
+                self.rc, "qwen4_phase_lm_head", False))):
+            self._reserve_qwen4_phase_lm_head()
         if bool(getattr(self, "_glm53_lm_head_pin_suspended", False)):
             # A dormant lease does not itself reserve ordinary LRU capacity.
             # Make its exact resident bytes available before fetching so the
@@ -5749,6 +5753,49 @@ class StreamingEngine:
         elif bool(getattr(self, "_glm53_lm_head_pin_suspended", False)):
             self._restore_glm53_phase_lm_head(head)
         return head
+
+    def _reserve_qwen4_phase_lm_head(self) -> None:
+        """Admit the missing exact head before cache.get can materialize it.
+
+        A dormant over-capacity pin is ownership permission, not free memory.
+        Do not use a contains-then-get check: an unpinned page could be evicted
+        between those calls. An already owned head returns earlier instead.
+        """
+        if self.governor is None:
+            return
+        phase_bytes = self._qwen4_phase_head_bytes
+        if (isinstance(phase_bytes, bool) or not isinstance(phase_bytes, int)
+                or phase_bytes <= 0):
+            raise ValueError("Qwen4 phase head requires exact positive byte metadata")
+        counter_names = (
+            "reservation_fast_path_calls", "reservation_clear_cache_only_calls",
+            "reservation_cache_released_bytes", "reservation_budget_reduced_bytes",
+            "reservation_budget_restored_bytes", "reservation_unproductive_shrinks",
+            "reservation_zero_release_short_circuits", "reservations",
+        )
+        before = {name: getattr(self.governor, name, None) for name in counter_names}
+        stats = self._qwen4_phase_head_admission_stats
+        stats["scope"] = "current_target_attempt_and_following_mtp"
+        stats["includes_prior_retry_attempts"] = False
+        stats["calls"] = stats.get("calls", 0) + 1
+        stats["requested_bytes"] = stats.get("requested_bytes", 0) + phase_bytes
+        stats.setdefault("refusals", 0)
+        started = time.perf_counter()
+        try:
+            self.governor.reserve(phase_bytes, reason="qwen4-phase-lm-head")
+        except MemoryError:
+            stats["refusals"] += 1
+            raise
+        finally:
+            stats["seconds"] = stats.get("seconds", 0.0) + time.perf_counter() - started
+            for name in counter_names:
+                after = getattr(self.governor, name, None)
+                prior = before[name]
+                if (type(prior) is int and type(after) is int and after >= prior
+                        and (name not in stats or stats[name] is not None)):
+                    stats[name] = stats.get(name, 0) + after - prior
+                else:
+                    stats[name] = None  # unavailable counter, not zero reclamation
 
     def _suspend_glm53_phase_lm_head(self) -> int:
         """Release GLM-5.3-Flash's exact head at the request boundary."""
@@ -11311,6 +11358,7 @@ class StreamingEngine:
         self._qwen4_phase_head_restore_successes = 0
         self._qwen4_phase_head_restore_refusals = 0
         self._qwen4_phase_head_restore_s = 0.0
+        self._qwen4_phase_head_admission_stats = {}
         self._qwen4_serial_verify_head_suspend_calls = 0
         self._qwen4_serial_verify_head_suspend_bytes = 0
         self._qwen4_serial_verify_head_restore_trim_bytes = 0
@@ -14327,6 +14375,8 @@ class StreamingEngine:
                 self._qwen4_phase_head_restore_refusals)
             path_stats["qwen4_phase_lm_head_restore_s"] = float(
                 self._qwen4_phase_head_restore_s)
+            path_stats["qwen4_phase_head_admission"] = dict(
+                self._qwen4_phase_head_admission_stats)
             path_stats["qwen4_serial_verify_suspend_lm_head"] = int(
                 self.rc.qwen4_serial_verify_suspend_lm_head)
             path_stats["qwen4_serial_verify_head_suspend_calls"] = int(

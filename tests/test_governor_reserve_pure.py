@@ -232,6 +232,63 @@ def test_glm53_zero_release_shrinks_do_not_persist():
     assert gov.reservation_reason_counts == {"glm53-expert-page": 1}
 
 
+def test_qwen4_head_zero_release_settle_does_not_ratchet_empty_cache():
+    module, mx = load_pressure(4_995_000_000)
+    gov = make_governor(module, mx, cache_max=2_200_000_000, floor=100_000_000)
+    gov.metal_limit = 5_000_000_000
+    gov.cache.total_bytes = 0
+    mx.clear_release_after = 4
+    mx.clear_release_bytes = 1_300_000_000
+    # Inject system samples into this isolated module, not global psutil.
+    module.psutil = types.SimpleNamespace(
+        virtual_memory=lambda: types.SimpleNamespace(available=6_000_000_000))
+    module.time = types.SimpleNamespace(sleep=lambda _: None)
+    gov.reserve(1_271_398_400, margin=0, reason="qwen4-phase-lm-head")
+    assert gov.cache.max_bytes == 2_200_000_000
+    assert gov.cache.total_bytes == 0
+    assert gov.reservation_cache_released_bytes == 0
+    assert gov.reservation_zero_release_short_circuits == 1
+    assert gov.reservations == 1
+    assert gov.reservation_budget_restored_bytes == gov.reservation_budget_reduced_bytes
+    assert gov.reservation_reason_counts == {"qwen4-phase-lm-head": 1}
+    assert gov.reservation_failures == 0
+
+
+def test_qwen4_head_unreclaimable_refusal_preserves_empty_cache_budget():
+    module, mx = load_pressure(4_995_000_000)
+    gov = make_governor(module, mx, cache_max=2_200_000_000, floor=100_000_000)
+    gov.metal_limit = 5_000_000_000
+    gov.cache.total_bytes = 0
+    module.psutil = types.SimpleNamespace(
+        virtual_memory=lambda: types.SimpleNamespace(available=6_000_000_000))
+    module.time = types.SimpleNamespace(sleep=lambda _: None)
+    try:
+        gov.reserve(1_271_398_400, margin=0, reason="qwen4-phase-lm-head")
+    except MemoryError as error:
+        assert "reason=qwen4-phase-lm-head" in str(error)
+    else:
+        raise AssertionError("unadmitted head allocation was allowed")
+    assert gov.cache.max_bytes == 2_200_000_000
+    assert gov.reservations == 1
+    assert gov.reservation_zero_release_short_circuits == 1
+    assert gov.reservation_cache_released_bytes == 0
+    assert gov.reservation_failures == 1
+    assert gov.prefetcher.paused
+
+
+def test_qwen4_head_fast_path_does_not_clear_or_change_cache_budget():
+    module, mx = load_pressure(400_000_000)
+    gov = make_governor(module, mx, cache_max=256_000_000, floor=64_000_000)
+    module.psutil = types.SimpleNamespace(
+        virtual_memory=lambda: types.SimpleNamespace(available=5_700_000_000))
+    gov.reserve(1_271_398_400, reason="qwen4-phase-lm-head")
+    assert gov.reservation_calls == gov.reservation_fast_path_calls == 1
+    assert gov.reservations == mx.clears == 0
+    assert gov.cache.max_bytes == 256_000_000
+    assert gov.reservation_cache_released_bytes == 0
+    assert not gov.prefetcher.paused
+
+
 def test_productive_reclaim_keeps_reduced_budget_and_reason_telemetry():
     module, mx = load_pressure(int(9.8e9))
     gov = make_governor(

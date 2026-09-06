@@ -236,9 +236,16 @@ def test_real_cache_release_drops_last_metal_reference():
     engine.cache = WeightCache(Store(), max_bytes=16_000_000)
     engine._glm53_phase_head_bytes = size
     engine.cache.register_suspended_pin("glm53:lm_head:persistent", size)
+    # Isolate ownership from asynchronous command-buffer retirement. The
+    # release API requires a completed consumer boundary; eval alone can leave
+    # a Metal completion handler holding a buffer briefly after it returns.
+    # Establish quiescence BEFORE measuring/releasing, never afterward to make
+    # a failed release pass. Keep both exact allocation-drop assertions below.
+    mx.synchronize()
     mx.clear_cache()
     initial = mx.get_active_memory()
     engine._lm_head_weight()
+    mx.synchronize()
     before = mx.get_active_memory()
     assert before >= initial + size
     assert engine._suspend_glm53_phase_lm_head() == size
@@ -264,6 +271,7 @@ def test_late_real_cache_release_failure_does_not_restore_unowned_head():
     engine._glm53_phase_head_bytes = size
     engine.cache.register_suspended_pin("glm53:lm_head:persistent", size)
     engine._lm_head_weight()
+    mx.synchronize()  # completed consumer precondition, not post-release cleanup
     before = mx.get_active_memory()
     with pytest.raises(RuntimeError, match="late mapping cleanup failed"):
         engine._suspend_glm53_phase_lm_head()

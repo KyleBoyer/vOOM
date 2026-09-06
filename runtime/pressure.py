@@ -263,6 +263,7 @@ class MemoryGovernor:
         reversible_admission = (
             reason.startswith("serial-verify-")
             or reason == "qwen-prefill-layer-page"
+            or reason == "qwen4-phase-lm-head"
             or reason.startswith("glm53-")
         )
         active, available, ceiling, projected = sample()

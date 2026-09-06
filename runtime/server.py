@@ -10694,6 +10694,7 @@ def _vision_protocol_timing(result: dict) -> dict:
         "generation_witness",
         "tool_call_text_witness",
         "qwen4_mtp_idle_head_memory_witness",
+        "qwen4_phase_head_admission",
         "qwen_mtp_accepted_by_step",
         "qwen_mtp_verified_by_step",
         "qwen_mtp_entropy_stop_events_by_step",

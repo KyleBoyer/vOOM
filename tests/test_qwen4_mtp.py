@@ -678,6 +678,34 @@ def test_idle_head_memory_observer_covers_each_return_path(
         assert stats["qwen4_mtp_fallback_reason"] == "repetition-penalty"
 
 
+def test_mtp_refreshes_head_admissions_after_bootstrap_without_aliasing(_cache_io_noop):
+    class Target(_FakeTarget):
+        def generate(self, *args, **kwargs):
+            result = super().generate(*args, **kwargs)
+            self._qwen4_phase_head_admission_stats = {
+                "scope": "current_target_attempt_and_following_mtp",
+                "includes_prior_retry_attempts": False,
+                "calls": 1, "requested_bytes": 128, "refusals": 0}
+            result["path_stats"]["qwen4_phase_head_admission"] = dict(
+                self._qwen4_phase_head_admission_stats)
+            return result
+
+        def forward_tokens_serial_positions(self, *args, **kwargs):
+            self._qwen4_phase_head_admission_stats["calls"] += 1
+            self._qwen4_phase_head_admission_stats["requested_bytes"] += 128
+            return super().forward_tokens_serial_positions(*args, **kwargs)
+
+    target = Target([11, 12, 13])
+    engine = Qwen4MTPSpeculativeEngine(target, depth=2, drafter=_FakeDrafter([11, 12]))
+    result = engine.generate("prompt", max_tokens=4, sampling=SamplingParams(temperature=0.0))
+    stats = result["path_stats"]["qwen4_phase_head_admission"]
+    assert stats["calls"] == 2 and stats["requested_bytes"] == 256
+    assert stats["includes_prior_retry_attempts"] is False
+    target._qwen4_phase_head_admission_stats["calls"] += 1
+    assert stats["calls"] == 2
+    assert result["tokens"] == [10, 11, 12, 13]
+
+
 class _CounterTarget(_FakeTarget):
     """Exercise the real cumulative cache-I/O helpers without checkpoint I/O."""
 

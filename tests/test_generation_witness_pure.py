@@ -175,6 +175,18 @@ def test_phase_head_memory_protocol_preserves_nested_unavailable_and_zero(api, s
 
 
 @pytest.mark.parametrize("source", ["path_stats", "top_level"])
+def test_qwen4_head_admission_protocol_preserves_attempt_scope_and_unavailable(api, source):
+    key = "qwen4_phase_head_admission"
+    stats = {"scope": "current_target_attempt_and_following_mtp",
+             "includes_prior_retry_attempts": False, "calls": 43,
+             "requested_bytes": 54_670_131_200, "refusals": 0,
+             "seconds": 0.003, "reservation_cache_released_bytes": None}
+    result = {"path_stats": {key: stats}} if source == "path_stats" else {key: stats}
+    assert api._vision_protocol_timing(result)[key] == stats
+    assert key not in api._vision_protocol_timing({})
+
+
+@pytest.mark.parametrize("source", ["path_stats", "top_level"])
 @pytest.mark.parametrize("reason,eligible,policy_eligible", [
     ("tile-aligned", True, True),
     ("no-admissible-complete-tile", False, False),
