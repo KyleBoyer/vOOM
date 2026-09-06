@@ -252,6 +252,8 @@ def main(argv=None):
     parser.add_argument("--profile-dir", action="append", default=[])
     parser.add_argument("--diagnose-retained-prefix", type=int, default=0,
                         help="Post-generation RAM-fork materialization/PLE-detachment experiment; max1 only")
+    parser.add_argument("--diagnose-retained-kda-conv", action="store_true",
+                        help="Also detach retained DeltaNet convolution histories; requires retained-prefix diagnostic")
     args = parser.parse_args(argv)
     if args.artifact.exists() or args.artifact.is_symlink():
         parser.error("artifact already exists; choose a fresh private artifact path")
@@ -259,6 +261,8 @@ def main(argv=None):
         parser.error("positive expected prompt-token count and valid port are required")
     if not 0 <= args.diagnose_retained_prefix < args.expected_prompt_tokens:
         parser.error("retained-prefix diagnostic must be a strict nonnegative prompt prefix")
+    if args.diagnose_retained_kda_conv and not args.diagnose_retained_prefix:
+        parser.error("KDA convolution diagnostic requires a retained prefix")
 
     # Heavy imports occur only in this explicit CLI entry point, after the
     # caller's preflight. Importing/testing schema helpers never initializes MLX.
@@ -290,6 +294,7 @@ def main(argv=None):
             mx.synchronize()
 
         def retained_diagnostic(target, prompt_ids):
+            cfg = target.cfg
             return diagnose_retained_fork(
                 target, prompt_ids, expected_prefix=args.diagnose_retained_prefix,
                 kv_type=KVCache, state_digest=_state_digest,
@@ -303,7 +308,16 @@ def main(argv=None):
                 metal_memory=lambda: {"active_bytes": int(mx.get_active_memory()),
                                       "cache_bytes": int(mx.get_cache_memory()),
                                       "allocator_peak_bytes": int(mx.get_peak_memory())},
-                clear_cache=mx.clear_cache)
+                clear_cache=mx.clear_cache,
+                include_kda_conv=args.diagnose_retained_kda_conv,
+                expected_kda_layers=tuple(
+                    layer for layer, kind in enumerate(cfg.layer_types)
+                    if kind == "linear_attention"),
+                expected_kda_shape=(
+                    1, max(0, cfg.linear_conv_kernel_dim - 1),
+                    2 * cfg.linear_num_key_heads * cfg.linear_key_head_dim
+                    + cfg.linear_num_value_heads * cfg.linear_value_head_dim),
+                expected_kda_dtype=mx.bfloat16)
 
     original = server._engine_generate
     probe = FirstTokenHTTPProbe(

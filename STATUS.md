@@ -1,5 +1,35 @@
 # STATUS — 2026-09-05 (current corrections first; dated chronology below is history)
 
+## 2026-09-06 UTC: expanded retained-convolution diagnostic ready
+
+Read-only follow-up found the same padded-tail pattern in all 36 decoder
+DeltaNet convolution histories: `_causal_depthwise_conv1d()` retains a slice
+of its padded input. Each BF16 `[1, 3, 10240]` history is 61,440 logical bytes,
+but a 1,024-position prefill can leave 20 MiB of additional backing per layer.
+Together with PLE, **775,946,240 potential excess bytes** are a new concrete,
+unmeasured explanation for most of the retained-prefix active-memory gap.
+The 36 separate FP32 recurrent matrices must remain untouched. QSA raw-key
+views have a separate potential backing cost and are deliberately excluded.
+
+The disposable max1 observer now accepts explicit
+`--diagnose-retained-kda-conv` only alongside a retained-prefix diagnostic.
+Before any mutation it validates every expected history layer, BF16 shape,
+distinct mutable list owner, immutable history tuple and resident/non-factor
+state. It replaces only the retained history tuples, samples KDA detachment
+separately from PLE and allocator clearing, and retains both whole-state and
+metadata before/after hashes plus the independent no-hot endpoint/hidden gate.
+Default PLE-only diagnostics and production serving behavior remain unchanged.
+
+**656 tests passed in 4.88s**, including all 16-bit payloads and BF16/F16
+continuations through the real causal-convolution operator after exact history
+detachment. Supervised PASS / exit0 after a fresh 30-second preflight. The
+checkpoint diagnostic has not run yet: planned private endpoint
+`logs/qwen4_retained_allconv_memory_first_20260906.json`. Require 36 KDA
+copies / 2,211,840 bytes and one PLE copy / 184,320 bytes; the predicted memory
+release is an observation to measure, not a forced pass criterion. This is
+post-generation attribution, not completed-output, serving pressure or speed
+proof. A separate fresh preflight is mandatory before that model run.
+
 ## 2026-09-06 UTC: PLE detachment recovers 20 MiB, not the large retained-memory gap
 
 The new post-generation experiment completed on source `d5bff9d`. On the

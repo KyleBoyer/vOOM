@@ -48,7 +48,8 @@ def metadata(kv):
         "dtype": a.dtype})
 
 
-def run(target, *, bad_copy=False, same_copy=False):
+def run(target, *, bad_copy=False, same_copy=False, include_kda=False,
+        bad_kda=False, kda_geometry=None):
     events = []
     live = [1000]
 
@@ -59,12 +60,16 @@ def run(target, *, bad_copy=False, same_copy=False):
     def digest(kv):
         events.append("hash")
         raw = b"".join(a.payload for a in kv.qwen4_cache.ple_conv)
+        for history in getattr(kv.kda_cache, "_conv", ()):
+            if history is not None:
+                raw += b"".join(a.payload for a in history if a is not None)
         return hashlib.sha256(raw).hexdigest(), 1, len(raw), {"ple": raw.hex()}
 
     def copy(value):
         events.append("copy")
-        live[0] = 700
-        return value if same_copy else Array(b"bad!" if bad_copy else value.payload)
+        live[0] -= 200
+        corrupt = bad_copy or (bad_kda and value.payload == b"kda!")
+        return value if same_copy else Array(b"bad!" if corrupt else value.payload)
 
     def sample_memory():
         events.append("sample")
@@ -74,7 +79,10 @@ def run(target, *, bad_copy=False, same_copy=False):
         target, (1, 2, 3, 4, 5, 6), expected_prefix=4, kv_type=KV,
         state_digest=digest, metadata_digest=metadata, copy_ple=copy,
         synchronize_ple=synchronize, pressure=lambda: {"available_bytes": 10_000},
-        metal_memory=sample_memory, clear_cache=lambda: events.append("clear"))
+        metal_memory=sample_memory, clear_cache=lambda: events.append("clear"),
+        include_kda_conv=include_kda,
+        **({"expected_kda_layers": (0,), "expected_kda_shape": (1, 1, 2),
+            "expected_kda_dtype": "bf16", **(kda_geometry or {})}))
     return report, events
 
 
@@ -154,3 +162,96 @@ def test_report_contains_hashes_not_metadata_payloads():
     report, _ = run(setup()[0])
     encoded = json.dumps(report)
     assert '"starts"' not in encoded and '"windows"' not in encoded
+
+
+def setup_kda():
+    target, endpoint, fork, shared = setup()
+    conv = Array(b"kda!")
+    recurrent = object()  # Deliberately not an array: never sent to bit copier.
+    for kv in (endpoint, fork):
+        kv.kda_cache = SimpleNamespace(_conv=[(conv,)], _state=[recurrent],
+                                       _spill_meta={}, _factor_capture=None,
+                                       spill_enabled=False)
+    return target, endpoint, fork, shared, conv, recurrent
+
+
+def test_all_conv_detach_preserves_authoritative_owner_and_recurrent_matrix():
+    target, endpoint, fork, shared, conv, recurrent = setup_kda()
+    old_tuple = fork.kda_cache._conv[0]
+    report, events = run(target, include_kda=True)
+    assert report["fork_equal"] and report["endpoint_equal"]
+    assert events.index("hash") < events.index("copy")
+    assert report["kda_conv_included"] is True
+    assert report["copied_arrays"] == report["kda_copied_arrays"] == 1
+    assert report["copied_bytes"] == report["kda_copied_bytes"] == 4
+    assert report["kda_copy_host_read_bytes"] == 4
+    assert report["detach_active_released_bytes"] == 200
+    assert report["kda_detach_active_released_bytes"] == 200
+    assert endpoint.kda_cache._conv[0][0] is old_tuple[0] is conv
+    assert fork.kda_cache._conv[0] is not old_tuple
+    assert fork.kda_cache._conv[0][0] is not conv
+    assert fork.kda_cache._conv[0][0].payload == conv.payload
+    assert fork.kda_cache._state[0] is endpoint.kda_cache._state[0] is recurrent
+    assert endpoint.qwen4_cache.ple_conv[0] is shared
+    assert [s["stage"] for s in report["stages"]][-4:] == [
+        "after_ple_detach", "after_kda_detach", "after_allocator_clear",
+        "after_verification_hashes"]
+
+
+def test_kda_corruption_fails_full_fork_equality_without_changing_endpoint():
+    report, _ = run(setup_kda()[0], include_kda=True, bad_kda=True)
+    assert report["fork_equal"] is False and report["endpoint_equal"] is True
+
+
+def test_default_mode_does_not_detach_kda_or_add_a_kda_stage():
+    target, endpoint, fork, _, conv, _ = setup_kda()
+    report, _ = run(target)
+    assert report["kda_conv_included"] is False
+    assert report["kda_copied_arrays"] == report["kda_copied_bytes"] == 0
+    assert not report["logical_kda_conv"]
+    assert fork.kda_cache._conv[0][0] is endpoint.kda_cache._conv[0][0] is conv
+    assert "after_kda_detach" not in [s["stage"] for s in report["stages"]]
+
+
+@pytest.mark.parametrize("change", [
+    "shared_list", "missing_list", "short_list", "mutable_history",
+    "spilled", "spill_metadata", "factor_capture", "wrong_shape",
+    "wrong_dtype", "missing_history", "two_arrays", "null_array",
+])
+def test_all_conv_rejects_unsupported_history_before_any_ple_mutation(change):
+    target, endpoint, fork, shared, _, _ = setup_kda()
+    kda = fork.kda_cache
+    if change == "shared_list": kda._conv = endpoint.kda_cache._conv
+    elif change == "missing_list": del kda._conv
+    elif change == "short_list": kda._conv = []
+    elif change == "mutable_history": kda._conv[0] = list(kda._conv[0])
+    elif change == "spilled": kda.spill_enabled = True
+    elif change == "spill_metadata": kda._spill_meta = {0: {}}
+    elif change == "factor_capture": kda._factor_capture = []
+    elif change == "wrong_shape": kda._conv[0][0].shape = (2, 1, 1)
+    elif change == "wrong_dtype": kda._conv[0][0].dtype = "fp32"
+    elif change == "missing_history": kda._conv[0] = None
+    elif change == "two_arrays": kda._conv[0] = (Array(), Array())
+    elif change == "null_array": kda._conv[0] = (None,)
+    with pytest.raises(ValueError, match="KDA"):
+        run(target, include_kda=True)
+    assert fork.qwen4_cache.ple_conv[0] is shared
+
+
+@pytest.mark.parametrize("geometry", [
+    {"expected_kda_layers": ()}, {"expected_kda_layers": (0, 0)},
+    {"expected_kda_layers": (1,)}, {"expected_kda_layers": (True,)},
+    {"expected_kda_shape": None}, {"expected_kda_dtype": None},
+])
+def test_all_conv_requires_expected_geometry_not_just_nonempty_copy(geometry):
+    with pytest.raises(ValueError, match="KDA"):
+        run(setup_kda()[0], include_kda=True, kda_geometry=geometry)
+
+
+def test_cli_requires_prefix_when_kda_mode_is_selected(tmp_path):
+    from tests.fixtures.qwen4_hot_boundary_http_probe import main
+    with pytest.raises(SystemExit) as error:
+        main(["--artifact", str(tmp_path / "never.json"), "--label", "guard",
+              "--expected-prompt-tokens", "6", "--profile", "unused",
+              "--diagnose-retained-kda-conv"])
+    assert error.value.code == 2
