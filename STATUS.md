@@ -1,5 +1,26 @@
 # STATUS — 2026-09-06 (current corrections first; dated chronology below is history)
 
+## 2026-09-06 UTC: full40K fused-prefill proof starts with an unfused state control
+
+Next supervised job `qwen4_full131_unfused_state_control_20260906` captures the
+current two-sweep aligned-compact endpoint and its independently swept retained
+prefix: full40,432 / retained39,936 positions, all121 state arrays, full position
+metadata and BF16 hidden bits. It is a read-only first-token diagnostic, NOT a
+completed response, Plex score or serving-speed measurement; host hashing adds
+separately timed reads/pressure. No state detachment, history drafting or fused
+candidate is enabled in this control. Existing generation-witness overlay only.
+
+All131 real tools and original messages/streaming remain. Diagnostic wire changes
+are explicitly model, max-output1, temperature0 and seed64012; this allows a
+deterministic first-token comparison, not a claim of untouched traffic. Capture
+SHA57a8486a...8601d4; wire148306B SHA
+858abfc26d6dec2dc139d433269e63d28145df8ef5f336e05452c2c5ed42df3f.
+Use a fresh30s preflight and unchanged8.5GB/5.3GB/16MB gates; source remains frozen
+while running. Private logs/qwen4_full131_unfused_state_control_20260906.json,
+matching endpoint/http/server artifacts and gates envelope. Finish and verify
+this control before the separate fused arm; neither short-token arm substitutes
+for subsequent max1024 completed cold/repeat/actual-continuation acceptance.
+
 ## 2026-09-06 UTC: full131-tool history observation completes; continuation matches weak, pressure FAIL
 
 The pending sourcee6f6afb shadow sequence has FINISHED. Installed uncensored
