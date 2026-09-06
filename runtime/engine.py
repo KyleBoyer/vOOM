@@ -923,6 +923,7 @@ class RuntimeConfig:
     # original prefill tile. Off until real endpoint/token/pressure gates pass.
     qwen4_hot_kv_tile_aligned: bool = False
     qwen4_compact_retained_conv: bool = False
+    qwen4_fused_aligned_prefix: bool = False
     # Evaluate this many already-independent routed tile accumulators in one
     # mx.eval call. Each expert GEMM retains its original per-tile shape and
     # every tile retains ascending expert accumulation; only the host/device
@@ -1570,6 +1571,7 @@ class RuntimeConfig:
             mlx_cache_limit_mb=mem.get("mlx_cache_limit_mb", 1024),
             qwen4_hot_kv_tile_aligned=run.get("qwen4_hot_kv_tile_aligned", False),
             qwen4_compact_retained_conv=run.get("qwen4_compact_retained_conv", False),
+            qwen4_fused_aligned_prefix=run.get("qwen4_fused_aligned_prefix", False),
             execution_profile=run.get("execution_profile", ""),
             native_ct_mxfp4=run.get("native_ct_mxfp4", False),
             kimi_k3_scale_sidecar_dir=run.get(
@@ -7002,9 +7004,50 @@ class StreamingEngine:
         self._restore_aggregate_layer_transient(transient_shape_positions)
         return x
 
+    def _layer_stationary_qwen4_capture_sweep(
+            self, x, kv, *, offset, tile_width, prefix_tokens, on_progress=None):
+        """Own a cold private capture through full-sweep success or failure."""
+        from .kda_state import KDAStateCache
+        from .qwen4_exp_state import Qwen4ExpStateCache
+        from .qwen4_prefix_capture import AlignedPrefixCapture
+        from .qwen4_retained_history import copy_history_bits
+
+        def empty_cache():
+            result = KVCache(self.cfg.num_hidden_layers)
+            result.kda_cache = KDAStateCache(self.cfg.num_hidden_layers)
+            result.qwen4_cache = Qwen4ExpStateCache(self.cfg.num_hidden_layers)
+            return result
+
+        capture = AlignedPrefixCapture(
+            kv, self.cfg, prefix_tokens=prefix_tokens,
+            total_tokens=int(x.shape[1]), tile_tokens=tile_width,
+            cache_types=(KVCache, KDAStateCache, Qwen4ExpStateCache),
+            empty_cache=empty_cache, activation_dtype=mx.bfloat16,
+            state_dtype=mx.float32, position_dtype=mx.int32,
+            copy_bits=copy_history_bits, evaluate=mx.eval,
+            reserve=lambda size: (
+                self.governor.reserve(size, reason="qwen4-fused-prefix-copy")
+                if self.governor is not None else None))
+        try:
+            hidden = self._layer_stationary_qwen4_sweep(
+                x, kv, offset=offset, tile_width=tile_width,
+                on_progress=on_progress, prefix_capture=capture)
+            # Final hidden restoration is part of successful sweep completion.
+            mx.eval(hidden)
+            self._note_true_peak()
+            limit = max(0, int(self.rc.metal_limit_mb)) * 1_000_000
+            if limit and max(mx.get_active_memory(), mx.get_peak_memory()) > limit:
+                raise MemoryError("Qwen4 fused prefix final hidden crossed Metal cap")
+            fork, stats = capture.finish(kv)
+            return hidden, fork, stats
+        finally:
+            # Includes weight/router/MoE/progress/cancellation failures outside
+            # helper callbacks. No private checkpoint reaches a hot slot here.
+            capture.abort()
+
     def _layer_stationary_qwen4_sweep(
             self, x: mx.array, kv: KVCache, offset: int,
-            tile_width: int, on_progress=None) -> mx.array:
+            tile_width: int, on_progress=None, prefix_capture=None) -> mx.array:
         """Bounded-position, layer-major prefill for Qwen4-Exp.
 
         The 49K released-schema capture makes one four-stream hidden state
@@ -7039,6 +7082,9 @@ class StreamingEngine:
         if len(input_ids) != total:
             raise ValueError(
                 "Qwen4 layer-stationary sweep lost position-aligned input ids")
+        if prefix_capture is not None:
+            prefix_capture.begin_sweep(
+                kv, offset=offset, total_tokens=total, tile_tokens=tile_width)
         profiler = self._request_profiler
         if profiler is not None:
             profiler.begin_sweep(total, path="layer_stationary_qwen4")
@@ -7207,6 +7253,13 @@ class StreamingEngine:
                 mx.eval(post_attention)
                 spool_phase_seconds["attention"] += (
                     time.perf_counter() - phase_started)
+                if prefix_capture is not None:
+                    captured = prefix_capture.observe_tile(
+                        kv, layer=i, start=pos, end=end)
+                    if captured:
+                        note_spool(
+                            "retained_prefix", layer=i, completed_tokens=end,
+                            host_bytes=spool_peak_host_bytes)
                 phase_started = time.perf_counter()
                 mixed, hyper_input, injection = hyper_connection_mix(
                     post_attention, w,
@@ -12425,6 +12478,7 @@ class StreamingEngine:
         boundary_fork_tokens = 0
         boundary_fork_kv = None
         deferred_qwen_boundary_tokens = 0
+        deferred_qwen4_prefix_tokens = 0
         if (exact_logits is None
                 and self.cfg.model_type == "deepseek_v4"
                 and self._dsv4_prompt_reuse):
@@ -12566,7 +12620,32 @@ class StreamingEngine:
                         and self.rc.qwen_fused_boundary_scaffold_prefill
                         and self.rc.prefill_chunk_size
                         and not self.rc.prefill_last_token_separate)
-                    if fuse_qwen_boundary_scaffold:
+                    fuse_qwen4_prefix = bool(
+                        boundary_layer_stationary
+                        and self.cfg.model_type == "qwen4_exp"
+                        and getattr(self.rc, "qwen4_fused_aligned_prefix", False)
+                        and aligned_qwen4_retention and hot_eligible
+                        and getattr(self.rc, "qwen4_compact_retained_conv", False)
+                        and pos == matched == 0 and type(kv) is KVCache
+                        and self.rc.prefill_chunk_size > 0
+                        and stable_boundary % boundary_chunk == 0
+                        and not self.rc.prefill_last_token_separate
+                        and not self.rc.prefill_checkpoint_every and kv_store is None
+                        and not self.rc.paged_kv_persist
+                        and self._hot_kv_persist is None
+                        and not prompt_state_approximate
+                        and not getattr(getattr(kv, "qwen4_cache", None),
+                                        "qsa_pool_cache_enabled", True)
+                        and not getattr(getattr(kv, "kda_cache", None),
+                                        "spill_enabled", True)
+                        and getattr(getattr(kv, "kda_cache", None),
+                                    "_factor_capture", None) is None)
+                    if fuse_qwen4_prefix:
+                        # Defer only a scalar plan. The private builder is
+                        # owned by the complete sweep's try/finally below.
+                        # Do not fork empty state or advance pos here.
+                        deferred_qwen4_prefix_tokens = stable_boundary
+                    elif fuse_qwen_boundary_scaffold:
                         boundary_fork_kv = fork_hybrid_kv_endpoint(kv)
                         boundary_fork_tokens = stable_boundary
                         deferred_qwen_boundary_tokens = stable_boundary
@@ -12656,7 +12735,7 @@ class StreamingEngine:
                                     "cache_source": path_stats[
                                         "prompt_cache_source"],
                                 })
-                    if not fuse_qwen_boundary_scaffold:
+                    if not fuse_qwen_boundary_scaffold and not fuse_qwen4_prefix:
                         path_stats["hot_prompt_boundary_prefill_chunks"] = (
                             -(-(stable_boundary - pos) // boundary_chunk))
                         if self.rc.paged_kv_persist:
@@ -12805,6 +12884,9 @@ class StreamingEngine:
             if deferred_qwen_boundary_tokens and not layer_stationary_eligible:
                 raise RuntimeError(
                     "deferred Qwen boundary lost layer-stationary eligibility")
+            if deferred_qwen4_prefix_tokens and not layer_stationary_eligible:
+                raise RuntimeError(
+                    "deferred Qwen4 prefix lost layer-stationary eligibility")
             if layer_stationary_eligible:
                 prefill_limit = (
                     len(tokens) - 1
@@ -12852,9 +12934,25 @@ class StreamingEngine:
                             xc, kv, offset=pos, tile_width=chunk,
                             on_progress=on_progress)
                     elif self.cfg.model_type == "qwen4_exp":
-                        xc = self._layer_stationary_qwen4_sweep(
-                            xc, kv, offset=pos, tile_width=chunk,
-                            on_progress=on_progress)
+                        if deferred_qwen4_prefix_tokens:
+                            if (pos != 0 or stop_before != len(tokens)
+                                    or chunk != self.rc.prefill_chunk_size
+                                    or boundary_fork_kv is not None):
+                                raise ValueError("deferred Qwen4 capture lost cold full-sweep scope")
+                            xc, captured_prefix, capture_stats = (
+                                self._layer_stationary_qwen4_capture_sweep(
+                                    xc, kv, offset=pos, tile_width=chunk,
+                                    prefix_tokens=deferred_qwen4_prefix_tokens,
+                                    on_progress=on_progress))
+                            boundary_fork_kv = captured_prefix
+                            boundary_fork_tokens = deferred_qwen4_prefix_tokens
+                            path_stats.update(capture_stats)
+                            path_stats["hot_prompt_boundary_fork_tokens"] = boundary_fork_tokens
+                            del captured_prefix
+                        else:
+                            xc = self._layer_stationary_qwen4_sweep(
+                                xc, kv, offset=pos, tile_width=chunk,
+                                on_progress=on_progress)
                     elif self.cfg.model_type == "glm5_next":
                         xc = self._layer_stationary_glm5_next_sweep(
                             xc, kv, offset=pos, tile_width=chunk,

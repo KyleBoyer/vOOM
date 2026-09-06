@@ -8,6 +8,8 @@ wrapper normally observes its prepared tokens and returned endpoint without chan
 request arguments, model operations, or the returned result. An explicit
 --diagnose-retained-prefix experiment may replace retained PLE buffers with
 bit-identical independent storage AFTER generation, in this one-call server only.
+The separate --observe-retained-prefix mode only hashes an existing retained
+prefix and complete position metadata; it never detaches or replaces state.
 Hashing copies
 state to the host and can affect pressure/latency: both costs are separated.
 No prompt, raw text, token IDs, logits, or tensor payloads are published.
@@ -78,6 +80,48 @@ def _atomic_write_private(path: Path, document: dict) -> None:
             os.close(directory)
 
 
+def _retained_prefix_witness(target, prompt_ids, *, expected_prefix, kv_type,
+                             state_digest, metadata_digest):
+    """Read only an existing complete aligned RAM prefix; never fork or copy it."""
+    slots = getattr(target, "_hot_prompt_slots", None)
+    if (type(expected_prefix) is not int or not 0 < expected_prefix < len(prompt_ids)
+            or not isinstance(slots, list) or len(slots) != 1
+            or getattr(target, "_hot_kv_persist", None) is not None):
+        raise ValueError("retained witness requires one strict RAM prefix")
+    slot, endpoint = slots[0], target.last_kv
+    fork = slot.kv
+    tile = getattr(slot, "qwen4_retention_tile", 0)
+    if (type(fork) is not kv_type or type(endpoint) is not kv_type or fork is endpoint
+            or tuple(slot.tokens) != tuple(prompt_ids[:expected_prefix])
+            or fork.offset != expected_prefix or endpoint.offset != len(prompt_ids)
+            or type(tile) is not int or tile <= 0 or expected_prefix % tile
+            or slot.approximate or slot.logits is not None
+            or slot.prompt_logits is not None or slot.exact_hidden is not None):
+        raise ValueError("retained witness requires a separate marked complete prefix")
+    count = len(endpoint.keys)
+    for left, right, fields in (
+        (fork, endpoint, ("keys", "values", "_starts", "_windows")),
+        (fork.kda_cache, endpoint.kda_cache, ("_state", "_conv")),
+        (fork.qwen4_cache, endpoint.qwen4_cache,
+         ("qsa_keys", "qsa_positions", "qsa_pooled_keys", "ple_conv", "ple_context", "ple_lengths")),
+    ):
+        if left is right:
+            raise ValueError("retained witness cache owners alias")
+        for field in fields:
+            a, b = getattr(left, field), getattr(right, field)
+            if (type(a) is not list or type(b) is not list or a is b
+                    or len(a) != count or len(b) != count):
+                raise ValueError("retained witness state lists are incomplete or aliased")
+    digest, arrays, payload, components = state_digest(fork)
+    if arrays <= 0 or payload <= 0:
+        raise ValueError("retained witness is empty")
+    return {"sha256": digest, "arrays": int(arrays), "bytes": int(payload),
+            "components": components, "positions": int(fork.offset),
+            "metadata": metadata_digest(fork),
+            "authoritative_endpoint_metadata": metadata_digest(endpoint),
+            "read_only": True}
+
+
 class FirstTokenHTTPProbe:
     """Dependency-injected observer; module import itself never imports MLX."""
 
@@ -85,9 +129,11 @@ class FirstTokenHTTPProbe:
                  engine_type, state_digest, hidden_digest, pressure,
                  metal_memory, profile_identity, model_revision,
                  clock=time.perf_counter, publish=_atomic_write_private,
-                 retained_diagnostic=None):
+                 retained_diagnostic=None, retained_witness=None):
         if expected_prompt_tokens <= 0:
             raise ValueError("expected prompt-token count must be positive")
+        if retained_diagnostic is not None and retained_witness is not None:
+            raise ValueError("read-only witness and mutation diagnostic are exclusive")
         self.original = original
         self.artifact = Path(artifact)
         self.expected_prompt_tokens = expected_prompt_tokens
@@ -103,6 +149,7 @@ class FirstTokenHTTPProbe:
         self.publish = publish
         self.claimed = False
         self.retained_diagnostic = retained_diagnostic
+        self.retained_witness = retained_witness
 
     def _publish(self, document):
         try:
@@ -185,6 +232,8 @@ class FirstTokenHTTPProbe:
                 # which could materialize the retained-view hypothesis away.
                 document["retained_fork_diagnostic"] = self.retained_diagnostic(
                     target, prompt.token_ids)
+            if self.retained_witness is not None:
+                document["retained_prefix"] = self.retained_witness(target, prompt.token_ids)
             digest, arrays, payload, components = self.state_digest(kv)
             if arrays <= 0 or payload <= 0:
                 raise ValueError("Qwen4 endpoint digest contains no state arrays")
@@ -218,6 +267,12 @@ class FirstTokenHTTPProbe:
                     "qwen4_hot_boundary_policy_eligible",
                     "qwen4_hot_boundary_reason",
                     "qwen4_retained_conv_compact_calls",
+                    "qwen4_fused_prefix_capture_layers",
+                    "qwen4_fused_prefix_capture_tokens",
+                    "qwen4_fused_prefix_capture_arrays_copied",
+                    "qwen4_fused_prefix_capture_bytes_copied",
+                    "qwen4_fused_prefix_capture_scratch_peak_bytes",
+                    "qwen4_fused_prefix_capture_seconds",
                     "qwen4_retained_conv_compact_arrays",
                     "qwen4_retained_conv_compact_bytes",
                     "qwen4_retained_conv_compact_scratch_bytes",
@@ -246,6 +301,7 @@ class FirstTokenHTTPProbe:
                 "artifact_write_included": False,
                 "state_host_read_bytes": (document.get("state") or {}).get("bytes"),
                 "hidden_host_read_bytes": (document.get("hidden") or {}).get("bytes"),
+                "retained_state_host_read_bytes": (document.get("retained_prefix") or {}).get("bytes"),
                 "note": "Hashing adds host reads/synchronization; not a serving timing or pressure proof.",
             }
             self._publish(document)
@@ -264,6 +320,8 @@ def main(argv=None):
                         help="Post-generation RAM-fork materialization/PLE-detachment experiment; max1 only")
     parser.add_argument("--diagnose-retained-kda-conv", action="store_true",
                         help="Also detach retained DeltaNet convolution histories; requires retained-prefix diagnostic")
+    parser.add_argument("--observe-retained-prefix", type=int, default=0,
+                        help="Read-only retained-prefix state/metadata witness; max1 diagnostic, not serving timing")
     args = parser.parse_args(argv)
     if args.artifact.exists() or args.artifact.is_symlink():
         parser.error("artifact already exists; choose a fresh private artifact path")
@@ -273,6 +331,10 @@ def main(argv=None):
         parser.error("retained-prefix diagnostic must be a strict nonnegative prompt prefix")
     if args.diagnose_retained_kda_conv and not args.diagnose_retained_prefix:
         parser.error("KDA convolution diagnostic requires a retained prefix")
+    if not 0 <= args.observe_retained_prefix < args.expected_prompt_tokens:
+        parser.error("observed prefix must be a strict nonnegative prompt prefix")
+    if args.observe_retained_prefix and args.diagnose_retained_prefix:
+        parser.error("read-only observation cannot be combined with mutation diagnostics")
 
     # Heavy imports occur only in this explicit CLI entry point, after the
     # caller's preflight. Importing/testing schema helpers never initializes MLX.
@@ -329,6 +391,17 @@ def main(argv=None):
                     + cfg.linear_num_value_heads * cfg.linear_value_head_dim),
                 expected_kda_dtype=mx.bfloat16)
 
+    retained_witness = None
+    if args.observe_retained_prefix:
+        from runtime.kv_cache import KVCache
+        from tests.fixtures.qwen4_retained_fork_diagnostic import complete_state_metadata
+
+        def retained_witness(target, prompt_ids):
+            return _retained_prefix_witness(
+                target, prompt_ids, expected_prefix=args.observe_retained_prefix,
+                kv_type=KVCache, state_digest=_state_digest,
+                metadata_digest=lambda kv: complete_state_metadata(kv, array_digest=array_digest))
+
     original = server._engine_generate
     probe = FirstTokenHTTPProbe(
         original, artifact=args.artifact, label=args.label,
@@ -342,6 +415,7 @@ def main(argv=None):
         profile_identity=active_runtime_profile_fields,
         model_revision=_model_revision,
         retained_diagnostic=retained_diagnostic,
+        retained_witness=retained_witness,
     )
     forwarded = ["runtime.server", "--port", str(args.port)]
     for profile in args.profile:

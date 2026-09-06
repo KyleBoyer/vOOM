@@ -112,6 +112,54 @@ class Prompt(str):
     stable_boundary_tokens = 1606
 
 
+def retained_setup():
+    from tests.test_qwen4_retained_history_pure import setup, KV
+    _, endpoint, fork = setup()
+    endpoint.offset = 7
+    slot = SimpleNamespace(kv=fork, tokens=(0, 1, 2, 3), qwen4_retention_tile=4,
+                           approximate=False, logits=None, prompt_logits=None, exact_hidden=None)
+    target = SimpleNamespace(_hot_prompt_slots=[slot], last_kv=endpoint, _hot_kv_persist=None)
+    return target, slot, endpoint, fork, KV
+
+
+def test_retained_witness_only_reads_existing_prefix_and_both_metadata_sets():
+    target, slot, endpoint, fork, kind = retained_setup()
+    old_histories, old_state = list(fork.kda_cache._conv), list(fork.kda_cache._state)
+    calls = []
+    result = probe_module._retained_prefix_witness(
+        target, tuple(range(7)), expected_prefix=4, kv_type=kind,
+        state_digest=lambda kv: calls.append(kv) or ("a" * 64, 12, 4096, {"kda": "b" * 64}),
+        metadata_digest=lambda kv: calls.append(kv) or {"positions": kv.offset})
+    assert calls == [fork, fork, endpoint]
+    assert result["positions"] == 4 and result["read_only"]
+    assert result["metadata"] == {"positions": 4}
+    assert result["authoritative_endpoint_metadata"] == {"positions": 7}
+    assert all(a is b for a, b in zip(fork.kda_cache._conv, old_histories))
+    assert all(a is b for a, b in zip(fork.kda_cache._state, old_state))
+    assert target.last_kv is endpoint and slot.kv is fork
+
+
+@pytest.mark.parametrize("invalid", ["two_slots", "persist", "source_alias", "wrong_tokens",
+                                    "wrong_offset", "tile", "approx", "logits", "owner_alias", "list_alias"])
+def test_retained_witness_rejects_invalid_ownership_before_hashing(invalid):
+    target, slot, endpoint, fork, kind = retained_setup()
+    if invalid == "two_slots": target._hot_prompt_slots.append(slot)
+    elif invalid == "persist": target._hot_kv_persist = object()
+    elif invalid == "source_alias": slot.kv = endpoint
+    elif invalid == "wrong_tokens": slot.tokens = (0, 1, 2, 9)
+    elif invalid == "wrong_offset": fork.offset = 3
+    elif invalid == "tile": slot.qwen4_retention_tile = 3
+    elif invalid == "approx": slot.approximate = True
+    elif invalid == "logits": slot.logits = object()
+    elif invalid == "owner_alias": fork.kda_cache = endpoint.kda_cache
+    else: fork.qwen4_cache.ple_conv = endpoint.qwen4_cache.ple_conv
+    with pytest.raises(ValueError):
+        probe_module._retained_prefix_witness(
+            target, tuple(range(7)), expected_prefix=4, kv_type=kind,
+            state_digest=lambda _: pytest.fail("hash before validation"),
+            metadata_digest=lambda _: pytest.fail("hash before validation"))
+
+
 class Wrapper:
     def __init__(self, target):
         self.target = target
@@ -202,6 +250,25 @@ def test_observer_preserves_arguments_result_and_owners_and_separates_costs(tmp_
     serialized = probe.artifact.read_text()
     assert str(prompt) not in serialized and result["text"] not in serialized
     assert "248069" not in serialized
+
+
+def test_read_only_prefix_observer_costs_are_explicit_and_result_is_unchanged(tmp_path):
+    calls = []
+    witness = lambda target, ids: calls.append((target, ids)) or {"bytes": 144003072, "read_only": True}
+    probe, engine, result, _ = _setup(tmp_path, retained_witness=witness)
+    prompt = Prompt("private")
+    assert probe(engine, prompt, 1) is result
+    document = json.loads(probe.artifact.read_text())
+    assert calls == [(engine.target, prompt.token_ids)]
+    assert document["retained_prefix"]["read_only"] is True
+    assert document["instrumentation"]["retained_state_host_read_bytes"] == 144003072
+    assert document["timing_benchmark"] is False
+    assert "retained_fork_diagnostic" not in document
+
+
+def test_read_only_and_mutating_observer_modes_cannot_mix(tmp_path):
+    with pytest.raises(ValueError, match="exclusive"):
+        _setup(tmp_path, retained_witness=lambda *a: {}, retained_diagnostic=lambda *a: {})
 
 
 def test_retained_experiment_is_explicit_and_precedes_endpoint_host_hashes(tmp_path):

@@ -1,5 +1,44 @@
 # STATUS — 2026-09-05 (current corrections first; dated chronology below is history)
 
+## 2026-09-06 UTC: cold fused-prefix integration passes 866 regressions; real state gate next
+
+New explicit profile
+`qwen38-flash-next-uncensored-fp8-exact-pipeline-hot-kv-aligned-compact-fused`
+adds only `VMODEL_QWEN4_FUSED_ALIGNED_PREFIX=1`. Runtime/YAML default remains
+off and server engine identity appends the flag without shifting old fields.
+Eligible cold plain-RAM requests defer the separate prefix sweep AND its old
+fork/position bookkeeping. The unchanged complete Qwen4 layer-major sweep now
+observes every existing post-attention tile, retaining the aligned prefix
+without splitting tiles, changing expert unions or modifying target arithmetic.
+Matched-prefix repeats and unsupported modes keep their existing path.
+
+A dedicated wrapper owns the private builder through all sweep, weight,
+router, progress, final-hidden and cancellation failures. Publication occurs
+only after full sweep/hidden evaluation, cap sampling and complete endpoint
+validation. Existing retained-state admission stays active; per-layer copy
+scratch is reserved separately. Captured layers/tokens/copy bytes/scratch/time
+are typed HTTP telemetry. No whole-fork compaction is repeated on this cold arm.
+
+The max1 observer gains a separate `--observe-retained-prefix` option: it only
+hashes the existing prefix plus complete retained/authoritative metadata,
+cannot combine with the post-generation mutation diagnostic, and explicitly
+accounts for its added host reads. It is NOT a serving timing/pressure test.
+
+**866 tests passed in5.73s**, supervised PASS / exit0 / no timeout or source
+drift after a fresh30-second preflight at6.273/6.311GB available and zero swap
+growth/churn. Read-only review found no remaining integration blocker for the
+next guarded real-model probe. Private envelope
+`logs/gates/qwen4_fused_integration_suite_20260906.done.json`.
+
+Next run a fresh cold max1 diagnostic on the same explicitly modified two-real-
+workspace-tool/short-history/developer/stream/greedy request, comparing BOTH
+the independent1024-token retained prefix and1611-token full endpoint, including
+component hashes, metadata, hidden and actual prepared/generated IDs. Require
+48 captured layers,37 copies/2,396,160B and unchanged156,585,984B retention
+projection. Then sufficient-output cold/repeat/extension and broader requests.
+No real-model timing, completion, Plex or generalization improvement is claimed
+from the implementation/unit tests; previous measured results remain below.
+
 ## 2026-09-06 UTC: fused-prefix capture helper passes 812 tests; serving integration remains next
 
 Added `runtime/qwen4_prefix_capture.py`, a private, **not-yet-wired** builder

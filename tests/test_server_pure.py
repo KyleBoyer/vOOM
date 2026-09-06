@@ -143,6 +143,24 @@ def test_route_ignores_query_string():
     assert handler._route() == "/responses"
 
 
+def test_fused_prefix_capture_telemetry_has_typed_scalars():
+    integers = {
+        "qwen4_fused_prefix_capture_layers": 48,
+        "qwen4_fused_prefix_capture_tokens": 1024,
+        "qwen4_fused_prefix_capture_arrays_copied": 37,
+        "qwen4_fused_prefix_capture_bytes_copied": 2396160,
+        "qwen4_fused_prefix_capture_scratch_peak_bytes": 491520,
+    }
+    timing = _vision_protocol_timing({"path_stats": {
+        **{key: str(value) for key, value in integers.items()},
+        "qwen4_fused_prefix_capture_seconds": "0.031",
+    }})
+    for key, value in integers.items():
+        assert timing[key] == value and type(timing[key]) is int
+    assert timing["qwen4_fused_prefix_capture_seconds"] == 0.031
+    assert type(timing["qwen4_fused_prefix_capture_seconds"]) is float
+
+
 def test_vision_protocol_timing_uses_generic_path_stats():
     result = {
         "vision_cache_hits": 99,

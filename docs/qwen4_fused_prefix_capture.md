@@ -1,7 +1,8 @@
 # Qwen4 cold aligned-prefix capture: integration and proof contract
 
-As of2026-09-06 the helper and its tests exist, but there are **no engine or
-server callers**. Nothing is enabled. The objective is to avoid a separate cold
+As of2026-09-06 the helper is wired into an **explicit, default-off**
+`...hot-kv-aligned-compact-fused` profile;866 regressions pass. Real-model
+state and serving gates remain next. The objective is to avoid a separate cold
 prefix sweep while retaining the existing aligned1024-token hot checkpoint.
 The focused1611-token workload currently reads an additional101,039,536,440
 bytes for that split. This is an I/O hypothesis, not an achieved speed gain.
@@ -43,18 +44,19 @@ all relevant state/metadata, source ownership, real depthwise-convolution
 continuation, invalid geometry/order, interruptions and partial publication.
 They do not prove full-model arithmetic/scheduling or serving pressure.
 
-## Engine hookup: next bounded implementation
+## Engine hookup contract (implemented; retain these invariants)
 
 1. Add a default-off runtime/YAML/server identity flag and an explicit profile
    extending `qwen38-flash-next-uncensored-fp8-exact-pipeline-hot-kv-aligned-compact`.
    Do not change any existing profile or automatic behavior. Keep the existing
    retained logical/QSA-view admission charge; do not double-charge it or
    assume shared arrays prove a full physical-memory bound.
-2. In `generate`, use a separate deferred Qwen4 builder variable. Cold gating
+2. In `generate`, use a separate deferred Qwen4 prefix-token scalar. The private
+   builder is created only inside the complete sweep's owning wrapper. Cold gating
    needs aligned+compact+hot eligibility, `pos==matched==0`, fixed layer-major
    tiles, plain RAM KV, no approximate state, persistence, adaptive paging,
    adaptive chunks, checkpoints or last-token-separate path. Unsupported
-   matches/extensions should keep the existing split path, not reinterpret
+   matches/extensions keep the existing split path, not reinterpret
    their recurrence. A builder that loses eligibility must fail closed before
    any alternate sweep.
 3. Defer BOTH the prefix mini-sweep and its later fork/`pos=stable_boundary`

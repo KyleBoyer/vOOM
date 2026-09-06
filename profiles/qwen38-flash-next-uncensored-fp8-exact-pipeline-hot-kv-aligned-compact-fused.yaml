@@ -1,0 +1,11 @@
+schema: voom.runtime-profile.v1
+name: qwen38-flash-next-uncensored-fp8-exact-pipeline-hot-kv-aligned-compact-fused
+description: Experimental cold aligned prefix captured inside the original full prefill sweep.
+notes:
+  - "Default-off. Avoids the separate prefix sweep only for cold plain-RAM fixed-tile requests. Captures all KV/QSA/KDA/PLE prefix state without splitting tiles or changing expert unions; copies small convolution histories bit-for-bit."
+  - "Matched-prefix repeats and unsupported modes keep the existing aligned-compact path. Additional retained-state admission and Metal guards remain in force."
+  - "Independent retained-prefix/full-endpoint, sufficient-output raw-token, pressure and broad real-request gates remain required. No serving latency or quality claim from synthetic helper tests."
+extends:
+  - qwen38-flash-next-uncensored-fp8-exact-pipeline-hot-kv-aligned-compact
+settings:
+  VMODEL_QWEN4_FUSED_ALIGNED_PREFIX: true

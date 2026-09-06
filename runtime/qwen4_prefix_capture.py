@@ -1,6 +1,6 @@
-"""Private, cold-only aligned prefix capture for a future Qwen4 sweep hook.
+"""Private, cold-only aligned prefix capture for the opt-in Qwen4 sweep hook.
 
-No model imports or serving call sites. The caller must already charge the
+No model imports at module load. The caller must already charge the
 additional retained logical state/backing allowance before beginning a sweep.
 This helper reserves only copy scratch; it never credits future reclamation.
 
