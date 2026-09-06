@@ -82,6 +82,80 @@ def test_wire_metadata_preserves_byte_identity_despite_equivalent_json():
     assert result["request_bytes"] == len(wire)
 
 
+def test_real_continuation_identity_is_pinned_without_private_payload():
+    assert gate.KNOWN_CAPTURES["qwen25_tool_result_error_v1"] == {
+        "sha256": "f0498d5e57dd5dcaa4798cb12081f2a1d817e89b97d3285e8d9eaae14eaf8728",
+        "bytes": 148_584,
+        "tools": 131,
+    }
+
+
+def test_preserved_stream_continuation_changes_only_model_and_output_budget(
+        monkeypatch, tmp_path):
+    original = {
+        "model": "old-model", "temperature": 0.3, "stream": True,
+        "store": False, "tool_choice": "auto",
+        "input": [
+            {"role": "system", "content": "private harness prefix"},
+            {"role": "system", "content": "private workspace prefix"},
+            {"role": "user", "content": [{
+                "type": "input_text", "text": "inspect the current state"}]},
+            {"type": "function_call", "call_id": "original-call-id",
+             "name": "original_tool_0", "arguments": '{"mode":"inspect"}'},
+            {"type": "function_call_output", "call_id": "original-call-id",
+             "output": "The original tool returned no result."},
+        ],
+        "tools": [
+            {"type": "function", "name": f"original_tool_{index}",
+             "description": f"Unchanged original description {index}",
+             "parameters": {"type": "object", "properties": {
+                 "mode": {"type": "string", "enum": ["inspect", "other"]}},
+                 "required": ["mode"], "additionalProperties": False}}
+            for index in range(131)
+        ],
+    }
+    raw = json.dumps(original, ensure_ascii=False).encode()
+    capture = tmp_path / "continuation.json"
+    capture.write_bytes(raw)
+    monkeypatch.setattr(gate, "KNOWN_CAPTURES", {
+        "synthetic-continuation": {
+            "sha256": hashlib.sha256(raw).hexdigest(), "bytes": len(raw),
+            "tools": 131},
+    })
+    monkeypatch.setattr(gate, "_pressure", lambda: gate.Pressure(7_000_000_000, 0, 0))
+    payloads, reports = [], []
+
+    def post(url, payload, timeout, stream, **kwargs):
+        assert stream is True
+        payloads.append(payload)
+        return {"http_status": 200, "wall_seconds": 1,
+                "response_status": "completed", "streamed_text_matches_final": True,
+                "tool_selection": {"selected": 131}}
+
+    monkeypatch.setattr(gate, "_post", post)
+    monkeypatch.setattr(gate, "_write", lambda path, report: reports.append(report))
+    monkeypatch.setattr(sys, "argv", [
+        "gate", str(capture), "--model", "new-model", "--repeats", "1",
+        "--max-output-tokens", "1024", "--preserve-stream",
+        "--expected-selected-tools", "131", "--expected-response-status", "completed",
+    ])
+    assert gate.main() == 0
+    payload, = payloads
+    expected = {**original, "model": "new-model", "max_output_tokens": 1024}
+    assert json.loads(payload) == expected
+    assert capture.read_bytes() == raw
+    report, = reports
+    row, = report["runs"]
+    assert row["request_changed_fields"] == ["max_output_tokens", "model"]
+    assert row["request_sha256"] == hashlib.sha256(payload).hexdigest()
+    assert report["request"]["temperature_override"] is None
+    assert report["request"]["seed_override"] is None
+    assert report["request"]["stream_preserved"] is True
+    assert report["request"]["scenario"] is None
+    assert report["request"]["effective_input_items"] == 5
+    assert report["request"]["effective_tool_count"] == 131
+
+
 @pytest.mark.parametrize("value", [None, False, True, 0, -1, "42", 1.5,
                                   float("nan"), float("inf"), {}, []])
 def test_requested_peak_gate_rejects_missing_or_invalid_telemetry(value):

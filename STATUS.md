@@ -1,5 +1,46 @@
 # STATUS — 2026-09-05 (current corrections first; dated chronology below is history)
 
+## 2026-09-06 UTC: next full-catalog captured tool-result continuation pinned; evaluation pending
+
+Content-free inventory found64 local captured requests and5 actual function-result
+continuations. The next bounded gate uses the shortest real continuation,
+`logs/captured_requests/1784120059489_a610054a.json`:148,584B,131 ORIGINAL tools,
+two original system messages, one user message, one actual function call and its
+actual no-result tool response. No synthetic tool response or shortened catalog
+is substituted. This is a different request shape from the modified two-tool
+workspace/media diagnostics. Its private payload stays ignored.
+
+The replay registry now pins its exact SHA
+f0498d5e57dd5dcaa4798cb12081f2a1d817e89b97d3285e8d9eaae14eaf8728 as
+`qwen25_tool_result_error_v1`. Planned wire changes ONLY model selection to the
+installed Qwen3.8-Flash-Next checkpoint and an explicit max-output budget1024.
+Original temperature0.3 and streaming=true remain unchanged; no seed, developer
+message, scenario, progress-request field, system or tool schema is added.
+Expected wire148,609B SHA505c1996774ced855024c2c034be4bba5652212d72301d5c487573f9a0188509.
+Therefore label the result a full131-tool **captured continuation with model
+override/output budget**, NOT byte-for-byte untouched traffic, a greedy-token
+A/B, the original134-tool capture, or a Plex intelligence score.
+
+The planned fresh-server control is the existing explicit unfused aligned-compact
+uncensored-FP8 profile plus generation-witness; BOTH selected profiles must be
+expected by the client and checked before launch. Require natural completion,
+all131 tools, valid true peak<8.5GB, final available>=5.3GB and swap growth/out
+<=16MB. Keep all failures and raw token/text/termination/actual stochastic-MTP
+witnesses. Do not execute any generated tool. Completion alone is not a semantic
+quality pass: this capture tests tool-error continuation, not the Plex rubric.
+No speed or quality expectation is inferred from the smaller previous probes.
+
+New pure regression verifies preservation of a complete131-tool input with
+function-call/output IDs and two system messages while changing only model/max
+budget. **69 replay tests pass0.15s;144 related pure regressions pass2.43s**,
+fixed random seed64003, supervised without source drift. No runtime/model code
+or serving defaults changed. Private receipts
+`logs/gates/captured_continuation_replay_pure_20260906.done.json` and
+`logs/gates/captured_continuation_pure_suite_20260906.done.json`.
+Next freeze/push, require a new passing30s memory preflight, launch ONE supervised
+max1024 continuation request, and finish that job before another model experiment.
+This evaluation is pending; the prior head-admission speed lever remains stopped.
+
 ## 2026-09-06 UTC: exact head-admission model witness matches; safety-only, stop this speed lever
 
 The completed source `802c42f` gate confirms every prepared/generated token and

@@ -68,6 +68,14 @@ KNOWN_CAPTURES = {
         "bytes": 178_616,
         "tools": 134,
     },
+    # Real 131-tool continuation after a command tool returned no result.
+    # Retain both system messages, the actual function-call/output pair,
+    # streaming, and captured temperature; no constructed tool result.
+    "qwen25_tool_result_error_v1": {
+        "sha256": "f0498d5e57dd5dcaa4798cb12081f2a1d817e89b97d3285e8d9eaae14eaf8728",
+        "bytes": 148_584,
+        "tools": 131,
+    },
 }
 
 
