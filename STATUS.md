@@ -1,5 +1,74 @@
 # STATUS — 2026-09-06 (current corrections first; dated chronology below is history)
 
+## 2026-09-06 UTC: original-temperature fused full131 replay completes; strict action and pressure FAIL
+
+The sourcedd99c08 three-request fused sequence has FINISHED. All131 original
+tools, both system messages, complete recorded histories, originaltemp0.3 and
+streaming retained; no seed. ONLY model/max1024 change on the wire. This is not
+untouched134-tool traffic, a live executed tool loop, a paired stochastic speed
+A/B, or a Plex score. Target remains the installed uncensored FP8 candidate.
+
+For these full131 captures with model/max1024-only overrides:
+
+| Request | Input / emitted | Cached | HTTP wall | Engine TTFT | Decode |
+|---|---:|---:|---:|---:|---:|
+| Initial, cold | 40,432 /44 | 0 | 854.4258s | 676.9539s | 162.2054s |
+| Same request, warm | 40,432 /44 | 39,936 | 246.4022s | 84.6056s | 161.3986s |
+| Actual recorded continuation, warm | 40,536 /76 | 39,936 | 324.7555s | 89.6265s | 234.6327s |
+
+All HTTP200/completed naturally, stream/final equality, one parseable execute-
+command call and zero duplicates/argument parse failures. Cold/repeat match all
+44 raw IDs399e97f8...17161f /194B text065cf0fb...4b2602 and minimal whoami
+canonical hashd3f4ea...8d81. Continuation has76 IDs98fa09cf...1e64d60 /225B
+textafa93614...d8bc64, but canonical call92591cb8...db6e0a does NOT match that
+minimal action. The raw-engine Hermes witness and protocol agree on the differing
+hash: it is not a parser-only discrepancy. Preserve the strict action failure.
+
+Do NOT infer the continuation is semantically wrong or that fusion caused it:
+arguments were deliberately not stored, and the argument-subset witness was not
+enabled. The captured schema has four additional nullable fields; added options
+and a changed command both alter the full-call hash. The specific all-null and
+all-null/background-false hypotheses do NOT match. Further guessing is not proof.
+Next relevant replay must also enable existing --expected-function-arguments-json
+for the required command, retaining exact full-call hashes and strict failures;
+do not retroactively relabel this unobserved semantic result PASS. No tool executed.
+
+Prefill676.9532/84.5510/89.5728s; engine839.1704/246.0089/324.2657s.
+Prefill/decode store bytes128900497040/240939699576 cold,
+93378926240/240939699576 repeat,98009609840/352265323496 continuation.
+These are logical reads, not physical NVMe bytes. Cold captures48 layers/39936
+prefix; both warm rows have no fused capture and retain ordinary reuse/compaction.
+MTP accepted28/46,28/46,53/69 over16/16/23 sweeps, no retries/fallback. Different
+stochastic output lengths prohibit calling these end-to-end differences a causal
+speed win against earlier48/48/58 or48/48/28 unseeded runs.
+
+OverallFAIL: seven pressure checks plus the strict continuation-action check.
+Metal peaks6.429/4.495/4.713GB pass8.5GB; available3.763/3.804/3.958GB all fail5.3GB.
+Actual swap-outs45,711,360/23,216,128/23,822,336B,total92,749,824B; repeat client's
+cumulative68,927,488B remains its check. Continuation swap-used grows158,597,120B
+as well. Do not waive pressure or promote the profile to a default.
+
+Parentexit1/1428.4578s16:54:57.890687->17:18:46.348426UTC, no timeout/signal/
+missing result/source drift. All711 source hashes, combined result, parent log
+and two child report hashes verified. Result SHA
+74013c96aac423f32f7d606743910b02ce9879c54e5e090394fbae83d5b682e6;
+log74367433a7b7fd0657eca87fc5a5bdb143f6ce924b5d1bdd7b0c8cc29f57fd4d.
+Root/externalmin16.804/98.364GB,maxRSS5.508GB; all job PIDs gone. Private
+logs/qwen4_full131_fused_originaltemp1024_20260906.json and initial/extension/
+server/gates artifacts; no private payloads committed.
+
+Read-only next-lever audit: cold phase counters attribute318.698s to attention,
+274.698s to experts,44.228s route/spool,19.184s output and5.911s PLE; copy38.347s
+may overlap these and must not be added as disjoint time. Decode verifier155.876/
+155.514/225.974s dwarfs draft5.921/5.483/8.000s. Idle-head instrumentation shows
+1,271,398,400 logical bytes released and Metal-active3,764,004,260->2,492,605,860B,
+but identical immediate system-available samples before/after; it explicitly does
+NOT synchronize the device. Audit bounded terminal synchronization/reclamation
+and ownership before another expensive repeat; prove retained cache/state and
+sampling unchanged, preserve response-wall overhead and all original pressure
+checks. No cleanup change implemented yet. Completed varied-domain/Plex, large
+context ladder and sub90s remain open; do not rerun this sequence unchanged.
+
 ## 2026-09-06 UTC: full131 completed greedy fused A/B matches every raw token; cold -75.96s, pressure FAIL
 
 Both source361f739 arms have FINISHED on identical711-file manifests. Installed
