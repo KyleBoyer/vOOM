@@ -1,5 +1,26 @@
 # STATUS — 2026-09-05 (current corrections first; dated chronology below is history)
 
+## 2026-09-06 UTC: completed-output compact-history A/B queued
+
+Next bounded acceptance experiment compares fresh aligned-control and
+aligned-compact servers, each with `generation-witness`, a cold call followed
+by an identical in-memory-prefix repeat, and a 512-token output budget.
+It uses the explicitly **modified two-real-workspace-tool / short-system-history /
+developer / stream-progress / greedy-seed64001** workspace-read request, not
+the full134-tool capture. Require completed termination, the correct read-file
+call/arguments,1611 actual prepared tokens, positive generated-ID witnesses,
+matching cold/repeat raw ID/text witnesses, and at least1024 reused tokens.
+No post-generation endpoint observer, mutation or allocator clearing is used.
+No expected prose/parsed-output hash is imposed; compare actual raw witnesses
+between arms instead. Frozen8.5GB/5.3GB/16MB pressure limits remain unchanged.
+
+Planned artifacts `logs/qwen4_compact_aligned_control_workspace512_20260906.json`
+and `logs/qwen4_compact_aligned_candidate_workspace512_20260906.json`, each with
+a separate supervised envelope and fresh30-second preflight. Source is frozen
+during each run, one server/model job at a time. Neither arm has run yet.
+This is a completed-output/repeated-cache regression gate for one focused
+request, not varied-domain, full harness, long-context or Plex quality proof.
+
 ## 2026-09-06 UTC: pre-suffix compaction lowers measured generation peak by 740 MiB
 
 The production opt-in `...hot-kv-aligned-compact` candidate on source `f40d04d`
