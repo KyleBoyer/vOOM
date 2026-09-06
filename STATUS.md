@@ -1,5 +1,53 @@
 # STATUS — 2026-09-05 (current corrections first; dated chronology below is history)
 
+## 2026-09-06 UTC: fused cold prefill removes duplicate reads; both independent state oracles match
+
+The new default-off `...aligned-compact-fused` profile on source `eb1dc1a`
+completed its first real cold **modified two-real-workspace-tool / short-
+history / developer / stream-progress / greedy-seed64001 / max1** diagnostic.
+It is NOT the full134-tool request or a completed-answer benchmark. Both the
+retained1024-token prefix and authoritative1611-token endpoint match their
+independently computed controls:121 arrays each, all component hashes and
+complete starts/windows/pool metadata. Full BF16 hidden bits, prepared IDs,
+actual first generated ID and raw engine text also match. This is stronger
+than matching only the final token while overlooking a corrupt hot prefix.
+
+The intended I/O change is now measured: prefill store reads
+**219,916,717,280 ->118,877,180,840B**, removing exactly101,039,536,440B versus
+the prior aligned-compact split; the new total equals the independent no-hot
+control. For that modified max1 diagnostic, engine prefill is**116.7294s**
+(prior split203.2787s), engine total116.7492s and instrumented HTTP131.2809s
+(prior217.6032s). These are diagnostic/historical comparisons, not a fresh
+paired complete-answer serving win. Capture48 layers,37 histories/2,396,160B,
+peak copy scratch491,520B, capture0.029303s; unchanged156,585,984B retention
+projection, no whole-fork compaction and zero memory retries.
+
+**Parent remains FAIL solely on the frozen5.3GB available-memory gate**:
+4.294GB immediately after generation and after instrumentation. Peak Metal
+2,117,271,592B (about68.3MB above the earlier split max1), active776,564,280B
+both before/after hashing; no used-swap growth. The read-only observer costs
+0.240959s and reads an additional144,003,072B prefix plus160,260,624B full
+state and20,480B hidden; no post-generation state replacement/allocator clear.
+Do not relabel this a serving-pressure pass or infer MTP/decode validation
+from max1 (`single-token-budget`, native MTP unused).
+
+HTTP200 / expected incomplete, same5,541B wireSHA `533f9f45...89900`, correct
+selected/effective digest `4473f9eb...df8250`, no overrides. Parent exit1,
+134.1967s,03:59:10.022046 ->04:01:24.218682 UTC, no source drift/timeout;
+root/external minimum18.926/99.111GB, max child-tree RSS4.318GB. Fresh30-second
+preflight passed6.261/6.250GB available with zero swap growth/churn.
+Private endpoint `logs/qwen4_fused_prefix_first_20260906.json`, separate
+`logs/qwen4_fused_prefix_first_http_20260906.json` and matching gate envelope.
+The endpoint's inherited display label says compact-boundary-cold; its new
+profile digest, path counters, artifact name and receipt identify the fused arm.
+
+This state diagnostic is finished; do not repeat it as acceptance. Next run
+the sufficient-output max512 cold plus memory-repeat candidate with native
+MTP and raw generation witnesses, no endpoint observer/mutation/extra cache
+clears. Compare actual completed witnesses to both prior aligned controls,
+keeping the same frozen pressure gates and explicit modified-request scope.
+Then actual extension, varied domains/functions, unmodified capture and Plex.
+
 ## 2026-09-06 UTC: cold fused-prefix integration passes 866 regressions; real state gate next
 
 New explicit profile
