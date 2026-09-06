@@ -1,5 +1,48 @@
 # STATUS — 2026-09-05 (current corrections first; dated chronology below is history)
 
+## 2026-09-06 UTC: fused-prefix capture helper passes 812 tests; serving integration remains next
+
+Added `runtime/qwen4_prefix_capture.py`, a private, **not-yet-wired** builder
+for the next cold aligned-prefix experiment. No engine call site, server flag,
+profile, default, model weight or arithmetic changed. It stages per-layer
+immutable records while observing every original attention tile, materializes
+all retained KV/QSA/FP32 arrays and copies only the small 16-bit convolution
+histories. There is no mixed-position destination cache during the sweep.
+Publication requires all layers/all tiles, complete final endpoint identity
+and a separately owned empty destination. Partial captures and failed
+publication are discarded; an invalid aliasing factory never clears source
+state. Extra retained-state admission is still the future caller's obligation;
+the helper reserves per-layer copy scratch without crediting later reclamation.
+
+Read-only review caught and fixed three pre-integration gaps: non-boundary
+tiles now validate local state too; final-tile object witnesses detect a
+same-shape KDA rewind before publication; and a partially populated private
+destination is emptied on exception/interruption. Pure lifecycle/geometry/
+failure regressions cover all three. Tiny real-MLX tests independently rebuild
+prefix and endpoint state at4/8/1024-token boundaries, compare complete array
+bits plus metadata, preserve noncontiguous BF16/F16 histories, and verify
+actual causal-convolution suffix outputs after the original endpoint advances.
+These are synthetic state/primitive tests, **not a released-model sweep oracle**.
+
+Combined suite: **812 passed in5.12s**, including the existing720 regressions
+and92 new tests. Supervised PASS / exit0,03:29:22.409813 ->03:29:29.886130 UTC,
+no timeout or source drift; private envelope
+`logs/gates/qwen4_prefix_capture_suite_v3_20260906.done.json`.
+The preceding v2 preflight was honestly DEFERRED (5.993GB initially available),
+so no MLX job launched from it. A new full30-second v3 sample passed at
+6.118/6.089GB available with zero swap growth/churn, root18.932GB free;
+only then did the test job run. No apps were closed and no model data moved.
+
+There is **no new harness timing or Plex score**. The prior complete max512
+cold/repeat results and pressure failures below remain the current evidence.
+Next wire the helper into the existing complete Qwen4 layer-major sweep as a
+new explicit cold-only profile, preserving tiles/expert unions; then compare
+both independent retained-prefix and full endpoint witnesses before running
+the sufficient-output cold/repeat/extension and broader request gates.
+Detailed hookup, cleanup, accounting and proof order:
+`docs/qwen4_fused_prefix_capture.md`. Do not repeat this completed helper suite
+as a substitute for that serving integration and real-model verification.
+
 ## 2026-09-06 UTC: complete cold/repeat raw-token equivalence passes; pressure and speed remain open
 
 Fresh aligned-control and aligned-compact servers on the same source `b7b86f3`
