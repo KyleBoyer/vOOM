@@ -1,4 +1,60 @@
-# STATUS — 2026-09-05 (current corrections first; dated chronology below is history)
+# STATUS — 2026-09-06 (current corrections first; dated chronology below is history)
+
+## 2026-09-06 UTC: obsolete hot-startup owner fixed; 500 regressions pass, full-model benefit unmeasured
+
+The concrete lifetime bug from the 131-tool continuation audit is fixed with
+one runtime statement: `del previous_last_kv` immediately after the existing
+release/slot-alias guard and `self.last_kv = None`. Plain RAM KV has no explicit
+`release()`; the old temporary previously kept an obsolete request alive for
+the entire next `generate()` frame. This now ends before slot scanning, admission
+and the next sweep. Retained slots, external owners and shared immutable arrays
+remain owned. No arithmetic, weights, sampling, cache eligibility, profile or
+HTTP-final cleanup policy changed. Direct-engine final endpoints remain available.
+
+Proof is bounded and instrumented, not a new harness latency claim:
+
+- A live-frame, actual-source pure negative control first reproduced the bug:
+  2 failed/5 passed0.77s. After the deletion, all7 pass0.53s. The observer runs
+  BEFORE slot scanning, not after the temporary frame has already unwound.
+- Tiny real MLX ownership probes show exactly8,388,608B active allocation
+  released for an unowned plain cache, versus0B for a retained identical cache
+  or independent fork sharing its tensors. The orphan wrapper dies in the fork
+  case, but every shared value survives unchanged. Synchronization is before
+  measurement, never a post-release GC/cache-clear workaround. This is active
+  allocator accounting, not system-available memory or a production pressure pass.
+- Three actual tiny-GLM engine cases (repeat/extension/branch) preserve every
+  generated ID, text, final KV/DSA digest and cache metadata. Reused prefixes are
+  51/54/36 tokens respectively. A reached production `_sweep` hook proves the
+  injected orphan is gone before the first next-request sweep (decode on an
+  exact repeat). All6 new MLX tests pass1.01s. This synthetic GLM fixture is NOT
+  the released Qwen hybrid/MTP model and disables the governor.
+- The first broader run was499 passed/1 failed9.78s: an existing Qwen3.5 test
+  fake bypassed `__init__` and omitted the real constructor's inactive Qwen4
+  head-lease flag. Only the fake is corrected; production head code is unchanged.
+  The corrected file passes6/6 in0.09s, then **500 related regressions pass9.69s**
+  with seed64004. Hot cache, persistence, fork, Qwen hybrid/MTP, head-lifetime and
+  serving-ownership regressions are included; this is not the entire repo suite.
+
+Preserve the initial new MLX test failure too: its admission hook never executed
+because the fixture disables the governor. The test now asserts coverage at the
+real sweep, rather than claiming an unexercised admission proof. All model/MLX
+jobs had new passing30s preflights and completed sequentially. Final suite parent
+exit0/11.5746s,10:32:08.465045 ->10:32:20.039621UTC, no timeout/signal/source drift;
+all707 source-file hashes still matched before this receipt edit. Parent-log SHA
+5af65c46d3c5422d09fd7fed44ae242f29aea988cb5c28462a4fddfe01436851 verified.
+Private receipts: logs/gates/hot_startup_lifetime_*_20260906.done.json and
+qwen35_head_fixture_20260906.done.json. No production-model inference ran in this
+change gate; no model data, NAS files, apps, cache budgets or pressure limits changed.
+
+Next: verify the real Qwen aligned-prefix repeat AND genuine extended request,
+with old/new token/state witnesses and preserved real tool catalogs, then measure
+peak/available/swap and end-to-end wall. The prior full endpoint's1.240GB is only
+a logical upper opportunity, not a measured saving from this fix. It does not
+change first-request idle endpoint ownership or erase the recorded35.947MB
+swap-out failure. Keep broader HTTP-final orphan disposal separate and opt-in;
+never clear hot prefixes through broad `release_request_state()`. Do not rerun
+the unchanged single-shot131-tool control or the stopped head-admission speed
+lever. Complete Plex/full-harness, long-output/context and sub90s remain open.
 
 ## 2026-09-06 UTC: real 131-tool / 40,536-token continuation completes; pressure still FAIL
 

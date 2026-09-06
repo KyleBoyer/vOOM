@@ -44,6 +44,9 @@ def _engine():
     engine._streamed_lm_head = None
     engine.cache = _Cache(head)
     engine._lm_head_w = head
+    # Match the real constructor's inactive other-family lease; this fixture
+    # bypasses __init__ but exercises the shared demand-head method.
+    engine._qwen4_lm_head_pin_suspended = False
     engine._qwen35_lm_head_pin_suspended = False
     engine._qwen35_lm_head_suspend_request_active = True
     engine._qwen35_serial_verify_head_suspend_calls = 0

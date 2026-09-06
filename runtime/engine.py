@@ -11888,6 +11888,10 @@ class StreamingEngine:
                             for slot in self._hot_prompt_slots)):
                 self._release_kv(previous_last_kv)
             self.last_kv = None
+            # Plain RAM KV has no release() method. End this temporary owner
+            # before reuse/admission/prefill, not at the end of generate().
+            # Any aliased hot slot or external caller still owns its state.
+            del previous_last_kv
             self._h_window = None
             self._h_last = None
 
