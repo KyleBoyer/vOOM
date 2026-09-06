@@ -4,8 +4,11 @@
 Start this instead of ``python -m runtime.server`` after a fresh preflight,
 then send exactly one existing HTTP replay with max_output_tokens=1. The
 normal server applies the requested profiles and owns the engine/lock. This
-wrapper observes its prepared tokens and returned endpoint without changing
-request arguments, model operations, or the returned result. Hashing copies
+wrapper normally observes its prepared tokens and returned endpoint without changing
+request arguments, model operations, or the returned result. An explicit
+--diagnose-retained-prefix experiment may replace retained PLE buffers with
+bit-identical independent storage AFTER generation, in this one-call server only.
+Hashing copies
 state to the host and can affect pressure/latency: both costs are separated.
 No prompt, raw text, token IDs, logits, or tensor payloads are published.
 """
@@ -81,7 +84,8 @@ class FirstTokenHTTPProbe:
     def __init__(self, original, *, artifact, expected_prompt_tokens, label,
                  engine_type, state_digest, hidden_digest, pressure,
                  metal_memory, profile_identity, model_revision,
-                 clock=time.perf_counter, publish=_atomic_write_private):
+                 clock=time.perf_counter, publish=_atomic_write_private,
+                 retained_diagnostic=None):
         if expected_prompt_tokens <= 0:
             raise ValueError("expected prompt-token count must be positive")
         self.original = original
@@ -98,6 +102,7 @@ class FirstTokenHTTPProbe:
         self.clock = clock
         self.publish = publish
         self.claimed = False
+        self.retained_diagnostic = retained_diagnostic
 
     def _publish(self, document):
         try:
@@ -175,6 +180,11 @@ class FirstTokenHTTPProbe:
                 raise ValueError("missing or misaligned Qwen4 first-token endpoint")
             if int(result.get("kv_positions", -1)) != int(kv.offset):
                 raise ValueError("result and authoritative endpoint positions differ")
+            if self.retained_diagnostic is not None:
+                # This opt-in experiment must precede ordinary host hashing,
+                # which could materialize the retained-view hypothesis away.
+                document["retained_fork_diagnostic"] = self.retained_diagnostic(
+                    target, prompt.token_ids)
             digest, arrays, payload, components = self.state_digest(kv)
             if arrays <= 0 or payload <= 0:
                 raise ValueError("Qwen4 endpoint digest contains no state arrays")
@@ -240,11 +250,15 @@ def main(argv=None):
     parser.add_argument("--port", type=int, default=8077)
     parser.add_argument("--profile", action="append", required=True)
     parser.add_argument("--profile-dir", action="append", default=[])
+    parser.add_argument("--diagnose-retained-prefix", type=int, default=0,
+                        help="Post-generation RAM-fork materialization/PLE-detachment experiment; max1 only")
     args = parser.parse_args(argv)
     if args.artifact.exists() or args.artifact.is_symlink():
         parser.error("artifact already exists; choose a fresh private artifact path")
     if args.expected_prompt_tokens <= 0 or not 1 <= args.port <= 65535:
         parser.error("positive expected prompt-token count and valid port are required")
+    if not 0 <= args.diagnose_retained_prefix < args.expected_prompt_tokens:
+        parser.error("retained-prefix diagnostic must be a strict nonnegative prompt prefix")
 
     # Heavy imports occur only in this explicit CLI entry point, after the
     # caller's preflight. Importing/testing schema helpers never initializes MLX.
@@ -258,6 +272,39 @@ def main(argv=None):
     from tests.fixtures.qwen4_flash_next_real_oracle import (
         _model_revision, _pressure, _state_digest)
 
+    def array_digest(value):
+        host = np.asarray(value.view(mx.uint16)
+                          if value.dtype == mx.bfloat16 else value)
+        return {"sha256": hashlib.sha256(host.tobytes(order="C")).hexdigest(),
+                "shape": list(value.shape), "dtype": str(value.dtype)}
+
+    retained_diagnostic = None
+    if args.diagnose_retained_prefix:
+        import psutil
+        from runtime.kv_cache import KVCache
+        from tests.fixtures.qwen4_retained_fork_diagnostic import (
+            complete_state_metadata, copy_ple_bits, diagnose_retained_fork)
+
+        def synchronize_ple(values):
+            mx.eval(*[value for value in values if value is not None])
+            mx.synchronize()
+
+        def retained_diagnostic(target, prompt_ids):
+            return diagnose_retained_fork(
+                target, prompt_ids, expected_prefix=args.diagnose_retained_prefix,
+                kv_type=KVCache, state_digest=_state_digest,
+                metadata_digest=lambda kv: complete_state_metadata(
+                    kv, array_digest=array_digest),
+                copy_ple=lambda value: copy_ple_bits(
+                    value, array_module=mx, numpy_module=np),
+                synchronize_ple=synchronize_ple,
+                pressure=lambda: {**_pressure(),
+                                  "rss_bytes": psutil.Process().memory_info().rss},
+                metal_memory=lambda: {"active_bytes": int(mx.get_active_memory()),
+                                      "cache_bytes": int(mx.get_cache_memory()),
+                                      "allocator_peak_bytes": int(mx.get_peak_memory())},
+                clear_cache=mx.clear_cache)
+
     original = server._engine_generate
     probe = FirstTokenHTTPProbe(
         original, artifact=args.artifact, label=args.label,
@@ -270,6 +317,7 @@ def main(argv=None):
                               "allocator_peak_bytes": int(mx.get_peak_memory())},
         profile_identity=active_runtime_profile_fields,
         model_revision=_model_revision,
+        retained_diagnostic=retained_diagnostic,
     )
     forwarded = ["runtime.server", "--port", str(args.port)]
     for profile in args.profile:

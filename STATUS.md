@@ -1,5 +1,44 @@
 # STATUS — 2026-09-05 (current corrections first; dated chronology below is history)
 
+## 2026-09-06 UTC: retained-PLE materialization diagnostic ready, no serving change
+
+New optional`--diagnose-retained-prefix 1024` on the dedicated max1 HTTP
+observer tests a concrete memory hypothesis. Qwen4 retains PLE convolution
+history as a lazy tail slice; the aligned fork copies its reference without
+evaluating the Qwen4 companion. On this checkpoint one PLE layer retains only
+184,320 logical bytes, while its1024+9-position padded backing is21,155,840B.
+Backing alone cannot explain the roughly0.8GB extra active memory seen after
+the aligned split; graph/weight parents or other owners remain unproven.
+
+The private experiment samples Metal active/cache/peak, RSS/available/swap
+**before any retained-state hashes**, synchronizes only retained PLE histories,
+then samples again. It separately records full before-hash cost/pressure,
+copies only retained PLE histories through independent uint16 host storage,
+samples, clears allocator cache as a distinct stage, and verifies both retained
+and authoritative endpoint digests. Supplemental hashes cover KV starts/windows,
+presence/layout and pooled QSA keys/policy omitted by the original array oracle.
+The retained slot must be separate, marked, RAM-only and an exact1024-ID prefix;
+mutable containers cannot alias. No target weights, model operators, generated
+IDs, active endpoint ownership or default serving behavior are changed.
+
+This intentionally mutates one retained fork's buffer ownership **after** a
+max1 generation in a disposable one-call diagnostic server. It is not a
+production optimization, continued-cache proof, serving-pressure pass or speed
+benchmark, and cannot erase earlier swap-out or peak. The ordinary observer
+remains unchanged unless the option is explicitly supplied.
+
+**628 tests passed in4.76s**, supervised PASS/exit0/no drift/timeout after a
+fresh passing30-second preflight. This includes all65,536 possible16-bit
+payloads in BF16 and FP16, signed zeros/NaN payloads/subnormals, noncontiguous
+tail views, ownership guards, sampling order, observer failure isolation and
+existing server/controller/profile/replay tests. The real checkpoint diagnostic
+has not run yet. Planned private endpoint
+`logs/qwen4_retained_ple_memory_first_20260906.json`, separate HTTP artifact and
+supervised envelope. Require old no-hot observed endpoint/hidden hashes plus
+unchanged before/after fork and full endpoint/metadata hashes. Keep the same
+modified two-real-workspace-tool/developer/streaming/greedy/max1 wire and frozen
+8.5GB/5.3GB/16MB gates. A passing fresh preflight is required before launch.
+
 ## 2026-09-05: confirmation replay repairs final metadata, repeats state match and pressure FAIL
 
 The source`077ad02` rerun of the **modified two-real-workspace-tool / short

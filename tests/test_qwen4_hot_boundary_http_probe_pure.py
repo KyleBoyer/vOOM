@@ -204,6 +204,32 @@ def test_observer_preserves_arguments_result_and_owners_and_separates_costs(tmp_
     assert "248069" not in serialized
 
 
+def test_retained_experiment_is_explicit_and_precedes_endpoint_host_hashes(tmp_path):
+    probe, engine, result, calls = _setup(tmp_path)
+    def retained(target, token_ids):
+        assert target is engine.target and token_ids == Prompt.token_ids
+        calls.append("retained-experiment")
+        return {"available": True, "fork_equal": True, "serving_timing_proof": False}
+    probe.retained_diagnostic = retained
+    returned = probe(engine, Prompt("private"), 1)
+    assert returned is result
+    assert calls[1:] == ["retained-experiment", "state-digest", "hidden-digest"]
+    document = json.loads(probe.artifact.read_text())
+    assert document["retained_fork_diagnostic"]["fork_equal"] is True
+
+
+def test_retained_experiment_failure_does_not_replace_generation_result(tmp_path):
+    def retained(*args):
+        raise ValueError("private metadata must not escape")
+    probe, engine, result, calls = _setup(tmp_path, retained_diagnostic=retained)
+    assert probe(engine, Prompt("private"), 1) is result
+    document = json.loads(probe.artifact.read_text())
+    assert document["available"] is False
+    assert document["error_type"] == "ValueError"
+    assert "private metadata" not in json.dumps(document)
+    assert document["instrumentation"]["state_host_read_bytes"] is None
+
+
 @pytest.mark.parametrize("bad", ["plain-engine", "wrong-model", "no-prepared-ids",
                                 "wrong-input-count", "invalid-boundary", "max2", "float1", "bool1"])
 def test_request_guards_fail_before_generation(tmp_path, bad):
