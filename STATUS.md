@@ -1,5 +1,77 @@
 # STATUS — 2026-09-05 (current corrections first; dated chronology below is history)
 
+## 2026-09-06 UTC: phase-head observer confirms the exact head is released; no output or speed change
+
+Source `6f13991` adds an opt-in, read-only memory witness around the EXISTING
+Qwen4 MTP end-of-generation head release. It uses the existing strict
+`VMODEL_GENERATION_WITNESS=1` flag and a separate structured protocol field;
+default-off behavior, target weights, arithmetic, sampling, release behavior
+and earlier HTTP/cache pressure samples are unchanged. **632 regressions pass
+in 2.90s**, including all three return paths, missing/invalid byte counters,
+before/after sample and clock failures, attachment failure, original release
+exceptions, default-off omission and preservation of nullable protocol fields.
+The supervised suite passed after a fresh 30s preflight, without source drift.
+
+The completed model gate is still the **modified two-original-Plex-tool /
+short system-user history / no developer / nonstream / greedy seed 64001 /
+max 512** request, NOT unmodified 134-tool traffic or a Plex intelligence score.
+Its 5,983B wire SHA, all 1839 prepared IDs, all 146 emitted IDs, 490B raw text,
+both raw call frames and parsed canonical calls match the frozen native-MTP
+control exactly. HTTP 200 completed naturally; no external tool was executed.
+Selected/effective digest remains 13273725...6505d4, no overrides. Native MTP
+still accepts 104/124 proposals over 42 rounds; no fused-prefix arm ran.
+
+At the observed release boundary, logical resident/pinned cache bytes fall
+**1,284,526,080 -> 13,127,680B**, and Metal active bytes fall
+**1,654,350,256 -> 382,951,856B**. Both decreases equal the exact head's
+1,271,398,400B. Allocator cache falls 64,053,712 -> 0B during the existing
+release, which takes 0.0060089s. The new two-sample observer costs **0.0005002s**.
+The earlier `weight_cache_pinned_bytes` snapshot remains 1,284,526,080B because
+it is correctly preserved from BEFORE release. It is not an idle retained-head
+leak. The new witness records all fields successfully without tensor traversal,
+device synchronization, cache clearing, GC, reserve calls or state replacement.
+
+These are non-atomic samples INSIDE the generation return frame, not post-serving
+idle or a physical-memory reclamation proof. System available bytes remain
+5,735,956,480 on both sides; other local owners and OS accounting still exist.
+The allocator's since-last-reset peak is separately labeled 2,210,194,032B;
+the unchanged request true peak is 2,525,569,160B. Neither peak is reset or
+reinterpreted by the observer.
+
+For this modified completed request, HTTP wall **632.8522s**, first 199.6008s,
+prefill 199.6001s, decode 419.1073s, engine 618.7461s. Prior native-MTP wall was
+635.2309s; this is not a demonstrated speed gain. Prefill/decode/total store
+bytes are IDENTICAL: 216,200,372,480 / 658,745,963,712 / 874,946,336,192B.
+Zero prefill retries. Acceptance remains **FAIL**: two identical search calls
+where one is required, and swap-out growth 59,326,464B exceeds 16MB. Endpoint
+available memory now passes 5.3GB and used swap falls 537,591,808B, but the run
+started with 2.624GB stale used swap versus 0.576GB on the prior native control;
+this changing machine state is NOT a new pressure optimization or overall pass.
+
+Parent exit 1 / 635.0112s, 06:59:20.086736 -> 07:09:55.097861 UTC; no timeout,
+signal, missing output or source drift. Artifact and log SHA256 match the parent
+envelope; all model processes ended and port 8073 is free. Fresh 30s model
+preflight passed with 8.337/8.312GB available and zero swap growth/out. Parent
+root/external minima 16.983/99.109GB; max child-tree RSS 5.214GB. Private
+`logs/qwen4_media_headmem512_20260906.json` and matching server/gate artifacts;
+`logs/gates/phase_head_witness_suite_20260906.done.json` records the test suite.
+
+This observer gate is finished; do not repeat it or add another idle release
+to fix a head that is already released. Read-only audit confirms a distinct
+admission gap: Qwen's suspended `_lm_head_weight` path trims the LRU, then
+fetches the head without a synchronous governor reservation; GLM already
+reserves its exact phase bytes before fetching. Cache ownership permission and
+trunk/expert reservations do not themselves admit that separate head allocation.
+Next test a scoped `trim -> reserve exact head bytes -> fetch -> promotion`
+repair: refusal must cause no fetch/promotion, resident/tied/streamed paths must
+remain unchanged, and an empty cache must not suffer a permanent budget ratchet.
+This is likely safety-only under current admission thresholds; if measured head
+reservations all fast-path without reclamation, stop treating it as a speed
+lever. Do not claim it will remove prior global swap churn without measurement.
+The duplicate action is still an ordinary-target quality failure, not an MTP
+or parser regression. Varied-domain/extension, full capture/Plex, long-context,
+sub-90s and full GLM storage-choice gates remain open.
+
 ## 2026-09-06 UTC: ordinary greedy reproduces every native-MTP token, including the duplicate Plex action
 
 The frozen media request now has a completed ordinary-target control on source

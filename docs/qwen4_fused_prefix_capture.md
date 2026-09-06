@@ -54,6 +54,29 @@ This isolation gate is finished; next add correctly timed phase-head pressure
 observations, then measure a bounded exact lifetime/reservation improvement.
 Do not repeat this same control or conceal the known quality failure.
 
+The phase-head observation gate is now complete on source `6f13991`. On the
+same modified media/max-512 request, all 146 raw tokens/text/call hashes and
+store I/O match the frozen native-MTP control. Actual before/after logical pins
+fall 1,284,526,080 -> 13,127,680B; Metal active falls 1,654,350,256 -> 382,951,856B.
+Both drops equal the exact 1,271,398,400B head. Existing release takes 6.009ms;
+the new observer adds 0.500ms. The previous large pin count was a PRE-release
+snapshot, not an observed idle leak. System available is unchanged across the
+samples; this is not proof of physical-memory reclamation or a pressure fix.
+HTTP wall 632.8522s versus prior 635.2309s is not a demonstrated speed gain;
+call-count and swap-out acceptance still FAIL. See STATUS for complete receipts.
+
+The optional `qwen4_mtp_idle_head_memory_witness` uses the existing strict
+generation-witness flag. Its nine scalar probes never evaluate/traverse tensors,
+clear caches, invoke GC/reservation or change existing HTTP samples. Snapshot
+scope is inside the generation return frame, non-atomic and unsynchronized;
+allocator peak since last reset is distinct from request true peak. Null fields
+or samples mean unavailable, not zero. Independent guards prevent observation,
+clock or annotation failures from skipping/repeating release or replacing its
+original exception. Structured protocol projection preserves those types.
+All 632 related regressions pass in 2.90s, supervised without source drift.
+This gate is finished; a future head-reload reservation experiment must be
+justified separately and preserve both raw witnesses and unchanged pressure gates.
+
 ## Proven helper scope
 
 `runtime.qwen4_prefix_capture.AlignedPrefixCapture` requires exact concrete
