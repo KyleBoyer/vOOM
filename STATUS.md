@@ -1,5 +1,75 @@
 # STATUS — 2026-09-06 (current corrections first; dated chronology below is history)
 
+## 2026-09-06 UTC: full131 completed greedy fused A/B matches every raw token; cold -75.96s, pressure FAIL
+
+Both source361f739 arms have FINISHED on identical711-file manifests. Installed
+uncensored Qwen FP8 target; aligned-compact vs fused, generation-witness only.
+All131 original tools and complete initial/repeat/recorded tool-result histories
+remain, including original streaming. Explicit wire overrides in BOTH arms:
+model/max1024/temp0/seed64013. This is a completed greedy diagnostic A/B, NOT
+original-temperature traffic, untouched134-tool replay, live tool execution,
+official-BF16 target proof, full decoded-state oracle or a Plex intelligence score.
+
+For these full131-tool captures with model/max1024/temp0/seed64013 overrides:
+
+| Request | Input / emitted | Cached | Unfused HTTP | Fused HTTP | Unfused / fused prefill |
+|---|---:|---:|---:|---:|---:|
+| Initial, cold | 40,432 /49 | 0 | 975.3016s | 899.3414s | 751.3477 /674.4035s |
+| Same request, warm | 40,432 /49 | 39,936 | 292.3225s | 293.1196s | 83.8354 /84.1898s |
+| Actual recorded continuation, warm | 40,536 /31 | 39,936 | 190.2980s | 189.2639s | 89.7063 /89.5643s |
+
+All six naturally complete HTTP200 responses have identical paired raw token
+IDs/text, prepared IDs, usage/cache counts, one canonical whoami call, and stream/
+final equality; zero duplicates/argument parse failures. Cold/repeat49-ID hash
+491305b9...251362 /194B text065cf0fb...4b2602; continuation31-ID29c710f4...e89e83
+/135B textead32824...dcb7fa. Every paired native proposal source, round width/
+outcome, accepted/proposed count and target-sweep count also matches:28/62 over21
+rounds for initial/repeat,20/30 over10 for continuation. This finite lossless
+output proof supplements the earlier40K first-token full/prefix state equality;
+it does not certify other request shapes or make the new profile automatic.
+
+Cold HTTP falls75.9602s (7.79%); prefill76.9442s (10.24%). This improvement is
+specific to the stated deterministic overrides; no original-traffic speed win
+claimed yet. No useful warm improvement: +0.7971s repeat/-1.0341s continuation.
+No OS-cache flush; cold=fresh server/prompt cache. Fused engine TTFT674.4044/
+84.2417/89.6167s; decode209.4902/208.4855/99.1519s versus208.5514/207.5486/
+100.0279s control. Target verification remains dominant: fused201.8265/200.7759/
+95.4929s versus draft7.2058/7.1919/3.4286s.
+
+Fused cold store reads128,900,497,040B prefill +314,306,054,856B decode,
+total443,206,551,896B: exactly92,063,285,640B fewer prefill reads than control.
+Warm prefill/decode reads unchanged:93,378,926,240/314,306,054,856B repeat,
+98,009,609,840/151,663,257,960B continuation. Store counters are not physical
+NVMe bytes. Cold captures48 layers/39,936 positions/37 histories/2,396,160B;
+both warm requests have zero fused capture and use the existing compactor/reuse.
+No prefill retries or MTP fallback in either arm. No endpoint hashing/history shadow.
+
+Both overall gates FAIL only their five preserved pressure checks. Fused peaks
+6,429,012,616/4,494,820,076/4,712,843,188B all pass8.5GB; cold is752,418,816B
+above control. Fused available4.775/3.794/3.958GB all fail5.3GB (control4.007/
+3.766/4.013GB). Per-request fused swap-outs31,866,880/18,907,136/7,536,640B,
+total58,310,656B; control41,975,808/14,991,360/12,763,136B,total69,730,304B.
+First-client repeat checks retain cumulative50,774,016B fused/56,967,168B control;
+separate continuation churn passes, available does not. Swap-used falling or
+nearly flat does not waive swap-outs. No pressure acceptance/default promotion.
+
+Both parents exit1, no timeout/signal/missing result/source drift. All711 hashes,
+both parent logs and four child reports independently verified before receipts.
+Control parent1461.2257s15:55:12.746495->16:19:33.972181UTC, result SHA
+57627d880b3179c97a7df2ce23864ad5fafef41c69114eb7619cc65285c1fce2;
+fused1384.6371s16:22:59.419061->16:46:04.056154UTC, result SHA
+25dffbb807e295fb06bd08d36a71690b49f9dd0e6da86b14e26250038c2985bb,
+logd434d9932991dcd7ff1350371e45cc34dc12f83273d19d2863671756e494ac90.
+Fused root/external minima16.792/98.370GB,maxRSS5.468GB; all jobs gone. Private
+logs/qwen4_full131_greedy1024_{unfused_control,fused_candidate}_20260906.json
+and matching initial/extension/server/gates artifacts. No private payloads committed.
+
+Next bounded job restores originaltemp0.3/no seed for full131 cold/repeat/actual
+continuation with fused profile, changing only model/max1024. Preserve schemas,
+messages, streaming, natural completion and pressure gates; do not compare variable
+stochastic output lengths as causal speed gains. Defaults stay unchanged. Varied
+domains/functions, full Plex, normal serving pressure and sub90s remain open.
+
 ## 2026-09-06 UTC: fused full40K endpoint/prefix equality passes; diagnostic prefill -9.86%, pressure FAIL
 
 Source209bced v2 fused job FINISHED. All eight comparison groups match the audited
