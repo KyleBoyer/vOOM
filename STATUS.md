@@ -1,5 +1,69 @@
 # STATUS — 2026-09-06 (current corrections first; dated chronology below is history)
 
+## 2026-09-06 UTC: full131-tool cold/repeat/actual-continuation all complete; pressure still FAIL
+
+The source1918fff three-request sequence has FINISHED. Runtime is the tested
+a7c69e6 startup-owner correction. Both original captures retain all131 schemas,
+both system messages and the complete recorded histories; ONLY model selection
+and max-output allowance1024 change. Temperature0.3 and streaming remain original,
+with no seed. This is recorded traffic replay, not a live generated tool loop,
+the original134-tool capture, an old/new code A/B, or a Plex intelligence score.
+Installed target is the uncensored Qwen FP8 candidate, not official Qwen BF16.
+
+For these full131-tool captures with model/max1024 overrides, all responses are
+HTTP200/completed naturally. No OS-cache flush; cold means fresh server/cold
+prompt cache. TTFT below is engine-reported, not client-observed startup-inclusive.
+
+| Request | Input / emitted tokens | Cached tokens | HTTP wall | Engine TTFT | Decode |
+|---|---:|---:|---:|---:|---:|
+| Initial, cold | 40,432 /48 | 0 | 928.5895s | 751.9453s | 160.8493s |
+| Same request, warm | 40,432 /48 | 39,936 | 245.1924s | 84.0280s | 160.7552s |
+| Actual tool-result continuation, warm | 40,536 /58 | 39,936 | 282.3392s | 89.3231s | 192.5312s |
+
+Prefill751.9446/83.8116/89.2676s; engine912.8035/244.7874/281.8587s.
+Store-accounted prefill/decode/total GB respectively220.964/242.233/463.196,
+93.379/242.233/335.611 and98.010/288.262/386.272. These are logical store reads,
+not independently measured physical NVMe traffic. Both warm requests exercise
+the expected aligned cache; this shows real reuse survived, not how many bytes
+the local-lifetime fix physically freed or a causal before/after speed gain.
+
+Every response has one parseable execute-command call, zero duplicates and
+stream/final equality. All canonical call hashes equal the previously verified
+minimal whoami call d3f4ea...8d81. No tool executes; surrounding prose/general
+intelligence remain unscored. Cold/repeat also match all48 emitted IDs and200B
+raw text: IDs88d86054...cc79aa, text42f4fdc0...3a8f05b, preparedc677e37c...f2a5b2.
+Continuation emits58 IDs693b39b7...2741a0 /189B textcb33b0d7...aa17f36 from the
+same40536-token prepared hash55c6b833...3a30d0 as the older cold continuation.
+This stochastic finite agreement is NOT a greedy/distribution/state oracle.
+Native MTP accepted32/46,32/46,38/57 over16/16/19 rounds; verifier155.043/
+154.866/185.374s versus draft5.449/5.467/6.609s. No fallback or observed retry.
+
+Overall acceptance FAILS only preserved pressure checks. True Metal peaks
+5.677/4.495/4.713GB all pass8.5GB; endpoint available4.185/4.043/3.784GB all
+fail5.3GB. Actual per-request swap-out growth32.031/6.554/13.255MB, sum51.839MB.
+The initial client's second-row failure uses its preserved CUMULATIVE38.584MB
+growth since that client's start, not6.554MB alone; the separate continuation
+client passes its own13.255MB churn check. Never relabel the combined gate PASS.
+Used swap is flat for the first two and falls8.389MB on the third; that does not
+erase swap-outs. Selected/effective13273725...6505d4, both profiles/no overrides.
+
+Parent exit1/1458.4945s,10:59:23.358423 ->11:23:41.852864UTC, no timeout,
+signal, missing result or source drift. All707 source hashes still match before
+receipt editing; every child and parent artifact hash verified. Combined result
+SHA84b61cf5d3cee2f19433d519a2c24b91a2d64671c31f47b2f360e6b18bcceb2c;
+parent-log SHAf12b3db8d42f88100194607cf42176377156c276981aba23d19cd7dfbdcf1881.
+Root/external minima17.966/98.405GB; max child-tree RSS5.062GB. All jobs ended,
+port8073 is free. Private logs/qwen4_real_captured_reuse1024_20260906.json plus
+matching initial/extension reports, server log and gate envelope.
+
+Do not rerun this unchanged sequence. Remaining warm latency is now dominated
+by16-19 native-MTP verifier sweeps, not drafting. Next review prior history/
+speculation experiments for a content-blind, target-verified way to reduce those
+sweeps before changing defaults; preserve this real multi-request corpus. Any
+new HTTP-final orphan cleanup still needs ownership/state and same-request
+pressure proof. Full state/old-new lifetime A/B, complete Plex, sustained-long
+output, context ladder and sub90s objectives remain open.
+
 ## 2026-09-06 UTC: real initial/repeat/tool-result corpus pinned; full-size reuse evaluation pending
 
 The next bounded job uses TWO actual captured requests, not a constructed tool
