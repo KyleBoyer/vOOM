@@ -1,5 +1,86 @@
 # STATUS — 2026-09-05 (current corrections first; dated chronology below is history)
 
+## 2026-09-06 UTC: real 131-tool / 40,536-token continuation completes; pressure still FAIL
+
+The source `7c56e99` full-catalog continuation gate is complete. It retains all131
+original tool objects, both original system messages, the original user/function
+call/tool-result history, temperature0.3 and streaming. The ONLY wire-field
+changes are model selection and max-output budget1024. Wire148,609B SHA
+505c1996774ced855024c2c034be4bba5652212d72301d5c487573f9a0188509 matches the
+pre-launch pin; this is NOT byte-for-byte unchanged traffic, the original134-tool
+capture, a greedy A/B, a context-ladder conformance gate or a Plex score.
+
+HTTP200 completed naturally at **40,536 input /49 output tokens**, far below the
+1024 allowance. Streamed text matches final text. Exactly ONE parseable
+`mastra_workspace_execute_command` call appears, with no duplicate, and its raw
+Hermes-frame digest equals its parsed canonical digest. An independent post-run
+hash of the user-requested minimal call `{command: whoami}` with that exact tool
+name matches BOTH: d3f4ea975e79b0edeedfd77fee70fb1228f1825f2c99bc971c58781c91cc8d81.
+This confirms the requested retry action, not successful command execution or
+semantic validation of surrounding prose. No generated tool executed. The
+original artifact remains honestly unscored for semantic quality/Plex; this
+post-run specific action check does not turn it into a broad intelligence pass.
+
+For this full131-tool captured continuation with model/max1024 overrides,
+fresh-server cold prompt-cache HTTP wall **915.9290s (15.27min)**, reported
+engine first-token743.7685s, prefill743.7677s, decode156.9207s,
+engine900.6949s. This is a new request-shape baseline, NOT a speed improvement
+against the smaller two-tool cases. No OS-cache flush was performed. Prefill /
+decode /total store bytes225,594,466,280 /242,738,882,376 /468,333,348,656.
+Prefill runs two layer-stationary sweeps totaling40,536 positions; retained
+aligned prefix39,936, compact histories2,396,160B (0.0430s), projected retained
+logical state1,221,709,824B. No fused-prefix arm or cache-repeat gate ran.
+
+The preserved nonzero temperature exercises actual stochastic native MTP:
+41 proposals reach stochastic verification;32/48 proposed tokens accepted over
+16 rounds, draft5.4873s/verifier151.0186s. No fallback or prefill retry. This is
+an execution witness, not a statistical proof or seeded/greedy equivalence A/B.
+Selected/effective digest13273725...6505d4, both intended profiles, no overrides.
+Target representation remains the installed uncensored FP8 candidate, not the
+official Qwen BF16 checkpoint. All17 exact head admissions fast-path (0.411ms)
+and idle head release still drops exact1,271,398,400B active/pinned bytes.
+
+Overall acceptance **FAILS only the preserved pressure gates**: endpoint
+available4,170,317,824B<5.3GB; swap-out growth35,946,496B>16MB. Used swap falls
+8,388,608B; true peak Metal5,676,593,792B<8.5GB. Final post-head-release active
+2,489,967,568B is an inside-generation, non-atomic snapshot, not proof of an
+idle leak. Full/retained KV owners and temporary MTP frames need a separate
+ownership audit before attributing it or disposing any cache.
+
+Raw witness:153B text SHAad7db09eb1dda3bde2aaca33fd5dba299048b55b22de9afd31c8628d70ed82c8;
+emitted-ID SHA4c7663067c9d245211e7f90b9451fcd306d90c542d626374550bedda20bebafd;
+prepared-ID SHA55c6b83380f4eb264533edf843efa91f831470a60afd4bd85fd43106ff3a30d0.
+Parent exit1/918.4034s,09:25:11.924017 ->09:40:30.327025UTC, no timeout, signal,
+spawn failure, missing output or source drift. Result SHA
+765be99dc01e2ddf9489e7d0bbb5174627fda61457f86cc563a785ce34e9b9e3 and parent-log
+SHAd13d04fd8cdb166ca719dc74c4c57a4d6ef2eade81d8f373b583358012e0fe91 match the
+supervisor envelope; every current source hash matched before this receipt edit.
+All model jobs ended and port8073 is free. Root/external minima17.988/98.627GB,
+max child-tree RSS5.504GB. Fresh30s preflight7.184/7.181GB available, zero churn.
+Private logs/qwen4_captured_continuation1024_20260906.json and matching gate/logs.
+
+The follow-up ownership audit accounts for 2,474,494,336B as final endpoint
+1,239,656,832B + retained prefix1,221,709,824B + remaining pins13,127,680B.
+The 15,473,232B residual is compatible in scale with QSA backing allowance and
+small return-frame arrays, not a measured decomposition or unexplained leak.
+A concrete next-request lifetime issue was found: hot startup calls optional
+`_release_kv(previous_last_kv)` and clears `self.last_kv`, but retains the local
+`previous_last_kv` for the entire next `generate()` frame. Plain RAM KV has no
+`release()` method. Drop that obsolete local after the existing alias check;
+prove weak-reference disposal before reuse/prefill and preserve every hot slot.
+The 1.240GB final endpoint is a logical opportunity, not proven physical savings.
+
+This gate is finished; do not replay it unchanged. A separate opt-in FINAL HTTP
+orphan-endpoint cleanup would need its own ownership and continued-request proof.
+The existing serving-only idle disposal deliberately skips hot-enabled cases;
+never call broad `release_request_state()` there, since it clears reusable slots.
+Cold fused-prefix/real continuation reuse can only be promoted after applicable
+state/token and pressure gates, not this stochastic one-shot. Original134-tool
+completed-output capture, complete Plex, sustained-long-output, large-context
+ladder, sub90s and full-GLM completed-output objectives remain open. Full GLM-5.3
+is already fully local per the newer 2026-08-31 CLAUDE.md correction; the old
+AGENTS.md storage-choice paragraph is stale, not a current acquisition blocker.
+
 ## 2026-09-06 UTC: next full-catalog captured tool-result continuation pinned; evaluation pending
 
 Content-free inventory found64 local captured requests and5 actual function-result
