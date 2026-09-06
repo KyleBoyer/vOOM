@@ -27,6 +27,16 @@ from runtime.profiles import (
 ROOT = Path(__file__).resolve().parent.parent
 
 
+def test_completed_history_shadow_overlay_changes_only_observation_flag():
+    catalog = discover_runtime_profiles((ROOT / "profiles",))
+    base = "qwen38-flash-next-uncensored-fp8-exact-pipeline-hot-kv-aligned-compact"
+    overlay = "qwen4-completed-history-shadow"
+    _, baseline = resolve_runtime_profiles((base,), catalog)
+    _, settings = resolve_runtime_profiles((base, overlay), catalog)
+    assert "VMODEL_QWEN4_COMPLETED_HISTORY_SHADOW" not in baseline
+    assert settings == {**baseline, "VMODEL_QWEN4_COMPLETED_HISTORY_SHADOW": "1"}
+
+
 def test_qwen_idle_release_overlay_changes_only_the_explicit_cleanup_flag():
     catalog = discover_runtime_profiles((ROOT / "profiles",))
     base = "qwen38-flash-next-uncensored-fp8-fast-tier-mtp-direct-fp8-qmv-prefill-pipeline-exact-fused-delta"

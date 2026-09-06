@@ -376,6 +376,7 @@ class Qwen4MTPSpeculativeEngine:
         ngram_max_draft_tokens: int = 7,
         q_calibration_scales: Sequence[float] = (),
         compact_kda_rollback: bool = False,
+        completed_history_shadow: bool = False,
         drafter=None,
     ):
         if target.cfg.model_type != "qwen4_exp":
@@ -417,6 +418,8 @@ class Qwen4MTPSpeculativeEngine:
                 "exclusive experiments")
         if not isinstance(compact_kda_rollback, bool):
             raise TypeError("Qwen4 MTP compact_kda_rollback must be bool")
+        if not isinstance(completed_history_shadow, bool):
+            raise TypeError("Qwen4 MTP completed_history_shadow must be bool")
         normalized_calibration_scales = []
         for value in q_calibration_scales:
             if isinstance(value, bool):
@@ -450,6 +453,14 @@ class Qwen4MTPSpeculativeEngine:
         self.q_calibration_scales = tuple(normalized_calibration_scales)
         self.compact_kda_rollback = compact_kda_rollback
         self.drafter = drafter or Qwen4MTPDrafter(target)
+        self._completed_output_history = None
+        if completed_history_shadow:
+            from .completed_output_history import CompletedOutputHistory
+
+            # Ownership by this engine also isolates model/tokenizer identity.
+            # This is observation only; candidates never enter draft/verify.
+            self._completed_output_history = CompletedOutputHistory(
+                vocab_size=int(target.cfg.vocab_size))
         self.mtp_engine_identity = (
             f"qwen4-mtp-depth{depth}-qmin{min_draft_probability:g}"
             + (f"-ngram-first-k{ngram_max_draft_tokens}"
@@ -458,13 +469,101 @@ class Qwen4MTPSpeculativeEngine:
                 f"{scale:g}" for scale in self.q_calibration_scales)
                if self.q_calibration_scales else "")
             + ("-compact-kda" if compact_kda_rollback else "")
+            + ("-completed-history-shadow" if completed_history_shadow else "")
             + "-exact-target")
 
     def __getattr__(self, name):
         return getattr(self.target, name)
 
     def close(self) -> None:
+        if self._completed_output_history is not None:
+            try:
+                self._completed_output_history.clear()
+            except Exception:
+                pass  # Optional history cannot prevent target resource release.
+            self._completed_output_history = None
         self.target.close()
+
+    def _finish_completed_history_shadow(
+        self, prompt, result, records, lookup_seconds, rounds, lookup_error,
+    ) -> None:
+        """Bounded, content-free diagnostics; never speculative acceptance.
+
+        Candidates were fixed at ordinary MTP round starts using only earlier
+        completed outputs and the then-emitted suffix. Comparison against the
+        later observed stream is descriptive, especially for stochastic output:
+        it is not p/q verification, a counterfactual decode, or a speed estimate.
+        """
+        history = self._completed_output_history
+        if history is None:
+            return
+        try:
+            started = time.perf_counter()
+            if lookup_error is not None:
+                history.clear()
+                result["path_stats"]["qwen4_completed_history_shadow"] = {
+                    "schema": "voom.completed-history-shadow.v1",
+                    "observation_only": True,
+                    "available": False,
+                    "error_type": lookup_error,
+                }
+                return
+            tokens = result["tokens"]
+            observations = []
+            for offset, proposal in records:
+                observed = tokens[offset:offset + len(proposal.tokens)]
+                matched = 0
+                for expected, actual in zip(proposal.tokens, observed):
+                    if expected != actual:
+                        break
+                    matched += 1
+                observations.append({
+                    "output_offset": offset,
+                    "match_length": proposal.match_length,
+                    "proposed_tokens": len(proposal.tokens),
+                    "observed_tokens": len(observed),
+                    "matching_prefix_tokens": matched,
+                    "unobserved_tokens": len(proposal.tokens) - len(observed),
+                })
+            before = history.telemetry()
+            added = history.add_output(
+                getattr(prompt, "cache_namespace", "default"), tokens,
+                completed=result.get("termination_reason") in (
+                    "eos", "grammar", "stop_sequence"))
+            result["path_stats"]["qwen4_completed_history_shadow"] = {
+                "schema": "voom.completed-history-shadow.v1",
+                "available": True,
+                "observation_only": True,
+                "scope": "overlapping_round_local_observed_token_prefixes",
+                "stochastic_acceptance_proof": False,
+                "single_tenant_timing_membership_risk": True,
+                "lookup_seconds": lookup_seconds,
+                "finish_seconds": time.perf_counter() - started,
+                "lookup_included_in_decode_time": True,
+                "finish_excluded_from_engine_total_time": True,
+                "record_limit": 128,
+                "skipped_rounds": max(0, rounds - len(records)),
+                "candidate_rounds": sum(bool(p.tokens) for _, p in records),
+                "records": observations,
+                "history_before": before,
+                "history_after": history.telemetry(),
+                "completed_output_added": added,
+            }
+        except Exception as error:
+            # Optional telemetry cannot replace an already completed response.
+            try:
+                history.clear()
+            except Exception:
+                self._completed_output_history = None
+            try:
+                result["path_stats"]["qwen4_completed_history_shadow"] = {
+                    "schema": "voom.completed-history-shadow.v1",
+                    "observation_only": True,
+                    "available": False,
+                    "error_type": type(error).__name__,
+                }
+            except Exception:
+                pass
 
     def _idle_phase_head_memory_sample(self) -> dict:
         """Best-effort observation; failure must not interfere with release."""
@@ -740,6 +839,9 @@ class Qwen4MTPSpeculativeEngine:
         ngram_rejected = 0
         ngram_native_draft_bypasses = 0
         outcomes = []
+        history_shadow_records = []
+        history_shadow_lookup_s = 0.0
+        history_shadow_error = None
         decode_started = time.perf_counter()
         while (
             len(emitted) < max_tokens
@@ -752,6 +854,18 @@ class Qwen4MTPSpeculativeEngine:
             if round_depth <= 0:
                 break
             rounds += 1
+            if (self._completed_output_history is not None
+                    and history_shadow_error is None
+                    and len(history_shadow_records) < 128):
+                try:
+                    lookup_started = time.perf_counter()
+                    shadow = self._completed_output_history.propose(
+                        getattr(prompt, "cache_namespace", "default"),
+                        emitted[-6:], max_tokens=min(7, remaining))
+                    history_shadow_lookup_s += time.perf_counter() - lookup_started
+                    history_shadow_records.append((len(emitted), shadow))
+                except Exception as error:
+                    history_shadow_error = type(error).__name__
             round_start_offset = int(kv.offset)
             target_start_lengths = kv.layer_lengths()
             mtp_start_lengths = mtp_kv.layer_lengths()
@@ -1399,4 +1513,7 @@ class Qwen4MTPSpeculativeEngine:
         if execution_profile is not None:
             result["execution_profile"] = execution_profile
         self._release_idle_phase_head(result)
+        self._finish_completed_history_shadow(
+            prompt, result, history_shadow_records, history_shadow_lookup_s,
+            rounds, history_shadow_error)
         return result

@@ -4187,8 +4187,10 @@ def test_qwen4_mtp_min_draft_probability_is_strictly_bounded(value):
             EngineManager().get(Path("/tmp/fake-qwen4"), "lossless")
 
 
+@pytest.mark.parametrize("setting", ["VMODEL_QWEN4_MTP_NGRAM_FIRST",
+                                     "VMODEL_QWEN4_COMPLETED_HISTORY_SHADOW"])
 @pytest.mark.parametrize("value", ["2", "true", "bad"])
-def test_qwen4_mtp_ngram_first_is_strict_boolean(value):
+def test_qwen4_mtp_ngram_first_is_strict_boolean(value, setting):
     from unittest.mock import patch
 
     from runtime.server import EngineManager
@@ -4199,13 +4201,13 @@ def test_qwen4_mtp_ngram_first_is_strict_boolean(value):
         num_hidden_layers=48, num_experts=512,
     )
     with patch.dict(os.environ, {
-        "VMODEL_QWEN4_MTP_NGRAM_FIRST": value,
+        setting: value,
     }, clear=False), \
          patch("runtime.config.ModelConfig.from_dir", return_value=cfg), \
          patch("runtime.path_resolver.resolve_model_dir", side_effect=lambda path: path):
         with pytest.raises(
             RequestValidationError,
-            match="QWEN4_MTP_NGRAM_FIRST",
+            match=setting,
         ):
             EngineManager().get(Path("/tmp/fake-qwen4"), "lossless")
 
@@ -4230,6 +4232,24 @@ def test_qwen4_mtp_compact_kda_rollback_is_strict_boolean(value):
             RequestValidationError,
             match="VMODEL_QWEN4_MTP_COMPACT_KDA_ROLLBACK",
         ):
+            EngineManager().get(Path("/tmp/fake-qwen4"), "lossless")
+
+
+def test_qwen4_history_shadow_requires_native_mtp():
+    from unittest.mock import patch
+    from runtime.server import EngineManager
+
+    cfg = SimpleNamespace(
+        model_type="qwen4_exp", tie_word_embeddings=False,
+        vision_config={"model_type": "qwen4_exp_vision"},
+        num_hidden_layers=48, num_experts=512)
+    with patch.dict(os.environ, {
+        "VMODEL_QWEN4_COMPLETED_HISTORY_SHADOW": "1",
+        "VMODEL_QWEN4_MTP_DEPTH": "0",
+    }, clear=False), \
+         patch("runtime.config.ModelConfig.from_dir", return_value=cfg), \
+         patch("runtime.path_resolver.resolve_model_dir", side_effect=lambda path: path):
+        with pytest.raises(RequestValidationError, match="COMPLETED_HISTORY_SHADOW requires"):
             EngineManager().get(Path("/tmp/fake-qwen4"), "lossless")
 
 
@@ -4270,7 +4290,7 @@ def test_qwen4_phase_head_and_mtp_are_explicitly_wired():
     class FakeMTP:
         def __init__(
             self, target, *, depth, min_draft_probability, ngram_first,
-            q_calibration_scales, compact_kda_rollback,
+            q_calibration_scales, compact_kda_rollback, completed_history_shadow,
         ):
             captured["target"] = target
             captured["depth"] = depth
@@ -4278,6 +4298,8 @@ def test_qwen4_phase_head_and_mtp_are_explicitly_wired():
             captured["ngram_first"] = ngram_first
             captured["q_calibration_scales"] = q_calibration_scales
             captured["compact_kda_rollback"] = compact_kda_rollback
+            captured.setdefault("completed_history_shadow", []).append(
+                completed_history_shadow)
 
         def close(self):
             captured["target"].close()
@@ -4297,13 +4319,18 @@ def test_qwen4_phase_head_and_mtp_are_explicitly_wired():
         "VMODEL_QWEN4_SERIAL_VERIFY_EXACT_BF16_GEMV": "1",
         "VMODEL_QWEN4_QSA_POOL_CACHE": "1",
         "VMODEL_QWEN4_MTP_COMPACT_KDA_ROLLBACK": "1",
+        "VMODEL_QWEN4_COMPLETED_HISTORY_SHADOW": "0",
     }, clear=False), \
          patch("runtime.config.ModelConfig.from_dir", return_value=cfg), \
          patch("runtime.path_resolver.resolve_model_dir", side_effect=lambda path: path), \
          patch("runtime.engine.StreamingEngine", FakeEngine), \
          patch("runtime.qwen4_mtp.Qwen4MTPSpeculativeEngine", FakeMTP):
-        engine = EngineManager().get(
+        manager = EngineManager()
+        engine = manager.get(
             Path("/tmp/fake-qwen4-phase-mtp"), "lossless")
+        os.environ["VMODEL_QWEN4_COMPLETED_HISTORY_SHADOW"] = "1"
+        observed = manager.get(Path("/tmp/fake-qwen4-phase-mtp"), "lossless")
+        assert observed is not engine
 
     assert isinstance(engine, FakeMTP)
     assert captured["depth"] == 4
@@ -4311,6 +4338,7 @@ def test_qwen4_phase_head_and_mtp_are_explicitly_wired():
     assert not captured["ngram_first"]
     assert captured["q_calibration_scales"] == [0.7, 1.0, 1.3]
     assert captured["compact_kda_rollback"]
+    assert captured["completed_history_shadow"] == [False, True]
     assert captured["rc"].qwen4_phase_lm_head
     assert captured["rc"].qwen4_serial_verify_suspend_lm_head
     assert captured["rc"].qwen4_serial_verify_exact_bf16_gemv

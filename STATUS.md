@@ -1,5 +1,58 @@
 # STATUS — 2026-09-06 (current corrections first; dated chronology below is history)
 
+## 2026-09-06 UTC: completed-output history shadow instrumented; real-capture observation pending
+
+New explicit `qwen4-completed-history-shadow` overlay measures the next proposed
+speculation lever WITHOUT using its candidates for decoding. Native MTP, target
+verification, widths, RNG and existing default settings remain unchanged. The
+engine-local CPU cache retains only naturally completed generated outputs:
+at most 8 requests / 4,096 total IDs / 1,024 IDs per output, with global FIFO
+eviction. Match only the latest six emitted IDs against separate previous
+outputs in the same namespace, never prompts/tool schemas or concatenated
+output boundaries. No raw IDs or namespace text are serialized/exported.
+Namespace filtering is not tenant authentication or timing isolation; this
+diagnostic remains explicit, single-tenant, default-off and clears on close.
+
+At most 128 ordinary round starts record an unverified candidate of up to seven
+IDs. After natural generation, compare those fixed candidates with the observed
+output prefix. These windows can overlap: coincidence is NOT stochastic p/q
+acceptance, a counterfactual greedy stream, saved sweeps, or a latency estimate.
+Lookup time is inside decode; finish comparison/copy time is separately reported
+and outside the existing engine total, but inside HTTP wall. Failed diagnostic
+clocks/lookups/cleanup/telemetry attachment cannot fail generation or target close.
+
+Verification: 84 CPU helper/profile tests pass in 0.74s; 19 tiny MLX/controller
+observer tests pass in 0.68s (seed64009); 32 selected server tests pass in 0.40s
+(seed64010). Final combined suite: **657 passed in 2.36s** (seed64011), including
+the full server test file and related sampler/MTP/hybrid/head/profile coverage;
+not the entire repository suite. Synthetic cold/repeat arms preserve IDs, text,
+native verifier calls/widths, toy state and subsequent RNG draws at temperatures
+0/0.3/1 with streaming on/off. Tests include namespace/engine isolation, capped
+output exclusion, 128-record truncation and injected observer failures. This is
+NOT released-model state equality, pressure acceptance or a Plex score.
+
+CPU-only 4,096-ID synthetic lookup probe (50 measured trials after 5 warmups):
+unique-hit median 0.1465ms / p95 0.1500ms; adversarial-miss median 4.8237ms /
+p95 4.9347ms. Retained structural accounting 268,368B versus 278,528B cap,
+plus 68,096B one-operation scratch bound; neither is measured RSS or total
+observer memory. No production weights were read. Three fresh 30s MLX preflights
+passed with zero swap-used/swap-out growth. Every supervisor exited zero with
+no signal/timeout/source drift; final 711 source hashes and all five parent log
+hashes verified before receipt editing. Final suite parent 13:07:47.232917 ->
+13:07:51.702685 UTC, 4.4698s; log SHA
+eff0005c6fc383f9a647e4d5b202bdf8ca6a63f13d4d3a43bb220658c77540db.
+
+Next bounded job: the same two full 131-tool recorded requests, initial cold,
+repeat and actual captured tool-result continuation, now with this shadow-only
+overlay plus aligned-compact and generation-witness. Only model/max1024 wire
+overrides; preserve original temperature0.3, streaming, all tools/messages and
+no seed. Keep 8.5GB/5.3GB/16MB gates and all failures. Expected artifacts:
+logs/qwen4_completed_history_shadow_capture1024_20260906.json and matching
+initial/extension/server/gate files. This new observation is not a speed A/B;
+do not infer acceptance or enable history drafting from repeated-output matches.
+Source must remain frozen while it runs. Full harness/Plex, context ladder,
+pressure and sub90s objectives remain open.
+
 ## 2026-09-06 UTC: Qwen4 stochastic zero-mass acceptance fixed; 236 regressions pass
 
 The next speculation audit found a correctness prerequisite, not a speed win:

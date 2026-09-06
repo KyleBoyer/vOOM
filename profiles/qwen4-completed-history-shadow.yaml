@@ -1,0 +1,10 @@
+schema: voom.runtime-profile.v1
+name: qwen4-completed-history-shadow
+description: Opt-in bounded completed-output lookup observation; never supplies draft tokens.
+notes:
+  - "Select after a Qwen4 native-MTP profile. Changes only this diagnostic flag. No weights, verifier widths, native drafting, or cache-placement settings change."
+  - "Single-tenant use only: namespaces filter matches, but do not provide timing isolation or authentication. Raw output IDs remain in a bounded engine-local RAM cache; neither IDs nor namespaces are exported or serialized."
+  - "At most 8 completed outputs, 4096 total IDs and 1024 IDs per output. Observe at most 128 round starts using only emitted suffixes and separate previous completed outputs, never prompt/tool schemas."
+  - "Observed token-prefix coincidence is not stochastic acceptance, saved sweeps, an intelligence score or a speed estimate. Candidate windows can overlap; their matching-token counts cannot be summed into saved tokens."
+settings:
+  VMODEL_QWEN4_COMPLETED_HISTORY_SHADOW: true

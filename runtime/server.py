@@ -1254,6 +1254,7 @@ class EngineManager:
                 ("VMODEL_QWEN4_HOT_KV_TILE_ALIGNED", "0"),
                 ("VMODEL_QWEN4_COMPACT_RETAINED_CONV", "0"),
                 ("VMODEL_QWEN4_FUSED_ALIGNED_PREFIX", "0"),
+                ("VMODEL_QWEN4_COMPLETED_HISTORY_SHADOW", "0"),
             )
         )
         dspark_request_identity = tuple(
@@ -3618,6 +3619,14 @@ class EngineManager:
                 if not 0 <= qwen4_mtp_depth <= 7:
                     raise RequestValidationError(
                         "VMODEL_QWEN4_MTP_DEPTH must be in [0, 7]")
+                if qwen4_request_identity[39] not in ("0", "1"):
+                    raise RequestValidationError(
+                        "VMODEL_QWEN4_COMPLETED_HISTORY_SHADOW must be 0 or 1")
+                qwen4_completed_history_shadow = qwen4_request_identity[39] == "1"
+                if qwen4_completed_history_shadow and not qwen4_mtp_depth:
+                    raise RequestValidationError(
+                        "VMODEL_QWEN4_COMPLETED_HISTORY_SHADOW requires "
+                        "VMODEL_QWEN4_MTP_DEPTH > 0")
                 try:
                     qwen4_mtp_min_draft_probability = float(
                         qwen4_request_identity[25])
@@ -5701,6 +5710,7 @@ class EngineManager:
                             qwen4_mtp_q_calibration_scales),
                         compact_kda_rollback=(
                             qwen4_mtp_compact_kda_rollback),
+                        completed_history_shadow=qwen4_completed_history_shadow,
                     )
                     print(
                         "[server] exact Qwen4 Lightning-MTP speculation: "
@@ -10694,6 +10704,7 @@ def _vision_protocol_timing(result: dict) -> dict:
         "generation_witness",
         "tool_call_text_witness",
         "qwen4_mtp_idle_head_memory_witness",
+        "qwen4_completed_history_shadow",
         "qwen4_phase_head_admission",
         "qwen_mtp_accepted_by_step",
         "qwen_mtp_verified_by_step",
