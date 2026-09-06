@@ -7744,6 +7744,32 @@ def _attach_generation_witness(prompt, result: dict) -> None:
         }
 
 
+def _observe_qwen4_post_generation_memory(engine, result) -> None:
+    """Opt-in boundary probe; never discard the hot-cache or final endpoint."""
+    mode = os.environ.get("VMODEL_QWEN4_POST_GENERATION_MEMORY", "")
+    if mode not in ("observe", "synchronize_clear_cache"):
+        return
+    from .qwen4_mtp import Qwen4MTPSpeculativeEngine
+
+    if type(engine) is not Qwen4MTPSpeculativeEngine:
+        return
+    target = engine.target
+    if getattr(getattr(target, "cfg", None), "model_type", None) != "qwen4_exp":
+        return
+    from .phase_head_witness import post_generation_memory_witness
+    import mlx.core as mx
+
+    # Device-barrier failures must propagate. Only attaching optional scalar
+    # telemetry is best-effort; never mislabel a failed barrier as completed.
+    observation = post_generation_memory_witness(
+        target, mx, barrier=mode == "synchronize_clear_cache")
+    try:
+        result.setdefault("path_stats", {})[
+            "qwen4_post_generation_memory_witness"] = observation
+    except Exception:
+        pass
+
+
 def _engine_generate(engine, *args, expert_top_k: int = 0, **kwargs):
     """Use fail-slow prefill retry when the concrete engine supports it.
 
@@ -7837,6 +7863,7 @@ def _engine_generate(engine, *args, expert_top_k: int = 0, **kwargs):
             cfg.expert_top_k_by_layer = old_cfg_schedule
             if rc is not None:
                 rc.expert_top_k_by_layer = old_rc_schedule
+    _observe_qwen4_post_generation_memory(engine, result)
     if os.environ.get("VMODEL_DEBUG_ENGINE_REPORT", "0") == "1":
         print("[debug] engine.report():\n" + engine.report(), flush=True)
     prompt = args[0] if args else ""
@@ -10704,6 +10731,7 @@ def _vision_protocol_timing(result: dict) -> dict:
         "generation_witness",
         "tool_call_text_witness",
         "qwen4_mtp_idle_head_memory_witness",
+        "qwen4_post_generation_memory_witness",
         "qwen4_completed_history_shadow",
         "qwen4_phase_head_admission",
         "qwen_mtp_accepted_by_step",

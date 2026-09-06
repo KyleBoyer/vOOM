@@ -1,0 +1,9 @@
+schema: voom.runtime-profile.v1
+name: qwen4-post-generation-barrier
+description: Experimental timed default-stream synchronization and allocator-cache drain after Qwen4 MTP generation.
+notes:
+  - "Default-off. Samples before, after default-device default-stream synchronize, and after clear_cache, once each, before protocol completion under the inference lock. Not an all-streams fence. No sleeps or pressure-threshold changes."
+  - "Does not delete endpoints, hot slots, model/cache entries, or RNG state. Device failures propagate. Costs belong to HTTP wall time, outside the already-finalized engine total."
+  - "No latency, physical memory reclamation, or real-model equivalence claim from pure tests. Requires completed-output cold/reuse replay with original pressure gates."
+settings:
+  VMODEL_QWEN4_POST_GENERATION_MEMORY: synchronize_clear_cache

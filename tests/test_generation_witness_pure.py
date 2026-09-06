@@ -17,7 +17,7 @@ def api(monkeypatch):
     source = Path(__file__).resolve().parents[1] / "runtime/server.py"
     tree = ast.parse(source.read_text())
     names = {"_attach_generation_witness", "_engine_generate", "_has_own_method",
-             "_vision_protocol_timing"}
+             "_vision_protocol_timing", "_observe_qwen4_post_generation_memory"}
     nodes = [node for node in tree.body
              if isinstance(node, ast.FunctionDef) and node.name in names]
     assert len(nodes) == len(names)
@@ -28,6 +28,7 @@ def api(monkeypatch):
     exec(compile(ast.Module(body=nodes, type_ignores=[]), str(source), "exec"), namespace)
     monkeypatch.delenv("VMODEL_GENERATION_WITNESS", raising=False)
     monkeypatch.delenv("VMODEL_DEBUG_ENGINE_REPORT", raising=False)
+    monkeypatch.delenv("VMODEL_QWEN4_POST_GENERATION_MEMORY", raising=False)
     return SimpleNamespace(**namespace)
 
 
@@ -155,8 +156,9 @@ def test_raw_tool_observer_failure_cannot_invalidate_original_generation_witness
 
 
 @pytest.mark.parametrize("source", ["path_stats", "top_level"])
-def test_phase_head_memory_protocol_preserves_nested_unavailable_and_zero(api, source):
-    key = "qwen4_mtp_idle_head_memory_witness"
+@pytest.mark.parametrize("key", ["qwen4_mtp_idle_head_memory_witness",
+                                  "qwen4_post_generation_memory_witness"])
+def test_phase_head_memory_protocol_preserves_nested_unavailable_and_zero(api, source, key):
     observation = {
         "schema": "voom.phase-head-memory-witness.v1",
         "atomic": False, "release_callable": True,

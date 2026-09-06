@@ -27,6 +27,19 @@ from runtime.profiles import (
 ROOT = Path(__file__).resolve().parent.parent
 
 
+@pytest.mark.parametrize("overlay,mode", [
+    ("qwen4-post-generation-memory", "observe"),
+    ("qwen4-post-generation-barrier", "synchronize_clear_cache"),
+])
+def test_qwen_post_generation_overlay_changes_only_explicit_boundary_mode(overlay, mode):
+    catalog = discover_runtime_profiles((ROOT / "profiles",))
+    base = "qwen38-flash-next-uncensored-fp8-exact-pipeline-hot-kv-aligned-compact-fused"
+    _, baseline = resolve_runtime_profiles((base, "generation-witness"), catalog)
+    _, settings = resolve_runtime_profiles((base, "generation-witness", overlay), catalog)
+    assert "VMODEL_QWEN4_POST_GENERATION_MEMORY" not in baseline
+    assert settings == {**baseline, "VMODEL_QWEN4_POST_GENERATION_MEMORY": mode}
+
+
 def test_completed_history_shadow_overlay_changes_only_observation_flag():
     catalog = discover_runtime_profiles((ROOT / "profiles",))
     base = "qwen38-flash-next-uncensored-fp8-exact-pipeline-hot-kv-aligned-compact"

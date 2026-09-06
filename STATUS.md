@@ -1,5 +1,84 @@
 # STATUS — 2026-09-06 (current corrections first; dated chronology below is history)
 
+## 2026-09-06 UTC: terminal allocator probe preserves completed outputs; no pressure or speed win
+
+The supervised terminal-barrier sequence has FINISHED. New default-off overlays
+`qwen4-post-generation-memory` (observe only) and `qwen4-post-generation-barrier`
+(timed synchronize/clear_cache) sample after the MTP generation frame returns,
+before protocol completion under INFER_LOCK. No endpoint, hot slot, weight-cache
+entry, RNG, target math, sleep, peak reset or pressure threshold is changed.
+The probe's cost belongs to HTTP completion wall time, outside engine total_s.
+
+Installed uncensored Qwen FP8, all 131 original tools/system messages/histories
+and streaming retained; explicit wire overrides model/max1024/temp0/seed64013.
+This is NOT original-temperature traffic, untouched 134-tool traffic, live tool
+execution, a Plex score or a same-manifest/randomized speed A/B. The pinned prior
+fused baseline has six explicitly hashed code/test/receipt changes and four new
+probe/profile/test files; 705 existing source files are unchanged.
+
+| Request | Input / emitted | Cached | HTTP wall | Engine TTFT | Decode |
+|---|---:|---:|---:|---:|---:|
+| Initial, fresh server/prompt cache | 40,432 / 49 | 0 | 907.7902s | 681.0739s | 211.5071s |
+| Exact repeat | 40,432 / 49 | 39,936 | 292.4973s | 84.0355s | 208.0541s |
+| Actual recorded tool-result continuation | 40,536 / 31 | 39,936 | 192.5172s | 89.9726s | 102.0583s |
+
+All three HTTP200 responses naturally complete, with exactly the prior fused
+baseline's raw token/text hashes, prepared IDs, usage, canonical minimal whoami
+call, native proposal widths/outcomes/acceptance and 21/21/10 verifier sweeps.
+The required-command argument-subset witness is now enabled and passes all three;
+strict full-call hashes still pass, with no duplicates/parse failures. This does
+not retroactively resolve the earlier unobserved stochastic continuation. No
+prefill retry/fallback. Prefill 681.0732/83.9901/89.9203s; engine total
+892.5877/292.0939/192.0359s. Logical store reads exactly match the prior fused
+baseline: prefill 128900497040/93378926240/98009609840B; decode
+314306054856/314306054856/151663257960B. Not physical NVMe byte measurements.
+
+Negative mechanism result: after generation-frame teardown, the allocator cache
+contains only 7,950,756/7,950,756/18,808,376B. Synchronization does not change active,
+cached or system-available bytes in any row. Clearing drains that small cache to
+zero, while active stays 2,474,213,416/2,474,213,416/2,476,408,872B. Available grows
+only 4,915,200B cold and zero on both warm rows. This is not the missing ~1.27GB.
+Total probe costs 0.191/0.542/1.081ms, with no meaningful memory/latency benefit.
+STOP this barrier as a speed/pressure lever; do not repeat unchanged or enable it
+by default. Keep the cheap opt-in observations for subsequent ownership audits.
+
+Overall FAIL: all three available-memory endpoints 4.145/3.956/4.024GB fail 5.3GB.
+Actual per-request swap-outs 33,062,912/13,221,888/9,404,416B total 55,689,216B;
+the initial client's repeat retains its cumulative 46,284,800B failure. Used swap
+grows 13,238,272/0/0B. All Metal peaks 6.404/4.495/4.713GB pass 8.5GB. Prior fused
+HTTP 899.3414/293.1196/189.2639s offers no terminal-barrier speed win; no causal
+claim from cross-run timing noise or different starting OS pressure.
+
+Parent exit1, 1396.4261s, 18:28:06.978882 -> 18:51:23.404912UTC; no timeout/signal,
+missing result or source drift. All 715 source hashes and combined/log/two child
+report hashes verified before receipts/metadata clarification. Root/external
+minima 16.724/98.347GB, max child-tree RSS 4.993GB; all known job PIDs gone.
+Result SHA 17521d2601ea9c84953b36e01eb1ebaa9d6a9497433409cac4ffc932bbee27ed;
+log e6fff46c55fa2ce49f9343b9d5948d7ad402ad7e4dff4a532162f81088d99c1b.
+Private logs/qwen4_full131_greedy1024_terminal_barrier_20260906.json and matching
+initial/extension/server/gates artifacts; no private payloads committed.
+
+Scope clarification: [MLX synchronize](https://ml-explore.github.io/mlx/build/html/python/_autosummary/mlx.core.synchronize.html)
+waits on the default device's default stream, NOT every worker/device stream.
+After this run, the witness adds explicit synchronization_scope metadata and the
+profile description says this precisely; operations are unchanged. No all-stream
+or immediate physical-memory reclamation assertion. 551 pure regressions pass;
+the earlier supervised 4/4 tiny real-MLX checks preserve BF16/FP32 live bits,
+owners and global RNG, not model equivalence or physical reclamation.
+The clarified final source also passes 4/4 real-MLX checks in 0.07s after a new
+passing 30-second preflight (zero swap growth/churn); parent exit0/2.4451s, all
+715 source hashes and log/result hashes verified. Private
+logs/post_generation_barrier_mlx_scope_20260906.json, SHA
+8cf94307ce70ba02f4e2c225c658b5ef0efc1664c83e0b7fc6eebf644751d895.
+
+Next bounded lever: audit the final, non-slot endpoint ownership separately from
+the reusable 39,936-prefix. Existing startup already releases last_kv only when
+it does not alias a retained slot; existing terminal cleanup rejects all hot
+engines. Any earlier disposal needs identity/alias and protocol-consumer proof,
+including hot-cache continuations, before implementation/promotion. Do not call
+release_request_state on a hot engine or treat logical bytes as guaranteed free
+RAM. Completed varied-domain/Plex, large-context ladder and sub90s remain open.
+
 ## 2026-09-06 UTC: original-temperature fused full131 replay completes; strict action and pressure FAIL
 
 The sourcedd99c08 three-request fused sequence has FINISHED. All131 original

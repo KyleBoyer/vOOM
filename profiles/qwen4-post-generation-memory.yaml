@@ -1,0 +1,8 @@
+schema: voom.runtime-profile.v1
+name: qwen4-post-generation-memory
+description: Opt-in scalar memory sample after the Qwen4 MTP generation frame returns.
+notes:
+  - "Observation only: no synchronization, cache clearing, endpoint disposal or sampling changes. Not a physical reclamation or pressure-pass assertion."
+  - "Included in HTTP completion wall time, not the already-finalized engine total. Samples are non-atomic. No prompt, output, arguments or tensor payloads are logged."
+settings:
+  VMODEL_QWEN4_POST_GENERATION_MEMORY: observe
