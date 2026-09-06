@@ -1,5 +1,67 @@
 # STATUS — 2026-09-05 (current corrections first; dated chronology below is history)
 
+## 2026-09-06 UTC: all-convolution diagnostic confirms 740 MiB retained backing
+
+The new post-generation real-checkpoint diagnostic on source `ae83314`
+confirms the predicted **775,946,240-byte (740 MiB) active Metal release**.
+One exact PLE-history copy releases 20,971,520 bytes; the 36 exact DeltaNet
+convolution-history copies release a further **754,974,720 bytes (720 MiB)**.
+Active Metal falls **1,552,511,544 -> 776,565,304 bytes**. This substantiates
+the large retained-memory gap as padded convolution backing on this path,
+not unexplained lazy weight parents. Logical histories total only 2,396,160
+bytes across 37 arrays; FP32 recurrent matrices and QSA state are untouched.
+
+The **modified two-real-workspace-tool / short-system-history / developer /
+stream-progress / greedy-seed64001 / max1** request is unchanged: 5,541-byte
+wire SHA `533f9f45...89900`, 1,611 prepared input IDs, actual fork 1,024 from
+the 1,606 stable hint. Both retained and full endpoint state/metadata hashes
+are unchanged before/after, and endpoint/hidden/first-ID/raw-text witnesses
+match the independent no-hot control. Fork SHA `8842fff6...a78fe` and its
+metadata also match the previous PLE-only diagnostic. This proves this
+post-generation buffer replacement, not a completed cache continuation,
+full harness answer, long-context acceptance or Plex score.
+
+PLE copy took 0.000111s; all 36 DeltaNet history copies took **0.034556s**.
+Separate allocator clear took 0.003682s. Before/verification state hashes
+took 0.242653/0.190302s, reading 608,527,392 state bytes; ordinary observer
+adds 160,281,104 state/hidden bytes. Total post-generation observation was
+0.572401s. Synchronization still released zero active bytes. Immediate
+available-memory samples stayed about 3.881GB through both detachments and
+allocator clear; the later verification sample was 6.126GB. Do not attribute
+that entire delayed system-level change to the exact active-byte release.
+
+Instrumented HTTP and parent gates PASS: HTTP200 / expected
+`response.incomplete`, voom, unchanged profile/effective digest
+`cd5ef35a...85337`, no overrides, 1,611 uncached input / one output token,
+zero memory retries. HTTP wall **218.5163s**, first token 203.6003s, engine
+prefill 203.5999s / decode 0s / total 203.6463s. Store reads remain
+219,916,717,280 bytes, all prefill; **no speed gain is established**.
+Generation peak remains 2.825GB and observer allocator peak 3.012GB: a late
+detach does not reduce already-incurred peak. HTTP final available 6.127GB,
+swap-out growth 13.631MB, zero used-swap growth pass the frozen endpoint
+gates. This is still not an uninterrupted serving-pressure pass: available
+was 3.860GB immediately after generation and diagnostics change observation.
+
+Parent PASS / exit0 / 221.2069s, 01:23:33.295686 -> 01:27:14.502571 UTC;
+no timeout, signal, spawn failure or source drift, all jobs ended. Fresh
+30-second preflight passed at 6.232/6.273GB with zero swap growth/churn.
+Root/external minimum free 18.977/99.133GB; child-tree RSS maximum 4.555GB.
+Private endpoint `logs/qwen4_retained_allconv_memory_first_20260906.json`,
+separate `logs/qwen4_retained_allconv_memory_first_http_20260906.json` and
+matching supervised envelope. Diagnostic code, 656 passing tests and this
+finding are pushed; production serving defaults have not changed.
+
+Next: integrate compact exact retained histories behind an explicit opt-in
+at the prefix-fork boundary, BEFORE suffix continuation, then verify complete
+endpoint and continued raw-token equality/pressure. Do not just rerun this
+finished attribution probe. Combine that proven ownership operation with
+per-layer aligned capture inside the existing full host-spool sweep to remove
+the extra 101.040GB cold reads. Budget retained logical payload plus remaining
+backing before admission; a bare 144MB logical estimate is not a physical
+memory guarantee. QSA backing is a separate potential ~12 MiB and remains
+unmeasured/untouched. Then prioritize sufficient-output varied-domain and
+unmodified harness acceptance; max1 diagnostics cannot replace those gates.
+
 ## 2026-09-06 UTC: expanded retained-convolution diagnostic ready
 
 Read-only follow-up found the same padded-tail pattern in all 36 decoder
