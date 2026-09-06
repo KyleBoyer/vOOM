@@ -1,5 +1,69 @@
 # STATUS — 2026-09-05 (current corrections first; dated chronology below is history)
 
+## 2026-09-06 UTC: ordinary greedy reproduces every native-MTP token, including the duplicate Plex action
+
+The frozen media request now has a completed ordinary-target control on source
+`ca753cd`. The new explicit `...hot-kv-aligned-compact-ar` diagnostic profile
+changes ONLY `VMODEL_QWEN4_MTP_DEPTH` from 3 to 0; it does not change target
+weights, prompt, schemas, sampling or production defaults. Its resolved-profile
+regression and the generation/replay/raw-call suites pass: **138 tests in 2.16s**
+on the completed job's unchanged source. No additional model job ran in parallel.
+
+This is still the **modified two-original-Plex-tool / short system-user history /
+no developer / nonstream / greedy seed 64001 / max 512** request, NOT unmodified
+134-tool traffic or the multi-turn Plex intelligence rubric. The 5,983B wire SHA
+`4af4867dc4b11734376a4b73111eadff59b28a6643751ca5292d014bf44daf00` is unchanged.
+HTTP 200 completed naturally at 146 output tokens from 1839 prepared tokens.
+The WHOLE generation witness equals the native-MTP control: all prepared and
+generated token hashes, 490B raw text hash, both disjoint raw Hermes frames and
+both canonical parsed-call hashes match exactly. Both paths generate the same
+search action with correct arguments TWICE; no external tool executed.
+
+Thus native MTP did NOT introduce the duplicate on this request: ordinary target
+generation in this runtime produces it too. This is scoped greedy-token/text
+equivalence for the installed uncensored FP8 checkpoint, not independent
+official-BF16 conformance, a broad MTP proof, or a model quality pass. There was
+no prompt retuning, host deduplication or output rewriting to conceal the failure.
+
+For this modified completed request, ordinary HTTP wall **1227.8277s**,
+first 200.8567s, prefill 200.8551s, decode 1010.4818s, engine 1213.6319s.
+The historical native-MTP counterpart was 635.2309s HTTP / 419.6825s decode.
+Both are fresh-server cold prompt-cache requests, not OS-cache-flushed reads.
+Prefill store bytes remain 216,200,372,480B. Ordinary decode reads
+1,406,363,212,800B versus 658,745,963,712B with native MTP: 747,617,249,088B more.
+Ordinary total reads 1,622,563,585,280B; zero prefill retries.
+
+**This is NOT an equal-head-lifetime performance/pressure A/B.** Ordinary
+generation restores the 1,271,398,400B head once and retains it through one-token
+trunks and idle; its head-suspension count is 0. Native MTP suspends it across
+multi-token verifier trunks and releases it at request end, with different
+bootstrap/rollback ownership too. These are existing path differences caused
+by disabling MTP, not new arithmetic changes. Do not attribute the whole 1.93x
+wall ratio or pressure difference solely to speculative-token acceptance.
+
+Acceptance remains **FAIL**: two calls/expected 1, used-swap growth
+2,484,142,080B and swap-out 61,587,456B, each above 16MB. Final available memory
+8,540,061,696B passes the 5.3GB endpoint floor but does not erase that churn.
+Peak Metal 7,726,085,150B stays below 8.5GB (native control 2,525,569,160B).
+The ordinary profile is a diagnostic control, not a recommended serving profile.
+Selected/effective digest 9787db0c...2bc7f5, no overrides. Fresh 30s preflight
+passed 6.823/6.822GB available with no swap growth/out; final-pressure failures
+remain visible. Parent root/external minima 16.945/99.131GB; max tree RSS 4.348GB.
+
+Parent exit 1 / 1230.8748s, 05:53:18.155301 -> 06:13:49.030100 UTC; no timeout,
+signal, missing result or source drift. Result and log SHA256 match the parent
+envelope; all model processes ended and port 8073 is no longer listening. Private
+`logs/qwen4_media_ar512_20260906.json` and matching server/gate logs retain
+the failed acceptance and explicit `complete_raw_generation_match:true` result.
+
+The generation-versus-parser-versus-MTP duplicate isolation is now complete for
+this frozen case; do not repeat it or claim to have fixed its quality failure.
+Next instrument phase-head cache/pin/Metal/available values immediately before
+and after release without moving existing HTTP pressure samples, then test the
+smallest evidence-backed lifetime/reservation improvement with exact witnesses.
+Resume varied-domain/extension and full capture/Plex gates without hiding known
+failures. Long-context, sub-90s and full GLM storage-choice gates remain open.
+
 ## 2026-09-06 UTC: identical duplicate Plex calls are already in engine text, not created by protocol parsing
 
 The new read-only observer on source `6e3a0d4` reproduced the frozen failed

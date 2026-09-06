@@ -32,6 +32,28 @@ Next compare native MTP with ordinary greedy target generation on that frozen
 case; raw-origin attribution alone does not prove the model, rather than its
 speculative decoder, is responsible. No host deduplication or prompt retuning.
 
+That comparison is now complete on source `ca753cd`: the explicit `...compact-ar`
+profile changes only native MTP depth 3 to 0, and ordinary greedy generation
+matches the ENTIRE native-MTP 146-token/raw-490B witness plus both raw frames and
+canonical parsed calls. Native MTP did not introduce the duplication on this
+frozen request; ordinary target generation in this runtime produces it too.
+This is not an independent official-BF16 oracle or a broad quality proof.
+The modified two-Plex-tool/no-developer/nonstream/max-512 call took 1227.8277s
+HTTP / 1010.4818s decode, versus historical native-MTP 635.2309s / 419.6825s.
+Ordinary decode reads 1,406,363,212,800B versus 658,745,963,712B; prefill bytes
+are unchanged. Head lifetime differs: ordinary retains the 1.271GB head through
+single-token trunks/idle, while native MTP suspends it around multi-token
+verification and releases it at request end. Do not call this an equal-lifetime
+speed/pressure A/B or attribute the entire wall ratio to acceptance alone.
+Both call-count and pressure acceptance still FAIL. Ordinary peak Metal 7.726GB
+stays below 8.5GB but used swap grows 2.484GB and swap-out 61.587MB; final 8.540GB
+available does not erase the churn. Parent exit 1/no timeout or source drift;
+all jobs ended. 138 pure regressions pass in 2.16s. Private
+`logs/qwen4_media_ar512_20260906.json` and matching gate/server artifacts.
+This isolation gate is finished; next add correctly timed phase-head pressure
+observations, then measure a bounded exact lifetime/reservation improvement.
+Do not repeat this same control or conceal the known quality failure.
+
 ## Proven helper scope
 
 `runtime.qwen4_prefix_capture.AlignedPrefixCapture` requires exact concrete
