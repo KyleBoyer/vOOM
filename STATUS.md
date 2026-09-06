@@ -1,5 +1,82 @@
 # STATUS — 2026-09-06 (current corrections first; dated chronology below is history)
 
+## 2026-09-06 UTC: full131-tool history observation completes; continuation matches weak, pressure FAIL
+
+The pending sourcee6f6afb shadow sequence has FINISHED. Installed uncensored
+Qwen FP8 target, aligned-compact + generation-witness + completed-history-shadow;
+selected/effective digest a6c1ed6d...b8c333, no overrides. Both actual captures
+retain all131 original tools, both system messages and their complete histories.
+ONLY wire model/max1024 change; original temperature0.3/streaming, no seed.
+No history candidate participates in decoding: every real proposal source is M.
+This is not untouched134-tool traffic, a live executed tool loop, a paired
+old/new speed test, a released-weight state/distribution oracle, or a Plex score.
+
+For these full131-tool captures with model/max1024 overrides, all three responses
+are HTTP200/completed naturally. Cold means fresh server/cold prompt cache, not
+an OS-cache flush; TTFT is engine-reported, not startup-inclusive client TTFT.
+
+| Request | Input / emitted tokens | Cached tokens | HTTP wall | Engine TTFT | Decode |
+|---|---:|---:|---:|---:|---:|
+| Initial, cold | 40,432 /48 | 0 | 936.5549s | 759.3864s | 161.1004s |
+| Same request, warm | 40,432 /48 | 39,936 | 245.5709s | 84.5589s | 160.6056s |
+| Actual recorded tool-result continuation, warm | 40,536 /28 | 39,936 | 189.0312s | 89.6726s | 98.6549s |
+
+Prefill759.3857/83.8792/89.6204s; engine920.4969/245.1694/188.3325s.
+Store-accounted prefill/decode/total GB220.964/242.233/463.196,
+93.379/242.233/335.611,98.010/149.658/247.667; not physical NVMe counters.
+Native MTP accepted32/46,32/46,18/28 over16/16/10 verifier sweeps. Verifier
+155.1401/154.7257/95.0899s versus draft5.5138/5.4594/3.3161s; no prefill retries.
+Each response has one parseable execute-command call, zero duplicates/argument
+parse failures and stream/final equality. Canonical hashes independently match
+the minimal whoami calld3f4ea...8d81. No tools executed or Plex/prose quality scored.
+
+Cold/repeat48 raw IDs and200B text match each other AND the prior unshadowed
+capture; their reads/Metal peaks also match. Finite historical agreement is not
+a formal A/B or full-state oracle. **Do not call189.0312s a speed improvement**:
+the prior stochastic continuation emitted58 tokens/19 sweeps in282.3392s, whereas
+this one emits28/10. Shorter sampled output changes work, not the serving algorithm.
+
+Shadow finding: cold0/16 rounds have candidates; repeat14/16 have fully matching
+windows (13x7 +1x4 =95 OVERLAPPING slots covering43 distinct output positions).
+Actual continuation has only2/10 candidates, each width7, matching prefixes3 and2
+respectively at emitted offsets9 and16. Those five matches are not stochastic
+acceptance or saved sweeps. Duplicate-output lookup works; this real continuation
+does NOT justify broad history drafting or width7 promotion. Keep observation-only
+and native defaults unchanged; mixed history/native state and p/q gates remain open.
+Timed lookup+finish pieces0.505/0.859/1.128ms; not a causal total-overhead A/B.
+History count0->1->2->3, final124 IDs; structural7,708/11,320/13,652B versus
+278,528B cap, plus68,096B scratch bound, not measured RSS. No skipped records,
+evictions or rejected outputs. Lookup is in decode; finish is outside existing
+engine-total time but inside HTTP wall.
+
+Combined acceptance FAILS only the five preserved pressure checks. Metal peaks
+5.677/4.495/4.713GB pass8.5GB; endpoint available3.930/3.872/4.086GB all fail5.3GB.
+Actual request swap-outs42,696,704/20,267,008/11,403,264B total74,366,976B.
+Initial client's repeat failure uses cumulative62,963,712B; the separate
+continuation client passes its own11.403MB churn check, not its available-memory
+check. Used swap stays1,599,864,832B throughout; flat occupancy does not waive churn.
+
+Parent exit1/1375.0046s,13:11:17.547837->13:34:12.552451UTC; no timeout,
+signal, missing result, spawn error or source drift. All711 source-file hashes
+and four result/log artifact hashes independently reverified before this receipt.
+Combined result SHAb276f872f63e40e0088987421411c0518c6d2d4e36dab673f4e6edbfcbbc60e3;
+parent log SHA79dfc1179d183884425202ac1dba23dbb86f708d30212271a74fd339542a54ba.
+Root/external minima16.754/98.375GB; max child-tree RSS5.259GB. Fresh preflight
+passed before launch; all four job PIDs are gone. Private logs/
+qwen4_completed_history_shadow_capture1024_20260906.json and matching initial,
+extension, server and gates artifacts; no private captures/results committed.
+
+Next bounded lever: existing explicit fused-aligned-prefix profile, not another
+unchanged history replay. Its sole configuration delta removes a separate cold
+prefill sweep; the earlier1,611-token modified-two-tool proof does not cover40K.
+First compare full40,432-token endpoint, retained39,936-token prefix, all state
+metadata and BF16 hidden bits with independent controls; label hashing diagnostic,
+not serving latency. Only after equality, run fresh matched full131-tool completed
+cold/repeat/actual-continuation arms with identical instrumentation and pressure
+gates. Repeat/continuation must retain ordinary reuse and capture no fused prefix.
+This lever offers no direct decode/repeat win or sub90s promise. Full-model state,
+complete Plex, varied-domain acceptance, context ladder and pressure remain open.
+
 ## 2026-09-06 UTC: completed-output history shadow instrumented; real-capture observation pending
 
 New explicit `qwen4-completed-history-shadow` overlay measures the next proposed
