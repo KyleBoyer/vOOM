@@ -1,5 +1,76 @@
 # STATUS — 2026-09-05 (current corrections first; dated chronology below is history)
 
+## 2026-09-06 UTC: complete cold/repeat raw-token equivalence passes; pressure and speed remain open
+
+Fresh aligned-control and aligned-compact servers on the same source `b7b86f3`
+each completed a cold call and an identical cached-prefix repeat with a
+**512-token budget**. All four calls naturally stopped at **70 generated
+tokens**, HTTP200 / `response.completed`, and emitted the correct workspace
+read-file call with path/offset/limit arguments. No tool was executed. This
+is the **modified two-real-workspace-tool / short-system-history / developer /
+stream-progress / greedy-seed64001** request, NOT the full134-tool capture.
+All four wires are5,543B / SHA `e5e51779...bf34b`, with1,611 actual prepared
+tokens and the same prepared-ID witness. Repeats genuinely reuse1,024 tokens
+from memory; they still compute the remaining587-token suffix.
+
+All four complete generated-ID hashes are
+`381c8319f7f04acfd719eb922593657e5e688b45f0273eb678ae6e9735a9ae9b`;
+all four raw engine texts are276B / SHA
+`a2d431a308749a320888633bc344118d8d49b5180b2eaa49478f77070d708356`.
+Cold/repeat and cross-arm **actual raw witnesses match**, with native MTP
+active; this is stronger than matching only parsed JSON or a max1 endpoint.
+The unchanged parsed-output SHA `0d9db4d2...f60e6` was observed, not imposed
+as a prose constraint. No endpoint-hash observer, post-generation mutation,
+extra allocator clear, substituted answer or host renderer was used.
+
+For that modified two-tool/greedy/max512 completed request, HTTP walls are:
+control **443.7801s cold /324.0679s cached-prefix repeat**; compact candidate
+**443.4725s cold /323.6819s repeat**. Differences of0.07%/0.12% are noise,
+**not a credible speed gain**. Candidate first tokens202.9496/97.9032s,
+prefill202.9490/97.9028s, decode226.2528/225.6773s, engine429.2415/323.6167s.
+Control prefill203.0571/98.2890s, decode226.4189/225.6869s, engine429.5181/
+324.0109s. Both arms read exactly572,497,390,208B cold and462,083,423,168B
+repeat: prefill219,916,717,280/109,502,750,240B and decode352,580,672,928B
+each. The cold split still costs extra reads; compacting ownership does not
+change weight traffic. The <90s end-to-end objective remains unmet.
+
+Candidate peak Metal is2,307,405,092B cold /2,264,152,356B repeat versus
+3,083,351,332B for both controls. The cold reduction is exactly740MiB
+(25.17%); the repeat has a larger observed reduction, not separately attributed.
+Each candidate call actually compacted37 histories /2,396,160B at prefix1024,
+charged156,585,984 retained bytes and used zero memory retries. Copy times
+0.002963/0.001955s. Selected/effective digests are the expected control
+`cd5ef35a...85337` and candidate `13273725...505d4`, with no overrides.
+
+**Both arms remain overall FAIL on unchanged pressure gates.** Control final
+available4.093/4.120GB; candidate4.551/4.424GB, all below5.3GB. Control
+swap-out growth25.608MB cold /41.468MB cumulative; candidate20.972MB cold /
+35.176MB cumulative, above16MB. Repeat-only churn is15.860/14.205MB, but the
+fixture also gates cumulative growth; do not relabel the second rows PASS.
+Control used-swap grows0.524MB; candidate has no growth. Candidate started
+with more system-available memory, so system-level differences are not a
+clean causal memory A/B. The lower Metal peak and raw equality are measured
+scoped results, not a broad serving-pressure or quality pass.
+
+Control parent FAIL / exit1 /770.1462s,02:17:52.761198 ->02:30:42.907326 UTC;
+candidate FAIL / exit1 /770.0642s,02:32:07.122128 ->02:44:57.186248 UTC.
+No timeout or source drift, all processes ended. Separate fresh30-second
+preflights passed at7.150/7.141GB and8.056/7.858GB with zero swap churn/growth.
+Root minimum18.957GB in both, external minimum99.140/99.135GB; child-tree
+RSS maxima4.314/5.128GB. Private artifacts
+`logs/qwen4_compact_aligned_control_workspace512_20260906.json` and
+`logs/qwen4_compact_aligned_candidate_workspace512_20260906.json`, matching
+server logs and supervised envelopes. Raw-witness assertions printed PASS
+before correctly propagating each HTTP pressure failure as exit1.
+
+Keep compact retention opt-in. This completed-output/cache-repeat regression
+is finished; do not repeat it without a new hypothesis. Next pursue fused
+aligned per-layer capture to remove the extra101.040GB cold reads, preserving
+the original tiles/expert unions and compact ownership. Add independent
+retained-prefix state/metadata coverage, then actual extension and varied-domain
+requests plus unmodified harness/Plex acceptance. No new Plex score, long-
+context proof or broad request-generalization claim was established here.
+
 ## 2026-09-06 UTC: completed-output compact-history A/B queued
 
 Next bounded acceptance experiment compares fresh aligned-control and
