@@ -1,5 +1,45 @@
 # STATUS — 2026-09-05 (current corrections first; dated chronology below is history)
 
+## 2026-09-06 UTC: compact prefix histories integrated as an opt-in candidate
+
+New profile `qwen38-flash-next-uncensored-fp8-exact-pipeline-hot-kv-aligned-compact`
+adds only `VMODEL_QWEN4_COMPACT_RETAINED_CONV=1` to the existing aligned profile.
+The production hook runs once at a complete stable-boundary fork, before suffix
+prefill, covering cold and matched-boundary forks. It does not touch global
+fork behavior, speculative snapshots, interrupted/partial endpoints or other
+models. Runtime/YAML default is off and the server engine identity includes
+the new flag; no existing profile/default changes.
+
+All geometry, full-attention/QSA presence, KDA/PLE state, independent mutable
+owners and shared immutable source arrays are checked before copying. All
+replacement histories are staged before publication, so copy/reservation
+failure leaves the fork unchanged. The production uint16 host-copy path is
+separately covered by all 65,536 payload patterns and real BF16/F16 causal
+convolution continuations. FP32 recurrent matrices, QSA/KV arrays and the active
+endpoint are unchanged. The copy reserves twice the logical history payload
+without crediting future release; the active endpoint still owns the original
+backings until it advances. No allocator clear or post-generation mutation is
+added to production.
+
+Admission separately charges the final prompt endpoint plus the extra retained
+logical payload and a conservative one-tile QSA query-head backing allowance
+(144,003,072 + 12,582,912 bytes at the next probe). This is not a complete
+bound on every lazy graph; existing governor/per-layer Metal guards remain.
+Copy counts/bytes/scratch, prefix position, time and immediate active-memory
+samples are exposed through typed HTTP timing telemetry.
+
+**720 tests passed in 4.94s**, supervised PASS / exit0 / no source drift or
+timeout after a fresh 30-second preflight. Read-only peer review found no
+launch blocker; additional malformed-source guards from review are included.
+Real serving validation has not run yet. Planned private endpoint
+`logs/qwen4_compact_boundary_first_20260906.json` uses the ordinary max1
+observer (NO post-generation retained-history mutation), unchanged modified
+two-tool developer/streaming/greedy wire, independent no-hot endpoint/hidden/
+first-ID witnesses and frozen pressure gates. Require actual37/2,396,160
+copy counters plus the156,585,984-byte additional-retention projection.
+Completed outputs, cache repeat/extension and the extra101GB cold-read removal
+remain open; this candidate is not yet a serving speed or lossless-answer pass.
+
 ## 2026-09-06 UTC: all-convolution diagnostic confirms 740 MiB retained backing
 
 The new post-generation real-checkpoint diagnostic on source `ae83314`

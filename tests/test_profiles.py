@@ -69,6 +69,15 @@ def test_qwen_aligned_hot_kv_changes_only_explicit_boundary_policy():
     assert settings == {**base_settings, "VMODEL_QWEN4_HOT_KV_TILE_ALIGNED": "1"}
 
 
+def test_qwen_compact_aligned_profile_changes_only_history_storage_flag():
+    catalog = discover_runtime_profiles((ROOT / "profiles",))
+    base = "qwen38-flash-next-uncensored-fp8-exact-pipeline-hot-kv-aligned"
+    base_order, base_settings = resolve_runtime_profiles((base,), catalog)
+    order, settings = resolve_runtime_profiles((base + "-compact",), catalog)
+    assert order == (*base_order, base + "-compact")
+    assert settings == {**base_settings, "VMODEL_QWEN4_COMPACT_RETAINED_CONV": "1"}
+
+
 @pytest.mark.parametrize("base", [
     "qwen38-flash-next-uncensored-fp8-fast-tier-mtp-direct-fp8-qmv-prefill-pipeline-exact-fused-delta",
     "qwen38-flash-next-uncensored-fp8-exact-pipeline-hot-kv",

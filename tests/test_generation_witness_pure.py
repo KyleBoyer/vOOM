@@ -141,3 +141,26 @@ def test_aligned_boundary_protocol_keeps_reason_string_and_typed_counts(
         if key != "qwen4_hot_boundary_reason":
             assert type(timing[key]) is int
             assert timing[key] == int(value)
+
+
+@pytest.mark.parametrize("source", ["path_stats", "top_level"])
+def test_retained_compact_protocol_preserves_copy_timing_and_integer_bytes(api, source):
+    fields = {
+        "qwen4_retained_conv_compact_calls": 1,
+        "qwen4_retained_conv_compact_arrays": 37,
+        "qwen4_retained_conv_compact_bytes": 2396160,
+        "qwen4_retained_conv_compact_scratch_bytes": 4792320,
+        "qwen4_retained_conv_compact_prefix_tokens": 1024,
+        "qwen4_retained_conv_compact_active_before_bytes": 1552511544,
+        "qwen4_retained_conv_compact_active_after_bytes": 1554907704,
+        "qwen4_retained_projected_logical_bytes": 144003072,
+        "qwen4_retained_qsa_backing_allowance_bytes": 12582912,
+        "qwen4_retained_conv_compact_seconds": 0.035678,
+    }
+    result = {"path_stats": fields} if source == "path_stats" else fields
+    timing = api._vision_protocol_timing(result)
+    for key, value in fields.items():
+        if key.endswith("_seconds"):
+            assert timing[key] == pytest.approx(value, abs=0.0001)
+        else:
+            assert type(timing[key]) is int and timing[key] == value

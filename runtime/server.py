@@ -1252,6 +1252,7 @@ class EngineManager:
                 ("VMODEL_QWEN4_EXPERT_BATCH_PREFETCH_PREFILL_ONLY", "0"),
                 ("VMODEL_QWEN4_NATIVE_FUSED_DELTA_PREFILL", "0"),
                 ("VMODEL_QWEN4_HOT_KV_TILE_ALIGNED", "0"),
+                ("VMODEL_QWEN4_COMPACT_RETAINED_CONV", "0"),
             )
         )
         dspark_request_identity = tuple(
@@ -3595,6 +3596,10 @@ class EngineManager:
                     raise RequestValidationError(
                         "VMODEL_QWEN4_HOT_KV_TILE_ALIGNED must be 0 or 1")
                 rc.qwen4_hot_kv_tile_aligned = qwen4_request_identity[36] == "1"
+                if qwen4_request_identity[37] not in ("0", "1"):
+                    raise RequestValidationError(
+                        "VMODEL_QWEN4_COMPACT_RETAINED_CONV must be 0 or 1")
+                rc.qwen4_compact_retained_conv = qwen4_request_identity[37] == "1"
                 if qwen4_request_identity[23] not in ("0", "1"):
                     raise RequestValidationError(
                         "VMODEL_QWEN4_PHASE_LM_HEAD must be 0 or 1")
@@ -10373,6 +10378,15 @@ def _vision_protocol_timing(result: dict) -> dict:
         "qwen4_hot_boundary_tile",
         "qwen4_hot_boundary_eligible",
         "qwen4_hot_boundary_policy_eligible",
+        "qwen4_retained_conv_compact_calls",
+        "qwen4_retained_conv_compact_arrays",
+        "qwen4_retained_conv_compact_bytes",
+        "qwen4_retained_conv_compact_scratch_bytes",
+        "qwen4_retained_conv_compact_prefix_tokens",
+        "qwen4_retained_conv_compact_active_before_bytes",
+        "qwen4_retained_conv_compact_active_after_bytes",
+        "qwen4_retained_projected_logical_bytes",
+        "qwen4_retained_qsa_backing_allowance_bytes",
         "qwen4_host_spool_h2d_bytes",
         "qwen4_host_spool_d2h_bytes",
         "qwen4_host_spool_peak_host_bytes",
@@ -10476,6 +10490,7 @@ def _vision_protocol_timing(result: dict) -> dict:
         if key in stats or key in result:
             value[key] = int(metric(key) or 0)
     optional_float_fields = (
+        "qwen4_retained_conv_compact_seconds",
         "vision_weight_load_s",
         "qwen_mtp_accept_rate",
         "qwen_mtp_stochastic_expected_acceptance",

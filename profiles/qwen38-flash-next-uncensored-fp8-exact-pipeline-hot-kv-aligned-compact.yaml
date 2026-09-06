@@ -1,0 +1,11 @@
+schema: voom.runtime-profile.v1
+name: qwen38-flash-next-uncensored-fp8-exact-pipeline-hot-kv-aligned-compact
+description: Experimental exact compact convolution histories at the retained prefix boundary.
+notes:
+  - "Default-off. Copies only BF16 retained DeltaNet/PLE history bits before suffix prefill; leaves FP32 recurrent matrices, QSA/KV, operators, tools and sampling unchanged. No production speed or complete-output proof yet."
+  - "The earlier post-generation diagnostic freed740MiB of padded backing with complete observed state hashes unchanged. That diagnostic does not prove continued-cache correctness or earlier peak reduction."
+  - "Retains the aligned profile's separate boundary sweep; does not yet remove its extra101GB cold reads."
+extends:
+  - qwen38-flash-next-uncensored-fp8-exact-pipeline-hot-kv-aligned
+settings:
+  VMODEL_QWEN4_COMPACT_RETAINED_CONV: true

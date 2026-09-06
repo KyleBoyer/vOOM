@@ -922,6 +922,7 @@ class RuntimeConfig:
     # Experimental retained recurrent prefix rounded down to a complete
     # original prefill tile. Off until real endpoint/token/pressure gates pass.
     qwen4_hot_kv_tile_aligned: bool = False
+    qwen4_compact_retained_conv: bool = False
     # Evaluate this many already-independent routed tile accumulators in one
     # mx.eval call. Each expert GEMM retains its original per-tile shape and
     # every tile retains ascending expert accumulation; only the host/device
@@ -1568,6 +1569,7 @@ class RuntimeConfig:
             max_weight_cache_mb=mem.get("max_weight_cache_mb", 6000),
             mlx_cache_limit_mb=mem.get("mlx_cache_limit_mb", 1024),
             qwen4_hot_kv_tile_aligned=run.get("qwen4_hot_kv_tile_aligned", False),
+            qwen4_compact_retained_conv=run.get("qwen4_compact_retained_conv", False),
             execution_profile=run.get("execution_profile", ""),
             native_ct_mxfp4=run.get("native_ct_mxfp4", False),
             kimi_k3_scale_sidecar_dir=run.get(
@@ -11660,6 +11662,20 @@ class StreamingEngine:
         required_total_kv_bytes = (
             min(resident_prompt_kv_bytes, initial_paged_mb * 1_000_000)
             if initial_paged_mb else resident_prompt_kv_bytes)
+        if (aligned_qwen4_retention and hot_eligible
+                and getattr(self.rc, "qwen4_compact_retained_conv", False)):
+            from .qwen4_retained_history import retained_qsa_backing_allowance
+
+            retained_logical = self._project_dense_text_kv_bytes(stable_boundary_positions)
+            qsa_backing = retained_qsa_backing_allowance(
+                self.cfg, prefix_tokens=stable_boundary_positions,
+                tile_tokens=self.rc.prefill_chunk_size)
+            # Charge the full final endpoint plus its additional retained fork.
+            # Admission already subtracts current keep_kv ownership on a hit.
+            # Do not subtract expected future convolution backing reclamation.
+            required_total_kv_bytes += retained_logical + qsa_backing
+            path_stats["qwen4_retained_projected_logical_bytes"] = retained_logical
+            path_stats["qwen4_retained_qsa_backing_allowance_bytes"] = qsa_backing
         admission_done = False
 
         def record_hot_admission(admission):
@@ -12675,6 +12691,28 @@ class StreamingEngine:
                         pos = stable_boundary
                         path_stats[
                             "hot_prompt_boundary_fork_tokens"] = stable_boundary
+            if (boundary_fork_kv is not None and aligned_qwen4_retention
+                    and hot_eligible and not force_adaptive_paged
+                    and getattr(self.rc, "qwen4_compact_retained_conv", False)):
+                # Only a complete stable-boundary fork exists here. The active
+                # endpoint has not consumed the suffix yet; stage compact
+                # retained histories before its per-layer replacements would
+                # otherwise leave full padded tile buffers pinned in the fork.
+                from .qwen4_retained_history import compact_retained_history, copy_history_bits
+
+                if (boundary_fork_tokens != stable_boundary_positions
+                        or deferred_qwen_boundary_tokens or prompt_state_approximate
+                        or self._hot_kv_persist is not None
+                        or boundary_fork_kv is getattr(self, "last_kv", None)):
+                    raise ValueError("retained compaction lost complete RAM prefix ownership")
+                path_stats.update(compact_retained_history(
+                    boundary_fork_kv, kv, self.cfg,
+                    prefix_tokens=boundary_fork_tokens, kv_type=KVCache,
+                    expected_dtype=mx.bfloat16, copy_bits=copy_history_bits,
+                    reserve=lambda size: (
+                        self.governor.reserve(size, reason="qwen4-retained-conv-copy")
+                        if self.governor is not None else None),
+                    active_bytes=mx.get_active_memory))
             ckpt = self.rc.prefill_checkpoint_every
             # Memory chunking and persistent checkpoints are deliberately
             # separate. F37 v6 journals only new positions at a checkpoint; a
