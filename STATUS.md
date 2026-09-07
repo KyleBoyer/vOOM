@@ -1,5 +1,64 @@
 # STATUS — 2026-09-07 (current corrections first; dated chronology below is history)
 
+## 2026-09-07 UTC: tracking opt-out completes full131 with exact49-token match; pressure still fails
+
+Source2ecaec6, installed uncensored Qwen3.8-Flash-Next FP8 with the explicit
+expert-transition-tracking-off overlay. Original131tools/all captured history/
+streaming retained; explicit model/max1024/temp0/seed64013 overrides. ONE naturally
+completed first model response: **HTTP867.9482s**,40432 uncached input/49 actual
+output tokens, HTTP200/completed. This is not the entire agent conversation,
+live tool execution, untouched request wire, official BF16 proof or Plex score.
+TTFT656.7840s, prefill656.7828s, decode207.4776s, engine864.2672s. Before/after
+native observations add21.225/42.977ms to HTTP wall; both region walks complete.
+
+All9 identity/equivalence checks PASS, including exact raw49 token IDs, engine
+text, prepared IDs, protocol output and canonical function call versus the prior
+greedy reference. One mastra_workspace_execute_command, expected command=whoami
+subset match; zero duplicate/argument-parse failures/retries; streaming/final
+text equal. Native MTP accepts28/62 proposals over21 target sweeps. This is finite
+greedy equivalence, not full-state or heterogeneous real-request proof. Saved
+212,862,449B transition history SHA unchanged before/after; default remains ON.
+
+Overall FAIL: HTTP-end available4,737,286,144B <5.3GB and actual request
+swap-out77,758,464B >16MB. Net swap-used growth0 DOES NOT erase that failure.
+TrueMetal peak6,429,012,616B passes8.5GB. All430 native samples available;
+minimum system available3,072,016,384B, max native footprint7,758,499,224B,
+observed compressed ledger2,528,903,168B/kernel reported peak2,546,499,584B.
+Before generation native footprint653,526,504B/compressed0; immediate return
+4,681,321,280B/compressed1,407,778,816B. Final periodic sample4,037,740,968B/
+339,984,384B is later and not the same boundary. Cache budget256MB at completion.
+Logical endpoint1,236,776,448B/40480 positions and separate retained prefix
+1,221,709,824B/39936 are unchanged, not unique physical RAM sums.
+
+Historical prior instrumented response911.6881s versus867.9482s now is a
+43.7399s lower observation, NOT a same-manifest controlled speed A/B. Host state
+and preflight availability differ, so no isolated causal percentage is claimed.
+The same-source setup pair below proves removal of the constructor allocation;
+this full response establishes its finite token check, not a clean pressure win.
+Logical store reads remain128,900,497,040B prefill +314,306,054,856B decode =
+443,206,551,896B, NOT measured physical NVMe traffic. Remaining prefill phase
+costs: attention317.4620s, experts260.8547s, host copy36.0415s (nested timings,
+do not sum blindly). Host transfer accounting407.415GB H2D/90.273GB D2H.
+
+Fresh30s preflightPASS8.920GBavailable/root16.200GB,zero growth/churn;
+fasttier62.512GB, no other model job. Parentexit1 is explicit pressure failure,
+not crash:871.2469s,19:04:48.102280->19:19:19.349172UTC; server normal managed
+SIGTERM(-15). All739 source/result/client/diagnostic/server/log hashes and all
+PIDs gone verified BEFORE edits; no timeout, parent signal, drift or missing
+result.897 selected pure regressions passed on this implementation. Private
+logs/qwen4_full131_tracking_off_complete_20260907.json SHA
+44036383aedd67dfd86c58a3a348e25503069d91e4f3d705524e77de14f58a35;
+.http.json23dac677b289726173f864214f5703ceddb4f57f3076c330ed21db4f3ca1dea3;
+.regions.json3ad9757c3150470de62f5287bcafdad4b8b69b861802b918990783b33311c9e8;
+.server.log7687ac6eeb2ae0330735035d52ca4bcbaf692d06b8661e90adecfaf0d55f302b;
+parentlog6f62517ea3857e53863700b375e4a51077c74e9b6766a4608cf430813c11ef07.
+
+Next: isolate remaining attention/expert transient native pressure and test the
+same no-consumer opt-in on GLM before promoting anything. GLM-5.3/Flash saved
+history sizes80,677,889/58,550,789B are metadata-only evidence of applicability,
+NOT measured GLM savings. Preserve both files. No job remains. Full134 Plex
+latest56/100FAIL (55.69min), varied domains, large contexts and sub90 remain OPEN.
+
 ## 2026-09-07 UTC: explicit unused-transition opt-out removes multi-GB setup allocation
 
 Implemented `--profile expert-transition-tracking-off` (or strict
