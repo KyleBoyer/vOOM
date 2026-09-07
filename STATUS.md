@@ -1,5 +1,59 @@
 # STATUS — 2026-09-07 (current corrections first; dated chronology below is history)
 
+## 2026-09-07 UTC: bounded Metal lifetime probe distinguishes delayed retirement from retained host pages
+
+Eight synthetic256MiB allocation/matvec cases PASS: FP16/BF16, GPU-created versus
+NumPy-copied weights, default versus explicitly isolated allocation streams.
+Every output row equals4096, retained-weight positive controls pass, live all65536
+FP16/BF16 bit patterns plus FP32 state and global MLX RNG remain byte-identical.
+No checkpoint/request/Plex execution, model equivalence or serving speed win.
+Only the disposable fixture uses cache limit0, restored on exit; no production
+configuration, weights, kernel or memory policy changed.
+
+In ALL8 cases the active Metal counter drops by268,435,456B immediately, with
+zero allocator cache, while the first native snapshots still show the large
+accelerator mapping and footprint. Extra allocator clearance does not remove
+that discrepancy immediately. Five cases lose the large mapping by the first
+100ms-idle observation; all8 lose it by the subsequent1s-idle observation,
+BEFORE tiny same-stream marker arithmetic. Observation/scheduling overhead means
+these are sampled boundaries, not precise retirement latency or a <=1s bound.
+Thus this bounded pattern demonstrates delayed native retirement, not a steadily
+leaked GPU weight. The marker adds no demonstrated reclamation benefit. Do not
+add sleeps/markers or repeat the rejected default-stream sync fix in serving.
+
+The host-copy cases reveal a separate clue: source NumPy weakrefs are already
+dead, but a268,435,456B MALLOC_LARGE mapping with16,384 resident pages persists
+through final observation, after the large accelerator mapping has disappeared.
+Final process footprint346,227,552B versus initial76,317,320B; all process
+compressed-ledger samples zero. This is consistent with retained freed host
+allocator pages, but not yet proof of that ownership or the full model's2.7GB
+setup footprint. Mapping sums and RSS/Metal/footprint overlap; never add them.
+Next bounded lever: test Darwin's documented malloc-zone pressure relief against
+an idle control on this host-allocation pattern, retaining live bit/RNG sentinels,
+before deciding whether a setup-host audit or live opt-in trial is justified.
+
+Version-matched upstream MLX0.32.0 source already uses scoped autorelease pools
+on [allocator release](https://github.com/ml-explore/mlx/blob/v0.32.0/mlx/backend/metal/allocator.cpp)
+and immediately commits [residency-set removal](https://github.com/ml-explore/mlx/blob/v0.32.0/mlx/backend/metal/resident.cpp).
+No evidence supports inventing a missing-commit fix. Version-matched source is
+mechanism context, not a claim to have reproduced the installed binary build.
+
+828 selected pure regressions PASS13.12s, including23 new fixture bounds,
+stage-order, exception and unchanged-pressure-threshold tests. Fresh30s preflight
+PASS, available7.042GB/root16.264GB, zero growth/churn; fast tier62.512GB allocated.
+Supervised diagnostic PASS/exit0/12.5648s, child10.6098s including deliberate idle
+controls;17:25:03.180424->17:25:15.745247UTC. MLX0.32.0/NumPy2.5.0, true Metal
+peak268,775,440B, sampled minimum available6,737,510,400B, zero swap growth/churn.
+All native observations complete. Root/external minima16.264/100.695GB. Source
+b30e5fc plus the two new manifest-pinned fixture/test files; all733 source hashes,
+result/log hashes and parent/child disappearance verified BEFORE edits. No
+timeout, signal, source drift or missing artifact. Private result
+logs/metal_resource_lifetime_20260907.json SHA
+b492c51796830d5f1fd28a59d46d46b12ef9125ea7756e3cb7317849d6c4e563;
+parent log70be5e492bcc10d83376059511500ec3cc190da70b1780da0e5daed5926e314c.
+No model job remains. Full134 Plex55.69min/56FAIL, latest modified131-tool first
+response911.6881s/pressureFAIL, varied-domain, context-ladder and sub90 goals OPEN.
+
 ## 2026-09-07 UTC: live native-region diagnostic completes; accelerator mappings dominate reported compressed-page counts
 
 Source01b52a7, installed uncensored QwenFP8 fused/aligned hot cache with generation
