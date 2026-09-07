@@ -1,0 +1,11 @@
+schema: voom.runtime-profile.v1
+name: prefill-phase-memory-witness
+description: Explicit native/Metal/cache observations at Qwen4 host-spool progress boundaries.
+notes:
+  - "Default-off diagnostic only. No tensor traversal, synchronization, clearing, peak reset, model math or governor decision change. Observation overhead is included in measured timings."
+  - "Bounded to1024 observations per sweep; sampled Python boundaries do not prove GPU retirement or causal ownership. Native footprint, compressed, Metal and logical cache bytes overlap; do not add them."
+  - "Missing/failed/capped observations cannot certify coverage. Per-phase trace is separate from whole-run memory and known-transcoder acceptance."
+extends:
+  - process-memory-witness
+settings:
+  VMODEL_PREFILL_PHASE_MEMORY_WITNESS: true

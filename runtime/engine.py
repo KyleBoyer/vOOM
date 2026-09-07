@@ -7130,10 +7130,17 @@ class StreamingEngine:
         from .layer_runner import _linear, _swiglu
         from .qwen35 import _route_experts
         import numpy as np
+        import os as _phase_os
 
         if tile_width <= 0:
             raise ValueError("Qwen4 layer-stationary tile width must be positive")
         total = int(x.shape[1])
+        phase_memory = None
+        if _phase_os.environ.get("VMODEL_PREFILL_PHASE_MEMORY_WITNESS") == "1":
+            from .prefill_phase_memory_witness import PrefillPhaseMemoryObserver
+            phase_memory = PrefillPhaseMemoryObserver(
+                total_tokens=total, total_layers=self.cfg.num_hidden_layers,
+                tile_width=tile_width)
         input_ids = tuple(getattr(self, "_qwen4_input_ids", ()))
         if len(input_ids) != total:
             raise ValueError(
@@ -7203,6 +7210,13 @@ class StreamingEngine:
                     "Qwen4 host-spooled prefill crossed its hard Metal cap: "
                     f"phase={phase} layer={layer} tokens={completed_tokens} "
                     f"observed={observed} limit={metal_limit_bytes}")
+            # Observe only after the existing hard-cap decision. No added eval,
+            # synchronization, clearing or tensor inspection on either path.
+            if phase_memory is not None and publish:
+                phase_memory.record(
+                    self, mx, phase=phase, layer_marker=int(layer),
+                    completed_tokens=int(completed_tokens),
+                    reported_host_spool_peak_bytes=int(host_bytes))
 
         def host_bits(value: mx.array) -> np.ndarray:
             """Copy the exact released 16-bit payload without conversion."""
@@ -7239,6 +7253,8 @@ class StreamingEngine:
             host_bytes=spool_peak_host_bytes)
 
         for i in range(self.cfg.num_hidden_layers):
+            if phase_memory is not None:
+                phase_memory.record(self, mx, phase="layer_enter", layer_marker=i)
             self._select_layer_transient(total, i)
             cache_before = (
                 profiler.cache_snapshot(self.cache)
@@ -7585,6 +7601,10 @@ class StreamingEngine:
             self._note_true_peak()
             del w
             mx.clear_cache()
+            if phase_memory is not None:
+                phase_memory.record(
+                    self, mx, phase="layer_released", layer_marker=i,
+                    completed_tokens=total)
         self._restore_aggregate_layer_transient(total)
         self._qwen4_host_spool_stats = {
             "h2d_bytes": spool_h2d_bytes,
@@ -7615,6 +7635,8 @@ class StreamingEngine:
         # All causal state covers the complete prompt; only the final hidden
         # row is consumed by the output mixer/head at this endpoint.
         self._qwen4_input_ids = (input_ids[-1],)
+        if phase_memory is not None:
+            phase_memory.finish()
         return metal_bits(hidden_host[:, -1:])
 
     def _layer_stationary_gptoss_sweep(

@@ -1,5 +1,78 @@
 # STATUS — 2026-09-07 (current corrections first; dated chronology below is history)
 
+## 2026-09-07 UTC: phase-local native tracing catches a transient missed by periodic sampling
+
+Added explicit `prefill-phase-memory-witness`, extending process-memory-witness.
+It samples native/Metal/cache scalars at existing Qwen4 host-spool boundaries,
+plus layer entry/release; tile phases sample their first/last tiles. Default OFF,
+bounded1024 records/sweep, no tensor traversal, evaluation, synchronization,
+clearing, peak reset, state disposal or governor-policy change. New observations
+follow the existing hard-Metal-cap decision. Sink/sample failures cannot change
+the model result and cannot certify trace coverage. Required per-layer boundary
+coverage, missing data and caps are explicit. An AST regression confirms that
+removing observer-only nodes leaves the exact pre-existing computation tree.
+
+Real instrumented completion: same pre-registered32K library/seed819203 synthetic
+no-tool request, greedy/non-streaming/no-reasoning,max1024, installed uncensored
+Qwen FP8 with fused aligned hot-KV/tracking-off/generation/host-activity profiles
+plus this observer. **HTTP624.9652s,32799 uncached input/47 actual output**, naturally
+completed. All7 strict answer/completion checks and all4 reference checks PASS:
+same wire, fixture, full raw generation witness and actual visible text. All47
+token IDs and72 output bytes match the prior623.2101s run; no truncation, retries
+or host repair. This is finite observer equivalence on ONE synthetic case, not
+captured harness/Plex/broad intelligence/full-state/released-BF16 or DSA proof.
+
+587 valid phase observations cover all48 layers; no missing required boundary,
+sample error or cap. Sampling-only cost45.955ms, excluding JSON/logging/dispatch
+overhead; all costs are included in the instrumented HTTP wall. The new trace
+finds native footprint **6,292,966,136B** at layer47's `retained_prefix` marker,
+32768 positions: **405,831,752B above** the highest2-second periodic sample.
+Available memory there is3,683,368,960B, versus the periodic minimum3,841,720,320B.
+At that same non-atomic observation: activeMetal2,963,339,878B, allocator
+cache75,771,908B, request trueMetal peak5,443,811,118B, native compressed844,890,112B,
+weight-cache logical243,370,496B/pinned13,127,680B. The reported host-spool
+839,916,792B is a logical HIGH-WATER counter, not a live physical allocation sum.
+These views overlap: do not add them or infer a leaked owner from their gap.
+
+The marker follows BOTH attention evaluation and prefix observation. It locates
+the next measurement boundary; it does NOT establish that prefix capture caused
+the spike, or that a GPU allocation has retired. Largest sampled footprints
+at ordinary attention/expert/output boundaries are4.578/4.901/4.834GB. Periodic
+native compressed usage peaks1,671,954,432B about113.074s after the last prefill
+boundary, so prefill scratch is not the only remaining pressure concern.
+
+Overall memory gate still FAIL: terminal available4,306,337,792B, HTTP actual
+swap-out36,061,184B, net used-swap growth0. Whole periodic native trace308 samples:
+peak footprint5,887,134,384B, actual swap-out35,274,752B. Known-transcoder isolation
+PASS across all308 samples (none listed); not general host-idle/swap-owner proof.
+Prefill471.1424s, engine-first471.1429s (not client SSE), decode152.3490s,
+totalengine623.4949s. Logicalstore117,677,725,640B prefill/230,132,213,640B decode
+and MTP32/45accepted/15sweeps exactly match the prior case; NOT physicalNVMe.
+The1.7551s HTTP difference is not isolated observer overhead or a causal regression:
+different source manifests/host state, uncleared OS caches, both pressure FAIL.
+
+1092 selected pure tests PASS14.66s before the run, including28 new checks.
+Fresh30.0340s preflightPASS/no listed transcoders/no growth/churn; available7.167GB,
+root16.205GB. Parent rootmin16.192GB; fasttier unchanged62.512GB. ParentFAIL/exit1,
+628.2381s (21:42:53.722307 ->21:53:21.960429UTC); driver625.9328s, client1,
+server normal managedSIGTERM(-15). All four PIDs gone. All749 source hashes,
+unchanged start/end manifest, result/client/response/server/log/preflight/tokenizer/
+reference hashes, full required phase coverage and unchanged212,862,449B history
+verified BEFORE docs edits. No timeout, parent signal, drift or missing result.
+
+Private logs/qwen4_phase_memory_retrieval32k_20260907.json SHA
+54327fa45f01bad38f8d469a3101119f0b8ed9d816ce18749e7d21bb3ca16822;
+client/resultlog2ad96e38774d5bbd996254a7d072e803b406ae25f32553e3713220752d9a7ed4;
+response9a642d90c7a9c89936d1ebec003182c4e283e8262a803c36b206994deaafd7a1;
+server0e9176684e5ade4dda15000c52be60d76e691a977b81908b9d3e31b08041fa16;
+parentlogf4d7ad02275d2c6f1527672aa01cc2c8a83f91098b02aa23e6e70bbea1159164.
+
+Next: bracket late full-attention/capture temporaries separately before changing
+tiling or retention; also preserve the post-prefill compressed-memory evidence.
+Do not repeat blind allocator clearing/shared-expert overlap or blame prefix
+capture from a coincident label. No model job remains. No default promotion or
+speed win; full131/Plex results unchanged, other domains/models/larger rungs/sub90 OPEN.
+
 ## 2026-09-07 UTC: Qwen naturally completes hidden32K retrieval correctly; pressure still FAIL
 
 The pre-registered library/fixture-seed819203 case now has a REAL model response:
