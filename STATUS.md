@@ -1,5 +1,49 @@
 # STATUS — 2026-09-07 (current corrections first; dated chronology below is history)
 
+## 2026-09-07 UTC: bounded host-owner probe rejects blind extra-copy optimization
+
+Eight real-MLX synthetic cases exercise the ACTUAL `_restore_lossless_16bit_host_spool`
+and `formats.packed.to_mx` helpers: contiguous/strided FP16/BF16 NumPy views and
+BF16/F16/rawFP8/F32 direct-read memoryviews. Each view exposes128KiB from a16MiB
+host owner. A weak-reference positive control first proves the view retains its
+owner; after conversion and dropping the input view, every owner is already gone,
+even BEFORE the probe's explicit eval/GC, while the MLX result remains live.
+The spool helper itself evaluates internally. Raw-reader stand-ins are explicitly
+weak-referenceable bytearray subclasses, not a claim to observe CPython bytes.
+
+All eight raw-bit hashes match, including all65536 FP16/BF16 bit patterns in
+contiguous cases; MLX RNG matches. Zero swap-used growth/swap-out, available
+minimum7,011,368,960B, actual allocator peak524,456B, native footprint max118,473,376B,
+no observed compression. This proves bounded Python/NumPy owner disposal, NOT
+native allocator/Metal backing reclamation, full-model pressure ownership or a
+speed gain. Do not extrapolate the tiny footprint to inference. No production
+model/kernel/profile/memory-policy change and no additional copy is justified.
+
+Local MLX0.32.0/NumPy2.5.0; total probe0.1231s, per-case construction+explicit eval
+27.541..82.416 microseconds for128KiB, one sample/case including cold effects,
+not serving latency or a robust conversion-throughput benchmark. This is
+consistent with the documented copying conversion in
+[MLX's current interop guide](https://ml-explore.github.io/mlx/build/html/usage/numpy.html);
+local version behavior is established by this probe, not assumed from latest docs.
+
+767 selected pure regressions pass in13.19s. Fresh30s preflight passes with
+zero growth/churn, available7.178GB/root16.266GB. Supervised tiny MLX gatePASS/
+exit0/2.4224s,16:05:26.531501->16:05:28.953925UTC; no source drift/signal/timeout/
+missing result. All725 source hashes and result/log hashes verified before edits.
+Source1195ec1 plus the two manifest-pinned new fixture/test files; no concurrent
+model job. Parent coarse RSS samples undershoot this short job; native snapshots
+are retained separately, and neither is an uninterrupted RSS peak measurement.
+Private logs/host_buffer_lifetime_20260907.json SHA
+1edaf03c5c86d79440c15ddd246da29d384e9bbf34bc7eca9d5e1d1fafe6bca9;
+parent logb79eacff80cc17adc98d22586b2d3f8c2b666e382b6aa6f7d25744cfe5516fb1.
+
+Next: obtain native allocation-class/retained-state observations on a bounded
+LIVE model probe; the completed full134 trace already proves process compression,
+but these synthetic conversions do not explain it. Do not rerun the full55-minute
+Plex sequence unchanged, add speculative copying, or loosen scoring/pressure gates.
+No model job remains. Full Plex56/100FAIL and all open speed/quality goals below
+remain unchanged; this is a useful negative hypothesis test, not an optimization win.
+
 ## 2026-09-07 UTC: full134 Plex completes, 56/100 strict FAIL; process compression persists
 
 The corrected v2 orchestrator completes all four responses and saves four
