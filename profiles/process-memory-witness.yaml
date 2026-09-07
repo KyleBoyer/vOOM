@@ -1,0 +1,10 @@
+schema: voom.runtime-profile.v1
+name: process-memory-witness
+description: Opt-in Darwin self-task memory timeline on the existing governor poll.
+notes:
+  - "Observation only: no new thread, target/cache/math/sampling changes, synchronization or allocator clearance. Safety responses precede observations. Additional log/read overhead is included in wall time."
+  - "Logs at most 4096 scalar samples, no more frequently than every two seconds, with an explicit cap marker. Records no prompt, output, arguments, paths or tensor payloads. No governor means no periodic trace."
+  - "Darwin REV1 footprint, RSS and internal-compressed ledger are overlapping accounting views, not attributable disk swap bytes. Non-atomic global and self samples cannot alone prove who caused global pressure. Unsupported or failed reads stay unavailable."
+  - "Adds the self-task sample to existing phase-head/terminal observations when those are enabled. Does not enable those observations, disposal or any experimental model path."
+settings:
+  VMODEL_PROCESS_MEMORY_WITNESS: true

@@ -3,6 +3,7 @@
 No MLX import, tensor traversal, request-state disposal or pressure verdicts.
 """
 
+import os
 import psutil
 import time
 
@@ -36,8 +37,16 @@ def sample_phase_head_memory(target, metal) -> dict:
         except Exception:
             values[key] = None
             unavailable.append(key)
-    return {"available": not unavailable, "unavailable_fields": unavailable,
-            **values}
+    result = {"available": not unavailable, "unavailable_fields": unavailable,
+              **values}
+    if os.environ.get("VMODEL_PROCESS_MEMORY_WITNESS", "0") == "1":
+        try:
+            from .process_memory_witness import sample_self_memory
+            result["process_memory"] = sample_self_memory()
+        except Exception:
+            result["process_memory"] = {"available": False,
+                                        "reason": "observation-error"}
+    return result
 
 
 def post_generation_memory_witness(target, metal, *, barrier=False) -> dict:

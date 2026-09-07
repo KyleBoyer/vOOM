@@ -22,6 +22,7 @@ sufficient for how fast our allocations move and keeps this dependency-free.
 from __future__ import annotations
 
 import math
+import os
 import threading
 import time
 from collections import deque
@@ -138,6 +139,10 @@ class MemoryGovernor:
         self._stop = threading.Event()
         self._peak_lock = threading.Lock()
         self._request_peak_metal_bytes = mx.get_active_memory()
+        self._process_memory_observer = None
+        if os.environ.get("VMODEL_PROCESS_MEMORY_WITNESS", "0") == "1":
+            from .process_memory_witness import process_memory_observer_from_environment
+            self._process_memory_observer = process_memory_observer_from_environment()
         self._thread = threading.Thread(target=self._run, daemon=True)
         self._thread.start()
 
@@ -544,6 +549,16 @@ class MemoryGovernor:
                             self.restores += 1
                 else:
                     self._green_streak = 0
+                # Observation follows the safety response and cannot change its
+                # inputs, thresholds or verdict. Reuse the existing poll/thread.
+                observer = getattr(self, "_process_memory_observer", None)
+                if observer is not None:
+                    observer.record(
+                        governor_monotonic_s=now, system_available_bytes=avail,
+                        system_swap_used_bytes=int(swap.used),
+                        system_swap_out_bytes=int(swap.sout), metal_active_bytes=metal,
+                        cache_budget_bytes_after_response=int(self.cache.max_bytes),
+                        swap_pressure_response=swap_pressure)
             except Exception:
                 pass  # governor must never take the runtime down
 

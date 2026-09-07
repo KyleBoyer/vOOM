@@ -1,4 +1,59 @@
-# STATUS — 2026-09-06 (current corrections first; dated chronology below is history)
+# STATUS — 2026-09-07 (current corrections first; dated chronology below is history)
+
+## 2026-09-07 UTC: native process-memory timeline verified; next gate is completed full-catalog Plex
+
+New explicit/default-off `process-memory-witness` adds Darwin self-task footprint,
+resident/internal/external/reusable and internal-compressed ledger scalars to the
+existing governor poll, AFTER its safety response. It adds no thread, target or
+cache reference, tensor traversal, device synchronization, allocator clearance,
+RNG call or threshold change. Samples include their own start/end timestamps and
+the preceding, non-atomic global swap/available/Metal samples. Existing phase-head
+and terminal observations also carry nested self snapshots when enabled; the
+profile does not enable those paths itself. Periodic JSONL goes only to the
+existing server log, at most once per two seconds/4096 samples, then a visible
+coverage-truncated marker. No governor means no periodic trace. Failed/unsupported
+native records remain unavailable/null, never a fabricated zero or pressure pass.
+
+ABI proof: compiled the installed Apple SDK's TASK_VM_INFO REV1 oracle and matched
+all 21 field offsets, 152-byte prefix and 38-natural count. Both actual native
+calls return success/count38; a touched 16MiB host allocation increased reported
+footprint by 16,809,984B. No forced compression or exact physical-reclaim claim.
+Across 256 CPU-only samples, self-read median/p95 11.541/15.125 microseconds;
+flushed JSONL median/p95 31.542/48.042 microseconds, maximum272.999 microseconds.
+Cost fixture uses accelerated timestamps/synthetic governor inputs, not a real
+pressure timeline or serving-speed A/B. These are local observations, not an
+overhead guarantee under inference. The initial Sep6 probe overlapped pure tests;
+the isolated repeat and final tracked-fixture probe had no concurrent task job.
+
+697 pure regressions pass in 13.04s, including governor response ordering and
+observer failure, default-off/profile isolation, short/error ABI records,
+redaction, log bounds and Plex/preflight gates. Fresh passing 30-second preflight
+has zero swap growth/churn. Two tiny real-MLX cases preserve every BF16/FP16 bit
+pattern, FP32 state and global MLX RNG around actual native reads/JSONL. This is
+not a model-token, live-compression, completed-harness or Plex-quality proof.
+Both supervised native and MLX gates PASS/exit0; parent2.3693/2.8713s. All723
+source hashes plus both result/log hashes verified before these receipt edits.
+Native logs/process_memory_native_final_20260907.json SHA
+d611ff49bc027c11836071141b4f8b7699936843ba63bb186cd59f594fb7f50e;
+MLX logs/process_memory_mlx_20260907.json SHA
+6551dd576c8a8d085beb5f2f5836ce40af1427b5d53ecfe8c8d4583de122db71.
+
+[Apple's ABI](https://github.com/apple-oss-distributions/xnu/blob/main/osfmk/mach/task_info.h)
+and [ledger implementation](https://github.com/apple-oss-distributions/xnu/blob/main/osfmk/kern/task.c)
+confirm that compressed is the internal-compressed ledger balance, not this
+process's disk swap-out bytes. Footprint/RSS/Metal overlap and must not be added.
+Correlation with global swap does not alone assign its cause. The previous
+continuation pressure spike remains UNATTRIBUTED; no new speed/quality win.
+
+Next: completed-output Plex with the full original 134-tool catalog and original
+prompt/history, plus explicit model/output-budget/sampling/protocol overrides
+recorded by the existing profiler and synthetic pagination results clearly
+labeled. Use the verified fused/aligned hot-cache Qwen profile plus observation;
+keep endpoint disposal off while investigating pressure. Preserve the strict
+whole-visible-output rubric and 5.3GB/16MB/8.5GB gates. This expands the media/tool
+shape beyond the 131-tool workspace sequence; it is not a live Plex execution or
+an untouched-wire claim. Sub90, complete Plex, varied-domain acceptance and the
+large-context ladder remain OPEN. No model job remained at the resume audit.
 
 ## 2026-09-06 UTC: guarded endpoint disposal halves terminal Metal active bytes; pressure still FAIL
 

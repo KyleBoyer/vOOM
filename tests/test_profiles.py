@@ -27,6 +27,15 @@ from runtime.profiles import (
 ROOT = Path(__file__).resolve().parent.parent
 
 
+def test_process_memory_overlay_changes_only_observer_flag():
+    catalog = discover_runtime_profiles((ROOT / "profiles",))
+    base = "qwen38-flash-next-uncensored-fp8-exact-pipeline-hot-kv-aligned-compact-fused"
+    _, baseline = resolve_runtime_profiles((base,), catalog)
+    _, candidate = resolve_runtime_profiles((base, "process-memory-witness"), catalog)
+    assert "VMODEL_PROCESS_MEMORY_WITNESS" not in baseline
+    assert candidate == {**baseline, "VMODEL_PROCESS_MEMORY_WITNESS": "1"}
+
+
 @pytest.mark.parametrize("overlay,mode", [
     ("qwen4-post-generation-memory", "observe"),
     ("qwen4-post-generation-barrier", "synchronize_clear_cache"),
