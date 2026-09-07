@@ -1,5 +1,70 @@
 # STATUS — 2026-09-07 (current corrections first; dated chronology below is history)
 
+## 2026-09-07 UTC: query-only SDPA tiling clears bit-exact component gate, cuts scratch
+
+Added an explicitly called, **unconnected** head256 SDPA scheduling candidate
+(`runtime/qwen4_sdpa_tiling.py`): tiles128/256/512, shared full KV and original
+precomputed additive mask, one evaluated output per query tile before concat.
+No projection, QSA ranking, KV/recurrent update, host/expert tile, target weight,
+allocator/governor or serving-default change. Short/passthrough calls remain one
+original SDPA call. A tail<=8rows merges into the preceding tile (bound tile+8)
+to avoid introducing a different vector-dispatch family. Implicit causal-string
+masks are rejected on sliced paths because their offset would change.
+
+Fresh supervised synthetic component gate **PASS**,10cases: five independent
+seeds77123/60391/44987/31729/90583 x BF16/FP16, query lengths1/17/257/1031/1024,
+key lengths257/127/2049/4099/32768, batch1 plus batch2, transposed Q/K/V, no mask
+and additive causal/block masks. Geometry24query/2KV heads,width256. Every case
+uses balanced0/128/256/512/512/256/128/0 ordering against an untiled reference.
+All80 arm comparisons are **bit-identical**, including all28 actually split
+calls; all Q/K/V/mask input hashes unchanged. Both supported dtypes and uneven
+tails pass. No tolerance, response repair, logits-only comparison or token cap.
+This is synthetic SDPA only: NO model weights/generated tokens, full model state,
+QSA selection conformance, captured harness/Plex score or end-to-end speed proof.
+
+At1024queries/32768keys, per-arm absolute Metal peaks include resident inputs:
+
+| Query tile | Untiled | 128 | 256 | 512 |
+|---|---:|---:|---:|---:|
+| Peak bytes, either dtype | 1,816,268,802 | 395,972,610 | 598,872,066 | 1,004,670,978 |
+| BF16 median seconds (2 calls) | 0.356237 | 0.350270 | 0.341661 | 0.341306 |
+| FP16 median seconds (2 calls) | 0.346905 | 0.349650 | 0.342999 | 0.348285 |
+
+Tile256 cuts this component's peak~67%, with similar/slightly lower sampled
+wall; not an isolated whole-request speed gain. Small shapes are not uniformly
+faster: batch2/257queries/2049keys tile128 takes56.034ms versus14.673ms BF16
+(FP16 51.042 versus12.523ms). Short controls and tile256/512 at257queries do not
+actually split, so their timing differences are noise, not tiling wins.
+Timings include SDPA construction+eval only; input creation, hashes, observations
+and per-arm diagnostic cache clearing excluded. Whole child wall9.1805s includes
+everything; cache limit0 is probe-only and restored. No model I/O or tokenizer.
+
+Pressure PASS:235 samples/~50ms periodic plus arm endpoints, minimum available
+6,098,141,184B, actual swap-out983,040B, net used-swap growth0. TrueMetal across
+setup/reference/allarms1,816,268,802B, native observed peak2,154,234,888B,
+native compressed0. Observations overlap and can miss short intervals; not a
+continuous host-idle or physical-I/O proof. Known-transcoder isolationPASS82
+inventories/no listed jobs. Fresh30.0326s preflightPASS/no growth/churn, available
+7.494GB/root16.189GB; fasttier unchanged62.512GB. ParentPASSexit0/11.5102s
+(22:47:51.793362 ->22:48:03.303543UTC), PIDs30577/30594gone. All752 source hashes,
+same start/end manifest, result/parent-log/preflight hashes and independent
+comparison replay verified BEFORE docs edits. No timeout, signal, drift or error.
+673 selected pure tests PASS2.69s before MLX, including62 new candidate/gate tests.
+
+Private logs/qwen4_sdpa_query_tiling_component_20260907.json SHA
+1bb9d91fe5e13e5ee767d941f31c1fc52f9e487d574856c981a7c5f4f609b9d1;
+parentlogb55e44da0d353c319531fc072093f25937c5676aef602f67576e8f81517181df;
+preflight3dabcac1be55efdcce33dfd0d9d48c6f1762127b3b7030c984c0a455c075fdac.
+
+Next: wire tile256 as an EXPLICIT profile/runtime identity, with no automatic
+selection, and test actual QSA+KV/recurrent endpoint bits before completed
+retrieval/unmodified capture. Preserve projection/ranking/update/host tile order;
+record real peak/pressure and avoid routing short calls through a costly split.
+Component identity alone cannot certify whole-model equivalence. No MLX/model
+job remains. Latest actual synthetic32K HTTP623.5684s/pressureFAIL and captured
+full131 HTTP867.9482s/pressureFAIL, Plex56FAIL unchanged. Sub90/other models/GLM
+large-context and heterogeneous completed-answer gates remain OPEN.
+
 ## 2026-09-07 UTC: bracketed trace locates the large transient before prefix capture
 
 Extended the opt-in phase observer with first/final AND exact aligned-capture
