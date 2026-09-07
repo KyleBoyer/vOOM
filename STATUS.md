@@ -1,5 +1,79 @@
 # STATUS — 2026-09-07 (current corrections first; dated chronology below is history)
 
+## 2026-09-07 UTC: query256 completes 32K exactly; less memory, no wall-time win
+
+The explicit `qwen4-prefill-sdpa-query256` profile now completes a full-model
+HTTP retrieval request, not a capped first-token test. This is one SYNTHETIC
+no-tool library case (seed819203), 32,799 uncached prepared tokens, greedy,
+non-streaming/no-reasoning, max-output1024 with 47 actual tokens and natural
+completion. Installed uncensored Qwen FP8; no original-BF16 reference claim.
+The request wire/fixture, all 47 raw generated tokens, and 72 output-text bytes
+match the historical untiled run exactly. Independent rescoring of the saved
+response passes all seven strict completion/record checks. No answer repair.
+
+| Metric | Historical untiled | Query256 |
+|---|---:|---:|
+| Complete HTTP wall | 623.5684s | 628.6776s |
+| Prefill | 470.1745s | 475.0599s |
+| Decode | 151.9014s | 152.1722s |
+| True peak Metal | 5,443,811,118B | 4,258,395,954B |
+| Observed peak native footprint | 6,236,310,144B | 5,210,524,360B |
+| Actual HTTP swap-out growth | 46,268,416B | 34,226,176B |
+
+Whole-request Metal peak is ~21.8% lower, but HTTP wall is ~0.8% higher.
+These are historical fresh-server/uncached-prompt runs, NOT an interleaved,
+OS-cache-controlled cold A/B. Starting available memory differs (reference
+preflight9.090GB, candidate7.566GB), so do not attribute all timing/pressure
+differences to tiling or claim a speed win. The option stays default OFF.
+Unchanged logical store accounting:117,677,725,640B prefill +
+230,132,213,640B decode =347,809,939,280B; not physical disk reads.
+Native MTP remains32/45 accepted,15 target sweeps. Attention245.916906s,
+experts169.294842s, host copying29.091050s. Engine first token475.0605s
+is not client SSE TTFT; total engine627.2360s. No retry.
+
+Actual path witness PASS:396 QSA calls,384 split calls,1548 query tiles,
+max query256/key32799, configured tile256. All144 ordered first/capture/final
+attention bracket groups pass across48 layers;1160 scalar observations,
+complete v2 ending, no cap/error. Query tiling performs evaluation INSIDE the
+attention call, so comparing only branch-return -> later eval is misleading.
+At layer47's32768 capture, native footprints are4,577,102,464B inputs-ready,
+4,968,680,064B branch-return,4,511,500,928B evaluated/prefix-observed. This is
+interval observation, not a causal allocation/retirement proof. Scalar sampling
+78.081ms excludes logging/dispatch; all instrumentation is inside HTTP wall.
+
+Overall gate FAILS pressure: terminal available4,291,428,352B and actual swap-out
+34,226,176B (net used-swap growth0). Whole-run310 periodic samples have minimum
+available4,086,677,504B, observed swap-out33,751,040B, native compressed peak
+1,083,392,000B. Known-transcoder isolation PASS310 observations/no listed jobs;
+not general idle or swap attribution. Fresh30.0343s preflight PASS/zero churn,
+root16.191GB; parent root minimum16,181,190,656B/external100,638,441,472B.
+Fast tier unchanged62.512GB. No safety threshold weakened.
+
+Parent FAIL exit1/631.7435s, driver629.6596s,23:35:30.216048 ->
+23:46:01.959565UTC. Managed server-15 is expected cleanup, not a crash.
+PIDs40578/40582/40584/40585 verified gone. All755 source hashes, identical
+start/end manifest, child/client/response/server/parent/preflight hashes,
+tokenizer/history/reference identity, independent response rescore and path/
+pressure/bracket checks verified BEFORE docs edits. No timeout, signal, source
+drift, missing result or history mutation. Runtime commit70449f5 is pushed.
+Final selected pure suite:1327 tests PASS in15.61s; git diff --check clean.
+
+Private result logs/qwen4_query256_completed32k_20260907.json SHA
+354af3c7b63916e575939732c019a2a5d06bc73cfb5a705be9a837bf9ebf0355;
+parentlog2dbce4c9d23e271f93393e9ce879d95d1b254c3853a9f129c6d5137fc2f226f5;
+response20975194e2f518bd44515281148cfa1e3d2a46763796d335ecf82d2d1569df96;
+preflight8c2f459a6d965f26e93f608a8ba103265d73eddf4c6ed66f7d68d40f3ce1ade8.
+Source tree a89d4ebe913efb7c9a00ab62330fa993af19b933cb1ec9f8011a3a47c9d588b9;
+profile digest69ae97e299e35600b0dddee2168fcda52f090fe08e55423da8547316619e1736.
+
+Next: retain query256 as an experimental MEMORY lever, not a speed profile.
+Whole recurrent/retained endpoint bits and heterogeneous completed traffic still
+need gates. For speed, first isolate real QSA indexing/selection versus SDPA/
+projection costs in a bounded diagnostic; only then attempt an arithmetic-gated
+kernel or sparse-key scheduling change. Do not keep replaying this identical
+case for timing noise. No new actual harness/Plex/GLM result: full131867.9482s
+and Plex56/100FAIL remain latest; sub90 and GLM context ladder remain OPEN.
+
 ## 2026-09-07 UTC: explicit prefill query256 integration and real QSA/state gate pass
 
 Added `qwen4-prefill-sdpa-query256` / `VMODEL_QWEN4_PREFILL_SDPA_QUERY_TILE=256`.
