@@ -1,5 +1,61 @@
 # STATUS — 2026-09-07 (current corrections first; dated chronology below is history)
 
+## 2026-09-07 UTC: native allocation-class reader verified; bounded live diagnostic next
+
+New explicitly invoked `process_region_witness.sample_self_regions()` walks this
+process's leaf VM mappings and aggregates kernel user tags/external-pager flags.
+No production flag/profile/automatic polling enables it. No task_for_pid, process
+fork/suspension, tensor evaluation, payload/filename/address/object-ID export,
+allocator clearing or model/state mutation. The earlier exploratory vmmap command
+reported a corpse snapshot and took1.25s on a tiny Python process; the new reader
+uses direct self-task metadata instead. Native calls still cost kernel work.
+
+Coverage is fail-closed: short/error/unsupported records, non-progressing regions,
+depth/cardinality/call/time limits produce unavailable plus explicitly partial
+groups, never a complete fabricated zero. Bounds16384 calls/256 groups/depth32;
+one-second time budget is checked BETWEEN calls, not a preemptive syscall timeout.
+Groups are mapping sums, NOT unique physical allocations/footprint. Kernel
+pages_swapped_out includes compressor-backed pages, NOT process disk-swap I/O.
+Unknown user tags remain numeric; a tag alone does not identify a Python tensor
+or library. See [Apple's ABI](https://github.com/apple-oss-distributions/xnu/blob/main/osfmk/mach/vm_region.h)
+and [map-page accounting](https://github.com/apple-oss-distributions/xnu/blob/main/osfmk/vm/vm_map.c).
+
+Installed-SDK compiled oracle matches all21 field offsets,76-byte packedV2 record,
+count19, and all12 named tags; native call returns0/count19. A touched16MiB malloc
+increases MALLOC_LARGE/HUGE mapped bytes by exactly16,777,216B. Eight CPU-only
+walks cover187 leaf regions each, median11.140ms/max15.171ms. No live-inference
+overhead or compression-attribution proof. Both real-MLX all-bit-pattern FP16/BF16
+cases plus FP32 state preserve rawbits/globalRNG. Tiny allocator peak135468B,
+available7.417GB, zero swap growth/churn after fresh passing30s preflight.
+
+804 selected pure regressions pass in12.98s, including limits/redaction/nested
+submaps, error preservation, exact wrapper forwarding and unchanged response
+identity. The disposable `process_region_http_probe` observes before/after ONE
+normal engine invocation with an explicitly sufficient output cap, records native
+groups alongside process/Metal/cache scalars and plain endpoint/slot LOGICAL
+sizes, and forwards original argument/result objects unchanged. Observer failures
+cannot repair/replace responses; absent/partial receipts fail the outside gate.
+Its timed snapshots are included in HTTP wall; no causal speed comparison.
+
+Supervised CPU/tinyMLX parents exit0 in2.4059/2.3544s; native child0.9617s,
+two-case pytest wrapper0.1708s. No timeout/signal/drift/missing result. All729/731
+source hashes and both result/log hashes verified before subsequent edits.
+Private logs/process_region_native_20260907.json SHA
+ceed1f1ba2d0b96eb8098a533a01f1f63de7f11f8cef4a4f7bb4177f3d91405c;
+native loge3d36f0237cb8a22f15a296b3729b81de7ce29222362e53c2a53bcb552ba7e98;
+logs/process_region_mlx_20260907.json SHA
+e42990ee7e6d0175ce05d617eefc41507e56b3fb93e0eb6ae4fcb4f4984e6cc9;
+MLX log19e95f03931508bcb63d5f1f276741db94fd3f8f0399d2690ed306a73c3ba6c7.
+
+Next bounded live run: current installed uncensored QwenFP8 fused/aligned profile
+plus generation/process-memory witnesses; original131-tool workspace request and
+all history/streaming retained, explicit model/max1024/temp0/seed64013 changes.
+One naturally completed FIRST model response, not the whole agent conversation,
+Plex intelligence or a context-ladder acceptance. Compare actual raw tokens/text/
+prepared IDs to the earlier49-token capture result. Keep endpoint disposal and
+terminal barrier OFF, preserve5.3GB/16MB/8.5GB gates, take native region snapshots
+without reading state payloads. Full134 Plex55.69min/56FAIL remains unchanged.
+
 ## 2026-09-07 UTC: bounded host-owner probe rejects blind extra-copy optimization
 
 Eight real-MLX synthetic cases exercise the ACTUAL `_restore_lossless_16bit_host_spool`
