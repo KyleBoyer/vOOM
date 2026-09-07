@@ -1,5 +1,81 @@
 # STATUS — 2026-09-07 (current corrections first; dated chronology below is history)
 
+## 2026-09-07 UTC: explicit prefill query256 integration and real QSA/state gate pass
+
+Added `qwen4-prefill-sdpa-query256` / `VMODEL_QWEN4_PREFILL_SDPA_QUERY_TILE=256`.
+RuntimeConfig/YAML/environment accept only integer0/128/256/512; default0. Only
+the existing Qwen4 host-spooled prefill passes this option to QSA. Ordinary
+decode, serial verification and native MTP retain their original calls. Server
+engine identity separates the option; persistent-KV identity separates nonzero
+tiles while preserving the OLD zero-policy fingerprint. New integer telemetry
+records configured tile, actual calls/split calls/query tiles/max query/key rows.
+No projections, QSA ranking, KV updates, outer host/expert tiles or weights changed.
+The option remains experimental/default OFF; no automatic shape/content policy.
+
+Real installed-attention gate **PASS** after a necessary mask-adapter correction:
+before QSA's index budget, the existing attention supplies a rank2 additive causal
+mask, not the rank4 QSA mask used by the first synthetic component fixture. The
+initial0.6794s attempt correctly refused the candidate before output (ValueError);
+its untiled layer3 control had completed4 prefill tiles+3 singleton continuations.
+Expanded the helper to slice rank2 OR rank4 masks without reshaping/recomputing
+values or offsets; implicit causal-string masks still refused on sliced paths.
+Both attempts have verified755 source/artifact hashes and stopped PIDs; no failed
+attempt was promoted. New pure tests exercise both mask ranks and broadcasts.
+
+Successful paired gate uses REAL installed Qwen attention layers3/47 (9 released
+BF16 attention tensors each, loaded through WeightStore), synthetic BF16 hidden
+inputs with independent seeds61783/94217,3079/32799 positions, original1024-row
+outer tiles and exactly3 subsequent singleton attention steps. Both arms execute
+the real projections, norms, RoPE, QSA selection and KV/index updates. All37
+prefill output pairs and their four state arrays match byte-for-byte; all6
+continuation output/state pairs match too. Input and loaded-weight hashes remain
+unchanged. No tolerance/repair. This is ATTENTION-LOCAL proof, not generated
+tokens, PLE/DeltaNet/MoE/head/full-model recurrent endpoint, actual harness/Plex,
+intelligence or complete-answer acceptance. The server wrapper itself has pure
+wiring/identity tests, not a new live HTTP proof yet.
+
+| Actual attention layer / positions | Untiled prefill | Query256 prefill | Untiled Metal peak | Query256 Metal peak |
+|---|---:|---:|---:|---:|
+| 3 / 3079 | 0.175279s | 0.177182s | 524,586,484B | 381,542,448B |
+| 47 / 32799 | 6.735464s | 7.186242s | 2,690,450,152B | 1,505,034,988B |
+
+The long case reduces component peak~44%, but sampled prefill is~6.7% slower.
+One pair, reversed arm order on the long case (candidate first), compilation/OS
+caches not independently controlled: no causal whole-request speed claim or
+latency promotion. Per-step timings include attention construction+eval, exclude
+input generation/hashing/observations/cache clearing. Three-step continuation
+sums0.007008/0.007019s short,0.019789/0.020060s long (untiled/candidate), not token
+decode. Candidate counters4calls/3splits/13querytiles and33/32/129, max query256;
+max keys3079/32799. Both arms use the same already-loaded weight objects. Each
+layer's store accounting102,893,056B, total205,786,112B; NOT physical NVMe reads.
+Weight fetch+eval8.045/7.374ms is OS-cache-affected, not a cold load measurement.
+
+Overall pressurePASS:298 sampled observations, minimum available5,803,180,032B,
+actual swap-out622,592B/netused growth0, trueMetal2,690,450,152B, observed native
+peak2,319,500,320B/compressed0. Views overlap and periodic samples can miss brief
+peaks; not additive RAM/general host-idle proof. Known-transcoder isolationPASS76
+inventories/no listed jobs. Fresh30.0285s preflightPASS/zero churn/end7.059GB/root
+16.188GB; unchanged fasttier62.512GB. ParentPASS0/19.6441s
+(23:24:31.385342 ->23:24:51.029430UTC), child17.6650s, PIDs38240/38257gone.
+All755 source hashes, same start/end manifest, result/parent-log/preflight/model
+metadata hashes and independent per-step output/state/counter/pressure replay
+verified BEFORE docs edits. No timeout, signal, drift or missing result. Before
+first model attempt1325 selected pure tests PASS15.28s; after rank2 correction140
+focused pure tests PASS1.41s. Final broader rerun:1327 pure tests PASS15.31s.
+
+Private logs/qwen4_real_qsa_query256_rank2_20260907.json SHA
+f38a8d43bbaff23a0325c001214b8b87ca6cee12b15ed3d63c0c034d982db345;
+parentlog23f01d9d9365d00e1e44f46329bd5c0a6ce3faf583ca19a382fd24391dcd3b2b;
+preflightc5c59c06e23fa5d2b5aeb1b92d94a2632f10c02d9931ebfcd193d10603cf416c.
+Earlier refused attempt result98daf83bdc90ac2554ce6155f476b26b50226696e518443e8ef30fc5291947a9.
+
+Next: whole-engine endpoint/token equivalence and completed32K retrieval on this
+explicit profile, then unmodified captured traffic. Test whether less prefill
+scratch actually improves whole-run pressure despite the local timing cost.
+No model job remains; no default promotion/new end-to-end timing/Plex score.
+Latest actual synthetic32K HTTP623.5684s/pressureFAIL; full131867.9482s/pressureFAIL,
+Plex56FAIL; other models/heterogeneous completed traffic/GLM ladder/sub90 OPEN.
+
 ## 2026-09-07 UTC: query-only SDPA tiling clears bit-exact component gate, cuts scratch
 
 Added an explicitly called, **unconnected** head256 SDPA scheduling candidate

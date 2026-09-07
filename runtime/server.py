@@ -1262,6 +1262,7 @@ class EngineManager:
                 ("VMODEL_QWEN4_COMPACT_RETAINED_CONV", "0"),
                 ("VMODEL_QWEN4_FUSED_ALIGNED_PREFIX", "0"),
                 ("VMODEL_QWEN4_COMPLETED_HISTORY_SHADOW", "0"),
+                ("VMODEL_QWEN4_PREFILL_SDPA_QUERY_TILE", "0"),
             )
         )
         dspark_request_identity = tuple(
@@ -3615,6 +3616,12 @@ class EngineManager:
                     raise RequestValidationError(
                         "VMODEL_QWEN4_FUSED_ALIGNED_PREFIX must be 0 or 1")
                 rc.qwen4_fused_aligned_prefix = qwen4_request_identity[38] == "1"
+                from .qwen4_sdpa_tiling import parse_prefill_query_tile
+                try:
+                    rc.qwen4_prefill_sdpa_query_tile = parse_prefill_query_tile(
+                        qwen4_request_identity[40])
+                except ValueError as error:
+                    raise RequestValidationError(str(error)) from error
                 if qwen4_request_identity[23] not in ("0", "1"):
                     raise RequestValidationError(
                         "VMODEL_QWEN4_PHASE_LM_HEAD must be 0 or 1")
@@ -10520,6 +10527,12 @@ def _vision_protocol_timing(result: dict) -> dict:
         "qwen4_host_spool_expert_tile_eval_syncs",
         "qwen4_host_spool_expert_tile_eval_groups",
         "qwen4_host_spool_fast_tier_decode_only",
+        "qwen4_host_spool_sdpa_query_tile",
+        "qwen4_host_spool_sdpa_calls",
+        "qwen4_host_spool_sdpa_split_calls",
+        "qwen4_host_spool_sdpa_query_tiles",
+        "qwen4_host_spool_sdpa_max_query_rows",
+        "qwen4_host_spool_sdpa_max_key_positions",
         "qwen4_ple_read_calls",
         "qwen4_ple_read_extents",
         "qwen4_ple_rows_requested",

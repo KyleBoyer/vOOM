@@ -1,0 +1,8 @@
+schema: voom.runtime-profile.v1
+name: qwen4-prefill-sdpa-query256
+description: Explicit query-only SDPA tiling in Qwen4 host-spooled prefill.
+notes:
+  - "Default-off experiment. Full KV/mask, projections, QSA ranking and existing host/expert tiles remain unchanged. Outputs are evaluated per query tile. No decode/MTP tiling."
+  - "Separate engine and persisted-KV identities. A synthetic SDPA component gate is bit-exact, but actual QSA/state, completed-answer and pressure gates remain required; no default or speed promotion."
+settings:
+  VMODEL_QWEN4_PREFILL_SDPA_QUERY_TILE: 256

@@ -126,6 +126,7 @@ def test_actual_tile_hook_runs_after_attention_eval_and_before_route_or_overwrit
             return captured
     source = object()
     execute([tile], dict(prefix_capture=Capture(), kv=source, i=4, pos=0, end=1024,
+                         phase_memory=None,
                          spool_peak_host_bytes=123,
                          note_spool=lambda *a, **kw: events.append(("sample", a, kw))))
     assert events[0] == ("observe", source, dict(layer=4, start=0, end=1024))

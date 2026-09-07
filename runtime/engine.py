@@ -979,6 +979,9 @@ class RuntimeConfig:
     # Raw released-BF16 QSA keys remain authoritative; trims invalidate the
     # derived cache. Default-off pending real long-context equality/timing.
     qwen4_qsa_pool_cache: bool = False
+    # Explicit query-only SDPA tiling inside Qwen4's host-spooled prefill.
+    # Zero preserves the original operation. Decode/MTP paths are unchanged.
+    qwen4_prefill_sdpa_query_tile: int = 0
     # Opt-in request-local attribution. "" disables it; "layers" records the
     # runtime's existing materialization boundaries; "ops" adds diagnostic
     # attention/router/MLP barriers for supported Qwen/Kimi/GLM hybrid blocks.
@@ -1575,6 +1578,7 @@ class RuntimeConfig:
             qwen4_hot_kv_tile_aligned=run.get("qwen4_hot_kv_tile_aligned", False),
             qwen4_compact_retained_conv=run.get("qwen4_compact_retained_conv", False),
             qwen4_fused_aligned_prefix=run.get("qwen4_fused_aligned_prefix", False),
+            qwen4_prefill_sdpa_query_tile=run.get("qwen4_prefill_sdpa_query_tile", 0),
             execution_profile=run.get("execution_profile", ""),
             native_ct_mxfp4=run.get("native_ct_mxfp4", False),
             kimi_k3_scale_sidecar_dir=run.get(
@@ -1918,6 +1922,9 @@ class StreamingEngine:
     def __init__(self, model_dir: str | Path, rc: RuntimeConfig | None = None):
         self.rc = rc or RuntimeConfig()
         from .predictor import make_expert_predictor, validate_transition_tracking
+        from .qwen4_sdpa_tiling import validate_prefill_query_tile
+
+        validate_prefill_query_tile(self.rc.qwen4_prefill_sdpa_query_tile)
 
         # Refuse conflicting consumers before any cache mutation/model I/O.
         validate_transition_tracking(
@@ -7158,6 +7165,7 @@ class StreamingEngine:
         spool_copy_s = 0.0
         spool_peak_host_bytes = 0
         spool_samples = 0
+        sdpa_stats = {}
         spool_expert_row_gathers = 0
         spool_expert_rows_uploaded = 0
         spool_expert_batch_tile_gathers = 0
@@ -7323,7 +7331,9 @@ class StreamingEngine:
                     compiled_delta_prefill=(
                         self.rc.qwen_compiled_delta_prefill),
                     native_fused_delta_prefill=(
-                        self.rc.qwen_native_fused_delta_prefill))
+                        self.rc.qwen_native_fused_delta_prefill),
+                    sdpa_query_tile=self.rc.qwen4_prefill_sdpa_query_tile,
+                    sdpa_stats=sdpa_stats)
                 if phase_memory is not None:
                     phase_memory.record(self, mx, phase="attention_branch_returned",
                                         layer_marker=i, completed_tokens=end)
@@ -7626,6 +7636,9 @@ class StreamingEngine:
             "peak_host_bytes": spool_peak_host_bytes,
             "memory_samples": spool_samples,
             "activation_dtype": str(activation_dtype),
+            "sdpa_query_tile": self.rc.qwen4_prefill_sdpa_query_tile,
+            **{f"sdpa_{name}": sdpa_stats.get(name, 0) for name in (
+                "calls", "split_calls", "query_tiles", "max_query_rows", "max_key_positions")},
             "global_expert_rows": int(self.rc.qwen4_global_expert_rows),
             "expert_row_gathers": spool_expert_row_gathers,
             "expert_rows_uploaded": spool_expert_rows_uploaded,
@@ -11023,6 +11036,7 @@ class StreamingEngine:
         call repeatedly."""
         if not hasattr(self, "_kv_fp"):
             from .kv_store import model_fingerprint
+            from .qwen4_sdpa_tiling import prefill_query_tile_identity
 
             quant = _quantization_cache_identity(self.rc, self.store)
             scale_sidecar = getattr(self.store, "k3_scale_sidecar", None)
@@ -11074,6 +11088,7 @@ class StreamingEngine:
                 f"qwencompileddelta{int(self.rc.qwen_compiled_delta_prefill)}"
                 f"qwennativeprefill{int(self.rc.qwen_native_fused_delta_prefill)}"
                 f"qwenchunkeddelta{int(self.rc.qwen_chunked_delta_prefill)}"
+                f"{prefill_query_tile_identity(self.rc.qwen4_prefill_sdpa_query_tile)}"
                 f"qwenserialbatchmlp{int(
                     self.rc.qwen35_serial_verify_batched_mlp)}"
                 f"qwenpagedonline{int(

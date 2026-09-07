@@ -121,9 +121,9 @@ def test_actual_attention_capture_brackets_preserve_operation_order(enabled, cap
         observe_tile=lambda *a, **k: events.append('capture') or capture_result)
     ns = dict(time=time, phase_started=0, spool_phase_seconds={'attention': 0},
         source=None, w=None, prefix='model.layers.0', kv=None, i=0, pos=12,
-        end=16, offset=0, spool_peak_host_bytes=0, phase_memory=phase, prefix_capture=capture,
+        end=16, offset=0, spool_peak_host_bytes=0, phase_memory=phase, prefix_capture=capture, sdpa_stats={},
         self=SimpleNamespace(cfg=None, rc=SimpleNamespace(qwen_compiled_delta_prefill=False,
-            qwen_native_fused_delta_prefill=False)),
+            qwen_native_fused_delta_prefill=False,qwen4_prefill_sdpa_query_tile=0)),
         mx=SimpleNamespace(eval=lambda *a: events.append('eval')),
         hyper_connection_mix=lambda *a: events.append('mix') or (1, 2, 3),
         qwen4_attention_branch=lambda *a, **k: events.append('branch') or 4,
@@ -250,16 +250,26 @@ def test_actual_factory_default_off_and_lazy(monkeypatch, flag):
     assert len(calls) == int(flag == '1')
 
 
-def test_observer_stripped_sweep_retains_exact_preexisting_operation_tree():
+def test_observer_and_disabled_candidate_stripped_sweep_retains_preexisting_operations():
     class StripObserver(ast.NodeTransformer):
         def visit_Import(self, node):
             return None if any(a.asname == '_phase_os' for a in node.names) else node
         def visit_Assign(self, node):
-            return None if any(isinstance(t, ast.Name) and t.id == 'phase_memory' for t in node.targets) else self.generic_visit(node)
+            return None if any(isinstance(t, ast.Name) and t.id in ('phase_memory','sdpa_stats') for t in node.targets) else self.generic_visit(node)
         def visit_If(self, node):
             return None if any(isinstance(n, ast.Name) and n.id in ('phase_memory', '_phase_os') for n in ast.walk(node.test)) else self.generic_visit(node)
+        def visit_Call(self, node):
+            if isinstance(node.func, ast.Name) and node.func.id == 'qwen4_attention_branch':
+                node.keywords = [k for k in node.keywords if k.arg not in ('sdpa_query_tile','sdpa_stats')]
+            return self.generic_visit(node)
+        def visit_Dict(self, node):
+            pairs = [(k,v) for k,v in zip(node.keys,node.values) if not (
+                isinstance(k,ast.Constant) and k.value=='sdpa_query_tile'
+                or k is None and any(isinstance(n,ast.Name) and n.id=='sdpa_stats' for n in ast.walk(v)))]
+            node.keys=[k for k,v in pairs];node.values=[v for k,v in pairs]
+            return self.generic_visit(node)
     fn = StripObserver().visit(source_method())
     digest = hashlib.sha256(ast.dump(fn, include_attributes=False).encode()).hexdigest()
-    # Method on e873ead, before observer-only edits: no altered model operations,
-    # tile boundaries, traversal, eval/clear/reset, routing or scheduling calls.
+    # Method on e873ead: strip only diagnostics and the explicit SDPA candidate's
+    # two OFF-default arguments/counters. The default branch is separately tested.
     assert digest == '904de4d986118add7b47d82ee2a8e368abcb41dc93a7b9e984df832e77bc5823'

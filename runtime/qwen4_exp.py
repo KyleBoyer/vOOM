@@ -379,6 +379,7 @@ def _qsa_attention(
     layer: int,
     offset: int,
     state: Qwen4ExpStateCache,
+    *, sdpa_query_tile: int = 0, sdpa_stats=None,
 ) -> mx.array:
     batch, length, _ = hidden.shape
     heads, kv_heads, dim = (
@@ -408,8 +409,14 @@ def _qsa_attention(
             if length > 1 else None)
     else:
         mask = mx.where(qsa_mask, 0.0, -mx.inf).astype(query.dtype)
-    attended = mx.fast.scaled_dot_product_attention(
-        query, keys, values, scale=dim ** -0.5, mask=mask)
+    if sdpa_query_tile:
+        from .qwen4_sdpa_tiling import query_tiled_sdpa
+        attended = query_tiled_sdpa(
+            mx, query, keys, values, scale=dim ** -0.5, mask=mask,
+            tile_queries=sdpa_query_tile, stats=sdpa_stats)
+    else:
+        attended = mx.fast.scaled_dot_product_attention(
+            query, keys, values, scale=dim ** -0.5, mask=mask)
     attended = attended.transpose(0, 2, 1, 3).reshape(
         batch, length, heads * dim)
     attended = attended * mx.sigmoid(output_gate)
@@ -427,6 +434,7 @@ def qwen4_attention_branch(
     *,
     compiled_delta_prefill: bool = False,
     native_fused_delta_prefill: bool = False,
+    sdpa_query_tile: int = 0, sdpa_stats=None,
 ) -> mx.array:
     layer_type = cfg.layer_types[layer]
     if layer_type == "linear_attention":
@@ -440,7 +448,8 @@ def qwen4_attention_branch(
         if not isinstance(state, Qwen4ExpStateCache):
             raise ValueError("Qwen4 QSA layer is missing auxiliary state")
         return _qsa_attention(
-            hidden, weights, prefix, cfg, kv, layer, offset, state)
+            hidden, weights, prefix, cfg, kv, layer, offset, state,
+            sdpa_query_tile=sdpa_query_tile, sdpa_stats=sdpa_stats)
     raise ValueError(f"unsupported Qwen4 layer type {layer_type!r}")
 
 

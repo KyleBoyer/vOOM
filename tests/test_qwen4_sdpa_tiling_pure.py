@@ -29,21 +29,27 @@ class Array:
         self.shape, self.label, self.events, self.dtype = shape, label, events, dtype
         self.ndim = len(shape)
     def __getitem__(self, index):
+        if len(index)==2:
+            a,b=index[0].start,index[0].stop
+            self.events.append(('slice',self.label,a,b))
+            return Array((b-a,self.shape[-1]),self.label,self.events,self.dtype)
         a, b = index[2].start, index[2].stop
         self.events.append(('slice', self.label, a, b))
         return Array((*self.shape[:2], b-a, self.shape[3]), self.label, self.events, self.dtype)
 
 
-@pytest.mark.parametrize('mask_kind', ['none', 'broadcast', 'full'])
+@pytest.mark.parametrize('mask_kind', ['none', 'broadcast', 'full','causal2d','broadcast2d'])
 def test_actual_helper_shares_full_kv_and_evaluates_each_chunk_before_next(mask_kind):
     events = []
     q = Array((1,24,257,256), 'query', events)
     k = Array((1,2,1024,256), 'keys', events)
     v = Array((1,2,1024,256), 'values', events)
     mask = None if mask_kind == 'none' else Array((1,1,1 if mask_kind=='broadcast' else 257,1024), 'mask', events)
+    if mask_kind.endswith('2d'):
+        mask=Array((1 if mask_kind=='broadcast2d' else 257,1024),'mask',events)
     def sdpa(query, keys, values, **kwargs):
         assert keys is k and values is v and kwargs['scale'] == 0.0625
-        if mask_kind != 'full': assert kwargs['mask'] is mask
+        if mask_kind not in ('full','causal2d'): assert kwargs['mask'] is mask
         events.append(('sdpa', query.shape[2]))
         return query
     mx = SimpleNamespace(bfloat16='bf16', float16='fp16', fast=SimpleNamespace(scaled_dot_product_attention=sdpa),
