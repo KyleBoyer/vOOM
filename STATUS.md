@@ -1,5 +1,59 @@
 # STATUS — 2026-09-07 (current corrections first; dated chronology below is history)
 
+## 2026-09-07 UTC: Darwin allocator-pressure relief is a measured no-op; do not promote
+
+Four bounded64/256MiB FP16/BF16 host-copy trials keep the full GPU weight alive
+through a1s idle control and one `malloc_zone_pressure_relief(NULL, goal)` call.
+Each also calls the API while the host object is still live as a negative control.
+All EIGHT calls report **0B released**. Large malloc mapping/resident-page counts
+are unchanged by each post-idle call:67,108,864B/4096pages in64MiB trials and
+335,544,320B/20480pages after both allocation sizes have been exercised. No
+reclamation benefit versus idle, no serving-speed result, no new runtime policy.
+
+Post-idle native calls take1.959..4.000microseconds (single samples, not a robust
+throughput benchmark). Native footprint sometimes changes by about42MB during
+idle or observation, but without a malloc mapping/page reduction or nonzero API
+return; that is NOT credited as API reclamation. Source NumPy weakrefs are dead
+before idle. The retained native host-page owner remains unidentified: this
+negative rules out this tested relief call as a fix, not every host-allocator
+strategy. No effective reclamation occurred, so byte equality here is not proof
+of safety for a future implementation that actually releases cached pages.
+
+Every host/complete-weight SHA-256, repeated matvec-output hash, all65536 FP16/BF16
+bit-pattern and FP32-state sentinel, and global MLX RNG check passes. Full large
+weight bytes are hashed, not sampled. All output rows equal4096. Cache limit0 is
+fixture-only/restored; GPU owners remain live across controls, no hidden GC/cache
+clear/synchronization there. No model, prompt, tool, Plex, or checkpoint evaluation.
+
+The installed SDK compile-time oracle verifies the exact size_t(pointer,size_t)
+ABI, both8-byte widths. Header SHA
+b86fab47ff11f522c1495469969c093fe63bb0dfec5376f37d4b72ebb75fa121;
+oraclef4273a9edbc83500cddd482b3438160da0026beab0f7960197dbb1e2afe837ab.
+[Apple's public contract](https://github.com/apple-oss-distributions/libmalloc/blob/main/include/malloc/malloc.h)
+defines a best-effort goal, not a hard byte/work/time limit; NULL selects this
+process's zones. No named live pointer, zone destruction, global system pressure,
+wiring changes or production activation is used.
+
+848 selected pure regressions PASS13.15s, including20 new goal/return/order/error
+and C-source-escaping checks. Fresh30s preflightPASS, available7.242GB/root16.243GB,
+zero preflight growth/churn; fast tier62.512GB. Supervised diagnosticPASS/exit0/
+8.5030s, child6.2011s including four idle controls and full-byte hashing;
+17:54:58.619861->17:55:07.122847UTC. MLX0.32.0/NumPy2.5.0, trueMetal268,775,432B,
+minimum sampled available6,725,369,856B, swap-used growth0, actual swap-out32,768B
+(within16MB, NOT zero). Native coverage complete/process compression zero. Source
+2b45236 plus two manifest-pinned fixture/test files; all735 source/result/log
+hashes and parent/child disappearance verified BEFORE edits. No drift, timeout,
+signal or missing result. Private logs/malloc_pressure_relief_20260907.json SHA
+90f3f72b3d9dd4cd62c02abe2a1cdff5f96fd456aac19e38f8eb6b8f19d9eeec;
+logcdad804e49ec70e44f9c438e137457196f2d2e67bffc7b521914669720fce1b4.
+
+Next: instrument actual server/model setup boundaries to locate the previously
+observed2.7GB pre-generation host footprint (or inspect live owning-zone stats),
+before another full expensive replay. Do not add this no-op relief call, extra
+copies, sleeps, stream markers or the rejected synchronize/clear fix to serving.
+No model job remains. Full134 Plex55.69min/56FAIL, modified131-tool first response
+911.6881s/pressureFAIL, varied domains, large contexts and sub90 remain OPEN.
+
 ## 2026-09-07 UTC: bounded Metal lifetime probe distinguishes delayed retirement from retained host pages
 
 Eight synthetic256MiB allocation/matvec cases PASS: FP16/BF16, GPU-created versus
