@@ -48,6 +48,14 @@ def test_sdk_v2_layout():
     assert region.RegionInfo64.object_id_full.offset == 68
 
 
+def test_accelerator_tag_is_named_without_relabeling_unknowns(native):
+    native[0].append({'info': {'user_tag': 100, 'pages_swapped_out': 17}})
+    r = region.sample_self_regions()
+    assert r['groups'][0]['tag_label'] == 'IOACCELERATOR'
+    assert r['groups'][0]['pages_swapped_out'] == 17
+    assert not r['swapped_out_pages_are_disk_io']
+
+
 def test_leaf_groups_preserve_unknown_tags_and_large_sums(native):
     rows, calls = native
     rows.extend([{"size": 1 << 40, "info": {"user_tag": 3, "pages_resident": 10}},

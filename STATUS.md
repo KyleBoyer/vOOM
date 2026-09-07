@@ -1,5 +1,87 @@
 # STATUS — 2026-09-07 (current corrections first; dated chronology below is history)
 
+## 2026-09-07 UTC: live native-region diagnostic completes; accelerator mappings dominate reported compressed-page counts
+
+Source01b52a7, installed uncensored QwenFP8 fused/aligned hot cache with generation
+and process-memory witnesses. Original131 workspace tools, all initial history
+and streaming retained; explicit model/max1024/temp0/seed64013 overrides. With
+those overrides and two added native boundary observations, cold HTTP wall is
+**911.6881s** for ONE naturally completed first model response, not the complete
+agent conversation, live tool execution, Plex intelligence or untouched wire.
+40,432 uncached input /49 actual output tokens; stop=grammar, HTTP200/completed.
+TTFT676.7591s, prefill676.7575s, decode220.0475s, engine896.8163s. No speed win
+versus earlier uninstrumented fused899.3414s; not a same-manifest causal A/B.
+
+All nine identity/equivalence checks PASS: raw49-ID/text/prepared-ID witnesses,
+protocol output and canonical function call match the earlier capture result;
+full catalog, expected digest and effective-wire identity preserved. One
+mastra_workspace_execute_command with command=whoami subset match, zero duplicate/
+parse failures, stream/final equality, no retry. This is finite greedy equivalence
+on the installed FP8 target, NOT full-state or official-Qwen-BF16 equivalence.
+Native accepted28/62 over21 target sweeps. Logical prefill/decode store bytes
+128900497040/314306054856B, total443206551896B, NOT physical NVMe reads.
+
+Overall FAIL: two distinct request-level pressure checks, recorded with redundant
+client/wrapper failure labels. Swap-used+73,531,392B and actual swap-out+811,171,840B
+exceed16MB. HTTP-end available5,422,596,096B passes5.3GB, but immediate engine-return
+available4,103,536,640B and periodic minimum2,699,608,064B do not establish an
+uninterrupted pressure pass. True Metal peak6,429,012,616B satisfies8.5GB. Governor
+reduces cache budget to64MB; no gate is weakened. All447 native timeline samples
+available, no malformed/capped trace. Observed max footprint10,126,316,440B,
+compressed ledger3,676,585,984B; kernel compressed peak3,684,122,624B. End ledger
+3,104,964,608B and footprint6,996,627,992B. Lifetime compressed credit reaches
+50,881,593,344B in the boundary snapshot, not disk-swap traffic.
+
+Both native map walks have COMPLETE coverage: before2282 leaf regions/2291 calls,
+after2931/2940, eight submaps each. Scan33.140/47.510ms; complete observations
+33.284/47.949ms, included in HTTP wall. Endpoint LOGICAL1,236,776,448B at40480;
+distinct retained39936-prefix LOGICAL1,221,709,824B. No state payload reads,
+disposal, synchronization, clearance, or proof that these sizes are unique RAM.
+
+The largest reported mapping class is SDK tag100, **IOACCELERATOR** (original
+receipt says UNKNOWN; its numeric tag is preserved). Of264,883 summed mapping
+pages_swapped_out, tag100 contributes143,906 (54.3%); named malloc tags55,904
+(21.1%); tag0 contributes65,033 (24.6%). Tag100 mapped extent sum3,766,091,776B.
+These overlapping mapping/page counters include compressor-backed pages and
+are NOT unique physical compression storage or per-process disk I/O. They narrow
+the next investigation to accelerator resource lifetimes plus remaining host
+owners, but do not identify a leaking tensor or assign exclusive latency cause.
+[Apple's tag definition](https://github.com/apple-oss-distributions/xnu/blob/main/osfmk/mach/vm_statistics.h)
+is verified against the installed SDK. New label metadata names100 for future
+receipts; old artifacts are unchanged. No runtime operation/default changes.
+
+Existing idle-head witness is instructive: it drops1,271,398,400 active Metal
+bytes in4.081ms, yet immediate native footprint declines only62,652,416B and
+compressed ledger remains unchanged. This is NOT proof that the entire head was
+physically freed, nor proof of a leak. Before generation the process already has
+2,744,126,440B footprint with only13,140,000B Metal active and no endpoint/slot.
+Next: a bounded Metal-resource lifetime/retirement experiment and setup-host-owner
+audit before another expensive full replay. Do not repeat the already-negative
+default-stream synchronize/clear-cache fix or add blind host copies. Native
+post-protocol observations may distinguish delayed release from steady retention.
+
+Parent exit1/913.8686s,16:36:51.377460->16:52:05.245996UTC; wrapper912.2852s,
+normal managed server SIGTERM(-15), no parent timeout/signal/source drift/missing
+result. All731 source hashes plus combined/client/diagnostic/server/parent log
+hashes verified BEFORE edits; all gate/driver/server/client PIDs gone. Root/external
+minima16.247/100.698GB, child-tree RSS max5.099GB. Private same-base
+logs/qwen4_full131_region_diagnostic_20260907.json SHA
+7e29eb7e868b067c56bcccf39c1cd727f41cfd20b6b9f513b2e07e2344b240db;
+parent758953178f5ddd0d38bc5d170424a6587cd781d94c8b2a02daf48cbfd174ceaf;
+client36a3246f7c41f117a6634c4841ab70c30659f83f28ebb800cc327719b7b3826f;
+regions2e1f8f30d6ebb1655841e0ab4a2385b7df55910601cac8c82176e93d6581f683;
+server148a6cc946a25c2d036b1fc4beb462d219fc43a65c6da53d67ba9ec84378973f;
+post-hoc .analysis.json SHA08e3d02fd13475aba84d6546d2762a981271199165830ff42d7d7c0f1af65d1c.
+
+805 selected pure regressions pass13.36s. Metadata-only tag-label SDK gatePASS/
+exit0/2.4577s, all731 sources/result/log verified before receipts; all13 tags and
+unchanged21offsets/76B/count19 match,16MiB malloc still observed exactly.
+logs/process_region_ioaccelerator_20260907.json SHA
+25af82d0eea32e5678a0f65eda0afe0e1f2e7c9561033f135ea69e0e53d46d2d;
+log862f19567201ef9a1ad6ab3d7f3c0b8be747a2ac38192e0fd53ce3ee527f3600.
+No model job remains. Full134 Plex55.69min/56FAIL, varied-domain acceptance,
+large-context ladder and sub90 goals remain OPEN.
+
 ## 2026-09-07 UTC: native allocation-class reader verified; bounded live diagnostic next
 
 New explicitly invoked `process_region_witness.sample_self_regions()` walks this
