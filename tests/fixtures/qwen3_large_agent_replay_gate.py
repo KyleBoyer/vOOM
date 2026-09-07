@@ -556,7 +556,8 @@ def _post(
         score_plex_profile: bool = False,
         print_progress: bool = False,
         fail_on_memory_retry: bool = False,
-        expected_function_call_name: str | None = None) -> dict:
+        expected_function_call_name: str | None = None,
+        response_observer=None) -> dict:
     request = urllib.request.Request(
         url, data=payload, headers={"Content-Type": "application/json"},
         method="POST")
@@ -704,6 +705,8 @@ def _post(
                 (len(delta.encode("utf-8")) for delta in deltas), default=0),
             "prefill_progress": progress,
         }
+    if response_observer is not None:
+        response_observer(response_value)
     return _summary(
         response_value, wall_s=time.perf_counter() - started,
         events=events, progress=progress, deltas=deltas,

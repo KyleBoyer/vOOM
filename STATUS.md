@@ -1,5 +1,80 @@
 # STATUS — 2026-09-07 (current corrections first; dated chronology below is history)
 
+## 2026-09-07 UTC: GLM Flash two captured shapes preserve complete outputs; pressure/latency not promoted
+
+Bounded same741-source-manifest ON/OFF test of expert-transition-tracking on the
+installed GLM-5.3-Flash canonical native-MTP3/direct-QMV-decode-only profile,
+with generation/process-memory witnesses. Two SMALL captured requests retain
+their original input, full respective tool catalogs (1/0), streaming (true/
+omitted), system-role structure and reasoning fields. Only model/max1024/temp0/
+seed64013 change. Weather:170 uncached input/25 actual output tokens; title:
+88 uncached input/7 output. Both naturally complete in BOTH arms, no truncation,
+retries, duplicate calls or parse failures. Weather emits exactly one get_weather
+with {city: Tokyo}; title obeys the <=4-word/plain-text/topic checks. Tools are
+NOT executed. These are captured short functional checks, not a real full131/134
+agent call, live weather, Plex score, broad intelligence or large-context proof.
+
+All32 generated token IDs, raw text, prepared IDs, protocol output and canonical
+calls are byte-identical ON versus OFF. Checker/reference responses are never
+inserted into prompts. Selected tools1/1 and0/0, same effective wire hashes,
+profile identities, finite generation witnesses and independent replay of the
+four private terminal responses all verify. The second request has a warm engine
+but a different uncached prefix, not a warm exact-cache timing. Default stays ON.
+
+| Captured request | HTTP ON / OFF (s) | Prefill ON / OFF (s) | Decode ON / OFF (s) |
+|---|---:|---:|---:|
+| Weather tool, streaming, 170in/25out | 329.3144 /425.0462 | 151.1630 /152.3881 | 172.8312 /269.6848 |
+| Short title, non-streaming, 88in/7out | 154.6873 /159.1061 | 115.1308 /119.2716 | 39.4853 /39.7440 |
+
+Engine-reported first-token times ON/OFF:151.1738/152.3990s weather,
+115.1440/119.2858s title; these are not client-observed first SSE events.
+
+No speed win. Both pressure gates FAIL. Whole-arm actual swap-out35,913,728B
+ON versus855,867,392B OFF; net usedswap0 versus36,634,624B. Periodic minimum
+available4,237,869,056/4,761,419,776B; native peak footprint5,280,124,888/
+4,529,327,824B and observed compressed peak1,912,094,720/1,466,630,144B.
+All239/290 native observations available. TrueMetal peaks per request ON
+3,062,956,672/3,091,915,912B, OFF2,758,603,336/3,081,994,144B, all below8.5GB.
+OFF weather cache budget shrinks1.5GB ->150MB under the unchanged governor;
+its decode logical reads rise365,362,587,208 ->391,334,285,840B. Whole-request
+logical reads weather604,397,354,816/630,369,053,448B, title261,039,858,872/
+263,582,174,032B. These are store accounting, NOT measured physical NVMe traffic.
+
+The slower OFF arm is NOT an isolated causal regression of the opt-out: initial
+preflight available6.690/8.821GB differs, OS caches were not purged, and a NEW
+Tdarr/ffmpeg workload began after OFF admission. Read-only19:47:35.883344UTC
+snapshot finds ffmpeg91723 (started19:44:10.545321UTC) under Tdarr with two open
+files on Plex NAS, not Workspace. No user process was changed/stopped. This
+records concurrent host activity, not attribution of system swap to that process.
+Background artifact SHA1ba82ceba809fd8b0203d3ffe34acafe275a60c0a29975314fbb2ad87616aa83.
+Keep finite-token/functional evidence; reject these timings for speed promotion.
+
+Fresh30s preflightPASS before EACH arm, zero growth/churn; root>=16.213GB and
+fasttier62.512GB. Parent exits1/1 are recorded pressure failures, not crashes:
+486.2844s (19:32:04.322889->19:40:10.607285UTC),586.3098s
+(19:41:36.190678->19:51:22.500493UTC). Both servers normal managed SIGTERM(-15),
+all model/gate PIDs gone. All741 source/result/server/log/four response hashes,
+same-manifest identity and immutable reference SHA verified BEFORE post-run
+fixture guard/docs edits; no timeout, parent signal, drift or missing result.
+Saved58,550,789B history SHA09a47d8847cfad69e380e8167359df0e86d0f74f11c4751e3af9002db59c7c2f
+unchanged before/after BOTH arms.934 selected pure tests passed before the pair;
+a post-run pure-tested guard additionally binds fixture streaming expectations
+to the captured transport, preventing future omission of the stream equality check.
+Final selected pure suite:935 PASS13.84s, including38 new captured-gate checks.
+
+Private logs/glm53_flash_tracking_{on,off}_captured_shapes_20260907.json SHA
+356902830452ed1f14e5be1f8643142462af08e5e60c5c9a42b5597dc156f483 /
+2bebb5e315580c78d39ca94c512423aaf85e638f3e671bca9c7cddb287500595;
+server logs07f560bdd12d5f56eed2d1db8c7f8a3d4b45d15e9d8284420587fd04b9fb1717 /
+ab2a1b031267bf353cffcc2b3a75aa008da9750c262439a74179b69aa79cb0d6;
+parent logs8d62fc001dd7d27bc2fe0fb5c8f06f20d2ab439fe1b4d7adc15eee642287056a /
+b44716698416ce3a3214082240684978ce2cff1815697c44352e9a5c462c207f.
+Next: wait for a quiet host before more timing gates; preserve Plex/Tdarr. Advance
+remaining phase-memory ownership or held-out retrieval without answer leakage,
+not another unqualified same-request speed loop. No model job remains. Qwen full131
+latest867.9482s/pressureFAIL; full134 Plex56FAIL, full GLM completed-answer,
+heterogeneous full traffic, context ladder and sub90 goals remain OPEN.
+
 ## 2026-09-07 UTC: tracking opt-out completes full131 with exact49-token match; pressure still fails
 
 Source2ecaec6, installed uncensored Qwen3.8-Flash-Next FP8 with the explicit
