@@ -7140,7 +7140,8 @@ class StreamingEngine:
             from .prefill_phase_memory_witness import PrefillPhaseMemoryObserver
             phase_memory = PrefillPhaseMemoryObserver(
                 total_tokens=total, total_layers=self.cfg.num_hidden_layers,
-                tile_width=tile_width)
+                tile_width=tile_width, prefix_capture_enabled=prefix_capture is not None,
+                capture_tokens=prefix_capture.prefix_tokens if prefix_capture is not None else None)
         input_ids = tuple(getattr(self, "_qwen4_input_ids", ()))
         if len(input_ids) != total:
             raise ValueError(
@@ -7314,20 +7315,32 @@ class StreamingEngine:
                 mixed, hyper_input, injection = hyper_connection_mix(
                     source, w, f"{prefix}.attn_hyper_connection", self.cfg)
                 mx.eval(mixed, injection)
+                if phase_memory is not None:
+                    phase_memory.record(self, mx, phase="attention_inputs_ready",
+                                        layer_marker=i, completed_tokens=end)
                 branch = qwen4_attention_branch(
                     mixed, w, prefix, self.cfg, kv, i, offset + pos,
                     compiled_delta_prefill=(
                         self.rc.qwen_compiled_delta_prefill),
                     native_fused_delta_prefill=(
                         self.rc.qwen_native_fused_delta_prefill))
+                if phase_memory is not None:
+                    phase_memory.record(self, mx, phase="attention_branch_returned",
+                                        layer_marker=i, completed_tokens=end)
                 post_attention = hyper_connection_inject(
                     branch, hyper_input, injection)
                 mx.eval(post_attention)
+                if phase_memory is not None:
+                    phase_memory.record(self, mx, phase="attention_evaluated",
+                                        layer_marker=i, completed_tokens=end)
                 spool_phase_seconds["attention"] += (
                     time.perf_counter() - phase_started)
                 if prefix_capture is not None:
                     captured = prefix_capture.observe_tile(
                         kv, layer=i, start=pos, end=end)
+                    if phase_memory is not None:
+                        phase_memory.record(self, mx, phase="prefix_observed",
+                                            layer_marker=i, completed_tokens=end)
                     if captured:
                         note_spool(
                             "retained_prefix", layer=i, completed_tokens=end,

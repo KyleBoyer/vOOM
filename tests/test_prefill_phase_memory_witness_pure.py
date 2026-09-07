@@ -4,6 +4,7 @@ import ast
 import copy
 import hashlib
 import json
+import time
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -35,6 +36,8 @@ def observer(**kwargs):
 
 def complete(value):
     for phase, layer, tokens in [('initial_hidden', 0, 16), ('layer_enter', 0, 0),
+        ('attention_inputs_ready', 0, 16), ('attention_branch_returned', 0, 16),
+        ('attention_evaluated', 0, 16),
         ('attention_tile', 0, 16), ('expert_batch', 0, 16), ('output_tile', 0, 16),
         ('layer_complete', 1, 16), ('layer_released', 0, 16)]:
         value.record(None, None, phase=phase, layer_marker=layer, completed_tokens=tokens)
@@ -45,25 +48,102 @@ def test_complete_boundary_coverage_and_no_retained_engine_reference():
     value, rows = observer()
     complete(value)
     assert rows[-1]['coverage_complete'] and rows[-1]['missing_required_boundaries'] == 0
-    assert rows[-1]['samples'] == 7 and len(rows) == 8
-    assert [r['sample_index'] for r in rows[:-1]] == list(range(1, 8))
+    assert rows[-1]['schema'] == 'voom.prefill-phase-memory-end.v2'
+    assert rows[-1]['samples'] == 10 and len(rows) == 11
+    assert [r['sample_index'] for r in rows[:-1]] == list(range(1, 11))
     assert not rows[-1]['synchronizes_device'] and not rows[-1]['clears_allocator_cache']
     assert 'target' not in value.__dict__ and 'metal' not in value.__dict__
     json.dumps(rows, allow_nan=False)
     value.finish(); value.record(None, None, phase='layer_enter', layer_marker=0)
-    assert len(rows) == 8
+    assert len(rows) == 11
 
 
 def test_partial_trace_cannot_claim_complete_coverage():
     value, rows = observer()
     value.record(None, None, phase='initial_hidden', layer_marker=0, completed_tokens=16)
     value.finish()
-    assert not rows[-1]['coverage_complete'] and rows[-1]['missing_required_boundaries'] == 6
+    assert not rows[-1]['coverage_complete'] and rows[-1]['missing_required_boundaries'] == 9
+
+
+@pytest.mark.parametrize('captured', [False, True])
+def test_capture_boundary_is_required_only_when_capture_exists(captured):
+    value, rows = observer(prefix_capture_enabled=True, capture_tokens=12)
+    if captured:
+        value.record(None, None, phase='prefix_observed', layer_marker=0, completed_tokens=16)
+        for phase in witness.BRACKET_PHASES:
+            value.record(None, None, phase=phase, layer_marker=0, completed_tokens=12)
+    complete(value)
+    assert rows[-1]['prefix_capture_enabled'] is True
+    assert rows[-1]['coverage_complete'] is captured
+    assert rows[-1]['missing_required_boundaries'] == 5 * int(not captured)
+
+
+def test_capture_tile_is_observed_even_when_not_first_or_final():
+    value, rows = observer(prefix_capture_enabled=True, capture_tokens=12)
+    for end in (4, 8, 12, 16):
+        for phase in sorted(witness.BRACKET_PHASES):
+            value.record(None, None, phase=phase, layer_marker=0, completed_tokens=end)
+    assert len(rows) == 12
+    assert {r['completed_tokens'] for r in rows} == {4, 12, 16}
+
+
+@pytest.mark.parametrize('enabled,tokens', [(False, 12), (True, None), (True, True),
+    (True, 0), (True, 16), (True, 11), (True, -4)])
+def test_invalid_capture_boundary_fails_closed(enabled, tokens):
+    with pytest.raises(ValueError):
+        observer(prefix_capture_enabled=enabled, capture_tokens=tokens)
+
+
+@pytest.mark.parametrize('phase', sorted(witness.TILE_PHASES))
+def test_each_tile_bracket_samples_only_first_and_final_tiles(phase):
+    value, rows = observer()
+    for end in (4, 8, 12, 16):
+        value.record(None, None, phase=phase, layer_marker=0, completed_tokens=end)
+    assert [r['completed_tokens'] for r in rows] == [4, 16]
+
+
+@pytest.mark.parametrize('enabled', [False, True])
+@pytest.mark.parametrize('capture_result', [None, False, True])
+def test_actual_attention_capture_brackets_preserve_operation_order(enabled, capture_result):
+    method = source_method()
+    loop = next(n for n in ast.walk(method) if isinstance(n, ast.For)
+                and isinstance(n.target, ast.Name) and n.target.id == 'pos')
+    begin = next(i for i, n in enumerate(loop.body) if isinstance(n, ast.Assign)
+                 and isinstance(n.value, ast.Call) and isinstance(n.value.func, ast.Name)
+                 and n.value.func.id == 'hyper_connection_mix')
+    end = next(i for i in range(begin, len(loop.body)) if isinstance(loop.body[i], ast.If)
+               and ast.unparse(loop.body[i].test) == 'prefix_capture is not None')
+    fn = ast.parse('def probe():\n pass').body[0]
+    fn.body = copy.deepcopy(loop.body[begin:end + 1])
+    events = []
+    phase = SimpleNamespace(record=lambda *a, **k: events.append(k['phase'])) if enabled else None
+    capture = None if capture_result is None else SimpleNamespace(
+        observe_tile=lambda *a, **k: events.append('capture') or capture_result)
+    ns = dict(time=time, phase_started=0, spool_phase_seconds={'attention': 0},
+        source=None, w=None, prefix='model.layers.0', kv=None, i=0, pos=12,
+        end=16, offset=0, spool_peak_host_bytes=0, phase_memory=phase, prefix_capture=capture,
+        self=SimpleNamespace(cfg=None, rc=SimpleNamespace(qwen_compiled_delta_prefill=False,
+            qwen_native_fused_delta_prefill=False)),
+        mx=SimpleNamespace(eval=lambda *a: events.append('eval')),
+        hyper_connection_mix=lambda *a: events.append('mix') or (1, 2, 3),
+        qwen4_attention_branch=lambda *a, **k: events.append('branch') or 4,
+        hyper_connection_inject=lambda *a: events.append('inject') or 5,
+        note_spool=lambda *a, **k: events.append('retained_prefix'))
+    exec(compile(ast.fix_missing_locations(ast.Module(body=[fn], type_ignores=[])), '<real-attention-brackets>', 'exec'), ns)
+    ns['probe']()
+    expected = ['mix', 'eval'] + (['attention_inputs_ready'] if enabled else [])
+    expected += ['branch'] + (['attention_branch_returned'] if enabled else [])
+    expected += ['inject', 'eval'] + (['attention_evaluated'] if enabled else [])
+    if capture_result is not None:
+        expected += ['capture'] + (['prefix_observed'] if enabled else [])
+        if capture_result:
+            expected += ['retained_prefix']
+    assert events == expected
 
 
 def test_middle_tiles_do_not_trigger_observer_reads():
     value, rows = observer(sample=lambda *a: pytest.fail('must not sample'))
-    for phase in ('attention_tile', 'output_tile'):
+    for phase in witness.TILE_PHASES:
         value.record(None, None, phase=phase, layer_marker=0, completed_tokens=8)
     assert not rows and value.count == 0
 
@@ -100,7 +180,7 @@ def test_sink_failure_is_nonfatal_and_disqualifies_coverage():
     assert rows[-1]['observation_failed'] and not rows[-1]['coverage_complete']
 
 
-@pytest.mark.parametrize('kwargs', [{'phase': 'PRIVATE'}, {'layer_marker': True},
+@pytest.mark.parametrize('kwargs', [{'phase': 'PRIVATE'}, {'phase': []}, {'layer_marker': True},
     {'layer_marker': 2}, {'completed_tokens': 17}, {'completed_tokens': -1},
     {'reported_host_spool_peak_bytes': -1}])
 def test_invalid_metadata_does_not_leak_or_change_execution(kwargs):
@@ -156,7 +236,7 @@ def test_actual_factory_default_off_and_lazy(monkeypatch, flag):
                  and any(isinstance(t, ast.Name) and t.id == 'total' for t in n.targets))
     end = next(i for i,n in enumerate(method.body) if isinstance(n, ast.Assign)
                and any(isinstance(t, ast.Name) and t.id == 'input_ids' for t in n.targets))
-    factory = ast.parse('def factory(x, self, tile_width):\n import os as _phase_os\n return None').body[0]
+    factory = ast.parse('def factory(x, self, tile_width):\n import os as _phase_os\n prefix_capture=None\n return None').body[0]
     factory.body[-1:] = copy.deepcopy(method.body[begin:end]) + [ast.Return(ast.Name('phase_memory', ast.Load()))]
     ns = {'__package__': 'runtime'}
     exec(compile(ast.fix_missing_locations(ast.Module(body=[factory], type_ignores=[])), '<real-observer-factory>', 'exec'), ns)

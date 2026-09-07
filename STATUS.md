@@ -1,5 +1,92 @@
 # STATUS — 2026-09-07 (current corrections first; dated chronology below is history)
 
+## 2026-09-07 UTC: bracketed trace locates the large transient before prefix capture
+
+Extended the opt-in phase observer with first/final AND exact aligned-capture
+tile brackets: attention inputs evaluated, lazy branch returned, existing
+post-attention evaluation complete, prefix observation complete. No added model
+ops/eval/sync/clear/reset or policy changes; stripped computation AST remains
+identical. End schema v2 records the capture point and requires its coverage;
+cap1536 observations/sweep, errors/missing boundaries fail coverage. Default OFF.
+1115 selected pure tests PASS15.05s, including51 phase-observer tests.
+
+Same pre-registered synthetic32K library/seed819203, no tools, greedy,
+non-streaming/no-reasoning,max1024, installed uncensored Qwen FP8 fused aligned
+hot-KV/tracking-off/generation/host-activity/phase profiles: **HTTP623.5684s,
+32799 uncached input/47 actual output**, naturally completed. All7 strict
+completion/answer checks independently PASS; all4 reference checks PASS, including
+same complete raw generation witness,72 output bytes, wire and fixture. No output
+cap/retry/repair. This is finite observer equivalence on ONE synthetic case, not
+captured harness/Plex/broad intelligence/full-state/released-BF16 or GLM DSA proof.
+
+1161 valid observations; all144 ordered first/capture/final bracket groups across
+48 layers independently verified. At the32768 capture point, EVERY one of the12
+full-attention layers gains **1,575,682,048..1,721,434,112B native footprint between
+lazy branch return and existing post-attention eval**. The immediately following
+prefix-observation interval adds exactly0B at all12. Layer47 is4,571,433,624 ->
+6,179,621,528 ->6,179,621,528B. Linear-layer capture intervals add65,536..294,960B.
+This localizes the large observed transient before capture; it does not prove
+physical allocation ownership or GPU retirement, nor that retained prefix state
+is free. The pre-eval/post-eval interval includes the attention graph AND hyper
+injection. Observations are non-atomic and native/Metal/cache views overlap.
+Sampling-only cost76.395ms excludes JSON/logging/dispatch; whole HTTP includes it.
+
+Read-only primary-source audit gives a concrete next candidate. Installed MLX is
+0.32.0. Its tagged Metal dispatch supports full fused SDPA at head widths64/80/128,
+not this model's256; vector support additionally requires query<=8 and
+query*GQA<=32. Local geometry24 query/2 KV heads with1024-position tiles therefore
+selects fallback under that source. This is source/version inference, not a trace
+of the installed binary's kernel dispatch.
+[MLX dispatch](https://github.com/ml-explore/mlx/blob/v0.32.0/mlx/backend/metal/scaled_dot_product_attention.cpp)
+The fallback explicitly forms dense scores before softmax/value matmul.
+[MLX fallback](https://github.com/ml-explore/mlx/blob/v0.32.0/mlx/fast.cpp)
+One BF16 score matrix at24*1024*32768 is1,610,612,736 logical bytes, consistent in
+scale with the interval, NOT a physical attribution proof. Next: component-gated
+query-only SDPA tiles128/256/512, preserving full KV/mask, projections, QSA ranking,
+state updates and existing expert/host tiles. Evaluate bounded outputs before
+concatenation. Changed matrix shape can change rounding: require bit/state and
+raw-token gates before calling this lossless. Do not repeat the rejected0.32.2
+upgrade or assume NAX-only kernels help M4. No tiling change implemented yet.
+
+Overall pressure FAIL: terminal available4,334,534,656B; actual HTTP swap-out
+46,268,416B despite zero net used-swap growth. Periodic308 samples: minimum
+available3,735,257,088B, actual swap-out44,089,344B, native peak6,236,310,144B,
+compressed peak1,541,750,784B. Known-transcoder isolation PASS/no listed jobs;
+not general host-idle/swap-owner proof. Final trueMetal5,443,811,118B. Prefill
+470.1745s, engine-first470.1750s (not client SSE), decode151.9014s, engine622.0795s.
+Store-accounted347,809,939,280B (prefill117,677,725,640/decode230,132,213,640),
+MTP32/45accepted/15target sweeps, exactly match prior reference; NOT physicalNVMe.
+Attention239.437728s/experts169.177999s/hostcopy28.877473s. Prefix history-copy
+payload2,396,160B/capture timer5.083ms. No causal speedup claimed: different source
+manifests/host state, uncleared OS caches, both whole-run pressure FAIL.
+
+Fresh30.0318s preflightPASS/zero churn/no listed transcoders/end available9.090GB,
+root16.189GB; fasttier unchanged62.512GB. ParentFAIL/exit1/no signal/timeout/drift,
+626.3867s (22:18:27.571180 ->22:28:53.957819UTC); driver624.5415s, client1,
+server normal managedSIGTERM(-15). PIDs24437/24441/24443/24451 gone. All749 source
+hashes, unchanged start/end manifest, result/client/response/server/parent-log/
+preflight/tokenizer/reference hashes and unchanged212,862,449B history verified
+BEFORE docs edits; independent completion/phase/native-summary replay matches.
+Parent rootmin16,179,109,888B; external100,656,574,464B.
+
+An earlier81.292s attempt was deliberately cancelled when inspection found its
+endpoint-only observer omitted the strict-interior32768 capture point. No timing
+or equivalence accepted. SIGTERM to the parent did NOT clean/finalize its child
+group (the wrapper lacks a handler); the verified owned child group was then
+interrupted, driver cleanup completed, all4 PIDs gone. Its stale running receipt
+is NOT live work; explicit private cancellation artifact records missing parent
+start-manifest proof. For future manual cancellation keep the supervisor alive
+and interrupt only the verified owned child group so it can record completion.
+
+Private logs/qwen4_attention_capture_aligned_brackets32k_20260907.json SHA
+23bd3762a10dcfd19294575de837d21037b221f60101ea6f0439c418aae4095d;
+client/resultlog e02b623ed5d9ddd4bf99d50a01490040a0da1bf0f0815a621b16d7a966fda015;
+response11b58d5f08cd1a964884fd06948f69bf098f98e0d5e2b1a96cf5277c74080c72;
+serverfa5ebf66076510519fb3f007249438d32c2503f16ba084e587efe1c8dca994eb;
+parentlog36066802edf937eb92a983e066335555a35983fa65b8f38591f2c6128ee1e3f5.
+No model job remains. No default promotion/speed win/new Plex score; heterogeneous
+completed traffic, other models/domains, GLM context ladder and sub90 remain OPEN.
+
 ## 2026-09-07 UTC: phase-local native tracing catches a transient missed by periodic sampling
 
 Added explicit `prefill-phase-memory-witness`, extending process-memory-witness.
