@@ -1,5 +1,65 @@
 # STATUS — 2026-09-07 (current corrections first; dated chronology below is history)
 
+## 2026-09-07 UTC: completion-only, answer-hidden retrieval corpus prepared and CPU-verified
+
+The old large-context fixture deliberately asked for integers until the output
+limit; its capped retrieval result cannot become a completed-answer pass. Added
+an explicit `--completed-retrieval` mode to the existing HTTP fixture, leaving
+legacy diagnostic request defaults/labels intact. The new task asks for one finite
+JSON mapping and then stops. It requires max output>=256 (planned runs use1024),
+natural completion with actual output strictly below the budget, exact keys and
+case-sensitive codes, a real message rather than reasoning/top-level fallback,
+checkpoint/backend/profile identity, generation witnesses and zero prefill retries.
+Duplicate keys, missing/extra IDs, prose, Markdown, refusals, tool calls and capped
+or failed responses are rejected without answer repair. Parsed terminal responses
+are saved separately as immutable0600 receipts for independent rescoring.
+
+`completed_retrieval_corpus.py` varies record IDs/codes, requested order, distant
+positions and three synthetic domains (library, shipping, builds), with three
+decoy records. Answers occur exactly once, only in the relevant archive records,
+never the final query or checker metadata. Explicit fixture seeds are separate
+from inference sampling seeds and not sent to the model. The comparator's
+expected mapping is not included in the request. This is no-tool synthetic
+retrieval, NOT unmodified captured traffic, Plex, broad intelligence, full-state
+equivalence or the F22/F33 GLM DSA context ladder.
+
+CPU-only pre-registration control on the installed Qwen3.8-Flash-Next and
+GLM-5.3-Flash tokenizer metadata: three domains x fixture seeds819203/527641/306817
+x two tokenizers =18 deterministic fixtures, all assembled twice identically.
+At32768 requested user tokens, measured local counts are32771-32774 Qwen and
+32773-32774 GLM Flash; rendered server counts are NOT yet measured. Synthetic
+expected-answer strings tokenize to39-43/33-35 tokens, respectively; these are
+CHECKER CONTROLS, not model outputs or quality scores. Every constructed correct
+response passes the strict checker and every identically correct-but-capped
+control fails. No model calls or MLX imports; no inference timing claim.
+
+1064 selected pure tests PASS14.86s, including78 new corpus/scorer/client checks
+and16 existing retrieval regressions. Supervised CPU control parentPASS/exit0,
+4.5560s (20:40:05.887576 ->20:40:10.443588UTC), child2.5803s. All746 source
+hashes, unchanged start/end manifest, result/log/tokenizer hashes, parent-child
+result equality and PID disappearance verified BEFORE docs edits. No timeout,
+signal, source drift or missing result. Peak child-tree RSS455,131,136B,
+root>=16.205GB; no model weights read, only tokenizer metadata. Existing ffmpeg
+was observed during this CPU fixture control and left untouched; this is not
+an isolated model performance measurement. A subsequent fresh30s admission
+sample passed with no listed transcoders, but must be renewed before launch.
+
+Private logs/completed_retrieval_fixture_tokenizers_20260907.json SHA
+761c5dd37165dbb79dfd1acc009898a89215fbef6159bb34a4317d553ea0cc3d;
+parentlog22ed6fe7840e8793e5ba1de0eb69fe7b709e9d77a0e8de8252c79e28c81058f9.
+Qwen tokenizer0997f410c57a1f4e53b09e4be8f4a172d90edd9564368fb0847030937229b9f3;
+GLM Flash tokenizer19e773648cb4e65de8660ea6365e10acca112d42a854923df93db4a6f333a82d.
+
+Next attempted model gate: ONE32K library/seed819203 case, max1024, greedy
+non-streaming/no-reasoning on installed uncensored Qwen FP8, current exact-pipeline
+fused aligned hot-KV profile plus explicit tracking-off/generation/host-activity
+witnesses. Require fresh30s admission and whole-run memory/isolation checks;
+preserve Plex/Tdarr. Planned run `qwen4_completed_retrieval32k_library_20260907`.
+Inspect its running/done envelope before any other model work. Completion-only
+mode is ready, but no real-model result from it is yet claimed. Existing latest
+full131867.9482s/pressureFAIL and full134 Plex56FAIL remain unchanged; sub90,
+large-context completion, heterogeneous full traffic and GLM acceptance stay OPEN.
+
 ## 2026-09-07 UTC: opt-in transcoder isolation guard verified; no new inference timing
 
 Following the mid-run Tdarr/ffmpeg confound below, added read-only known-transcoder
