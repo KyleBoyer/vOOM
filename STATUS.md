@@ -1,5 +1,76 @@
 # STATUS — 2026-09-07 (current corrections first; dated chronology below is history)
 
+## 2026-09-07 UTC: Qwen naturally completes hidden32K retrieval correctly; pressure still FAIL
+
+The pre-registered library/fixture-seed819203 case now has a REAL model response:
+**HTTP623.2101s,32799 uncached rendered input/47 actual output tokens**, naturally
+completed with a1024-token budget. This is ONE synthetic no-tool, greedy,
+non-streaming/no-reasoning retrieval request on installed uncensored Qwen FP8,
+using the current fused aligned hot-KV exact-pipeline profile plus explicit
+tracking-off/generation/host-activity witnesses. It is not captured harness
+traffic, Plex, all18 pre-registered cases, broad intelligence, full-state
+equivalence, released-BF16 proof or the GLM F22/F33 context ladder.
+
+Both exact requested ID/code pairs are recovered in one72-byte JSON message;
+all7 completion/strict-content checks PASS. No extra IDs/prose, duplicate keys,
+tools, repair, reasoning answer substitution or output truncation. The checker
+was independently rerun on the immutable parsed terminal receipt. Rebuilt
+fixture metadata matches the BEFORE-generation CPU pre-registration exactly:
+32774 local user tokens, requested record positions7241/21650, three decoys,
+each answer only once in its distant record and absent from final query/metadata.
+No expected answer was passed to the model. Cached/reasoning tokens0/0; zero
+prefill retries. Raw47-token witness is recorded for future equivalence checks,
+not a new A/B or independent target-model reference proof.
+
+Engine-reported first token469.8739s, prefill469.8733s, decode151.8280s,
+total engine621.7052s. First token is not a client-observed SSE measurement
+(request is non-streaming). Native MTP accepted32/45 proposals over15 target
+sweeps; draft4.9690s, verifier146.5617s. No MTP-OFF speed comparison was run.
+Store-accounted reads117,677,725,640B prefill +230,132,213,640B decode =
+347,809,939,280B total (287,542,231,280 archive/60,267,708,000 fast tier).
+These are logical store accounting, NOT measured physical NVMe reads. Nested
+prefill phase costs: attention239.5341s, experts169.1122s, host copy28.9536s;
+H2D309,341,275,776B/D2H73,230,458,496B. Retained-prefix logical1,023,184,896B
+and endpoint1,025,317,488B are not additive unique physical RAM measurements.
+
+Overall FAIL, not a speed promotion: terminal available4,479,221,760B <5.3GB;
+HTTP actual swap-out34,684,928B >16MB despite ZERO net used-swap growth.
+308 valid periodic observations independently fail: minimum available
+3,542,581,248B, actual swap-out34,668,544B, native peak footprint6,130,535,208B,
+observed compressed peak1,301,331,968B. TrueMetal5,443,811,118B is below8.5GB.
+The known-transcoder isolation witness PASSES all308 observations: none listed;
+that is a narrow allowlist observation, not general host-idle or swap-attribution
+proof. This removes the previously observed transcoder confound from this run's
+sampled records, but does not establish a causal latency comparison. The older
+1260.900s/256-output capped sequence is a DIFFERENT task/output, not its baseline.
+
+Fresh30.0329s preflight2PASS, no listed transcoders or net/actual swap growth,
+end available6.749GB, root>=16.224GB before launch. Fasttier62.512GB; parent
+root minimum16.199GB. ParentFAIL/exit1/626.2489s,
+21:00:05.237337 ->21:10:31.486180UTC; driver624.1394s, clientexit1 is explicit
+pressure failure, server normal managedSIGTERM(-15). All four PIDs gone. All746
+source hashes, unchanged start/end manifest, result/client/response/server/log/
+preflight/tokenizer hashes, independent scorer/native-summary replay and unchanged
+212,862,449B transition history verified BEFORE docs edits; no timeout, parent
+signal, source drift or missing result. Sourcec97d38a;1064 selected pure tests
+had already passed14.86s on this unchanged fixture implementation.
+
+Private logs/qwen4_completed_retrieval32k_library_20260907.json SHA
+bf9c04e8c679328b08569e8504ae4e421649d8fa93542a480bd272dab197c691;
+client/resultlogd8f2c3a028169655e536c5dfe652912d2a44d4b40212ae1256ec9cc1a46d74cb;
+parsedresponse298cbb9d710412e891bb3093887b33ae1b4a020972edf7206f927c9567f3f13a;
+serverae2d06405f218c9bde37a30c67d5f743d75a1cd016edc7c06793c925b5176df0;
+parentlog1cc0039b123c2ac80b6f392c9cf306a660fe9584f61672772f838e00fc5da05b.
+Wire183811B SHA7ce276a58087ee1f9f2bd7976e2403b3f700d802668a99bcb2bb7dd92620572b;
+prepared32799 SHA0be8f54537efc20cf45e1c9d2f6af8fd53e227d98e1bbc2d54e561350bca4908;
+raw47 SHA bdd9ba611ceb836533bfe886148f085f4903f4700b0ed1767b8bfc0ef3e10c0d.
+
+No model job remains. Keep this completed retrieval evidence; do not call it a
+clean overall pass or latency win. Next: remaining attention/expert native-memory
+ownership, then further pre-registered domains/functions with completion and
+pressure gates. Full131 latest867.9482s/pressureFAIL, full134 Plex56FAIL unchanged;
+full GLM completed-answer, heterogeneous full traffic, larger rungs and sub90 OPEN.
+
 ## 2026-09-07 UTC: completion-only, answer-hidden retrieval corpus prepared and CPU-verified
 
 The old large-context fixture deliberately asked for integers until the output
