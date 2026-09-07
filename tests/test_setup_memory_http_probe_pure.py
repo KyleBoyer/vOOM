@@ -111,3 +111,42 @@ def test_import_time_generated_exec_is_not_a_module_boundary():
     assert probe_module.classify(generated) is None
     real = frame(name='<module>', module='runtime.engine')
     assert probe_module.classify(real) == 'runtime.engine.<module>'
+
+
+def test_predictor_owner_scalars_do_not_read_entries_or_claim_recursive_size():
+    counts = {(0, 1, 2): object()}
+    rc = SimpleNamespace(expert_transition_tracking=True,
+                         expert_predictive_prefetch=False, warm_start=0)
+    target = SimpleNamespace(rc=rc, predictor=SimpleNamespace(counts=counts))
+    result = probe_module.predictor_owners(SimpleNamespace(target=target))
+    assert result == dict(available=True, present=True, entry_count=1,
+        dictionary_shallow_bytes=sys.getsizeof(counts),
+        shallow_bytes_are_total_ownership=False, tracking=True,
+        predictive_prefetch=False, warm_start=0)
+
+
+def test_disabled_predictor_owner_is_explicitly_absent():
+    rc = SimpleNamespace(expert_transition_tracking=False,
+                         expert_predictive_prefetch=False, warm_start=0)
+    result = probe_module.predictor_owners(SimpleNamespace(rc=rc, predictor=None))
+    assert result['available'] and not result['present'] and not result['tracking']
+    assert result['entry_count'] is None and result['dictionary_shallow_bytes'] is None
+
+
+def test_unknown_count_container_is_not_inspected():
+    class Forbidden(dict):
+        def __len__(self):
+            raise AssertionError('unknown container must not be inspected')
+        def __sizeof__(self):
+            raise AssertionError('unknown container must not be inspected')
+        def __iter__(self):
+            raise AssertionError('unknown container must not be inspected')
+    engine = SimpleNamespace(predictor=SimpleNamespace(counts=Forbidden()))
+    result = probe_module.predictor_owners(engine)
+    assert not result['available'] and result['present']
+    assert result['entry_count'] is None and result['dictionary_shallow_bytes'] is None
+
+
+def test_predictor_constructor_is_directly_profiled():
+    f = frame(name='MarkovExpertPredictor.__init__', module='runtime.predictor')
+    assert probe_module.classify(f) == 'runtime.predictor.MarkovExpertPredictor.__init__'

@@ -24,6 +24,7 @@ FUNCTIONS = frozenset((
     ('runtime.server', 'EngineManager.get'),
     ('runtime.engine', 'StreamingEngine.__init__'),
     ('runtime.model_loader', 'WeightStore.__init__'),
+    ('runtime.predictor', 'MarkovExpertPredictor.__init__'),
     ('runtime.server', '_prepare_chat_prompt'),
     ('runtime.server', '_chat_prompt'),
     ('runtime.server', '_configure_constraint'),
@@ -78,6 +79,23 @@ def prepared_identity(frame, expected_count, expected_sha, output_cap):
                        and type(engine).__name__ == 'Qwen4MTPSpeculativeEngine')}
 
 
+def predictor_owners(engine):
+    """Constant-time, shallow owner scalars; never iterate learned entries."""
+    from collections import defaultdict
+    target = getattr(engine, 'target', engine)
+    rc = getattr(target, 'rc', None)
+    predictor = getattr(target, 'predictor', None)
+    counts = getattr(predictor, 'counts', None)
+    valid = counts is None or type(counts) in (dict, defaultdict)
+    return {'available': valid, 'present': predictor is not None,
+            'entry_count': len(counts) if valid and counts is not None else None,
+            'dictionary_shallow_bytes': sys.getsizeof(counts) if valid and counts is not None else None,
+            'shallow_bytes_are_total_ownership': False,
+            'tracking': getattr(rc, 'expert_transition_tracking', None),
+            'predictive_prefetch': getattr(rc, 'expert_predictive_prefetch', None),
+            'warm_start': getattr(rc, 'warm_start', None)}
+
+
 class SetupProfiler:
     def __init__(self, *, sample, publish, expected_count, expected_sha, output_cap):
         if type(expected_count) is not int or not 1 <= expected_count <= 1_000_000:
@@ -125,6 +143,7 @@ class SetupProfiler:
                         'completed_model_response': False, 'speed_benchmark': False,
                         'events': self.events, 'capped': self.capped,
                         'prepared_identity': identity,
+                        'predictor_owners': predictor_owners(frame.f_locals.get('engine')),
                         'diagnostic_wall_seconds': time.perf_counter() - self.started}
             profiles = sys.modules.get('runtime.profiles')
             if profiles is not None:

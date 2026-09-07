@@ -27,6 +27,15 @@ from runtime.profiles import (
 ROOT = Path(__file__).resolve().parent.parent
 
 
+def test_no_transition_tracking_overlay_changes_only_explicit_history_policy():
+    catalog = discover_runtime_profiles((ROOT / 'profiles',))
+    base = 'qwen38-flash-next-uncensored-fp8-exact-pipeline-hot-kv-aligned-compact-fused'
+    _, baseline = resolve_runtime_profiles((base,), catalog)
+    _, candidate = resolve_runtime_profiles((base, 'expert-transition-tracking-off'), catalog)
+    assert 'VMODEL_EXPERT_TRANSITION_TRACKING' not in baseline
+    assert candidate == {**baseline, 'VMODEL_EXPERT_TRANSITION_TRACKING': '0'}
+
+
 def test_process_memory_overlay_changes_only_observer_flag():
     catalog = discover_runtime_profiles((ROOT / "profiles",))
     base = "qwen38-flash-next-uncensored-fp8-exact-pipeline-hot-kv-aligned-compact-fused"

@@ -1,0 +1,8 @@
+schema: voom.runtime-profile.v1
+name: expert-transition-tracking-off
+description: Explicit no-consumer opt-out of Markov expert transition history.
+notes:
+  - "Skips loading, online learning and saving expert_transitions.json. Existing history is untouched. Does not change authoritative routing, target weights, math, KV, sampling, or deterministic expert-batch prefetch."
+  - "Fails if predictive expert prefetch or warm_start requires the history. Default remains historical tracking enabled. Not an automatic path or completed-answer/pressure gate waiver."
+settings:
+  VMODEL_EXPERT_TRANSITION_TRACKING: false

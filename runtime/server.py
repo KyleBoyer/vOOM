@@ -1195,6 +1195,13 @@ class EngineManager:
             hybrid_prefill_chunk_size as _hybrid_prefill_chunk_size,
         )
         from .path_resolver import resolve_model_dir
+        from .predictor import parse_transition_tracking
+
+        try:
+            expert_transition_tracking = parse_transition_tracking(
+                os.environ.get("VMODEL_EXPERT_TRANSITION_TRACKING"))
+        except ValueError as error:
+            raise RequestValidationError(str(error)) from error
 
         yarn_factor = 0.0
         if mode == "fast-long":
@@ -2399,6 +2406,7 @@ class EngineManager:
                 "VMODEL_GLM53_FULL_WEIGHT_CACHE_MB must be in [150, 2000]")
         key = (
             str(model_dir), mode, yarn_factor.hex(),
+            expert_transition_tracking,
             bool(requires_vision), resident_backend_request,
             qwen4_request_identity,
             dspark_request_identity,
@@ -2558,6 +2566,7 @@ class EngineManager:
         model_dir = resolve_model_dir(model_dir)
         key = (
             str(model_dir), mode, yarn_factor.hex(),
+            expert_transition_tracking,
             bool(requires_vision), resident_backend_request,
             qwen4_request_identity,
             dspark_request_identity,
@@ -5527,6 +5536,7 @@ class EngineManager:
                     "using vOOM",
                     flush=True,
                 )
+            rc.expert_transition_tracking = expert_transition_tracking
             target_engine = StreamingEngine(model_dir, rc)
             self._engine = target_engine
             if execution_profile:

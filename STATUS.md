@@ -1,5 +1,55 @@
 # STATUS — 2026-09-07 (current corrections first; dated chronology below is history)
 
+## 2026-09-07 UTC: explicit unused-transition opt-out removes multi-GB setup allocation
+
+Implemented `--profile expert-transition-tracking-off` (or strict
+`VMODEL_EXPERT_TRANSITION_TRACKING=0`). Legacy tracking remains the default;
+invalid policies and disabled tracking with predictive prefetch or warm_start
+fail before cache/model I/O. Both server engine identities include the policy.
+Off skips history loading, online learning and saving; authoritative routing,
+usage/trace telemetry, deterministic batch prefetch, weights/math/KV/sampling
+are unchanged. The existing212,862,449B history file is preserved, not deleted.
+This is an explicit no-consumer mode, not predictor-based next-token speculation.
+
+Same739-source-manifest sequential ON/OFF setup diagnostics use fresh servers,
+the original131 tools/history/stream, and model/max1024/temp0/seed64013 overrides.
+Both reach identical40432 prepared tokens/SHA c677e37ce033358ada3e01e9ceb0288fafa5bb9bdd196f7a1bbea000d1f2a5b2
+and INTENTIONALLY STOP before generation: zero generated tokens, explicit
+response.failed diagnostic marker, no completed-answer/Plex/lossless-token proof.
+Profiled HTTP SETUP ONLY: **39.1726s ON ->8.8428s OFF**. This includes Python
+profiling/native observers and is not unprofiled serving latency. OS file caches
+were not purged; baseline available7.397GB versus9.753GB for the second arm.
+One sequential pair does not isolate every host/cache timing effect.
+
+Direct constructor bracket confirms12,260,757 learned entries,671,088,736B
+SHALLOW dictionary size (not recursive ownership). Native footprint rises from
+390,054,872B to4,684,681,248B inside Markov construction, while activeMetal stays
+13,140,000B. OFF has no predictor/constructor event. Engine-return footprint
+4,684,795,984 ->392,840,176B; final pre-generation2,724,875,312 ->697,288,240B;
+max observed5,080,994,328 ->910,411,312B. These overlapping native stage counters
+are not additive allocator ownership. Python final blocks28,953,328 ->4,474,093.
+All55/53 native observations available, uncapped; observer costs1.7815/0.8848s
+exclude profile-dispatch overhead. Saved-history SHA before/after BOTH arms:
+a8b3bc1c45d4ad963384d354194425aec64fe0092eb33f859e3d5dfef040e3c5.
+
+Both fresh30s preflights PASS, root>=16.187GB/fasttier62.512GB. Setup pressure
+PASS: available minima6,556,090,368/8,376,991,744B; swap-used growth0/0;
+actual swap-out4,276,224/0B; trueMetal peak13,140,000B both. ON transient native
+compressed peak1,063,452,672B versus0 OFF. Parent exit0/41.9568s and0/11.5479s;
+19:00:32.392028->19:01:14.348771 and19:02:01.890943->19:02:13.438846UTC.
+Both servers normal managed SIGTERM(-15), all PIDs gone. All739 source hashes,
+same-manifest identity, parent/result/diagnostic/server hashes verified BEFORE
+edits; no timeout, signal, source drift or missing result.897 pure tests PASS13.60s.
+Private logs/qwen4_full131_tracking_{on,off}_setup_20260907.json SHA respectively
+10c06e62030dc2763ee9d5e11116325d6a395c454026a925cac10d50e016a658 and
+fd0fc5053e5a06358498cf96fda1811850b2655416cc33fd7b540912ed89a98f.
+
+Next: a naturally completed full131 max1024 response with this opt-in, finite
+greedy token/reference checks and unchanged pressure gates, then heterogeneous
+real captures/Plex before considering any default. No new answer-quality result.
+Latest prior actual modified131 response911.6881s/pressureFAIL, full134 Plex
+55.69min/56FAIL, GLM quality/speed, context ladder and sub90 goals remain OPEN.
+
 ## 2026-09-07 UTC: actual setup trace localizes multi-GB host growth inside engine construction
 
 The original131-tool/history/stream request, with model/max1024/temp0/seed64013

@@ -21,6 +21,37 @@ from collections import defaultdict
 from pathlib import Path
 
 
+def parse_transition_tracking(raw: str | None) -> bool:
+    """Strict server policy; omitted preserves historical online learning."""
+    if raw is None or raw == '1':
+        return True
+    if raw == '0':
+        return False
+    raise ValueError('VMODEL_EXPERT_TRANSITION_TRACKING must be 0 or 1')
+
+
+def validate_transition_tracking(tracking, *, predictive_prefetch, warm_start):
+    if type(tracking) is not bool:
+        raise ValueError('expert_transition_tracking must be boolean')
+    if not tracking and (predictive_prefetch or warm_start != 0):
+        raise ValueError(
+            'disabled expert_transition_tracking conflicts with predictive prefetch or warm_start')
+
+
+def make_expert_predictor(num_layers, num_experts, path, *, tracking=True,
+                          predictive_prefetch=False, warm_start=0):
+    """No-consumer opt-out avoids reading, learning, or writing saved history.
+
+    Authoritative routing, usage/trace telemetry and deterministic expert-batch
+    prefetch are separate. Existing history is neither deleted nor replaced.
+    """
+    validate_transition_tracking(tracking, predictive_prefetch=predictive_prefetch,
+                                 warm_start=warm_start)
+    if not tracking or not num_experts:
+        return None
+    return MarkovExpertPredictor(num_layers, num_experts, path=path)
+
+
 class MarkovExpertPredictor:
     def __init__(self, num_layers: int, num_experts: int, path: str | Path | None = None):
         self.num_layers = num_layers

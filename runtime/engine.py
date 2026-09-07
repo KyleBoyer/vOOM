@@ -1517,6 +1517,9 @@ class RuntimeConfig:
     expert_predictive_prefetch: bool = False  # Markov next-layer expert hints;
     # separately gated from deterministic trunk prefetch because F45-class
     # speculative traffic regressed on the saturated local disk. Explicit opt-in.
+    # Explicit no-consumer opt-out. True preserves historical learning/persistence;
+    # False does not load or update the potentially large saved transition map.
+    expert_transition_tracking: bool = True
     expert_prefetch_idle_only: bool = True  # when enabled, issue a predicted
     # expert hint only if no other prefetch is queued/active. False is an
     # intentionally aggressive experiment and must be byte/wall A/B tested.
@@ -1793,6 +1796,7 @@ class RuntimeConfig:
             router_lookahead=run.get("router_lookahead", False),
             expert_predictive_prefetch=run.get(
                 "expert_predictive_prefetch", False),
+            expert_transition_tracking=run.get("expert_transition_tracking", True),
             expert_prefetch_idle_only=run.get(
                 "expert_prefetch_idle_only", True),
             context_bound=run.get("context_bound", 0),
@@ -1913,6 +1917,13 @@ _DSV4_FUSED_FP8_SUFFIXES = (
 class StreamingEngine:
     def __init__(self, model_dir: str | Path, rc: RuntimeConfig | None = None):
         self.rc = rc or RuntimeConfig()
+        from .predictor import make_expert_predictor, validate_transition_tracking
+
+        # Refuse conflicting consumers before any cache mutation/model I/O.
+        validate_transition_tracking(
+            self.rc.expert_transition_tracking,
+            predictive_prefetch=self.rc.expert_predictive_prefetch,
+            warm_start=self.rc.warm_start)
         self.rc.execution_profile = str(
             self.rc.execution_profile or "").strip().lower()
         self.rc.kimi_k3_prefill_tile_policy = str(
@@ -3089,14 +3100,12 @@ class StreamingEngine:
                 )
         if self.rc.resident_moe_decode:
             self._build_resident_moe_layers()
-        self.predictor = None
-        if self.cfg.num_experts:
-            from .predictor import MarkovExpertPredictor
-
-            self.predictor = MarkovExpertPredictor(
-                self.cfg.num_hidden_layers, self.cfg.num_experts,
-                path=self._model_dir / "expert_transitions.json",
-            )
+        self.predictor = make_expert_predictor(
+            self.cfg.num_hidden_layers, self.cfg.num_experts,
+            self._model_dir / "expert_transitions.json",
+            tracking=self.rc.expert_transition_tracking,
+            predictive_prefetch=self.rc.expert_predictive_prefetch,
+            warm_start=self.rc.warm_start)
 
         # Prefetcher sized against a typical page so budget checks are meaningful.
         if self.cfg.num_experts:
