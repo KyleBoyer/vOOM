@@ -60,6 +60,16 @@ mode is ready, but no real-model result from it is yet claimed. Existing latest
 full131867.9482s/pressureFAIL and full134 Plex56FAIL remain unchanged; sub90,
 large-context completion, heterogeneous full traffic and GLM acceptance stay OPEN.
 
+Launch update: the RENEWED30.0252s preflight returned DEFERRED_PRECONDITION/exit1.
+It retained TWO ffmpeg PID/start identities observed during the window even as
+the jobs changed. Memory-only criteria would pass (6.715GB available at end,
+zero net swap growth/actual churn, root>=16.200GB); the explicit isolation veto
+correctly blocks the timed model run. No model/server/client was launched and
+no user process was changed. Do not reuse the earlier passing sample. The
+only planned-run artifact is `logs/qwen4_completed_retrieval32k_library_20260907.preflight.json`,
+SHA d398b23d1a6221817b72d80b3e5db4f7d4f14872560e60beb1b79005cd58ac5c.
+Retry later with a fresh, uniquely named passing preflight; preserve Plex/Tdarr.
+
 ## 2026-09-07 UTC: opt-in transcoder isolation guard verified; no new inference timing
 
 Following the mid-run Tdarr/ffmpeg confound below, added read-only known-transcoder
