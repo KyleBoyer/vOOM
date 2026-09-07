@@ -1,5 +1,87 @@
 # STATUS — 2026-09-07 (current corrections first; dated chronology below is history)
 
+## 2026-09-07 UTC: full134 Plex completes, 56/100 strict FAIL; process compression persists
+
+The corrected v2 orchestrator completes all four responses and saves four
+immutable private full-response receipts. Installed uncensored Qwen FP8 candidate,
+original134 tool schemas and all initial system/history items retained. Explicit
+wire changes: model, max_output_tokens1024, temperature0, nonstream, no reasoning,
+sequential calls. Synthetic mixed two-page tool results, NOT live Plex execution
+or untouched-wire replay. No host policy adapter, schema substitution, answer
+repair, endpoint disposal or runtime/model change from the preceding attempt.
+
+With those overrides and synthetic pages, total profiler wall is **3341.6814s
+(55.69 minutes)**. All four HTTP200 responses naturally complete below the1024
+ceiling; no incomplete/error response or unhandled/protocol call failure:
+
+| Response | Input / output | Cached | HTTP wall | TTFT | Decode |
+|---|---:|---:|---:|---:|---:|
+| First movie query | 49,231 /69 | 0 | 1112.7920s | 851.3642s | 246.3188s |
+| Second movie query | 49,546 /56 | 49,152 | 301.9553s | 76.2756s | 225.1681s |
+| First show query | 49,865 /90 | 49,152 | 378.1093s | 87.1573s | 290.4319s |
+| Terminal answer | 50,182 /346 | 49,152 | 1548.7509s | 98.6733s | 1449.5660s |
+
+The unchanged strict rubric scores **56/100, FAIL**. All four eligible titles
+appear, but the final eligible-TV table also includes JULIET_TVPG. The model
+explicitly acknowledges TV-PG exceeds TV-Y7 and then relaxes the user's ceiling.
+This is a substantive answer error, not merely an excluded-title explanation.
+The whole-visible-output gate also fails because rejected titles are discussed.
+Completion PASS is distinct from quality and pressure FAIL.
+
+Rubric limitation: 29 points are deducted for a separate-media strategy that the
+ORIGINAL schema explicitly permits (mediaType movie/show with ratingValue, and
+offset per media type). Movie offsets0/50 followed by show offset0 are not by
+themselves invalid pagination. The old scorer instead requires mediaType=all,
+both per-type threshold fields on call one, and globally increasing offsets.
+Its fixture also advances one global mixed-page queue, returning the final mixed
+page again for the show query, rather than independent media-specific queues.
+Keep the historical56 score unchanged, but do not present these four deductions
+as definitive tool-contract violations or this score as a universal intelligence
+metric. A future semantic evaluator requires independent contract-valid strategy
+and negative-case coverage; it must still reject the actual TV-PG inclusion.
+Do not tune the scorer or repair this response to manufacture a pass.
+
+Pressure fails11 checks (plus one combined quality failure): each response ends
+below5.3GB available and exceeds16MB swap-out; first-turn swap-used also exceeds
+16MB, and sequence availability/churn fail. Per-turn swap-out238796800/193511424/
+77758464/512704512B totals **1,022,771,200B**, despite net sequence swap-used
+DECLINING1,441,792B. End available4,113,104,896B. All true Metal peaks
+7.244/4.895/5.926/6.246GB satisfy8.5GB; that does not waive global pressure.
+Native self samples1653/1653 available, none malformed/capped. Observed compressed
+ledger max3,564,175,360B, reported lifetime peak4,174,331,904B, footprint
+11,098,461,512B, RSS5,526,749,184B, lifetime compressed-ledger credit353,159,036,928B.
+These overlapping process ledger views must not be added or confused with
+physical compressor storage or process-attributed disk swap. They establish
+server compression, not exclusive causation of global swap or elapsed time.
+
+Prefill851.3634/76.2147/87.0879/98.6085s; native accepted/proposed44/72,34/63,
+60/87,214/394 over24/21/29/132 target sweeps. Store-accounted traffic totals
+3,664,304,619,736B, NOT physical NVMe reads. Every turn selects all134 tools,
+lossy shortlist false, backend voom, expected profile digest. No causal speed
+A/B, broad default promotion or official-Qwen-BF16 equivalence claim. First two
+complete generation witnesses equal the preceding partial run; this finite
+observation does not make the FP8 checkpoint official-BF16 lossless.
+
+Parent exit1/3344.5179s,14:26:32.280076->15:22:16.797944UTC, no timeout/signal/
+missing result/source drift; parent/driver/server gone. All723 source hashes,
+combined result and parent/server logs verified BEFORE receipt edits. CPU-only
+offline replay of all four saved responses reconstructs every effective request
+identity with original catalog/initial history and reproduces calls, final text,
+all turns, completion, unchanged rubric and visible-output failures exactly.
+This validates receipt/scorer consistency, not model quality. All four receipts
+are0600 and their hashes are pinned in the private audit. Sourcee8cc025;
+root/external minima16.269/100.710GB, child-tree RSS max5.570GB.
+
+Private logs/qwen4_full134_plex1024_process_memory_v2_20260907.json SHA
+2ff78a1e73087eec033c1f3940a4b2c92c4a51bc3c2794ac1175bdec5dff7312;
+parent log6ee7a319b22def6312cb2c0fa5484f7eea394a2e3de3341e869c9dfb79c78a4c;
+server loge2ccf5b9dc3f2aba51379dc0526cc05bab27cdfb0cc6c908257e104234ce4c93;
+same-base .receipt-audit.json SHA
+9245fbc80437dcad02eafb0f2004100af4f8f58ec223a49fddd2121999092188.
+Next: audit host-buffer ownership/lifetimes alongside Metal accounting before
+another expensive unchanged replay. Safety thresholds remain unchanged. Sub90,
+Plex-quality acceptance, varied-domain acceptance and large-context ladder OPEN.
+
 ## 2026-09-07 UTC: full134 Plex attempt stops on progress-publication bug; no final score
 
 The source9d8e832 full-catalog attempt has FINISHED, overall FAIL. Two model
