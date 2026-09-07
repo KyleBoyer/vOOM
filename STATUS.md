@@ -1,5 +1,69 @@
 # STATUS — 2026-09-07 (current corrections first; dated chronology below is history)
 
+## 2026-09-07 UTC: actual setup trace localizes multi-GB host growth inside engine construction
+
+The original131-tool/history/stream request, with model/max1024/temp0/seed64013
+overrides, reaches the exact40432-token prepared-ID hash and expected fused/aligned
+profile digest. The disposable profiler INTENTIONALLY STOPS before the first
+`_engine_generate` body. HTTP39.4400s is diagnostic setup time including Python
+profiling/59 native observations, NOT first-token/prefill/decode/end-to-end model
+latency. HTTP200 carries response.created/in_progress/**failed** with the explicit
+diagnostic-stop marker; zero generated tokens, no completed answer or Plex score.
+The parent PASS means setup/identity/diagnostic-pressure checks passed only.
+
+Main finding: native footprint is48,939,656B on StreamingEngine constructor entry,
+172,442,344B after WeightStore construction, then **4,679,307,272B** at engine
+constructor return. Python allocated-block count rises from893,049 after the
+store to27,310,363 after engine initialization, while Metal active is only
+13,140,000B. The later MTP wrapper adds under1MB; the huge allocation already
+exists BEFORE prompt preparation, Torch/XGrammar imports and grammar compilation.
+Peak observed footprint5,075,849,656B; final pre-generation2,896,809,032B. These
+are nested stage observations, not exclusive allocator ownership or additive
+RSS/Metal totals. Full Python profiling changes lifetimes/cost; compare only
+structural localization, not these39s against earlier unprofiled HTTP numbers.
+
+Code inspection identifies a strong, still-to-be-directly-bracketed suspect:
+StreamingEngine ALWAYS constructs MarkovExpertPredictor for MoE models, even
+when predictive prefetch is disabled (its default) and warm_start=0. The predictor
+loads the entire expert_transitions.json and expands string keys into integer
+tuples plus a second dictionary. This checkpoint's existing file is212,862,449B
+with12,260,757 colon delimiters (stream count, NOT independent JSON validation),
+SHAa8b3bc1c45d4ad963384d354194425aec64fe0092eb33f859e3d5dfef040e3c5.
+That file and learned history are untouched. Route tracking also continues
+updating this structure without a prefetch consumer. This is a concrete candidate
+for multi-GB exact-state representation reduction or explicit disabled/lazy
+tracking, NOT proof that all observed host bytes belong to that dictionary.
+Next: directly bracket predictor construction/owner-size scalars and test an
+explicit no-consumer tracking mode (fail if predictive prefetch/warm-start needs
+it), or compact exact counters. Preserve the saved history; no default flip,
+deletion or inference speed claim before full-request pressure/token gates.
+
+All59 native snapshots complete, no cap; prepared-ID SHA
+c677e37ce033358ada3e01e9ceb0288fafa5bb9bdd196f7a1bbea000d1f2a5b2 and effectivewire
+3350745f87c2f7a70753dbdcd0bb73d6229bd72efe0587ea79f32dc08e62ac2e match the earlier
+49-token replay. Native observation total1.8838s excludes Python profile-dispatch
+overhead. Some import-labelled records also captured generated <string> frames;
+those are not distinct imports. The decisive explicitly named function boundaries
+are unaffected. A post-run pure-tested filename guard fixes future import labels;
+the original artifact is unchanged. No production profiler/env/default is added.
+
+Fresh30s preflightPASS7.263GBavailable/root16.243GB,zerochurn,fasttier62.512GB.
+Parentexit0/42.0018s, child40.0990s;18:26:25.383066->18:27:07.384886UTC. Normal
+managed server SIGTERM(-15), no parent timeout/signal/drift/missing result. All737
+source/result/diagnostic/server/log hashes plus parent/driver/server disappearance
+verified BEFORE edits. Sampled minimum available6,760,202,240B, swap-used growth0,
+actual swap-out3,670,016B (<16MB, notzero), Metalpeak13,140,000B; native compressed
+ledger observed max104,398,848B. Parent tree-RSS max5.402GB is separately sampled.
+867 selected pure regressions pass (includes19 new profiler bounds, no-body-stop,
+redaction, failure and generated-module-label tests). Private same-base
+logs/qwen4_full131_setup_memory_20260907.json SHA
+f164589be275b5ad1cfbb8fded80cb90be947b2392aeef947e28edb79bd992ad;
+.setup.json253abedc0c0558b578fe2e15e82854a9128a1457783d9d97eb24f5cffec23494;
+.server.logf55c190ed393590e22f84db5702e0f4e772c81438aabc12d0f286a1fd2a944d6.
+Parent log is empty, verified SHAe3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855.
+No model job remains. Full134 Plex55.69min/56FAIL, actual modified131 first-response
+911.6881s/pressureFAIL, varied domains, context ladder and sub90 remain OPEN.
+
 ## 2026-09-07 UTC: Darwin allocator-pressure relief is a measured no-op; do not promote
 
 Four bounded64/256MiB FP16/BF16 host-copy trials keep the full GPU weight alive
