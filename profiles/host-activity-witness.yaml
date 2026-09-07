@@ -1,0 +1,11 @@
+schema: voom.runtime-profile.v1
+name: host-activity-witness
+description: Explicit read-only known-transcoder observations alongside process memory.
+notes:
+  - "Records bounded ffmpeg/HandBrakeCLI PID/start identities on the existing governor thread after safety responses. No command lines, environments, open files or user content; never controls other processes."
+  - "Detects listed transcoders starting after admission. Absence is not proof of a generally idle host or attribution of system swap. Sampling can miss between-poll activity. Observation errors/caps cannot certify isolation."
+  - "Use memory_preflight --require-no-transcoders before a timed job as well. This profile does not change weights, math, sampling, allocation limits or governor decisions. Default-off; inventory overhead is included in measured wall time."
+extends:
+  - process-memory-witness
+settings:
+  VMODEL_HOST_ACTIVITY_WITNESS: true

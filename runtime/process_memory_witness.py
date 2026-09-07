@@ -123,6 +123,10 @@ class GovernorProcessMemoryObserver:
         self.count = 0
         self.last_monotonic = None
         self.capped = False
+        self.host_activity_sample = None
+        if os.environ.get('VMODEL_HOST_ACTIVITY_WITNESS') == '1':
+            from .host_activity_witness import sample_known_transcoders
+            self.host_activity_sample = sample_known_transcoders
 
     def record(self, *, governor_monotonic_s, system_available_bytes,
                system_swap_used_bytes, system_swap_out_bytes, metal_active_bytes,
@@ -155,6 +159,11 @@ class GovernorProcessMemoryObserver:
             "swap_pressure_response": bool(swap_pressure_response),
             "process": memory,
         }
+        if self.host_activity_sample is not None:
+            try:
+                row['known_transcoders'] = self.host_activity_sample()
+            except Exception:
+                row['known_transcoders'] = {'available': False, 'reason': 'inventory-error'}
         print('[process-memory] ' + json.dumps(row, allow_nan=False,
                                              separators=(",", ":")), flush=True)
 

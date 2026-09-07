@@ -1,5 +1,63 @@
 # STATUS — 2026-09-07 (current corrections first; dated chronology below is history)
 
+## 2026-09-07 UTC: opt-in transcoder isolation guard verified; no new inference timing
+
+Following the mid-run Tdarr/ffmpeg confound below, added read-only known-transcoder
+instrumentation. `runtime.memory_preflight --require-no-transcoders` observes
+ffmpeg/HandBrakeCLI throughout the 30-second admission window and defers on an
+observed match or unavailable inventory, without changing memory thresholds.
+The explicit `host-activity-witness` profile extends the existing process-memory
+observer: bounded PID/start identities are recorded on the existing governor
+thread AFTER safety responses. No command lines, environments, open files or user
+content are inspected; no user process is stopped, paused or reprioritized.
+The captured-transition gate requires the corresponding passing preflight and
+rejects speed qualification if a listed transcoder appears in periodic records.
+An earlier match remains disqualifying even if the final scan is quiet; unknown
+or capped observations cannot certify isolation. Defaults remain unchanged.
+
+This is a best-effort name allowlist, NOT proof of a generally idle CPU/GPU/disk,
+complete between-poll coverage, process-specific swap ownership or an automatic
+workload scheduler. Post-admission detection is an acceptance veto, not a request
+to kill either workload. Sampling adds overhead to measured wall time. No model,
+MLX, weight, math, routing, cache, sampling or governor decision was changed here.
+
+Same744-source-manifest CPU-only live controls both PASS, numeric parent exits0:
+
+- No listed transcoder observed: 30.0297s preflight/16 inventories PASS;
+  parent31.9643s (20:07:41.030054 ->20:08:12.994358UTC). Memory-only admission
+  also passes; net swap growth0, actual swap-out376,832B (not zero).
+- Owned synthetic ffmpeg: silent lavfi audio to null output, no user media,
+  network, GPU or model. 30.0280s preflight/16 inventories identifies its exact
+  PID/start pair and returns DEFERRED_PRECONDITION/exit1, while memory-only
+  admission would PASS with zero net growth/churn. Parent positive-control
+  PASS31.9622s (20:10:32.513300 ->20:11:04.475480UTC). Only that owned test
+  process is stopped afterward; Plex/Tdarr and all user processes are untouched.
+
+Ten additional CPU-only inventories of526 processes measure median5.864ms,
+range5.087-16.586ms, total69.548ms. These are inventory costs on this host,
+NOT serving latency, in-model governor overhead, general host-idle proof or a
+speed win. Both control parents/drivers and owned ffmpeg are gone. All744 source
+hashes, unchanged start/end manifests, both result/preflight/log hashes and exact
+parent-child result equality verified BEFORE these docs edits; no timeout,
+parent signal, drift or missing result. Root remained>=16.215GB; no large writes.
+970 selected pure tests PASS13.93s before controls and13.69s on final rerun,
+including35 new inventory/window/redaction/preflight/observer/gate checks.
+No new Plex score or completed-model proof.
+
+Private logs/known_transcoder_isolation_{live,positive}_20260907.json SHA
+f71e160e6908fc6d8038b7b305e3e8b67df24721214e44e1b907dbaf4f283a2c /
+97df0e153f3149272172b3ead7cc6a98c0531f07e4a1eb3b46874042b386f5b4;
+preflight231f8e4e3bddd710d64f22185137b68cba452327263bc4a4ca1a4d74d66d0da1 /
+c9a81d826c65b4f211f60999bd6f90f418bab51d52b95d4105a7f94569ec8dfa;
+parentlog96c55195dd08f506e2191c45cb6001bae35c0b12768d34decb2dcc6160412717 /
+4c8a790ee67233e3030ffe94bf225bdd8703d58bc046efb361db381a06d92fc1.
+
+Next: use both admission and periodic activity witnesses for new performance
+gates, preserve Plex/Tdarr, and target remaining attention/expert native-memory
+pressure or held-out retrieval without answer leakage. No model job remains.
+Qwen full131 latest867.9482s/pressureFAIL; full134 Plex56FAIL; full GLM completed
+answers, heterogeneous full traffic, context ladder and sub90 goals remain OPEN.
+
 ## 2026-09-07 UTC: GLM Flash two captured shapes preserve complete outputs; pressure/latency not promoted
 
 Bounded same741-source-manifest ON/OFF test of expert-transition-tracking on the

@@ -128,6 +128,10 @@ def native_pressure_summary(log_text):
     result['passed'] = (result['minimum_available_bytes'] >= 5_300_000_000
         and result['swap_used_growth_bytes'] <= 16_000_000
         and result['actual_swap_out_growth_bytes'] <= 16_000_000)
+    if any('known_transcoders' in r for r in records):
+        from runtime.host_activity_witness import summarize_known_transcoders
+        result['known_transcoders'] = summarize_known_transcoders(
+            r.get('known_transcoders', {'available': False}) for r in records)
     return result
 
 
@@ -141,8 +145,12 @@ def run(config):
     assert pre['passed'] and pre['sample_seconds'] >= 30
     assert 0 <= time.monotonic() - pre['end']['monotonic_s'] < 120
     assert pre['end']['root_free_bytes'] >= 10_000_000_000
-    profiles = apply_runtime_profiles(config['profiles'], environ={})
+    profile_env = {}
+    profiles = apply_runtime_profiles(config['profiles'], environ=profile_env)
     assert profiles.profile_digest == config['profile_digest']
+    host_activity_required = profile_env.get('VMODEL_HOST_ACTIVITY_WITNESS') == '1'
+    if host_activity_required:
+        assert pre.get('known_transcoders', {}).get('passed') is True
     assert _port_is_free(config['port'])
     for path in [config['result'], config['server_log'], *[c['response'] for c in config['cases']]]:
         assert not Path(path).exists()
@@ -219,6 +227,10 @@ def run(config):
                 document['native_pressure'] = {'available': False, 'passed': False}
             if not document['native_pressure']['passed']:
                 failures.append('whole-arm periodic native pressure gate')
+            isolation = document['native_pressure'].get('known_transcoders')
+            if ((host_activity_required or isolation is not None)
+                    and not (isolation or {}).get('passed')):
+                failures.append('known-transcoder isolation gate')
             if rows:
                 first, last = rows[0]['row']['pressure_before'], rows[-1]['row']['pressure_after']
                 document['whole_arm_swap_used_growth_bytes'] = last['swap_used_bytes']-first['swap_used_bytes']

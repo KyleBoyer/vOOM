@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import shutil
 import time
@@ -134,9 +135,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--min-root-free-gb", type=float, default=5.0)
     parser.add_argument("--max-swap-growth-mb", type=float, default=16.0)
     parser.add_argument("--max-swap-out-growth-mb", type=float, default=16.0)
+    parser.add_argument("--require-no-transcoders", action="store_true",
+        help="Also defer if ffmpeg/HandBrakeCLI is observed anywhere in the sample window; read-only, not a general host-idle proof.")
     args = parser.parse_args()
     if args.sample_seconds < 0:
         parser.error("sample-seconds must be nonnegative")
+    if args.require_no_transcoders and (not math.isfinite(args.sample_seconds)
+                                      or args.sample_seconds > 3600):
+        parser.error("transcoder sampling window must be finite and at most 3600 seconds")
     for name, value in vars(args).items():
         if name.endswith(("_gb", "_mb")) and value < 0:
             parser.error(f"{name.replace('_', '-')} must be nonnegative")
@@ -146,7 +152,11 @@ def parse_args() -> argparse.Namespace:
 def main() -> int:
     args = parse_args()
     start = capture(args.workspace)
-    if args.sample_seconds:
+    host_activity = None
+    if args.require_no_transcoders:
+        from .host_activity_witness import sample_transcoder_window
+        host_activity = sample_transcoder_window(args.sample_seconds)
+    elif args.sample_seconds:
         time.sleep(args.sample_seconds)
     end = capture(args.workspace)
     decision = evaluate(
@@ -158,6 +168,12 @@ def main() -> int:
         max_swap_growth_bytes=int(args.max_swap_growth_mb * 1e6),
         max_swap_out_growth_bytes=int(args.max_swap_out_growth_mb * 1e6),
     )
+    if host_activity is not None and not host_activity['passed']:
+        decision['passed'] = False
+        decision['verdict'] = 'DEFERRED_PRECONDITION'
+        decision['admission_path'] = 'none'
+        decision['reasons'].append('known_transcoders_active' if host_activity['transcoders']
+                                   else 'transcoder_inventory_unavailable')
     result = {
         "schema": "voom.memory-preflight.v1",
         "sample_seconds": end.monotonic_s - start.monotonic_s,
@@ -172,6 +188,8 @@ def main() -> int:
         "end": asdict(end),
         **decision,
     }
+    if host_activity is not None:
+        result['known_transcoders'] = host_activity
     _atomic_json(args.result, result)
     print(json.dumps(result, indent=2, sort_keys=True))
     return 0 if decision["passed"] else 1
