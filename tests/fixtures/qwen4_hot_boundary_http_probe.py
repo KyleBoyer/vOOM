@@ -80,6 +80,22 @@ def _atomic_write_private(path: Path, document: dict) -> None:
             os.close(directory)
 
 
+def _atomic_write_turn_private(base_path: Path, turn: int, document: dict) -> Path:
+    """Publish each completed turn to its own immutable private receipt.
+
+    The one-shot result publisher deliberately refuses replacement. Reusing a
+    single progress path aborts a multi-turn evaluator on its second response.
+    Keep that protection and use distinct turn filenames, not a mutable result.
+    """
+    if type(turn) is not int or turn < 1:
+        raise ValueError("turn must be a positive integer")
+    base_path = Path(base_path)
+    path = base_path.with_name(
+        f"{base_path.stem}.turn-{turn:04d}{base_path.suffix}")
+    _atomic_write_private(path, document)
+    return path
+
+
 def _retained_prefix_witness(target, prompt_ids, *, expected_prefix, kv_type,
                              state_digest, metadata_digest):
     """Read only an existing complete aligned RAM prefix; never fork or copy it."""

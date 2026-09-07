@@ -1,5 +1,65 @@
 # STATUS — 2026-09-07 (current corrections first; dated chronology below is history)
 
+## 2026-09-07 UTC: full134 Plex attempt stops on progress-publication bug; no final score
+
+The source9d8e832 full-catalog attempt has FINISHED, overall FAIL. Two model
+responses completed, but my orchestration reused a single progress filename with
+the intentionally exclusive `_atomic_write_private` publisher. The second write
+raised FileExistsError after response two, before the profiler could consume it
+and continue to a final answer. This is an evaluation-orchestration failure, not
+evidence that the model failed Plex semantically. NO final Plex score is available;
+do not score the partial conversation or call it a completed harness pass.
+
+Installed uncensored Qwen FP8, original134 tools/system/history retained; explicit
+wire changes model/max1024/temp0/nonstream/no-reasoning/sequential-call. Storefalse
+was already captured. Synthetic pagination, no live tool execution or host policy
+adapter. These overrides apply to both partial timings below; not untouched wire:
+
+| Partial response | Input / output | Cached | HTTP wall | TTFT | Decode |
+|---|---:|---:|---:|---:|---:|
+| First tool turn | 49,231 /69 | 0 | 1115.2081s | 853.6997s | 243.9679s |
+| Second tool turn | 49,546 /56 | 49,152 | 288.6831s | 76.1035s | 212.0379s |
+
+Both HTTP responses naturally completed and retained all134 selected tools.
+Engine totals1097.6768/288.1463s, prefill853.6989/76.0401s; native accepted44/72
+and34/63 over24/21 sweeps. Logical prefill/decode store reads129028307840/
+372634040432B and87022796840/327917905056B; NOT physical NVMe bytes. Raw69/56-ID
+hashes74365c42...b9017f/b0c4c478...dd595d are preserved; no paired lossless or
+causal speed claim. Original response-two protocol payload was not saved before
+the exception; do not reconstruct its tool arguments from hashes.
+
+Pressure independently FAILS four checks: final available4204019712/3858595840B,
+first-turn swap-used+561709056B and swap-out+173572096B. Second-turn used swap
+declines50331648B and swap-out+11370496B. True Metal peaks7185395340/4894618119B
+pass8.5GB; this does not waive global pressure. All690 native self samples are
+available, no malformed/capped trace. Server's observed compressed-ledger balance
+peaks4224811008B, kernel-reported lifetime peak4416618496B, footprint11046720744B,
+RSS4480892928B; lifetime compressed-ledger credit reaches100139270144B. This
+confirms substantial compression charged to the server process, not just an
+unobserved-background hypothesis. These overlapping ledger views must not be
+added or interpreted as physical compressor/disk-swap bytes or an exclusive
+cause of latency/global swap. Next ownership work should inspect host-buffer
+lifetimes alongside Metal accounting; keep safety thresholds unchanged.
+
+Parent exit1/1407.0613s,13:40:58.635949->14:04:25.697163UTC; no timeout/signal/
+source drift/missing result. All723 source hashes and combined/parent/server log
+hashes verified before edits; all model/gate PIDs gone. Result
+logs/qwen4_full134_plex1024_process_memory_20260907.json SHA
+364834247fc4f05f69896854803d8b1e900c12e0e516d200b2a39a67e7be3a10;
+parent log30b1f766a92f0fa2bf42bf0620c83973d117e6255b3fa7fbc32b6b01ca7f53b3;
+server log77264cd8ac98a73a7b791ad3645f608727201601f7f8e058d2eaf730eccb851a.
+Root/external minima16.260/100.721GB; max child-tree RSS4.661GB.
+
+Repair: `_atomic_write_turn_private` gives each completed turn its own immutable
+0600 filename. Three consecutive publications and duplicate/invalid-turn refusal
+are regression-tested without weakening result overwrite protection.
+755 pure regressions pass in 13.24s on the repaired source. The next
+fresh v2 replay must use that helper and save each full protocol response in its
+private per-turn receipt before advancing; leave this failed artifact untouched.
+No runtime/model/profile/sampling change accompanies the orchestration repair.
+Full Plex score, varied-domain acceptance, large-context ladder and sub90 remain
+OPEN. Do not repeat unchanged; resume only with corrected per-turn publication.
+
 ## 2026-09-07 UTC: native process-memory timeline verified; next gate is completed full-catalog Plex
 
 New explicit/default-off `process-memory-witness` adds Darwin self-task footprint,

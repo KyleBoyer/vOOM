@@ -107,6 +107,31 @@ def test_failed_serialization_never_publishes_partial_artifact(tmp_path):
     assert not list(tmp_path.iterdir())
 
 
+def test_multiturn_progress_publishes_distinct_immutable_private_receipts(tmp_path):
+    base = tmp_path / "nested" / "replay.progress.json"
+    paths = []
+    for turn in range(1, 4):
+        document = {"turn": turn, "response": {"status": "completed"}}
+        paths.append(probe_module._atomic_write_turn_private(base, turn, document))
+        assert paths[-1].name == f"replay.progress.turn-{turn:04d}.json"
+        assert json.loads(paths[-1].read_text()) == document
+        assert stat.S_IMODE(paths[-1].stat().st_mode) == 0o600
+    assert not base.exists()
+    assert len(list(base.parent.iterdir())) == 3
+    before = [p.read_bytes() for p in paths]
+    with pytest.raises(FileExistsError):
+        probe_module._atomic_write_turn_private(base, 2, {"overwritten": True})
+    assert [p.read_bytes() for p in paths] == before
+    assert set(base.parent.iterdir()) == set(paths)
+
+
+@pytest.mark.parametrize("turn", [0, -1, True, "2", 1.5, None])
+def test_invalid_progress_turn_never_creates_an_artifact(tmp_path, turn):
+    with pytest.raises(ValueError):
+        probe_module._atomic_write_turn_private(tmp_path / "progress.json", turn, {})
+    assert not list(tmp_path.iterdir())
+
+
 class Prompt(str):
     token_ids = tuple(range(1611))
     stable_boundary_tokens = 1606
