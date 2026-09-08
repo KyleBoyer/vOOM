@@ -1,5 +1,112 @@
 # STATUS — 2026-09-08 UTC (current corrections first; dated chronology below is history)
 
+## 2026-09-08 UTC: Huihui finishes model-only Plex; 55/100, 25.3 minutes, pressure FAIL
+
+The corrected HOST_ROUTE=0 / host-render-off audit now completes all three
+responses without a memory retry. The quality-only retry permission was enabled
+but NOT exercised: this is no proof that a memory bottleneck was fixed.
+No model, runtime, profile or source changed during this measured run.
+
+Scope: original 178,616-byte, 134-tool capture retains input/history, schemas,
+streaming and reasoning; only model/max1024/temp0/seed64013 are overridden.
+Wire SHA f7c1c60c46e8ed5e88eabe9c43d8bdcc74755561e1b69ed8e5f116f2125ce318.
+The existing gateway still compacts model input/catalog; all-MXFP4 target,
+approximate 16:1024 prompt state and reassociated DeltaNet remain LOSSY.
+This is NOT full49K/full-schema model replay, released-BF16 or live Plex.
+The unchanged fixture appends two synthetic mixed pages; no real tool executes.
+
+| Response | HTTP wall | Prepared phases (tokens) | Prefill / decode | Actual public output |
+| --- | ---: | --- | --- | ---: |
+| Initial movie listing | 258.5892s | decision4924 + execution6339 | 104.9592s /150.7291s, summed phases | 41 |
+| Next movie page | 201.5106s | decision5194 + execution6609 | 103.7934s /97.4542s, summed phases | 43 |
+| Final answer | 1058.9319s | direct decision5469 | 55.4325s /1003.2751s | 488 |
+
+Complete Plex workflow 1519.0512s (25.32min), driver1519.5093s.
+All responses naturally complete below their1024 budget with model-authored
+provenance and raw-token witnesses. Hidden decisions add50/22 tokens beyond
+the572 public-output tokens:644 generated tokens across the five phases.
+Engine first-token metrics190.8587/136.6947/55.4831s are NOT client SSE-TTFT;
+public tool output is buffered until complete. All phases are cache_source=cold,
+zero prompt reuse/writes, fresh server; physical disk/OS cache is uncontrolled.
+
+Unchanged rubric **55/100 FAIL**; protocol completion PASS, no pending calls.
+The model itself paginated movie offset0 ->100, then stopped on final-page
+flags. It initially included a forbidden Kids-root movie and visibly corrected
+it later. The corrected list has the four eligible titles, but the contradictory
+earlier list remains in the user-visible answer: do not slice it away or call
+this a clean answer. All excluded titles are also named as exclusions.
+The legacy rubric deducts30 points for missing first-call all-media/rating
+arguments and15 for ANY mention of ineligible titles, including explicit
+exclusion discussion. These deductions are not45 independent semantic errors.
+The mixed fixture supplies shows even for movie-only calls, so this run cannot
+prove real two-media collection. Preserve55 and these limitations; do not
+rewrite the scorer/artifact or promote this profile on its corrected suffix.
+
+The first41 raw tokens/prepared6339 identity match the earlier independent
+initial-action runs. Different routing/host state makes258.6s versus111/122s
+NOT an optimization A/B. Native MTP final answer:330/626 proposals accepted,
+158 target sweeps,3.082 output tokens/sweep. Target weight wait615.1385s versus
+draft24.7887s; target head79.1759s, reservation97.1842s, page preparation38.0538s
+(includes36.3416s page reservation). Nested intervals are NOT additive.
+Final single-engine logical reads2,253,828,534,336B, of which decode
+2,239,606,435,008B; wasted prefetch53,080,153,152B /14.9254s. None of these
+counters measure physical disk reads. Drafting is not the dominant observed
+cost; another sidecar download is not justified by this result.
+
+Instrumentation defect found: per-phase weight_store_bytes_read was0 because
+the server read result top level rather than engine path_stats. Aggregate
+timing includes hidden decisions, but existing top-level I/O/MTP/witness fields
+belong to the exposed execution generation; don't infer whole-workflow reads
+from their sum. After receipt verification, fixed phase I/O to use path_stats
+with legacy top-level fallback and an explicit source/single-phase logical
+scope. Independent phase snapshots and precedence/no-double-counting have
+six new pure tests. **588 selected pure tests PASS3.96s**, including the entire
+pure server adapter suite. This is an instrumentation correction, not a timed
+speed win; a new live phase-I/O witness is still required. Historical zeros
+remain in the immutable receipts and must not be treated as no-read evidence.
+
+Pressure FAIL despite completed output:752 periodic samples, minavailable
+4,963,844,096B, observed actual swap-out80,461,824B, net-used growth0.
+Whole HTTP interval actual swap-out82,542,592B; final response58,474,496B,
+terminalavailable5,203,279,872B. Native footprint4,086,156,600B /
+compressed1,772,896,256B. Exposed per-engine true Metal peaks
+2,691,675,624 /2,493,010,984 /2,680,431,080B pass8.5GB, but are not a
+complete hidden-phase peak proof. Known-transcoder witness PASS752 inventories/
+none, not general host-idle or process-attribution proof. Fresh30.0279s
+preflight PASS/end6.659GB/swap-out671,744B/net0; root/external minima
+16,168,398,848B /100,618,887,168B. No floors weakened, apps killed or data deleted.
+
+Parent FAILexit1/1521.3547s,03:24:11.879180 ->03:49:33.233891UTC;
+server-15 expected cleanup; PIDs88068/88085/88087 gone. All762 source hashes,
+identical start/end manifests, recomputed tree, parent/result/server/preflight/
+metadata, all three0600 responses and immutable progress prefixes verified
+BEFORE edits. Offline replay of exactly those responses reconstructs every
+effective request, original prefix/catalog, calls, rubric and completion.
+No timeout, source drift, missing result or supervisor signal.
+
+NEXT: no unchanged25-minute rerun. Use the new phase accounting in the next
+controlled quality comparison: disable only approximate mixed-depth state
+while retaining the same MXFP4 target, model-only routing, full captured wire
+catalog and1024 budget. This remains quantized/gateway-transformed, not BF16
+lossless. Record natural full answers and pressure; then test held-out domains
+and tool shapes before any promotion. Separately audit actual phase-boundary
+ownership before reclamation changes: cold generation replaces last_kv before
+prefill, and MTP needs that endpoint during bootstrap; the earlier hot-only
+cleanup observation is NOT a confirmed leak. Defer GLM/FlashNext work.
+
+Private run huihui_plex_quality_retry_max1024_20260908; source
+d001cd1f162c3efa58e93d4254152b018dc38de5; tree
+9180cd9da7515dbc6b1722679abf642b00b885c41bafd2e45116180fec4bc509;
+profile3c387f8e44d69fe98b3f294e4e00c7d0516ce2a27e471312c6c9fb3cb25bddad.
+Result39e567262147ff3ef5cd9c2d4563e96d28a7e8f77a70d3ada319b3e875ab3a85;
+parentlog3f70a9c67c7b7150d1b4d3c25980fa9cb88ca45d1fd07fd74d924d523020b0a6;
+server9c6a920364581a6b35cc6345505e382d7fa5cd9e0f3e9cf712cfc59d875951bb;
+preflight740c1f88f698b3c2b2f9f0293f4de8ccd73f28c427488b6a3ac7a4e19cdd58e6.
+Response hashes in turn order:
+e0ef5346f7fd0e2b42858d4cfc2e6fa70d925d371a9f1c7691a5f304722b3b45 /
+d275c9966e5c1fd3b5dfa05a3a788525ac459108829f46f2e7c017b208cf52fe /
+e0b9b16f782ab76dfdf268a3dc193d08eda4ae2c581cd2411ae5fc2b303be8a4.
+
 ## 2026-09-08 UTC: corrected model-only route reaches the memory guard before public output
 
 Reran the SAME captured134-tool HTTP request with the corrected explicit

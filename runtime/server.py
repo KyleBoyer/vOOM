@@ -9616,6 +9616,12 @@ class _HiddenDecisionStream:
 def _cache_phase_telemetry(name: str, phase_result: dict) -> dict:
     """Stable per-inference cache accounting for multi-phase Responses calls."""
     stats = phase_result.get("path_stats") or {}
+    # StreamingEngine/MTP report request-local reads in path_stats, not at
+    # result top level. Match _vision_protocol_timing's precedence; never add
+    # both copies or silently attribute the execution phase to the decision.
+    io_key = "weight_store_bytes_read"
+    io_source = ("path_stats" if io_key in stats else
+                 "result" if io_key in phase_result else "unavailable")
     phase_prompt_tokens = int(phase_result.get("prompt_tokens", 0) or 0)
     cached = min(phase_prompt_tokens, int(
         stats.get("prompt_cache_prefix_tokens", 0) or 0))
@@ -9642,7 +9648,9 @@ def _cache_phase_telemetry(name: str, phase_result: dict) -> dict:
             phase_result.get("total_s", 0.0) or 0.0), 4),
         "output_tokens": len(phase_result.get("tokens", ())),
         "weight_store_bytes_read": int(
-            phase_result.get("weight_store_bytes_read", 0) or 0),
+            stats.get(io_key, phase_result.get(io_key, 0)) or 0),
+        "weight_store_bytes_read_source": io_source,
+        "weight_store_bytes_read_scope": "single_engine_phase_logical_not_physical",
         "cache_lookup_seconds": round(float(
             stats.get("prompt_cache_lookup_s", 0.0) or 0.0), 4),
         "admission_evicted_slots": int(stats.get(

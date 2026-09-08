@@ -5391,6 +5391,36 @@ def test_cache_phase_telemetry_keeps_hidden_phases_separate():
     assert execution["execution_profile"]["level"] == "layers"
 
 
+@pytest.mark.parametrize("result,expected,source", [
+    ({"path_stats": {"weight_store_bytes_read": 123}}, 123, "path_stats"),
+    ({"weight_store_bytes_read": 456}, 456, "result"),
+    ({"weight_store_bytes_read": 456,
+      "path_stats": {"weight_store_bytes_read": 123}}, 123, "path_stats"),
+    ({"weight_store_bytes_read": 456,
+      "path_stats": {"weight_store_bytes_read": 0}}, 0, "path_stats"),
+    ({}, 0, "unavailable"),
+])
+def test_cache_phase_reads_use_engine_stats_without_double_counting(result, expected, source):
+    import copy
+
+    original = copy.deepcopy(result)
+    phase = _cache_phase_telemetry("gateway_decision", result)
+    assert phase["weight_store_bytes_read"] == expected
+    assert phase["weight_store_bytes_read_source"] == source
+    assert phase["weight_store_bytes_read_scope"] == "single_engine_phase_logical_not_physical"
+    assert result == original
+
+
+def test_cache_phase_io_snapshots_do_not_reuse_the_other_phase():
+    decision = {"path_stats": {"weight_store_bytes_read": 101}}
+    execution = {"path_stats": {"weight_store_bytes_read": 202}}
+    first = _cache_phase_telemetry("gateway_decision", decision)
+    second = _cache_phase_telemetry("gateway_execution", execution)
+    decision["path_stats"]["weight_store_bytes_read"] = 999
+    assert first["weight_store_bytes_read"] == 101
+    assert second["weight_store_bytes_read"] == 202
+
+
 def test_responses_stream_emits_terminal_failure_instead_of_truncated_sse():
     import io
 
