@@ -1,5 +1,37 @@
 # STATUS — 2026-09-08 UTC (current corrections first; dated chronology below is history)
 
+## 2026-09-08 UTC: prefill page-refusal context instrumented; admission policy unchanged
+
+Read-only audit confirms layer-stationary Qwen prefill calls reserve(page)
+with the governor's default400MB margin, whereas serial verification's
+explicit exact-page mode uses its separately selected one-position margin.
+Prefill separately admits learned compute scratch after page fetch. This does
+not establish that400MB can safely be removed: page materialization lifetime
+and multi-position compute are not covered by the decode-only proof.
+
+Added failure-only [qwen35-prefill-page-admission] JSON before page fetch:
+zero-based layer, full sweep positions, tile width, architecture signature,
+estimated page bytes, selected learned compute scratch/margin, matching-shape
+observation count, and existing non-atomic Metal/system/cache/native-process
+memory sample. Missing probes remain unavailable/null. Logical cache bytes and
+post-refusal observations are not ownership attribution or a physical page-load
+peak measurement. No tensor/token/prompt content is logged.
+
+The original MemoryError is re-raised unchanged even if observation,
+serialization or logging fails. Successful admission performs no new memory
+sampling/logging. Same prepare/reserve/fetch order, same default margin,
+no additional retries, allocations, device sync/peak resets or cache clearing.
+No runtime/quality/prompt/sampling default changed and no new speed claim.
+
+580 pure tests PASS4.42s, including7 new checks executing the actual extracted
+guard AST without importing MLX or loading a model. Cover unchanged success
+kwargs/order, matching-shape metadata, unavailable probes, diagnostic failures,
+original exception identity and no device mutation. No model job launched in
+this bounded instrumentation tranche. Next: fresh-preflight diagnostic to
+collect the refusal context plus actual page/compute lifetime evidence before
+any change to admission. Large-catalog/model-only Plex and clean pressure
+qualification remain open; Huihui27B remains priority.
+
 ## 2026-09-08 UTC: stricter Huihui headroom refuses prefill; retry reporting repaired
 
 huihui_direct_hermes_factors_headroom_20260908,sourcefd97d6775507547712c396e0372dd0c78b83277a,

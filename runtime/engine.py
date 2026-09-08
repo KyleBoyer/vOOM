@@ -6855,10 +6855,43 @@ class StreamingEngine:
                 if incoming_page:
                     self.cache.prepare_for(incoming_page)
                     if self.governor is not None:
-                        self.governor.reserve(
-                            incoming_page,
-                            reason="qwen-prefill-layer-page",
-                        )
+                        try:
+                            self.governor.reserve(
+                                incoming_page,
+                                reason="qwen-prefill-layer-page",
+                            )
+                        except MemoryError:
+                            # Failure-only observations: do not substitute the
+                            # verifier's one-position margin for prefill, retry
+                            # the allocation here, or alter the refusal itself.
+                            try:
+                                import json
+                                from .phase_head_witness import sample_phase_head_memory
+
+                                signature = self._transient_layer_signature(i)
+                                context = {
+                                    "schema": "voom.qwen35-prefill-page-refusal.v1",
+                                    "layer": i,
+                                    "positions": transient_shape_positions,
+                                    "tile_width": tile_width,
+                                    "signature": signature,
+                                    "estimated_page_bytes": int(incoming_page),
+                                    "page_margin_source": "governor_default",
+                                    "selected_compute_scratch_bytes": int(self._layer_transient),
+                                    "selected_compute_margin_bytes": int(self._layer_transient_margin),
+                                    "matching_compute_observations": int(getattr(
+                                        self, "_layer_transient_observation_counts", {}
+                                    ).get((transient_shape_positions, signature), 0)),
+                                    "memory": sample_phase_head_memory(self, mx),
+                                    "scope": "after_refusal_before_page_fetch; non-atomic observation, not allocation attribution",
+                                }
+                                print("[qwen35-prefill-page-admission] " + json.dumps(
+                                    context, sort_keys=True, allow_nan=False), flush=True)
+                            except Exception:
+                                # Optional diagnostics cannot replace the
+                                # original MemoryError or make a failed gate pass.
+                                pass
+                            raise
             w = self.cache.get(layer_key, layer_names)
             if self._dsv4_packed_trunk:
                 w = self._materialize_packed_trunk(w)
