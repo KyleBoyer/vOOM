@@ -1,5 +1,68 @@
 # STATUS — 2026-09-08 UTC (current corrections first; dated chronology below is history)
 
+## 2026-09-08 UTC: same-profile pressure retry preserves tokens but fails again
+
+`huihui_factor_head_release_pressure_retry_20260908` on
+`ce01d01724189a55a1c3e0526adf2c985cf140e6` is independently verified.
+The unchanged two original short captures complete in **50.2259s weather**
+(111 prepared / 23 output tokens, grammar stop) and **22.3395s title**
+(92 / 2, EOS). All 24/25 per-request checks and all-phase prepared/raw
+token, text, budget and termination identities match the passing source534fd43
+reference. Original 359B/487B inputs, tools, streaming and reasoning are retained;
+only model/max1024/temp0/seed64013 wire overrides. Explicit MXFP4, reassociated
+prefill and Hermes prompt transformation remain. This is not released-BF16,
+full Plex, the 134-tool harness, large-context or long-output validation.
+First request uses a fresh server; second is same-process uncached. Neither
+reuses prompt KV, and the OS file cache/other host activity is uncontrolled.
+
+Factor-boundary physical release repeats exactly: 675430400B on each of
+3 weather / 1 title partial-prefix restorations, matching cache accounting and
+every phase's counters. MTP accepts 17/20 and 1/4; scalar restoration takes
+0.3099453s / 0.0524779s. No retries, host execution or answer repair.
+Engine first-token 17.2020s / 16.1159s; prefill 17.2010s / 16.1157s;
+decode 30.5037s / 6.1480s; total engine 47.7062s / 22.2641s.
+First-token figures are engine metrics, not wire SSE-TTFT. True Metal peaks
+2311216897B / 1313317928B. Logical weight reads 85385222464B /
+27866926976B are not physical disk traffic. Slower HTTP observations do not
+isolate a code regression; this repeat has unchanged runtime code.
+
+**Overall FAIL again**, solely periodic minimum available memory:
+5228363776B versus the unchanged 5300000000B requirement, 71.64MB short.
+Minimum sample2 follows prefill layer-page cache shedding: Metal active
+69560360B, cache budget64000000B, native footprint944768704B and compressed
+300498944B. The snapshots are non-atomic; low available/low active has now
+recurred, not evidence of a model leak or permission to weaken the gate.
+Across35 samples, peak native footprint2086324600B, compressed739360768B,
+actual swap-out6979584B (whole HTTP7061504B), net swap growth0.
+Known-transcoder inventory passes16 preflight /35 runtime samples, not general
+host-idle proof. Fresh30.0354s preflight passes with zero preceding-window
+swap growth/churn. Driver72.9127s / parent74.7374s is the failed short arm,
+not completed full-harness latency. Root/external free minima17240813568B /
+100496318464B; internal fast tier62512074752B. No user data/apps touched.
+
+All776 source/start-end/fresh-tree, capture/wire/reference/response identities,
+recomputed checks and positive physical-release counters, result/log/preflight
+receipts independently verified BEFORE edits. PIDs34267/34271/34273 gone;
+server-15 is normal cleanup. No model job remains. No runtime/profile changes;
+the previously tested790 pure +116 MLX/mocked tests remain scoped to that code.
+
+Next: stop blind identical retries. Inspect system-snapshot age and cache
+reclamation timing at the prefill reserve boundary; add narrowly bounded,
+phase-aligned read-only native/Metal/allocator observations if missing.
+Keep all failures and existing floors; obtain pressure-qualified short proof
+before another expensive full Plex workflow. Full Plex score and under90s
+remain OPEN. Do not promote defaults or claim a speedup from these short runs.
+
+Tree c1eb57a2470c4cf4434419bff3f4acc2a04677fccf01e6bcb58e98660e97fb74;
+result 6bf5206fc4853679517f7a1411d7269b1037f0bb3f042cb3455394659ff1c741;
+receipt d8b7856cee2061172dda2ccccdec1f873a7f43cfc516aef87c48a404e13fdb21;
+parent log f24546ed398371e1d4a9f77a4d3e6493b455c0b9dab3343e7ce5228f9bfc54e2;
+server 38cf85dfae9bb19b5118bec46ad52b3d8fbcd899dcd37e2fb944ef604ba59ff1;
+preflight 122ed80e3cbe09440884f1c3c409675f243958d15b390430e70f45935614e3bb;
+weather 54b5ed858fed898f2840ec99f04065e122188c03701e658cb7b6937a7f563768;
+title 27950f63b453baa4c588bb4ceb3a36d0f83a5349877f13d97e349087a1c8de33.
+
+
 ## 2026-09-08 UTC: factor-boundary head release measured; token checks pass, pressure does not
 
 huihui_factor_head_release_captured_shapes_20260908 on
