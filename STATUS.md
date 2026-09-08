@@ -2,6 +2,27 @@
 
 ## 2026-09-08 UTC: flat Huihui scalar-factor MTP rollback implemented, default-off
 
+Final dc45eab52b54160bf7dda46acfb33027f30fde66 rerun:99 focused MLX/mocked
+tests PASS0.88s, plus150 pure profile/provenance/phase checks PASS0.74s.
+Includes the new switch's live EngineManager cache-key reconstruction test.
+MemoryError diagnostics now report bounded partial factor counts/logical bytes
+before cleanup; these are not physical allocation attribution. Short-capture
+gate gains explicit factor/full-state witnesses and optional history protection;
+legacy transition-history checks remain intact when that file is supplied.
+
+Final unit run huihui_scalar_rollback_final_units_20260908:
+fresh30.0301s preflightPASS (983,040B prior-window churn); driver1.070115s,
+parent3.421480s, Metal32,279,670B, endavailable6,603,866,112B, actual interval
+swap-out49,152B, net0. All766 source/start-end/tree/result/log/preflight hashes
+verified before notes; PIDs25069/25073 gone. Tree
+96421c19258b015fff15734ad0463e73ecb2d83b7fdf924de1a382dcff9fcc18;
+resulte37e92a292a8c709c3a7bfd232e4d2b7f67faca5a57807874ddc56efa146c893;
+loga8a0f6f472dc31942bda9e9894c6a118477f7c433630caa57a8af7e90a6bb89a;
+preflight4f84706105bc604756a492489665a646c5320bd7af1601c5b6c6a5e985f400dd.
+Next bounded jobs are huihui_scalar_dense_captured_shapes_20260908 then
+huihui_scalar_factors_captured_shapes_20260908, each requiring its own fresh
+30s preflight and the same source manifest. No real speed/score claim yet.
+
 New explicit VMODEL_QWEN_MTP_COMPACT_KDA_ROLLBACK=1 and profile
 huihui-qwen38-27b-full-state-factors-audit retain one immutable base plus
 captured scalar updates instead of all strict-prefix recurrent endpoints.
