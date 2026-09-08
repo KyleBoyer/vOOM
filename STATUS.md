@@ -1,5 +1,40 @@
 # STATUS — 2026-09-08 UTC (current corrections first; dated chronology below is history)
 
+## 2026-09-08 UTC: underfull-cache admission bug repaired; real replay deferred for Plex
+
+Repaired pressure.reserve()'s zero-release early exit. A budget shrink that
+does not yet reach resident bytes is no longer treated as proof of an empty
+cache. WeightCache.can_reclaim_to(floor) checks resident bytes and real pin
+flags under one lock, without nested public-property locks or mutation.
+Only confirmed absence of further permitted victims short-circuits. Unknown
+or unavailable metadata continues bounded reclamation to the unchanged floor.
+Actual live Metal/system admission is still sampled after each eviction and
+remains fail-closed. True-empty/pinned-only debounce, original400MB margin,
+prefetch pause, concurrent-pressure protection and restoration accounting
+remain intact. No target arithmetic/weights/prompt/sampling/default profile
+change; this is a shared memory-governor robustness correction.
+
+Before the fix, all4 new named-admission reproductions fail with the recorded
+1.64GB active/1.6177GB resident/2.2GB budget geometry. After the fix they
+reclaim266624456B in3 budget steps and admit under the SAME live ceiling,
+preserving only the actual productive budget reduction. This is fake-cache
+control-flow evidence, NOT measured physical reclamation or completed tokens.
+24 new pure cases cover each named family, underfull residency, pinned-only
+debounce/refusal, missing/malformed/unavailable metadata, bounded floor
+refusal, concurrent pressure, untouched fast path and lock-safe real-method
+pin/floor checks. 628 pure tests PASS10.17s,123 profiles validate,diff clean.
+
+No real model job launched. Fresh30.0248s preflight
+logs/huihui_underfull_cache_fix_20260908.preflight.json correctly defers solely
+for active Plex transcoders72123/72218 across16samples. Endavailable
+7257767936B, swapout8257536B, net0, root17026174976B,
+external100523175936B. All user apps/data preserved. No new speed/Plex claim.
+Next: fresh passing preflight then rerun the SAME all-prompt phase-head
+profile/captures/max1024/temp0/seed64013 against the saved naturally completed
+scalar reference, with updated source identity and fresh artifact paths.
+Keep every prior path/token/completion/pressure gate; verify all receipts
+before edits. Full Plex and heterogeneous larger prompts remain pending.
+
 ## 2026-09-08 UTC: phase-head deferral observed; underfull-cache early-exit blocks prefill
 
 huihui_phase_head_allprompts_retry_20260908 on cfa9cdb is a verified FAIL:

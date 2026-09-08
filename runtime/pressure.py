@@ -232,6 +232,24 @@ class MemoryGovernor:
             self.prefetcher.paused = paused
         self.paused_prefetch = paused
 
+    def _cache_can_reclaim_to_floor(self) -> bool:
+        """Unknown metadata must continue the bounded shrink/refusal path.
+
+        WeightCache supplies an atomic residency/pin hint. Lightweight cache
+        adapters without it can establish only that residency is already at
+        the configured floor; positive underfull residency is not empty.
+        This hint never authorizes an allocation: reserve still samples the
+        actual live ceiling after every eviction and refuses if it cannot fit.
+        """
+        try:
+            probe = getattr(self.cache, "can_reclaim_to", None)
+            if callable(probe):
+                return probe(self.floor) is not False
+            resident = getattr(self.cache, "total_bytes", None)
+            return not (type(resident) is int and 0 <= resident <= self.floor)
+        except Exception:
+            return True
+
     def reserve(
         self,
         incoming_bytes: int,
@@ -320,6 +338,9 @@ class MemoryGovernor:
                   flush=True)
             mx.clear_cache()
             active, available, ceiling, projected = sample()
+            # A zero-release shrink may only have closed unused budget slack:
+            # 2.2->1.87GB does not evict a 1.62GB resident cache. Stop only when
+            # no further permitted eviction can help, not on zero release alone.
             # Once a named/reversible admission finds no evictable cache bytes,
             # lowering the cache limit again cannot free any memory. The real
             # 46.8K GLM trace repeated the remaining 14 budget steps for each
@@ -330,7 +351,8 @@ class MemoryGovernor:
             # short-lived high-water; safety thresholds and fail-closed refusal
             # remain unchanged.
             if (released == 0 and reversible_admission
-                    and projected > ceiling):
+                    and projected > ceiling
+                    and not self._cache_can_reclaim_to_floor()):
                 self.reservation_zero_release_short_circuits += 1
                 zero_release_short_circuit = True
                 break

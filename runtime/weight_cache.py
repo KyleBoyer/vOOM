@@ -381,6 +381,17 @@ class WeightCache:
         with self._lock:
             return self._total_bytes
 
+    def can_reclaim_to(self, target_bytes: int) -> bool:
+        """Whether a lower limit can evict a resident, non-pinned page now.
+
+        A point-in-time scheduling hint, not allocation admission or a promise
+        that eviction releases Metal memory. Keep the residency and pin check
+        under one lock; public byte properties acquire this same lock.
+        """
+        with self._lock:
+            return (self._total_bytes > max(0, int(target_bytes))
+                    and any(not page.pinned for page in self._pages.values()))
+
     @property
     def pinned_bytes(self) -> int:
         with self._lock:
