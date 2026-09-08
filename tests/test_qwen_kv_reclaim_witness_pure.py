@@ -40,7 +40,10 @@ def phase(value):
 
 def response(*values):
     phases = [phase(v) for v in values]
-    return dict(vmodel_cache_phases=phases, vmodel_timing=copy.deepcopy(phases[-1]))
+    timing = copy.deepcopy(phases[-1])
+    # Match the real protocol: the budget exists on each phase, not flat timing.
+    timing.pop('paged_kv_budget_bytes')
+    return dict(vmodel_cache_phases=phases, vmodel_timing=timing)
 
 
 def log(*rows):

@@ -87,15 +87,18 @@ def phase_checks(response, timing, *, budget_bytes):
     valid = isinstance(phases, list) and bool(phases)
     key = 'qwen35_serial_kv_reclaim'
     enabled = key + '_enabled'
-    def witnessed(value):
+    def witnessed(value, *, require_budget=True):
         return (isinstance(value, dict) and type(value.get(enabled)) is int
             and value[enabled] == 1
-            and type(value.get('paged_kv_budget_bytes')) is int
-            and value['paged_kv_budget_bytes'] == budget_bytes and key in value
+            and (not require_budget or (
+                type(value.get('paged_kv_budget_bytes')) is int
+                and value['paged_kv_budget_bytes'] == budget_bytes)) and key in value
             and valid_trace(value[key], budget_bytes=budget_bytes))
     complete = valid and all(witnessed(phase) for phase in phases)
+    # The existing protocol carries KV budget on phases, not flat timing.
+    # Keep every phase's budget mandatory; compare flat trace/flag separately.
     return dict(all_phase_serial_kv_reclaim_witness=bool(complete),
-        final_serial_kv_reclaim_trace_matches=bool(complete and witnessed(timing)
+        final_serial_kv_reclaim_trace_matches=bool(complete and witnessed(timing, require_budget=False)
             and timing[key] == phases[-1][key]))
 
 
