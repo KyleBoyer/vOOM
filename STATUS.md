@@ -1,5 +1,58 @@
 # STATUS — 2026-09-08 UTC (current corrections first; dated chronology below is history)
 
+## 2026-09-08 UTC: phase-head deferral observed; underfull-cache early-exit blocks prefill
+
+huihui_phase_head_allprompts_retry_20260908 on cfa9cdb is a verified FAIL:
+weather HTTP5.4431s, driver5.8033s, parent7.6712s. Five of64 prefill layers
+complete before observed memory_retry; no terminal response/title/token
+comparison/Plex score. Not a5.44s completed request. All-length profile is
+still experimental and unqualified; no safety margin or output cap changed.
+
+Failure context proves the initial head was deferred: pinned cache10240B
+(norm only), versus675440640B in the prior short-path refusal. However,
+ordinary cache holds1617699456B with2200000000B budget. Active1642572264B,
+incoming213873879B, margin400000000B, available6016663552B, ceiling~2.06GB;
+the requested projection~2.26GB refuses. The sampled selected compute scratch
+48974764B has4 matching111-position linear_attention+dense observations.
+This failed-prefix snapshot is not a full-request peak/pressure proof.
+
+Read-only source audit finds a concrete early-exit bug in pressure.reserve():
+its reversible-admission loop treats the first released==0 shrink as proof
+that no cache can be reclaimed. Here budget2.2->1.87GB still exceeds actual
+resident1.6177GB, so no eviction was even required. The loop breaks, then
+restores2.2GB on refusal despite non-pinned pages remaining. Zero bytes
+released from an UNDERFULL budget is not evidence of an empty/unreclaimable
+cache. WeightCache._evict_to_locked correctly returns early while resident
+bytes already fit the requested budget.
+
+CPU-only deterministic reproduction using the existing fake-governor test
+helpers and measured values: named qwen-prefill-layer-page refuses after
+one zero-release shrink; existing unspecified-reason path continues through
+1.5895GB then1.351075GB, releases266624456B and admits under the SAME live
+ceiling/incoming/margin. This is synthetic control-flow evidence, not a
+physical allocation/token proof. No runtime fix applied in this bounded run.
+Next: repair the zero-release guard to stop only when no further permitted
+eviction can help (floor or known absence of victims), preserving true-empty
+cache debounce and fail-closed/pinned/concurrent-pressure semantics. Add
+underfull/pinned/unknown-metadata regressions and rerun the same profile only
+after those gates; do not hide the bug by switching reason strings or lowering
+the400MB margin. Avoid another model retry before this repair.
+
+Fresh30.0272s preflightPASS: endavailable6575669248B, swapout2375680B, net0,
+no listed transcoders across16samples. Plex Commercial Skipper remained
+running/untouched; same-PID native I/O observed0B/30.0100s, disk4 aggregate
+0.20MB/30s. This allows a bounded memory/path diagnostic, not isolated speed
+qualification or proof of general host idleness. Two periodic model samples:
+min5828362240B, swapout229376B (wholeHTTP622592B), net0; incomplete prefix only.
+All772 source/start-end/tree/artifact/capture/wire/reference checks verified
+BEFORE edits, PIDs65617/65634/65636 gone. Root/external minima
+17189433344/100525449216B. No model/app/data deletion or large write.
+Tree278222e170fe56148b7c8fa46c53e7bb01b9a03b37bd72e5d57cb8e48a8477f4;
+resulte92d9ba630c1181556a4a76242c89d6a2514be1901e6e5975d67f26279f797a2;
+log1cb15654782bd45a43b0a79e4fe31de8847a0bb88bf4b125df46591050f6b594;
+server9201fae94b762d6a5baa92f2b1a341e128b835bd9524f21aaeece88e97801866;
+preflight2dec064263996fac3bc5bb479b7eb065df202cb75259255d9f2706bf8fa2e852.
+
 ## 2026-09-08 UTC: Huihui phase-head profile ready; real launch safely deferred for Plex
 
 Priority is Huihui Qwen3.8-27B-abliterated; GLM/Flash Next remain deferred.
