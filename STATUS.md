@@ -1,5 +1,89 @@
 # STATUS — 2026-09-08 UTC (current corrections first; dated chronology below is history)
 
+## 2026-09-08 UTC: extra-budget continuation fails despite clean pressure; prompt visibility verified
+
+`huihui_saved_budget_extension_20260908`, clean/pushed
+8f58531267a48a7af6428ebae13104c06013f95c, is independently verified **FAIL**.
+This is the explicitly EXTRA-BUDGET sixth HTTP from the preceding entry's
+hash-pinned reconstruction, not an original-workflow replay or repaired pass.
+Same 184657B/134-tool request, max1024/temp0/seed64013, full-prepared-state
+MXFP4/reassociated-prefill/Hermes/gateway/top-up profile and unchanged synthetic
+mixed-page queue [0,1,1,1,1]. The five preceding HTTPs' process/cache history
+is omitted in a fresh server; OS file cache and general host state are uncontrolled.
+No live Plex, released BF16, full-schema model computation or end-to-end speed claim.
+
+HTTP **503.9541s**, driver504.2947s /parent506.7862s. Only failed acceptance
+check: `terminal_answer_without_pending_calls`. The model emits another
+`plugin__plex__plex_list_library_media` call with mediaType=movie,
+ratingOperator=lte, ratingValue=PG-13, limit=500, offset=1000; no terminal text.
+It is a naturally completed model-authored call, not max-output truncation.
+No final-answer Plex score exists (`final_plex_score:null`); no partial rubric
+is assigned by this diagnostic. No further HTTP/tool execution follows.
+
+Hidden/public input/output are6132/17 and7067/59, each max1024 with natural
+grammar termination, cold per-phase KV caches and zero cached tokens.
+Hidden prefill142.3420s/decode51.5479s; public157.6427s/149.5659s.
+Prefill totals299.9847s; decode201.1138s. Engine-reported first token351.5355s
+is NOT independently measured wire SSE-TTFT. Public MTP accepts37/84 proposals,
+draft3.7550s, target weight wait86.4591s. Logical weight reads440,050,777,664B
+are NOT physical disk bytes. Hidden/public KV reload1.3457s/6.0845s and
+spill0.1081s/0.1046s; KV I/O alone cannot explain the hundreds of seconds.
+ZERO admission refusals, retries, serial-reclaim/top-up events; all state/path/
+phase/head/factor/witness checks pass. Unused top-up is not a demonstrated win.
+
+Strict pressure PASS:249 native samples, min available5,423,710,208B,
+max footprint3,949,497,536B/compressed861,601,792B; max Metal2,330,564,394B.
+Periodic swap-out13,221,888B; whole-HTTP13,533,184B; net growth0.
+All249 known-transcoder samples pass, not general host-idle or swap attribution.
+Fresh30.0318s preflight passed with available7.0723 ->7.1382GB, zero swap
+growth/churn and16 known-transcoder samples. Root/external free minima
+20,647,186,432B/100,212,989,952B; internal tier62,512,074,752B.
+5.6GB reserve/400MB page margin/256MB BF16 KV, apps/data and defaults unchanged.
+One passing run does not prove all host pressure is solved.
+
+All792 source start/end/fresh manifests and config/model/capture/request/
+response/progress/receipt identities, pressure and acceptance math verified
+BEFORE edits. No source drift, timeout/signal/spawn/child-result error.
+PIDs67281/67285/67287 gone; session8587 drained exit1; server-15 ordinary cleanup.
+Tree e4a34deae744962da5044bbfe6f16d4ef23c2de0f66cc40447c2fe2bab181853;
+result87fe5cb66b0a5a3fa3bb2c58e581d30935a75abc04020dbdd0ef7ac816f18c8d;
+receipt8cc4d15db809ffc2d3a96d48ed4cb49c43b0613211be8a1f22d4614d21145591;
+parentlog8cb376b5412a7a3f095af7eb11e6513601bd00d1c0d47eab414b615c738fd008;
+server2f9386e031390cce60bcc6e3c1d104e6010cda4126d15c3c70478864ef05a1a6;
+response776914b85db4eda8c9d0ba0fa6ccaf619eadb8cf28d7a77e34cab4a590642534;
+preflight64e045fee801d0e470bdfa260d4bf6f0e43cd4d8035ac29bfe53d897be5e47b1.
+
+A tokenizer-only follow-up reconstructs BOTH prepared prompts from the pinned
+request using current protocol/template helpers. It imports no MLX or model
+weights, sends no HTTP, and executes the exact schema-only AST definitions
+from structured.py (no fake schema validation). Whole prepared-token counts/
+SHA-256 match the recorded generations:
+decision6132/e530fa80d94d06f3059b64575bc05edb0f1fe9b7b5600f090ffd7f2614da5515;
+execution7067/76838fa932bd8de0016bf0d39e9a555820a206ed33773fcf3d7e72d051ffdea1.
+ALL five original tool-result strings appear intact in both prompts, with
+multiplicity1 for page0 and4 for page1. Pagination states are true/false/false/
+false/false. The decision policy allowing a direct answer after tool results
+is present. Thus prompt preparation did NOT drop the final-page results in
+this run. The selector itself chose enable-tools; the subsequent execution
+phase's existing required-call constraint is not evidence of a forced selector.
+This is prompt-visibility proof, not an independent whole-model state/quality oracle.
+Private local audit files: logs/huihui_saved_budget_extension_20260908.prompt_audit.py
+(f7af44d3042571b982add9c7a09d401100a74b2141c25b7aea13ccb7dee4135c) and .json
+(deb211bf001356f909fc1b7973e00b7210e9780d10e5e9eceb1e8379e60e6180).
+
+Stop further budget-extension runs: one more turn did not finish, though this
+does not prove an infinite loop. Next bounded work should isolate selector
+stopping/grammar behavior across different tool-result and multi-action shapes,
+including cases needing another action after a completed page. Do not blindly
+enable the previously failed generic terminal-synthesis path or substitute host
+rendering for model-only quality. Exact repeated-prefill reuse remains a separate
+speed lever needing whole-state/request-identity gates; no new default or
+latency/quality promotion here. Full completed answer, heterogeneous functions/
+long context and the user's under90s goal remain OPEN. No model job remains.
+Documentation-only follow-up: selected strict no-real-MLX suite582 PASS12.03s;
+127 profiles validate. Runtime/profile/default settings remain unchanged.
+
+
 ## 2026-09-08 UTC: explicit one-HTTP budget-extension diagnostic prepared
 
 Added a separate `saved_budget_extension` mode to inspect terminal behavior
