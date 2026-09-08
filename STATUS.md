@@ -1,5 +1,67 @@
 # STATUS — 2026-09-08 UTC (current corrections first; dated chronology below is history)
 
+## 2026-09-08 UTC: uncaptured head lifetime repair passes both original short captures
+
+huihui_server_head_lifetime_20260908 on534fd436ff0c87d221df55862f591cf87828a6aa
+is independently verified PASS. First streaming weather request49.9866s HTTP,
+111 prepared/23 generated tokens, one get_weather(Tokyo), natural grammar stop.
+The next same-process uncached no-tool title now completes in15.0865s HTTP,
+92 prepared/2 generated tokens, Node with EOS; previously this request failed
+HTTP500 after18.6502s with an approximately675MB allocation outside the cache.
+Both have zero actual prefill retries. All24/25 per-case checks pass, including
+all-phase prepared/raw token and engine-text identity against the naturally
+completed scalar reference, termination/budget, actual factor/head paths and
+pressure. No response repair, hidden truncation, live tool execution or KV reuse.
+
+SAME original359B/487B Responses captures, tools/input/stream/reasoning retained;
+only model/max1024/temp0/seed64013 wire overrides. Explicit Hermes prompt
+transformation, quantized MXFP4 target and reassociated prefill remain. This
+is NOT released-BF16 lossless, a full134-tool/Plex replay, a cached-KV result
+or broad generalization. First request is fresh-process, second model-warm;
+OS file caches are uncontrolled. These are short naturally completed outputs,
+not a1024-token decode benchmark. No default profile promotion.
+
+Engine first-token metrics12.8617s/9.2964s and decode34.6076s/5.7053s;
+these are not client SSE-TTFT. True Metal peaks1468856877/1313317992B.
+MTP accepts17/20 and1/4 proposals. Actual target-head suspend witnesses record
+675430400B maximum physical active-byte release in BOTH requests; cumulative
+3377152000/1350860800B across repeated events, not unique retained storage.
+Scalar restore wall0.32009/0.04654s,3/1 restores; factor/base logical peaks
+26634240/153944064B. Together with four fail-before/pass-after weakref tests,
+this verifies the server-local lifetime repair on the measured next request.
+The49.99s weather is similar to the old49.92s scalar reference; do not present
+this as a broad speedup. The concrete improvement is successful second-request
+completion under the unchanged stricter live memory policy.
+
+Driver65.3979s/parent67.4653s for BOTH SMALL requests, not the under90s full
+harness goal. Fresh30.0356s preflightPASS, zero window swapout/net growth.
+Whole-arm32 periodic samples: minavailable5523668992B, swapout4489216B
+(whole HTTP4538368B),net0,native footprint2224015592B. Known-transcoder
+inventory PASS16 preflight/32 runtime samples, not general host-idle proof.
+Root/external minima17257771008/100503994368B. All773 source/start-end/tree,
+capture/wire/reference/response/result/log/preflight checks independently
+recomputed BEFORE edits; owned98420/98424/98426 gone. Server-15 is normal cleanup.
+638 pure tests/123 profiles remain the source's completed validation.
+
+Tree33276d48eb51eccc1fc01e984cc596d6a8ff84963e49b216c126600c35f8c4cf;
+result9d836fc03c7848c0edf22dbbe2226bd535a58dcbbadfc14c4a70e14020b7e8d6;
+receiptb94013c7b1fa01e3bfe12b0c8e1993413f77c8f558d11e20694ced47ba2ec951;
+parentlogadc9c188364ba71d27b1378911eec43c760b74be6dad329a9a51bd8673b5a71c;
+server118f208d2679ee40a90489b278f482b77eaa48e38d1c5fcdd84e197cb501bcc2;
+preflight3b5b076af395223ef225d9aa3f103e6bd0e61f628cdc0535fe4e18c2afdd59fb;
+weather09ddad5f4185d969bdbb26e51e477a5d877496c2c33c18c11998dbb4e3bf7f2c;
+titlebccdd135ea12234013f7d107ce85b2712d730c9ec377df92e7f8f5074101ec17.
+
+Next: broader original captured shapes and the full134-tool model-only Plex
+workflow, with actual all-phase natural completion/raw witnesses and unchanged
+whole-visible scoring. The short direct profile disables the gateway; do not
+silently apply it to the49K catalog. Prepare a separately explicit full-workflow
+audit preserving its existing gateway compaction and clearly label that
+transformation; require fresh preflight and all pressure/provenance gates.
+Full harness under90s, larger-output/context qualification and a new Plex
+score remain OPEN. Do not relaunch obsolete pre-fix jobs or grade partial output.
+
+
 ## 2026-09-08 UTC: server telemetry local retains prior head; lifetime repair ready
 
 Found a concrete outer owner in server._engine_generate(): its optional
