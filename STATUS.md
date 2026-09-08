@@ -1,5 +1,49 @@
 # STATUS — 2026-09-08 UTC (current corrections first; dated chronology below is history)
 
+## 2026-09-08 UTC: explicit one-HTTP budget-extension diagnostic prepared
+
+Added a separate `saved_budget_extension` mode to inspect terminal behavior
+after the verified five-call workflow, without rerunning its40min prefix.
+It permits exactly ONE explicitly declared additional HTTP in a fresh server.
+The prior failed result and every saved model response are hash-pinned; every
+earlier original-schema request and full fixture-turn record is reconstructed
+and matched in order. All source capture/model/profile/metadata identities
+remain mandatory. Saved calls must be naturally completed, model-authored,
+single supported pagination calls, with original IDs/argument text intact.
+Typed JSON comparisons reject bool/int provenance aliases. The unchanged
+synthetic page queue is appended exactly as the existing fixture would append it.
+
+This is explicitly an EXTRA-BUDGET diagnostic, NOT a replay or a repaired
+passing version of the original four-handled-round workflow. Its original
+failure, page data, rubric and round budget stay unchanged. Prior process/cache
+history is intentionally omitted; OS file cache/host state are uncontrolled.
+No new steering instruction, tool selection, sampling setting or output budget
+is introduced. It makes only one HTTP and requires actual terminal text with
+no pending (including malformed) function call. A returned tool call fails
+that diagnostic check. It never renders an answer, executes live tools,
+continues again, or assigns any Plex score, even if a terminal answer appears.
+Existing second-HTTP `saved_continuation` and full-workflow modes are unchanged.
+
+The actual saved five-call source1649a382113ab67473b66ff3132998d6ee307130a91619e85e6b780989491c51
+reconstructs a184657B/134-tool/13-item sixth request, canonical SHA
+f4ca16823aef8bf7d8b8498edc3263b5d89dc360a2a291a3770ab576aa6568ab,
+wire SHA052ce5d8cb1b2e9271a37d8ee6d49da9256a19014cd78e8c19577bd9f6953d27.
+Append page indices0/1/1/1/1, matching the unchanged legacy mixed-page queue.
+Same full-prepared-state MXFP4/reassociated/Hermes/gateway/top-up profile,
+max1024/temp0/seed64013; original input/tools/system/stream otherwise intact.
+This is not live Plex, released BF16, full-schema model computation, a fair
+independent media-pagination simulator, or an end-to-end latency comparison.
+
+Initial focused174 tests PASS1.29s before five added typed-provenance cases.
+Final selected strict no-real-MLX suite582 PASS11.99s;127 profiles validate.
+Cases cover1/3/5 prior HTTPs, every response hash/provenance link, malformed
+budget/turn/duration types, missing/changed source shapes, capped or host-rendered
+prior outputs, pending and malformed calls, empty answers, and exactly-one-
+transport/no-score behavior. No model job/result from this new mode yet.
+Next: fresh30s preflight and one bounded terminal diagnostic, retaining
+5.6GB reserve/400MB page margin/256MB KV and all phase/pressure/witness gates.
+
+
 ## 2026-09-08 UTC: full top-up replay completes five HTTPs but fails workflow and pressure
 
 `huihui_plex_serial_kv_topup_20260908`, clean/pushed

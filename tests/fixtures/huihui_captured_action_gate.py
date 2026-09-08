@@ -77,6 +77,14 @@ def acceptance(row, response, config, *, initial_action=True):
     witness = t.get('generation_witness') or {}
     before, after = row['pressure_before'], row['pressure_after']
     checks = action_checks(response) if initial_action else {}
+    if config.get('workflow') == 'saved_budget_extension':
+        from tests.fixtures import plex_agent_profile as plex
+        checks['terminal_answer_without_pending_calls'] = (
+            isinstance(response.get('output'), list)
+            and bool(plex.response_text(response).strip())
+            and not plex.response_calls(response)
+            and not any(isinstance(item, dict) and item.get('type') == 'function_call'
+                for item in response.get('output', [])))
     if config.get('require_all_phase_completion', False):
         checks.update(generation_phase_checks(response))
     if config.get('require_serial_kv_reclaim', False):
@@ -274,6 +282,8 @@ def prepare_request(config):
     from tests.fixtures import plex_agent_profile as plex
 
     request, wire, metadata = prepare_case(config['case'], config['model'])
+    if config.get('workflow') == 'saved_budget_extension':
+        return prepare_budget_extension(config, request, metadata)
     if config.get('workflow', 'initial_action') != 'saved_continuation':
         return request, wire, metadata
     source = config['saved_continuation']
@@ -315,6 +325,86 @@ def prepare_request(config):
         request_change='append_exact_saved_call_and_unchanged_first_fixture_page',
         scope='Identical saved second HTTP in a fresh server; not full-workflow latency or Plex score')
     return continuation, wire, metadata
+
+
+def prepare_budget_extension(config, request, metadata):
+    """One extra diagnostic HTTP after a pinned tool-budget failure, not a replay.
+
+    Reconstruct every prior request from its exact saved model call and the
+    unchanged legacy page queue. No new instructions, tools, sampling choices
+    or output budget are introduced; previous process/cache history is omitted.
+    This cannot change the prior workflow verdict or produce a final Plex grade.
+    """
+    from tests.fixtures import plex_agent_profile as plex
+
+    source = config['saved_budget_extension']
+    def same_json(left, right):
+        # Python equality otherwise aliases True/1 and False/0 in provenance.
+        return json.dumps(left, sort_keys=True, allow_nan=False) == json.dumps(
+            right, sort_keys=True, allow_nan=False)
+    if type(source.get('additional_http_calls')) is not int or source['additional_http_calls'] != 1:
+        raise ValueError('budget extension requires exactly one explicit additional HTTP')
+    if sha(source['result']) != source['sha256']:
+        raise ValueError('saved workflow result identity mismatch')
+    reference = json.loads(Path(source['result']).read_text())
+    ref_config = reference['config']
+    if (reference.get('schema') != 'voom.huihui-captured-plex.v1'
+            or ref_config.get('workflow') != 'plex'
+            or any(config.get(key) != ref_config.get(key) for key in (
+                'case', 'model', 'profiles', 'profile_digest', 'metadata_hashes'))
+            or metadata != reference.get('request')):
+        raise ValueError('saved workflow source configuration mismatch')
+    prior = reference.get('workflow_http')
+    if not isinstance(prior, list) or not 1 <= len(prior) <= 5:
+        raise ValueError('requires one to five witnessed prior HTTPs')
+    fixture = reference.get('plex', {})
+    count = len(prior)
+    if (fixture.get('tool_results_source') != 'synthetic_two_page_fixture'
+            or fixture.get('protocol_failures') != [dict(turn=count, reason='tool_round_limit')]
+            or not same_json(fixture.get('completion'), dict(passed=False, non_completed_turns=[],
+                error_turns=[], terminal_has_unhandled_calls=True,
+                unhandled_call_turns=[count], terminal_text_present=False))
+            or fixture.get('final_text') != ''
+            or not isinstance(fixture.get('turns'), list) or len(fixture['turns']) != count):
+        raise ValueError('source must end only with an unhandled tool-budget call')
+    current = copy.deepcopy(request)
+    hashes, page_indices = [], []
+    for index, entry in enumerate(prior, 1):
+        if type(entry.get('turn')) is not int or entry['turn'] != index:
+            raise ValueError('saved HTTP order mismatch')
+        if not same_json(entry.get('request'), plex.request_shape(current)):
+            raise ValueError('reconstructed request differs from saved HTTP')
+        if sha(entry['response_path']) != entry['response_sha256']:
+            raise ValueError('saved response identity mismatch')
+        response = json.loads(Path(entry['response_path']).read_text())
+        if (response.get('status') != 'completed' or not model_authored_output(response)
+                or not all(generation_phase_checks(response).values())):
+            raise ValueError('saved response is not naturally completed/model authored')
+        calls = plex.response_calls(response)
+        if (len(calls) != 1 or calls[0]['name'] not in plex.PLEX_PAGINATION_TOOLS
+                or not isinstance(calls[0]['arguments'], dict) or not calls[0]['call_id']):
+            raise ValueError('requires one exact saved pagination call per HTTP')
+        wall = entry.get('row', {}).get('wall_seconds')
+        if type(wall) not in (int, float) or not math.isfinite(wall) or wall <= 0:
+            raise ValueError('invalid saved HTTP duration')
+        turn = plex._response_turn(response, wall, index, current)
+        turn['handled_call_count'] = int(index < count)
+        if not same_json(turn, fixture['turns'][index - 1]):
+            raise ValueError('saved fixture turn provenance mismatch')
+        page_index = min(index - 1, len(plex.SYNTHETIC_PAGES) - 1)
+        plex._append_call_and_result(current, calls[0], plex.SYNTHETIC_PAGES[page_index])
+        hashes.append(entry['response_sha256'])
+        page_indices.append(page_index)
+    wire = json.dumps(current, ensure_ascii=False, separators=(',', ':')).encode()
+    return current, wire, dict(request_sha256=hashlib.sha256(wire).hexdigest(),
+        request_bytes=len(wire), original_capture_request=metadata,
+        request_shape=plex.request_shape(current), saved_workflow_result_sha256=source['sha256'],
+        saved_response_sha256=hashes, appended_fixture_page_indices=page_indices,
+        original_workflow_turn=count + 1, preceding_http_calls_omitted=count,
+        additional_http_calls=1, original_handled_tool_round_budget=count - 1,
+        tool_results_source='unchanged_synthetic_two_page_queue',
+        request_change='append_exact_saved_calls_and_unchanged_fixture_pages',
+        scope='One explicitly extra-budget diagnostic HTTP in a fresh server; prior workflow remains failed. Not original-workflow replay, complete-workflow latency or Plex score.')
 
 
 def run_single_request(config, wire, document, *, initial_action):
@@ -387,7 +477,7 @@ def run(config):
     for key in ('result', 'response', 'server_log'):
         assert not Path(config[key]).exists()
     workflow = config.get('workflow', 'initial_action')
-    assert workflow in ('initial_action', 'plex', 'saved_continuation')
+    assert workflow in ('initial_action', 'plex', 'saved_continuation', 'saved_budget_extension')
     if workflow == 'plex':
         for index in range(1, 6):
             assert not Path(config['result']).with_suffix(f'.turn{index}.progress.json').exists()
@@ -409,6 +499,9 @@ def run(config):
     elif workflow == 'saved_continuation':
         document.update(schema='voom.huihui-saved-continuation.v1',
             scope='Diagnostic fresh-server replay of the exact saved second HTTP, reconstructed from the original134-tool capture plus the exact first model call and unchanged synthetic first page. First HTTP process/cache history is intentionally omitted. Same model/max1024/temp0/seed64013 and explicit lossy gateway preparation. No live tools, complete-workflow timing, Plex score, full-schema model replay or BF16 proof.')
+    elif workflow == 'saved_budget_extension':
+        document.update(schema='voom.huihui-saved-budget-extension.v1',
+            scope='One explicitly additional HTTP beyond a pinned prior tool-round budget. Every previous request/call/fixture page is reconstructed and checked; unchanged original134-tool capture and sampling/output settings. Prior process/cache history is omitted, prior workflow remains failed. Require a natural terminal answer with no pending calls; no Plex score, live tool execution, original-workflow latency or BF16 claim.')
     server = None
     try:
         with open(config['server_log'], 'x') as log:
