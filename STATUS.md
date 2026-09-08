@@ -1,5 +1,62 @@
 # STATUS — 2026-09-08 UTC (current corrections first; dated chronology below is history)
 
+## 2026-09-08 UTC: factor-boundary head release measured; token checks pass, pressure does not
+
+huihui_factor_head_release_captured_shapes_20260908 on
+d1e83c5664d5095cd647e3f74bea2edd6ae9b1ac is independently verified:
+both original short captures naturally complete, all24/25 per-request checks
+PASS, all-phase prepared/raw token/text/budget/termination exactly match the
+passing source534fd43 reference. Weather41.6265s HTTP/23tokens/grammar;
+same-process uncached title16.2674s/2tokens/EOS. Max1024, not a16-token cap.
+Original359B/487B tools/input/transport retained; only model/max1024/temp0/
+seed64013 overrides. MXFP4/reassociated prefill and explicit Hermes remain;
+not released-BF16 or a full134-tool/Plex/large-output/context result.
+
+The NEW factor-restore boundary physically releases675430400B each time:
+weather3 releases/2026291200B cumulative, title1/675430400B, equal to the
+actual partial-restore counts. Cache-accounted bytes and existing Metal
+active-release deltas agree; every phase independently carries the counters.
+This confirms the intended real lifetime change, not a unique2GB saving.
+No retries, host tool execution, answer repair or prompt KV reuse.
+MTP accepted17/20 and1/4; scalar restore0.35918/0.05382s. First-token engine
+metrics7.9945/11.1135s,decode30.9644/5.0667s; not wire SSE-TTFT.
+True Metal2294317217/1517045224B, logical weight reads84588203904/
+27866926976B; do NOT claim a lower whole-run peak than the reference.
+
+Overall gate remains FAIL solely for periodic minimum available memory:
+5223366656B versus5300000000B required (76.63MB short). At that sample,
+model active memory is298574056B after cache shedding; this does not prove
+a model-owned leak or justify weakening the gate. Native footprint2390723008B,
+compressed477954048B;28 samples,swapout3162112B (wholeHTTP3358720B),net0.
+No known transcoder seen16 preflight/28 run samples, not host-idle proof.
+Fresh30.0402s preflightPASS,163840B preceding-window swapout.
+Driver58.2214s/parent60.3813s complete BOTH SMALL requests but fail pressure.
+Weather is faster and title slower than the49.99/15.09s reference; with this
+failed qualification and uncontrolled file cache/host state, no speedup claim.
+
+All776 source/start-end/tree, reference/capture/wire/responses/phase identities,
+recomputed checks/positive physical-release counts, result/log/preflight receipts
+verified BEFORE edits; owned23637/23641/23643 gone, server-15 normal cleanup.
+Root/external minima17254232064/100480385024B. No user data/apps touched.
+Code remains tested790 pure +116 MLX/mocked tests;124 profiles validate.
+
+Next: obtain pressure-qualified short replay before another expensive full
+Plex workflow. If low-available/low-active samples recur, align native/allocator/
+system reclamation observations rather than infer ownership or lower reserves.
+Keep the new physical release and all-phase equivalence checks, preserve all
+original failures, and do not relaunch obsolete pre-fix configs. Full Plex
+score and under90s remain OPEN. No model job is currently running.
+
+Tree5c7bfc058b5212a6e4c6b96f93bf9e88b498161234769de412ae98081ff54064;
+resultd776b8ac542b5afff105fffa4069621b714728b0a3a96e64cbec30d1797a94a1;
+receipte2df0e298d2c453d743551b1d69f5b0ff5522bb0ebd0fdc87850026e7f4faac8;
+parentlog73dbc6266162ac6b004a97038bbd6fb7a3848505e62f77cdb6752ea250f23c2e;
+serveref41ae3959acc7d400e06c29ca0ab44df099e6c6add34fa290f1c015591aaaf7;
+preflight685fe90478bcdb1deba4e36fcf2ae3272f1ade22e623c4b9ebaca7706a181ba5;
+weather7741cfc5f51f3fa00bfca8255775bf98174ab990daae27cf13cb1e503b666502;
+title96707e0726f8b7c6b4ae47d64f7a104f11b1282f435a90bfd2a97ff5a0dd7db7.
+
+
 ## 2026-09-08 UTC: next failure is scalar replay with an unnecessary head lease
 
 huihui_plex_serial_context_20260908 on c68edab is verified FAIL, first HTTP
