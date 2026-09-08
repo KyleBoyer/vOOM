@@ -10486,10 +10486,44 @@ class StreamingEngine:
                 self._qwen4_serial_verify_weight_wait_s += weight_wait_s
             if self.governor is not None and self._layer_transient:
                 reserve_t0 = time.perf_counter()
-                self.governor.reserve(
-                    self._layer_transient,
-                    margin=self._layer_transient_margin,
-                    reason="serial-verify-transient")
+                try:
+                    self.governor.reserve(
+                        self._layer_transient,
+                        margin=self._layer_transient_margin,
+                        reason="serial-verify-transient")
+                except MemoryError:
+                    if qwen_family:
+                        # Diagnose the refused operation, not a later wrapper
+                        # snapshot. Observe scalar metadata only; no retry,
+                        # eviction, device barrier or safety-policy change.
+                        try:
+                            import json
+                            from .phase_head_witness import sample_phase_head_memory
+
+                            signature = self._transient_layer_signature(layer)
+                            key = (verifier_positions, signature)
+                            context = {
+                                "schema": "voom.qwen35-serial-transient-refusal.v1",
+                                "layer": layer,
+                                "verifier_positions": verifier_positions,
+                                "start_offset": offset,
+                                "signature": signature,
+                                "selected_compute_scratch_bytes": int(self._layer_transient),
+                                "selected_compute_margin_bytes": int(self._layer_transient_margin),
+                                "matching_verify_observations": self._serial_verify_layer_transient_counts.get(key),
+                                "matching_verify_scratch_bytes": self._serial_verify_layer_transient.get(key),
+                                "one_position_scratch_bytes": self._layer_transient_by_signature.get((1, signature)),
+                                "target_kv_type": type(kv).__name__,
+                                "target_kv_resident_logical_bytes": kv.nbytes(),
+                                "target_kv_budget_bytes": getattr(kv, "max_bytes", None),
+                                "memory": sample_phase_head_memory(self, mx),
+                                "scope": "after_refusal_with_current_page_before_compute; non-atomic, KV/cache accounting is not physical attribution",
+                            }
+                            print("[qwen35-serial-transient-admission] " + json.dumps(
+                                context, sort_keys=True, allow_nan=False), flush=True)
+                        except Exception:
+                            pass  # Optional diagnostics never mask the refusal.
+                    raise
                 if qwen_family:
                     self._qwen35_serial_verify_reserve_s += (
                         time.perf_counter() - reserve_t0)

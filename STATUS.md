@@ -1,5 +1,88 @@
 # STATUS — 2026-09-08 UTC (current corrections first; dated chronology below is history)
 
+## 2026-09-08 UTC: full-workflow lifetime audit reaches third request; no final Plex score
+
+huihui_plex_lifetime_full_workflow_20260908 on35a09810eb14cbffb938116516d32f509ac2bb69
+is independently verified FAIL. Two HTTP calls naturally complete in482.9358s
+and452.0546s; third request fails in375.1564s, with no final answer or Plex
+score. Driver1310.5332s,parent1312.5519s are failed-workflow wall, NOT a
+completed latency result or sub90s success. Compared with the earlier paged
+audit's first-response verifier failure, this is further execution coverage,
+not isolated speed, correctness or broad intelligence improvement.
+
+The first model call is plex_list_library_media(mediaType=all,ratings<=PG-13/
+TV-Y7,limit500,offset0). After the first unchanged synthetic mixed page, the
+second model call switches to movie/PG-13/limit500/offset0, rather than proving
+correct pagination. This is a planning concern, not a repaired/accepted answer.
+No host action/argument correction/rendering, live tools or prompt KV reuse.
+All134 original HTTP tools and three initial messages are preserved; subsequent
+five/seven-item requests are independently reconstructed from those exact model
+calls plus the unchanged synthetic pages, matching all canonical hashes.
+Only model/max1024/temp0/seed64013 wire overrides. Explicit Hermes/gateway
+compaction changes prepared prompts to4767/5599 then5046/5878 tokens.
+MXFP4 and reassociated prefill remain lossy; not full49K or released-BF16.
+
+Both completed responses pass natural termination, raw witnesses, full prepared
+state, actual scalar/head/paging paths, no-retry and model-authorship checks;
+each fails actual swap-out. Hidden/public output tokens41/67 then16/56, all
+grammar termination under actual1024 budgets, no truncated hidden generation.
+First response phases: prefill101.4820/139.0194s,decode108.8431/130.7577s;
+second: prefill117.9611/151.4567s,decode46.2148/135.0367s. Public-engine
+first-token metrics349.3551/316.7395s are NOT wire SSE-TTFT.
+Per-phase Metal2704941032/1440145640/1438490856/1439719656B. Exact target-head
+release675430400B is observed in every completed phase; paging spills/reloads
+57/3739,110/9455,73/2175,127/10421. Logical weight reads210870207488/
+288761452544/99512393984/249750057280B, not physical device traffic.
+Public MTP accepts49/69 and39/66; target weight waits72.9430/69.8501s versus
+draft2.6046/2.5751s, so draft compute alone is not the dominant measured cost.
+
+Third HTTP200 SSE terminates response.failed at serial-verify-transient:
+active792454568B, incoming~330MB, projected~1.12GB versus~1.07GB live ceiling
+at~5.88GB available. No retry line/event observed. Scalar failure witness:
+width5,45 captured linear layers/225 steps,base/live logical153944064B each,
+partial factors24969600B. The wrapper's history kv577536B is NOT the target
+KV residency; its before/after-flush/after-sidecar active samples are not
+allocation attribution. Do not infer the exact failing layer, weaken the
+5600MB floor or reduce learned scratch from these rounded totals.
+
+Whole-arm pressure FAIL:647 periodic samples,minavailable4807639040B,
+actual swapout45793280B (wholeHTTP45875200B),net0,peak nativefootprint
+3819736688B/compressed1018281984B. At the minimum-available sample, model
+active memory is680218152B, so a low host-available value is not itself proof
+of a model-owned leak. Known-transcoder witness passes647samples/no matches,
+not general host-idle or swap-attribution proof. Preflight30.0426sPASS.
+Root/external minima17238351872/100344107008B. All774 source/start-end/tree,
+capture/wire/metadata/three canonical continuations/responses/progress/checks/
+result/log/preflight receipts verified BEFORE edits; owned4773/4777/4779 gone.
+Failure artifacts remain unchanged; no data deleted or user apps stopped.
+
+Added failure-only Qwen serial-verifier diagnostics at the actual refused
+reservation: exact layer/window/start offset/signature, selected scratch and
+margin, matching calibration counts, target KV logical resident/budget bytes,
+and existing non-atomic cache/Metal/native observations. No success sampling,
+device barrier, tensor mutation, second reservation or admission-policy change.
+Ten pure regressions pass: original exception/margin preserved; unavailable
+calibration stays null; unrelated models/errors and successful calls are quiet;
+observer/serialization/KV/log failures cannot mask MemoryError. Full selected
+pure suite785PASS;124 profiles validate. Real diagnostic observation pending.
+
+Next bounded evaluation should use this failure context under the SAME full
+workflow/profile before attributing the deficit or changing exact KV residency.
+A smaller exact paged-KV budget is a plausible memory lever, not yet measured;
+do not promote it or silently substitute a narrower/rewritten request.
+No additional model job launched in this follow-up.
+
+Tree d16279bb51480d80f7f4252513cfaf96fdf0b4518a9d091bd4b48328f6e79d40;
+result51ed7179cb78ac310bcdce64b6dcf913cc1b37ac6b8a4e9579a44a888c0d21e5;
+receipt178fc8be8720186ade0d76d322224381a50bc2166d1d8345cb36edacbbeeeddd;
+parentlog013f6247fb5837abab07dea01c1c85386266f727e28bf3d1a6beebd84ff6cd0b;
+server6353bcf7e5027e42a96af8e2a7a5ec014619dd25d9b752dfb276e66cc4baae9c;
+preflight1cf41d21c287c0313f3bf7eed33f3068c070d7684d8523b512ff3cc74aa56cdc;
+responses70f696da1fa32fc7f9fd3443ab2021e211812e36a591237610a67be8f4ff9071/
+94e010d66c852a278fc113f5f2b2deac4be69d5a48f088c1680d1a41a0642e61/
+2d60905ffb7f28e1ad4805be9f40e3a2ee4bb0d726808a92a78aaa3dbe7890e0.
+
+
 ## 2026-09-08 UTC: full-workflow lifetime audit prepared with per-phase path checks
 
 New explicit huihui-qwen38-27b-full-workflow-lifetime-audit preserves the
