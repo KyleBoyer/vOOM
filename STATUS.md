@@ -1,5 +1,86 @@
 # STATUS — 2026-09-08 UTC (current corrections first; dated chronology below is history)
 
+## 2026-09-08 UTC: governor alignment is verified; title retries remain the next bottleneck
+
+New explicit `governor-reclamation-witness` overlay on code
+`82fb125613ddecdbd31cb37ee378c6e7ee82202e` brackets the original periodic
+system/Metal/swap reads and adds a post-safety-response system/Metal/allocator
+observation before the existing native self sample. It uses the existing
+two-second/4096-sample limit, with fail-closed ordered-coverage checks in the
+short captured-transition driver. No synchronization, evaluation, clearing,
+thread, memory-floor, admission/math/prompt or sampling-policy change.
+Existing pressure fields remain authoritative. 840 selected pure tests PASS
+in11.38s;125 profiles validate. New tests cover strict opt-in/no-read default,
+safety-before-observation order, rate/cap, failed/invalid reads and brackets,
+native chronology, and preservation of earlier low-available failures.
+
+Real `huihui_governor_reclamation_alignment_20260908` verifies66/66 aligned
+records and identical all-phase prepared/raw tokens, text, output budgets and
+natural terminations against source534fd43's passing reference. Original
+359B/487B weather/title captures retain tools/input/stream/reasoning; only
+model/max1024/temp0/seed64013 wire overrides. This overlay is the ONLY added
+effective environment setting versus the preceding model profile.
+Explicit MXFP4/reassociated prefill/Hermes and full prepared prompt state
+remain; not released-BF16, full134-tool/Plex, long context or long output.
+Fresh-server weather **51.7099s**,111 prepared/23 output tokens, grammar;
+same-process uncached title **83.0193s**,92/2, EOS. No prompt KV reuse or
+host execution/repair; OS file cache and general host activity uncontrolled.
+These are not speed gains. All24 weather checks pass; title24/25 passes,
+with no_retry correctly failing for **two actual from-scratch prefill retries**.
+
+Title refusal diagnostics identify the original128 tile at layer60 and
+retry32 tile at layer4, both linear_attention+dense. Incoming page213873879B,
+unchanged margin400000000B, available6173048832B/6173458432B and critical
+reserve5600000000B leave about40MB less headroom than the declaration needs.
+Active237168680B/13658152B, allocator cache0 and weight resident10240B:
+lowering an empty cache limit cannot release the requested missing headroom.
+The logged learned scratch57924258B is diagnostic, not proof that replacing
+the400MB margin is safe for these page-fetch/compute lifetimes. Existing retry
+128 ->32 ->8 eventually completes with reference-identical final tokens;
+do not hide either restart or charge only the successful suffix.
+
+Weather engine first-token14.0930s/prefill14.0920s/decode35.1427s/total49.2361s;
+title76.9020s/76.9012s/6.0267s/82.9412s, including retries. First-token metrics
+are engine timings, not wire SSE-TTFT. True Metal1468861745B/1226812456B;
+logical weight reads85594824896B/45493297088B, not physical disk bytes.
+Factor-head release remains exactly675430400B on each3/1 partial restorations,
+matching actual active-memory deltas and all-phase counters. Scalar restore
+2.3116343s/0.0551332s; MTP accepts17/20 and1/4.
+
+Periodic pressure PASSES this time: min available5687508992B,
+swap-out14745600B/wholeHTTP15532032B, max net growth327680B; native peak
+2123909496B, compressed604700672B. Entire gate still FAILS for title retries.
+The new input brackets span at most147750ns; safety-response-to-observation
+delay58292ns; post-response-through-native span287292ns. Maximum absolute
+post/input available delta8388608B, Metal delta2293760B; max observed allocator
+cache231334338B. At minimum sample15, before/after available and Metal agree.
+This run does not reproduce or explain away the earlier low-available failures;
+periodic observations are neither exact prefill-operation boundaries nor
+causal ownership/GPU-retirement proof. Known-transcoder inventory16/66 PASS,
+not general idle proof. Fresh30.0393s preflight PASS with zero prior-window
+churn. Driver135.0538s / parent137.0648s is a failed short arm, not full harness.
+Root/external minima17890627584B/100494884864B; no user data/apps touched.
+
+All778 source/start-end/fresh-tree, exact profile delta, capture/wire/reference/
+response and phase identities, recomputed checks, physical release, alignment
+coverage/timestamp order, two retry/refusal diagnostics and artifact receipts
+verified BEFORE edits. Owned41701/41718/41720 gone, server-15 normal cleanup.
+No model job remains. Next: inspect the page admission's page/scratch lifetime
+and existing shape-calibration contracts before proposing any tighter sizing.
+Keep400MB margin and5.6GB live reserve during that investigation; no blind
+reruns, floor reduction, default promotion or full Plex launch yet. Full Plex
+score and under90s remain OPEN.
+
+Tree27ee0aa912a48abfbfee8b1a099125bc440b5d1c36306b9ecd82cfb79e70ccac;
+result432ac3c5923bd57f253de1d41bb6265781687b6020f6c57b870c5dddbda8ed54;
+receipt438522522a0a6a070d6965eb633966fa2e492a4b25b3b5398a051247ea6c0674;
+log0aec6a039af0df3169d66902bbd0d16ed32b91aed82c5fc5feab3eacd970f5a1;
+server057c2ff89f694b552a4cbe7a98eb5ce1668cd776b055e47efb14551ee47bd79d;
+preflight9d1899236b0462ef01702161144ce00283069869c98bb2f1c534f7d0f33d4435;
+weatherc3d7b69a1e94a112909741c138d05642583666874a9a8e052164549619915644;
+title5b884fce677cc87d09d97e9355395c7d02eefc63fa68740119f42c7fe8fd0e53.
+
+
 ## 2026-09-08 UTC: same-profile pressure retry preserves tokens but fails again
 
 `huihui_factor_head_release_pressure_retry_20260908` on
