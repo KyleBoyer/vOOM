@@ -7926,6 +7926,11 @@ def _engine_generate(engine, *args, expert_top_k: int = 0, **kwargs):
     else:
         from contextlib import nullcontext
 
+        # This optional telemetry lookup must not own an uncaptured head
+        # throughout inference. On the next request a phase-scoped engine
+        # drops its head before prefill, but this outer frame otherwise keeps
+        # the full tensor alive even after the cache releases its pin.
+        del head
         capture_context = nullcontext()
         head_capture_context = nullcontext()
     try:

@@ -7804,6 +7804,63 @@ def test_engine_generate_writes_private_decode_only_expert_trace(
     assert files[0].stat().st_mode & 0o777 == 0o600
 
 
+@pytest.mark.parametrize('wrapped', [False, True])
+@pytest.mark.parametrize('fail_second', [False, True])
+def test_engine_generate_does_not_pin_uncaptured_head_across_next_prefill(wrapped, fail_second):
+    import weakref
+
+    class Head:
+        pass
+
+    expected_error = RuntimeError('injected second request failure')
+
+    class Target:
+        def __init__(self):
+            self._lm_head_w = None
+            self.calls = 0
+            self.releases = 0
+            self.cfg = SimpleNamespace(model_type='qwen3_5')
+            self.rc = SimpleNamespace(expert_top_k_by_layer=())
+
+        def generate_with_memory_retry(self, *args, **kwargs):
+            self.calls += 1
+            if self._lm_head_w is not None:
+                previous = weakref.ref(self._lm_head_w)
+                self._lm_head_w = None  # engine releases its exact phase lease
+                assert previous() is None, 'outer server frame still owns unused head'
+                self.releases += 1
+            if fail_second and self.calls == 2:
+                raise expected_error
+            self._lm_head_w = Head()  # projection materializes a fresh exact head
+            return {'via': 'target'}
+
+    target = Target()
+
+    class Wrapper:
+        def __init__(self):
+            self.target = target
+            self.calls = 0
+
+        def __getattr__(self, name):
+            return getattr(self.target, name)
+
+        def generate(self, *args, **kwargs):
+            self.calls += 1
+            return self.target.generate_with_memory_retry(*args, **kwargs)
+
+    engine = Wrapper() if wrapped else target
+    assert _engine_generate(engine, 'first', 1024) == {'via': 'target'}
+    if fail_second:
+        with pytest.raises(RuntimeError) as raised:
+            _engine_generate(engine, 'different second prompt', 1024)
+        assert raised.value is expected_error
+    else:
+        assert _engine_generate(engine, 'different second prompt', 1024) == {'via': 'target'}
+    assert target.releases == 1
+    if wrapped:
+        assert engine.calls == 2  # never bypass the wrapper via delegated retry
+
+
 def test_engine_generate_scopes_privacy_safe_authoritative_rank_capture():
     class Capture:
         def __init__(self):

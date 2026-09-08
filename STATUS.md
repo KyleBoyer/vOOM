@@ -1,5 +1,29 @@
 # STATUS — 2026-09-08 UTC (current corrections first; dated chronology below is history)
 
+## 2026-09-08 UTC: server telemetry local retains prior head; lifetime repair ready
+
+Found a concrete outer owner in server._engine_generate(): its optional
+rank-capture lookup assigns head = engine._lm_head_w and retains that local
+across generate(), even when recall_rank_capture is None. First cold request
+has no head yet; the next request obtains the675430400B MXFP4 head from the
+previous request. Engine/cache suspension cannot free the outer frame's copy.
+This is consistent with the measured next-request non-cache active allocation.
+
+Added del head ONLY in the no-rank-capture branch before invoking generation.
+No engine/cache eviction is forced; the engine remains the authoritative
+owner and releases its phase lease at its existing safe boundary. Active
+rank-capture contexts remain unchanged. No arithmetic, weight representation,
+prompt, sampling, governor threshold or profile change.
+
+Four new weak-reference regressions fail before the patch and pass afterward:
+direct and forwarding speculative wrappers, normal completion and injected
+second-request exceptions. They prove the head becomes collectible immediately
+when the target clears its own reference during the next prefill, while wrapper
+dispatch and original exception identity are preserved. Existing rank-capture
+scoping tests also pass. 638 pure tests PASS9.71s;123 profiles validate.
+Real physical release/token/pressure verification is next on the SAME two
+captured requests/profile with fresh preflight. No speed/Plex claim yet.
+
 ## 2026-09-08 UTC: governor repair completes exact weather output; second-request lifetime remains open
 
 huihui_underfull_cache_fixed_captured_shapes_20260908 on df3ea08:
