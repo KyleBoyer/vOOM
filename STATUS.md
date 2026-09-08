@@ -1,5 +1,65 @@
 # STATUS — 2026-09-08 UTC (current corrections first; dated chronology below is history)
 
+## 2026-09-08 UTC: Huihui paged audit fails; scalar-factor reconstruction exactness passes
+
+Priority remains Huihui Qwen3.8-27B-abliterated, not Flash Next/GLM.
+Run huihui_plex_full_state_paged256_max1024_20260908 FAILED before the first
+public response: driver126.7697s, HTTP126.3611s, parent129.2904s. HTTP200 SSE
+ended response.failed, zero public bytes, no terminal usage/timing or Plex
+score. Same original134-tool capture/history/stream; explicit model/max1024/
+temp0/seed64013 overrides; MXFP4/reassociated target and gateway remain lossy.
+Only conventional BF16 full-attention KV resident budget changed to256MB.
+No model-quality, exact-token, actual live-paging or latency win is established.
+
+Hidden4924-token prefill reached all64 layers (last progress105.0776s), then
+MTP serial-verify-transient admission refused active1.63GB+incoming0.29GB,
+projected1.93GB versus1.86GB live ceiling, available5.53GB. Last history
+observations before/after flush2,582,416,744/2,582,941,032B and after sidecar
+release2,359,322,984B are not attribution or measured bytes freed at failure.
+No retry event occurred; no_retry=true is consistent with a direct failure.
+Pressure FAIL:62 periodic samples,minavailable5,188,354,048B,observed actual
+swap-out6,340,608B (HTTP6,651,904B),net0. Native peakfootprint4,358,131,504B;
+compressed826,900,480B. Known-transcoder witness PASS62/none, not host-idle
+proof. Root/external minima17,223,573,504/100,543,045,632B. No floor weakened,
+user process killed, live tool executed or user data deleted. Server-15 was
+normal owned cleanup; PIDs14582/14586/14588 gone. All764 source hashes and
+start/end manifests/tree, request/metadata/result/parent/server/preflight/
+response/progress receipts verified before source edits.
+
+Paged source237691eaf4c39b3ff8af7038e562d6cb917dc047;
+tree d97462b216c920713d597475a81ca0003f93ebfe22387756d40e25fada0f2fd5;
+result8c83528d910c05df0e4f3b5dcae7b0c73b089715d7c0dd65d64c88365c8caa6f;
+parentlog025f1c69f70cb1c5e82e45af7e19e8a2d02baccc1ebbe56d0711f30106636b8a;
+servere829fbe0745589a54adeaf4cc3281bb9e32f3281c0cb28493ae5ae7b2059b3fc;
+preflight63fb8777b9ac1a15f0a321b5106ea4d340407b01db78c6b63778998c127e2fd0.
+Response9396558cdaf9ef9e890d2db426395d570e16799ab9413d173fe82971bdb5f270;
+progress9c23bb5982fe14f27d480b450f3f11507bd7a5344fe6f366d7bffa9546f77720.
+
+Next candidate is compact scalar-decay factor replay for flat native MTP,
+not wider speculation, CPU factor replay or a fused/reassociated commit.
+engine.py already deletes the per-layer weights reference: that is not a new
+fix. Current flat MTP retains dense strict-prefix recurrent snapshots; existing
+KDAFactorWindow supports Qwen scalar decay but flat MTP has not used it.
+Geometry suggests hundreds of MB less retained rollback storage at depth4,
+but this is an estimate, not measured released RAM or causal proof.
+
+Fresh30.0237s preflight PASS preceded huihui_scalar_factors_micro_20260908.
+Four synthetic cases (two seeds, zero/populated base) reproduce EVERY prefix
+0..5 at installed48x128x128 geometry exactly: FP32 recurrent values and BF16
+convolution history, untouched layers/base preserved. Ordinary scalar Qwen
+recurrence versus plain MLX factor replay, native_fused=False. PASS, driver
+0.323314s/parent2.469676s, observed Metal peak38,570,288B, terminalavailable
+6,475,628,544B, zero interval swap growth/churn. Not real weights, integrated
+MTP correctness, inference latency, broad corpus or a model-score proof.
+All764 source hashes/start-end manifests/tree and receipt/log hashes verified
+before notes; PIDs21455/21459 gone. Test source35b326321a7180c7c65e82ecffa5e7cce9e2d9f9;
+tree b22d7d76aabdebace60fe564d970a4bbee6622f4a6f7bd3e3aa200234f617243;
+result9a143614bb1d73050eb2557a170f8c4ba794744980f667f077b829c844ff0d79;
+parentlog0dc5250fbc04288a748a050ee361a9d5949a3b210422891a99fd9ee1f5df71f6;
+freshpreflighte738ab2ab1a8ab2a80b3dcfcfb089f281f3d01ca6bd51f0a4e81fd34e1754069.
+Next: explicit/default-off flat MTP integration, rollback/stop/failure cleanup
+tests, then real short A/B and full captured workflow with unchanged scoring.
+
 ## 2026-09-08 UTC: exact paged full-state Huihui audit prepared; small lifecycle gates pass
 
 Next bounded run: huihui_plex_full_state_paged256_max1024_20260908.
