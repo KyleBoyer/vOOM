@@ -15,6 +15,11 @@ def call(arguments, name='plugin__plex__plex_list_library'):
     return dict(type='function_call', name=name, arguments=json.dumps(arguments))
 
 
+def selection():
+    return dict(gateway_deterministic_policy_rendered=0, gateway_pagination_host_routed=0,
+        gateway_initial_pagination_defaults_applied=0, gateway_literal_arguments_grounded=0)
+
+
 @pytest.mark.parametrize('arguments', [{}, {'limit': 50, 'offset': 0},
     {'limit': None, 'offset': None}, {'limit': 20.0, 'offset': 0.0}])
 def test_initial_listing_only_is_not_final_plex_grade(arguments):
@@ -32,7 +37,7 @@ def test_invalid_or_non_listing_first_action_rejected(output):
     assert not all(gate.action_checks(dict(output=output)).values())
 
 
-def test_evaluation_profile_only_disables_host_render_and_prompt_cache():
+def test_evaluation_profile_only_disables_host_actions_render_and_prompt_cache():
     base, audit = {}, {}
     apply_runtime_profiles(['huihui-qwen38-27b-fast-agent-mtpquant'], environ=base)
     apply_runtime_profiles(['huihui-qwen38-27b-fast-agent-model-only-audit'], environ=audit)
@@ -40,6 +45,7 @@ def test_evaluation_profile_only_disables_host_render_and_prompt_cache():
     settings = lambda env: {k: v for k, v in env.items() if k.startswith('VMODEL_') and k != 'VMODEL_PROFILE'}
     assert settings(audit) == {**settings(base),
         'VMODEL_FAST_TOOL_GATEWAY_DETERMINISTIC_POLICY': '0',
+        'VMODEL_FAST_TOOL_GATEWAY_HOST_ROUTE': '0',
         'VMODEL_QWEN35_HOT_KV': '0', 'VMODEL_QWEN35_MIXED_DEPTH_HOT_KV_PERSIST': '0'}
     assert audit['VMODEL_FAST_TOOL_GATEWAY'] == '1'
     assert audit['VMODEL_QWEN35_LOSSY_SUFFIX_PREFILL'] == '16:1024'
@@ -58,7 +64,7 @@ def row():
 
 
 def check(value, status='completed'):
-    return gate.acceptance(value, dict(status=status, output=[call({})]),
+    return gate.acceptance(value, dict(status=status, output=[call({})], vmodel_tool_selection=selection()),
         dict(profiles=['audit'], profile_digest='digest'))
 
 
@@ -99,6 +105,8 @@ def workflow_setup(tmp_path, monkeypatch, *, incomplete=False):
             dict(type='output_text', text=', '.join(plex.ELIGIBLE_TITLES))])])]
     if incomplete:
         responses[0]['status'] = 'incomplete'
+    for response in responses:
+        response['vmodel_tool_selection'] = selection()
     config = dict(port=1234, response=str(tmp_path/'reply.json'),
         result=str(tmp_path/'result.json'), profiles=['audit'], profile_digest='digest',
         wire_sha256=hashlib.sha256(json.dumps(request, ensure_ascii=False,
@@ -166,3 +174,34 @@ def test_workflow_rejects_tool_schema_rewrite_before_http(tmp_path, monkeypatch)
     with pytest.raises(AssertionError):
         gate.run_plex_workflow(config, request, dict(failures=[]))
     assert not wires and plex._post is original_post
+
+
+@pytest.mark.parametrize('key', list(selection()))
+def test_positive_model_tokens_do_not_hide_host_action_or_argument_repair(key):
+    observed = selection(); observed[key] = 1
+    checks = gate.acceptance(row(), dict(status='completed', output=[call({})],
+        vmodel_tool_selection=observed), dict(profiles=['audit'], profile_digest='digest'))
+    assert checks['raw_witness'] and not checks['model_authored_output']
+
+
+def test_missing_host_action_provenance_is_not_model_only_proof():
+    checks = gate.acceptance(row(), dict(status='completed', output=[call({})]),
+        dict(profiles=['audit'], profile_digest='digest'))
+    assert not checks['model_authored_output']
+
+
+@pytest.mark.parametrize('branch', ['direct', 'tool'])
+def test_direct_model_branch_precedes_execution_only_host_transforms(branch):
+    observed = dict(gateway_phase='direct', gateway_host_routed=0,
+        gateway_decision_branch=branch, gateway_deterministic_policy_rendered=0)
+    assert gate.model_authored_output(dict(vmodel_tool_selection=observed))
+    observed['gateway_pagination_host_routed'] = 1
+    assert not gate.model_authored_output(dict(vmodel_tool_selection=observed))
+
+
+def test_partial_or_host_direct_branch_is_not_model_only_proof():
+    observed = dict(gateway_phase='direct', gateway_decision_branch='direct',
+        gateway_deterministic_policy_rendered=0)
+    assert not gate.model_authored_output(dict(vmodel_tool_selection=observed))
+    observed['gateway_host_routed'] = 1
+    assert not gate.model_authored_output(dict(vmodel_tool_selection=observed))

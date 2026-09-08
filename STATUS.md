@@ -1,5 +1,75 @@
 # STATUS — 2026-09-08 UTC (current corrections first; dated chronology below is history)
 
+## 2026-09-08 UTC: Plex audit catches host-authored pagination; evaluation profile corrected
+
+The first multi-turn Huihui audit correctly STOPPED rather than scoring a host
+action as model intelligence. The final-answer policy renderer was disabled,
+but inherited HOST_ROUTE still authoritatively generated the next offset.
+Second HTTP response:0.1783s, completed, zero input/output tokens and zero
+model compute, cache_source=host, gateway_pagination_host_routed=1. It emitted
+the next movie listing at offset100. This is an existing gateway feature, NOT
+a failed model generation, speed improvement or completed Plex score.
+
+First response independently reproduces all41 raw tokens, prepared6339-token
+identity and public-output hash of the previous baseline. It naturally completes
+in111.3849s with max1024: prefill51.2622s /engine first51.2624s /decode57.3812s,
+2,696,596,420B peakMetal, same165,885,588,480B logical reads. Initial public
+arguments were NOT defaulted/grounded by the host; catalog selection was host
+routed. This repeat's faster time is not an optimization A/B: no target change,
+uncontrolled OS-cache/host state. Original134-tool HTTP catalog/history/stream
+retained; explicit model/max1024/temp0/seed64013, existing lossy gateway
+compaction and mixed-depth MXFP4. NOT full49K/BF16 proof.
+
+The unchanged synthetic mixed-page fixture appended only its first page.
+No live Plex tool ran. The wrapper saved both full Responses and immutable,
+per-turn cumulative progress receipts, then rejected turn2 for no actual model
+output/witness. No final answer, pagination-comprehension pass or Plex score;
+final_plex_score remains NULL. The legacy scorer's separate-media/global-page
+limitations were documented before launch, not altered to improve a result.
+
+Fresh30.0309s preflight PASS/no churn/end6.661GB. Whole-run pressure PASS:
+55 samples,minavailable5,414,354,944B,actual observed swap-out6,078,464B/net-used0;
+HTTP first-turn actual swap-out7,192,576B,second0. Native footprint4,190,162,256B,
+compressed724,959,232B. Known-transcoder witness PASS55 inventories/none.
+Root/external minima16,179,605,504B /100,622,639,104B. All safety floors retained.
+Parent FAILexit1/113.8351s, driver111.9372s,02:27:50.206193 ->
+02:29:44.041281UTC; server-15 expected cleanup; PIDs76448/76452/76454 gone.
+All762 source/start-end manifest hashes, recomputed tree, result/server/parent/
+preflight/model metadata and both private responses verified BEFORE edits.
+Offline reconstruction preserves both effective requests and the exact initial
+capture prefix/catalog; first generation matches the previous independent run.
+
+Correction after verification: the evaluation-only profile now also sets
+VMODEL_FAST_TOOL_GATEWAY_HOST_ROUTE=0. This existing switch disables host catalog
+decisions, pagination and initial argument defaults; it does not disable gateway
+catalog reduction itself. The model must author catalog decisions and public
+actions. The fixture additionally rejects explicit host-render/pagination/
+argument-repair provenance, and handles the source-verified direct-model branch
+where execution-only flags do not apply. Missing provenance fails closed.
+No production default/runtime implementation, weight or scoring rule changed.
+Tests also caught and fixed a repeated immutable progress-file publication
+BEFORE the live job: receipts now have distinct per-turn paths.
+
+209 pure tests PASS3.15s before launch; corrected profile/provenance checks:
+217 PASS3.26s. The corrected HOST_ROUTE=0 composition has NOT yet had a live
+completed workflow. NEXT: rerun the SAME pinned capture/1024-output workflow
+with the newly resolved profile digest after a fresh preflight; require actual
+model generations on every turn, then grade final titles without host repair.
+Keep failures and synthetic-page limitations explicit. No new GLM/FlashNext job.
+
+Private logs/huihui_plex_max1024_20260908.json SHA
+363288dcc8fe85243ae11c9fdb742faaf84c74df4571985dc7cf32ab2b5afc32;
+parentlog4e7c5f999975db0587aa3b7ccae69f0c1384752050f95748d4ee62a6e126c81f;
+server9c678c60f9b5010f3b6aa62c536024d13ec5b717b362e251f3464048f4ee4f9c;
+preflight52e896504ec03ebf02bc6041662ebaa951c83a9e1ebc06b16956a4ae7cd524c4.
+Responses turn1/turn2:
+4ca32ff06f9248f0f72f6e0050587690a853b422ca9251f46c928891faa0aae3 /
+443d6e6109fe4b6b1f036c3bffeec9ea9165525425a61642791a1e16b5365dad.
+Run source dc1632f96d62bfd824100869202801b4c6ecc0fc, tree
+74c0e58d5a9a3ebcbbe058688f8c93a900122b564bded288979533279af3d1de;
+OLD run profile44e098c8c7507017012de74bd335422ff2282ff2918599249025a05dcd88cc2e.
+Do not reuse that digest for the corrected host-routing-off profile.
+
 ## 2026-09-08 UTC: Huihui completes the captured first action in122.43s; pressure gate still fails
 
 Fresh model-only Huihui MXFP4 audit with max-output1024, not the historical

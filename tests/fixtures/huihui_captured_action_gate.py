@@ -53,6 +53,23 @@ def action_checks(response):
             for a in arguments))
 
 
+def model_authored_output(response):
+    selection = response.get('vmodel_tool_selection') or {}
+    flags = ('gateway_pagination_host_routed',
+        'gateway_initial_pagination_defaults_applied', 'gateway_literal_arguments_grounded')
+    if selection.get('gateway_deterministic_policy_rendered') != 0:
+        return False
+    if any(selection.get(key, 0) != 0 for key in flags):
+        return False
+    # server.py's direct decision returns before execution pagination/defaults/
+    # grounding. Those execution-only flags are absent on this explicit branch.
+    if (selection.get('gateway_phase') == 'direct'
+            and selection.get('gateway_host_routed') == 0
+            and selection.get('gateway_decision_branch') in ('direct', 'tool')):
+        return True
+    return all(selection.get(key) == 0 for key in flags)
+
+
 def acceptance(row, response, config, *, initial_action=True):
     t, usage = row.get('timing') or {}, row.get('usage') or {}
     witness = t.get('generation_witness') or {}
@@ -67,6 +84,7 @@ def acceptance(row, response, config, *, initial_action=True):
             and witness.get('prepared_prompt_token_ids_sha256') is not None
             and type(witness.get('generated_token_count')) is int
             and witness['generated_token_count'] > 0,
+        model_authored_output=model_authored_output(response),
         # Gateway workflows may generate more than once. This hash witnesses
         # the exposed engine generation, not aggregate workflow token equality.
         profile=row.get('runtime_profiles') == config['profiles']
@@ -130,8 +148,8 @@ report those independently of actual final-title errors, never repair a score.
         print(json.dumps(dict(plex_turn=index, wall_seconds=row.get('wall_seconds'),
             output_tokens=(row.get('usage') or {}).get('output_tokens'),
             checks=checks)), flush=True)
-        if not checks['completed'] or not checks['not_output_capped']:
-            raise RuntimeError('Plex turn did not naturally complete within budget')
+        if not checks['completed'] or not checks['not_output_capped'] or not checks['model_authored_output']:
+            raise RuntimeError('Plex turn did not naturally complete with model-authored output')
         return response, row['wall_seconds']
 
     # Scope this observer to one synchronous, single-server fixture call.
@@ -164,6 +182,7 @@ def run(config):
     profile = apply_runtime_profiles(config['profiles'], environ=env)
     assert profile.profile_digest == config['profile_digest']
     assert env['VMODEL_FAST_TOOL_GATEWAY_DETERMINISTIC_POLICY'] == '0'
+    assert env['VMODEL_FAST_TOOL_GATEWAY_HOST_ROUTE'] == '0'
     assert env['VMODEL_QWEN35_HOT_KV'] == '0'
     assert env['VMODEL_QWEN35_MIXED_DEPTH_HOT_KV_PERSIST'] == '0'
     assert env['VMODEL_GENERATION_WITNESS'] == env['VMODEL_HOST_ACTIVITY_WITNESS'] == '1'
