@@ -1,5 +1,74 @@
 # STATUS — 2026-09-08 UTC (current corrections first; dated chronology below is history)
 
+## 2026-09-08 UTC: Huihui completes the captured first action in122.43s; pressure gate still fails
+
+Fresh model-only Huihui MXFP4 audit with max-output1024, not the historical
+16-token cap. Original pinned178,616-byte /134-tool capture input/history,
+schemas and streaming retained; declared model/temp0/seed64013/max1024
+overrides produce wire178,694B. The EXISTING lossy general-agent route still
+reduces the catalog to ONE selected full-schema tool and prepares6339 tokens;
+this is a gateway-transformed replay, NOT a full49K/full-schema model test.
+Approximate16:1024 state and reassociated DeltaNet remain explicitly lossy.
+
+New evaluation-only profile disables deterministic host rendering and both
+in-memory/durable prompt reuse, without deleting caches. Fresh process,
+zero cached tokens/writes and cache_source=cold. OS file-cache state is
+uncontrolled; do not call this uncached physical disk I/O. No production
+runtime/default, target weights or proposal depth changed.
+
+HTTP completes naturally in **122.4279s**, producing41 actual tokens under
+the1024 budget. One actual model-authored plex_list_library call requests
+movies, limit100, offset0. The gate checks ONLY a bounded initial listing:
+it does NOT prove both media types, rating/path filtering, pagination or final
+answer quality. No tool was executed, no response was rendered/repaired,
+and final Plex score is NULL. All15 initial-action/completion/identity/
+terminal-pressure checks pass; raw41-token and prepared6339-token hashes
+are available and streamed text matches the terminal response.
+
+Prefill51.2178s /engine first-token51.2180s /decode68.3542s /
+engine119.5737s. No client SSE-TTFT metric was recorded. Native MTP depth4
+accepts30/41 proposals and requires11 target sweeps. Target weight-wait37.1835s
+versus1.7235s drafting; page-preparation9.4323s includes page-reserve8.9404s,
+so these intervals must NOT be blindly added as disjoint work. No attribution
+of system pressure to this model alone. Logical prefill13,616,944,128B +
+decode152,268,644,352B =165,885,588,480B, NOT physical disk reads.
+True peakMetal2,676,257,732B.
+
+Overall pressure FAIL:60 periodic samples reach5,277,450,240B available,
+22,549,760B below the unchanged5.3GB grading floor. Actual HTTP/periodic
+swap-out11,403,264B and net-used growth0 both pass16MB; terminalavailable
+6,136,119,296B passes. Native footprint peak4,187,688,368B/compressed929,447,936B.
+Known-transcoder witness PASS60 inventories/none (not general host-idle proof).
+Fresh30.0331s preflight PASS/end6.763GB/no churn. Root minimum16,196,329,472B,
+external100,607,750,144B; fasttier unchanged62.512GB. No threshold weakened.
+
+Parent FAIL exit1/125.0529s, driver122.7786s,01:29:59.443891 ->
+01:32:04.496759UTC. Server-15 is expected cleanup. PIDs64714/64718/64720 gone.
+All762 source hashes, identical start/end manifest, recomputed tree digest,
+result/response/server/parent/preflight/model-metadata hashes, wire identity
+and independent action/pressure rechecks passed BEFORE docs edits.
+161 selected pure tests PASS3.17s before launch and3.18s after completion.
+New fixture/profile only;
+no same-case BF16/token/state reference and no new speed-win claim.
+
+Private result logs/huihui_captured_action_max1024_20260908.json SHA
+3a5dd267e3dc107c06ffb779bffb11bc775afbdd10ae9dd09a8d92815cd56e68;
+response979f54f060280276c37c7479c6ae166c7d56e7e6aa0568ca9364522ce3298c4e;
+parentlog260facfb8287f64e2241417e9c6f421b3d2f4f42888254ba725998a92fc25790;
+preflighte15b1972ffda0532d36ba75d440bfab18d2c91d01cbf2e3b0e563faf6286bd9d.
+Source tree1bbed6a1eceb6f4393cd0eaa24c9f9889ac2159e147a271dc942210784ffe372,
+runtime/evaluation HEAD096b5684e9ea86136758521ed9dfe2cb57905569,
+profile44e098c8c7507017012de74bd335422ff2282ff2918599249025a05dcd88cc2e.
+Raw tokensf9e1a083c81c81ec71499e13bc37b7ffc4877c8d18eb5402383bcab4abe5c2f3;
+prepared4fdd281df82b1bf6987513031d2d01d8b2ea28cfd0e96df3626f6dda696a4bf8.
+
+Next: complete the model-only paginated Plex workflow with sufficient budget
+and immutable results BEFORE tuning answers/proposals. Retain this fixed
+first-action witness for exact scheduler A/B. Full-schema gateway-disabled
+replay, BF16 comparison, held-out functions and long-context acceptance remain
+open. Investigate measured target page/reservation lifetimes if pursuing speed;
+the small draft-time fraction does not justify another sidecar download.
+
 ## 2026-09-08 UTC: user redirects priority to Huihui Qwen3.8-27B uncensored
 
 The user explicitly requested more focus on the uncensored Qwen3.8 model.
