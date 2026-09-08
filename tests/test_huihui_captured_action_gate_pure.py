@@ -92,7 +92,8 @@ def test_physical_swap_out_fails_despite_unchanged_swap_usage():
     assert not check(value)['actual_swap_out']
 
 
-def workflow_setup(tmp_path, monkeypatch, *, incomplete=False):
+def workflow_setup(tmp_path, monkeypatch, *, incomplete=False, retry_evidence=False,
+                   abort_on_memory_retry=True):
     request = dict(model='test', stream=True, temperature=0, seed=64013,
         max_output_tokens=1024, input=[dict(role='user', content='unaltered')],
         tools=[dict(type='function', name=plex.PLEX_TOOL, parameters={})])
@@ -109,6 +110,7 @@ def workflow_setup(tmp_path, monkeypatch, *, incomplete=False):
         response['vmodel_tool_selection'] = selection()
     config = dict(port=1234, response=str(tmp_path/'reply.json'),
         result=str(tmp_path/'result.json'), profiles=['audit'], profile_digest='digest',
+        abort_on_memory_retry=abort_on_memory_retry,
         wire_sha256=hashlib.sha256(json.dumps(request, ensure_ascii=False,
             separators=(',', ':')).encode()).hexdigest())
     wires = []
@@ -117,13 +119,15 @@ def workflow_setup(tmp_path, monkeypatch, *, incomplete=False):
         assert current['tools'] == baseline['tools']
         assert current['input'][:1] == baseline['input']
         assert len(current['input']) == 1 + len(wires)*2
-        assert kwargs['stream'] and kwargs['fail_on_memory_retry']
+        assert kwargs['stream'] and kwargs['fail_on_memory_retry'] is abort_on_memory_retry
         assert current['max_output_tokens'] == 1024
         wires.append(wire)
         response = responses[len(wires)-1]
         kwargs['response_observer'](response)
         value = row()
         value.update(wall_seconds=1.5, response_status=response['status'])
+        if retry_evidence and len(wires) == 1:
+            value['prefill_progress'] = [{'phase': 'memory_retry', 'completed': 1}]
         return value
     monkeypatch.setattr(gate, '_post', post)
     monkeypatch.setattr(gate, '_pressure', lambda: Pressure(6_000_000_000, 0, 0))
@@ -205,3 +209,26 @@ def test_partial_or_host_direct_branch_is_not_model_only_proof():
     assert not gate.model_authored_output(dict(vmodel_tool_selection=observed))
     observed['gateway_host_routed'] = 1
     assert not gate.model_authored_output(dict(vmodel_tool_selection=observed))
+
+
+@pytest.mark.parametrize('evidence', [
+    {'aborted_on_memory_retry': True}, {'error': 'aborted_on_memory_retry'},
+    {'prefill_progress': [{'phase': 'memory_retry', 'completed': 1}]}])
+def test_observed_retry_cannot_be_hidden_by_missing_terminal_timing(evidence):
+    value = row(); value['timing'] = {}; value.update(evidence)
+    assert not check(value)['no_retry']
+
+
+def test_ordinary_prefill_progress_does_not_count_as_retry():
+    value = row(); value['prefill_progress'] = [{'phase': 'prefill_layer', 'completed': 64}]
+    assert check(value)['no_retry']
+
+
+def test_quality_retry_mode_can_score_completion_without_passing_latency_gate(tmp_path, monkeypatch):
+    request, config, _, wires = workflow_setup(tmp_path, monkeypatch,
+        retry_evidence=True, abort_on_memory_retry=False)
+    document = dict(failures=[])
+    gate.run_plex_workflow(config, request, document)
+    assert len(wires) == 3 and document['final_plex_score'] == 100
+    assert document['plex']['completion']['passed']
+    assert document['failures'] == ['turn1:no_retry']

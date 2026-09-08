@@ -91,7 +91,11 @@ def acceptance(row, response, config, *, initial_action=True):
             and row.get('runtime_profile_digest') == config['profile_digest']
             and not row.get('runtime_profile_overrides'),
         backend=row.get('backend') == 'voom',
-        no_retry=int(t.get('memory_prefill_retries') or 0) == 0,
+        no_retry=not row.get('aborted_on_memory_retry')
+            and row.get('error') != 'aborted_on_memory_retry'
+            and not any(event.get('phase') == 'memory_retry'
+                for event in row.get('prefill_progress', []) if isinstance(event, dict))
+            and int(t.get('memory_prefill_retries') or 0) == 0,
         no_prompt_reuse=usage.get('input_tokens_details', {}).get('cached_tokens') == 0,
         metal=type(t.get('true_peak_metal_bytes')) in (int, float)
             and 0 < t['true_peak_metal_bytes'] <= 8_500_000_000,
@@ -134,7 +138,8 @@ report those independently of actual final-title errors, never repair a score.
             terminal.append(response)
         before = asdict(_pressure())
         row = _post(url, wire, timeout=timeout, stream=True, print_progress=True,
-            fail_on_memory_retry=True, response_observer=observe)
+            fail_on_memory_retry=config.get('abort_on_memory_retry', True),
+            response_observer=observe)
         row.update(pressure_before=before, pressure_after=asdict(_pressure()))
         response = terminal[0] if terminal else {}
         checks = acceptance(row, response, config, initial_action=False)
@@ -171,6 +176,9 @@ report those independently of actual final-title errors, never repair a score.
 
 
 def run(config):
+    # Quality-only retries retain the runtime governor and full charged wall;
+    # no_retry still fails. The default remains fail-fast for latency audits.
+    assert type(config.get('abort_on_memory_retry', True)) is bool
     assert not any(k.startswith('VMODEL_') for k in os.environ)
     assert subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip() == config['source_commit']
     pre = json.loads(Path(config['preflight']).read_text())
@@ -232,7 +240,8 @@ def run(config):
                 before = asdict(_pressure())
                 row = _post(f'http://127.0.0.1:{config["port"]}/v1/responses', wire,
                     timeout=1800, stream=True, print_progress=True,
-                    fail_on_memory_retry=True, response_observer=observe)
+                    fail_on_memory_retry=config.get('abort_on_memory_retry', True),
+                    response_observer=observe)
                 row.update(pressure_before=before, pressure_after=asdict(_pressure()))
                 document['row'] = row
                 document['checks'] = acceptance(row, terminal[0] if terminal else {}, config)

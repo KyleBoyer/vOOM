@@ -1,5 +1,74 @@
 # STATUS — 2026-09-08 UTC (current corrections first; dated chronology below is history)
 
+## 2026-09-08 UTC: corrected model-only route reaches the memory guard before public output
+
+Reran the SAME captured134-tool HTTP request with the corrected explicit
+HOST_ROUTE=0 /host-render-off audit profile. Model/temp0/seed64013/max1024
+are the only wire overrides; original messages, tools and streaming remain.
+The profile still uses a lossy compacted gateway/mixed-depth MXFP4 target,
+not full49K input or released-BF16. No model/runtime/profile change during run.
+
+The hidden decision prompt renders4924 tokens and completes all64 prefill
+layers (last progress at47.4211s). Execution then renders6339 tokens, but its
+prefill refuses a page reservation: active1.16GB +incoming0.21GB +margin0.40GB,
+available5.14GB, dynamic ceiling1.16GB. Cache budget had already fallen to
+about0.1GB with zero bytes released by the last reclamation attempts.
+This is the profile's live system-memory admission limit, not an8.5GB Metal
+peak violation. It is not yet proof of which retained object causes pressure.
+
+The server announced its EXISTING chunk32 retry. The latency-audit client
+then deliberately aborted at186.0976s because fail_on_memory_retry was true.
+Synthetic client status598 is NOT an HTTP598 returned by the server; the SSE
+stream had created/in-progress events but no terminal response or public text.
+No immutable full-response receipt exists because none arrived; one immutable
+progress receipt records the abort. No tool page was appended/executed, no
+completed first action/final answer, and Plex score remains NULL. Do not report
+186.1s as completed-harness latency or a model intelligence failure.
+
+Fresh30.0341s preflight PASS/no churn/end6.746GB.92 periodic samples:
+minavailable5,142,036,480B ->pressureFAIL, observed swap-out13,615,104B /
+HTTP14,057,472B,net-used0. Native footprint3,946,630,384B/compressed847,282,176B.
+Sampled Metal maximum2,525,524,524B is NOT a true completed-request Metal peak;
+the terminal metric is unavailable. Known-transcoder witness PASS92 inventories/
+none, not general host-idle proof. Root/external minima16,177,782,784B /
+100,622,233,600B. No app killed, reserve weakened, weight/cache file deleted.
+
+Parent FAILexit1/188.7453s, driver186.5773s,02:54:12.515345 ->
+02:57:21.260626UTC. Server-15 expected cleanup; PIDs81933/81937/81939 gone.
+All762 source hashes, identical start/end manifests, recomputed tree,
+result/server/parent/preflight/model metadata and progress receipt verified
+BEFORE edits; no timeout, supervisor signal, source drift or missing result.
+
+The audit had labeled no_retry=true when an aborted stream lacked terminal
+timing. Fixed that diagnostic: explicit abort/error/progress retry evidence
+now fails no_retry independently of the absent result. Added an explicit
+abort_on_memory_retry=false QUALITY-only evaluation option. It allows the
+unchanged governor's bounded safe fallback to continue; every retry remains
+timed and FAILS latency acceptance. It does not change live allocation floors,
+runtime retry logic, output budget, model, prompt, rubric or overall pass.
+A pure test proves a completed mock answer can receive a rubric result while
+the retry check keeps the combined run failed.222 selected pure tests PASS3.23s.
+
+NEXT: one bounded quality-only workflow with abort_on_memory_retry=false and
+the same corrected profile/capture after a fresh preflight. Let existing safe
+chunk fallback run, rather than aborting before answer evidence; preserve all
+failures and charge the entire retry wall. Do not keep replaying fail-fast
+unchanged. In parallel with non-model work, inspect decision-to-execution state
+and in-flight prefetch ownership before proposing reclamation/scheduling changes.
+No attribution, new speed win, final Plex score or default promotion yet.
+
+Private logs/huihui_plex_model_authored_max1024_20260908.json SHA
+cab07e25cf90487f3ada96763c3e1c5043e42a43259daa5095b74e48697c3e08;
+parentlog9f683e734f165a69f49f6c149fd561c1e3f551c6e828c31d62ead82b9c998c3f;
+server7b260f4dee0c03262e2a5ce271ac50b67f8744ddd7ae44a1021f2c499939110b;
+preflightaffa5c722f6f21832a6bcdcbfef02c35e716567c0b7fc4d44da7bbea705252f3;
+progress61529129f265609b2d9151d697dd4c50054ff0f7003b53a359c81e0c54982afe.
+Run sourcef4d4854cee8151bd4e139cb4dbd2d37ad6490c91, tree
+d05f0aca2345d72314705c5536e82d8fa54302f1238217a248cc03dbbabc89b9,
+profile3c387f8e44d69fe98b3f294e4e00c7d0516ce2a27e471312c6c9fb3cb25bddad.
+The saved artifact retains its historical no_retry=true bug; this correction
+does not rewrite evidence or turn its overall FAIL into a pass.
+
 ## 2026-09-08 UTC: Plex audit catches host-authored pagination; evaluation profile corrected
 
 The first multi-turn Huihui audit correctly STOPPED rather than scoring a host
