@@ -113,9 +113,20 @@ def test_real_generation_hook_and_protocol_projection_preserve_output(api, monke
     timing = api._vision_protocol_timing(result)
     assert ("generation_witness" in timing) is enabled
     assert ("tool_call_text_witness" in timing) is enabled
+    assert ("generation_max_tokens" in result) is enabled
     if enabled:
+        assert result['generation_max_tokens'] == 512
         assert timing["generation_witness"] == result["generation_witness"]
         assert timing["generation_witness"]["generated_token_count"] == 2
+
+
+def test_generation_budget_is_not_guessed_for_unspecified_call(api, monkeypatch):
+    monkeypatch.setenv('VMODEL_GENERATION_WITNESS', '1')
+    class Engine:
+        def generate(self, prompt):
+            return {'tokens': [7], 'text': 'ok', 'termination_reason': 'eos'}
+    result = api._engine_generate(Engine(), SimpleNamespace(token_ids=(1,)))
+    assert 'generation_max_tokens' not in result
 
 
 def test_empty_generation_is_distinct_from_missing_generation(api, monkeypatch):

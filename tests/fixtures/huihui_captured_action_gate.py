@@ -23,7 +23,7 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 from runtime.profiles import apply_runtime_profiles
 from tests.fixtures.captured_transition_tracking_gate import (
-    native_pressure_summary, prepare_case, sha)
+    generation_phase_checks, native_pressure_summary, prepare_case, sha)
 from tests.fixtures.qwen3_large_agent_replay_gate import _post
 from tests.fixtures.qwen4_hot_boundary_http_probe import _atomic_write_private
 from tests.fixtures.runtime_profile_http_gate import (
@@ -75,6 +75,8 @@ def acceptance(row, response, config, *, initial_action=True):
     witness = t.get('generation_witness') or {}
     before, after = row['pressure_before'], row['pressure_after']
     checks = action_checks(response) if initial_action else {}
+    if config.get('require_all_phase_completion', False):
+        checks.update(generation_phase_checks(response))
     checks.update(
         completed=row.get('http_status') == 200 and row.get('response_status') == 'completed'
             and not row.get('error') and response.get('status') == 'completed',
@@ -187,6 +189,9 @@ report those independently of actual final-title errors, never repair a score.
             checks=checks)), flush=True)
         if not checks['completed'] or not checks['not_output_capped'] or not checks['model_authored_output']:
             raise RuntimeError('Plex turn did not naturally complete with model-authored output')
+        if config.get('require_all_phase_completion', False) and not all(
+                checks[key] for key in ('all_phase_natural_termination', 'all_phase_generation_witness')):
+            raise RuntimeError('Plex turn has incomplete or unwitnessed hidden/public generation')
         if config.get('require_full_prompt_state', False) and not all(
                 checks[key] for key in ('full_prompt_state', 'phase_io_witness', 'all_phase_metal')):
             raise RuntimeError('Full-state comparison lacks required per-phase witnesses')
@@ -213,6 +218,7 @@ report those independently of actual final-title errors, never repair a score.
 
 
 def run(config):
+    assert config.get('require_all_phase_completion') is True
     # Quality-only retries retain the runtime governor and full charged wall;
     # no_retry still fails. The default remains fail-fast for latency audits.
     assert type(config.get('abort_on_memory_retry', True)) is bool

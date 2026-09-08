@@ -1,0 +1,10 @@
+schema: voom.runtime-profile.v1
+name: huihui-qwen38-27b-full-state-direct-factors-audit
+description: Compact scalar-factor MTP comparison against the direct full-state audit.
+notes:
+  - "Changes only flat MTP rollback storage versus the direct audit. Preserve all-phase raw token/termination/budget identity and the unchanged input/tools/transport."
+  - "Experimental/default-off. Plain scalar factor reconstruction, no fused replay or new target quantization. Require real-token and pressure gates; synthetic equivalence alone is not a speed or quality result."
+extends:
+  - huihui-qwen38-27b-full-state-direct-audit
+settings:
+  VMODEL_QWEN_MTP_COMPACT_KDA_ROLLBACK: true

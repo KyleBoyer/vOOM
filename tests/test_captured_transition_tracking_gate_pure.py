@@ -124,6 +124,46 @@ def factor_timing():
         qwen_mtp_kda_factor_restore_s=0.1)
 
 
+def completed_phase(count=2, reason='eos'):
+    return dict(input_tokens=7, output_tokens=count, generation_max_tokens=1024,
+        termination_reason=reason, generation_witness=dict(available=True,
+            generated_token_count=count, prepared_prompt_token_count=7,
+            generated_token_ids_sha256='a'*64, prepared_prompt_token_ids_sha256='b'*64,
+            engine_text_sha256='c'*64))
+
+
+@pytest.mark.parametrize('bad', [dict(output_tokens=1024, termination_reason='length'),
+    dict(termination_reason=None), dict(termination_reason='unknown'),
+    dict(output_tokens=True), dict(generation_max_tokens=True),
+    dict(generation_max_tokens=0), dict(generation_max_tokens=None), dict(output_tokens=1025)])
+def test_hidden_truncation_cannot_hide_behind_a_completed_public_call(bad):
+    hidden = {**completed_phase(), **bad}
+    response = dict(vmodel_cache_phases=[hidden, completed_phase()])
+    assert not gate.generation_phase_checks(response)['all_phase_natural_termination']
+
+
+@pytest.mark.parametrize('bad', [None, {}, dict(available=False),
+    dict(available=True, generated_token_count=999),
+    {**completed_phase()['generation_witness'], 'engine_text_sha256': 'invalid'},
+    {**completed_phase()['generation_witness'], 'generated_token_count': True}])
+def test_every_phase_needs_its_own_valid_raw_identity(bad):
+    hidden = completed_phase(); hidden['generation_witness'] = bad
+    checks = gate.generation_phase_checks(dict(vmodel_cache_phases=[hidden, completed_phase()]))
+    assert checks['all_phase_natural_termination']
+    assert not checks['all_phase_generation_witness']
+
+
+@pytest.mark.parametrize('phases', [None, [], [None], [{}]])
+def test_missing_phase_provenance_is_not_completion(phases):
+    assert not any(gate.generation_phase_checks(dict(vmodel_cache_phases=phases)).values())
+
+
+def test_all_phase_gate_accepts_actual_natural_stop_including_eos_at_budget():
+    response = dict(vmodel_cache_phases=[completed_phase(1024),
+        completed_phase(19, 'grammar'), completed_phase(2, 'stop_sequence')])
+    assert all(gate.generation_phase_checks(response).values())
+
+
 @pytest.mark.parametrize('bad', [{}, {'qwen_mtp_compact_kda_rollback_enabled': 0},
     {'qwen_mtp_compact_kda_rollback_enabled': True}, {'qwen_mtp_kda_factor_rounds': 0},
     {'qwen_mtp_kda_factor_bytes_peak': 0}, {'qwen_mtp_kda_factor_base_bytes_peak': None},

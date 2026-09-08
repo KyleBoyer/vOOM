@@ -31,6 +31,12 @@ class _FactorTarget(_WideTarget):
         self.factor_refs = []
         self.fail_verify = False
         self.omit_layer = False
+        self.factor_peak_observations = 0
+
+    def _note_true_peak(self):
+        self.factor_peak_observations += 1
+        self._true_peak_metal_bytes = max(
+            self._true_peak_metal_bytes, mx.get_peak_memory())
 
     def generate(self, *args, **kwargs):
         result = super().generate(*args, **kwargs)
@@ -124,6 +130,7 @@ def _assert_equal(targets, results):
     assert stats["qwen_mtp_kda_factor_bytes_peak"] > 0
     assert stats["qwen_mtp_kda_factor_base_bytes_peak"] > 0
     assert stats["qwen_mtp_kda_endpoint_restores"] == 0
+    assert targets[1].factor_peak_observations == stats["qwen_mtp_kda_factor_restores"]
 
 
 @pytest.mark.parametrize("stop_kind", ["eos", "stop", "budget", "grammar"])
@@ -172,6 +179,21 @@ def test_missing_active_layer_factors_fail_closed():
     target.omit_layer = True
     with pytest.raises(RuntimeError, match="omitted KDA factors for layer"):
         _engine(target, True).generate("x", 6)
+    assert not target.last_kv.kda_cache.factor_capture_active
+    assert target.factors is None
+
+
+def test_failed_reconstruction_still_records_true_transient_peak():
+    from runtime.kda_state import KDAFactorWindow
+
+    target = _FactorTarget(0)
+    error = MemoryError('injected-reconstruction')
+    with patch.object(KDAFactorWindow, 'commit_prefix', side_effect=error):
+        with pytest.raises(MemoryError) as raised:
+            _engine(target, True).generate('x', 2)
+    assert raised.value is error
+    assert target.factor_peak_observations == 1
+    assert target._true_peak_metal_bytes > 0
     assert not target.last_kv.kda_cache.factor_capture_active
     assert target.factors is None
 

@@ -6,6 +6,7 @@ the model, sufficient output budget and deterministic sampling are overridden.
 Saves actual terminal responses privately; no tools are executed or repaired.
 Small captured shapes are NOT a full harness, Plex or large-context proof.
 An optional protected transition-history file is checked only when supplied.
+Real runs require all-phase completion/witness checks, including hidden steps.
 """
 
 from __future__ import annotations
@@ -86,6 +87,37 @@ def semantic_checks(response, case):
     raise ValueError('unknown semantic check')
 
 
+def generation_phase_checks(response):
+    """A successful public suffix cannot hide a capped/unknown hidden phase."""
+    phases = response.get('vmodel_cache_phases')
+    valid = isinstance(phases, list) and bool(phases) and all(
+        isinstance(phase, dict) for phase in phases)
+
+    def natural(phase):
+        budget, count = phase.get('generation_max_tokens'), phase.get('output_tokens')
+        return (type(budget) is int and budget > 0
+            and type(count) is int and 0 < count <= budget
+            and phase.get('termination_reason') in ('eos', 'stop_sequence', 'grammar'))
+
+    def witnessed(phase):
+        witness = phase.get('generation_witness')
+        if not isinstance(witness, dict) or witness.get('available') is not True:
+            return False
+        for witness_key, phase_key in (('generated_token_count', 'output_tokens'),
+                                      ('prepared_prompt_token_count', 'input_tokens')):
+            if (type(witness.get(witness_key)) is not int
+                    or type(phase.get(phase_key)) is not int
+                    or witness[witness_key] != phase[phase_key]):
+                return False
+        return all(isinstance(witness.get(key), str) and len(witness[key]) == 64
+            and all(c in '0123456789abcdef' for c in witness[key]) for key in (
+                'generated_token_ids_sha256', 'prepared_prompt_token_ids_sha256',
+                'engine_text_sha256'))
+
+    return dict(all_phase_natural_termination=valid and all(natural(p) for p in phases),
+                all_phase_generation_witness=valid and all(witnessed(p) for p in phases))
+
+
 def row_checks(row, response, case, config):
     t, usage = row.get('timing') or {}, row.get('usage') or {}
     witness = t.get('generation_witness') or {}
@@ -111,6 +143,8 @@ def row_checks(row, response, case, config):
         actual_swap_out=after['swap_out_bytes'] - before['swap_out_bytes'] <= 16_000_000)
     if case.get('stream'):
         checks['stream_final_equal'] = row.get('streamed_text_matches_final') is True
+    if config.get('require_all_phase_completion', False):
+        checks.update(generation_phase_checks(response))
     if config.get('require_qwen_factors', False):
         checks['qwen_scalar_factor_path'] = (
             type(t.get('qwen_mtp_compact_kda_rollback_enabled')) is int
@@ -157,6 +191,9 @@ def native_pressure_summary(log_text):
 
 
 def run(config):
+    # Reject legacy invocations before any model load: they only checked the
+    # final public output and missed a 1024-token hidden gateway truncation.
+    assert config.get('require_all_phase_completion') is True
     for flag in ('require_qwen_factors', 'require_full_prompt_state'):
         assert type(config.get(flag, False)) is bool
     if not 1 <= len(config['cases']) <= 3:
@@ -227,6 +264,17 @@ def run(config):
                         protocol_output=row.get('output_sha256') == ref['row'].get('output_sha256'),
                         canonical_calls=row.get('function_call_canonical_sha256')
                             == ref['row'].get('function_call_canonical_sha256'))
+                    reference_response = json.loads(Path(ref['response_path']).read_text())
+                    assert sha(ref['response_path']) == ref['response_sha256']
+                    checks['reference_all_phase_complete'] = all(
+                        generation_phase_checks(reference_response).values())
+                    identity = lambda value: [(p.get('phase'), p.get('generation_witness'),
+                        p.get('termination_reason'), p.get('generation_max_tokens'))
+                        for p in value.get('vmodel_cache_phases', [])]
+                    checks['all_phase_token_identity'] = (
+                        checks['reference_all_phase_complete']
+                        and all(generation_phase_checks(response).values())
+                        and identity(response) == identity(reference_response))
                 rows.append(dict(name=case['name'], capture_sha256=case['sha256'],
                     response_path=case['response'], response_sha256=sha(case['response']) if terminal else None,
                     checks=checks, row=row))

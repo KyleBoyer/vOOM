@@ -1,0 +1,11 @@
+schema: voom.runtime-profile.v1
+name: huihui-qwen38-27b-full-state-direct-audit
+description: Explicit Huihui full-state audit without the hidden tool-search gateway.
+notes:
+  - "Changes only the gateway switch versus the paged256 model-only audit. All supplied tools go through the normal prompt-preparation path; no hidden catalog-selection generation, host tool routing, answer rendering or prompt reuse. No request-text predicates."
+  - "Use first for held-out small captured catalogs. The one-tool gateway control exhausted 1024 hidden tokens before a correct public call; this profile tests removal of that unnecessary phase, not a smaller output cap."
+  - "MXFP4 target and reassociated prefill remain lossy. This is not a default, released-BF16 proof, full134-tool Plex result or performance claim. Large catalogs need their own memory/context gate."
+extends:
+  - huihui-qwen38-27b-full-state-paged256-audit
+settings:
+  VMODEL_FAST_TOOL_GATEWAY: false

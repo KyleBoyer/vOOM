@@ -1622,6 +1622,7 @@ class QwenMTPSpeculativeEngine:
                 raise ValueError("compact Qwen rollback requires plain scalar recurrence")
             if not all(callable(getattr(target, name, None)) for name in (
                 "forward_tokens_serial_positions", "consume_serial_kda_factors",
+                "_note_true_peak",
             )):
                 raise ValueError("compact Qwen rollback requires serial factor support")
         self.target = target
@@ -3598,8 +3599,15 @@ class QwenMTPSpeculativeEngine:
                             tgt.governor.reserve(
                                 sum(matrix_bytes) + 6 * max(matrix_bytes),
                                 margin=0, reason="qwen-mtp-factor-restore")
-                        retained_prefix = round_factors.commit_prefix(
-                            round_factor_base, target_fed_positions, native_fused=False)
+                        try:
+                            retained_prefix = round_factors.commit_prefix(
+                                round_factor_base, target_fed_positions, native_fused=False)
+                        finally:
+                            # The governor samples, while MLX records the
+                            # actual transient high water. Preserve that peak
+                            # before another draft/layer resets the allocator
+                            # counter, including a failed reconstruction.
+                            tgt._note_true_peak()
                         kda_factor_restore_s += time.perf_counter() - restore_started
                         kda_factor_restores += 1
                     else:

@@ -1,5 +1,75 @@
 # STATUS — 2026-09-08 UTC (current corrections first; dated chronology below is history)
 
+## 2026-09-08 UTC: short Huihui control exposes capped hidden gateway; stale factor comparison cancelled
+
+Completed huihui_scalar_dense_captured_shapes_20260908, source
+071793a3811e49593e7125ea3876edba834e8756, parentexit1/1263.3477s,
+driver1261.6991s,06:22:31.417938->06:43:34.765566UTC. Two original small
+captures: streaming weather tool359B/one tool and nonstream title487B/no tools.
+Only model/max1024/temp0/seed64013 wire overrides. No live tools/host rendering/
+prompt reuse. First request is cold-process; second is same-process uncached,
+not another cold-process timing. OS disk page-cache state is uncontrolled.
+
+Weather HTTP1249.6721s yields the correct get_weather(city=Tokyo) call with19
+PUBLIC engine tokens. But the hidden607-token gateway decision generated1024
+tokens, reaching its output budget, with29.7375s prefill+1165.5342s decode,
+1195.6840s engine and2,886,396,801,152B logical reads. Public execution is
+472prompt/19output,14.1716s prefill+36.7638s decode,51.4296s engine and
+105,315,418,560B logical reads. Reported first_token_seconds1210.3495s is the
+public execution-engine metric, NOT wire SSE-TTFT. Public-only raw witness
+does NOT certify the hidden1024 tokens. The original gate only tested the
+19-token suffix; do NOT call this all-phase natural completion or a quality win.
+The no-tool title returns correct Node in11.6756s/2rawtokens,92prompt tokens,
+6.4087s prefill+4.5778s decode,26,108,687,360B logical reads. This tiny title
+is not a Plex score or broad intelligence proof.
+
+Pressure FAIL: minimumavailable5,227,233,280B,624 native samples, actual
+periodic swap-out52,477,952B /whole HTTP52,789,248B,net0. Native footprint
+3,465,596,384B/compressed1,114,112,000B. No transcoder seen624samples; this
+is not general host-idle proof. Reported phase Metal2,642,381,524B hidden,
+2,223,363,476B public,1,789,445,076B title. No retry; all actual prompt-state
+flags0. Short requests caused no KV spills/reloads; do not count profile
+configuration as a live paging proof. Root/external minima17,196,306,432/
+100,584,960,000B. Fast tier unchanged62.512GB. No app killed/data deleted.
+PIDs25496/25503/25515 gone, server-15 normal cleanup. All766 source hashes/
+start-end manifests/tree, result/parent/server/preflight/response hashes,
+wire identity, phase records and recomputed legacy checks verified BEFORE edits.
+
+Tree c404f8b9bb8f1a8279eaf5ecedf5e37ea63df5293d5c050066e4da3dbd345659;
+result3e89c3d1ced1da9e0057fc97fca00621debdc62ef9448fed32d8141863ae65fa;
+parentlogd8a4840a510a0fe0e1c1cf4db288c255d12b85f93d85a226e381f87384e3962e;
+serverb6f6338f458d145f4384bee5befeadc6d221a1ae1aa4f5f2668338008bf0250c;
+preflight81a5d9c3de0cc9b67053575731f504264d2f90faa5be47e57dfc1a076cc95398.
+Weather response381b27e97db010d2a39ac8ab883a7d6b0eda43be230c4eda490d409ffa0e3ade;
+titleb3bec1186e05e5524e224eb4f9c640f3b1ef8c758d7421d762dcc08eeed96621.
+Public prompt/token hashes weather806e222c.../5ea1bea8...,title4238a7db.../6506c22a....
+Complete digests remain in private artifacts, not inferred from visible text.
+
+STOP the planned huihui_scalar_factors_captured_shapes_20260908 comparison:
+its control contains a capped hidden phase and no hidden token/termination
+witness. That stale config must NOT be launched. It was never started.
+New server telemetry preserves each hidden/public generation's actual explicit
+budget, observed termination reason and existing private-safe ID/text hashes.
+No guessed budget or natural-stop default. Real capture gate entrypoints now
+require require_all_phase_completion=true and reject capped/unknown/missing
+hidden phases; A/B requires every phase's identity, not just the public suffix.
+This is instrumentation/gate repair, not a runtime token cap or sampling change.
+
+Scalar replay now records MLX's real transient high-water through the target
+_note_true_peak immediately after reconstruction, including failure, before
+the next layer can reset it. Sampled governor peak alone could miss that brief
+allocation. No memory floor, representation or scalar arithmetic changes.
+
+Next bounded evaluation: two SAME-source direct short-capture arms, both with
+gateway OFF through explicit huihui-qwen38-27b-full-state-direct-audit /
+huihui-qwen38-27b-full-state-direct-factors-audit. Direct control changes only
+the gateway flag; second changes only compact scalar rollback. No request
+content predicates, default promotion, smaller output budget or changed wire
+tools/messages. This is not permission to run the full134-tool direct catalog
+without its own context/memory gate. Keep all-phase completion/raw identity,
+full-state and pressure qualification mandatory. Released-BF16 and Plex
+quality/latency remain open. No new model-performance win is claimed.
+
 ## 2026-09-08 UTC: flat Huihui scalar-factor MTP rollback implemented, default-off
 
 Final dc45eab52b54160bf7dda46acfb33027f30fde66 rerun:99 focused MLX/mocked

@@ -7942,6 +7942,11 @@ def _engine_generate(engine, *args, expert_top_k: int = 0, **kwargs):
     prompt = args[0] if args else ""
     max_tokens = int(args[1] if len(args) > 1 else kwargs.get("max_tokens", 64))
     _attach_generation_witness(prompt, result)
+    if (os.environ.get("VMODEL_GENERATION_WITNESS", "0").strip() == "1"
+            and (len(args) > 1 or "max_tokens" in kwargs)):
+        # The actual per-generation budget, not the HTTP request's public
+        # output count. Hidden gateway phases may exhaust their own budget.
+        result["generation_max_tokens"] = max_tokens
     _persist_request_expert_trace(
         engine,
         trace_start,
@@ -9674,6 +9679,15 @@ def _cache_phase_telemetry(name: str, phase_result: dict) -> dict:
         "admission_governor_reservations": int(stats.get(
             "hot_prompt_admission_governor_reservations", 0) or 0),
     }
+    # Keep hidden/public termination and raw ID witnesses separate. Never
+    # infer natural completion from a later successful public tool call.
+    for key in ("termination_reason", "generation_max_tokens"):
+        if key in phase_result:
+            value[key] = phase_result[key]
+    if "generation_witness" in phase_result:
+        witness = phase_result["generation_witness"]
+        value["generation_witness"] = (
+            dict(witness) if isinstance(witness, dict) else witness)
     # Observe the actual state policy on every hidden and public generation.
     # Missing legacy metadata must remain missing, not an invented exact zero.
     for key in ("prompt_state_approximate",
@@ -9682,7 +9696,10 @@ def _cache_phase_telemetry(name: str, phase_result: dict) -> dict:
                 "kv_layout", "kv_bytes", "kv_positions", "paged_kv_budget_bytes",
                 "hybrid_recurrent_cache_attached", "paged_kv_spills",
                 "paged_kv_reloads", "paged_kv_spill_seconds", "paged_kv_reload_seconds",
-                "qwen35_paged_online_attention", "qwen35_paged_online_page_native"):
+                "qwen35_paged_online_attention", "qwen35_paged_online_page_native",
+                "qwen_mtp_compact_kda_rollback_enabled", "qwen_mtp_kda_factor_rounds",
+                "qwen_mtp_kda_factor_restores", "qwen_mtp_kda_factor_bytes_peak",
+                "qwen_mtp_kda_factor_base_bytes_peak", "qwen_mtp_kda_factor_restore_s"):
         if key in stats or key in phase_result:
             value[key] = stats.get(key, phase_result.get(key))
     if phase_result.get("execution_profile") is not None:

@@ -5442,6 +5442,27 @@ def test_cache_phase_paging_witness_uses_complete_wrapper_stats():
     assert result['kv_bytes'] == 12345 and result['kv_positions'] == 4924
 
 
+def test_cache_phase_retains_own_budget_termination_and_raw_ids_without_defaults():
+    witness = dict(available=True, generated_token_count=1024,
+        generated_token_ids_sha256='a' * 64, engine_text_sha256='b' * 64)
+    decision = _cache_phase_telemetry('gateway_decision', dict(
+        tokens=list(range(1024)), generation_max_tokens=1024,
+        termination_reason='length', generation_witness=witness,
+        path_stats=dict(qwen_mtp_kda_factor_rounds=12)))
+    public = _cache_phase_telemetry('gateway_execution', dict(
+        tokens=[7, 8], generation_max_tokens=1024, termination_reason='eos'))
+    assert decision['termination_reason'] == 'length'
+    assert decision['generation_max_tokens'] == 1024
+    assert decision['generation_witness'] == witness
+    assert decision['qwen_mtp_kda_factor_rounds'] == 12
+    witness['generated_token_count'] = 3
+    assert decision['generation_witness']['generated_token_count'] == 1024
+    assert public['termination_reason'] == 'eos' and public['output_tokens'] == 2
+    assert 'generation_witness' not in public
+    missing = _cache_phase_telemetry('request', {})
+    assert 'termination_reason' not in missing and 'generation_max_tokens' not in missing
+
+
 def test_responses_stream_emits_terminal_failure_instead_of_truncated_sse():
     import io
 

@@ -113,6 +113,16 @@ def test_compact_factors_audit_changes_only_flat_mtp_rollback_storage():
     assert settings(factors) == {**settings(base), 'VMODEL_QWEN_MTP_COMPACT_KDA_ROLLBACK': '1'}
 
 
+def test_direct_audit_only_removes_gateway_and_factor_arm_only_changes_rollback():
+    base, direct, factors = {}, {}, {}
+    apply_runtime_profiles(['huihui-qwen38-27b-full-state-paged256-audit'], environ=base)
+    apply_runtime_profiles(['huihui-qwen38-27b-full-state-direct-audit'], environ=direct)
+    apply_runtime_profiles(['huihui-qwen38-27b-full-state-direct-factors-audit'], environ=factors)
+    settings = lambda env: {k: v for k, v in env.items() if k.startswith('VMODEL_') and k != 'VMODEL_PROFILE'}
+    assert settings(direct) == {**settings(base), 'VMODEL_FAST_TOOL_GATEWAY': '0'}
+    assert settings(factors) == {**settings(direct), 'VMODEL_QWEN_MTP_COMPACT_KDA_ROLLBACK': '1'}
+
+
 def test_paged_witness_requires_actual_spill_and_reload_on_both_phases():
     assert all(full_state_checks([paged_phase(), paged_phase()], require_paged_kv=True).values())
 
