@@ -103,6 +103,23 @@ def acceptance(row, response, config, *, initial_action=True):
         swap_used=after['swap_used_bytes'] - before['swap_used_bytes'] <= 16_000_000,
         actual_swap_out=after['swap_out_bytes'] - before['swap_out_bytes'] <= 16_000_000,
         stream_matches=row.get('streamed_text_matches_final') is True)
+    if config.get('require_full_prompt_state', False):
+        phases = response.get('vmodel_cache_phases')
+        valid = isinstance(phases, list) and bool(phases) and all(
+            isinstance(phase, dict) for phase in phases)
+        state_keys = ('prompt_state_approximate',
+            'qwen_lossy_suffix_prefill_early_layers', 'qwen_lossy_suffix_prefill_used')
+        checks['full_prompt_state'] = valid and all(
+            type(phase.get(key)) is int and phase[key] == 0
+            for phase in phases for key in state_keys)
+        checks['phase_io_witness'] = valid and all(
+            phase.get('weight_store_bytes_read_source') == 'path_stats'
+            and phase.get('weight_store_bytes_read_scope') == 'single_engine_phase_logical_not_physical'
+            and type(phase.get('weight_store_bytes_read')) is int
+            and phase['weight_store_bytes_read'] > 0 for phase in phases)
+        checks['all_phase_metal'] = valid and all(
+            type(phase.get('true_peak_metal_bytes')) is int
+            and 0 < phase['true_peak_metal_bytes'] <= 8_500_000_000 for phase in phases)
     return checks
 
 
@@ -155,6 +172,9 @@ report those independently of actual final-title errors, never repair a score.
             checks=checks)), flush=True)
         if not checks['completed'] or not checks['not_output_capped'] or not checks['model_authored_output']:
             raise RuntimeError('Plex turn did not naturally complete with model-authored output')
+        if config.get('require_full_prompt_state', False) and not all(
+                checks[key] for key in ('full_prompt_state', 'phase_io_witness', 'all_phase_metal')):
+            raise RuntimeError('Full-state comparison lacks required per-phase witnesses')
         return response, row['wall_seconds']
 
     # Scope this observer to one synchronous, single-server fixture call.
@@ -179,6 +199,7 @@ def run(config):
     # Quality-only retries retain the runtime governor and full charged wall;
     # no_retry still fails. The default remains fail-fast for latency audits.
     assert type(config.get('abort_on_memory_retry', True)) is bool
+    assert type(config.get('require_full_prompt_state', False)) is bool
     assert not any(k.startswith('VMODEL_') for k in os.environ)
     assert subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip() == config['source_commit']
     pre = json.loads(Path(config['preflight']).read_text())
@@ -193,6 +214,8 @@ def run(config):
     assert env['VMODEL_FAST_TOOL_GATEWAY_HOST_ROUTE'] == '0'
     assert env['VMODEL_QWEN35_HOT_KV'] == '0'
     assert env['VMODEL_QWEN35_MIXED_DEPTH_HOT_KV_PERSIST'] == '0'
+    if config.get('require_full_prompt_state', False):
+        assert env['VMODEL_QWEN35_LOSSY_SUFFIX_PREFILL'] == 'off'
     assert env['VMODEL_GENERATION_WITNESS'] == env['VMODEL_HOST_ACTIVITY_WITNESS'] == '1'
     assert _port_is_free(config['port'])
     for key in ('result', 'response', 'server_log'):

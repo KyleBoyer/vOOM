@@ -1,0 +1,11 @@
+schema: voom.runtime-profile.v1
+name: huihui-qwen38-27b-full-state-model-only-audit
+description: Controlled model-only Huihui MXFP4 quality audit without mixed-depth prompt state.
+notes:
+  - "Changes only the mixed-depth prefill switch relative to the model-only audit. Every prepared prompt position traverses all target layers; the gateway still reduces the original HTTP catalog and prompt. This is not a full-schema/full49K model replay."
+  - "Target weights remain all-MXFP4 and DeltaNet arithmetic remains reassociated. Full prompt state does not make this released-BF16 lossless. Native depth-four MTP remains proposal-only and target verified."
+  - "Experimental quality comparison, not a speed winner or serving default. Preserve host-routing/rendering/cache disablement, all memory floors and actual output budgets. Require actual per-phase state and I/O witnesses, natural completion and held-out quality before promotion."
+extends:
+  - huihui-qwen38-27b-fast-agent-model-only-audit
+settings:
+  VMODEL_QWEN35_LOSSY_SUFFIX_PREFILL: "off"

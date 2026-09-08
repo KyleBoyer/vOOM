@@ -9664,6 +9664,13 @@ def _cache_phase_telemetry(name: str, phase_result: dict) -> dict:
         "admission_governor_reservations": int(stats.get(
             "hot_prompt_admission_governor_reservations", 0) or 0),
     }
+    # Observe the actual state policy on every hidden and public generation.
+    # Missing legacy metadata must remain missing, not an invented exact zero.
+    for key in ("prompt_state_approximate",
+                "qwen_lossy_suffix_prefill_early_layers",
+                "qwen_lossy_suffix_prefill_used", "true_peak_metal_bytes"):
+        if key in stats or key in phase_result:
+            value[key] = stats.get(key, phase_result.get(key))
     if phase_result.get("execution_profile") is not None:
         value["execution_profile"] = phase_result["execution_profile"]
     return value

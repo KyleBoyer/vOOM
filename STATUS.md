@@ -1,5 +1,38 @@
 # STATUS — 2026-09-08 UTC (current corrections first; dated chronology below is history)
 
+## 2026-09-08 UTC: full-state Huihui comparison prepared; no result or promotion yet
+
+Next bounded quality run: huihui_plex_full_state_max1024_20260908.
+New explicit huihui-qwen38-27b-full-state-model-only-audit inherits the corrected
+model-only audit and changes ONLY VMODEL_QWEN35_LOSSY_SUFFIX_PREFILL to off.
+The all-MXFP4 target, reassociated DeltaNet, depth-four quantized native MTP,
+gateway compaction, HOST_ROUTE/render/cache disablement and safety floors are
+unchanged. Full prepared-prompt state is not released-BF16 lossless or a full
+49K/full-schema model replay. No prompt content, tool schema or rubric change.
+
+The same captured134-tool HTTP request keeps model/max1024/temp0/seed64013
+overrides and the unchanged synthetic two-page continuation. All final outputs
+must complete naturally; no live Plex tools run. Quality retries may continue,
+but every retry still fails latency acceptance and its entire wall is charged.
+Expected hypothesis: retaining all prepared positions at all64 layers may
+improve the answer; it may instead increase latency/pressure or fail admission.
+The earlier55/100 is a baseline, not a promised improved score or paired speed win.
+
+New per-phase witnesses expose actual approximate-state flag, early-layer depth,
+mixed-depth usage and true Metal peak without turning missing metadata into
+zeros. Full-state audit requires each hidden/public phase to report all three
+state fields exactly0, measured positive logical weight reads from path_stats,
+and a positive true peak at most8.5GB. Missing/contradictory witness stops after
+saving the immutable response, before claiming a comparison or continuing.
+No allocation, model math, sampling, runtime retry or production default changed.
+
+610 selected pure tests PASS3.71s. Resolved full-state+generation+host witness
+digest4bde953e266c9561673088508392a1e94668e240ee24d69bb90c932dc29ad37b.
+A fresh30s memory/known-transcoder preflight is mandatory immediately before
+the supervised single-server launch. These are prepared instructions, NOT a
+claim that the live comparison has completed. Leave source/docs untouched
+during the job; verify the supervisor/source/response receipts before edits.
+
 ## 2026-09-08 UTC: Huihui finishes model-only Plex; 55/100, 25.3 minutes, pressure FAIL
 
 The corrected HOST_ROUTE=0 / host-render-off audit now completes all three

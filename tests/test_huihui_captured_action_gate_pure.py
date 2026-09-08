@@ -63,6 +63,56 @@ def row():
         pressure_after=dict(available_bytes=6_000_000_000, swap_used_bytes=0, swap_out_bytes=0))
 
 
+def test_full_state_audit_changes_only_the_mixed_depth_switch():
+    base, full = {}, {}
+    apply_runtime_profiles(['huihui-qwen38-27b-fast-agent-model-only-audit'], environ=base)
+    apply_runtime_profiles(['huihui-qwen38-27b-full-state-model-only-audit'], environ=full)
+    settings = lambda env: {k: v for k, v in env.items() if k.startswith('VMODEL_') and k != 'VMODEL_PROFILE'}
+    assert settings(full) == {**settings(base), 'VMODEL_QWEN35_LOSSY_SUFFIX_PREFILL': 'off'}
+    from runtime.server import _qwen_lossy_suffix_prefill_policy
+    assert _qwen_lossy_suffix_prefill_policy('off', mode='fast', total_layers=64,
+        layer_types=['linear_attention'] * 3 + ['full_attention']) == (0, 0, 0)
+
+
+def full_state_checks(phases):
+    return gate.acceptance(row(), dict(status='completed', output=[call({})],
+        vmodel_tool_selection=selection(), vmodel_cache_phases=phases),
+        dict(profiles=['audit'], profile_digest='digest', require_full_prompt_state=True))
+
+
+def phase():
+    return dict(prompt_state_approximate=0, qwen_lossy_suffix_prefill_early_layers=0,
+        qwen_lossy_suffix_prefill_used=0, true_peak_metal_bytes=100,
+        weight_store_bytes_read=123, weight_store_bytes_read_source='path_stats',
+        weight_store_bytes_read_scope='single_engine_phase_logical_not_physical')
+
+
+def test_full_state_witness_accepts_both_model_generations():
+    assert all(full_state_checks([phase(), phase()]).values())
+
+
+@pytest.mark.parametrize('phases', [None, [], {}, [None], [phase(), {}],
+    [{**phase(), 'prompt_state_approximate': 1}, phase()],
+    [{**phase(), 'qwen_lossy_suffix_prefill_early_layers': 16}, phase()],
+    [{**phase(), 'qwen_lossy_suffix_prefill_used': 1}, phase()],
+    [{**phase(), 'prompt_state_approximate': False}]])
+def test_full_state_witness_fails_closed_on_any_hidden_phase(phases):
+    assert not full_state_checks(phases)['full_prompt_state']
+
+
+@pytest.mark.parametrize('bad', [
+    {'weight_store_bytes_read_source': 'unavailable'},
+    {'weight_store_bytes_read': 0}, {'weight_store_bytes_read': True},
+    {'weight_store_bytes_read_scope': 'physical'}])
+def test_phase_io_needs_positive_measured_logical_reads(bad):
+    assert not full_state_checks([phase(), {**phase(), **bad}])['phase_io_witness']
+
+
+@pytest.mark.parametrize('peak', [None, 0, True, 8_500_000_001])
+def test_hidden_phase_metal_cannot_be_hidden_by_public_peak(peak):
+    assert not full_state_checks([{**phase(), 'true_peak_metal_bytes': peak}, phase()])['all_phase_metal']
+
+
 def check(value, status='completed'):
     return gate.acceptance(value, dict(status=status, output=[call({})], vmodel_tool_selection=selection()),
         dict(profiles=['audit'], profile_digest='digest'))
@@ -166,6 +216,25 @@ def test_incomplete_workflow_stops_after_durable_receipt_and_restores_post(tmp_p
     assert json.loads((tmp_path/'reply.turn1.json').read_text()) == responses[0]
     assert 'final_plex_score' not in document
     assert not document['workflow_http'][0]['checks']['completed']
+
+
+@pytest.mark.parametrize('with_witness', [True, False])
+def test_full_state_workflow_requires_phase_witness_before_continuation(tmp_path, monkeypatch, with_witness):
+    request, config, responses, wires = workflow_setup(tmp_path, monkeypatch)
+    config['require_full_prompt_state'] = True
+    if with_witness:
+        for response in responses:
+            response['vmodel_cache_phases'] = [phase()]
+        document = dict(failures=[])
+        gate.run_plex_workflow(config, request, document)
+        assert len(wires) == 3 and not document['failures']
+    else:
+        document = dict(failures=[])
+        with pytest.raises(RuntimeError, match='per-phase witnesses'):
+            gate.run_plex_workflow(config, request, document)
+        assert len(wires) == 1 and 'final_plex_score' not in document
+        assert not document['workflow_http'][0]['checks']['full_prompt_state']
+        assert (tmp_path/'reply.turn1.json').exists()
 
 
 def test_workflow_rejects_tool_schema_rewrite_before_http(tmp_path, monkeypatch):

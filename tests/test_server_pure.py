@@ -5421,6 +5421,17 @@ def test_cache_phase_io_snapshots_do_not_reuse_the_other_phase():
     assert second["weight_store_bytes_read"] == 202
 
 
+def test_cache_phase_state_witness_preserves_actual_policy_and_missing_metadata():
+    fields = dict(prompt_state_approximate=1,
+        qwen_lossy_suffix_prefill_early_layers=16, qwen_lossy_suffix_prefill_used=1)
+    phase = _cache_phase_telemetry("gateway_decision", {
+        "path_stats": fields, "true_peak_metal_bytes": 321})
+    assert all(phase[key] == value for key, value in fields.items())
+    assert phase["true_peak_metal_bytes"] == 321
+    missing = _cache_phase_telemetry("gateway_execution", {})
+    assert all(key not in missing for key in (*fields, "true_peak_metal_bytes"))
+
+
 def test_responses_stream_emits_terminal_failure_instead_of_truncated_sse():
     import io
 
