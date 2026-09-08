@@ -119,6 +119,30 @@ def test_phase_head_gate_is_not_added_to_other_profiles():
     assert 'qwen_all_prompt_phase_head_path' not in checks
 
 
+@pytest.mark.parametrize('bad', [None,
+    ('qwen_mtp_target_head_restore_calls', 0),
+    ('qwen_mtp_target_head_restore_calls', None),
+    ('qwen_mtp_target_head_restore_calls', True),
+    ('qwen_mtp_target_head_suspend_enabled', 0),
+    ('qwen_mtp_target_head_suspend_request_active', 0)])
+def test_phase_head_gate_uses_complete_mtp_loop_not_bootstrap_snapshot(bad):
+    row = valid_row()
+    row['timing'].update(qwen35_serial_verify_suspend_lm_head=1,
+        qwen35_serial_verify_suspend_lm_head_min_prompt_tokens=0,
+        qwen35_serial_verify_suspend_lm_head_request_active=1,
+        qwen35_serial_verify_head_restore_calls=0, qwen_mtp_used=1,
+        qwen_mtp_target_head_restore_calls=6,
+        qwen_mtp_target_head_suspend_enabled=1,
+        qwen_mtp_target_head_suspend_request_active=1)
+    if bad is not None:
+        row['timing'][bad[0]] = bad[1]
+        # A stale positive bootstrap value cannot hide missing loop evidence.
+        row['timing']['qwen35_serial_verify_head_restore_calls'] = 20
+    checks = gate.row_checks(row, {}, dict(kind='short_title', topic='node'),
+        dict(profiles=['test'], profile_digest='digest', require_qwen_phase_head=True))
+    assert checks['qwen_all_prompt_phase_head_path'] is (bad is None)
+
+
 @pytest.mark.parametrize('key,value', [('response_status', 'incomplete'), ('http_status', 500),
     ('backend', 'other'), ('runtime_profiles', []), ('runtime_profile_digest', 'wrong')])
 def test_good_content_cannot_hide_completion_or_identity_failure(key, value):

@@ -1,5 +1,62 @@
 # STATUS — 2026-09-08 UTC (current corrections first; dated chronology below is history)
 
+## 2026-09-08 UTC: governor repair completes exact weather output; second-request lifetime remains open
+
+huihui_underfull_cache_fixed_captured_shapes_20260908 on df3ea08:
+first streaming weather capture naturally completes in54.1609s HTTP,
+111 prepared tokens/23 raw output tokens, one correct get_weather(Tokyo),
+grammar termination. All-phase prompt IDs/raw IDs/text/budget/termination
+match the saved completed scalar reference. Original359B capture preserved;
+only model/max1024/temp0/seed64013 wire overrides, explicit Hermes prompt
+transform and MXFP4/reassociated prefill. Not a released-BF16/full134-tool
+Plex replay or isolated speed win. Prior scalar weather49.9217s
+was faster but failed pressure; avoid conflating configurations/host state.
+Engine first-token16.6524s/decode34.5574s; true Metal2283840872B.
+MTP17/20 accepted,3 scalar restores/1.44913s, factor/base logical peaks
+26634240/153944064B. No tool execution, host answer rendering or KV reuse.
+
+This completes the first request where the pre-fix all-length profile failed
+at layer5, but the TWO-REQUEST gate remains FAIL. The unchanged487B title
+capture follows in the same process uncached and returns HTTP500/18.6502s
+without a terminal model response. Real runtime retries128->32->8->1; final
+prefill-page refusal active676390952B + page213873879B + margin400000000B
+exceeds live ceiling~1.23GB at available6158270464B. Cache is actually
+floor-limited and empty except10240B pinned norm, so this is NOT the fixed
+underfull-cache early exit. A head-sized active allocation remains outside
+reported cache residency. Size alone is not ownership proof; next audit is
+the retained tensor lifetime across completed-request -> next prefill.
+Do not weaken the400MB margin, treat the18.65s failure as completion, or
+launch full Plex before this warm-next-request defect is understood.
+Nonstream failure has no terminal retry telemetry; its saved no_retry=true
+means no retry was observed on that transport, NOT proof of zero retries.
+
+The new phase-head subcheck incorrectly read the bootstrap engine counter0,
+while real MTP loop counters report6 target-head restores/5 suspends, each
+up to675430400B physically released (3377152000B total across events).
+Fixed the CHECKER to use qwen_mtp_target_head_* only for observed MTP use,
+requiring active/enabled flags and a positive actual restore count. Direct
+engine path keeps its existing fields. Six regressions reject missing/zero/
+boolean counters and stale positive bootstrap counts. Read-only recomputation
+passes all weather checks; original FAIL artifacts are retained unchanged.
+634 pure tests PASS9.62s,123 profiles validate; no runtime/quality change in
+this post-measurement reporting repair.
+
+Driver73.1763s,parent76.0568s include the failed title, NOT a completed
+under90s harness. Fresh30.0386s preflightPASS, no known transcoders16samples;
+source disk4 measured0.33MB/5s beforehand, not general host-idle proof.
+Whole-arm periodic pressure35samples: minavailable5595578368B,
+swapout8339456B (wholeHTTP8355840B),net0,native footprint3023441016B.
+Pressure passes the unchanged5300MB/16MB gates, but overall completion fails.
+All773 source/start-end/tree/result/log/capture/wire/reference/response
+checks verified BEFORE edits; owned90585/90589/90593 gone.
+Root/external minima17166397440/100507303936B, no large write/deletion.
+Treea7ed6ee4463219d8f47f2f169fc4c2c0c435af0a9042671318154b3226a9ea17;
+result1f78ee303166837a7202571606083ee0c9fe216a618b4bffaad9baa34d2839fd;
+log5204e7152cc195a582d6c8abba8f5df35eabcf66bb39f530d3ce6fc891097278;
+server4d4a6ae9342e01b506c0f7e3b38c5d4e987d0b05ff621a9c8f77f8785ed8ec25;
+preflight0c2e164f92ea50150a37b7dbf168df2c183c7ae11aec0c6e77daefd83301cc12;
+weathera520526cdd6d6fac0f40aebcf1d167c36d35c072c8005d5b76efbb300fed0776.
+
 ## 2026-09-08 UTC: underfull-cache admission bug repaired; real replay deferred for Plex
 
 Repaired pressure.reserve()'s zero-release early exit. A budget shrink that
