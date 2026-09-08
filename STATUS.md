@@ -1,5 +1,110 @@
 # STATUS — 2026-09-08 UTC (current corrections first; dated chronology below is history)
 
+## 2026-09-08 UTC: failure-only KV admission component diagnostics added after full-run verification
+
+The common request-KV admission helper now emits `[kv-admission-refusal]`
+only after the original governor MemoryError. It reports the exact projected
+KV growth, kept-state accounting, selected scratch, requested sum, selected/
+operator-floor margins and remaining/evicted slot counts, alongside the existing
+non-atomic system/Metal/native memory snapshot. The original reservation call,
+reason classification, exception identity, thresholds and retry order are
+unchanged. Successful calls do not sample or log. This distinguishes the
+previous rounded0.26GB request from a supposed physical260MB tensor.
+
+The Qwen prefill-page refusal snapshot additionally reports current KV logical
+residency/budget, recurrent logical state and hidden-array logical bytes.
+These can alias or omit backing; they are not summed into physical attribution
+or allocation credit. Unknown optional ownership remains null. Both failure
+observers preserve the original refusal if sampling/serialization/logging fails;
+neither adds synchronization, clearing, reclamation, sleeping or another reserve.
+No model, arithmetic, request, profile or default fast path changed.
+
+The actual extracted production methods pass18 focused pure tests in0.67s.
+Final selected **438 pure tests pass in11.32s** under a guard that rejects any
+real MLX import;126 profiles validate. A broader807-test attempt with that same
+guard is retained as204 import-guard failures/603 passes, not a runtime
+regression result: `test_server_pure.py` includes MLX-dependent adapter tests
+despite its label. That file is excluded from the final strict no-MLX suite,
+not silently reported passing. No MLX/model job was launched in this step.
+These observers still need real serving evidence; no new speed or quality claim.
+
+Next: examine prefill/request-admission host ownership and shape-independent
+memory headroom with these components. At the last refusal, even the full256MB
+KV budget cannot alone close the431.7MB page-admission deficit; a blind full
+rerun or moving the serial-recovery hook earlier is not a demonstrated fix.
+Preserve5.6GB reserve/400MB page margin/256MB KV and obtain a fresh30s preflight
+before any subsequent MLX probe. Full harness completion and Plex score remain
+open. User apps/data unchanged.
+
+
+## 2026-09-08 UTC: full Huihui workflow still fails before serial KV recovery can run
+
+`huihui_plex_serial_kv_reclaim_20260908` on clean, pushed
+`d11b65b1dbdacfe67ab65e049c1c77ebc768ac34` is independently verified **FAIL**.
+The first HTTP completes in **460.6073s**; the next HTTP fails after **78.6470s**.
+Driver539.6351s / parent542.3205s ends without a final model answer or Plex score.
+This is the original178616B/134-tool capture, with ONLY model/max1024/temp0/
+seed64013 wire overrides and unchanged synthetic mixed two-page tool results,
+not live Plex. The existing explicit MXFP4/reassociated-prefill/Hermes/gateway
+profile still compacts the prepared model prompt; this is not released BF16
+or an uncompressed full-schema model replay.
+
+The recovery overlay is the ONLY effective setting added versus the prior full
+run. First-HTTP hidden4767/41 and public5599/67 prompt/output tokens naturally
+terminate under max1024 with identical complete prepared/raw token and text
+witnesses to that reference. Prefill102.0928s/137.1820s and
+decode90.7255s/127.8404s; no first-HTTP retry or prompt reuse. First-response
+head/factor/full-state/paged witnesses pass, including675,430,400B physically
+released on each of10 factor restorations PER phase. Metal peaks2,786,746,616B/
+1,494,278,948B. Logical weight reads217,158,683,520B/279,250,850,112B
+are not physical disk traffic.
+
+Independent raw logs contain **zero serial KV recovery attempts** and zero
+serial-compute refusals. Every completed phase explicitly reports an empty
+recovery trace. The previous942.6795s first HTTP had two prefill restarts; this
+one has none, but the unused recovery feature cannot explain that difference.
+Host memory/file-cache state is uncontrolled: no causal speedup is claimed.
+
+The exact continuation preserves all134 tools and original message/global
+fields, appending only the first model-authored call and unchanged fixture
+page. Its5046-position prefill refuses layer40 before fetching a213,873,879B
+page. Available5,782,142,976B leaves182,142,976B above the unchanged5.6GB
+reserve; the page plus400MB default margin requires613,873,879B, a
+**431,730,903B deficit**. Metal active440,215,592B; allocator cache0B;
+weight cache resident/pinned10,240B. Even releasing the entire256MB KV
+policy budget cannot alone bridge that observed deficit.
+
+Retries128->32->8->1 then fail BEFORE prefill at the common request-KV
+admission call (`_evict_hot_slots_for_admission`), NOT serial verification.
+The final traceback's `reason=unspecified incoming=0.26GB` is that helper's
+projected KV growth plus selected scratch, not an identified260MB tensor
+allocation. At final refusal Metal active rounds to0.00GB and available5.66GB
+leaves only~60MB above reserve. More precise component diagnostics are the
+next bounded action; do not lower reserves or rerun the unchanged full job.
+
+All266 native/transcoder samples are available. Minimum available5,520,048,128B
+passes, net swap growth0, but sampled35,569,664B and full-HTTP35,897,344B
+actual swap-out FAIL the16MB gate. Native footprint max3,526,725,112B,
+compressed614,072,320B. No known transcoder was observed; this is neither
+general host-idle proof nor process swap attribution. Fresh30.0386s preflight
+passed. Root/external minima21,444,141,056B/100,358,062,080B.
+
+All787 source/start-end/fresh manifests, metadata/capture/wire/response/progress/
+reference hashes, recomputed checks, exact continuation, raw diagnostics and
+owned-process completion verified BEFORE edits. Whole recovery coverage
+correctly fails because the second response lacks completed phases; absent
+failed-phase evidence is not relabeled inactive success. PIDs55264/55268/55270
+gone, session drained exit1, server-15 normal cleanup. No user apps/data changed.
+No default promotion, full-workflow success, fresh Plex score or under90s claim.
+
+Tree85bfa78886002a88f6205942d572b8a5276773fab86663211afb05bf6b4b93f3;
+result3af3fe903ac3da68f87d2e4be58947b7169458c7353560cbdba77212dd8562b3;
+receipt4266e82f6ff6f789a510fc935835231dc55f90cb3c818ef9ecd6f0bc8e70ba8c;
+logabcfdb08c67c49c16b1fa8a80d8b2363d8a3a43cd60c5cc9fb9fe6ee2574ac8a;
+server22dca7b50ee80b6abd8bd078683314c77a916843736a549644d459966a706eb6;
+preflightc8cc434cd6c68665b5b83825d2b49598303bb48b92a3516c6baa63fd050ec33d.
+
+
 ## 2026-09-08 UTC: real short captures pass with KV recovery enabled; recovery remains inactive
 
 `huihui_serial_kv_reclaim_short_contract_20260908` on

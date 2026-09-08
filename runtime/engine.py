@@ -3609,7 +3609,40 @@ class StreamingEngine:
                 mx.clear_cache()
             critical = int(getattr(self.governor, "critical", 0) or 0)
             reserve_margin = max(margin, system_floor - critical)
-            reserve(reservation_bytes, margin=reserve_margin)
+            try:
+                reserve(reservation_bytes, margin=reserve_margin)
+            except MemoryError:
+                # This also admits cold, disk-paged requests: its incoming
+                # estimate is not necessarily a hot slot or one new tensor.
+                # Report the exact policy components only after the unchanged
+                # governor refuses. Do not retry, reclaim or weaken admission.
+                try:
+                    import json
+                    from .phase_head_witness import sample_phase_head_memory
+
+                    context = {
+                        "schema": "voom.kv-admission-refusal.v1",
+                        "required_total_kv_bytes": int(required_total_kv_bytes),
+                        "kept_kv_accounted_bytes": int(current_bytes),
+                        "kept_kv_type": type(keep_kv).__name__ if keep_kv is not None else None,
+                        "projected_incoming_bytes": int(incoming),
+                        "projected_transient_bytes": int(transient),
+                        "reservation_bytes": int(reservation_bytes),
+                        "selected_compute_margin_bytes": int(margin),
+                        "reservation_margin_bytes": int(reserve_margin),
+                        "system_floor_bytes": int(system_floor),
+                        "governor_critical_bytes": int(critical),
+                        "remaining_hot_slots": len(self._hot_prompt_slots),
+                        "evicted_slots": stats["evicted_slots"],
+                        "evicted_accounted_bytes": stats["evicted_bytes"],
+                        "memory": sample_phase_head_memory(self, mx),
+                        "scope": "after_refusal_before_KV_growth; projection/accounting is not allocation attribution; non-atomic memory sample",
+                    }
+                    print("[kv-admission-refusal] " + json.dumps(
+                        context, sort_keys=True, allow_nan=False), flush=True)
+                except Exception:
+                    pass  # Optional diagnostics never mask the original error.
+                raise
         stats["governor_reservations"] = max(0, int(getattr(
             self.governor, "reservations", 0) or 0) - reservations_before)
         stats["system_available_bytes"] = int(
@@ -6889,8 +6922,15 @@ class StreamingEngine:
                                     "matching_compute_observations": int(getattr(
                                         self, "_layer_transient_observation_counts", {}
                                     ).get((transient_shape_positions, signature), 0)),
+                                    "target_kv_type": type(kv).__name__,
+                                    "target_kv_resident_logical_bytes": kv.nbytes(),
+                                    "target_kv_budget_bytes": getattr(kv, "max_bytes", None),
+                                    "target_recurrent_logical_bytes": (
+                                        kv.kda_cache.nbytes()
+                                        if getattr(kv, "kda_cache", None) is not None else None),
+                                    "hidden_logical_bytes": int(x.nbytes),
                                     "memory": sample_phase_head_memory(self, mx),
-                                    "scope": "after_refusal_before_page_fetch; non-atomic observation, not allocation attribution",
+                                    "scope": "after_refusal_before_page_fetch; logical bytes may alias or omit backing; non-atomic observation, not allocation attribution",
                                 }
                                 print("[qwen35-prefill-page-admission] " + json.dumps(
                                     context, sort_keys=True, allow_nan=False), flush=True)

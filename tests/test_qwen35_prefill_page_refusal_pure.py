@@ -25,7 +25,10 @@ def hook():
                 for c in ast.walk(ast.Module(body=n.body, type_ignores=[]))))
     fn = ast.parse('def invoke(self, incoming_page, i, transient_shape_positions, tile_width): pass').body[0]
     fn.body = [copy.deepcopy(node)]
-    namespace = {'__package__': 'runtime', 'mx': object()}
+    namespace = {'__package__': 'runtime', 'mx': object(),
+        'kv': SimpleNamespace(nbytes=lambda: 250_000_000, max_bytes=256_000_000,
+            kda_cache=SimpleNamespace(nbytes=lambda: 150_000_000)),
+        'x': SimpleNamespace(nbytes=60_000_000)}
     module = ast.fix_missing_locations(ast.Module(body=[fn], type_ignores=[]))
     exec(compile(module, str(ROOT / 'runtime/engine.py'), 'exec'), namespace)
     return namespace['invoke'], method
@@ -76,7 +79,26 @@ def test_refusal_records_matching_shape_and_preserves_original_error(monkeypatch
     assert result['selected_compute_scratch_bytes'] == 73_000_000
     assert result['selected_compute_margin_bytes'] == 400_000_000
     assert result['page_margin_source'] == 'governor_default'
+    assert result['target_kv_resident_logical_bytes'] == 250_000_000
+    assert result['target_kv_budget_bytes'] == 256_000_000
+    assert result['target_recurrent_logical_bytes'] == 150_000_000
+    assert result['hidden_logical_bytes'] == 60_000_000
     assert result['memory'] == memory  # missing observations are not zeroed
+
+
+def test_unknown_optional_ownership_is_null_not_zero(monkeypatch, capsys):
+    monkeypatch.setattr(phase_head_witness, 'sample_phase_head_memory', lambda *args: {})
+    invoke, _ = hook()
+    invoke.__globals__['kv'] = SimpleNamespace(nbytes=lambda: 13)
+    error = MemoryError('unchanged')
+    engine, _ = target(error)
+    with pytest.raises(MemoryError) as raised:
+        invoke(engine, 21, 3, 19, 8)
+    assert raised.value is error
+    result = json.loads(capsys.readouterr().out.split('] ', 1)[1])
+    assert result['target_kv_resident_logical_bytes'] == 13
+    assert result['target_kv_budget_bytes'] is None
+    assert result['target_recurrent_logical_bytes'] is None
 
 
 @pytest.mark.parametrize('kind', ['sample', 'serialization', 'emit'])
