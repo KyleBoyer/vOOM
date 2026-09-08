@@ -1,5 +1,92 @@
 # STATUS — 2026-09-08 UTC (current corrections first; dated chronology below is history)
 
+## 2026-09-08 UTC: full-state Huihui first plan improves; second response hits verifier memory guard
+
+Run huihui_plex_full_state_max1024_20260908 ends FAIL, with NO final Plex score.
+Same original134-tool capture/wire, model/max1024/temp0/seed64013 overrides,
+same MXFP4 target, model-authored gateway, host render/action off and no prompt
+reuse. The only model-policy change is mixed-depth state OFF; DeltaNet arithmetic
+is still reassociated and the gateway still compacts the model input/catalog.
+This is not released-BF16 lossless, full49K/full-schema replay or live Plex.
+
+First HTTP naturally completes in507.6269s with70 public output tokens.
+The model chooses the other real supported function, plex_list_library_media,
+with mediaType=all, ratingOperator=lte, movieRatingValue=PG-13,
+showRatingValue=TV-Y7, limit500, offset0. The root exclusion is not in this call;
+post-filtering/final correctness remain untested. These planning fields improve
+on the earlier movie-only plan, but do NOT establish an improved complete-answer
+score. One unchanged synthetic mixed page is appended; no live tool executes.
+
+Hidden decision4924 tokens/39 generated,102.5687s prefill+106.0849s decode,
+208.6560s engine; execution5755 tokens/70 generated,157.0669s prefill+
+138.8744s decode,295.9748s engine. HTTP first engine-token metric365.7231s
+is not client SSE-TTFT; tool output is buffered. The prepared execution differs
+from the earlier6339 because the model selected a different real function, not
+because the harness substituted a schema. Both phases witness actual full state:
+prompt_state_approximate /early_layers /mixed_depth_used all0. The new I/O
+correction reports207,413,400,576B decision and277,644,867,776B execution logical
+reads instead of historical false zeros. These counters are not physical disk
+traffic; failed-attempt I/O coverage is not proven merely by summed phase bytes.
+True phase Metal peaks3,282,196,648B /2,713,670,696B both pass8.5GB.
+
+First execution prefill safely refuses a0.91GB generic reservation at active
+1.16GB/available6.26GB/ceiling2.12GB, then completes the existing chunk32 retry.
+Its retry wall is charged, no_retry FAIL; actual first HTTP swap-out23,068,672B
+also FAIL. Native MTP accepts51/76 proposals in19 target sweeps, target weight
+wait70.4931s versus draft2.9797s, on this execution only.
+
+Second HTTP fails after665.6539s, not at an output cap or client abort.
+Decision prompt5241 and execution6072 tokens; execution prefill first refuses
+at active1.18GB/incoming0.95GB/available6.59GB/ceiling2.46GB and retries chunk8.
+Later MTP target verification raises server_memory_error at an existing
+serial-verify-transient reservation: active1.97GB +incoming0.20GB, projected
+2.18GB versus2.14GB live ceiling, available5.47GB. The server correctly emits
+a terminal response.failed over the already-open HTTP200 SSE stream, with
+empty public output and no terminal usage/timing. The gate saves that immutable
+failure response and stops; no second synthetic page or final answer is scored.
+Do not call1173.7s a completed-workflow latency or score the absence as0/100.
+
+Pressure FAIL:580 periodic samples,minavailable4,602,904,576B,
+actual observed swap-out37,994,496B,net-used growth0. HTTP interval swap-out
+38,191,104B. Native footprint5,071,802,352B/compressed1,649,197,056B.
+Known-transcoder witness PASS580 inventories/none, not general host-idle proof.
+Fresh30.0315s preflight PASS/end7.424GB/zero churn. Root/external minima
+16,106,889,216B /100,614,008,832B; fast tier unchanged62.512GB.
+No memory floor weakened, user app killed, weight changed or data deleted.
+
+Parent FAILexit1/1176.4815s,driver1173.7067s,04:28:06.427142 ->
+04:47:42.908597UTC. Server-15 expected cleanup; PIDs1631/1650/1652 gone.
+All763 source hashes/start-end manifests/tree and result/parent/server/preflight/
+metadata/response/progress hashes verified BEFORE edits. Reconstructed the
+second request from the exact first model call plus unchanged first fixture
+page; original capture prefix and134 tools remain intact. No timeout/source
+drift/supervisor signal/missing result. Both checks.no_retry correctly fail.
+
+NEXT: stop unchanged resident-full-state replays. Test the existing exact
+BF16 KV paging mechanism at a bounded256MB full-attention resident budget,
+with online/page-native attention OFF and no KV quantization/persistence.
+DeltaNet state must remain attached and retained; MTP bootstrap must retain
+the endpoint until verification completes. This is a storage/lifetime lever,
+not authority to weaken the governor or drop context. Require the same first
+prepared prompt/raw70-token witness where reproducible, complete model-only
+answers, exact per-phase state and actual paging/pressure evidence; keep all
+differences and failures. The quantized target/gateway still make the overall
+profile lossy. Do not blindly unpin the MXFP4 head into the raw-BF16 streaming
+reader, or treat output-budget-aware MTP width as a memory-aware controller:
+source shows it clamps only near the requested output limit.
+
+Private source412605bf752f49460b44ca50ee50c92bfe7e087e; tree
+3682c5d171f52ab88030612c43f76fffc6fde9c88268083580bb89378e8d692b;
+profile4bde953e266c9561673088508392a1e94668e240ee24d69bb90c932dc29ad37b.
+Result4ff4a45d5acf2285aba6d3a88b77c8070ffc6102492cfb178a6485c9eb53ad5c;
+parentlog20a4e4f6ddbc2c97189ba9abd1c23e0aaba21994a4512c16764c8346461a34d9;
+servere595c34f39ddb2ed37f8e2f6a8d8db9260d9f6babddaf92f16f7546e20c4cd70;
+preflight7909748b0347293b9c480e4cc378c15f4f8dd6c8ba576cab9dd4f71d22ddcf98.
+Response hashes:
+6a179ccc2b5dafb76de55b0b6a0dc2ec0662502c1889b20965a1e8663c41f994 /
+c0700b440f4fa87f88a89a051b0fba876bcb1b72aaab6a5c5b0b5d0d878cf0a0.
+No runtime/default change or performance promotion from this failed run.
+
 ## 2026-09-08 UTC: full-state Huihui comparison prepared; no result or promotion yet
 
 Next bounded quality run: huihui_plex_full_state_max1024_20260908.
