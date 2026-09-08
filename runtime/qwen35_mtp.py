@@ -1440,6 +1440,47 @@ class QwenMTPDrafter:
             h_last, last_token, mtp_kv, offset, weights)))
 
 
+def _capture_qwen_serial_factors(target, tokens, kv):
+    """Own one exact scalar-decay rollback window; never leave capture armed.
+
+    The base shares immutable, evaluated arrays until the verifier replaces
+    them. Only the small update factors survive for strict-prefix replay.
+    This is intentionally separate from tree and native-fused recurrences.
+    """
+    source = kv.kda_cache
+    if bool(getattr(getattr(target, "rc", None),
+                    "native_fused_deltanet_decode", False)):
+        raise ValueError("compact Qwen rollback requires plain scalar recurrence")
+    if source.spill_enabled or source.factor_capture_active:
+        raise ValueError("compact Qwen rollback requires idle resident KDA state")
+    base = source.fork()
+    factors = None
+    try:
+        logits = target.forward_tokens_serial_positions(
+            tokens, kv, capture_kda_endpoints=False, capture_kda_factors=True)
+    finally:
+        # Also handles a verifier failure after partially advancing live KV.
+        # Propagate the original error; never retry that mutated endpoint.
+        try:
+            factors = target.consume_serial_kda_factors()
+        finally:
+            source.cancel_factor_capture()
+    if (factors is None or factors.positions != len(tokens)
+            or len(factors.steps) != len(base._state)
+            or kv.kda_cache is not source):
+        raise RuntimeError("serial Qwen verifier omitted complete KDA factors")
+    active_layers = 0
+    for layer, steps in enumerate(factors.steps):
+        if base.state(layer) is not None or source.state(layer) is not None:
+            active_layers += 1
+            if len(steps) != len(tokens):
+                raise RuntimeError(
+                    f"serial Qwen verifier omitted KDA factors for layer {layer}")
+    if not active_layers:
+        raise RuntimeError("serial Qwen verifier captured no recurrent layers")
+    return logits, base, factors
+
+
 class QwenMTPSpeculativeEngine:
     """Serving adapter, mirroring SpeculativeEngine's shape: falls back to
     the plain target engine for any request shape the target-exact native-MTP
@@ -1467,6 +1508,7 @@ class QwenMTPSpeculativeEngine:
         selective_tree_margin: float = 0.0,
         entropy_stop_threshold: float = 0.0,
         budget_aware_width: bool = False,
+        compact_kda_rollback: bool = False,
         drafter=None,
         mtp_ablation_direction=None,
         mtp_ablation_strength: float = 1.0,
@@ -1554,6 +1596,20 @@ class QwenMTPSpeculativeEngine:
                 "trees")
         if not isinstance(budget_aware_width, bool):
             raise TypeError("Qwen MTP budget_aware_width must be bool")
+        if not isinstance(compact_kda_rollback, bool):
+            raise TypeError("Qwen MTP compact_kda_rollback must be bool")
+        if compact_kda_rollback:
+            if (getattr(target.cfg, "model_type", None) != "qwen3_5"
+                    or getattr(target.cfg, "num_experts", 0)
+                    or native_tree_width or selective_tree_margin):
+                raise ValueError("compact Qwen rollback requires dense flat qwen3_5")
+            if bool(getattr(getattr(target, "rc", None),
+                            "native_fused_deltanet_decode", False)):
+                raise ValueError("compact Qwen rollback requires plain scalar recurrence")
+            if not all(callable(getattr(target, name, None)) for name in (
+                "forward_tokens_serial_positions", "consume_serial_kda_factors",
+            )):
+                raise ValueError("compact Qwen rollback requires serial factor support")
         self.target = target
         self.drafter = drafter if drafter is not None else QwenMTPDrafter(target)
         self.proposal_source = str(getattr(
@@ -1625,6 +1681,7 @@ class QwenMTPSpeculativeEngine:
         self.selective_tree_margin = float(selective_tree_margin)
         self.entropy_stop_threshold = float(entropy_stop_threshold)
         self.budget_aware_width = budget_aware_width
+        self.compact_kda_rollback = compact_kda_rollback
         weight_identity = self.drafter.request_weight_representation
         self.mtp_engine_identity = (
             f"qwen-mtp-depth{self.depth}-{self.proposal_q_policy.name}"
@@ -1655,6 +1712,7 @@ class QwenMTPSpeculativeEngine:
                 if self.entropy_stop_threshold else ""
             )
             + ("-budget-aware-width" if self.budget_aware_width else "")
+            + ("-compact-kda-scalar" if self.compact_kda_rollback else "")
             + (
                 f"-mtp-ablation-{mtp_ablation_fingerprint[:12]}-"
                 f"s{float(mtp_ablation_strength):g}"
@@ -2193,6 +2251,11 @@ class QwenMTPSpeculativeEngine:
         adaptive_reactivations = 0
         serial_verify_rounds = 0
         kda_endpoint_restores = 0
+        kda_factor_rounds = 0
+        kda_factor_restores = 0
+        kda_factor_bytes_peak = 0
+        kda_factor_base_bytes_peak = 0
+        kda_factor_restore_s = 0.0
         refeed_sweeps_saved = 0
         grammar_forced_tokens = 0
         grammar_forced_sweeps = 0
@@ -2378,6 +2441,8 @@ class QwenMTPSpeculativeEngine:
             round_start_layer_lengths = None
             round_layer_growth = None
             round_capture_endpoint = False
+            round_factor_base = None
+            round_factors = None
             round_serial_verify = False
             round_mtp_start_lengths = None
             round_bonus_candidate = False
@@ -3039,11 +3104,23 @@ class QwenMTPSpeculativeEngine:
                             and getattr(kv, "kda_cache", None) is not None
                         )
                         if round_serial_verify:
-                            spec_logits = tgt.forward_tokens_serial_positions(
-                                verify_tokens,
-                                kv,
-                                capture_kda_endpoints=round_capture_endpoint,
-                            )
+                            if self.compact_kda_rollback:
+                                if not round_capture_endpoint:
+                                    raise RuntimeError("compact Qwen rollback lost KDA state")
+                                round_capture_endpoint = False
+                                spec_logits, round_factor_base, round_factors = (
+                                    _capture_qwen_serial_factors(tgt, verify_tokens, kv))
+                                kda_factor_rounds += 1
+                                kda_factor_bytes_peak = max(
+                                    kda_factor_bytes_peak, round_factors.nbytes())
+                                kda_factor_base_bytes_peak = max(
+                                    kda_factor_base_bytes_peak, round_factor_base.nbytes())
+                            else:
+                                spec_logits = tgt.forward_tokens_serial_positions(
+                                    verify_tokens,
+                                    kv,
+                                    capture_kda_endpoints=round_capture_endpoint,
+                                )
                             serial_verify_rounds += 1
                         else:
                             # Compatibility fallback for old dense adapters. MoE
@@ -3492,10 +3569,30 @@ class QwenMTPSpeculativeEngine:
                     del round_tree_verification, spec_logits
                     mx.clear_cache()
                 elif target_fed_positions < round_verify_width:
-                    retained_prefix = (
-                        tgt.consume_serial_kda_endpoint(target_fed_positions)
-                        if round_capture_endpoint else None
-                    )
+                    if round_factors is not None:
+                        restore_started = time.perf_counter()
+                        if tgt.governor is not None:
+                            matrix_bytes = [
+                                int(steps[0].key.shape[0]
+                                    * steps[0].key.shape[1]
+                                    * steps[0].key.shape[2]
+                                    * steps[0].value.shape[2] * 4)
+                                for steps in round_factors.steps if steps
+                            ]
+                            # A new complete endpoint plus bounded per-layer
+                            # scalar-recurrence scratch; no floor is relaxed.
+                            tgt.governor.reserve(
+                                sum(matrix_bytes) + 6 * max(matrix_bytes),
+                                margin=0, reason="qwen-mtp-factor-restore")
+                        retained_prefix = round_factors.commit_prefix(
+                            round_factor_base, target_fed_positions, native_fused=False)
+                        kda_factor_restore_s += time.perf_counter() - restore_started
+                        kda_factor_restores += 1
+                    else:
+                        retained_prefix = (
+                            tgt.consume_serial_kda_endpoint(target_fed_positions)
+                            if round_capture_endpoint else None
+                        )
                     if round_capture_endpoint and retained_prefix is None:
                         raise RuntimeError(
                             "serial Qwen verifier did not retain KDA prefix "
@@ -3516,7 +3613,7 @@ class QwenMTPSpeculativeEngine:
                         kv.trim_layer_lengths(retained_lengths)
                     else:
                         kv.trim(round_start_offset + target_fed_positions)
-                    if round_capture_endpoint:
+                    if round_capture_endpoint or round_factors is not None:
                         kv.kda_cache = retained_prefix
                     if round_capture_endpoint:
                         kda_endpoint_restores += 1
@@ -3534,6 +3631,12 @@ class QwenMTPSpeculativeEngine:
                     # Drop strict-prefix snapshots; the full endpoint already
                     # lives in kv.kda_cache.
                     tgt.consume_serial_kda_endpoint(None)
+
+                # Full acceptance uses the already-computed live endpoint;
+                # strict prefixes use plain scalar replay above. Neither path
+                # retains factors or the base into the next drafting round.
+                round_factors = round_factor_base = None
+                retained_prefix = None
 
                 mtp_end_lengths = mtp_kv.layer_lengths()
                 mtp_growth = tuple(
@@ -3802,6 +3905,14 @@ class QwenMTPSpeculativeEngine:
                 entropy_stop_round_records),
             "qwen_mtp_budget_aware_width_enabled": int(
                 self.budget_aware_width),
+            "qwen_mtp_compact_kda_rollback_enabled": int(self.compact_kda_rollback),
+            "qwen_mtp_kda_factor_rounds": kda_factor_rounds,
+            "qwen_mtp_kda_factor_restores": kda_factor_restores,
+            # Logical retained storage, not unique physical allocation or
+            # bytes freed. The shared base is reported separately.
+            "qwen_mtp_kda_factor_bytes_peak": kda_factor_bytes_peak,
+            "qwen_mtp_kda_factor_base_bytes_peak": kda_factor_base_bytes_peak,
+            "qwen_mtp_kda_factor_restore_s": kda_factor_restore_s,
             "qwen_mtp_budget_width_clamped_rounds": (
                 budget_width_clamped_rounds),
             "qwen_mtp_budget_draft_steps_avoided": (

@@ -1,0 +1,10 @@
+schema: voom.runtime-profile.v1
+name: huihui-qwen38-27b-full-state-factors-audit
+description: Experimental compact scalar-factor rollback for full-state Huihui MTP.
+notes:
+  - "Only flat MTP rollback storage changes relative to the paged256 audit: one immutable base plus captured scalar factors replaces dense strict-prefix endpoints. Plain MLX scalar replay, never CPU or fused replay."
+  - "Experimental/default-off. The target is still MXFP4 with reassociated prefill and a compacted gateway, not released-BF16 lossless or a full-schema model replay. Require exact real-target A/B, actual factor/commit/pressure witnesses and unchanged complete-answer scoring before any speed claim."
+extends:
+  - huihui-qwen38-27b-full-state-paged256-audit
+settings:
+  VMODEL_QWEN_MTP_COMPACT_KDA_ROLLBACK: true

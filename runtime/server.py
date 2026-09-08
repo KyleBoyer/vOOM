@@ -1289,6 +1289,8 @@ class EngineManager:
             "VMODEL_QWEN_MTP_GRAMMAR_AWARE_DRAFT", "0").strip()
         qwen_mtp_budget_aware_width_request = os.environ.get(
             "VMODEL_QWEN_MTP_BUDGET_AWARE_WIDTH", "0").strip()
+        qwen_mtp_compact_kda_request = os.environ.get(
+            "VMODEL_QWEN_MTP_COMPACT_KDA_ROLLBACK", "0").strip()
         qwen_mtp_ablation_direction_request = os.environ.get(
             "VMODEL_QWEN_MTP_ABLATION_DIRECTION", "").strip()
         qwen_mtp_q_policy_kind = os.environ.get(
@@ -1404,6 +1406,10 @@ class EngineManager:
                 "VMODEL_QWEN_MTP_BUDGET_AWARE_WIDTH must be 0 or 1")
         qwen_mtp_budget_aware_width = (
             qwen_mtp_budget_aware_width_request == "1")
+        if qwen_mtp_compact_kda_request not in ("0", "1"):
+            raise RequestValidationError(
+                "VMODEL_QWEN_MTP_COMPACT_KDA_ROLLBACK must be 0 or 1")
+        qwen_mtp_compact_kda = qwen_mtp_compact_kda_request == "1"
         if qwen_mtp_tree_width and qwen_mtp_ngram_first:
             raise RequestValidationError(
                 "VMODEL_QWEN_MTP_TREE_WIDTH cannot be combined with "
@@ -2429,6 +2435,7 @@ class EngineManager:
             qwen_mtp_ngram_first_request,
             qwen_mtp_grammar_aware_draft_request,
             qwen_mtp_budget_aware_width_request,
+            qwen_mtp_compact_kda_request,
             qwen_mtp_ablation_direction_request,
             qwen_mtp_ablation_strength.hex(),
             qwen_mtp_max_prompt_tokens,
@@ -2589,6 +2596,7 @@ class EngineManager:
             qwen_mtp_ngram_first_request,
             qwen_mtp_grammar_aware_draft_request,
             qwen_mtp_budget_aware_width_request,
+            qwen_mtp_compact_kda_request,
             qwen_mtp_ablation_direction_request,
             qwen_mtp_ablation_strength.hex(),
             qwen_mtp_max_prompt_tokens,
@@ -6007,6 +6015,7 @@ class EngineManager:
                         entropy_stop_threshold=(
                             qwen_mtp_entropy_stop_threshold),
                         budget_aware_width=qwen_mtp_budget_aware_width,
+                        compact_kda_rollback=qwen_mtp_compact_kda,
                         grammar_aware_draft=(
                             qwen_mtp_grammar_aware_draft),
                         ngram_first=qwen_mtp_ngram_first,
@@ -6042,6 +6051,7 @@ class EngineManager:
                         f"{qwen_mtp_entropy_stop_threshold:g} "
                         f"budget_aware_width="
                         f"{int(qwen_mtp_budget_aware_width)} "
+                        f"compact_kda_rollback={int(qwen_mtp_compact_kda)} "
                         f"grammar_aware_draft="
                         f"{int(qwen_mtp_grammar_aware_draft)} "
                         f"ngram_first={int(qwen_mtp_ngram_first)} "
@@ -10310,6 +10320,11 @@ def _vision_protocol_timing(result: dict) -> dict:
         "qwen_mtp_entropy_stop_profiled_rounds",
         "qwen_mtp_entropy_stop_events",
         "qwen_mtp_budget_aware_width_enabled",
+        "qwen_mtp_compact_kda_rollback_enabled",
+        "qwen_mtp_kda_factor_rounds",
+        "qwen_mtp_kda_factor_restores",
+        "qwen_mtp_kda_factor_bytes_peak",
+        "qwen_mtp_kda_factor_base_bytes_peak",
         "qwen_mtp_budget_width_clamped_rounds",
         "qwen_mtp_budget_draft_steps_avoided",
         "qwen_mtp_prompt_history_enabled",
@@ -10718,6 +10733,7 @@ def _vision_protocol_timing(result: dict) -> dict:
         "qwen_mtp_estimated_break_even_accept_rate",
         "qwen_mtp_native_tree_hit_rate",
         "qwen_mtp_native_tree_factor_commit_s",
+        "qwen_mtp_kda_factor_restore_s",
         "qwen_mtp_selective_tree_margin",
         "qwen_mtp_proposal_page_load_s",
         "qwen_mtp_proposal_page_release_s",
