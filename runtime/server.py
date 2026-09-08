@@ -2861,6 +2861,8 @@ class EngineManager:
                     qwen35_paged_online_page_native)
                 rc.qwen35_serial_verify_batched_mlp = (
                     qwen35_batched_mlp_request == "1")
+                rc.qwen35_serial_kv_reclaim = (
+                    os.environ.get("VMODEL_QWEN35_SERIAL_KV_RECLAIM", "0") == "1")
                 rc.qwen35_serial_verify_suspend_lm_head = (
                     qwen35_suspend_lm_head_request == "1")
                 rc.qwen35_serial_verify_suspend_lm_head_min_prompt_tokens = (
@@ -9719,6 +9721,7 @@ def _cache_phase_telemetry(name: str, phase_result: dict) -> dict:
                 "qwen_mtp_kda_factor_head_cache_released_bytes",
                 "qwen_mtp_kda_factor_head_active_released_bytes",
                 "qwen_mtp_used", "qwen35_serial_verify_suspend_lm_head",
+                "qwen35_serial_kv_reclaim_enabled", "qwen35_serial_kv_reclaim",
                 "qwen35_serial_verify_suspend_lm_head_min_prompt_tokens",
                 "qwen35_serial_verify_suspend_lm_head_request_active",
                 "qwen35_serial_verify_head_restore_calls",
@@ -10554,6 +10557,7 @@ def _vision_protocol_timing(result: dict) -> dict:
         "qwen35_prefill_chunk_selected",
         "qwen35_serial_verify_exact_page_admission",
         "qwen35_serial_verify_batched_mlp",
+        "qwen35_serial_kv_reclaim_enabled",
         "qwen35_serial_verify_suspend_lm_head",
         "qwen35_serial_verify_suspend_lm_head_min_prompt_tokens",
         "qwen35_serial_verify_suspend_lm_head_request_active",
@@ -10884,6 +10888,7 @@ def _vision_protocol_timing(result: dict) -> dict:
     # instead of silently dropping the evidence at the protocol boundary.
     for key in (
         "generation_witness",
+        "qwen35_serial_kv_reclaim",
         "tool_call_text_witness",
         "qwen4_mtp_idle_head_memory_witness",
         "qwen4_post_generation_memory_witness",

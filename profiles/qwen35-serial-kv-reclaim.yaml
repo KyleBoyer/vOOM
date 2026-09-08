@@ -1,0 +1,9 @@
+schema: voom.runtime-profile.v1
+name: qwen35-serial-kv-reclaim
+description: Exact closed-page KV spill recovery after refused Qwen serial-verifier admission.
+settings:
+  VMODEL_QWEN35_SERIAL_KV_RECLAIM: true
+notes:
+  - "Explicit default-off recovery for qwen3_5/qwen3_5_moe with PagedKVCache only, before current-layer attention. Keeps all tokens, current-layer pages, tails, recent-page policy, recurrent companions and the configured KV budget."
+  - "Uses the unchanged live governor deficit; logical eviction never authorizes allocation. One bounded spill attempt must pass a fresh ordinary reservation before compute. I/O errors and persistent pressure fail closed."
+  - "Does not modify weights, attention arithmetic, prompt/tool preparation, output budgets, sampling, safety reserves or page margins. Requires fresh short/full-model token-state and pressure proof; storage-only probes are not harness speedups or Plex scores."

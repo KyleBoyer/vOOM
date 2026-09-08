@@ -1287,6 +1287,9 @@ class RuntimeConfig:
     # The served BF16 lossless route never enables this; MXFP4 promotion still
     # requires identical target tokens plus the heterogeneous quality corpus.
     qwen35_serial_verify_batched_mlp: bool = False
+    # Exact, default-off recovery after a refused serial compute reservation.
+    # Spill closed KV pages outside the current layer, then re-reserve normally.
+    qwen35_serial_kv_reclaim: bool = False
     # Exact-target, default-off memory-lifetime optimization for an untied
     # Qwen LM head. Startup registers an exact dormant lease instead of
     # materializing the head before prefill. The head is pinned on its first
@@ -1710,6 +1713,7 @@ class RuntimeConfig:
                 "qwen35_serial_verify_exact_page_admission", False),
             qwen35_serial_verify_batched_mlp=run.get(
                 "qwen35_serial_verify_batched_mlp", False),
+            qwen35_serial_kv_reclaim=run.get("qwen35_serial_kv_reclaim", False),
             qwen35_serial_verify_suspend_lm_head=run.get(
                 "qwen35_serial_verify_suspend_lm_head", False),
             qwen35_serial_verify_suspend_lm_head_min_prompt_tokens=run.get(
@@ -2601,6 +2605,7 @@ class StreamingEngine:
         self._qwen35_serial_verify_cache_prepare_s = 0.0
         self._qwen35_serial_verify_page_reserve_s = 0.0
         self._qwen35_serial_verify_reserve_s = 0.0
+        self._qwen35_serial_kv_reclaim_stats = {}
         self._qwen35_serial_verify_weight_wait_s = 0.0
         self._qwen35_serial_verify_linear_layer_compute_s = 0.0
         self._qwen35_serial_verify_full_layer_compute_s = 0.0
@@ -10494,10 +10499,11 @@ class StreamingEngine:
                         margin=self._layer_transient_margin,
                         reason="serial-verify-transient")
                 except MemoryError:
+                    recovered = False
                     if qwen_family:
                         # Diagnose the refused operation, not a later wrapper
-                        # snapshot. Observe scalar metadata only; no retry,
-                        # eviction, device barrier or safety-policy change.
+                        # snapshot. This observation changes no device state;
+                        # any separately opted-in recovery runs below it.
                         try:
                             import json
                             from .phase_head_witness import sample_phase_head_memory
@@ -10525,7 +10531,12 @@ class StreamingEngine:
                                 context, sort_keys=True, allow_nan=False), flush=True)
                         except Exception:
                             pass  # Optional diagnostics never mask the refusal.
-                    raise
+                        from .qwen_kv_reclaim import recover_serial_kv_admission
+                        recovered = recover_serial_kv_admission(
+                            self, kv, mx, layer=layer,
+                            positions=verifier_positions, offset=offset)
+                    if not recovered:
+                        raise
                 if qwen_family:
                     self._qwen35_serial_verify_reserve_s += (
                         time.perf_counter() - reserve_t0)
@@ -11465,6 +11476,7 @@ class StreamingEngine:
         self._qwen35_serial_verify_cache_prepare_s = 0.0
         self._qwen35_serial_verify_page_reserve_s = 0.0
         self._qwen35_serial_verify_reserve_s = 0.0
+        self._qwen35_serial_kv_reclaim_stats = {}
         self._qwen35_serial_verify_weight_wait_s = 0.0
         self._qwen35_serial_verify_linear_layer_compute_s = 0.0
         self._qwen35_serial_verify_full_layer_compute_s = 0.0
@@ -14247,6 +14259,10 @@ class StreamingEngine:
             kv.rotated_view_nbytes()
             if getattr(kv, "position_free", False) else 0)
         paged_stats = getattr(kv, "stats", None)
+        if self.rc.qwen35_serial_kv_reclaim:
+            path_stats["qwen35_serial_kv_reclaim_enabled"] = 1
+            path_stats["qwen35_serial_kv_reclaim"] = dict(
+                self._qwen35_serial_kv_reclaim_stats)
         path_stats["paged_kv_spills"] = int(
             getattr(paged_stats, "spills", 0) or 0)
         path_stats["paged_kv_reloads"] = int(

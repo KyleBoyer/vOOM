@@ -103,6 +103,8 @@ def main():
     parser.add_argument('--preflight', type=Path, required=True)
     parser.add_argument('--result', type=Path, required=True)
     parser.add_argument('--pytest-root', type=Path, required=True)
+    parser.add_argument('--include-serial-recovery-tests', action='store_true',
+                        help='Also test the real serial admission hook under a controlled device ceiling.')
     args = parser.parse_args()
     assert not args.result.exists() and not args.pytest_root.exists()
     pre = json.loads(args.preflight.read_text())
@@ -115,6 +117,8 @@ def main():
     mx.reset_peak_memory()
     tests = ['tests/test_paged_kv_reclaim_mlx.py', 'tests/test_paged_kv_hybrid_recurrent.py',
              'tests/test_qwen_paged_hybrid_prefix_persist.py', 'tests/test_qwen35_paged_online_attention.py']
+    if args.include_serial_recovery_tests:
+        tests += ['tests/test_qwen_kv_reclaim_mlx.py', 'tests/test_qwen_mtp_scalar_rollback.py']
     rc = int(pytest.main(['-q', '--basetemp='+str(args.pytest_root), *tests]))
     rows, error = [], None
     try:
@@ -135,6 +139,7 @@ def main():
     passed = rc == 0 and error is None and len(rows) == 2 and all(r['passed'] for r in rows) and pressure_ok and 0 < peak <= 8_500_000_000
     doc = dict(schema='voom.paged-kv-reclamation-probe.v1', passed=passed,
         scope=__doc__, model_executed=False, serving_integration_enabled=False,
+        serial_admission_hook_tested=args.include_serial_recovery_tests,
         test_exit_code=rc, tests=tests, rows=rows, error=error,
         pressure_before=before, pressure_after=after, sampled_pressure_passed=pressure_ok,
         observed_peak_metal_bytes=peak, preflight_sha256=hashlib.sha256(args.preflight.read_bytes()).hexdigest(),

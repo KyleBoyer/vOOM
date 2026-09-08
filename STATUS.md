@@ -1,5 +1,78 @@
 # STATUS — 2026-09-08 UTC (current corrections first; dated chronology below is history)
 
+## 2026-09-08 UTC: default-off Qwen serial KV recovery is wired and unit-gated
+
+Added the explicit `qwen35-serial-kv-reclaim` overlay
+(`VMODEL_QWEN35_SERIAL_KV_RECLAIM=1`) and RuntimeConfig/YAML/server wiring.
+Only a refused qwen3_5/qwen3_5_moe serial-compute reservation with an actual
+PagedKVCache is eligible. The existing refusal diagnostic remains; the owning
+engine thread then gets one bounded exact spill attempt before current-layer
+attention or next-layer prefetch. Size comes from the unchanged live governor
+ceiling, selected scratch and margin, never prompt/tool/capture content.
+Current-layer pages, tails, recent-page policy, recurrent state, all positions
+and the fixed KV budget remain intact.
+
+Allocation requires a new ordinary governor reservation after any reclamation;
+logical bytes and signed non-atomic Metal active deltas are reported separately.
+No candidates or a second refusal re-raises the original MemoryError; I/O/device
+failures propagate. Earlier pages successfully spilled before a later write
+failure remain represented in the logical/spill counters. Records/logs cap at
+64 per generation with aggregate totals/drop counts retained. Generation resets
+the trace, and completed MTP exports post-bootstrap recovery stats so hidden
+and public server phases retain structured evidence, not stale bootstrap zeros.
+No existing profile/default, target weights, arithmetic, prompt preparation,
+sampling, output limits, 5.6GB reserve, 400MB page margin or 256MB policy changed.
+
+Supervised `huihui_serial_kv_reclaim_integration_20260908` on
+`cd670105120d0454964f641ebdc6b1ae19a3acfb` plus its recorded patch passes
+**69 MLX tests in 1.21s**. Tests execute the extracted REAL engine admission
+block, real MemoryGovernor and actual BF16 paged arrays at a deliberately tight
+device ceiling; the test alone disables artificial settle waits. Recovery must
+physically free at least the controlled 2.1MB deficit and pass the second
+reservation. Disabled/retained-alias controls remain refused. Exact full-history
+readback, unchanged SDPA, protected/tail/recurrent ownership and rollback across
+spilled history pass. The MTP/compact-factor regression covers prefix rejection,
+termination and state agreement using mocked target/proposal weights.
+These are controlled integration/unit proofs, NOT a full engine weight sweep,
+actual host-pressure recovery, released-model token proof or a Plex score.
+
+The accompanying synthetic 5,046-token/full-Huihui-geometry repeat physically
+frees **138,412,032B in 0.048590s**; its retained-alias control frees **0B**
+despite equal logical eviction. Both retain all 16 exact BF16 history hashes,
+independently recomputed with NumPy. This is standalone spill timing, not a
+serving speedup, and 48.6ms versus the prior 51.5ms is not an isolated code gain.
+Driver 2.621720s / parent 4.466671s; peak Metal 285,589,582B, minimum sampled
+available 6,452,002,816B, actual swap-out 32,768B and net swap growth zero.
+Fresh 30.0365s preflight passes with zero swap churn/growth and 16 known-
+transcoder observations. No periodic host-activity sampler in this short
+weights-free job; no claim of full runtime isolation or pressure qualification.
+Root/external free minima 21,457,932,288B / 100,387,741,696B.
+
+All 785 source/start-end/fresh manifests, recorded patch, result/log/preflight/
+receipt hashes, independent BF16 geometry oracle and owned PID completion
+verified before edits. PIDs 52517/52521 gone; no model job remains.
+A subsequent pure-only partial-write regression was added without changing
+measured runtime/MLX tests. Final selected pure suite **882 passed in 11.74s**;
+all 126 profiles validate. No user apps/data changed.
+
+Next: add strict per-phase recovery-witness checks to the captured replay gate,
+then a fresh short original-capture comparison using ONLY the new overlay
+against the passing unchanged-profile reference. Require complete prepared/raw
+token identities, natural output under max1024, physical/path evidence where
+recovery fires, and all pressure/isolation gates. A no-refusal short pass only
+qualifies the overlay's inactive path; the controlled test is not a substitute
+for recovery on real traffic. Then revisit the full original-input Plex workflow
+with its existing explicit MXFP4/reassociated-prefill/Hermes/gateway profile.
+Prefill page-admission retries remain separate. No blind unchanged full rerun,
+profile promotion, released-BF16 claim, new Plex score or under-90s claim.
+
+Tree e24381344c7201b130e9681f4d66964e7c79c5f8753f4d152a331fe437626c26;
+result 55c64b82d4f0217e6031f578c034c320492b165a558e8d5b1a660ae9bbc5ac5b;
+receipt e25934833674ae1742b99a029caf1142a222ea60b96536200db4d95d262bfd69;
+log 58fded3cc9dcda2298c5f35d154d6e5e11d883a1debc25ec54f59408f21374ec;
+preflight 0a34e91fe5985bae967f5e43022ee36689a55d287bee1b532126d4bcdf3db77b.
+
+
 ## 2026-09-08 UTC: exact KV reclamation primitive proves physical release; serving integration pending
 
 Implemented `PagedKVCache.reclaim_closed_pages()`: a bounded, explicit

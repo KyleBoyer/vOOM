@@ -4339,6 +4339,12 @@ class QwenMTPSpeculativeEngine:
                 sidecar_release_s
                 if request_weight_representation == "released-bf16" else 0.0),
         })
+        if getattr(getattr(tgt, "rc", None), "qwen35_serial_kv_reclaim", False):
+            # Bootstrap stats precede serial decoding; expose the completed
+            # phase's recovery evidence, not the bootstrap's empty snapshot.
+            path_stats["qwen35_serial_kv_reclaim_enabled"] = 1
+            path_stats["qwen35_serial_kv_reclaim"] = dict(
+                getattr(tgt, "_qwen35_serial_kv_reclaim_stats", {}))
         if self.proposal_replay_top_k:
             path_stats["qwen_mtp_proposal_q_replay"] = (
                 proposal_replay_records)
