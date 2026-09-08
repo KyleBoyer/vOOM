@@ -1,5 +1,71 @@
 # STATUS — 2026-09-08 UTC (current corrections first; dated chronology below is history)
 
+## 2026-09-08 UTC: exact KV reclamation primitive proves physical release; serving integration pending
+
+Implemented `PagedKVCache.reclaim_closed_pages()`: a bounded, explicit
+owning-thread operation that spills eligible closed pages oldest-first while
+preserving the protected layer, recent-page policy, all tails/history/recurrent
+companions, offsets and fixed KV budget. It reuses the existing exact spill path.
+Ordinary budget enforcement retains its previous selection policy. Compressed
+spills now reject non-BF16 input before writes because that existing format
+does not encode dtype; uncompressed BF16 and FP32 remain supported.
+No serving/governor call site or default/profile change is included.
+
+Supervised `huihui_paged_kv_reclaim_geometry_20260908` on source
+`b2c819f51e3d189d115a95c6610c8b78c450093d` plus the recorded dirty patch
+passes with 23 MLX tests (0.20s), driver 1.7183s / parent 3.5171s.
+This is a weights-free SYNTHETIC activation/ownership probe using real local
+Huihui geometry: 64 layers, 16 full-attention layers, four KV heads, dimension
+256, context 5,046, append width 128 and page width 256. The fixed KV budget
+remains 256,000,000B with one recent page per layer; layer 27 is protected.
+The 137,720,144B request reproduces the previous serial-admission deficit for
+this probe only; it is NOT a serving constant or prompt-dependent policy.
+
+Positive ownership case: 132 closed pages remove 138,412,032B of logical
+residency AND 138,412,032B of actual Metal active memory in **0.051529s**.
+Active memory falls 243,270,000 -> 104,857,968B. Whole positive case is
+0.702245s including construction and readback, not model/harness latency.
+An explicit retained-alias negative control removes the SAME logical bytes
+but frees **0B** physically (0.054559s reclamation). Consequently logical
+eviction must never count as allocation credit: future serving integration
+must remeasure and repeat ordinary governor admission after one bounded attempt.
+
+All 16 full-history raw-BF16 hashes match an independently recomputed NumPy
+integer-to-float32-to-BF16-bit oracle. Protected pages/tails/offsets/budget remain
+unchanged. MLX tests cover exact BF16/FP32 serialization, compressed BF16,
+unchanged SDPA results, append/rollback across spilled history, recurrent
+companion preservation, I/O failure retaining references/stats, and cache-local
+spill paths/release isolation. The final selected pure suite passes **857 tests
+in 11.39s**; all 125 profiles validate. These are storage/attention-unit proofs,
+not full-model token equivalence, released-weight quality or a new Plex score.
+
+Peak Metal 285,589,582B; minimum sampled available 6,413,254,656B;
+whole-probe swap-out 65,536B and net swap growth 0. Fresh 30.0382s preflight
+passes with 16 known-transcoder samples, preceding-window swap-out 1,277,952B
+and net growth 0. No runtime host-activity sampler was added to this roughly
+two-second weights-free probe; this is not a full periodic-pressure or general
+host-idle qualification. Parent root/external free minima
+21,466,595,328B / 100,256,813,056B. No user apps/data touched.
+
+Source/start-end/fresh manifests (781 files), dirty patch, child/result/log/
+preflight receipts, independent history oracle, physical/alias-control evidence
+and owned PID completion verified before documentation edits. No job remains.
+Next: explicit default-off serial-verifier recovery at a safe owning-thread
+boundary; derive the current deficit from unchanged governor limits, preserve
+the current layer, record logical and actual release separately, and always
+re-reserve before compute. Prove disabled/no-candidate/alias/error/refusal cases
+and token/state equivalence, then fresh short and full-workflow model gates.
+Do not lower the 5.6GB reserve, 400MB page margin or 256MB KV budget.
+Prefill page-admission retries remain a separate bottleneck. Full Plex completion/
+score, long-context/output/generalization and under-90s remain OPEN.
+
+Tree cc589aac82d8066d8a0ed69b99fa6fb35ac63638c3e54fc2101db5df3e6aa422;
+result 7b816ba996322c3d7407d4063639ea9f596dd11ead2517ca03b45db8c4a7ddc1;
+receipt a1d91148d502f0652d9930f8576c2261920a39937f4b7af4b8c79966935dc270;
+log ca869b5bad6142591ef03acfd4b28ea231c541cf41b3ea9a2be1682024d0f084;
+preflight 09dfd6f8b6d7f5bedded5cc5d305196998f7c6513121fefc599f241488d3f7db.
+
+
 ## 2026-09-08 UTC: full Plex follow-up fails at verifier admission; no final score
 
 `huihui_plex_after_user_app_cleanup_20260908` on

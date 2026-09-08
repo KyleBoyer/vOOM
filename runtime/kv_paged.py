@@ -518,6 +518,62 @@ class PagedKVCache:
 
     # ---- spilling -----------------------------------------------------------
 
+    def _spill_resident_page(self, layer: int, page_idx: int) -> int:
+        """Use the established exact spill path; return logical bytes only."""
+        page = self._pages[layer][page_idx]
+        if not page.resident:
+            return 0
+        if self.compress_spill and (page.k.dtype != mx.bfloat16 or page.v.dtype != mx.bfloat16):
+            raise ValueError("compressed KV spilling requires BF16 pages")
+        raw_bytes = page.nbytes
+        t0 = time.perf_counter()
+        comp_bytes = page.spill(
+            self.spill_dir
+            / (f"kv_{self._cache_id}_l{layer}_p{page_idx}.safetensors"),
+            compress=self.compress_spill)
+        self.stats.spills += 1
+        self.stats.spill_s += time.perf_counter() - t0
+        if comp_bytes is not None:
+            self.stats.spill_bytes_raw += raw_bytes
+            self.stats.spill_bytes_compressed += comp_bytes
+        mx.clear_cache()
+        return raw_bytes
+
+    def reclaim_closed_pages(
+        self, requested_bytes: int, *, protected_layer: int | None = None,
+    ) -> int:
+        """Best-effort exact spill without changing the configured KV budget.
+
+        Call only between attention operations on the cache's owning thread.
+        Preserve all tails, the protected layer, and each layer's configured
+        recent resident pages. Visit eligible closed pages oldest-first across
+        layers, using the same exact serialization/reload path as ordinary
+        paging. Never truncate history or touch recurrent companions.
+
+        Returned bytes are removed cache references, NOT a physical allocation
+        credit: aliases/lazy consumers may retain their backing storage. The
+        caller must remeasure and perform normal admission before allocating.
+        An unavailable/insufficient candidate set returns less than requested;
+        spill errors propagate with the page's tensor references intact.
+        This primitive is not automatically invoked by serving or the governor.
+        """
+        if type(requested_bytes) is not int or requested_bytes < 0:
+            raise ValueError("requested_bytes must be a non-negative integer")
+        if (protected_layer is not None and (type(protected_layer) is not int
+                or not 0 <= protected_layer < self.num_layers)):
+            raise ValueError("protected_layer is outside cache geometry")
+        if requested_bytes == 0:
+            return 0
+        released = 0
+        for page_idx in range(max((len(p) for p in self._pages), default=0)):
+            for layer, pages in enumerate(self._pages):
+                if layer == protected_layer or page_idx >= len(pages) - self.resident_pages:
+                    continue
+                released += self._spill_resident_page(layer, page_idx)
+                if released >= requested_bytes:
+                    return released
+        return released
+
     def _enforce_budget(self, protected_layer: int | None = None):
         if self.nbytes() <= self.max_bytes:
             return
@@ -542,21 +598,8 @@ class PagedKVCache:
                     pages = self._pages[layer]
                     if page_idx >= len(pages) - self.resident_pages:
                         continue
-                    page = pages[page_idx]
-                    if not page.resident:
+                    if not pages[page_idx].resident:
                         continue
-                    raw_bytes = page.nbytes
-                    t0 = time.perf_counter()
-                    comp_bytes = page.spill(
-                        self.spill_dir
-                        / (f"kv_{self._cache_id}_l{layer}_p{page_idx}"
-                           ".safetensors"),
-                        compress=self.compress_spill)
-                    self.stats.spills += 1
-                    self.stats.spill_s += time.perf_counter() - t0
-                    if comp_bytes is not None:
-                        self.stats.spill_bytes_raw += raw_bytes
-                        self.stats.spill_bytes_compressed += comp_bytes
-                    mx.clear_cache()
+                    self._spill_resident_page(layer, page_idx)
                     if self.nbytes() <= self.max_bytes:
                         return
