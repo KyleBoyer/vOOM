@@ -1,0 +1,13 @@
+schema: voom.runtime-profile.v1
+name: huihui-qwen38-27b-full-workflow-lifetime-audit
+description: Explicit full-state model-only Huihui gateway audit with measured short-request lifetime repairs.
+notes:
+  - "Extends the full-state paged256 scalar-factor audit with the same explicit Hermes protocol, 5600MB live reserve and all-length phase-head boundary tested on the two short captures. Unlike the short direct profile, the existing gateway remains enabled; the complete 134-tool HTTP input is preserved but model preparation still compacts its catalog and prompt."
+  - "The target remains MXFP4 with reassociated prefill, not released-BF16 lossless or a full49K/full-schema model replay. All prepared prompt state is retained; conventional BF16 KV paging and scalar rollback do not add another approximation. No host routing, argument repair, answer rendering or prompt-cache reuse."
+  - "Experimental, no default promotion or speed/quality claim. Require naturally completed hidden AND public generations, raw IDs/text, actual factor/head/paging witnesses, whole-visible model-only Plex scoring and unchanged pressure gates. Original capture, max1024/temp0/seed64013, synthetic mixed-page fixture; no live tools."
+extends:
+  - huihui-qwen38-27b-full-state-factors-audit
+settings:
+  VMODEL_QWEN35_DENSE_HERMES_TOOLS: true
+  VMODEL_QWEN35_MIN_AVAILABLE_MB: 5600
+  VMODEL_QWEN35_SERIAL_VERIFY_SUSPEND_LM_HEAD_MIN_PROMPT_TOKENS: 0

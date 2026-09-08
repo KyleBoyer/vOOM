@@ -123,6 +123,73 @@ def test_direct_audit_only_removes_gateway_and_factor_arm_only_changes_rollback(
     assert settings(factors) == {**settings(direct), 'VMODEL_QWEN_MTP_COMPACT_KDA_ROLLBACK': '1'}
 
 
+def test_full_workflow_lifetime_audit_preserves_gateway_and_other_policies():
+    base, audit, direct = {}, {}, {}
+    apply_runtime_profiles(['huihui-qwen38-27b-full-state-factors-audit'], environ=base)
+    apply_runtime_profiles(['huihui-qwen38-27b-full-workflow-lifetime-audit'], environ=audit)
+    apply_runtime_profiles(['huihui-qwen38-27b-hermes-factors-phase-head-audit'], environ=direct)
+    settings = lambda env: {k: v for k, v in env.items()
+        if k.startswith('VMODEL_') and k != 'VMODEL_PROFILE'}
+    assert settings(audit) == {**settings(base), 'VMODEL_QWEN35_DENSE_HERMES_TOOLS': '1',
+        'VMODEL_QWEN35_MIN_AVAILABLE_MB': '5600',
+        'VMODEL_QWEN35_SERIAL_VERIFY_SUSPEND_LM_HEAD_MIN_PROMPT_TOKENS': '0'}
+    assert settings(audit) == {**settings(direct), 'VMODEL_FAST_TOOL_GATEWAY': '1'}
+
+
+def lifetime_phase():
+    from tests.test_captured_transition_tracking_gate_pure import completed_phase, factor_timing
+    return dict(**paged_phase(), **completed_phase(), **factor_timing(),
+        qwen_mtp_used=1, qwen35_serial_verify_suspend_lm_head=1,
+        qwen35_serial_verify_suspend_lm_head_min_prompt_tokens=0,
+        qwen35_serial_verify_suspend_lm_head_request_active=1,
+        qwen35_serial_verify_head_restore_calls=0,
+        qwen_mtp_target_head_restore_calls=3,
+        qwen_mtp_target_head_suspend_enabled=1,
+        qwen_mtp_target_head_suspend_request_active=1)
+
+
+@pytest.mark.parametrize('bad,key', [
+    ({}, 'all_phase_scalar_factors'),
+    ({'qwen_mtp_kda_factor_rounds': 0}, 'all_phase_scalar_factors'),
+    ({'qwen_mtp_kda_factor_restore_s': float('nan')}, 'all_phase_scalar_factors'),
+    ({'qwen_mtp_target_head_restore_calls': None}, 'all_phase_head_lifetime'),
+    ({'qwen_mtp_target_head_restore_calls': True}, 'all_phase_head_lifetime'),
+    ({'qwen_mtp_target_head_suspend_request_active': 0}, 'all_phase_head_lifetime'),
+    ({'qwen35_serial_verify_suspend_lm_head_min_prompt_tokens': 4096}, 'all_phase_head_lifetime')])
+def test_lifetime_gate_checks_hidden_phase_not_just_public_summary(bad, key):
+    good = lifetime_phase()
+    config = dict(require_all_phase_completion=True, require_paged_kv=True,
+        require_qwen_factors=True, require_qwen_phase_head=True)
+    assert all(full_state_checks([good, good], **config).values())
+    suspect = {**good, **bad} if bad else {}
+    assert not full_state_checks([suspect, good], **config)[key]
+
+
+@pytest.mark.parametrize('phases', [None, [], [None]])
+def test_lifetime_gate_does_not_invent_missing_phase_evidence(phases):
+    checks = full_state_checks(phases, require_qwen_factors=True, require_qwen_phase_head=True)
+    assert not checks['all_phase_scalar_factors'] and not checks['all_phase_head_lifetime']
+
+
+@pytest.mark.parametrize('flag,key,bad', [
+    ('require_qwen_factors', 'qwen_mtp_kda_factor_rounds', 0),
+    ('require_qwen_phase_head', 'qwen_mtp_target_head_restore_calls', 0)])
+def test_lifetime_failure_is_saved_before_stopping_workflow(tmp_path, monkeypatch, flag, key, bad):
+    request, config, responses, wires = workflow_setup(tmp_path, monkeypatch)
+    config.update(require_all_phase_completion=True, **{flag: True})
+    for response in responses:
+        response['vmodel_cache_phases'] = [lifetime_phase(), lifetime_phase()]
+    responses[0]['vmodel_cache_phases'][0][key] = bad
+    original_post = plex._post
+    document = dict(failures=[])
+    with pytest.raises(RuntimeError, match='lifetime path'):
+        gate.run_plex_workflow(config, request, document)
+    assert plex._post is original_post and len(wires) == 1
+    assert 'final_plex_score' not in document
+    assert json.loads((tmp_path/'reply.turn1.json').read_text()) == responses[0]
+    assert json.loads((tmp_path/'result.turn1.progress.json').read_text())['turns'] == document['workflow_http']
+
+
 def test_paged_witness_requires_actual_spill_and_reload_on_both_phases():
     assert all(full_state_checks([paged_phase(), paged_phase()], require_paged_kv=True).values())
 

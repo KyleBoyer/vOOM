@@ -5561,6 +5561,27 @@ def test_cache_phase_retains_own_budget_termination_and_raw_ids_without_defaults
     assert 'termination_reason' not in missing and 'generation_max_tokens' not in missing
 
 
+def test_cache_phase_head_lifetime_uses_own_complete_wrapper_stats_without_defaults():
+    fields = dict(qwen_mtp_used=1, qwen35_serial_verify_suspend_lm_head=1,
+        qwen35_serial_verify_suspend_lm_head_min_prompt_tokens=0,
+        qwen35_serial_verify_suspend_lm_head_request_active=1,
+        qwen35_serial_verify_head_restore_calls=0,
+        qwen_mtp_target_head_suspend_enabled=1,
+        qwen_mtp_target_head_suspend_request_active=1,
+        qwen_mtp_target_head_restore_calls=3,
+        qwen_mtp_target_head_suspend_active_released_bytes=123,
+        qwen_mtp_target_head_suspend_active_peak_bytes=41)
+    hidden = _cache_phase_telemetry('gateway_decision', dict(path_stats=fields,
+        qwen_mtp_target_head_restore_calls=99))
+    assert all(hidden[key] == value for key, value in fields.items())
+    fields['qwen_mtp_target_head_restore_calls'] = 7
+    public = _cache_phase_telemetry('gateway_execution', dict(path_stats=fields))
+    assert hidden['qwen_mtp_target_head_restore_calls'] == 3
+    assert public['qwen_mtp_target_head_restore_calls'] == 7
+    missing = _cache_phase_telemetry('request', {})
+    assert not set(fields) & set(missing)
+
+
 def test_responses_stream_emits_terminal_failure_instead_of_truncated_sse():
     import io
 

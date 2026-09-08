@@ -1,5 +1,43 @@
 # STATUS — 2026-09-08 UTC (current corrections first; dated chronology below is history)
 
+## 2026-09-08 UTC: full-workflow lifetime audit prepared with per-phase path checks
+
+New explicit huihui-qwen38-27b-full-workflow-lifetime-audit preserves the
+existing compacted gateway, full prepared state,256MB BF16 KV paging, scalar
+rollback and all host-action/render/cache disablements. It adds the same
+Hermes protocol/5600MB live floor/all-length phase-head boundary proven on
+the short captures. Its resolved settings equal the short passing direct
+profile except gateway=1; versus full-state-factors only those three settings
+change. MXFP4/reassociated target and gateway compaction remain lossy; NOT
+released-BF16/full49K or a default. No new model result yet.
+
+Server per-phase telemetry now retains that generation's existing head/MTP
+flags, restore/suspend counts and actual active-release bytes/times. No tensor
+sampling, synchronization, math, cache eviction or inference policy changes.
+Missing evidence stays missing. The full-workflow gate reuses the same typed
+scalar-factor and head-path predicates as the short capture gate, but requires
+them on EVERY hidden/public phase. A good public suffix cannot hide a missing
+hidden path. Existing all-phase budget/raw/natural-stop gates remain mandatory;
+failure is persisted before continuation stops. No change to synthetic page
+contents, whole-visible scoring or generated outputs.
+
+13 new regressions fail before the implementation and pass after; the profile
+contract also passes. Coverage includes malformed/missing hidden counters,
+MTP bootstrap-vs-loop precedence, independent phase snapshots and durable
+stop-on-failure receipts. 775 selected pure tests PASS10.52s;124 profiles validate.
+Combined full-workflow+generation+host digest
+8d98d906577180242df67463f4361c83ebc1359079ec00012070ae5476d2e93f.
+
+Next bounded run huihui_plex_lifetime_full_workflow_20260908: SAME original
+178616B/134-tool captured HTTP body/history/stream; only model/max1024/temp0/
+seed64013 overrides; same synthetic mixed two-page Plex rubric, model-only.
+No tools execute. Preserve actual paging/factor/head/full-state/all-phase
+completion, pressure and provenance gates; quality-only runtime retries remain
+charged and fail no_retry. Fresh30s preflight required before launch. Stop at
+the existing five-response/1800s-per-response bound, supervisor9300s. Full Plex,
+under90s and broad held-out/context quality remain unqualified until measured.
+
+
 ## 2026-09-08 UTC: uncaptured head lifetime repair passes both original short captures
 
 huihui_server_head_lifetime_20260908 on534fd436ff0c87d221df55862f591cf87828a6aa

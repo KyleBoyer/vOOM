@@ -9714,7 +9714,19 @@ def _cache_phase_telemetry(name: str, phase_result: dict) -> dict:
                 "qwen35_paged_online_attention", "qwen35_paged_online_page_native",
                 "qwen_mtp_compact_kda_rollback_enabled", "qwen_mtp_kda_factor_rounds",
                 "qwen_mtp_kda_factor_restores", "qwen_mtp_kda_factor_bytes_peak",
-                "qwen_mtp_kda_factor_base_bytes_peak", "qwen_mtp_kda_factor_restore_s"):
+                "qwen_mtp_kda_factor_base_bytes_peak", "qwen_mtp_kda_factor_restore_s",
+                "qwen_mtp_used", "qwen35_serial_verify_suspend_lm_head",
+                "qwen35_serial_verify_suspend_lm_head_min_prompt_tokens",
+                "qwen35_serial_verify_suspend_lm_head_request_active",
+                "qwen35_serial_verify_head_restore_calls",
+                "qwen_mtp_target_head_suspend_enabled",
+                "qwen_mtp_target_head_suspend_request_active",
+                "qwen_mtp_target_head_suspend_calls", "qwen_mtp_target_head_suspend_bytes",
+                "qwen_mtp_target_head_suspend_active_released_bytes",
+                "qwen_mtp_target_head_suspend_active_peak_bytes",
+                "qwen_mtp_target_head_restore_calls", "qwen_mtp_target_head_restore_successes",
+                "qwen_mtp_target_head_restore_refusals", "qwen_mtp_target_head_suspend_s",
+                "qwen_mtp_target_head_restore_s"):
         if key in stats or key in phase_result:
             value[key] = stats.get(key, phase_result.get(key))
     if phase_result.get("execution_profile") is not None:

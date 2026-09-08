@@ -118,6 +118,35 @@ def generation_phase_checks(response):
                 all_phase_generation_witness=valid and all(witnessed(p) for p in phases))
 
 
+def qwen_scalar_factor_path(t):
+    """Actual flat scalar rollback observations, not just a configured switch."""
+    return (type(t.get('qwen_mtp_compact_kda_rollback_enabled')) is int
+        and t['qwen_mtp_compact_kda_rollback_enabled'] == 1
+        and all(type(t.get(key)) is int and t[key] > 0 for key in (
+            'qwen_mtp_kda_factor_rounds', 'qwen_mtp_kda_factor_bytes_peak',
+            'qwen_mtp_kda_factor_base_bytes_peak'))
+        and type(t.get('qwen_mtp_kda_factor_restores')) is int
+        and t['qwen_mtp_kda_factor_restores'] >= 0
+        and type(t.get('qwen_mtp_kda_factor_restore_s')) in (int, float)
+        and 0 <= t['qwen_mtp_kda_factor_restore_s'] < float('inf'))
+
+
+def qwen_all_prompt_phase_head_path(t):
+    """MTP's bootstrap counters cannot substitute for its complete loop."""
+    mtp_used = type(t.get('qwen_mtp_used')) is int and t['qwen_mtp_used'] == 1
+    restore_key = ('qwen_mtp_target_head_restore_calls' if mtp_used
+        else 'qwen35_serial_verify_head_restore_calls')
+    return (all(type(t.get(key)) is int and t[key] == expected
+        for key, expected in (
+            ('qwen35_serial_verify_suspend_lm_head', 1),
+            ('qwen35_serial_verify_suspend_lm_head_min_prompt_tokens', 0),
+            ('qwen35_serial_verify_suspend_lm_head_request_active', 1)))
+        and type(t.get(restore_key)) is int and t[restore_key] > 0
+        and (not mtp_used or all(type(t.get(key)) is int and t[key] == 1
+            for key in ('qwen_mtp_target_head_suspend_enabled',
+                        'qwen_mtp_target_head_suspend_request_active'))))
+
+
 def row_checks(row, response, case, config):
     t, usage = row.get('timing') or {}, row.get('usage') or {}
     witness = t.get('generation_witness') or {}
@@ -150,33 +179,9 @@ def row_checks(row, response, case, config):
     if config.get('require_all_phase_completion', False):
         checks.update(generation_phase_checks(response))
     if config.get('require_qwen_factors', False):
-        checks['qwen_scalar_factor_path'] = (
-            type(t.get('qwen_mtp_compact_kda_rollback_enabled')) is int
-            and t['qwen_mtp_compact_kda_rollback_enabled'] == 1
-            and all(type(t.get(key)) is int and t[key] > 0 for key in (
-                'qwen_mtp_kda_factor_rounds', 'qwen_mtp_kda_factor_bytes_peak',
-                'qwen_mtp_kda_factor_base_bytes_peak'))
-            and type(t.get('qwen_mtp_kda_factor_restores')) is int
-            and t['qwen_mtp_kda_factor_restores'] >= 0
-            and type(t.get('qwen_mtp_kda_factor_restore_s')) in (int, float)
-            and 0 <= t['qwen_mtp_kda_factor_restore_s'] < float('inf'))
+        checks['qwen_scalar_factor_path'] = qwen_scalar_factor_path(t)
     if config.get('require_qwen_phase_head', False):
-        # The engine fields in an MTP response are its one-token bootstrap
-        # snapshot. Actual verifier/drafter lifetime counters are reported by
-        # the wrapper under qwen_mtp_target_head_*, after the complete loop.
-        mtp_used = type(t.get('qwen_mtp_used')) is int and t['qwen_mtp_used'] == 1
-        restore_key = ('qwen_mtp_target_head_restore_calls' if mtp_used
-            else 'qwen35_serial_verify_head_restore_calls')
-        checks['qwen_all_prompt_phase_head_path'] = (
-            all(type(t.get(key)) is int and t[key] == expected
-                for key, expected in (
-                    ('qwen35_serial_verify_suspend_lm_head', 1),
-                    ('qwen35_serial_verify_suspend_lm_head_min_prompt_tokens', 0),
-                    ('qwen35_serial_verify_suspend_lm_head_request_active', 1)))
-            and type(t.get(restore_key)) is int and t[restore_key] > 0
-            and (not mtp_used or all(type(t.get(key)) is int and t[key] == 1
-                for key in ('qwen_mtp_target_head_suspend_enabled',
-                            'qwen_mtp_target_head_suspend_request_active'))))
+        checks['qwen_all_prompt_phase_head_path'] = qwen_all_prompt_phase_head_path(t)
     if config.get('require_full_prompt_state', False):
         phases = response.get('vmodel_cache_phases')
         checks['all_phases_full_prompt_state'] = (

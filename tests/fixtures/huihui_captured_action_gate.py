@@ -23,7 +23,8 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 from runtime.profiles import apply_runtime_profiles
 from tests.fixtures.captured_transition_tracking_gate import (
-    generation_phase_checks, native_pressure_summary, prepare_case, sha)
+    generation_phase_checks, native_pressure_summary, prepare_case,
+    qwen_all_prompt_phase_head_path, qwen_scalar_factor_path, sha)
 from tests.fixtures.qwen3_large_agent_replay_gate import _post
 from tests.fixtures.qwen4_hot_boundary_http_probe import _atomic_write_private
 from tests.fixtures.runtime_profile_http_gate import (
@@ -137,6 +138,13 @@ def acceptance(row, response, config, *, initial_action=True):
             and all(type(phase.get(key)) is int and phase[key] == 0
                 for key in ('qwen35_paged_online_attention', 'qwen35_paged_online_page_native'))
             for phase in phases)
+    for flag, key, predicate in (
+        ('require_qwen_factors', 'all_phase_scalar_factors', qwen_scalar_factor_path),
+        ('require_qwen_phase_head', 'all_phase_head_lifetime', qwen_all_prompt_phase_head_path)):
+        if config.get(flag, False):
+            phases = response.get('vmodel_cache_phases')
+            checks[key] = (isinstance(phases, list) and bool(phases)
+                and all(isinstance(phase, dict) and predicate(phase) for phase in phases))
     return checks
 
 
@@ -197,6 +205,10 @@ report those independently of actual final-title errors, never repair a score.
             raise RuntimeError('Full-state comparison lacks required per-phase witnesses')
         if config.get('require_paged_kv', False) and not checks['paged_kv_witness']:
             raise RuntimeError('Paged-state comparison lacks required per-phase witnesses')
+        for flag, key in (('require_qwen_factors', 'all_phase_scalar_factors'),
+                          ('require_qwen_phase_head', 'all_phase_head_lifetime')):
+            if config.get(flag, False) and not checks[key]:
+                raise RuntimeError('Required lifetime path is absent from a hidden/public phase')
         return response, row['wall_seconds']
 
     # Scope this observer to one synchronous, single-server fixture call.
@@ -224,6 +236,8 @@ def run(config):
     assert type(config.get('abort_on_memory_retry', True)) is bool
     assert type(config.get('require_full_prompt_state', False)) is bool
     assert type(config.get('require_paged_kv', False)) is bool
+    for flag in ('require_qwen_factors', 'require_qwen_phase_head'):
+        assert type(config.get(flag, False)) is bool
     assert not config.get('require_paged_kv', False) or config.get('require_full_prompt_state', False)
     assert not any(k.startswith('VMODEL_') for k in os.environ)
     assert subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip() == config['source_commit']
@@ -248,6 +262,11 @@ def run(config):
         assert env.get('VMODEL_QWEN35_PAGED_KV_PERSIST', '0') == '0'
         assert env['VMODEL_QWEN35_FP8_KV_CACHE'] == '0'
     assert env['VMODEL_GENERATION_WITNESS'] == env['VMODEL_HOST_ACTIVITY_WITNESS'] == '1'
+    if config.get('require_qwen_factors', False):
+        assert env['VMODEL_QWEN_MTP_COMPACT_KDA_ROLLBACK'] == '1'
+    if config.get('require_qwen_phase_head', False):
+        assert env['VMODEL_QWEN35_SERIAL_VERIFY_SUSPEND_LM_HEAD'] == '1'
+        assert env['VMODEL_QWEN35_SERIAL_VERIFY_SUSPEND_LM_HEAD_MIN_PROMPT_TOKENS'] == '0'
     assert _port_is_free(config['port'])
     for key in ('result', 'response', 'server_log'):
         assert not Path(config[key]).exists()
