@@ -182,6 +182,10 @@ def row_checks(row, response, case, config):
         checks['qwen_scalar_factor_path'] = qwen_scalar_factor_path(t)
     if config.get('require_qwen_phase_head', False):
         checks['qwen_all_prompt_phase_head_path'] = qwen_all_prompt_phase_head_path(t)
+    if config.get('require_serial_kv_reclaim', False):
+        from tests.fixtures.qwen_kv_reclaim_witness import phase_checks
+        checks.update(phase_checks(response, t,
+            budget_bytes=config['serial_kv_budget_bytes']))
     if config.get('require_full_prompt_state', False):
         phases = response.get('vmodel_cache_phases')
         checks['all_phases_full_prompt_state'] = (
@@ -224,7 +228,7 @@ def run(config):
     # final public output and missed a 1024-token hidden gateway truncation.
     assert config.get('require_all_phase_completion') is True
     for flag in ('require_qwen_factors', 'require_full_prompt_state',
-                 'require_qwen_phase_head'):
+                 'require_qwen_phase_head', 'require_serial_kv_reclaim'):
         assert type(config.get(flag, False)) is bool
     if not 1 <= len(config['cases']) <= 3:
         raise ValueError('one to three bounded captured cases required')
@@ -240,6 +244,10 @@ def run(config):
     assert profiles.profile_digest == config['profile_digest']
     host_activity_required = profile_env.get('VMODEL_HOST_ACTIVITY_WITNESS') == '1'
     reclamation_required = profile_env.get('VMODEL_GOVERNOR_RECLAMATION_WITNESS') == '1'
+    serial_kv_required = profile_env.get('VMODEL_QWEN35_SERIAL_KV_RECLAIM') == '1'
+    assert config.get('require_serial_kv_reclaim', False) is serial_kv_required
+    if serial_kv_required:
+        assert type(config.get('serial_kv_budget_bytes')) is int and config['serial_kv_budget_bytes'] > 0
     if host_activity_required:
         assert pre.get('known_transcoders', {}).get('passed') is True
     assert _port_is_free(config['port'])
@@ -335,6 +343,15 @@ def run(config):
             if (reclamation_required and not document['native_pressure'].get(
                     'reclamation_alignment', {}).get('passed')):
                 failures.append('governor reclamation alignment coverage gate')
+            if serial_kv_required:
+                from tests.fixtures.qwen_kv_reclaim_witness import log_coverage
+                responses = [json.loads(Path(r['response_path']).read_text())
+                    for r in rows if r.get('response_sha256')]
+                document['serial_kv_reclaim_coverage'] = log_coverage(responses,
+                    Path(config['server_log']).read_text(),
+                    budget_bytes=config['serial_kv_budget_bytes'])
+                if not document['serial_kv_reclaim_coverage']['passed']:
+                    failures.append('serial KV recovery event/phase coverage gate')
             isolation = document['native_pressure'].get('known_transcoders')
             if ((host_activity_required or isolation is not None)
                     and not (isolation or {}).get('passed')):
