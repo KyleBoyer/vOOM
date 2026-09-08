@@ -1,5 +1,45 @@
 # STATUS — 2026-09-08 UTC (current corrections first; dated chronology below is history)
 
+## 2026-09-08 UTC: user redirects priority to Huihui Qwen3.8-27B uncensored
+
+The user explicitly requested more focus on the uncensored Qwen3.8 model.
+Prioritize the installed Huihui Qwen3.8-27B checkpoint, not Flash-Next. New
+GLM and Flash-Next experiments are deferred unless needed for this work or
+the user redirects again. The existing 30-minute task heartbeat was updated
+in the app with this priority and its safety/quiet-notification rules retained.
+No model, cache, process, serving default or weight was changed or deleted.
+The previous shipping32K job is complete; no model job is running at handoff.
+
+Next bounded work, in order:
+
+1. Establish a fresh completed-output Huihui baseline using the actual pinned
+   178,616-byte /134-tool capture, retaining input/tools/streaming. Declare
+   model, greedy sampling/seed and max-output1024 overrides; require natural
+   completion and preserve the actual response privately. Record original AND
+   prepared prompt size, runtime transformations, cache source, raw token
+   witness, phase timings and whole-run pressure. Disable deterministic host
+   answer rendering explicitly for model-only evaluation. A fast-profile
+   gateway reduction is a transformed-request result, not a full-schema model
+   replay; full-schema acceptance also requires gateway reduction disabled.
+2. Run completed model-only paginated Plex and held-out domains/functions,
+   with short and long contexts. Preregister cases and score actual final
+   answers, not host-rendered/repaired text or an incomplete tool prefix.
+   Keep fast-profile results separate from released-BF16 reference results.
+3. Target the measured Huihui prefill/decode bottleneck with one change at a
+   time. Prefer target-verified speculation and exact scheduling/residency;
+   preserve source/artifact hashes and greedy token/state A/B gates. Do not
+   repeat the balanced two-disk placement or rejected tree/entropy thresholds
+   without new evidence. Retest a fresh real capture and held-out shapes
+   before reporting a speed win or promoting a default.
+
+The historical62.7884s result used max-output16 and a gateway-prepared6339-token
+prompt with approximate mixed-depth MXFP4 computation. It is NOT a completed
+full49K harness result or released-BF16 proof. Historical100/100 was deterministic
+HOST rendering; direct model-only synthesis was87.5/100 and rejected. Neither
+number closes the current quality or full-output sub90-second goal. The prior
+BF16 cold/restart measurements likewise emitted only one token. No fresh
+Huihui latency/quality claim is made by this priority update.
+
 ## 2026-09-08 UTC: held-out shipping32K answer passes; pressure and latency goals remain open
 
 Completed a NEW shipping-domain retrieval case with fixture seed251807, not
