@@ -1,5 +1,75 @@
 # STATUS — 2026-09-07 (current corrections first; dated chronology below is history)
 
+## 2026-09-07 UTC: real-QSA phase diagnostic identifies SDPA, not selection, as the main cost
+
+Added a process-local diagnostic, `tests/fixtures/qwen4_qsa_phase_gate.py`.
+It compiles a copy of the ACTUAL `_qsa_attention` AST with five explicit
+evaluation boundaries: indexer/selection/state, QKV projection/norm/RoPE/KV,
+additive mask, SDPA, output gate/projection. A pure structural test strips only
+the injected markers/terminal temporary and recovers every original AST node.
+Changed/missing boundaries fail closed. No serving/runtime source, profile,
+weight, arithmetic expression, governor or default changed; the temporary
+function wrapper is restored. Records are scalar-only, capped and ordered.
+
+Fresh supervised real-weight gate PASS: same installed BF16 attention tensors
+at layers3/47, synthetic hidden seeds61783/94217 at3079/32799positions and
+original1024 outer tiles. Both untiled/query256 arms, plus3 singleton attention
+continuations each, match the PINNED UNINSTRUMENTED reference byte-for-byte:
+all74 prefill outputs and12 continuation outputs, their four KV/QSA state arrays,
+all input/weight hashes. All86 calls carry exactly five ordered phase records
+(430 records), with independently checked layer/offset/length/tile identity.
+This is attention-local diagnostic proof, NOT model tokens/full recurrent state,
+completed harness/Plex quality or a new serving latency/pressure result.
+
+Long-case synchronized phase sums (33 calls; seconds):
+
+| Phase | Untiled | Query256 |
+|---|---:|---:|
+| Indexer/selection/state | 0.508232 | 0.510552 |
+| QKV projection/norm/RoPE/KV | 0.790979 | 0.792425 |
+| Additive mask | 0.140400 | 0.145325 |
+| SDPA | 5.454383 | 5.576871 |
+| Output gate/projection | 0.376365 | 0.335058 |
+| Sum | 7.270359 | 7.360230 |
+
+SDPA is ~75% of this untiled full-attention component; indexer/selection ~7%.
+This narrows the next kernel/scheduling experiment; it does NOT say full Qwen
+prefill is75% SDPA (only12 of48 layers use full QSA, and MoE/PLE/KDA/I/O remain).
+Short3079-position sums0.229865/0.185353s are not an isolated speed win:
+one arm per configuration, reversed order on the long case, compiler/OS caches
+not controlled. Additional evaluation boundaries serialize work, materialize
+state sooner and alter allocator lifetimes. Phase times exclude observation
+overhead; whole step/wall includes it. Never compare the diagnostic's peak or
+phase sums against serving telemetry as an achieved improvement.
+
+Diagnostic pressure PASS:307 samples, minimum available5,878,169,600B,
+zero actual swap-out/net-used growth, trueMetal1,972,635,170B, observed native
+peak2,318,337,056B/compressed0. Known-transcoder isolation PASS76 observations,
+no listed jobs; not continuous idle or physical-I/O proof. Fresh30.0288s
+preflight PASS/no churn/end7.849GB; fasttier unchanged62.512GB. Root minimum
+16,173,699,072B/external100,636,839,936B. Child18.2507s, parent PASS0/20.6206s,
+23:57:18.894205 ->23:57:39.514819UTC. PIDs45200/45204 gone. All757 source hashes,
+same start/end manifest, result/parent/preflight/reference/source/modelmetadata
+hashes, independent86-call output/state/phase/pressure replay verified BEFORE
+docs edits. No timeout, signal, source drift or missing result.
+Before model launch:1337 selected pure tests PASS15.51s, including10 new tests.
+Final selected pure rerun:1337 PASS15.46s; git diff --check clean.
+
+Private logs/qwen4_real_qsa_phase_20260907.json SHA
+9b474e5c6249580b9c41ef862f5e3641c746118ea6e71d0ff8aceb0b3e23f711;
+parentlogca0464ffe512975d3ac003eba77b91e41ea7d2100deaf341c5fb69b0543e332f;
+preflightaa8f5c39dcc666836cc2601606055e15ab6e0c68b19d35d7b38b43db2025fc91.
+Source tree a1cdc7e100028106af5b834872aaf91ca89a05cdfbd64decb22f47103f058022.
+
+Next: a bounded, bit-gated head256 SDPA/kernel or exact sparse-key scheduling
+candidate, grounded in the actual installed MLX lowering. Keep original key
+order/masking/reduction semantics; reject numerical mismatch, not loosen the
+oracle. Do not invest in indexer/pooling optimization as the dominant fix.
+Then full recurrent endpoints and heterogeneous completed/actual traffic gates.
+No new model/harness/Plex/GLM timing or score. Latest synthetic32K query256
+HTTP628.6776s/pressureFAIL; full131867.9482s/pressureFAIL and Plex56FAIL unchanged.
+Sub90, broad quality and GLM context ladder remain OPEN.
+
 ## 2026-09-07 UTC: query256 completes 32K exactly; less memory, no wall-time win
 
 The explicit `qwen4-prefill-sdpa-query256` profile now completes a full-model
