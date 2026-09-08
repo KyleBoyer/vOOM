@@ -1,5 +1,53 @@
 # STATUS — 2026-09-08 UTC (current corrections first; dated chronology below is history)
 
+## 2026-09-08 UTC: top-up option passes short real captures; full-workflow test is next
+
+`huihui_serial_kv_topup_short_20260908` on clean/pushed
+3428af477dd1dbdbdf14421bd4641f1b64b3a6d2 is independently verified PASS.
+Original359B streaming weather /487B nonstreaming title captures, with ONLY
+the previously declared model/max1024/temp0/seed64013 request overrides,
+complete in46.5061s /15.0458s HTTP. All26/27 checks pass. Complete prepared/raw
+token and text witnesses match the prior one-pass recovery reference exactly:
+111/23 and92/2 input/output tokens, natural grammar/EOS termination under
+max1024, no prefill retries or prompt-cache reuse.
+
+The top-up overlay is the ONLY effective configuration delta against that
+reference. Both phases and final timing expose the strict top-up flag and
+explicit empty recovery traces; independent raw-log reconciliation confirms
+ZERO recovery events/logical or Metal bytes released by recovery. These small
+contexts do not create eligible closed pages. This is inactive-path compatibility,
+not real pressure-recovery evidence or a speed win. Prior one-pass HTTP walls
+were38.8830s /15.6700s; host/file-cache conditions are uncontrolled. No inference
+that the user's app cleanup alone caused a performance change is justified.
+Existing explicit MXFP4/reassociated-prefill/Hermes/factor/phase-head profile
+remains; not released BF16, large actual output, full harness or Plex score.
+
+Driver61.8994s/parent64.4802s. True Metal peaks1,663,141,072B /1,517,045,224B.
+Thirty periodic native/known-transcoder/alignment samples pass: minimum available
+5,814,124,544B, maximum footprint2,313,636,360B/compressed769,785,856B.
+Whole HTTP swap-out4,325,376B, net growth0. Fresh30.0372s preflight passes with
+available6.7691 ->6.8092GB, zero preceding-window swap growth/churn.
+Root/external minima21,425,668,096B/100,467,417,088B; fast tier62,512,074,752B.
+All791 source/start-end/fresh manifests, profile-only delta, capture/model/
+wire/reference/response/log identities, acceptance, head-release arithmetic,
+pressure/alignment/recovery coverage and completion verified BEFORE edits.
+PIDs61871/61875/61877 gone, session44386 drained exit0; server-15 normal cleanup.
+
+Treeab2c5ec52dae337972b2db0f63ccecdf6c7ced79c1ebe34bf1bd4ec3941d3581;
+result23902a020e6b765e61cdb020b9b7f02ded4376b3029316b02c03907f9672aa8d;
+receiptedf7e94a1dd808aa327d8c9fdff18490850ce769f29e34771172791ef26a869b;
+loga8a3f613752fbca88e7f8154110c156f7d51f83f0867548cc0ec41cb0c33753e;
+serverd642bf1e587b3982deac02a8c2251cc4cfc1d0fd24305122599b88362d609403;
+preflightdff5a3252efc8d5a594314ab1149ddf051d84e1fab415544a65939f08efad4c0.
+
+Next: fresh preflight, full original134-tool/Plex-fixture workflow with ONLY
+the new top-up overlay added to its prior full-workflow profile. Preserve
+5.6GB reserve/400MB page margin/256MB KV, max1024 and all original request/tool
+fields and unchanged synthetic pages. Stop at the first memory retry, retain
+raw v2 pass witnesses and score only a naturally completed model-authored
+workflow. It is not live Plex and gateway-compacted prepared prompts remain
+explicitly part of this lossy profile. Under90s and model-only Plex score open.
+
 ## 2026-09-08 UTC: bounded exact serial-KV top-up is opt-in and mechanism-gated
 
 After the user's additional app cleanup, a fresh30.0315s performance preflight
