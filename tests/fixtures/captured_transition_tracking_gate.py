@@ -160,6 +160,15 @@ def row_checks(row, response, case, config):
             and t['qwen_mtp_kda_factor_restores'] >= 0
             and type(t.get('qwen_mtp_kda_factor_restore_s')) in (int, float)
             and 0 <= t['qwen_mtp_kda_factor_restore_s'] < float('inf'))
+    if config.get('require_qwen_phase_head', False):
+        checks['qwen_all_prompt_phase_head_path'] = (
+            all(type(t.get(key)) is int and t[key] == expected
+                for key, expected in (
+                    ('qwen35_serial_verify_suspend_lm_head', 1),
+                    ('qwen35_serial_verify_suspend_lm_head_min_prompt_tokens', 0),
+                    ('qwen35_serial_verify_suspend_lm_head_request_active', 1)))
+            and type(t.get('qwen35_serial_verify_head_restore_calls')) is int
+            and t['qwen35_serial_verify_head_restore_calls'] > 0)
     if config.get('require_full_prompt_state', False):
         phases = response.get('vmodel_cache_phases')
         checks['all_phases_full_prompt_state'] = (
@@ -198,7 +207,8 @@ def run(config):
     # Reject legacy invocations before any model load: they only checked the
     # final public output and missed a 1024-token hidden gateway truncation.
     assert config.get('require_all_phase_completion') is True
-    for flag in ('require_qwen_factors', 'require_full_prompt_state'):
+    for flag in ('require_qwen_factors', 'require_full_prompt_state',
+                 'require_qwen_phase_head'):
         assert type(config.get(flag, False)) is bool
     if not 1 <= len(config['cases']) <= 3:
         raise ValueError('one to three bounded captured cases required')

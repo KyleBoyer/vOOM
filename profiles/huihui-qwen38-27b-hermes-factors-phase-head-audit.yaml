@@ -1,0 +1,11 @@
+schema: voom.runtime-profile.v1
+name: huihui-qwen38-27b-hermes-factors-phase-head-audit
+description: Explicit Huihui diagnostic deferring the exact selected head for every prompt length.
+notes:
+  - "Changes only the existing phase-head minimum prompt boundary from4096 to0 versus the stricter headroom audit. The untied675430400B MXFP4 head is not needed during prefill; keep its dormant lease until projection and release it between draft and target-body phases. This can increase demand reads and is not a speed claim."
+  - "Preserves5600MB live reserve,400MB default prefill page margin, full prepared state, target representation, scalar rollback, output budget, sampling and explicit Hermes protocol. The target remains quantized and prefill reassociated, not released-BF16 lossless. No automatic/default behavior changes."
+  - "Require original short captured shapes with all-phase raw identity, natural completion, actual phase-head path witnesses and pressure qualification before larger catalogs. No Plex-quality claim from short-capture agreement."
+extends:
+  - huihui-qwen38-27b-hermes-factors-headroom-audit
+settings:
+  VMODEL_QWEN35_SERIAL_VERIFY_SUSPEND_LM_HEAD_MIN_PROMPT_TOKENS: 0

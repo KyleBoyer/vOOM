@@ -1204,6 +1204,22 @@ def test_dense_hermes_no_tool_prompt_and_existing_token_cache_unchanged(tmp_path
     assert engine.tokenizer.calls == 1
 
 
+def test_huihui_all_prompt_phase_head_profile_changes_only_length_boundary():
+    from runtime.profiles import apply_runtime_profiles
+    before, after = {}, {}
+    common = ['generation-witness', 'host-activity-witness']
+    apply_runtime_profiles(['huihui-qwen38-27b-hermes-factors-headroom-audit',
+        *common], environ=before)
+    apply_runtime_profiles(['huihui-qwen38-27b-hermes-factors-phase-head-audit',
+        *common], environ=after)
+    key = 'VMODEL_QWEN35_SERIAL_VERIFY_SUSPEND_LM_HEAD_MIN_PROMPT_TOKENS'
+    assert before.pop(key) == '4096'
+    assert after.pop(key) == '0'
+    assert before == after
+    assert after['VMODEL_QWEN35_MIN_AVAILABLE_MB'] == '5600'
+    assert after['VMODEL_QWEN35_SERIAL_VERIFY_SUSPEND_LM_HEAD'] == '1'
+
+
 def test_huihui_headroom_profile_changes_only_live_reserve():
     from runtime.profiles import apply_runtime_profiles
 

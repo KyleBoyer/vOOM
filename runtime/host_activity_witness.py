@@ -17,7 +17,8 @@ MAX_PROCESSES = 8192
 MAX_MATCHES = 32
 MAX_WINDOW_SAMPLES = 1802
 POLL_SECONDS = 2.0
-NAMES = {'ffmpeg': 'ffmpeg', 'handbrakecli': 'HandBrakeCLI'}
+NAMES = {'ffmpeg': 'ffmpeg', 'handbrakecli': 'HandBrakeCLI',
+         'plex transcoder': 'Plex Transcoder'}
 SCOPE = 'best-effort process-name allowlist; not general host-idle or swap-attribution proof'
 
 

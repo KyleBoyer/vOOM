@@ -93,6 +93,32 @@ def valid_row():
         pressure_after=dict(available_bytes=6_000_000_000, swap_used_bytes=0, swap_out_bytes=0))
 
 
+@pytest.mark.parametrize('bad', [None,
+    ('qwen35_serial_verify_suspend_lm_head', 0),
+    ('qwen35_serial_verify_suspend_lm_head_min_prompt_tokens', 4096),
+    ('qwen35_serial_verify_suspend_lm_head_request_active', 0),
+    ('qwen35_serial_verify_suspend_lm_head_request_active', True),
+    ('qwen35_serial_verify_head_restore_calls', 0),
+    ('qwen35_serial_verify_head_restore_calls', None)])
+def test_all_prompt_phase_head_requires_observed_path(bad):
+    row = valid_row()
+    row['timing'].update(qwen35_serial_verify_suspend_lm_head=1,
+        qwen35_serial_verify_suspend_lm_head_min_prompt_tokens=0,
+        qwen35_serial_verify_suspend_lm_head_request_active=1,
+        qwen35_serial_verify_head_restore_calls=3)
+    if bad is not None:
+        row['timing'][bad[0]] = bad[1]
+    checks = gate.row_checks(row, {}, dict(kind='short_title', topic='node'),
+        dict(profiles=['test'], profile_digest='digest', require_qwen_phase_head=True))
+    assert checks['qwen_all_prompt_phase_head_path'] is (bad is None)
+
+
+def test_phase_head_gate_is_not_added_to_other_profiles():
+    checks = gate.row_checks(valid_row(), {}, dict(kind='short_title', topic='node'),
+        dict(profiles=['test'], profile_digest='digest'))
+    assert 'qwen_all_prompt_phase_head_path' not in checks
+
+
 @pytest.mark.parametrize('key,value', [('response_status', 'incomplete'), ('http_status', 500),
     ('backend', 'other'), ('runtime_profiles', []), ('runtime_profile_digest', 'wrong')])
 def test_good_content_cannot_hide_completion_or_identity_failure(key, value):

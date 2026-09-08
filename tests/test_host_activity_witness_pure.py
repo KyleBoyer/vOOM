@@ -34,9 +34,25 @@ def test_inventory_only_emits_allowed_identity_scalars():
     assert result['observation_seconds'] >= 0
 
 
-@pytest.mark.parametrize('name', ['ffmpeg-worker', '/private/ffmpeg', 'ffmpeg PRIVATE', 'Plex Media Server'])
+@pytest.mark.parametrize('name', ['ffmpeg-worker', '/private/ffmpeg', 'ffmpeg PRIVATE',
+    'Plex Media Server', 'Plex Media Scanner', 'Plex Transcoder Helper',
+    '/private/Plex Transcoder'])
 def test_allowlist_not_arbitrary_process_content(name):
     assert scan(process(name))['transcoders'] == []
+
+
+@pytest.mark.parametrize('name', ['Plex Transcoder', 'plex transcoder', 'PLEX TRANSCODER'])
+def test_plex_named_transcoder_vetoes_even_if_final_sample_is_quiet(name):
+    result = host.summarize_known_transcoders([scan(), scan(process(name)), scan()])
+    assert result['available'] and not result['passed']
+    assert result['transcoders'] == [dict(pid=17, created=123.5, kind='Plex Transcoder')]
+
+
+def test_plex_pid_reuse_retains_both_observed_transcoder_identities():
+    result = host.summarize_known_transcoders([
+        scan(process('Plex Transcoder')), scan(process('Plex Transcoder', created=999)), scan()])
+    assert not result['passed']
+    assert [row['created'] for row in result['transcoders']] == [123.5, 999]
 
 
 @pytest.mark.parametrize('item', [process(name=None), process(pid=True), process(pid=0),

@@ -1,5 +1,78 @@
 # STATUS — 2026-09-08 UTC (current corrections first; dated chronology below is history)
 
+## 2026-09-08 UTC: Huihui phase-head profile ready; real launch safely deferred for Plex
+
+Priority is Huihui Qwen3.8-27B-abliterated; GLM/Flash Next remain deferred.
+Implemented huihui-qwen38-27b-hermes-factors-phase-head-audit: only the
+existing exact-selected-head lifetime boundary4096->0 changes. Added an
+optional captured-replay gate requiring the active all-length path and actual
+head demand/restore calls, while all prior completion/token/pressure gates
+remain mandatory. New profile is unmeasured, explicit, and not a default.
+
+Live prelaunch inventory found Plex Transcoder, which the existing narrow
+ffmpeg/HandBrakeCLI allowlist missed. Added exact case-insensitive
+"Plex Transcoder" matching without matching Plex Media Server/Scanner/helper
+names or examining args/files/environment. No process control. Aggregate
+history keeps transient and PID-reuse identities, even after a quiet sample.
+Historical "no known transcoders" results did NOT observe this previously
+unlisted name and cannot retroactively establish Plex isolation.
+
+604 pure tests PASS10.38s, all123 profiles validate, diff check clean.
+Fresh30.0231s preflight correctly DEFERRED_PRECONDITION solely for active
+Plex transcoders62070/62241 (16samples). Memory otherwise passes:
+endavailable6958694400B, swapout4751360B, net0, root16953561088B,
+external100536074240B. No MLX/model job launched, no fake timing or score,
+no user application stopped. Artifact:
+logs/huihui_phase_head_allprompts_20260908.preflight.json.
+
+Next: wait for a fresh quiet preflight, then supervised two-case original
+weather/title replay with max1024/temp0/seed64013 and only model override
+in addition to those declared sampling/budget fields. Compare all-phase
+raw identity to huihui_direct_hermes_factors_captured_shapes_20260908;
+require_qwen_phase_head=true, require_qwen_factors=true and full prepared
+state. Preserve prepared-prompt identity and original captured tool schemas.
+Freeze source/docs and independently verify receipts before edits. This is
+a short-shape memory/path gate, not a full Plex or under90s harness claim.
+The existing30-minute task heartbeat remains active and already prioritizes
+Huihui; resume this bounded gate there when host preconditions pass.
+
+## 2026-09-08 UTC: real refusal identifies short-prompt head lifetime; all-length audit queued
+
+Verified huihui_prefill_refusal_context_retry_20260908 on source8b3f9aa:
+FAIL, weather HTTP11.8481s, driver12.2051s, parent15.0111s. Prefill reaches
+30/64 layers, then the benchmark aborts on the observed memory retry. No
+terminal response/title, no new latency or Plex score. Corrected no_retry=false.
+
+Failure-only context: active807200808B, incoming page213873879B, default
+margin400000000B, available6198312960B. Selected compute scratch149215291B
+has23 matching linear_attention+dense observations at111 positions/tile128.
+Pinned/resident cache675440640B, ordinary budget68800000B. This sample is
+after refusal BEFORE page fetch, not page-load peak evidence or permission
+to remove the400MB margin. Five periodic samples cover only the failed prefix:
+minavailable6175506432B, actualswap1294336B, net0, no known transcoders.
+
+Read-only ownership audit identifies the pinned bytes precisely: checkpoint
+head U32[248320,640]=635699200B plus U8 scales[248320,160]=39731200B,
+total675430400B; BF16 final norm10240B makes675440640B. Untied BF16
+embeddings use existing row paging. generate() explicitly reloads the dormant
+head BEFORE prefill below the existing4096-token phase boundary. Prefill does
+not consume it. Next explicit profile changes ONLY that boundary4096->0,
+retaining5600MB live reserve and unchanged page margin/representation/prompt/
+sampling/output allowance. Existing exact-selected-head lease and demand
+projection are reused; may add reloads or regress wall time. No default change.
+
+All771 source/start-end/tree/receipt/preflight/wire/reference hashes verified
+BEFORE edits; owned59911/59935/59940 gone. Fresh30.0318s preflightPASS.
+Plex preserved. Before this diagnostic, disk4 interval I/O was2.50MB/30s;
+sampled scanner reads36864B/30s are a lower bound with one PID-churn edge.
+Neither is a host-idle guarantee; this is not isolated performance promotion.
+Treeae49ee3bc0779842d204c90c8b1dc50bc4f9c4118e7453a156264c918cf1d1b1;
+resultc0a391c17785bfacc7a89265f3739679d943ed0f2fb2173728eb64cd621a6ad0;
+log0781aab7a5515b92cce3fbd7f852853401066ab562fed0da742534e084e250b3;
+server716eff9888e66df9201f3a5ef5a65f26951d14009c4b9628e7b0736d0aab70a9;
+preflightef851519e646a258a38f77219898f279450d4c659e193f0803f6d8425e4acb32.
+Root/external minima17189953536/100543946752B; no large writes/deletions.
+
 ## 2026-09-08 UTC: prefill page-refusal context instrumented; admission policy unchanged
 
 Read-only audit confirms layer-stationary Qwen prefill calls reserve(page)
