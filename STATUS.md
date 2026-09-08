@@ -1,4 +1,70 @@
-# STATUS — 2026-09-07 (current corrections first; dated chronology below is history)
+# STATUS — 2026-09-08 UTC (current corrections first; dated chronology below is history)
+
+## 2026-09-08 UTC: native vector-SDPA prefill rejected immediately by exact-bit gate
+
+Tested the next bounded head256 fused-kernel route, without serving integration:
+split a prefill into1/2 query rows while sharing FULL K/V and slicing the original
+explicit additive mask with its original offsets. No key pruning/reordering,
+target weights, model state, profile or default changed. The fixture's independent
+shape planner checks GQA bounds; serving still refuses query tiles1/2.
+
+The version-matched [MLX dispatch source](https://github.com/ml-explore/mlx/blob/v0.32.0/mlx/backend/metal/scaled_dot_product_attention.cpp)
+makes these query shapes vector-eligible for24/2 heads. The
+[fallback](https://github.com/ml-explore/mlx/blob/v0.32.0/mlx/fast.cpp) and
+[vector kernel](https://github.com/ml-explore/mlx/blob/v0.32.0/mlx/backend/metal/kernels/sdpa_vector.h)
+have different intermediate rounding/reduction paths: identical input bytes are
+not enough to establish losslessness. This is source/version/shape inference,
+not a binary GPU kernel trace. InstalledMLX0.32.0/NumPy2.5.0 were recorded.
+
+First pre-registered synthetic shape:17 queries/257 keys, seed68329, head256,
+24 query/2 KV heads, original-position causal additive mask. BF16 uses rank2,
+FP16 rank4. Balanced order0/1/2/2/1/0 against an untouched untiled reference;
+104,448 output values per arm. All four untiled control repetitions are exact.
+ALL EIGHT vector candidates fail the output-bit test:
+
+| Dtype | Differing output elements, each tile1/2 arm | Untiled milliseconds (two calls) | Tile1 milliseconds | Tile2 milliseconds |
+|---|---:|---|---|---|
+| BF16 | 64,655 /104,448 | 0.869 /1.043 | 5.298 /7.810 | 62.244 /4.707 |
+| FP16 | 64,249 /104,448 | 1.014 /1.072 | 18.147 /6.455 | 17.633 /4.614 |
+
+Both widths/repetitions produce the SAME candidate hash within each dtype,
+distinct from its reference; all input hashes unchanged. Recorded104 vector-
+eligible SDPA invocations. Planned33/4099 and129/32768 shapes were NOT attempted
+after this mismatch. No numerical tolerance, altered oracle, full-model trial
+or automatic lossy profile. Different output elements are NOT an intelligence
+score or a measured downstream answer failure. Cold compilation affects these
+tiny timings; none is a serving speed result or a general large-shape forecast.
+Native MTP/ordinary decode calls remain unchanged.
+
+Stop gate FAIL as intended for numerical mismatch only; diagnostics pressure
+PASS. Child0.301659s, parent FAIL exit1/2.377570s,00:28:34.632847 ->
+00:28:37.010401UTC. Fourteen endpoint samples: minavailable6,706,479,104B,
+zero actual swap-out/net-used growth, native footprint82,526,880B/compressed0;
+trueMetal2,324,355B. Endpoint samples may miss brief pressure; no model I/O.
+Known-transcoder isolation PASS14 inventories/none, not continuous general idle.
+Fresh30.0342s preflight PASS/no churn/end6.809GB; unchanged fasttier62.512GB.
+Root minimum16,162,676,736B/external100,630,810,624B. PIDs51599/51609 gone.
+
+All759 source hashes, identical start/end manifest, result/parent/preflight
+hashes and independent shape/order/counter/output-hash/verdict/pressure checks
+verified BEFORE docs edits. No timeout, signal, source drift or missing result.
+New fixture-only implementation/tests; no production source changes.
+Before the final scalar metadata rename:1358 selected pure tests PASS15.38s;
+after it:120 focused pure tests PASS0.34s. Final full rerun:1358 PASS15.37s.
+
+Private logs/qwen4_vector_sdpa_stop_20260908.json SHA
+525527e2b50137af11b2d4644120e6976075ccf37849220e40c11dc00cbed4e7;
+parentlog9371ad9b2c4cf2ca992cc513666e87fc1e592ae9a5c3456fc7b3ef2a31ab090a;
+preflight45798d19c6eb6511b608cf7945c79df8a2860bc90c2eed6016d09a849167cc8c.
+Source tree466c4a7e95e9978e1b27d15631e3782c155753acdef208c3cbff40c8ee2bfda9.
+
+Next: STOP this native-vector-prefill route. A future replacement must preserve
+the relevant intermediate rounding/reduction contract and clear a small bit gate
+first; input/weight identity alone cannot qualify fusion. Return priority to
+held-out completed retrieval/function shapes and full recurrent endpoint checks
+on existing safe profiles, without treating diagnostics as those acceptances.
+Latest actual synthetic32K HTTP628.6776s/pressureFAIL, full131867.9482s/pressureFAIL,
+Plex56FAIL unchanged; no new GLM result, sub90 or context-ladder completion.
 
 ## 2026-09-07 UTC: real-QSA phase diagnostic identifies SDPA, not selection, as the main cost
 
