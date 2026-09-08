@@ -8,6 +8,7 @@ All generated tools remain unexecuted. No final-answer rendering or repair.
 from __future__ import annotations
 
 import argparse
+import copy
 from dataclasses import asdict
 import json
 import math
@@ -16,6 +17,7 @@ from pathlib import Path
 import subprocess
 import sys
 import time
+from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
@@ -51,11 +53,11 @@ def action_checks(response):
             for a in arguments))
 
 
-def acceptance(row, response, config):
+def acceptance(row, response, config, *, initial_action=True):
     t, usage = row.get('timing') or {}, row.get('usage') or {}
     witness = t.get('generation_witness') or {}
     before, after = row['pressure_before'], row['pressure_after']
-    checks = action_checks(response)
+    checks = action_checks(response) if initial_action else {}
     checks.update(
         completed=row.get('http_status') == 200 and row.get('response_status') == 'completed'
             and not row.get('error') and response.get('status') == 'completed',
@@ -82,6 +84,74 @@ def acceptance(row, response, config):
     return checks
 
 
+def run_plex_workflow(config, request, document):
+    """Retain the legacy fixed two-page rubric, with immutable HTTP receipts.
+
+The synthetic mixed-page queue is not live Plex or independent movie/show
+pagination. Its unchanged rubric has known separate-media strategy limitations;
+report those independently of actual final-title errors, never repair a score.
+"""
+    from tests.fixtures import plex_agent_profile as plex
+
+    base = copy.deepcopy(request)
+    receipts = document['workflow_http'] = []
+    def recording_post(url, current, timeout):
+        index = len(receipts) + 1
+        assert 1 <= index <= 5
+        assert current['tools'] == base['tools']
+        assert current['input'][:len(base['input'])] == base['input']
+        assert {k: v for k, v in current.items() if k != 'input'} == {
+            k: v for k, v in base.items() if k != 'input'}
+        wire = json.dumps(current, ensure_ascii=False, separators=(',', ':')).encode()
+        if index == 1:
+            import hashlib
+            assert hashlib.sha256(wire).hexdigest() == config['wire_sha256']
+        response_path = Path(config['response']).with_name(
+            Path(config['response']).stem + f'.turn{index}.json')
+        assert not response_path.exists()
+        terminal = []
+        def observe(response):
+            assert not terminal
+            _atomic_write_private(response_path, response)
+            terminal.append(response)
+        before = asdict(_pressure())
+        row = _post(url, wire, timeout=timeout, stream=True, print_progress=True,
+            fail_on_memory_retry=True, response_observer=observe)
+        row.update(pressure_before=before, pressure_after=asdict(_pressure()))
+        response = terminal[0] if terminal else {}
+        checks = acceptance(row, response, config, initial_action=False)
+        receipts.append(dict(turn=index, request=plex.request_shape(current),
+            response_path=str(response_path),
+            response_sha256=sha(response_path) if terminal else None,
+            row=row, checks=checks))
+        # Persist each completed HTTP receipt even if a later turn fails.
+        _atomic_write_private(Path(config['result']).with_suffix(f'.turn{index}.progress.json'),
+            dict(schema='voom.huihui-plex-progress.v1', state='running', turns=receipts))
+        print(json.dumps(dict(plex_turn=index, wall_seconds=row.get('wall_seconds'),
+            output_tokens=(row.get('usage') or {}).get('output_tokens'),
+            checks=checks)), flush=True)
+        if not checks['completed'] or not checks['not_output_capped']:
+            raise RuntimeError('Plex turn did not naturally complete within budget')
+        return response, row['wall_seconds']
+
+    # Scope this observer to one synchronous, single-server fixture call.
+    # No production code, page contents or model-authored response is changed.
+    with patch.object(plex, '_post', recording_post):
+        result = plex.run_profile(request, f'http://127.0.0.1:{config["port"]}/v1/responses',
+            timeout=1800, max_tool_rounds=4)
+    document['plex'] = result
+    document['final_plex_score'] = result['rubric']['score']
+    if not result['passed']:
+        document['failures'].append('completed_plex_quality_or_protocol')
+    for receipt in receipts:
+        document['failures'] += [f'turn{receipt["turn"]}:{key}'
+            for key, ok in receipt['checks'].items() if not ok]
+    before, after = receipts[0]['row']['pressure_before'], receipts[-1]['row']['pressure_after']
+    if max(after['swap_out_bytes'] - before['swap_out_bytes'],
+           after['swap_used_bytes'] - before['swap_used_bytes']) > 16_000_000:
+        document['failures'].append('whole_workflow_http_swap_growth')
+
+
 def run(config):
     assert not any(k.startswith('VMODEL_') for k in os.environ)
     assert subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip() == config['source_commit']
@@ -100,6 +170,13 @@ def run(config):
     assert _port_is_free(config['port'])
     for key in ('result', 'response', 'server_log'):
         assert not Path(config[key]).exists()
+    workflow = config.get('workflow', 'initial_action')
+    assert workflow in ('initial_action', 'plex')
+    if workflow == 'plex':
+        for index in range(1, 6):
+            assert not Path(config['result']).with_suffix(f'.turn{index}.progress.json').exists()
+            assert not Path(config['response']).with_name(
+                Path(config['response']).stem + f'.turn{index}.json').exists()
     request, wire, metadata = prepare_case(config['case'], config['model'])
     assert metadata['request_sha256'] == config['wire_sha256']
     assert len(request['tools']) == 134 and request['stream'] is True
@@ -110,6 +187,9 @@ def run(config):
         scope=__doc__, config=config, preflight_sha256=sha(config['preflight']),
         request=metadata, generated_tools_executed=False, final_plex_score=None,
         failures=[], source_commit=config['source_commit'])
+    if workflow == 'plex':
+        document.update(schema='voom.huihui-captured-plex.v1',
+            scope='Model-only capped-five-response Plex workflow: original134-tool HTTP catalog/history/stream; model/max1024/temp0/seed64013 overrides. Existing lossy gateway prepares a smaller catalog/prompt. Legacy synthetic mixed two-page fixture and unchanged rubric, with known separate-media strategy limitations. No live tool execution, host rendering, full-schema model replay or BF16 proof.')
     server = None
     try:
         with open(config['server_log'], 'x') as log:
@@ -122,21 +202,24 @@ def run(config):
             assert registry['vmodel_runtime_profile_digest'] == config['profile_digest']
             assert registry['vmodel_runtime_profiles'] == config['profiles']
             assert not registry.get('vmodel_runtime_profile_overrides')
-            terminal = []
-            def observe(value):
-                assert not terminal
-                _atomic_write_private(Path(config['response']), value)
-                terminal.append(value)
-            before = asdict(_pressure())
-            row = _post(f'http://127.0.0.1:{config["port"]}/v1/responses', wire,
-                timeout=1800, stream=True, print_progress=True,
-                fail_on_memory_retry=True, response_observer=observe)
-            row.update(pressure_before=before, pressure_after=asdict(_pressure()))
-            document['row'] = row
-            document['checks'] = acceptance(row, terminal[0] if terminal else {}, config)
-            document['failures'] += [k for k, v in document['checks'].items() if not v]
-            if terminal:
-                document['response_sha256'] = sha(config['response'])
+            if workflow == 'plex':
+                run_plex_workflow(config, request, document)
+            else:
+                terminal = []
+                def observe(value):
+                    assert not terminal
+                    _atomic_write_private(Path(config['response']), value)
+                    terminal.append(value)
+                before = asdict(_pressure())
+                row = _post(f'http://127.0.0.1:{config["port"]}/v1/responses', wire,
+                    timeout=1800, stream=True, print_progress=True,
+                    fail_on_memory_retry=True, response_observer=observe)
+                row.update(pressure_before=before, pressure_after=asdict(_pressure()))
+                document['row'] = row
+                document['checks'] = acceptance(row, terminal[0] if terminal else {}, config)
+                document['failures'] += [k for k, v in document['checks'].items() if not v]
+                if terminal:
+                    document['response_sha256'] = sha(config['response'])
     except BaseException as error:
         document['failures'].append('driver_error:' + type(error).__name__)
     finally:

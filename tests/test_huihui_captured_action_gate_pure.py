@@ -1,9 +1,14 @@
 import json
+import copy
+import hashlib
+from pathlib import Path
 
 import pytest
 
 from runtime.profiles import apply_runtime_profiles
 from tests.fixtures import huihui_captured_action_gate as gate
+from tests.fixtures import plex_agent_profile as plex
+from tests.fixtures.runtime_profile_http_gate import Pressure
 
 
 def call(arguments, name='plugin__plex__plex_list_library'):
@@ -79,3 +84,85 @@ def test_prompt_cache_reuse_rejects_cold_claim():
 def test_physical_swap_out_fails_despite_unchanged_swap_usage():
     value = row(); value['pressure_after']['swap_out_bytes'] = 16_000_001
     assert not check(value)['actual_swap_out']
+
+
+def workflow_setup(tmp_path, monkeypatch, *, incomplete=False):
+    request = dict(model='test', stream=True, temperature=0, seed=64013,
+        max_output_tokens=1024, input=[dict(role='user', content='unaltered')],
+        tools=[dict(type='function', name=plex.PLEX_TOOL, parameters={})])
+    baseline = copy.deepcopy(request)
+    args = dict(mediaType='all', ratingOperator='lte', movieRatingValue='PG-13',
+        showRatingValue='TV-Y7', excludeRootFolderPath='/Kids/', limit=50, offset=0)
+    responses = [dict(status='completed', output=[dict(call(args), call_id='a')]),
+        dict(status='completed', output=[dict(call({**args, 'offset': 50}), call_id='b')]),
+        dict(status='completed', output=[dict(type='message', content=[
+            dict(type='output_text', text=', '.join(plex.ELIGIBLE_TITLES))])])]
+    if incomplete:
+        responses[0]['status'] = 'incomplete'
+    config = dict(port=1234, response=str(tmp_path/'reply.json'),
+        result=str(tmp_path/'result.json'), profiles=['audit'], profile_digest='digest',
+        wire_sha256=hashlib.sha256(json.dumps(request, ensure_ascii=False,
+            separators=(',', ':')).encode()).hexdigest())
+    wires = []
+    def post(url, wire, **kwargs):
+        current = json.loads(wire)
+        assert current['tools'] == baseline['tools']
+        assert current['input'][:1] == baseline['input']
+        assert len(current['input']) == 1 + len(wires)*2
+        assert kwargs['stream'] and kwargs['fail_on_memory_retry']
+        assert current['max_output_tokens'] == 1024
+        wires.append(wire)
+        response = responses[len(wires)-1]
+        kwargs['response_observer'](response)
+        value = row()
+        value.update(wall_seconds=1.5, response_status=response['status'])
+        return value
+    monkeypatch.setattr(gate, '_post', post)
+    monkeypatch.setattr(gate, '_pressure', lambda: Pressure(6_000_000_000, 0, 0))
+    return request, config, responses, wires
+
+
+def test_workflow_preserves_requests_scores_unchanged_and_saves_each_response(tmp_path, monkeypatch):
+    request, config, responses, wires = workflow_setup(tmp_path, monkeypatch)
+    original_post = plex._post
+    document = dict(failures=[])
+    gate.run_plex_workflow(config, request, document)
+    assert plex._post is original_post
+    assert len(wires) == 3 and not document['failures']
+    assert document['final_plex_score'] == 100
+    assert document['plex']['completion']['passed']
+    assert document['plex']['tool_results_source'] == 'synthetic_two_page_fixture'
+    for receipt, response in zip(document['workflow_http'], responses):
+        path = Path(receipt['response_path'])
+        assert json.loads(path.read_text()) == response
+        assert gate.sha(path) == receipt['response_sha256']
+        assert path.stat().st_mode & 0o777 == 0o600
+        assert all(receipt['checks'].values())
+    assert json.loads((tmp_path/'result.turn3.progress.json').read_text())['turns'] == document['workflow_http']
+    for index in (1, 2):
+        progress = json.loads((tmp_path/f'result.turn{index}.progress.json').read_text())
+        assert progress['turns'] == document['workflow_http'][:index]
+
+
+def test_incomplete_workflow_stops_after_durable_receipt_and_restores_post(tmp_path, monkeypatch):
+    request, config, responses, wires = workflow_setup(tmp_path, monkeypatch, incomplete=True)
+    original_post = plex._post
+    document = dict(failures=[])
+    with pytest.raises(RuntimeError, match='naturally complete'):
+        gate.run_plex_workflow(config, request, document)
+    assert plex._post is original_post and len(wires) == 1
+    assert json.loads((tmp_path/'reply.turn1.json').read_text()) == responses[0]
+    assert 'final_plex_score' not in document
+    assert not document['workflow_http'][0]['checks']['completed']
+
+
+def test_workflow_rejects_tool_schema_rewrite_before_http(tmp_path, monkeypatch):
+    request, config, _, wires = workflow_setup(tmp_path, monkeypatch)
+    original_post = plex._post
+    def rewritten(current, url, **kwargs):
+        current['tools'] = []
+        return plex._post(url, current, 10)
+    monkeypatch.setattr(plex, 'run_profile', rewritten)
+    with pytest.raises(AssertionError):
+        gate.run_plex_workflow(config, request, dict(failures=[]))
+    assert not wires and plex._post is original_post
