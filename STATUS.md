@@ -2,6 +2,26 @@
 
 ## 2026-09-08 UTC: short Huihui control exposes capped hidden gateway; stale factor comparison cancelled
 
+Post-fix validation on249debb:532 pure phase/provenance/server/profile tests
+PASS3.15s and100 supervised scalar/MTP regressions PASS0.78s, including
+reconstruction failure still recording actual peak. All120 profiles validate.
+Run huihui_phase_completion_peak_units_20260908: fresh30.0350s preflightPASS,
+driver0.958957s/parent3.439051s, Metal32,278,656B, endavailable6,494,470,144B,
+zero interval swap growth/churn. All768 source/start-end/tree/receipt hashes
+verified before notes; PIDs35473/35497 gone. Root/external minima
+17,177,702,400/100,587,102,208B. Tree
+79b8a4e9cdc1d94fae3326d3dd527b499afb6aa5c990c76117c324a7791c7dfa;
+result2acd06909ca3f58b648b79e5abda8935b8d5eaecb7e5dc5171f0abe08715d69d;
+logec4b9abf24145849d4ba69cc7933c0a6e8bb357b7ef070383b08077384b1d241;
+preflight8a5133471392a2daa10fe08d6b3ed32a1213a910ca1ab1f180ab6d9d3305922b.
+Planned direct control huihui_direct_dense_captured_shapes_20260908, then
+huihui_direct_factors_captured_shapes_20260908 on the SAME source. Both
+require_all_phase_completion=true, full prepared state and original captured
+wire tools/input/stream with only model/max1024/temp0/seed overrides.
+Separate fresh preflights; no source/docs edits between arms. Preserve all
+failures and actual natural stops. This is a short-catalog mechanism gate,
+not the full Plex capture or a speed/quality promotion.
+
 Completed huihui_scalar_dense_captured_shapes_20260908, source
 071793a3811e49593e7125ea3876edba834e8756, parentexit1/1263.3477s,
 driver1261.6991s,06:22:31.417938->06:43:34.765566UTC. Two original small
