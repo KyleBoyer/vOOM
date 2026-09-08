@@ -1,0 +1,11 @@
+schema: voom.runtime-profile.v1
+name: governor-reclamation-witness
+description: Bracket governor input samples and observe memory again after its safety response.
+extends:
+  - process-memory-witness
+settings:
+  VMODEL_GOVERNOR_RECLAMATION_WITNESS: true
+notes:
+  - "Explicit read-only diagnostic on the existing bounded two-second governor trace. Adds input timestamps and post-response system available, Metal active and allocator-cache getters before the existing native self sample. No new synchronization, evaluation, cache clearing, policy or thread."
+  - "Preserves original pressure fields and qualification thresholds. Post-response observations cannot erase an earlier low-available sample or certify ownership, atomicity or GPU retirement. Missing/error/capped alignment coverage is not a pass."
+  - "Sampling overhead is included in wall time. This is not a speed profile and does not enable experimental model paths, run tools or modify requests."

@@ -512,10 +512,14 @@ class MemoryGovernor:
     def _run(self):
         while not self._stop.wait(self.poll_s):
             try:
+                observer = getattr(self, "_process_memory_observer", None)
+                aligned = observer is not None and getattr(observer, "reclamation_enabled", False)
+                input_start_ns = time.monotonic_ns() if aligned else None
                 avail = psutil.virtual_memory().available
                 metal = mx.get_active_memory()
                 now = time.monotonic()
                 swap = psutil.swap_memory()
+                input_end_ns = time.monotonic_ns() if aligned else None
                 self._swap_samples.append(
                     (now, int(swap.used), int(swap.sout)))
                 while (len(self._swap_samples) > 1
@@ -573,14 +577,15 @@ class MemoryGovernor:
                     self._green_streak = 0
                 # Observation follows the safety response and cannot change its
                 # inputs, thresholds or verdict. Reuse the existing poll/thread.
-                observer = getattr(self, "_process_memory_observer", None)
                 if observer is not None:
                     observer.record(
                         governor_monotonic_s=now, system_available_bytes=avail,
                         system_swap_used_bytes=int(swap.used),
                         system_swap_out_bytes=int(swap.sout), metal_active_bytes=metal,
                         cache_budget_bytes_after_response=int(self.cache.max_bytes),
-                        swap_pressure_response=swap_pressure)
+                        swap_pressure_response=swap_pressure,
+                        input_sample_bounds_ns=(input_start_ns, input_end_ns) if aligned else None,
+                        metal=mx if aligned else None)
             except Exception:
                 pass  # governor must never take the runtime down
 

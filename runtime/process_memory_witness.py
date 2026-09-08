@@ -15,8 +15,11 @@ import os
 import platform
 import time
 
+import psutil
+
 
 FLAG = "VMODEL_PROCESS_MEMORY_WITNESS"
+RECLAMATION_FLAG = "VMODEL_GOVERNOR_RECLAMATION_WITNESS"
 TASK_VM_INFO = 22
 MAX_SAMPLES = 4096
 MIN_INTERVAL_SECONDS = 2.0
@@ -110,6 +113,78 @@ def sample_self_memory() -> dict:
     return result
 
 
+def sample_reclamation_alignment(metal, input_sample_bounds_ns) -> dict:
+    """Read-only post-response comparison; never replace admission inputs.
+
+    The two brackets identify non-atomic input and subsequent observation
+    intervals. Differences are not causal attribution or proof that GPU work
+    has retired. No evaluation, synchronization or allocator mutation occurs.
+    """
+    started = time.monotonic_ns()
+    fields = ("system_available_bytes", "metal_active_bytes", "metal_cache_bytes")
+    result = dict(schema="voom.governor-reclamation-alignment.v1", atomic=False,
+                  available=False, reason=None,
+                  input_sample_start_ns=None, input_sample_end_ns=None,
+                  observation_start_ns=started, **dict.fromkeys(fields))
+    try:
+        valid = (isinstance(input_sample_bounds_ns, tuple)
+                 and len(input_sample_bounds_ns) == 2
+                 and all(type(v) is int for v in input_sample_bounds_ns)
+                 and 0 <= input_sample_bounds_ns[0] <= input_sample_bounds_ns[1] <= started)
+        if not valid:
+            result["reason"] = "invalid-input-bracket"
+        else:
+            result.update(input_sample_start_ns=input_sample_bounds_ns[0],
+                          input_sample_end_ns=input_sample_bounds_ns[1])
+            values = (psutil.virtual_memory().available,
+                      metal.get_active_memory(), metal.get_cache_memory())
+            if not all(type(v) is int and v >= 0 for v in values):
+                result["reason"] = "invalid-observation"
+            else:
+                result.update(zip(fields, values))
+                result["available"] = True
+    except Exception:
+        result["reason"] = "observation-error"
+    result["observation_end_ns"] = time.monotonic_ns()
+    return result
+
+
+def summarize_reclamation_alignment(records) -> dict:
+    """Missing/error/capped coverage is never a successful aligned trace."""
+    rows = list(records)
+    result = dict(available=False, passed=False, samples=len(rows))
+    if not rows:
+        return result
+    delays, input_spans, observations = [], [], []
+    for row in rows:
+        alignment = row.get("reclamation_alignment")
+        process = row.get("process")
+        if not isinstance(alignment, dict) or not isinstance(process, dict):
+            return result
+        if (alignment.get("schema") != "voom.governor-reclamation-alignment.v1"
+                or alignment.get("available") is not True
+                or alignment.get("atomic") is not False
+                or process.get("available") is not True):
+            return result
+        stamps = [alignment.get(key) for key in (
+            "input_sample_start_ns", "input_sample_end_ns",
+            "observation_start_ns", "observation_end_ns")]
+        stamps += [process.get("monotonic_start_ns"), process.get("monotonic_end_ns")]
+        if (not all(type(v) is int and v >= 0 for v in stamps)
+                or stamps != sorted(stamps)
+                or not all(type(alignment.get(key)) is int and alignment[key] >= 0
+                           for key in ("system_available_bytes", "metal_active_bytes", "metal_cache_bytes"))):
+            return result
+        input_spans.append(stamps[1] - stamps[0])
+        delays.append(stamps[2] - stamps[1])
+        observations.append(stamps[5] - stamps[2])
+    result.update(available=True, passed=True,
+                  maximum_input_sample_span_ns=max(input_spans),
+                  maximum_after_response_delay_ns=max(delays),
+                  maximum_observation_span_ns=max(observations))
+    return result
+
+
 class GovernorProcessMemoryObserver:
     """Bounded JSONL to the existing server log, on the existing governor thread.
 
@@ -123,6 +198,7 @@ class GovernorProcessMemoryObserver:
         self.count = 0
         self.last_monotonic = None
         self.capped = False
+        self.reclamation_enabled = os.environ.get(RECLAMATION_FLAG) == "1"
         self.host_activity_sample = None
         if os.environ.get('VMODEL_HOST_ACTIVITY_WITNESS') == '1':
             from .host_activity_witness import sample_known_transcoders
@@ -130,7 +206,8 @@ class GovernorProcessMemoryObserver:
 
     def record(self, *, governor_monotonic_s, system_available_bytes,
                system_swap_used_bytes, system_swap_out_bytes, metal_active_bytes,
-               cache_budget_bytes_after_response, swap_pressure_response):
+               cache_budget_bytes_after_response, swap_pressure_response,
+               input_sample_bounds_ns=None, metal=None):
         now = float(governor_monotonic_s)
         if self.capped or (self.last_monotonic is not None
                           and now - self.last_monotonic < MIN_INTERVAL_SECONDS):
@@ -144,6 +221,9 @@ class GovernorProcessMemoryObserver:
                 "governor_monotonic_s": now, "coverage_complete": False}), flush=True)
             return
         self.count += 1
+        alignment = None
+        if self.reclamation_enabled:
+            alignment = sample_reclamation_alignment(metal, input_sample_bounds_ns)
         try:
             memory = sample_self_memory()
         except Exception:
@@ -159,6 +239,8 @@ class GovernorProcessMemoryObserver:
             "swap_pressure_response": bool(swap_pressure_response),
             "process": memory,
         }
+        if alignment is not None:
+            row["reclamation_alignment"] = alignment
         if self.host_activity_sample is not None:
             try:
                 row['known_transcoders'] = self.host_activity_sample()

@@ -213,6 +213,9 @@ def native_pressure_summary(log_text):
         from runtime.host_activity_witness import summarize_known_transcoders
         result['known_transcoders'] = summarize_known_transcoders(
             r.get('known_transcoders', {'available': False}) for r in records)
+    if any('reclamation_alignment' in r for r in records):
+        from runtime.process_memory_witness import summarize_reclamation_alignment
+        result['reclamation_alignment'] = summarize_reclamation_alignment(records)
     return result
 
 
@@ -236,6 +239,7 @@ def run(config):
     profiles = apply_runtime_profiles(config['profiles'], environ=profile_env)
     assert profiles.profile_digest == config['profile_digest']
     host_activity_required = profile_env.get('VMODEL_HOST_ACTIVITY_WITNESS') == '1'
+    reclamation_required = profile_env.get('VMODEL_GOVERNOR_RECLAMATION_WITNESS') == '1'
     if host_activity_required:
         assert pre.get('known_transcoders', {}).get('passed') is True
     assert _port_is_free(config['port'])
@@ -328,6 +332,9 @@ def run(config):
                 document['native_pressure'] = {'available': False, 'passed': False}
             if not document['native_pressure']['passed']:
                 failures.append('whole-arm periodic native pressure gate')
+            if (reclamation_required and not document['native_pressure'].get(
+                    'reclamation_alignment', {}).get('passed')):
+                failures.append('governor reclamation alignment coverage gate')
             isolation = document['native_pressure'].get('known_transcoders')
             if ((host_activity_required or isolation is not None)
                     and not (isolation or {}).get('passed')):
