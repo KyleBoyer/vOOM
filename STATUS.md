@@ -1,5 +1,90 @@
 # STATUS — 2026-09-08 UTC (current corrections first; dated chronology below is history)
 
+## 2026-09-08 UTC: real short captures pass with KV recovery enabled; recovery remains inactive
+
+`huihui_serial_kv_reclaim_short_contract_20260908` on
+`779e83e5e86d41b777b02536120b6b99b8b27ad1` is independently verified PASS.
+With the original 359B streaming weather and 487B nonstreaming title captures
+and ONLY model/max1024/temp0/seed64013 overrides, HTTP walls are **38.8830s**
+and **15.6700s**. Prepared/output lengths remain 111/23 and 92/2, naturally
+grammar/EOS terminated. All 26/27 case checks pass, including complete
+prepared/raw token, text, output budget and termination identities against
+the passing after-app-cleanup reference. No prefill retry or prompt KV reuse.
+
+The new `qwen35-serial-kv-reclaim` overlay is the only additional effective
+setting versus that reference; existing full-prepared-state MXFP4/reassociated-
+prefill/Hermes/scalar-factor/all-prompt-head and governor-witness settings remain.
+This is NOT released-BF16, the full 134-tool harness, Plex, long context, or
+large actual output. Fresh server for weather, same-process uncached title;
+OS file cache/general host activity are uncontrolled. The 54.9019s driver /
+57.3110s parent wall completes TWO SMALL requests, not the user's under-90s goal.
+
+Every returned phase and final recovery trace is explicitly present and empty.
+Independent raw log reconciliation confirms **zero recovery attempts, zero
+reclaimed pages and zero recovery-related physical bytes**. These short
+contexts do not create eligible closed pages. Thus this verifies the feature's
+inactive serving path, not pressure recovery on real traffic. Lower weather
+wall versus the earlier 45.6700s is not attributable to the unused recovery
+feature; no new optimization speedup is claimed.
+
+Engine first-token 7.8538s/10.0057s (not wire SSE-TTFT), prefill7.8528s/9.6901s,
+decode28.6198s/5.5673s, total36.4739s/15.5732s. True Metal peaks
+1,692,087,080B/1,517,028,840B; logical weight reads84,785,980,288B/
+27,459,548,160B, not physical disk traffic. MTP17/20 and1/4.
+Existing factor-boundary head release still physically frees675,430,400B on
+each3/1 restoration with exact cache-accounting agreement and all-phase tokens.
+This is cumulative repeated release, not unique retained-memory savings.
+
+All26 periodic native/alignment/isolation observations pass: minimum available
+5,835,620,352B; maximum native footprint2,469,563,152B/compressed880,066,560B.
+Whole HTTP swap-out2,441,216B; net swap growth0. Fresh30.0411s preflight
+passes with zero preceding-window swap growth/churn and16 known-transcoder
+observations. Root/external free minima21,451,268,096B/100,475,805,696B.
+Known-transcoder absence is not general host-idle or process swap attribution.
+
+The new pure validator requires every phase's configured KV budget, strict
+typed/finite records, recomputed deficits/logical and active deltas, exact
+aggregate counts, no errors/drops, and chronological equality to independent
+raw logs. Empty observed traces qualify only inactive coverage. Final timing
+must match the last phase's trace/flag. No physical allocation credit is inferred.
+
+An initial run `huihui_serial_kv_reclaim_short_20260908` on f05a8c2 is retained
+as **FAIL**, not silently relabeled: the new checker incorrectly required the
+KV-budget field in flat timing, while the real protocol supplies it on phases.
+Both calls completed38.8782s/12.1115s with identical tokens, zero retries,
+passing pressure and empty recovery traces; only the final-trace/schema and
+derived coverage checks failed. After independent verification, the checker
+was corrected to require budget on EVERY phase and trace/flag agreement on
+flat timing. Runtime/model/profile behavior was unchanged. Pure fixtures now
+match that actual protocol boundary, and the fresh run above passes.
+Final selected pure suite **942 passed in11.90s**;126 profiles validate.
+
+Both runs'787 source/start-end/fresh manifests, model config/index hashes,
+capture/wire/reference/response identities, recomputed checks, physical head
+release, pressure/alignment/log coverage and completion receipts verified BEFORE
+edits. Failed-run PIDs53791/53795/53797 and passing54045/54049/54051 gone;
+server-15 is normal cleanup. No job remains; no user apps/data changed.
+
+Next: reuse these strict witness checks in the full Huihui action/Plex driver,
+then fresh preflight and the ORIGINAL full-input workflow with its existing
+full-workflow lifetime profile plus only the new recovery overlay. Preserve
+all synthetic tool pages, model-only scoring, max1024 and natural completion.
+Positive real recovery and full-token/state evidence are still required;
+prefill page-admission retries remain a separate bottleneck. No default
+promotion, full-harness latency, new Plex score or under-90s success yet.
+
+Passing tree c0a478fabae9e9f3582a6b0da5647573b173ac88425d41ea76ff2d3038ab3b1e;
+result8b1136906276cb4d3379350511d8d5404688c4e78c656f4e12ba63aa853aa798;
+receipt536a9984abae0c0161afea14c0035d40e859556fda59990eb64367fcba40994c;
+log91e7b8e305d4953847206d6d0825c35a47dbf4f6bfec8629e2b5271546039545;
+server42d448129b73e2095022f99c0c0c25ea898269ade0713da30c1ff53a97ba3803;
+preflight23c331993edcc618e932c2b2e387b98957c180543d327ebabc06d7b9b1d52370.
+Passing response hashes0d4320c74ff17db7e76c5556dd0b8cadf42c5ef96d11ae01567f29b121de50cf /
+9ead5c5cd3af4043b79d08ca2e7af2a95e7118dd1be5254e61516dd3bd33fc38.
+Prior failed result2f3eba57a0392bf5a9ce3a54db70e924e3340535d37b184c272c8d188e44eefc;
+receipt15ee6b1c5cbcb71a65e00d8c90e8d17c2d60769fb9680714a2a54a52d5f4015e.
+
+
 ## 2026-09-08 UTC: default-off Qwen serial KV recovery is wired and unit-gated
 
 Added the explicit `qwen35-serial-kv-reclaim` overlay
