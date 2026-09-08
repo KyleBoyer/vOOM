@@ -1,5 +1,69 @@
 # STATUS — 2026-09-08 UTC (current corrections first; dated chronology below is history)
 
+## 2026-09-08 UTC: next failure is scalar replay with an unnecessary head lease
+
+huihui_plex_serial_context_20260908 on c68edab is verified FAIL, first HTTP
+486.0099s/driver486.3787s/parent488.9730s, no completed public answer or Plex
+score. SAME original134 tools/history/max1024/temp0/seed64013, unchanged
+full-workflow profile and synthetic pages. No serial-transient diagnostic
+fires: execution instead reaches qwen-mtp-factor-restore and refuses
+active1282842664B +~170MB incoming against~1.28GB live ceiling at5593219072B
+available. This is NOT a successful486s request or proof the earlier
+serial-verifier failure was fixed. No policy changed between these two runs.
+
+Pressure FAIL:minavailable4660379648B,240 periodic samples,swapout14745600B
+(wholeHTTP14974976B),net0,native footprint4167421480B/compressed612892672B.
+Known-transcoder inventory passes240 samples; not host-idle proof. Fresh30.0420s
+preflightPASS,901120B earlier-window churn. No retry observed. Root/external
+minima17229967360/100383981568B. All775 source/start-end/tree/capture/wire/
+metadata/response/progress/checks/result/log/preflight receipts verified BEFORE
+edits; owned15962/15966/15968 gone, server-15 normal cleanup.
+
+Code inspection identifies a removable lease at this NEW refusal boundary:
+serial target verification evaluates its complete logits before returning,
+then MTP samples/emits the selected tokens. Partial recurrent reconstruction
+does not consume the head, but the existing phase lease survives until the
+next verifier loop. Now release that lease before scalar replay's unchanged
+reservation, using the engine's existing opt-in/request-guarded suspend method.
+This applies only to compact scalar rollback's partial-prefix branch. Disabled
+phase-head policies/missing adapters remain no-ops; full acceptance and dense
+endpoint rollback are unchanged. No extra synchronization, math, weight,
+prompt, output-budget, sampling, paging-budget or memory-floor change.
+
+New counters separate successful factor-boundary head releases, cache-accounted
+bytes and physical active-release deltas already observed by the existing
+engine method. Both public timing and each hidden/public phase retain them.
+This is a concrete lifetime fix, not yet a measured real-model speed win.
+
+Five pure helper/order/ownership tests pass. Ten new real-array integration
+cases span every accepted prefix0..4 at greedy/stochastic sampling and prove
+release-before-commit order with identical tokens/text/termination, recurrent/
+convolution values, hidden states and KV lengths. Those head bytes and logits
+are mocked; do not present them as measured675MB release or real-target proof.
+Full selected pure suite790PASS;124 profiles validate.
+Supervised huihui_factor_head_release_units_20260908:116 MLX/mocked tests
+PASS1.03s,driver1.16767s,parent3.43553s,observed peak32279894B,
+terminalavailable6485262336B,zero interval swap growth/churn. Fresh30.0422s
+preflightPASS; all776 recorded dirty-source/start-end/tree/result/log/preflight
+receipts verified before further edits, owned22882/22886 gone.
+
+Next: same original short weather/title gate against the passed source534fd43
+reference, with fresh preflight. Require positive actual factor-boundary head
+release, unchanged all-phase token/text/budget/termination and pressure before
+another full Plex run. Full workflow score/under90s/long-context remain OPEN.
+
+Full-failure treeab7341d26584c4fa3aca707f0da6e765231a82d1f85b93d4777056e75eb0e807;
+resulta5fac791ef6da4deef6f68e2154f58b035c027158a84de9b270fbbfa9fd0e2db;
+log e02bb52039a3091f73d4df60952180eb50f1c9712f2c1ccfc0c17c0fdfd4e547;
+server608856201b7f002496e289c6a49262e8a09978bdf94d3e6ecc8dc4bdfd1cce67;
+preflight182996b9b71648402741c6490937b5144faee9dcabe212b067834add05f620b6;
+response0f19881f435ddb09613f9202092e92cad1a84480a94aed824f61aa31ff6e371a.
+Unit tree006bf089640040e20df2a4f4a749b70a1d80b7ea02c1686d79ccfb2d42c7a8f4;
+result871075eac041245091e77abc6bbdd0589e9a3c0730eba1540655128f44fe4f45;
+log3a658d2bfce5184a60587c1b3708a30f8443ce49a42f66b0369026e329e0122f;
+preflight818c3461c7e729ad165838faf2a3dba9c08214d730211abfaa8e2fd23adb9915.
+
+
 ## 2026-09-08 UTC: full-workflow lifetime audit reaches third request; no final Plex score
 
 huihui_plex_lifetime_full_workflow_20260908 on35a09810eb14cbffb938116516d32f509ac2bb69

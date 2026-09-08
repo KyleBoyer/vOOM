@@ -5962,12 +5962,14 @@ class StreamingEngine:
         return int(released)
 
     def _suspend_qwen35_serial_verify_lm_head(self) -> int:
-        """Drop the phase-scoped head before a streamed verifier trunk.
+        """Drop the phase-scoped head before a trunk or recurrent replay.
 
         The caller invokes this only after proposal projection has synchronized
         and before any target layer is fetched. Clearing ``_lm_head_w`` first
         ensures the cache owns the final live reference when it releases the
-        dedicated pin page.
+        dedicated pin page. Compact scalar rollback also calls this after
+        evaluated target logits have supplied all decisions for the round;
+        that reconstruction does not consume projection weights either.
         """
         if (not bool(getattr(
                 getattr(self, "rc", None),

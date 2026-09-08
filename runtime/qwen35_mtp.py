@@ -1440,6 +1440,25 @@ class QwenMTPDrafter:
             h_last, last_token, mtp_kv, offset, weights)))
 
 
+def _suspend_qwen_head_for_factor_restore(target):
+    """Release an existing phase lease after target decisions, before replay.
+
+    Serial verification has already evaluated all returned logits, and the
+    caller has sampled/emitted this round. Recurrent reconstruction needs no
+    projection weights. The engine's existing opt-in/request guards remain
+    authoritative; missing support is a no-op. Return cache-accounted and
+    observed active-release bytes separately, with no new device operations.
+    """
+    suspend = getattr(target, "_suspend_qwen35_serial_verify_lm_head", None)
+    if not callable(suspend):
+        return 0, 0
+    counter = "_qwen35_serial_verify_head_suspend_active_released_bytes"
+    before = int(getattr(target, counter, 0))
+    released = int(suspend())
+    active_released = max(0, int(getattr(target, counter, 0)) - before)
+    return max(0, released), active_released
+
+
 def _capture_qwen_serial_factors(target, tokens, kv):
     """Own one exact scalar-decay rollback window; never leave capture armed.
 
@@ -2271,6 +2290,9 @@ class QwenMTPSpeculativeEngine:
         kda_factor_bytes_peak = 0
         kda_factor_base_bytes_peak = 0
         kda_factor_restore_s = 0.0
+        kda_factor_head_releases = 0
+        kda_factor_head_cache_bytes = 0
+        kda_factor_head_active_bytes = 0
         refeed_sweeps_saved = 0
         grammar_forced_tokens = 0
         grammar_forced_sweeps = 0
@@ -3586,6 +3608,11 @@ class QwenMTPSpeculativeEngine:
                 elif target_fed_positions < round_verify_width:
                     if round_factors is not None:
                         restore_started = time.perf_counter()
+                        head_cache_bytes, head_active_bytes = (
+                            _suspend_qwen_head_for_factor_restore(tgt))
+                        kda_factor_head_releases += int(head_cache_bytes > 0)
+                        kda_factor_head_cache_bytes += head_cache_bytes
+                        kda_factor_head_active_bytes += head_active_bytes
                         if tgt.governor is not None:
                             matrix_bytes = [
                                 int(steps[0].key.shape[0]
@@ -3935,6 +3962,9 @@ class QwenMTPSpeculativeEngine:
             "qwen_mtp_kda_factor_bytes_peak": kda_factor_bytes_peak,
             "qwen_mtp_kda_factor_base_bytes_peak": kda_factor_base_bytes_peak,
             "qwen_mtp_kda_factor_restore_s": kda_factor_restore_s,
+            "qwen_mtp_kda_factor_head_releases": kda_factor_head_releases,
+            "qwen_mtp_kda_factor_head_cache_released_bytes": kda_factor_head_cache_bytes,
+            "qwen_mtp_kda_factor_head_active_released_bytes": kda_factor_head_active_bytes,
             "qwen_mtp_budget_width_clamped_rounds": (
                 budget_width_clamped_rounds),
             "qwen_mtp_budget_draft_steps_avoided": (

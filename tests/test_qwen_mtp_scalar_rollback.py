@@ -174,6 +174,39 @@ def test_failed_verifier_cancels_capture_without_retry(capsys):
     assert 'factor_layers=1 factor_steps=1' in diagnostic
 
 
+@pytest.mark.parametrize('accepted', range(5))
+@pytest.mark.parametrize('temperature', [0.0, 1.0])
+def test_phase_head_release_precedes_factor_commit_without_changing_tokens_state(accepted, temperature):
+    from runtime.kda_state import KDAFactorWindow
+
+    targets = [_FactorTarget(accepted), _FactorTarget(accepted)]
+    results = [_engine(targets[0], True).generate('x', accepted + 2,
+        sampling=SamplingParams(temperature=temperature, seed=17))]
+    target = targets[1]
+    target._qwen35_serial_verify_head_suspend_active_released_bytes = 0
+    events = []
+    def suspend():
+        events.append('release')
+        target._qwen35_serial_verify_head_suspend_active_released_bytes += 321
+        return 456
+    target._suspend_qwen35_serial_verify_lm_head = suspend
+    original = KDAFactorWindow.commit_prefix
+    def commit(window, *args, **kwargs):
+        assert events == ['release']
+        events.append('commit')
+        return original(window, *args, **kwargs)
+    with patch.object(KDAFactorWindow, 'commit_prefix', commit):
+        results.append(_engine(target, True).generate('x', accepted + 2,
+            sampling=SamplingParams(temperature=temperature, seed=17)))
+    _assert_equal(targets, results)
+    partial = int(accepted < 4)
+    assert events == (['release', 'commit'] if partial else [])
+    stats = results[1]['path_stats']
+    assert stats['qwen_mtp_kda_factor_head_releases'] == partial
+    assert stats['qwen_mtp_kda_factor_head_cache_released_bytes'] == 456 * partial
+    assert stats['qwen_mtp_kda_factor_head_active_released_bytes'] == 321 * partial
+
+
 def test_missing_active_layer_factors_fail_closed():
     target = _FactorTarget(4)
     target.omit_layer = True

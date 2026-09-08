@@ -5570,7 +5570,10 @@ def test_cache_phase_head_lifetime_uses_own_complete_wrapper_stats_without_defau
         qwen_mtp_target_head_suspend_request_active=1,
         qwen_mtp_target_head_restore_calls=3,
         qwen_mtp_target_head_suspend_active_released_bytes=123,
-        qwen_mtp_target_head_suspend_active_peak_bytes=41)
+        qwen_mtp_target_head_suspend_active_peak_bytes=41,
+        qwen_mtp_kda_factor_head_releases=2,
+        qwen_mtp_kda_factor_head_cache_released_bytes=90,
+        qwen_mtp_kda_factor_head_active_released_bytes=80)
     hidden = _cache_phase_telemetry('gateway_decision', dict(path_stats=fields,
         qwen_mtp_target_head_restore_calls=99))
     assert all(hidden[key] == value for key, value in fields.items())
