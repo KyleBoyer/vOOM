@@ -51,6 +51,29 @@ def test_recurrent_attachment_is_idempotent_and_architecture_scoped():
     assert not hasattr(ordinary, "kda_cache")
 
 
+def test_bf16_page_materialization_preserves_full_history_and_companion(tmp_path):
+    kv = PagedKVCache(num_layers=2, max_bytes=1, spill_dir=tmp_path,
+        page_positions=4, resident_pages=0)
+    attach_hybrid_recurrent_cache(kv, model_type="qwen3_5", num_hidden_layers=2)
+    companion = mx.ones((1, 2, 3, 3), dtype=mx.float32)
+    kv.kda_cache.set_state(0, companion)
+    reference = mx.array(np.arange(192, dtype=np.float32).reshape(1, 2, 12, 8) / 17 - 3).astype(mx.bfloat16)
+    values = (-reference).astype(mx.bfloat16)
+    mx.eval(reference, values)
+    for layer in range(2):
+        for start in range(0, 12, 4):
+            kv.update(layer, reference[:, :, start:start+4], values[:, :, start:start+4])
+    assert kv.stats.spills > 0
+    for layer in range(2):
+        keys, restored_values = kv.materialize_layer(layer)
+        assert keys.dtype == restored_values.dtype == mx.bfloat16
+        assert bool(mx.array_equal(keys, reference).item())
+        assert bool(mx.array_equal(restored_values, values).item())
+    assert kv.stats.reloads > 0 and kv.offset == 12
+    assert kv.kda_cache.state(0) is companion
+    kv.release()
+
+
 def test_paged_kv_per_layer_speculative_rollback_is_exact(tmp_path):
     kv = PagedKVCache(
         num_layers=4,

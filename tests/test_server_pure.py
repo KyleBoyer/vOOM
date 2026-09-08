@@ -5432,6 +5432,16 @@ def test_cache_phase_state_witness_preserves_actual_policy_and_missing_metadata(
     assert all(key not in missing for key in (*fields, "true_peak_metal_bytes"))
 
 
+def test_cache_phase_paging_witness_uses_complete_wrapper_stats():
+    fields = dict(kv_layout='paged', paged_kv_budget_bytes=256_000_000,
+        hybrid_recurrent_cache_attached=1, paged_kv_spills=15, paged_kv_reloads=22,
+        qwen35_paged_online_attention=0, qwen35_paged_online_page_native=0)
+    result = _cache_phase_telemetry('gateway_decision', {
+        'path_stats': fields, 'kv_bytes': 12345, 'kv_positions': 4924})
+    assert all(result[key] == value for key, value in fields.items())
+    assert result['kv_bytes'] == 12345 and result['kv_positions'] == 4924
+
+
 def test_responses_stream_emits_terminal_failure_instead_of_truncated_sse():
     import io
 

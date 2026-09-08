@@ -74,10 +74,10 @@ def test_full_state_audit_changes_only_the_mixed_depth_switch():
         layer_types=['linear_attention'] * 3 + ['full_attention']) == (0, 0, 0)
 
 
-def full_state_checks(phases):
+def full_state_checks(phases, **config):
     return gate.acceptance(row(), dict(status='completed', output=[call({})],
         vmodel_tool_selection=selection(), vmodel_cache_phases=phases),
-        dict(profiles=['audit'], profile_digest='digest', require_full_prompt_state=True))
+        dict(profiles=['audit'], profile_digest='digest', require_full_prompt_state=True, **config))
 
 
 def phase():
@@ -89,6 +89,34 @@ def phase():
 
 def test_full_state_witness_accepts_both_model_generations():
     assert all(full_state_checks([phase(), phase()]).values())
+
+
+def test_paged_audit_only_changes_full_attention_residency():
+    base, paged = {}, {}
+    apply_runtime_profiles(['huihui-qwen38-27b-full-state-model-only-audit'], environ=base)
+    apply_runtime_profiles(['huihui-qwen38-27b-full-state-paged256-audit'], environ=paged)
+    settings = lambda env: {k: v for k, v in env.items() if k.startswith('VMODEL_') and k != 'VMODEL_PROFILE'}
+    assert settings(paged) == {**settings(base), 'VMODEL_QWEN35_KV_MAX_MB': '256'}
+
+
+def paged_phase():
+    return dict(**phase(), kv_layout='paged', paged_kv_budget_bytes=256_000_000,
+        hybrid_recurrent_cache_attached=1, paged_kv_spills=12, paged_kv_reloads=8,
+        qwen35_paged_online_attention=0, qwen35_paged_online_page_native=0)
+
+
+def test_paged_witness_requires_actual_spill_and_reload_on_both_phases():
+    assert all(full_state_checks([paged_phase(), paged_phase()], require_paged_kv=True).values())
+
+
+@pytest.mark.parametrize('bad', [{}, {'kv_layout': 'concatenated'},
+    {'paged_kv_budget_bytes': 768_000_000}, {'hybrid_recurrent_cache_attached': 0},
+    {'hybrid_recurrent_cache_attached': True}, {'paged_kv_spills': 0},
+    {'paged_kv_reloads': 0}, {'paged_kv_reloads': True},
+    {'qwen35_paged_online_attention': 1}, {'qwen35_paged_online_page_native': 1}])
+def test_paged_witness_rejects_missing_or_wrong_hidden_phase(bad):
+    suspect = {**paged_phase(), **bad} if bad else {}
+    assert not full_state_checks([suspect, paged_phase()], require_paged_kv=True)['paged_kv_witness']
 
 
 @pytest.mark.parametrize('phases', [None, [], {}, [None], [phase(), {}],
@@ -247,6 +275,18 @@ def test_workflow_rejects_tool_schema_rewrite_before_http(tmp_path, monkeypatch)
     with pytest.raises(AssertionError):
         gate.run_plex_workflow(config, request, dict(failures=[]))
     assert not wires and plex._post is original_post
+
+
+def test_paging_gate_stops_after_receipt_when_full_state_is_not_actually_paged(tmp_path, monkeypatch):
+    request, config, responses, wires = workflow_setup(tmp_path, monkeypatch)
+    config.update(require_full_prompt_state=True, require_paged_kv=True)
+    for response in responses:
+        response['vmodel_cache_phases'] = [phase()]
+    document = dict(failures=[])
+    with pytest.raises(RuntimeError, match='Paged-state comparison'):
+        gate.run_plex_workflow(config, request, document)
+    assert len(wires) == 1 and 'final_plex_score' not in document
+    assert (tmp_path/'reply.turn1.json').exists()
 
 
 @pytest.mark.parametrize('key', list(selection()))

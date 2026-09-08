@@ -9668,7 +9668,11 @@ def _cache_phase_telemetry(name: str, phase_result: dict) -> dict:
     # Missing legacy metadata must remain missing, not an invented exact zero.
     for key in ("prompt_state_approximate",
                 "qwen_lossy_suffix_prefill_early_layers",
-                "qwen_lossy_suffix_prefill_used", "true_peak_metal_bytes"):
+                "qwen_lossy_suffix_prefill_used", "true_peak_metal_bytes",
+                "kv_layout", "kv_bytes", "kv_positions", "paged_kv_budget_bytes",
+                "hybrid_recurrent_cache_attached", "paged_kv_spills",
+                "paged_kv_reloads", "paged_kv_spill_seconds", "paged_kv_reload_seconds",
+                "qwen35_paged_online_attention", "qwen35_paged_online_page_native"):
         if key in stats or key in phase_result:
             value[key] = stats.get(key, phase_result.get(key))
     if phase_result.get("execution_profile") is not None:

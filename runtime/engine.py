@@ -12565,6 +12565,9 @@ class StreamingEngine:
         if use_stepped_kv and isinstance(kv, KVCache):
             kv = SteppedKVCache.from_cache(kv)
             self.last_kv = kv
+        path_stats["paged_kv_budget_bytes"] = int(getattr(kv, "max_bytes", 0))
+        path_stats["hybrid_recurrent_cache_attached"] = int(
+            getattr(kv, "kda_cache", None) is not None)
         path_stats["prompt_cache_prefix_tokens"] = matched
         path_stats["hot_prompt_reusable_prefix_tokens"] = reusable_watermark
         if matched and on_progress is not None:

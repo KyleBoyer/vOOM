@@ -120,6 +120,21 @@ def acceptance(row, response, config, *, initial_action=True):
         checks['all_phase_metal'] = valid and all(
             type(phase.get('true_peak_metal_bytes')) is int
             and 0 < phase['true_peak_metal_bytes'] <= 8_500_000_000 for phase in phases)
+    if config.get('require_paged_kv', False):
+        phases = response.get('vmodel_cache_phases')
+        valid = isinstance(phases, list) and bool(phases) and all(
+            isinstance(phase, dict) for phase in phases)
+        checks['paged_kv_witness'] = valid and all(
+            phase.get('kv_layout') == 'paged'
+            and type(phase.get('paged_kv_budget_bytes')) is int
+            and phase.get('paged_kv_budget_bytes') == 256_000_000
+            and type(phase.get('hybrid_recurrent_cache_attached')) is int
+            and phase['hybrid_recurrent_cache_attached'] == 1
+            and all(type(phase.get(key)) is int and phase[key] > 0
+                for key in ('paged_kv_spills', 'paged_kv_reloads'))
+            and all(type(phase.get(key)) is int and phase[key] == 0
+                for key in ('qwen35_paged_online_attention', 'qwen35_paged_online_page_native'))
+            for phase in phases)
     return checks
 
 
@@ -175,6 +190,8 @@ report those independently of actual final-title errors, never repair a score.
         if config.get('require_full_prompt_state', False) and not all(
                 checks[key] for key in ('full_prompt_state', 'phase_io_witness', 'all_phase_metal')):
             raise RuntimeError('Full-state comparison lacks required per-phase witnesses')
+        if config.get('require_paged_kv', False) and not checks['paged_kv_witness']:
+            raise RuntimeError('Paged-state comparison lacks required per-phase witnesses')
         return response, row['wall_seconds']
 
     # Scope this observer to one synchronous, single-server fixture call.
@@ -200,6 +217,8 @@ def run(config):
     # no_retry still fails. The default remains fail-fast for latency audits.
     assert type(config.get('abort_on_memory_retry', True)) is bool
     assert type(config.get('require_full_prompt_state', False)) is bool
+    assert type(config.get('require_paged_kv', False)) is bool
+    assert not config.get('require_paged_kv', False) or config.get('require_full_prompt_state', False)
     assert not any(k.startswith('VMODEL_') for k in os.environ)
     assert subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip() == config['source_commit']
     pre = json.loads(Path(config['preflight']).read_text())
@@ -216,6 +235,12 @@ def run(config):
     assert env['VMODEL_QWEN35_MIXED_DEPTH_HOT_KV_PERSIST'] == '0'
     if config.get('require_full_prompt_state', False):
         assert env['VMODEL_QWEN35_LOSSY_SUFFIX_PREFILL'] == 'off'
+    if config.get('require_paged_kv', False):
+        assert env['VMODEL_QWEN35_KV_MAX_MB'] == '256'
+        assert env.get('VMODEL_QWEN35_PAGED_ONLINE_ATTENTION', '0') == '0'
+        assert env.get('VMODEL_QWEN35_PAGED_ONLINE_PAGE_NATIVE', '0') == '0'
+        assert env.get('VMODEL_QWEN35_PAGED_KV_PERSIST', '0') == '0'
+        assert env['VMODEL_QWEN35_FP8_KV_CACHE'] == '0'
     assert env['VMODEL_GENERATION_WITNESS'] == env['VMODEL_HOST_ACTIVITY_WITNESS'] == '1'
     assert _port_is_free(config['port'])
     for key in ('result', 'response', 'server_log'):

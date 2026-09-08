@@ -1,0 +1,11 @@
+schema: voom.runtime-profile.v1
+name: huihui-qwen38-27b-full-state-paged256-audit
+description: Full-state Huihui MXFP4 quality audit with bounded exact full-attention KV paging.
+notes:
+  - "Only the conventional full-attention KV resident budget changes to 256 MB. Exact BF16 pages spill on Workspace NVMe; the DeltaNet companion remains resident and is not included in that page budget."
+  - "Uses the existing materialize-and-attend path, not online/page-native attention, KV quantization or durable prompt reuse. The model-only parent still uses quantized target weights and a compacted gateway, so this is not released-BF16 lossless or a full-schema model replay."
+  - "Experimental memory comparison, not a default or speed claim. Require actual page spill/reload and recurrent-companion witnesses, unchanged prepared/input token comparisons where available, completed answer quality and all pressure gates."
+extends:
+  - huihui-qwen38-27b-full-state-model-only-audit
+settings:
+  VMODEL_QWEN35_KV_MAX_MB: 256
