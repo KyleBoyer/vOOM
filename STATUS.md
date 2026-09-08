@@ -1,5 +1,85 @@
 # STATUS — 2026-09-08 UTC (current corrections first; dated chronology below is history)
 
+## 2026-09-08 UTC: real continuation KV recovery frees69.2MB, but live admission still refuses
+
+`huihui_saved_continuation_isolated_20260908` on clean/pushed
+`85e189b84a6a58c7e80280372bd4822528b47468` is independently verified **FAIL**.
+The isolated saved second HTTP fails after124.2732s (driver124.6316s /
+parent127.3443s), with no public output, completed engine phase or Plex score.
+All64 prefill-layer progress events complete by110.1293s elapsed; this is a
+progress timestamp, not a returned engine-prefill or first-token timing.
+No prefill retry occurs. Serial verification then fails at layer55, width5,
+offset5046. Complete prepared/output token hashes and final Metal/state evidence
+are unavailable on this failed generation; do not infer them from progress.
+
+The exact179931B/134-tool/five-item second request is reconstructed and matched
+to the previous full-workflow canonical SHA
+c038a9d21b7ca87174ddcc5bb6bf4353f76c087860c17043eadcfe12f752780a.
+Original capture and all original fields/tools remain intact; only the saved
+model call plus unchanged synthetic first tool page are appended, with the
+already-declared model/max1024/temp0/seed64013 overrides. Same explicit full-state
+MXFP4/reassociated-prefill/Hermes/gateway and KV-recovery profile. The NEW SERVER
+intentionally omits first-HTTP process/cache history; OS file-cache/host state and
+learned admission history are uncontrolled. Passing prefill here versus the
+prior continuation's layer40 failure does NOT establish a previous-request leak,
+a cold-disk speedup, full-schema model equivalence or completed-workflow latency.
+
+The existing default-off recovery finally fires on REAL request execution:
+257,394,692B selected scratch (13 matching full-attention observations), margin0,
+target PagedKVCache logical255,463,424B, fixed256,000,000B budget.
+Initial recovery snapshot available5,788,352,512B/Metal828,380,392B requires
+69,042,180B more headroom under the unchanged5.6GB reserve. It spills66 closed
+pages, reducing logical residency AND observed Metal active by **69,206,016B**
+to186,257,408B and759,174,376B respectively. Reclamation takes **0.058797s**
+including0.055939s spill writes. No alias-free full-token/state proof is possible
+from the failed generation; this is positive physical-release mechanism evidence,
+not a successful recovery or answer-quality result.
+
+The post-spill non-atomic sample is still **4,702,212B short**: available rises
+only64,339,968B to5,852,692,480B. The mandatory ordinary governor reservation
+again refuses; total recovery wall1.949036s includes that bounded settling.
+Physical release cannot be credited as equal system-available headroom.
+One raw recovery record has outcome=refused; final phase coverage correctly
+FAILS because no completed phases exist. No KV/request-page refusal diagnostic
+or prefill restart appears. The pre-refusal recorded request Metal peak is
+2,514,645,156B at that moment, not a completed whole-request peak qualification.
+
+Pressure itself passes:61 native/known-transcoder observations, minimum available
+5,716,918,272B, maximum native footprint4,055,060,128B/compressed225,837,056B.
+Sampled swap-out7,913,472B; whole HTTP8,060,928B, net swap growth0.
+Known-transcoder absence is not general host-idle or process swap attribution.
+Fresh30.0357s preflight passes with zero preceding-window swap churn/growth.
+Root/external free minima21,439,766,528B/100,325,556,224B. Internal fast tier
+remains62,512,074,752B. No user apps/data changed.
+
+All789 source/start-end/fresh manifests, config/model/capture/wire/reference/
+response/result/log/preflight hashes, exact continuation, recomputed failed
+acceptance, raw recovery arithmetic and process completion verified BEFORE edits.
+PIDs58327/58331/58333 gone, session10332 drained exit1; server-15 normal cleanup.
+No model job remains. Full original workflow, Plex score and under90s remain open.
+
+A new pure real-governor/fake-Metal negative control pins these observed sizes:
+equal69.2MB physical/logical release admits when live available returns enough,
+but the captured64.34MB available return still refuses at4.7MB deficit.
+Both preserve5.6GB reserve,8.5GB cap and256MB policy; no actual arrays/model I/O.
+Focused27 tests PASS0.33s; final strict no-real-MLX selected suite460 PASS11.27s;
+126 profiles validate. No runtime behavior changed in this step.
+Next credible lever: explicit bounded top-up after physical progress, sized only
+from a FRESH live deficit, followed by ordinary admission. Preserve the current
+one-pass profile as control, protect current-layer/tails/recurrent state, stop on
+no progress/errors/exhaustion, and record each spill/snapshot. Do not simply pad
+the captured deficit, lower margins, turn it into an unbounded loop or claim a
+win before exact-state, alias-control and fresh request gates.
+
+Treebcc61783e00cb01543a372064c223efe61aa16e43b0995568cfe5d116fb9a010;
+result8c79abba4a03df37b29957cebe46ab4c420826c1452f83590a6859d84421b3ef;
+receiptbd01c3fecd4ac88e10080b2c131abd9bd508889b16810330fbd3bffc53853d1a;
+log5266f4e3a0ae09fa0ba4fac1dee8c55cbf76d3d098349de339647b6300fefa99;
+server9f2c4e6901c289cba0a9122ca7d534eda2eb5e78ad0a94be36bac7c818babed1;
+preflight2c92442ce3f2a5687b0e6e16dcc4a688989111b68601476f024a63f36b7adabf;
+response211ee37f834ed721c95ae10b47ff97398c4217dae544f1c5b3cf4afd6e3fa844.
+
+
 ## 2026-09-08 UTC: exact saved-continuation isolation gate prepared, no model result yet
 
 Added an explicit `saved_continuation` diagnostic mode to the Huihui captured

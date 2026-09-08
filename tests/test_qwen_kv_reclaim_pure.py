@@ -104,6 +104,54 @@ def test_aliases_never_turn_logical_reclamation_into_admission(setup):
     assert row["outcome"] == "refused" and calls == [("spill", 60, 3), "refuse"]
 
 
+@pytest.mark.parametrize('available_returned,admitted,remaining', [
+    (69_206_016, True, 0),
+    (64_339_968, False, 4_702_212),
+])
+def test_real_refusal_geometry_requires_live_headroom_not_only_physical_release(
+        setup, monkeypatch, available_returned, admitted, remaining):
+    # Captured layer55 geometry, but controlled fake Metal/host samples. This
+    # pins the one-pass failure, not a full model/state or physical-memory test.
+    engine, kv, _, calls = setup
+    module, metal = load_pressure(828_380_392)
+    governor = make_governor(module, metal,
+        cache_max=194_408_366, floor=68_800_000)
+    governor.critical = 5_600_000_000
+    governor.metal_limit = 8_500_000_000
+    governor.cache.total_bytes = 10_240
+    governor.cache._evict_locked = lambda: None
+    available = [5_788_352_512]
+    sample = lambda: SimpleNamespace(available=available[0])
+    module.psutil = SimpleNamespace(virtual_memory=sample)
+    module.time = SimpleNamespace(sleep=lambda _: None)
+    monkeypatch.setattr(recovery.psutil, 'virtual_memory', sample)
+    engine.governor = governor
+    engine._layer_transient = 257_394_692
+    engine._layer_transient_margin = 0
+    kv.resident = 255_463_424
+    def spill(requested, *, protected_layer):
+        calls.append(('spill', requested, protected_layer))
+        kv.resident -= 69_206_016
+        kv.stats.spills += 66
+        metal.active -= 69_206_016
+        available[0] += available_returned
+        return 69_206_016
+    kv.reclaim_closed_pages = spill
+    assert recovery.recover_serial_kv_admission(
+        engine, kv, metal, layer=55, positions=5, offset=5046) is admitted
+    record = engine._qwen35_serial_kv_reclaim_stats['records'][0]
+    assert calls == [('spill', 69_042_180, 55)]
+    assert record['outcome'] == ('admitted' if admitted else 'refused')
+    assert record['logical_reclaimed_bytes'] == record['metal_active_released_bytes'] == 69_206_016
+    assert record['spill_pages'] == 66 and record['logical_after_bytes'] == 186_257_408
+    assert record['after_reclaim']['deficit_bytes'] == remaining
+    assert record['reservation_retried'] is True
+    assert governor.reservation_calls == 1
+    assert governor.reservation_failures == int(not admitted)
+    assert governor.critical == 5_600_000_000 and governor.metal_limit == 8_500_000_000
+    assert kv.max_bytes == 256_000_000 and engine._layer_transient_margin == 0
+
+
 def test_no_candidates_keeps_refusal_without_second_settle_loop(setup):
     engine, _, metal, calls = setup
     kv = FakePaged(calls, released=0)
