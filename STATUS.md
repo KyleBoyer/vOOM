@@ -1,5 +1,87 @@
 # STATUS — 2026-09-08 UTC (current corrections first; dated chronology below is history)
 
+## 2026-09-08 UTC: held-out shipping32K answer passes; pressure and latency goals remain open
+
+Completed a NEW shipping-domain retrieval case with fixture seed251807, not
+another replay of the library answer. Domain, record IDs/codes/order and distant
+positions were fixed BEFORE launch; no prompt/model/profile changes followed
+the result. Two requested records are at local user positions5576/22523 with
+three decoys, each answer appearing once in its record and not in the final
+query. Synthetic no-tool template, greedy/non-streaming/no-reasoning, max-output
+1024, actual prepared32799 uncached tokens. Installed uncensored Qwen FP8 with
+the SAME explicit query256/aligned-compact-fused/tracking-off/witness profiles.
+
+Natural completion:39 actual generated tokens,67 UTF-8 output bytes. Both exact
+requested IDs and codes are correct; all seven strict completion/record checks
+PASS on independent rescoring of the immutable saved response. Raw generation
+witness available. No rendering/repair/tool execution. This is a second
+synthetic retrieval domain, NOT live/captured Plex, varied real tool schemas,
+broad intelligence, full recurrent endpoint equivalence or original-BF16 proof.
+There is NO untiled same-case token/state reference for this shipping case.
+
+| Metric | Shipping case |
+|---|---:|
+| Complete HTTP wall | 652.9205s |
+| Prefill / engine first token | 473.7049s /473.7054s |
+| Decode / total engine | 177.7587s /651.4677s |
+| True peak Metal | 4,258,395,954B |
+| Logical prefill / decode reads | 117,535,167,440B /271,698,059,448B |
+| Native MTP accepted / proposed / target sweeps | 21 /53 /18 |
+
+Engine first-token time is NOT client SSE TTFT; no retry. Total logical store
+accounting389,233,226,888B is not physical disk I/O. Attention245.739851s,
+experts168.732125s, host copying28.657541s. Actual query256 witness PASS:
+396 calls/384 splits/1548 query tiles/max query256/key32799. All144 ordered
+first/capture/final attention bracket groups PASS;1155 scalar observations,
+complete v2 ending, no cap/error. Sampling77.189ms excludes logging/dispatch;
+all instrumentation is inside HTTP wall.
+
+Compared with the prior library query256 case, output is SHORTER (39 vs47)
+but native MTP accepts21/53 rather than32/45 and needs18 rather than15 target
+sweeps. Decode reads rise271.698 vs230.132GB and decode time177.759 vs152.172s.
+This demonstrates prompt-dependent proposal economics, not a paired regression
+or causal timing claim: domain/output/routes and starting host pressure differ.
+No native-MTP width/proposer tuning was made for this answer.
+
+Overall pressure FAIL: terminal available3,929,817,088B, actual HTTP swap-out
+39,600,128B, net used-swap growth0. Whole-run322 samples: minavailable
+3,882,827,776B, observed swap-out38,338,560B, native footprint peak5,271,489,224B,
+native compressed1,972,731,904B. Known-transcoder isolation PASS322 inventories,
+none listed; not general idle or swap attribution. Fresh30.0286s preflight
+PASS/no churn/end6.823GB; root minimum16,154,304,512B/external100,628,963,328B,
+fasttier unchanged62.512GB. No safety/acceptance threshold weakened.
+
+Parent FAIL exit1/655.8805s, driver653.8701s,00:56:14.715923 ->
+01:07:10.596431UTC. Managed server-15 is expected cleanup. PIDs57349/57353/
+57355/57362 gone. All759 source hashes, identical start/end manifest,
+result/client/response/server/parent/preflight hashes, tokenizer/history identity,
+preregistered fixture/wire identity, independent answer rescore and path/phase/
+pressure checks verified BEFORE docs edits. No timeout, signal, source drift,
+missing result or history mutation. No runtime/serving code changed this run.
+Post-run selected pure suite:695 PASS3.13s; git diff --check clean.
+
+Preregistered wire173106B SHA
+de932fc8d57f174354e04516226b8829f7e31e34d315cd4bcdd8fef1cdf964bd;
+user56b2738b1365a73494eba75e7bc8c974e84bc2901a6290510a7790d8d568cef4.
+Private result logs/qwen4_query256_shipping32k_20260908.json SHA
+5280a80574aa7c24ab04a5c288d77e60f494a8ae96d07e68a4b9ef68f68fa155;
+response749d79c1c0fe254f09ff24e8820d19dc86e8dcf611de697fc97a6b74f71dfad0;
+parentlog29dd6d66a15596180108d722928b347697a08759626e1530b328d58fa78fb5be;
+preflight75fb3fa803c1e0be2a299e5e6b3407a415bdc992cb3acba38fd5aa1efd46c418.
+Prepared token hashab3c5a2016189c918973832b0c98c8174d11bf12fa5f0ab6877249f3117f1a59;
+raw39token hash7b43f39ddd6c1a744cd9904c1961f34cc5ce93954efe931dbd762356d5fa6314.
+Source tree02c485040cc1dc1ea069543a35b7dafd350bc785c4575b152868befde8597405;
+profile digest69ae97e299e35600b0dddee2168fcda52f090fe08e55423da8547316619e1736.
+
+Next: heterogeneous actual function/captured shapes and same-case correctness
+references remain necessary. Before any proposal tuning, audit the EXISTING
+Qwen4 ngram-first implementation across fixed actual generated-token witnesses
+(not inferred tokens without matching hashes); only model-verified proposals
+may change timing, never answers. Do not tune MTP width to one retrieved code.
+The native-vector-prefill bit-mismatch stop remains in force. Query256 stays
+opt-in/memory-only. Latest actual full131867.9482s/pressureFAIL and Plex56FAIL
+unchanged; no new GLM score, sub90 or context-ladder completion.
+
 ## 2026-09-08 UTC: native vector-SDPA prefill rejected immediately by exact-bit gate
 
 Tested the next bounded head256 fused-kernel route, without serving integration:
