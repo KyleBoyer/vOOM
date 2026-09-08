@@ -1,5 +1,52 @@
 # STATUS — 2026-09-08 UTC (current corrections first; dated chronology below is history)
 
+## 2026-09-08 UTC: exact paged full-state Huihui audit prepared; small lifecycle gates pass
+
+Next bounded run: huihui_plex_full_state_paged256_max1024_20260908.
+Explicit huihui-qwen38-27b-full-state-paged256-audit changes ONLY the existing
+full-state audit's conventional full-attention KV resident budget to256MB.
+It uses ordinary BF16 materialize-and-attend paging on external NVMe: no
+online/page-native attention, KV quantization, prompt persistence or truncation.
+The fixed-size DeltaNet companion remains resident OUTSIDE this page budget.
+MXFP4 target/reassociated DeltaNet/gateway remain lossy, as clearly labeled.
+
+The previous resident-state run failed in MTP verification. This storage/lifetime
+experiment is intended to free room for verifier transients without changing
+the target representation or dropping prepared context. It may add spill I/O
+and fail latency or quality; no completion/speed/correctness claim yet.
+Same original134 HTTP tools/history/stream, max1024/temp0/seed64013, synthetic
+mixed pages and unchanged rubric. No live Plex or user-data deletion.
+
+New scalar telemetry witnesses actual paged budget and attached recurrent
+companion. Per-phase adapter also preserves layout, resident KV bytes/positions,
+spill/reload counters/times and online-attention settings. The explicit paged
+audit requires real positive spills AND reloads on every hidden/public phase,
+256MB configured page budget, recurrent attachment and online flags0, as well
+as all existing full-state/identity/provenance/pressure checks. Missing evidence
+stops after saving the immutable response. Page-byte counters exclude recurrent
+state and materialization transients; they are NOT whole-Metal peak measures.
+
+624 selected pure tests PASS4.14s. Fresh30.0309s preflight PASS/no churn preceded
+a single supervised small MLX job: eight page/recurrent/rollback/MTP-lifecycle
+tests PASS0.08s, driver0.2230s, parent2.4191s, observed Metal peak2560B,
+terminalavailable6.540GB and zero swap growth/churn. Includes finite BF16
+full-history exact value/dtype roundtrip and speculative per-layer rollback;
+MTP ownership tests use mocked targets, not real27B weights. No model-score claim.
+All764 source hashes/start-end manifests/tree and receipt/log hashes verified
+before these notes. PIDs14059/14063 gone. Existing cache-local UUID spill names
+and owned-path-only cleanup prevent collision with unrelated cached data.
+
+Micro source733bf60e6e87a3d575a0c0443f295b590db13878; tree
+459c2973cedf4ab81c7381b30881b036f9b0c87b213c48429f327e439320994b;
+result2751fda4dc4db35a4899d521e67138ff0bbdaa014e5b86db86685c1b2018513e;
+parentlog234d1237f1032868c9e670e3d98917c45b4b9da949f226f786fc38f1f5f24833;
+preflight180a50884fa312f0572f2485517bd9a49e690a310fc52f9957da2102b656b102.
+Paged+generation+host witness digest
+cc41c809d84c26987cf5758f886aa0f4e890e91493e7b428c5c525d17cb45f5f.
+A SEPARATE fresh30s preflight is required before the real captured workflow.
+No source/docs edits during that job. Compare saved first prepared5755/raw70
+identity where available, without suppressing changes or grading partial output.
+
 ## 2026-09-08 UTC: full-state Huihui first plan improves; second response hits verifier memory guard
 
 Run huihui_plex_full_state_max1024_20260908 ends FAIL, with NO final Plex score.
