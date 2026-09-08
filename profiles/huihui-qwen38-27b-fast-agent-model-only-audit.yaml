@@ -1,0 +1,14 @@
+schema: voom.runtime-profile.v1
+name: huihui-qwen38-27b-fast-agent-model-only-audit
+description: Explicit cold model-only evaluation of the existing lossy Huihui agent route.
+notes:
+  - "Evaluation profile, not a new speed winner or a serving default. Pair with lossy-Huihui-Qwen3.8-27B-abliterated-mlx-all-mxfp4-mtpquant."
+  - "Disables deterministic host answer rendering and in-memory/durable prompt reuse. No existing cache files are removed. OS file-cache state is uncontrolled: cold means a new process with no prompt-cache reuse, not cold disk pages."
+  - "Retains the parent's gateway catalog reduction, all-MXFP4 target, approximate 16:1024 prompt state and reassociated DeltaNet prefill. A preserved 134-tool HTTP body is therefore NOT a full-schema model replay or released-BF16 proof."
+  - "Use sufficient output budgets, save actual terminal responses privately, and grade model-only answers separately from first tool actions."
+extends:
+  - huihui-qwen38-27b-fast-agent-mtpquant
+settings:
+  VMODEL_FAST_TOOL_GATEWAY_DETERMINISTIC_POLICY: false
+  VMODEL_QWEN35_HOT_KV: false
+  VMODEL_QWEN35_MIXED_DEPTH_HOT_KV_PERSIST: false
