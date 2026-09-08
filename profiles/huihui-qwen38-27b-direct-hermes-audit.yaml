@@ -1,0 +1,11 @@
+schema: voom.runtime-profile.v1
+name: huihui-qwen38-27b-direct-hermes-audit
+description: Explicit dense Qwen prompt/grammar protocol-consistency experiment.
+notes:
+  - "Changes only dense fast-mode tool rendering versus full-state-direct-audit. The released template asks for nested XML, but the existing constraint emits Hermes JSON. This profile uses the existing canonical Hermes system instructions and historical calls for both. It does not shorten the caller's tool catalog, messages or output allowance."
+  - "Prompt-only protocol transformation, not released-template lossless or a default. All-MXFP4 weights and reassociated prefill remain lossy. No sampling change, forced single-tool termination, duplicate suppression, host action or answer rendering."
+  - "First test original small captures at max1024/temp0/seed64013 with all-phase natural completion and full-state witnesses. The prior direct weather control repeated 64 identical calls before its cap; it is a negative diagnostic, not a valid token-equivalence or latency reference. Broader real traffic and full Plex remain required."
+extends:
+  - huihui-qwen38-27b-full-state-direct-audit
+settings:
+  VMODEL_QWEN35_DENSE_HERMES_TOOLS: true

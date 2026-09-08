@@ -1,5 +1,66 @@
 # STATUS — 2026-09-08 UTC (current corrections first; dated chronology below is history)
 
+## 2026-09-08 UTC: direct Huihui greedy control repeats64 calls; protocol-consistency test next
+
+Focus remains Huihui Qwen3.8-27B-abliterated; Flash Next/GLM are deferred.
+huihui_direct_dense_captured_shapes_20260908 is a verified FAIL on519ac44.
+The original359B streaming weather capture (only model/max1024/temp0/seed64013
+wire overrides) takes1246.5930s HTTP /1246.9470s driver /1248.7319s parent.
+Gateway OFF,268 prepared tokens, all prepared prompt state retained. It emits
+64 identical get_weather(city=Tokyo) calls and reaches1024 output tokens,
+termination=length / response.status=incomplete. No tool was executed.
+No-tool title case was correctly skipped after this incomplete first result.
+Do not benchmark scalar rollback against this as a usable answer. Cancel
+huihui_direct_factors_captured_shapes_20260908 BEFORE launch; old handoff is
+obsolete. The output loop is NOT a20.8-minute completed workflow or Plex score.
+
+Prefill engine20.403s (last all64-layer progress23.2448s includes bootstrap
+setup); decode1223.1935s; totalengine1244.009s. Native MTP accepts805/863
+proposals,218 target sweeps. High acceptance of repeated output is not useful
+quality. Logical pread1,727,084,250,368B is not physical device traffic.
+True reported Metal2,495,559,892B. Pressure FAIL:616 periodic samples,
+minavailable5,003,902,976B, actualswap55,721,984B /wholeHTTP56,147,968B, net0.
+Native footprint3,283,635,368B/compressed1,338,703,872B. No listed transcoders
+in616samples, not general host-idle/attribution proof. Root/external minima
+17,165,189,120/100,581,871,616B. PIDs36086/36090/36092 gone,server-15 normal
+cleanup. All768 source/start-end/tree/result/log/capture/wire/response hashes
+and independently recomputed checks verified BEFORE source or docs edits.
+Tree6295c2688d7ed891bf51a2e83565157a3508f826bdee31aafc87c1e7efa849c9;
+result5897ee17ef9feec93fa0c51e68f9011fa1e235c7e75bc17dfa59ac96b083376d;
+parentlogbc6b82f03ad2352418bb7a51c9ab0fdc269fe4b07dd2b1bfce1b006a1746d61e;
+server537ff6f983ca900bd325fe76ffc52a7334baa7e58301b30d30bea1277940577c;
+preflight63c34559d2e09bda771cf7b6694235d4482a5c1392c2f8078608a04c3cf423e9;
+response522346f10ca38d3d1d28b687e28fd90c648e3f797f85777621bf4d5c0bae3752.
+Raw token5592c9c8.../text25f52430... and prepareda9d130d9... hashes retained.
+
+Read-only diagnosis found a concrete protocol disagreement: dense qwen3_5's
+released template instructs nested XML function/parameter calls, while the
+existing auto constraint enforces Hermes JSON. The MoE fast path already
+aligns prompt/history with Hermes; dense does not. This is evidence of an
+inconsistent input contract, NOT yet proof it caused the observed repetition.
+New explicit VMODEL_QWEN35_DENSE_HERMES_TOOLS=1 and
+huihui-qwen38-27b-direct-hermes-audit reuse that existing renderer only for
+dense fast-mode tools. Default0, lossless rendering, no-tool requests and
+other model families stay unchanged. Strict0/1 parsing. No stop-token hack,
+call deduplication, forced single-call grammar or sampling change.
+Prompt protocol changes; this is not released-template/BF16 lossless.
+
+547 pure server/phase/provenance tests PASS3.58s; all121 profiles validate.
+Tests cover dense default/opt-in, fast-long, untouched lossless/MoE/unrelated
+paths, history consistency, input/schema immutability, no-tool cache identity
+and invalid flags. New real greedy small-capture diagnostic is next, with its
+own fresh preflight and unchanged1024 allowance. No speed win yet.
+If naturally correct, compare scalar rollback on the corrected same-source
+profile before full Plex and heterogeneous real traffic. No default promotion.
+
+Research checked the [official Qwen3.8 model card](https://huggingface.co/Qwen/Qwen3.8-27B):
+non-thinking recommendations are temp0.7/top-p0.8/top-k20/presence1.5;
+the current runtime does not implement presence penalties. A
+[separate AWQ derivative author](https://huggingface.co/twolven/Qwen3.8-27B-abliterated-AWQ-MTP)
+reports greedy repetition and a small repetition penalty. This is only a
+possible separate sampling diagnostic, not evidence about our MXFP4 target,
+not an implemented sampling fix and not permission to silently alter requests.
+
 ## 2026-09-08 UTC: short Huihui control exposes capped hidden gateway; stale factor comparison cancelled
 
 Post-fix validation on249debb:532 pure phase/provenance/server/profile tests

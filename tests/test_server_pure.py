@@ -1136,6 +1136,74 @@ def test_fast_qwen35_tool_history_uses_one_canonical_hermes_prefix(tmp_path):
     assert followup.startswith(str(first) + canonical_call)
 
 
+@pytest.mark.parametrize('model_type,mode,flag,canonical', [
+    ('qwen3_5', 'fast', None, False),
+    ('qwen3_5', 'fast', '0', False),
+    ('qwen3_5', 'fast', '1', True),
+    ('qwen3_5', 'fast-long', '1', True),
+    ('qwen3_5', 'lossless', '1', False),
+    ('qwen3_5_moe', 'fast', '0', True),
+    ('qwen3_5_moe', 'fast', '1', True),
+    ('qwen3_5_moe', 'lossless', '1', False),
+    ('llama', 'fast', '1', False),
+])
+def test_dense_hermes_protocol_is_explicit_and_family_scoped(
+        tmp_path, monkeypatch, model_type, mode, flag, canonical):
+    monkeypatch.delenv('VMODEL_QWEN35_DENSE_HERMES_TOOLS', raising=False)
+    if flag is not None:
+        monkeypatch.setenv('VMODEL_QWEN35_DENSE_HERMES_TOOLS', flag)
+    # The released Qwen template chooses its nested-XML instructions and
+    # historical call rendering only when native tools/calls are supplied.
+    (tmp_path / 'chat_template.jinja').write_text(
+        '{% if tools %}<function=native_xml>{% endif %}'
+        '{% for message in messages %}{{ message.role }}={{ message.content or "" }}|'
+        '{% for call in message.tool_calls or [] %}NATIVE={{ call.function.name }}{% endfor %}'
+        '{% endfor %}{% if add_generation_prompt %}assistant={% endif %}')
+    engine = _fake_engine(model_type=model_type)
+    tool = _named_tool('inventory_lookup')
+    messages = [{'role': 'user', 'content': 'Look up the item.'},
+        {'role': 'assistant', 'content': None, 'tool_calls': [{
+            'id': 'inventory_call', 'type': 'function', 'function': {
+                'name': 'inventory_lookup', 'arguments': '{"value":"item-42"}'}}]},
+        {'role': 'tool', 'tool_call_id': 'inventory_call', 'content': '{"count":3}'}]
+    before = json.dumps([messages, tool], sort_keys=True)
+    prompt, _, _, response_tools, metadata = _prepare_chat_prompt(
+        engine, tmp_path, messages, 'low', [tool], [tool], mode, 1024)
+    assert metadata['tool_protocol_profile'] == (
+        'canonical-hermes-v1' if canonical else 'released')
+    assert ('<function=native_xml>' not in prompt) is canonical
+    assert ('NATIVE=' not in prompt) is canonical
+    if canonical:
+        assert '<tool_call>{"name": "inventory_lookup", "arguments": {"value": "item-42"}}</tool_call>' in prompt
+    assert response_tools == [tool]
+    assert json.dumps([messages, tool], sort_keys=True) == before
+
+
+@pytest.mark.parametrize('flag', ['', 'true', 'false', '2', '-1'])
+def test_dense_hermes_protocol_flag_rejects_typos(tmp_path, monkeypatch, flag):
+    monkeypatch.setenv('VMODEL_QWEN35_DENSE_HERMES_TOOLS', flag)
+    with pytest.raises(RequestValidationError, match='must be 0 or 1'):
+        _prepare_chat_prompt(_fake_engine(model_type='qwen3_5'), tmp_path,
+            [{'role': 'user', 'content': 'Hello'}], 'low', [], [], 'fast', 1024)
+
+
+def test_dense_hermes_no_tool_prompt_and_existing_token_cache_unchanged(tmp_path, monkeypatch):
+    (tmp_path / 'chat_template.jinja').write_text(
+        '{% for message in messages %}{{ message.content }}{% endfor %}')
+    engine = _fake_engine(model_type='qwen3_5')
+    engine.tokenizer = _CountingCharTokenizer()
+    args = (engine, tmp_path, [{'role': 'user', 'content': 'x' * 1500}],
+            'low', [], [], 'fast', 1024)
+    monkeypatch.setenv('VMODEL_QWEN35_DENSE_HERMES_TOOLS', '0')
+    first = _prepare_chat_prompt(*args)
+    monkeypatch.setenv('VMODEL_QWEN35_DENSE_HERMES_TOOLS', '1')
+    second = _prepare_chat_prompt(*args)
+    assert first[0].token_ids == second[0].token_ids
+    assert second[4]['tool_protocol_profile'] == 'released'
+    assert second[4]['prompt_token_cache_hit'] == 1
+    assert engine.tokenizer.calls == 1
+
+
 def test_native_template_bos_token_concatenation_does_not_raise():
     # Groq's real Llama-3-Groq-8B-Tool-Use chat_template.jinja does exactly
     # this: `{% set content = bos_token + content %}` for the first message

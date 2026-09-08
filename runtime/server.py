@@ -9306,8 +9306,18 @@ def _prepare_chat_prompt(engine, model_dir: Path, messages: list[dict], reasonin
     effective_enable_thinking = enable_thinking
     if effective_enable_thinking is None and fast_mode:
         effective_enable_thinking = False
-    canonical_hermes_tools = bool(
-        compact_json and engine.cfg.model_type == "qwen3_5_moe")
+    dense_hermes = os.environ.get(
+        "VMODEL_QWEN35_DENSE_HERMES_TOOLS", "0").strip()
+    if dense_hermes not in ("0", "1"):
+        raise RequestValidationError(
+            "VMODEL_QWEN35_DENSE_HERMES_TOOLS must be 0 or 1")
+    # Dense Qwen3.8 also ships a nested-XML tool template, whereas our
+    # constraint emits Hermes JSON. Test matching the prompt/history to that
+    # constraint explicitly; do not promote a changed prompt from one capture.
+    # Released/lossless rendering and the established MoE path stay unchanged.
+    canonical_hermes_tools = bool(compact_json and (
+        engine.cfg.model_type == "qwen3_5_moe"
+        or (engine.cfg.model_type == "qwen3_5" and dense_hermes == "1")))
     prompt = _chat_prompt(
         engine, model_dir, messages, reasoning, tools=prompt_tools,
         compact_json=compact_json,
