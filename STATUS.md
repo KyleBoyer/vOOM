@@ -1,5 +1,92 @@
 # STATUS — 2026-09-08 UTC (current corrections first; dated chronology below is history)
 
+## 2026-09-08 UTC: full top-up replay completes five HTTPs but fails workflow and pressure
+
+`huihui_plex_serial_kv_topup_20260908`, clean/pushed
+a89331f9a3cbd0a7296e540735705c0fd6bda39d, is independently verified **FAIL**.
+Driver2401.6232s /parent2403.5044s (about40min), not under90s.
+Original178616B/134-tool capture; first wire178694B. ONLY the prior
+model/max1024/temp0/seed64013 request overrides, all original tools/input and
+unchanged synthetic mixed two-page responses. Same full-prepared-state explicit
+MXFP4/reassociated-prefill/Hermes/gateway profile; only runtime setting added
+versus the one-pass control is the top-up flag. Driver now aborts at the first
+memory retry (the previous full run allowed retries); no retries occurred.
+This is not live Plex, released BF16, or full-schema model computation:
+the gateway still compacts the prepared model prompts.
+
+| HTTP | Wall s | Hidden prompt/output | Public prompt/output |
+|---|---:|---:|---:|
+| 1 | 487.1100 | 4767/41 | 5599/67 |
+| 2 | 443.0873 | 5046/16 | 5878/56 |
+| 3 | 460.7380 | 5317/17 | 6252/55 |
+| 4 | 490.7867 | 5587/17 | 6522/58 |
+| 5 | 519.4935 | 5860/17 | 6795/57 |
+
+All10 model phases naturally terminate via grammar under max1024 (the16-token
+hidden result is natural, NOT a16-token limit);401 raw generated tokens total.
+Every HTTP returns one model-authored tool call. First/all@0, movie@0, show@0,
+movie@500, show@500 exhaust the unchanged four-handled-round budget: the fifth
+call remains UNHANDLED, final answer/reasoning are EMPTY. No completed-answer
+Plex score exists. The archived field `final_plex_score=68` is only legacy
+partial rubric accounting:53 planning points plus15 vacuous exclusion points
+for empty text, zero eligible-title points. Completion and quality gates both
+FAIL; never promote68 to an intelligence score. The rubric also assumes one
+globally increasing offset and the fixed mixed-page queue is not independent
+movie/show pagination; preserve those known fixture limitations separately
+from the actual absent final answer. No extra rounds or edited pages were
+silently substituted, and all five reconstructed request shapes/hashes verify.
+
+There are ZERO raw admission refusals, prefill retries, serial recovery or
+top-up events. All phases/final timings explicitly report empty recovery traces
+and top-up-enabled=1. Thus the previously failing continuation now completes,
+but the unused top-up cannot explain this; host/cache conditions are uncontrolled.
+First HTTP complete prepared/raw token/text witnesses match the previous one-pass
+full run exactly. Subsequent continuations are new model generations, not A/B
+token-equivalence proof. All complete state/path witnesses pass; no independent
+whole-model recurrent-state oracle is inferred from them.
+
+Prefill sums1407.0834s across ten phases; decode989.6467s. Logical weight reads
+2,067,739,515,008B are NOT physical disk bytes. Maximum phase Metal peak
+2,018,982,124B;1187 native/known-transcoder samples, minimum available
+5,308,252,160B, max footprint2,754,906,704B/compressed895,188,992B.
+Whole HTTP AND periodic swap-out83,132,416B, net growth0: strict performance
+pressure FAIL, despite no runtime admission failure. Firsttwo HTTP swap-out
+checks fail, latterthree pass individually. Known-transcoder absence is not
+general host-idle or per-process swap attribution. Fresh30.0400s preflight
+passed with available7.2147 ->7.3545GB and zero preceding-window swap churn.
+Root/external free minima21,416,407,040B/100,235,468,800B; internal tier
+62,512,074,752B. User apps/data, reserves and KV budgets unchanged.
+
+All791 start/end/fresh source manifests, config/model/capture/wire/reference/
+five response+progress identities, every acceptance check and full unchanged
+fixture replay verified BEFORE edits. Pure replay of the five immutable responses
+reconstructed every request and reproduced the ENTIRE fixture result/rubric;
+no HTTP/model/tool execution or answer rendering in verification.
+PIDs62191/62195/62197 gone; session99066 drained exit1, server-15 normal cleanup.
+No model job remains. Tree
+1e895fca4178db9c7554bba64539ee627b5d693563c63aa741f79bcaea02618e;
+result1649a382113ab67473b66ff3132998d6ee307130a91619e85e6b780989491c51;
+receipt7a5373e77dc56a9c955385db10f446550303ffacc209c9eb4be80086267f9e9a;
+log9f5d8846e863104ed817eeb2da46bc36bbe540cc016f7806bc250eac8b610962;
+server92396308bff5b96cf7462e85a4f5bd4e173ca02c221648ed260c49b033ebacaf;
+preflight075054ed30512f4e6ba68cbc4a21707d988b60674677c00e764248f55c3ecc5d.
+
+After verification, corrected REPORTING ONLY: the full driver retains unchanged
+rubric points in `plex_rubric_score`, and `final_plex_score` stays null unless
+the workflow completion gate passes. A completed but wrong answer may still
+receive its actual low grade; pending tool calls or empty terminal text cannot.
+Archived results are untouched. Three new pure cases reproduce the five-call68
+trap, empty terminal output and completed-but-wrong answer; selected strict
+no-real-MLX suite525 PASS11.94s,127 profiles validate. No serving/profile/default
+or fixture page, round-budget, rubric-weight or model change in this correction.
+
+Next credible work: inspect terminal/tool-loop behavior using a separately labeled
+hash-pinned continuation diagnostic (not silently increasing the legacy budget),
+and investigate exact repeated-prefill reuse with whole-state and request-identity
+gates. Do not blindly rerun the40min workflow or tune KV top-up: it never fired.
+Full-answer quality, heterogeneous functions/long context and under90s stay OPEN.
+
+
 ## 2026-09-08 UTC: top-up option passes short real captures; full-workflow test is next
 
 `huihui_serial_kv_topup_short_20260908` on clean/pushed

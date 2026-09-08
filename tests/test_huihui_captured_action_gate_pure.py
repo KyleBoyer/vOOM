@@ -305,6 +305,7 @@ def test_workflow_preserves_requests_scores_unchanged_and_saves_each_response(tm
     assert plex._post is original_post
     assert len(wires) == 3 and not document['failures']
     assert document['final_plex_score'] == 100
+    assert document['plex_rubric_score'] == 100
     assert document['plex']['completion']['passed']
     assert document['plex']['tool_results_source'] == 'synthetic_two_page_fixture'
     for receipt, response in zip(document['workflow_http'], responses):
@@ -489,3 +490,46 @@ def test_quality_retry_mode_can_score_completion_without_passing_latency_gate(tm
     assert len(wires) == 3 and document['final_plex_score'] == 100
     assert document['plex']['completion']['passed']
     assert document['failures'] == ['turn1:no_retry']
+
+
+def test_tool_round_limit_preserves_partial_rubric_but_never_a_final_score(tmp_path, monkeypatch):
+    request, config, responses, wires = workflow_setup(tmp_path, monkeypatch)
+    template = copy.deepcopy(responses[0])
+    responses.clear()
+    for index, (kind, offset) in enumerate((('all', 0), ('movie', 0),
+            ('show', 0), ('movie', 500), ('show', 500))):
+        args = dict(mediaType=kind, ratingOperator='lte', limit=500, offset=offset)
+        if kind == 'all':
+            args.update(movieRatingValue='PG-13', showRatingValue='TV-Y7')
+        else:
+            args['ratingValue'] = 'PG-13' if kind == 'movie' else 'TV-Y7'
+        response = copy.deepcopy(template)
+        response['output'] = [dict(call(args), call_id=f'budget-{index}')]
+        responses.append(response)
+    document = dict(failures=[])
+    gate.run_plex_workflow(config, request, document)
+    assert len(wires) == 5 and len(document['workflow_http']) == 5
+    assert document['plex']['protocol_failures'] == [dict(turn=5, reason='tool_round_limit')]
+    assert document['plex']['completion']['unhandled_call_turns'] == [5]
+    assert document['plex']['final_text'] == ''
+    assert document['plex_rubric_score'] == document['plex']['rubric']['score'] == 68
+    assert document['plex']['rubric']['exclusion_points'] == 15
+    assert document['final_plex_score'] is None
+    assert document['failures'] == ['completed_plex_quality_or_protocol']
+
+
+@pytest.mark.parametrize('final_text', ['', 'ALPHA_G'])
+def test_final_score_requires_completion_not_a_passing_rubric(tmp_path, monkeypatch, final_text):
+    request, config, responses, wires = workflow_setup(tmp_path, monkeypatch)
+    responses[-1]['output'][0]['content'][0]['text'] = final_text
+    document = dict(failures=[])
+    gate.run_plex_workflow(config, request, document)
+    assert len(wires) == 3 and document['failures'] == ['completed_plex_quality_or_protocol']
+    assert document['plex']['rubric']['passed'] is False
+    assert document['plex_rubric_score'] == document['plex']['rubric']['score']
+    if final_text:
+        assert document['plex']['completion']['passed'] is True
+        assert document['final_plex_score'] == document['plex_rubric_score']
+    else:
+        assert document['plex']['completion']['passed'] is False
+        assert document['final_plex_score'] is None

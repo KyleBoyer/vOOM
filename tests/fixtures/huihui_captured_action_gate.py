@@ -227,7 +227,12 @@ report those independently of actual final-title errors, never repair a score.
         result = plex.run_profile(request, f'http://127.0.0.1:{config["port"]}/v1/responses',
             timeout=1800, max_tool_rounds=4)
     document['plex'] = result
-    document['final_plex_score'] = result['rubric']['score']
+    # Planning points (and vacuous exclusion points on empty text) are not
+    # a completed-answer grade. Retain the unchanged rubric diagnostically,
+    # but never label it final while tool calls or the final answer are pending.
+    document['plex_rubric_score'] = result['rubric']['score']
+    document['final_plex_score'] = (result['rubric']['score']
+        if result.get('completion', {}).get('passed') is True else None)
     if not result['passed']:
         document['failures'].append('completed_plex_quality_or_protocol')
     for receipt in receipts:
