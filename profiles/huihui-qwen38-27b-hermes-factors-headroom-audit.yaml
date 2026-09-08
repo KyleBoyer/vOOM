@@ -1,0 +1,11 @@
+schema: voom.runtime-profile.v1
+name: huihui-qwen38-27b-hermes-factors-headroom-audit
+description: Explicit compact-rollback Huihui diagnostic with a stricter live memory reserve.
+notes:
+  - "Changes only the live available-memory floor from5300 to5600MB versus the direct Hermes scalar-factor combination. This adds300MB admission headroom after that combination briefly fell below the unchanged5300MB performance gate during serial verification. It does not weaken a governor or acceptance threshold."
+  - "Preserves quantized target, all prepared prompt state, native scalar rollback, output allowance, sampling and explicit Hermes protocol. No default, speed, pressure or Plex-quality claim until measured. May reduce cache and fail slower or refuse admission."
+extends:
+  - huihui-qwen38-27b-full-state-direct-factors-audit
+  - huihui-qwen38-27b-direct-hermes-audit
+settings:
+  VMODEL_QWEN35_MIN_AVAILABLE_MB: 5600

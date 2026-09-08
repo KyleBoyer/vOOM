@@ -1204,6 +1204,20 @@ def test_dense_hermes_no_tool_prompt_and_existing_token_cache_unchanged(tmp_path
     assert engine.tokenizer.calls == 1
 
 
+def test_huihui_headroom_profile_changes_only_live_reserve():
+    from runtime.profiles import apply_runtime_profiles
+
+    common = ['generation-witness', 'host-activity-witness']
+    before, after = {}, {}
+    apply_runtime_profiles(['huihui-qwen38-27b-full-state-direct-factors-audit',
+        'huihui-qwen38-27b-direct-hermes-audit', *common], environ=before)
+    apply_runtime_profiles(['huihui-qwen38-27b-hermes-factors-headroom-audit',
+        *common], environ=after)
+    difference = {key: (before.get(key), after.get(key))
+        for key in before.keys() | after.keys() if before.get(key) != after.get(key)}
+    assert difference == {'VMODEL_QWEN35_MIN_AVAILABLE_MB': ('5300', '5600')}
+
+
 def test_native_template_bos_token_concatenation_does_not_raise():
     # Groq's real Llama-3-Groq-8B-Tool-Use chat_template.jinja does exactly
     # this: `{% set content = bos_token + content %}` for the first message

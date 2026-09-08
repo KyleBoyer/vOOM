@@ -1,5 +1,63 @@
 # STATUS — 2026-09-08 UTC (current corrections first; dated chronology below is history)
 
+## 2026-09-08 UTC: Hermes stops short-capture loop; real scalar rollback preserves all tokens
+
+Two fresh-process short-corpus runs on SAME source d158636069a91082c93ab03af112f817a76be93b.
+Original captures/tools/input/stream/reasoning; only model/max1024/temp0/
+seed64013 wire overrides. Explicit Hermes prompt transform:111-token weather
+prompt, not the268-token released-XML-instruction control. No host actions,
+deduplication, prompt-cache reuse or generated-tool execution. OS page-cache
+state uncontrolled. Both runs naturally complete all phases, not capped.
+This is quantized MXFP4/reassociated prefill, not released-BF16 lossless,
+a full134-tool replay, a live Plex session or a new Plex score.
+
+Dense endpoints: huihui_direct_hermes_captured_shapes_20260908.
+Weather42.4432s HTTP,23 raw tokens,one correct get_weather(city=Tokyo), observed
+grammar termination with no decoder-rejection warning. Title17.6324s,2tokens,
+Node,EOS. Driver60.4276s,parent62.4053s. Weather prefill13.174s/decode26.4166s;
+title prefill10.391s/decode7.1673s. Weather logicalstore80.06GB. This repairs
+the tested looping behavior relative to the1246.593s capped negative, but
+is NOT a same-prompt29x optimization or broad quality claim.
+True Metal2,561,312,020/2,038,066,580B. Pressure-onlyFAIL min5,225,562,112B;
+29samples,periodicswap4,341,760B/wholeHTTP4,358,144B,net0. Lowest sample is in
+title serial verification,56.739s after first memory sample. No transcoders
+observed, not general host-idle proof. Native footprint3,125,283,984B.
+Result7aa50e8a15b99e43c4556bc958bd23c66fd42c0b19af694c1ec0c7291b2171f9;
+parentlog799235c431b8f3d41dc55fc4457f62fdf4ed00cb130bd9fb58e47fb4bf223862;
+server892f6cbdf46da2c8e31ec8ac5584cdb382e723c3a09febc07e5dc97d976a05d0;
+preflight1ee2f95610b1f0e817c9bcae2f9888475e8e687c262709ac5d716670f785880e.
+
+Scalar factors: huihui_direct_hermes_factors_captured_shapes_20260908.
+Changes ONLY VMODEL_QWEN_MTP_COMPACT_KDA_ROLLBACK=1. Every phase's actual
+prompt IDs,23/2 raw generated IDs,text,budget and termination matches control;
+protocol output/canonical tool arguments also match. Weather49.9217s,title
+14.7932s,driver65.0663s,parent67.5203s: NOT an overall speed win.
+Actual factor rounds5/1,restores3/1,26,634,240B factor peak+153,944,064B base
+logical storage, restore0.359467s/0.037612s. True Metal2,556,997,676/
+1,472,994,600B. Title Metal falls27.7%, weather essentially unchanged; avoid
+attributing whole-RAM changes to one allocation. Native footprint2,554,923,816B.
+Pressure-onlyFAIL min5,130,682,368B at20.378s/serial-verify-layer-page;
+31samples,periodicswap3,932,160B/wholeHTTP4,243,456B,net0. No observed transcoders.
+Result2d6708c5333d290a01cc55f1a8601844b03744153e5ac3653c03d5fdc23b3065;
+parentlogdafbf4bad2301b7470e3a44cd7eeea816ca36f02a39606594fdc52e98cbe5033;
+server1749bb3bb56bd16ba489df7cac5a4c6fa56ee8faf8860e28d93e57f2f51b1ef8;
+preflightdb08644a3cafe21142acabd12b7708aef72b9df2f656a415727e9593dc55a5e8.
+
+Both runs'769 source/start/end files,all receipts/reference/wire/response
+hashes and recomputed phase checks verified BEFORE these edits; all owned
+PIDs gone. SAME treefe94b5f4dd07f4e7c1af4c61eb25965a1137c656cd96b09d96fcb23c8ae56cbe.
+Combined root/external minima17,176,219,648/100,583,444,480B,fasttier unchanged.
+Scalar replay now has real-model short-shape exactness evidence, still not
+released-BF16/broad-corpus proof or a default.
+
+Next bounded run uses huihui-qwen38-27b-hermes-factors-headroom-audit:
+only the live available-memory floor rises5300->5600MB, adding300MB admission
+headroom. Acceptance stays>=5300MB and all previous gates remain mandatory.
+Content-blind safety/resource adjustment; may reduce cache or refuse admission.
+No smaller output allowance, representation or sampling change. Verify same
+real raw IDs against the completed scalar reference. Full Plex/held-out
+larger catalogs follow only after this short-path memory qualification.
+
 ## 2026-09-08 UTC: direct Huihui greedy control repeats64 calls; protocol-consistency test next
 
 Focus remains Huihui Qwen3.8-27B-abliterated; Flash Next/GLM are deferred.
