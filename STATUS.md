@@ -1,5 +1,41 @@
 # STATUS — 2026-09-08 UTC (current corrections first; dated chronology below is history)
 
+## 2026-09-08 UTC: stricter Huihui headroom refuses prefill; retry reporting repaired
+
+huihui_direct_hermes_factors_headroom_20260908,sourcefd97d6775507547712c396e0372dd0c78b83277a,
+FAIL: HTTP9.831s/driver10.2706s/parent12.6648s, no terminal model response.
+The benchmark stops on an observed prefill retry, NOT successful completion.
+Full allowance1024, unchanged capture/sampling/scalar/Hermes path; only live
+admission floor rises5300->5600MB. Fresh30.0312s preflightPASS, zero churn,
+but available6.913GB versus prior scalar arm7.792GB: do not attribute the
+difference in outcome solely to that profile change or compare as speed.
+
+At layer27/64 then retry, governor refuses qwen-prefill-layer-page:
+active0.80GB+incoming0.21GB+margin0.40GB projected1.40GB exceeds1.38GB ceiling,
+available6.18GB. Runtime proposes chunk32; fail-fast benchmark aborts and
+owned server cleans up. No floor weakened, model/app killed broadly or data
+deleted. Next diagnosis is whether this prefill page's generic400MB margin
+is warranted by actual quantized-page and compute lifetimes; do NOT blindly
+remove it, transfer decode-only proof or raise cache admission.
+Stricter profile remains explicit/unqualified; no full Plex run launched.
+
+Periodic pressure during this INCOMPLETE prefix passes4samples,min5.861GB,
+0.688MB swap/net0, no known transcoders. That is not full-request pressure proof.
+All770 source/start-end/tree/receipt/log/preflight/wire/reference identities
+verified BEFORE edits; PIDs44149/44153/44155 gone. Root/external minima
+17,189,662,720/100,582,445,056B.
+Tree5dc06f1a0b3bfd637bf7d8290506268b0fb2b1f2168e0cd0098c1c1a45c832a6;
+resultd957265137f29db032fad8a3df9b4a73518d088323908ba8b64f5a165f8ba74b;
+loga8f372949cbb9901e883d6e65a7b7f810d22ea469c4acc5bd51fae6596cafd45;
+serverecd2631a788525057bd6eab5b57dcbd99f307399075e5c9b9b80c8bdaadc32e2;
+preflightc11ea6723acda5f56688c4aae38ef233b4a9cca2ac2d8df9fc02d7f35f198b21.
+
+The overall gate correctly failed, but its no_retry subcheck incorrectly
+passed when aborted HTTP had no terminal timing. It now also checks the
+explicit abort flag, abort error and observed memory_retry progress events,
+matching the existing Plex gate. Three pure regressions cover those sources.
+This changes only reporting/acceptance, not runtime admission or output.
+
 ## 2026-09-08 UTC: Hermes stops short-capture loop; real scalar rollback preserves all tokens
 
 Two fresh-process short-corpus runs on SAME source d158636069a91082c93ab03af112f817a76be93b.

@@ -135,7 +135,11 @@ def row_checks(row, response, case, config):
             and row.get('runtime_profile_digest') == config['profile_digest']
             and not row.get('runtime_profile_overrides'),
         backend=row.get('backend') == 'voom',
-        no_retry=int(t.get('memory_prefill_retries') or 0) == 0,
+        no_retry=not row.get('aborted_on_memory_retry')
+            and row.get('error') != 'aborted_on_memory_retry'
+            and not any(event.get('phase') == 'memory_retry'
+                for event in row.get('prefill_progress', []) if isinstance(event, dict))
+            and int(t.get('memory_prefill_retries') or 0) == 0,
         metal=type(t.get('true_peak_metal_bytes')) in (int, float)
             and 0 < t['true_peak_metal_bytes'] <= 8_500_000_000,
         terminal_available=after['available_bytes'] >= 5_300_000_000,

@@ -110,6 +110,20 @@ def test_cap_or_empty_response_is_not_a_completed_answer_pass(tokens):
     assert not checks['sufficient_actual_output']
 
 
+@pytest.mark.parametrize('change', [
+    {'aborted_on_memory_retry': True},
+    {'error': 'aborted_on_memory_retry'},
+    {'prefill_progress': [{'phase': 'memory_retry', 'attempt': 1}]},
+])
+def test_retry_without_terminal_timing_cannot_pass_no_retry(change):
+    row = valid_row()
+    row.update(change)
+    row['timing'] = {}
+    checks = gate.row_checks(row, {}, dict(kind='short_title', topic='node'),
+        dict(profiles=['test'], profile_digest='digest'))
+    assert not checks['no_retry']
+
+
 def test_actual_swap_out_failure_even_when_net_usage_does_not_grow():
     row = valid_row(); row['pressure_after']['swap_out_bytes'] = 16_000_001
     checks = gate.row_checks(row, dict(output=[message('NodeJS Joke')]),
