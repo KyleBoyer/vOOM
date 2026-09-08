@@ -1,5 +1,73 @@
 # STATUS — 2026-09-08 UTC (current corrections first; dated chronology below is history)
 
+## 2026-09-08 UTC: after user app cleanup, unchanged short-capture arm fully passes
+
+The user reports closing extra apps. Without any runtime/profile/floor change,
+`huihui_after_user_app_cleanup_20260908` on
+`c9f6bedea4fe9a1ff28e79cd1d6050d62f41055e` is independently verified **PASS**.
+Only STATUS differs from the preceding measured source82fb125.
+Same explicit MXFP4/reassociated-prefill/Hermes/full-prepared-state/scalar-factor/
+phase-head profile and governor-reclamation overlay. Same original359B/487B
+weather/title captures retain tools/input/stream/reasoning; only
+model/max1024/temp0/seed64013 wire overrides. Not released-BF16, the full134-tool
+harness, Plex, long context or large actual output. Fresh-server first request,
+same-process uncached second; no prompt KV reuse, host execution or answer repair.
+OS file cache and general host activity remain uncontrolled.
+
+Weather **45.6700s** /111 prepared/23 output tokens, natural grammar stop;
+title **15.9324s** /92/2, natural EOS. Both have **zero prefill retries**,
+versus the preceding same-profile51.7099s weather/83.0193s title with two
+title restarts. All24/25 per-case checks pass, with all-phase prepared/raw
+token/text/budget/termination and canonical outputs exactly matching the
+passing source534fd43 reference. This is a successful host-state repeat,
+not an isolated code speedup or a causal measurement of particular closed apps.
+
+Engine first-token12.6536s/10.4041s, prefill12.6523s/10.4039s,
+decode30.2809s/5.4525s, total42.9350s/15.8569s; first-token metrics are
+not wire SSE-TTFT. True Metal2487358508B/1517045224B. Logical weight reads
+84791893312B/27657324544B are not physical disk traffic. MTP17/20 and1/4,
+scalar restoration0.3383444s/0.0457316s. Factor-boundary head release remains
+675430400B on each3/1 partial restoration, matching cache-accounted and
+actual active-memory deltas plus all-phase counters.
+
+All30 periodic pressure/alignment records pass. Minimum available5673222144B,
+native peak3043593360B, compressed674562048B; swap-out4800512B
+(wholeHTTP6144000B), net swap growth0. At the minimum sample17, before/after
+available agree; globally max available delta0, Metal delta540672B and observed
+allocator cache176986128B. Alignment input span<=144500ns,
+post-response delay<=69208ns, observation-through-native span<=318250ns.
+No listed transcoders in16 preflight/30 runtime samples, not general idle proof.
+Fresh30.0384s preflight PASS with zero swap-out; endpoint available6791905280B
+versus the preceding6595592192B, swap used1117257728B versus1539768320B.
+Driver61.9205s / parent64.6279s completes both SMALL requests only, not the
+full captured harness. Root/external free minima21491527680B/100492308480B.
+No apps/data modified by the agent.
+
+All778 source/start-end/fresh-tree, exact unchanged model profile, raw capture/
+wire/reference/response/phase identities, recomputed checks, physical head release,
+aligned timestamp coverage and artifact receipts verified BEFORE edits. No
+retry/refusal diagnostics. Owned45758/45762/45764 gone, server-15 normal cleanup.
+No model job remains. Runtime tests unchanged:840 pure passed for source82fb125.
+
+Next: short pressure/token/head qualification is now satisfied for this profile.
+Use a fresh passing preflight to revisit the full Plex workflow with the existing
+full-workflow lifetime profile (preserve gateway behavior and model-only scoring).
+Do not substitute the short gateway-off profile for the full catalog, shrink
+the output budget, lower the5.6GB reserve/400MB margin, or claim full success
+from these short timings. The page-admission lifetime investigation remains a
+credible robustness lever, but no blind short rerun is needed absent new evidence.
+Full Plex score, full-size/generalization/long-output and under90s remain OPEN.
+
+Tree18bca656d591651010fe29e116d52007d695bcfc9d0b2b9df22ec3f689be4a42;
+result2c75dd1014316f2d9437daffceb1960b04a2102d8b3a7ced5fb2fa5a6076116d;
+receipt5206bb3440495812301511718d57b1191bfdc6f739d672a5286912738a99c325;
+loga829678f20e01cc5f49e487e8f2ef48268aaa3b4443694f3896e7bd460d2b591;
+server6de53efa8bbaa222945a5f4adece9e301515172624962f039b1b11598d2bbe8d;
+preflight60e64c8a8bd48b7b7683f7392894ef47d91ec79312269f8d4332d40837729654;
+weather18d14f9e9d1d75ce36142e5d6aae874d7061ae3766c016b8a9dfdec2e88315af;
+titlee16f7bbc57ea32381a271223e1088334331281e6a9190fc36e853a71666435c7.
+
+
 ## 2026-09-08 UTC: governor alignment is verified; title retries remain the next bottleneck
 
 New explicit `governor-reclamation-witness` overlay on code
