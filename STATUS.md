@@ -1,5 +1,94 @@
 # STATUS — 2026-09-08 UTC (current corrections first; dated chronology below is history)
 
+## 2026-09-08 UTC: full Plex follow-up fails at verifier admission; no final score
+
+`huihui_plex_after_user_app_cleanup_20260908` on
+`d6f371ca38b8328954f378af5904f03017e241fe` is independently verified FAIL.
+First HTTP completes in942.6795s; second fails after1174.9207s at
+serial-verify-transient. Driver2117.9910s / parent2120.0534s (~35.3min) is
+failed-workflow wall, not completed latency or a Plex score. Supervisor exits1
+without timeout/signal/source drift. User app cleanup qualified the short arm
+but did not make this full workflow complete.
+
+Original178616B capture/134 tools/three initial items preserved; only
+model/max1024/temp0/seed64013 wire overrides. The exact model-authored first call
+is plex_list_library_media(all, ratings<=PG-13/TV-Y7, limit500, offset0).
+The second request's134 tools/five items are independently reconstructed from
+that exact saved call plus the unchanged first synthetic mixed page. No live
+tools, host routing/rendering/argument repair or prompt KV reuse. Same existing
+full-workflow lifetime profile, explicit MXFP4/reassociated prefill/Hermes and
+gateway compaction, not a full49K prepared prompt or released-BF16 replay.
+The fixed legacy two-page rubric remains unchanged; no final answer means no
+model-only score, even though the first listing action is structurally valid.
+
+First hidden/public prepared lengths4767/5599, outputs41/67, both naturally
+grammar-terminated under actual1024 budgets. All-phase raw/prepared token,
+text/budget/termination identities match the same full profile's source35a0981
+first response. Both phases pass full-state, BF16 paged256MB, actual scalar/
+head-lifetime and model-authorship checks. Each phase physically releases
+675430400B on each10 partial restorations, matching cache accounting:
+the factor-boundary fix now has positive full-workflow first-response evidence.
+This is cumulative release, not13.5GB unique memory saved or a completed score.
+
+First HTTP still fails no_retry and actual_swap_out: two execution-prefill
+restarts128 ->32 ->8 at layers56/54. The next hidden5046-token prefill retries
+8 ->1 at layer13. Every refusal requests213873879B page + unchanged400MB
+margin with only about555..594MB available above the5.6GB reserve. The tiny
+remaining weight cache cannot provide the deficit. Whole-page safety margins
+must not be reduced merely because learned compute scratch is smaller.
+
+First hidden phase prefill102.2059s/decode89.2428s/total191.4511s; public
+prefill616.1683s/decode131.9402s/total748.4754s, including retry work.
+Combined first-token807.9308s is the exposed engine timing, not wire SSE-TTFT.
+Phase Metal peaks2786879736B/1319781452B; logical weight reads214510721216B/
+296381146048B, not physical disk traffic. Public MTP49/69, target weight wait
+72.5726s, draft rounds2.9833s. Faster drafting alone cannot remove the repeated
+prefill or target-admission failures.
+
+The failure-only serial diagnostic now fires on REAL traffic: layer27,
+full_attention+dense, five verifier positions at offset5046. Selected scratch
+366180688B is also the learned value with486 matching observations; margin0,
+not an uncalibrated conservative fallback. At refusal, available5828460544B
+leaves228460544B above the reserve, ~137.72MB short. Active693727656B,
+allocator cache0, weight cache resident10240B; target PagedKVCache logical
+resident255320064B (budget256000000B). Native footprint1681180856B,
+compressed605257728B; these overlapping views do not identify physical ownership.
+The later wrapper's540672B history-KV counter is not target KV residency.
+
+Whole-run pressure FAIL for56328192B actual swap-out, net growth0; available
+minimum5457199104B passes the5.3GB threshold.1048 native records,
+peak footprint4784771104B/compressed939491328B; known-transcoder inventory
+16 preflight/1048 runtime samples PASS, not general idle proof. Fresh30.0303s
+preflight PASS, zero preceding-window swap growth/churn. Root/external free
+minima21510754304B/100374265856B. No user apps/data touched.
+All778 source/start-end/fresh-tree, metadata/capture/wire/continuation hashes,
+responses/progress prefixes, recomputed acceptance, old first-response token
+identity, actual factor-head releases and refusal/artifact receipts verified
+BEFORE edits. Owned46267/46271/46273 gone; server-15 normal cleanup. No job running.
+
+Next: no unchanged full rerun. Investigate lossless pressure-triggered reclamation
+of closed target KV pages before serial compute. Current PagedKVCache only
+enforces its fixed budget after append, while governor reserve sheds weight
+cache only; the observed255MB KV residency is a candidate, not a demonstrated
+137MB physical saving. Preserve tails/current-layer needs, exact page bytes,
+offsets/rollback and full attention math; require real physical release,
+spill/reload and token/state equivalence tests before model evaluation.
+Do not lower the5.6GB reserve,400MB page margin or fixed256MB policy to bypass
+proof. Page-admission lifetime/sizing remains a separate prefill bottleneck.
+Full Plex, long-context/output/generalization and under90s remain OPEN.
+
+Tree6a3f23bdb42213421383996e865bb94c03c97b91d25622eabdc9184f5be1844c;
+resultba0c4f3ec5696dc5e71eaa654d8c409c4365d0fb1000d1afb2920baf22eff5da;
+receipt16a918971b364bebde396c9f975f1b6e1444f09e08444d87def35fafec252c73;
+log4e9388dbd23b1b1beb92375fba672a41329e85e8a90d1ebc3e6e225c61b4fcfb;
+server7630fd4e611a9dbfed9c977111726f309d8ab11e3e10ab4312ee89e97cc47423;
+preflight1d743cdd955916a25337b558a6adbd453bfa2a2f2883a48e411467ade663071c;
+responses a398af30476e67cd0eb0da0c8d57e8cb7e61975fce8493ed31ddc9181329c021 /
+bc5304f2680ad373811f4ca5902af59daeaf8c1445751730a11606be3a940890;
+progress b7f469fd2b2107f596b39b8ee8f261d5b42da04f457782d9a1f56f50fc99acf3 /
+57dd1720802e6a1b7018d11e04b67a945aa2fed614f7b242aa104d332af2a88d.
+
+
 ## 2026-09-08 UTC: after user app cleanup, unchanged short-capture arm fully passes
 
 The user reports closing extra apps. Without any runtime/profile/floor change,
