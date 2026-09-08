@@ -319,6 +319,69 @@ def test_workflow_preserves_requests_scores_unchanged_and_saves_each_response(tm
         assert progress['turns'] == document['workflow_http'][:index]
 
 
+def test_serial_recovery_overlay_is_single_setting_and_keeps_full_workflow_contract():
+    base, candidate = {}, {}
+    profiles = ['huihui-qwen38-27b-full-workflow-lifetime-audit',
+                'generation-witness', 'host-activity-witness']
+    apply_runtime_profiles(profiles, environ=base)
+    apply_runtime_profiles(profiles + ['qwen35-serial-kv-reclaim'], environ=candidate)
+    assert candidate == {**base, 'VMODEL_QWEN35_SERIAL_KV_RECLAIM': '1'}
+
+
+@pytest.mark.parametrize('bad', [None, 'hidden', 'final'])
+def test_serial_recovery_gate_preserves_receipts_before_continuing_or_stopping(tmp_path, monkeypatch, bad):
+    from tests.test_qwen_kv_reclaim_witness_pure import response as recovery_response, trace, log, record
+    request, config, responses, wires = workflow_setup(tmp_path, monkeypatch)
+    config.update(require_serial_kv_reclaim=True, serial_kv_budget_bytes=256_000_000,
+                  workflow='plex', server_log=str(tmp_path/'server.log'))
+    for response in responses:
+        response.update(recovery_response(trace(), {}))
+    if bad == 'hidden':
+        responses[0]['vmodel_cache_phases'][0].pop('qwen35_serial_kv_reclaim')
+    elif bad == 'final':
+        responses[0]['vmodel_timing']['qwen35_serial_kv_reclaim'] = trace()
+    post = gate._post
+    def traced(*args, **kwargs):
+        value = post(*args, **kwargs)
+        value['timing'].update(responses[len(wires)-1]['vmodel_timing'])
+        return value
+    monkeypatch.setattr(gate, '_post', traced)
+    document = dict(failures=[])
+    if bad is None:
+        gate.run_plex_workflow(config, request, document)
+        assert len(wires) == 3 and not document['failures']
+        assert document['final_plex_score'] == 100  # mocked answers; not a model score
+        Path(config['server_log']).write_text(log(*[record() for _ in responses]))
+        covered = gate.serial_recovery_coverage(config, document)
+        assert covered['passed'] and covered['phase_attempts'] == 3
+        Path(document['workflow_http'][0]['response_path']).write_text('{}')
+        assert not gate.serial_recovery_coverage(config, document)['passed']
+    else:
+        with pytest.raises(RuntimeError, match='serial KV recovery witness'):
+            gate.run_plex_workflow(config, request, document)
+        assert len(wires) == 1 and 'final_plex_score' not in document
+        assert json.loads((tmp_path/'reply.turn1.json').read_text()) == responses[0]
+        assert json.loads((tmp_path/'result.turn1.progress.json').read_text())['turns'] == document['workflow_http']
+
+
+@pytest.mark.parametrize('mode', ['extra_event', 'no_response', 'bad_hash', 'missing_log'])
+def test_recovery_finalization_fails_closed_on_orphan_events_or_missing_artifacts(tmp_path, mode):
+    from tests.test_qwen_kv_reclaim_witness_pure import response, record, log
+    reply, server_log = tmp_path/'reply.json', tmp_path/'server.log'
+    reply.write_text(json.dumps(response({})))
+    server_log.write_text(log(record()) if mode == 'extra_event' else '')
+    config = dict(workflow='plex', serial_kv_budget_bytes=256_000_000,
+                  server_log=str(server_log))
+    document = dict(workflow_http=[dict(response_path=str(reply), response_sha256=gate.sha(reply))])
+    if mode == 'no_response':
+        document['workflow_http'] = []
+    elif mode == 'bad_hash':
+        document['workflow_http'][0]['response_sha256'] = '0'*64
+    elif mode == 'missing_log':
+        config['server_log'] = str(tmp_path/'absent.log')
+    assert not gate.serial_recovery_coverage(config, document)['passed']
+
+
 def test_incomplete_workflow_stops_after_durable_receipt_and_restores_post(tmp_path, monkeypatch):
     request, config, responses, wires = workflow_setup(tmp_path, monkeypatch, incomplete=True)
     original_post = plex._post

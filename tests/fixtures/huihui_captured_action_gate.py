@@ -78,6 +78,10 @@ def acceptance(row, response, config, *, initial_action=True):
     checks = action_checks(response) if initial_action else {}
     if config.get('require_all_phase_completion', False):
         checks.update(generation_phase_checks(response))
+    if config.get('require_serial_kv_reclaim', False):
+        from tests.fixtures.qwen_kv_reclaim_witness import phase_checks
+        checks.update(phase_checks(response, t,
+            budget_bytes=config['serial_kv_budget_bytes']))
     checks.update(
         completed=row.get('http_status') == 200 and row.get('response_status') == 'completed'
             and not row.get('error') and response.get('status') == 'completed',
@@ -209,6 +213,10 @@ report those independently of actual final-title errors, never repair a score.
                           ('require_qwen_phase_head', 'all_phase_head_lifetime')):
             if config.get(flag, False) and not checks[key]:
                 raise RuntimeError('Required lifetime path is absent from a hidden/public phase')
+        if config.get('require_serial_kv_reclaim', False) and not all(checks[key]
+                for key in ('all_phase_serial_kv_reclaim_witness',
+                            'final_serial_kv_reclaim_trace_matches')):
+            raise RuntimeError('Required serial KV recovery witness is incomplete')
         return response, row['wall_seconds']
 
     # Scope this observer to one synchronous, single-server fixture call.
@@ -229,6 +237,26 @@ report those independently of actual final-title errors, never repair a score.
         document['failures'].append('whole_workflow_http_swap_growth')
 
 
+def serial_recovery_coverage(config, document):
+    """Verify immutable terminal files and the independent complete server log."""
+    from tests.fixtures.qwen_kv_reclaim_witness import log_coverage
+    try:
+        if config.get('workflow', 'initial_action') == 'plex':
+            files = [(r['response_path'], r['response_sha256'])
+                for r in document.get('workflow_http', []) if r.get('response_sha256')]
+        else:
+            files = [(config['response'], document.get('response_sha256'))]
+        responses = []
+        for path, digest in files:
+            if not digest or sha(path) != digest:
+                raise ValueError('terminal response identity mismatch')
+            responses.append(json.loads(Path(path).read_text()))
+        return log_coverage(responses, Path(config['server_log']).read_text(),
+            budget_bytes=config['serial_kv_budget_bytes'])
+    except (OSError, ValueError, TypeError, KeyError):
+        return dict(passed=False, complete_phase_coverage=False)
+
+
 def run(config):
     assert config.get('require_all_phase_completion') is True
     # Quality-only retries retain the runtime governor and full charged wall;
@@ -236,7 +264,7 @@ def run(config):
     assert type(config.get('abort_on_memory_retry', True)) is bool
     assert type(config.get('require_full_prompt_state', False)) is bool
     assert type(config.get('require_paged_kv', False)) is bool
-    for flag in ('require_qwen_factors', 'require_qwen_phase_head'):
+    for flag in ('require_qwen_factors', 'require_qwen_phase_head', 'require_serial_kv_reclaim'):
         assert type(config.get(flag, False)) is bool
     assert not config.get('require_paged_kv', False) or config.get('require_full_prompt_state', False)
     assert not any(k.startswith('VMODEL_') for k in os.environ)
@@ -249,6 +277,12 @@ def run(config):
     env = {}
     profile = apply_runtime_profiles(config['profiles'], environ=env)
     assert profile.profile_digest == config['profile_digest']
+    serial_kv_required = env.get('VMODEL_QWEN35_SERIAL_KV_RECLAIM') == '1'
+    assert config.get('require_serial_kv_reclaim', False) is serial_kv_required
+    if serial_kv_required:
+        assert config.get('require_paged_kv') is True
+        assert type(config.get('serial_kv_budget_bytes')) is int
+        assert config['serial_kv_budget_bytes'] == 256_000_000
     assert env['VMODEL_FAST_TOOL_GATEWAY_DETERMINISTIC_POLICY'] == '0'
     assert env['VMODEL_FAST_TOOL_GATEWAY_HOST_ROUTE'] == '0'
     assert env['VMODEL_QWEN35_HOT_KV'] == '0'
@@ -336,6 +370,10 @@ def run(config):
             document['failures'].append('whole_run_pressure')
         if not document['native_pressure'].get('known_transcoders', {}).get('passed'):
             document['failures'].append('known_transcoder_isolation')
+        if serial_kv_required:
+            document['serial_kv_reclaim_coverage'] = serial_recovery_coverage(config, document)
+            if not document['serial_kv_reclaim_coverage']['passed']:
+                document['failures'].append('serial_kv_recovery_event_phase_coverage')
         document['metadata_unchanged'] = all(
             sha(path) == digest for path, digest in config['metadata_hashes'].items())
         if not document['metadata_unchanged']:
