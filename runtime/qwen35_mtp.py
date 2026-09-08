@@ -1458,6 +1458,20 @@ def _capture_qwen_serial_factors(target, tokens, kv):
     try:
         logits = target.forward_tokens_serial_positions(
             tokens, kv, capture_kda_endpoints=False, capture_kda_factors=True)
+    except MemoryError:
+        # Observe partially retained logical buffers BEFORE cleanup. These
+        # scalar counts are not allocation attribution or physical RAM freed.
+        captured = source._factor_capture or []
+        print(
+            "[qwen-mtp-scalar-factor-failure] "
+            f"verify_positions={len(tokens)} "
+            f"base_logical_bytes={base.nbytes()} "
+            f"live_state_logical_bytes={source.nbytes()} "
+            f"factor_layers={sum(bool(steps) for steps in captured)} "
+            f"factor_steps={sum(len(steps) for steps in captured)} "
+            f"factor_logical_bytes={sum(step.nbytes() for steps in captured for step in steps)} "
+            f"active_metal_bytes={int(mx.get_active_memory())}", flush=True)
+        raise
     finally:
         # Also handles a verifier failure after partially advancing live KV.
         # Propagate the original error; never retry that mutated endpoint.

@@ -1,5 +1,45 @@
 # STATUS — 2026-09-08 UTC (current corrections first; dated chronology below is history)
 
+## 2026-09-08 UTC: flat Huihui scalar-factor MTP rollback implemented, default-off
+
+New explicit VMODEL_QWEN_MTP_COMPACT_KDA_ROLLBACK=1 and profile
+huihui-qwen38-27b-full-state-factors-audit retain one immutable base plus
+captured scalar updates instead of all strict-prefix recurrent endpoints.
+Partial acceptance and early stops use plain MLX scalar replay, native_fused=False.
+Full acceptance keeps the already-computed endpoint. Capture ownership is
+consumed/cancelled on verifier failure, with no retry of partially mutated KV.
+The commit reserves a complete new endpoint plus bounded per-layer scratch
+through the existing governor. Dense flat qwen3_5 only; tree, spilled-state,
+already-active capture and native-fused recurrence combinations fail closed.
+No default change, target weight change, CPU/fused factor replay or speed claim.
+
+Server parsing, engine-cache identity, MTP identity and scalar timing telemetry
+are wired. Actual factor rounds/restores, logical factor/base byte peaks and
+restore wall are separate; logical storage is not measured unique RAM freed.
+The profile changes only rollback storage versus the paged256 audit. Overall
+target/gateway remains lossy MXFP4/reassociated/compacted, not BF16 lossless.
+
+Source614fc5f:99 focused tests PASS0.85s. The new mocked-logit tests use REAL
+scalar recurrent arrays and cover all five accepted-prefix cases at greedy
+and stochastic sampling, EOS/stop/grammar/output-budget termination at every
+proposal, incomplete capture, failure cleanup and strict unsupported-mode
+rejection. Existing committed-history and dense-endpoint suites also pass.
+Fresh30.0423s preflightPASS; driver1.05618s/parent3.40597s; Metal32,278,656B;
+terminalavailable6,509,740,032B, actual swap-out65,536B, net0. No real-weight
+A/B or complete Plex quality/latency result yet. All766 source files/start-end
+manifests/tree/result/log/preflight hashes verified before subsequent edits,
+PIDs23272/23276 gone. Root/external minima17,195,937,792/100,607,967,232B.
+
+Tree32f6244932511a8ab9f067c81f33b34060017c68db2806618bec4b6ad5b0ea57;
+result867cc7131a91d8fb8cf78f27ad83c110eb2c04b13e656f6558faf7981eb92ba7;
+parentlog3fa4a1e9283439a4f602d0c784a4132eb17ebb1cf1f6c285afc3dee06ec7db92;
+preflighte7e41d3ea18d1bd211a9c604a93b8f33bce4e0e96557d12d4dc1ec5da2f3805e.
+Next: short real captured streaming weather-tool and nonstream no-tool title
+A/B on the SAME source, unchanged captured input/tools/reasoning, only model/
+max1024/temp0/seed64013 overrides; then the full captured Plex workflow.
+Those short requests are not the large134-tool Plex harness. Do not confuse
+synthetic rollback equivalence with a real-weight or broad-corpus speed proof.
+
 ## 2026-09-08 UTC: Huihui paged audit fails; scalar-factor reconstruction exactness passes
 
 Priority remains Huihui Qwen3.8-27B-abliterated, not Flash Next/GLM.

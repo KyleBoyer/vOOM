@@ -105,6 +105,14 @@ def paged_phase():
         qwen35_paged_online_attention=0, qwen35_paged_online_page_native=0)
 
 
+def test_compact_factors_audit_changes_only_flat_mtp_rollback_storage():
+    base, factors = {}, {}
+    apply_runtime_profiles(['huihui-qwen38-27b-full-state-paged256-audit'], environ=base)
+    apply_runtime_profiles(['huihui-qwen38-27b-full-state-factors-audit'], environ=factors)
+    settings = lambda env: {k: v for k, v in env.items() if k.startswith('VMODEL_') and k != 'VMODEL_PROFILE'}
+    assert settings(factors) == {**settings(base), 'VMODEL_QWEN_MTP_COMPACT_KDA_ROLLBACK': '1'}
+
+
 def test_paged_witness_requires_actual_spill_and_reload_on_both_phases():
     assert all(full_state_checks([paged_phase(), paged_phase()], require_paged_kv=True).values())
 

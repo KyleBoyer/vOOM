@@ -154,7 +154,7 @@ def test_compact_matches_dense_terminal_prefix(stop_kind, position):
     assert results[1]["path_stats"]["qwen_mtp_kda_factor_restores"] == 1
 
 
-def test_failed_verifier_cancels_capture_without_retry():
+def test_failed_verifier_cancels_capture_without_retry(capsys):
     target = _FactorTarget(4)
     target.fail_verify = True
     with pytest.raises(MemoryError, match="injected-verifier-admission"):
@@ -162,6 +162,9 @@ def test_failed_verifier_cancels_capture_without_retry():
     assert not target.last_kv.kda_cache.factor_capture_active
     assert target.factors is None
     assert len(target.serial_calls) == 1
+    diagnostic = capsys.readouterr().out
+    assert '[qwen-mtp-scalar-factor-failure]' in diagnostic
+    assert 'factor_layers=1 factor_steps=1' in diagnostic
 
 
 def test_missing_active_layer_factors_fail_closed():

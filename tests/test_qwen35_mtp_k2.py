@@ -2094,6 +2094,7 @@ def test_server_q_policy_is_strict_and_part_of_engine_cache_identity():
         "VMODEL_QWEN_MTP_PROMPT_HISTORY_MIN_PROMPT_TOKENS": "0",
         "VMODEL_QWEN_MTP_SELECTIVE_TREE_MARGIN": "0",
         "VMODEL_QWEN_MTP_GRAMMAR_AWARE_DRAFT": "0",
+        "VMODEL_QWEN_MTP_COMPACT_KDA_ROLLBACK": "0",
         "VMODEL_QWEN35_SERIAL_VERIFY_EXACT_PAGE_ADMISSION": "0",
         "VMODEL_QWEN35_SERIAL_VERIFY_BATCHED_MLP": "0",
         "VMODEL_QWEN35_SERIAL_VERIFY_SUSPEND_LM_HEAD": "0",
@@ -2135,6 +2136,8 @@ def test_server_q_policy_is_strict_and_part_of_engine_cache_identity():
         os.environ["VMODEL_QWEN_MTP_DEPTH"] = "4"
         os.environ["VMODEL_QWEN_MTP_SELECTIVE_TREE_MARGIN"] = "2"
         eleventh = manager.get(Path("/tmp/fake-qwen-q-policy"), "fast")
+        os.environ["VMODEL_QWEN_MTP_COMPACT_KDA_ROLLBACK"] = "1"
+        twelfth = manager.get(Path("/tmp/fake-qwen-q-policy"), "fast")
 
     assert first is made[0]
     assert second is made[1]
@@ -2147,6 +2150,7 @@ def test_server_q_policy_is_strict_and_part_of_engine_cache_identity():
     assert ninth is made[8]
     assert tenth is made[9]
     assert eleventh is made[10]
+    assert twelfth is made[11]
     assert first.closes == 1
     assert second.closes == 1
     assert third.closes == 1
@@ -2157,6 +2161,7 @@ def test_server_q_policy_is_strict_and_part_of_engine_cache_identity():
     assert eighth.closes == 1
     assert ninth.closes == 1
     assert tenth.closes == 1
+    assert eleventh.closes == 1
 
 
 def test_server_wires_typed_q_policy_and_explicit_deep_chain():

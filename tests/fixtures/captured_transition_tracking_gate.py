@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
-"""One bounded, profile-only arm of a captured-request transition-tracking A/B.
+"""One bounded, profile-only arm of a captured-request A/B.
 
 Preserves original Responses tools, input, streaming and reasoning fields. Only
 the model, sufficient output budget and deterministic sampling are overridden.
 Saves actual terminal responses privately; no tools are executed or repaired.
 Small captured shapes are NOT a full harness, Plex or large-context proof.
+An optional protected transition-history file is checked only when supplied.
 """
 
 from __future__ import annotations
@@ -110,6 +111,26 @@ def row_checks(row, response, case, config):
         actual_swap_out=after['swap_out_bytes'] - before['swap_out_bytes'] <= 16_000_000)
     if case.get('stream'):
         checks['stream_final_equal'] = row.get('streamed_text_matches_final') is True
+    if config.get('require_qwen_factors', False):
+        checks['qwen_scalar_factor_path'] = (
+            type(t.get('qwen_mtp_compact_kda_rollback_enabled')) is int
+            and t['qwen_mtp_compact_kda_rollback_enabled'] == 1
+            and all(type(t.get(key)) is int and t[key] > 0 for key in (
+                'qwen_mtp_kda_factor_rounds', 'qwen_mtp_kda_factor_bytes_peak',
+                'qwen_mtp_kda_factor_base_bytes_peak'))
+            and type(t.get('qwen_mtp_kda_factor_restores')) is int
+            and t['qwen_mtp_kda_factor_restores'] >= 0
+            and type(t.get('qwen_mtp_kda_factor_restore_s')) in (int, float)
+            and 0 <= t['qwen_mtp_kda_factor_restore_s'] < float('inf'))
+    if config.get('require_full_prompt_state', False):
+        phases = response.get('vmodel_cache_phases')
+        checks['all_phases_full_prompt_state'] = (
+            isinstance(phases, list) and bool(phases)
+            and all(isinstance(phase, dict)
+                and all(type(phase.get(key)) is int and phase[key] == 0
+                    for key in ('prompt_state_approximate',
+                        'qwen_lossy_suffix_prefill_early_layers', 'qwen_lossy_suffix_prefill_used'))
+                for phase in phases))
     return checks
 
 
@@ -136,6 +157,8 @@ def native_pressure_summary(log_text):
 
 
 def run(config):
+    for flag in ('require_qwen_factors', 'require_full_prompt_state'):
+        assert type(config.get(flag, False)) is bool
     if not 1 <= len(config['cases']) <= 3:
         raise ValueError('one to three bounded captured cases required')
     if any(k.startswith('VMODEL_') for k in os.environ):
@@ -154,7 +177,9 @@ def run(config):
     assert _port_is_free(config['port'])
     for path in [config['result'], config['server_log'], *[c['response'] for c in config['cases']]]:
         assert not Path(path).exists()
-    assert sha(config['history']) == config['history_sha256']
+    history = config.get('history')
+    if history is not None:
+        assert sha(history) == config['history_sha256']
     prepared = [prepare_case(c, config['model']) for c in config['cases']]
     reference = json.loads(Path(config['reference']).read_text()) if config.get('reference') else None
     if reference:
@@ -163,7 +188,8 @@ def run(config):
     document = dict(schema='voom.captured-transition-tracking-arm.v1', passed=False,
         cases=rows, failures=failures, source_commit=config['source_commit'],
         profiles=config['profiles'], profile_digest=config['profile_digest'],
-        history_sha256_before=config['history_sha256'], generated_tools_executed=False,
+        history_sha256_before=config.get('history_sha256') if history is not None else None,
+        history_checked=history is not None, generated_tools_executed=False,
         scope='Small captured shapes, original tools/input/stream/reasoning; only model/max1024/temp0/seed64013 overrides. Not full harness/Plex/large-context or full-state equivalence.',
         reference_sha256=sha(config['reference']) if reference else None)
     started = time.perf_counter()
@@ -218,8 +244,8 @@ def run(config):
             _stop_server(server)
             document.update(server_returncode=server.returncode,
                 server_log_sha256=sha(config['server_log']), wall_seconds=time.perf_counter() - started,
-                history_sha256_after=sha(config['history']))
-            if document['history_sha256_after'] != config['history_sha256']:
+                history_sha256_after=sha(history) if history is not None else None)
+            if history is not None and document['history_sha256_after'] != config['history_sha256']:
                 failures.append('saved transition history changed')
             try:
                 document['native_pressure'] = native_pressure_summary(Path(config['server_log']).read_text())

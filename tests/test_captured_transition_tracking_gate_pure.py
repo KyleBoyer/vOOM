@@ -117,6 +117,45 @@ def test_actual_swap_out_failure_even_when_net_usage_does_not_grow():
     assert checks['swap_used'] and not checks['actual_swap_out']
 
 
+def factor_timing():
+    return dict(qwen_mtp_compact_kda_rollback_enabled=1,
+        qwen_mtp_kda_factor_rounds=2, qwen_mtp_kda_factor_bytes_peak=123,
+        qwen_mtp_kda_factor_base_bytes_peak=456, qwen_mtp_kda_factor_restores=1,
+        qwen_mtp_kda_factor_restore_s=0.1)
+
+
+@pytest.mark.parametrize('bad', [{}, {'qwen_mtp_compact_kda_rollback_enabled': 0},
+    {'qwen_mtp_compact_kda_rollback_enabled': True}, {'qwen_mtp_kda_factor_rounds': 0},
+    {'qwen_mtp_kda_factor_bytes_peak': 0}, {'qwen_mtp_kda_factor_base_bytes_peak': None},
+    {'qwen_mtp_kda_factor_restores': True}, {'qwen_mtp_kda_factor_restore_s': float('nan')}])
+def test_optional_factor_gate_requires_actual_typed_path_witness(bad):
+    row = valid_row()
+    row['timing'].update(factor_timing())
+    config = dict(profiles=['test'], profile_digest='digest', require_qwen_factors=True)
+    case = dict(kind='short_title', topic='node')
+    response = dict(output=[message('NodeJS Joke')])
+    assert all(gate.row_checks(row, response, case, config).values())
+    if bad:
+        row['timing'].update(bad)
+    else:
+        row['timing'].pop('qwen_mtp_kda_factor_rounds')
+    assert not gate.row_checks(row, response, case, config)['qwen_scalar_factor_path']
+
+
+@pytest.mark.parametrize('phases', [None, [], [{}], [dict(prompt_state_approximate=True)],
+    [dict(prompt_state_approximate=0, qwen_lossy_suffix_prefill_early_layers=0,
+          qwen_lossy_suffix_prefill_used=1)]])
+def test_optional_full_state_gate_rejects_missing_or_approximate_phase(phases):
+    row = valid_row()
+    config = dict(profiles=['test'], profile_digest='digest', require_full_prompt_state=True)
+    case = dict(kind='short_title', topic='node')
+    response = dict(output=[message('NodeJS Joke')], vmodel_cache_phases=phases)
+    assert not gate.row_checks(row, response, case, config)['all_phases_full_prompt_state']
+    response['vmodel_cache_phases'] = [dict(prompt_state_approximate=0,
+        qwen_lossy_suffix_prefill_early_layers=0, qwen_lossy_suffix_prefill_used=0)]
+    assert all(gate.row_checks(row, response, case, config).values())
+
+
 @pytest.mark.parametrize('stream', [False, True])
 def test_client_observer_gets_actual_terminal_without_altering_wire_or_summary(monkeypatch, stream):
     terminal = dict(status='completed', output=[message('NodeJS Joke')])
