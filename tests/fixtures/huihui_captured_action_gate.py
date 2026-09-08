@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import copy
 from dataclasses import asdict
+import hashlib
 import json
 import math
 import os
@@ -257,6 +258,79 @@ def serial_recovery_coverage(config, document):
         return dict(passed=False, complete_phase_coverage=False)
 
 
+def prepare_request(config):
+    """Optionally isolate the exact second HTTP of a pinned prior workflow.
+
+    Omitting the first HTTP's process history is the experimental variable,
+    not a prompt/tool rewrite or a completed-workflow latency comparison.
+    """
+    from tests.fixtures import plex_agent_profile as plex
+
+    request, wire, metadata = prepare_case(config['case'], config['model'])
+    if config.get('workflow', 'initial_action') != 'saved_continuation':
+        return request, wire, metadata
+    source = config['saved_continuation']
+    if sha(source['result']) != source['sha256']:
+        raise ValueError('saved workflow result identity mismatch')
+    reference = json.loads(Path(source['result']).read_text())
+    ref_config = reference['config']
+    if (reference.get('schema') != 'voom.huihui-captured-plex.v1'
+            or any(config.get(key) != ref_config.get(key) for key in (
+                'case', 'model', 'profiles', 'profile_digest', 'metadata_hashes'))
+            or metadata != reference.get('request')):
+        raise ValueError('saved workflow source configuration mismatch')
+    prior = reference['workflow_http']
+    if len(prior) < 2 or prior[0]['request'] != plex.request_shape(request):
+        raise ValueError('saved workflow does not witness the first two requests')
+    first = prior[0]
+    if sha(first['response_path']) != first['response_sha256']:
+        raise ValueError('saved first response identity mismatch')
+    response = json.loads(Path(first['response_path']).read_text())
+    if (response.get('status') != 'completed' or not model_authored_output(response)
+            or not all(generation_phase_checks(response).values())):
+        raise ValueError('saved first response is not naturally completed/model authored')
+    calls = plex.response_calls(response)
+    if (len(calls) != 1 or calls[0]['name'] not in plex.PLEX_PAGINATION_TOOLS
+            or not isinstance(calls[0]['arguments'], dict) or not calls[0]['call_id']):
+        raise ValueError('requires one exact saved pagination call')
+    continuation = copy.deepcopy(request)
+    plex._append_call_and_result(continuation, calls[0], plex.SYNTHETIC_PAGES[0])
+    shape = plex.request_shape(continuation)
+    if shape != prior[1]['request']:
+        raise ValueError('reconstructed continuation differs from saved second HTTP')
+    wire = json.dumps(continuation, ensure_ascii=False, separators=(',', ':')).encode()
+    metadata = dict(request_sha256=hashlib.sha256(wire).hexdigest(),
+        request_bytes=len(wire), original_capture_request=metadata,
+        request_shape=shape, saved_workflow_result_sha256=source['sha256'],
+        saved_first_response_sha256=first['response_sha256'],
+        original_workflow_turn=2, preceding_http_calls_omitted=1,
+        tool_results_source='unchanged_synthetic_first_page',
+        request_change='append_exact_saved_call_and_unchanged_first_fixture_page',
+        scope='Identical saved second HTTP in a fresh server; not full-workflow latency or Plex score')
+    return continuation, wire, metadata
+
+
+def run_single_request(config, wire, document, *, initial_action):
+    """Durably save one HTTP response before applying its unchanged gates."""
+    terminal = []
+    def observe(value):
+        assert not terminal
+        _atomic_write_private(Path(config['response']), value)
+        terminal.append(value)
+    before = asdict(_pressure())
+    row = _post(f'http://127.0.0.1:{config["port"]}/v1/responses', wire,
+        timeout=1800, stream=True, print_progress=True,
+        fail_on_memory_retry=config.get('abort_on_memory_retry', True),
+        response_observer=observe)
+    row.update(pressure_before=before, pressure_after=asdict(_pressure()))
+    document['row'] = row
+    document['checks'] = acceptance(row, terminal[0] if terminal else {}, config,
+        initial_action=initial_action)
+    document['failures'] += [k for k, v in document['checks'].items() if not v]
+    if terminal:
+        document['response_sha256'] = sha(config['response'])
+
+
 def run(config):
     assert config.get('require_all_phase_completion') is True
     # Quality-only retries retain the runtime governor and full charged wall;
@@ -305,13 +379,13 @@ def run(config):
     for key in ('result', 'response', 'server_log'):
         assert not Path(config[key]).exists()
     workflow = config.get('workflow', 'initial_action')
-    assert workflow in ('initial_action', 'plex')
+    assert workflow in ('initial_action', 'plex', 'saved_continuation')
     if workflow == 'plex':
         for index in range(1, 6):
             assert not Path(config['result']).with_suffix(f'.turn{index}.progress.json').exists()
             assert not Path(config['response']).with_name(
                 Path(config['response']).stem + f'.turn{index}.json').exists()
-    request, wire, metadata = prepare_case(config['case'], config['model'])
+    request, wire, metadata = prepare_request(config)
     assert metadata['request_sha256'] == config['wire_sha256']
     assert len(request['tools']) == 134 and request['stream'] is True
     for path, digest in config['metadata_hashes'].items():
@@ -324,6 +398,9 @@ def run(config):
     if workflow == 'plex':
         document.update(schema='voom.huihui-captured-plex.v1',
             scope='Model-only capped-five-response Plex workflow: original134-tool HTTP catalog/history/stream; model/max1024/temp0/seed64013 overrides. Existing lossy gateway prepares a smaller catalog/prompt. Legacy synthetic mixed two-page fixture and unchanged rubric, with known separate-media strategy limitations. No live tool execution, host rendering, full-schema model replay or BF16 proof.')
+    elif workflow == 'saved_continuation':
+        document.update(schema='voom.huihui-saved-continuation.v1',
+            scope='Diagnostic fresh-server replay of the exact saved second HTTP, reconstructed from the original134-tool capture plus the exact first model call and unchanged synthetic first page. First HTTP process/cache history is intentionally omitted. Same model/max1024/temp0/seed64013 and explicit lossy gateway preparation. No live tools, complete-workflow timing, Plex score, full-schema model replay or BF16 proof.')
     server = None
     try:
         with open(config['server_log'], 'x') as log:
@@ -339,22 +416,8 @@ def run(config):
             if workflow == 'plex':
                 run_plex_workflow(config, request, document)
             else:
-                terminal = []
-                def observe(value):
-                    assert not terminal
-                    _atomic_write_private(Path(config['response']), value)
-                    terminal.append(value)
-                before = asdict(_pressure())
-                row = _post(f'http://127.0.0.1:{config["port"]}/v1/responses', wire,
-                    timeout=1800, stream=True, print_progress=True,
-                    fail_on_memory_retry=config.get('abort_on_memory_retry', True),
-                    response_observer=observe)
-                row.update(pressure_before=before, pressure_after=asdict(_pressure()))
-                document['row'] = row
-                document['checks'] = acceptance(row, terminal[0] if terminal else {}, config)
-                document['failures'] += [k for k, v in document['checks'].items() if not v]
-                if terminal:
-                    document['response_sha256'] = sha(config['response'])
+                run_single_request(config, wire, document,
+                    initial_action=workflow == 'initial_action')
     except BaseException as error:
         document['failures'].append('driver_error:' + type(error).__name__)
     finally:

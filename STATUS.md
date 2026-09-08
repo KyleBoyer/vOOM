@@ -1,5 +1,41 @@
 # STATUS — 2026-09-08 UTC (current corrections first; dated chronology below is history)
 
+## 2026-09-08 UTC: exact saved-continuation isolation gate prepared, no model result yet
+
+Added an explicit `saved_continuation` diagnostic mode to the Huihui captured
+action driver. It reconstructs ONLY the second HTTP from a hash-pinned previous
+full-workflow result, its exact first model-authored call and the unchanged
+synthetic first page. It verifies original capture/model/profile/metadata and
+first/second request identities, response hash, natural generation provenance,
+call identity and all global/tool fields before any server launch. A fresh
+server intentionally omits the preceding HTTP's process/cache history; this
+is a host-ownership isolation experiment, not a faster full workflow.
+
+The real saved second request from `huihui_plex_serial_kv_reclaim_20260908`
+reconstructs to179931B,134 tools/five input items with canonical SHA
+c038a9d21b7ca87174ddcc5bb6bf4353f76c087860c17043eadcfe12f752780a and
+wire SHA c84a47fd6bac03328d71f1ad04e3da779ddcd807f15f99536012813da4a494b9.
+Its original capture/first HTTP still have only model/max1024/temp0/seed64013
+overrides. No prompt/tool/schema/pagination-result editing is permitted.
+Same explicit full-state MXFP4/reassociated-prefill/Hermes/gateway plus serial
+KV-recovery profile; not BF16 or full-schema model computation.
+
+The isolated mode makes exactly one HTTP, saves its terminal response before
+acceptance, and retains all natural-output, per-phase state/path, pressure and
+raw recovery-log gates. It never executes tools, continues pagination, renders
+an answer or assigns a Plex score. Initial-action and full-workflow modes retain
+their existing request path. Model-dependent fields missing on failure still
+fail, and a passed isolation arm would not prove inter-request state causality
+without controlled host-memory evidence.
+
+Focused fixture regression119 tests PASS1.17s; final strict no-real-MLX selected
+suite458 PASS11.26s;126 profiles validate. No runtime behavior changed since the
+failure-only observers. Next: fresh30s performance preflight, then one bounded
+isolated second-request run with abort-on-first-memory-retry to locate the
+initial refusal without replaying discarded prefills. No model job/result from
+this mode yet; do not report its preparation as a timing/quality improvement.
+
+
 ## 2026-09-08 UTC: failure-only KV admission component diagnostics added after full-run verification
 
 The common request-KV admission helper now emits `[kv-admission-refusal]`
