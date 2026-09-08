@@ -82,7 +82,8 @@ def acceptance(row, response, config, *, initial_action=True):
     if config.get('require_serial_kv_reclaim', False):
         from tests.fixtures.qwen_kv_reclaim_witness import phase_checks
         checks.update(phase_checks(response, t,
-            budget_bytes=config['serial_kv_budget_bytes']))
+            budget_bytes=config['serial_kv_budget_bytes'],
+            topup_required=config.get('require_serial_kv_reclaim_topup', False)))
     checks.update(
         completed=row.get('http_status') == 200 and row.get('response_status') == 'completed'
             and not row.get('error') and response.get('status') == 'completed',
@@ -253,7 +254,8 @@ def serial_recovery_coverage(config, document):
                 raise ValueError('terminal response identity mismatch')
             responses.append(json.loads(Path(path).read_text()))
         return log_coverage(responses, Path(config['server_log']).read_text(),
-            budget_bytes=config['serial_kv_budget_bytes'])
+            budget_bytes=config['serial_kv_budget_bytes'],
+            topup_required=config.get('require_serial_kv_reclaim_topup', False))
     except (OSError, ValueError, TypeError, KeyError):
         return dict(passed=False, complete_phase_coverage=False)
 
@@ -352,7 +354,8 @@ def run(config):
     profile = apply_runtime_profiles(config['profiles'], environ=env)
     assert profile.profile_digest == config['profile_digest']
     serial_kv_required = env.get('VMODEL_QWEN35_SERIAL_KV_RECLAIM') == '1'
-    assert config.get('require_serial_kv_reclaim', False) is serial_kv_required
+    from tests.fixtures.qwen_kv_reclaim_witness import validate_config
+    validate_config(config, env)
     if serial_kv_required:
         assert config.get('require_paged_kv') is True
         assert type(config.get('serial_kv_budget_bytes')) is int

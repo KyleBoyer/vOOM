@@ -185,7 +185,8 @@ def row_checks(row, response, case, config):
     if config.get('require_serial_kv_reclaim', False):
         from tests.fixtures.qwen_kv_reclaim_witness import phase_checks
         checks.update(phase_checks(response, t,
-            budget_bytes=config['serial_kv_budget_bytes']))
+            budget_bytes=config['serial_kv_budget_bytes'],
+            topup_required=config.get('require_serial_kv_reclaim_topup', False)))
     if config.get('require_full_prompt_state', False):
         phases = response.get('vmodel_cache_phases')
         checks['all_phases_full_prompt_state'] = (
@@ -245,7 +246,8 @@ def run(config):
     host_activity_required = profile_env.get('VMODEL_HOST_ACTIVITY_WITNESS') == '1'
     reclamation_required = profile_env.get('VMODEL_GOVERNOR_RECLAMATION_WITNESS') == '1'
     serial_kv_required = profile_env.get('VMODEL_QWEN35_SERIAL_KV_RECLAIM') == '1'
-    assert config.get('require_serial_kv_reclaim', False) is serial_kv_required
+    from tests.fixtures.qwen_kv_reclaim_witness import validate_config
+    validate_config(config, profile_env)
     if serial_kv_required:
         assert type(config.get('serial_kv_budget_bytes')) is int and config['serial_kv_budget_bytes'] > 0
     if host_activity_required:
@@ -349,7 +351,8 @@ def run(config):
                     for r in rows if r.get('response_sha256')]
                 document['serial_kv_reclaim_coverage'] = log_coverage(responses,
                     Path(config['server_log']).read_text(),
-                    budget_bytes=config['serial_kv_budget_bytes'])
+                    budget_bytes=config['serial_kv_budget_bytes'],
+                    topup_required=config.get('require_serial_kv_reclaim_topup', False))
                 if not document['serial_kv_reclaim_coverage']['passed']:
                     failures.append('serial KV recovery event/phase coverage gate')
             isolation = document['native_pressure'].get('known_transcoders')

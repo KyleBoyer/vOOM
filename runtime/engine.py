@@ -1290,6 +1290,9 @@ class RuntimeConfig:
     # Exact, default-off recovery after a refused serial compute reservation.
     # Spill closed KV pages outside the current layer, then re-reserve normally.
     qwen35_serial_kv_reclaim: bool = False
+    # Additional default-off spill pass, sized from fresh live headroom only
+    # after the first exact spill made physical and logical progress.
+    qwen35_serial_kv_reclaim_topup: bool = False
     # Exact-target, default-off memory-lifetime optimization for an untied
     # Qwen LM head. Startup registers an exact dormant lease instead of
     # materializing the head before prefill. The head is pinned on its first
@@ -1714,6 +1717,7 @@ class RuntimeConfig:
             qwen35_serial_verify_batched_mlp=run.get(
                 "qwen35_serial_verify_batched_mlp", False),
             qwen35_serial_kv_reclaim=run.get("qwen35_serial_kv_reclaim", False),
+            qwen35_serial_kv_reclaim_topup=run.get("qwen35_serial_kv_reclaim_topup", False),
             qwen35_serial_verify_suspend_lm_head=run.get(
                 "qwen35_serial_verify_suspend_lm_head", False),
             qwen35_serial_verify_suspend_lm_head_min_prompt_tokens=run.get(
@@ -14301,6 +14305,8 @@ class StreamingEngine:
         paged_stats = getattr(kv, "stats", None)
         if self.rc.qwen35_serial_kv_reclaim:
             path_stats["qwen35_serial_kv_reclaim_enabled"] = 1
+            path_stats["qwen35_serial_kv_reclaim_topup_enabled"] = int(
+                self.rc.qwen35_serial_kv_reclaim_topup is True)
             path_stats["qwen35_serial_kv_reclaim"] = dict(
                 self._qwen35_serial_kv_reclaim_stats)
         path_stats["paged_kv_spills"] = int(

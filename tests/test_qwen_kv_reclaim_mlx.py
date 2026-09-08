@@ -28,7 +28,8 @@ def _bits(value):
     return np.array(value.view(mx.uint16))
 
 
-@pytest.mark.parametrize("mode", ["disabled", "recover", "aliases"])
+@pytest.mark.parametrize("mode", ["disabled", "recover", "aliases",
+    "one_pass_moving", "topup_moving", "topup_aliases", "topup_exhausted"])
 def test_real_hook_exact_pages_and_governor_recheck(tmp_path, monkeypatch, mode):
     kv = PagedKVCache(8, 256_000_000, tmp_path, page_positions=256, resident_pages=1)
     kv.kda_cache = KDAStateCache(8)
@@ -44,9 +45,10 @@ def test_real_hook_exact_pages_and_governor_recheck(tmp_path, monkeypatch, mode)
     lengths = kv.layer_lengths()
     protected = [(p.k, p.v) for p in kv._pages[7]]
     tails = tuple(kv._tail_k), tuple(kv._tail_v)
-    aliases = [(p.k, p.v) for pages in kv._pages for p in pages if p.resident] if mode == "aliases" else []
+    aliases = [(p.k, p.v) for pages in kv._pages for p in pages if p.resident] if mode in ("aliases", "topup_aliases") else []
     engine, _ = refusal_target()
-    engine.rc = SimpleNamespace(qwen35_serial_kv_reclaim=mode != "disabled")
+    engine.rc = SimpleNamespace(qwen35_serial_kv_reclaim=mode != "disabled",
+        qwen35_serial_kv_reclaim_topup=mode.startswith("topup_"))
     engine.cfg = SimpleNamespace(model_type="qwen3_5")
     engine._layer_transient = 8_388_608
     engine._layer_transient_margin = 0
@@ -60,25 +62,54 @@ def test_real_hook_exact_pages_and_governor_recheck(tmp_path, monkeypatch, mode)
     mx.clear_cache()
     before_active = mx.get_active_memory()
     governor.metal_limit = before_active + engine._layer_transient - 2_100_000
+    if mode in ("one_pass_moving", "topup_moving", "topup_exhausted"):
+        # A controlled post-spill ceiling drop models headroom moving while
+        # real arrays retire. No host-app allocations or production policy
+        # constants are changed. Retain the actual governor's second check.
+        initial_ceiling = governor.metal_limit
+        original_reclaim = kv.reclaim_closed_pages
+        def moving_reclaim(*args, **kwargs):
+            released = original_reclaim(*args, **kwargs)
+            governor.metal_limit = initial_ceiling - (
+                20_000_000 if mode == "topup_exhausted" else 2_000_000)
+            return released
+        monkeypatch.setattr(kv, "reclaim_closed_pages", moving_reclaim)
     invoke, _ = hook()
     invoke.__globals__["mx"] = mx
     try:
-        if mode == "recover":
+        if mode in ("recover", "topup_moving"):
             invoke(engine, 7, 5, length, kv)
             row = engine._qwen35_serial_kv_reclaim_stats["records"][0]
             assert row["outcome"] == "admitted" and row["reservation_retried"]
             assert row["logical_reclaimed_bytes"] >= 2_100_000
             assert row["metal_active_released_bytes"] >= 2_100_000
             assert governor.reservation_calls == 2 and governor.reservation_failures == 1
+            if mode == "topup_moving":
+                from tests.fixtures.qwen_kv_reclaim_witness import valid_trace
+                assert len(row['reclaim_passes']) == 2
+                assert row['topup_check']['deficit_bytes'] > 0
+                assert all(p['metal_active_released_bytes'] > 0 for p in row['reclaim_passes'])
+                assert valid_trace(engine._qwen35_serial_kv_reclaim_stats,
+                    budget_bytes=256_000_000)
         else:
             with pytest.raises(MemoryError, match="unsafe Metal reservation"):
                 invoke(engine, 7, 5, length, kv)
-            if mode == "aliases":
+            if mode in ("aliases", "topup_aliases"):
                 row = engine._qwen35_serial_kv_reclaim_stats["records"][0]
                 assert row["outcome"] == "refused" and row["reservation_retried"]
                 assert row["logical_reclaimed_bytes"] >= 2_100_000
                 assert row["metal_active_released_bytes"] < 2_100_000
                 assert governor.reservation_calls == governor.reservation_failures == 2
+                if mode == "topup_aliases":
+                    assert len(row['reclaim_passes']) == 1 and row['topup_check'] is None
+            elif mode in ("one_pass_moving", "topup_exhausted"):
+                row = engine._qwen35_serial_kv_reclaim_stats['records'][0]
+                assert row['outcome'] == 'refused' and row['after_reclaim']['deficit_bytes'] > 0
+                assert governor.reservation_calls == governor.reservation_failures == 2
+                if mode == "topup_exhausted":
+                    assert len(row['reclaim_passes']) == 2
+                else:
+                    assert row['schema'].endswith('.v1')
             else:
                 assert kv.stats.spills == 0 and governor.reservation_calls == 1
         assert kv.layer_lengths() == lengths and kv.offset == length and kv.max_bytes == 256_000_000
@@ -107,10 +138,12 @@ def test_real_hook_exact_pages_and_governor_recheck(tmp_path, monkeypatch, mode)
         kv.release()
 
 
-def test_mtp_exports_post_bootstrap_recovery_stats(monkeypatch):
+@pytest.mark.parametrize('topup', [False, True])
+def test_mtp_exports_post_bootstrap_recovery_stats(monkeypatch, topup):
     from tests.test_qwen_mtp_scalar_rollback import _FactorTarget, _engine
     target = _FactorTarget(2)
     target.rc.qwen35_serial_kv_reclaim = True
+    target.rc.qwen35_serial_kv_reclaim_topup = topup
     original = target.forward_tokens_serial_positions
     expected = dict(attempts=1, admitted=1, records=[dict(outcome="admitted")])
     def verify(*args, **kwargs):
@@ -119,4 +152,5 @@ def test_mtp_exports_post_bootstrap_recovery_stats(monkeypatch):
     monkeypatch.setattr(target, "forward_tokens_serial_positions", verify)
     result = _engine(target, True).generate("x", 4)
     assert result["path_stats"]["qwen35_serial_kv_reclaim_enabled"] == 1
+    assert result["path_stats"]["qwen35_serial_kv_reclaim_topup_enabled"] == int(topup)
     assert result["path_stats"]["qwen35_serial_kv_reclaim"] == expected

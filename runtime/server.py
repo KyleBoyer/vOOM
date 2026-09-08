@@ -1657,6 +1657,15 @@ class EngineManager:
         if qwen35_batched_mlp_request not in ("0", "1"):
             raise RequestValidationError(
                 "VMODEL_QWEN35_SERIAL_VERIFY_BATCHED_MLP must be 0 or 1")
+        qwen35_kv_topup_request = os.environ.get(
+            "VMODEL_QWEN35_SERIAL_KV_RECLAIM_TOPUP", "0")
+        if qwen35_kv_topup_request not in ("0", "1"):
+            raise RequestValidationError(
+                "VMODEL_QWEN35_SERIAL_KV_RECLAIM_TOPUP must be 0 or 1")
+        if (qwen35_kv_topup_request == "1" and os.environ.get(
+                "VMODEL_QWEN35_SERIAL_KV_RECLAIM", "0") != "1"):
+            raise RequestValidationError(
+                "serial KV top-up requires VMODEL_QWEN35_SERIAL_KV_RECLAIM=1")
         qwen35_suspend_lm_head_request = os.environ.get(
             "VMODEL_QWEN35_SERIAL_VERIFY_SUSPEND_LM_HEAD", "0"
         ).strip()
@@ -2462,6 +2471,7 @@ class EngineManager:
             qwen35_paged_online_page_native_request,
             qwen35_kv_page_positions,
             qwen35_batched_mlp_request,
+            qwen35_kv_topup_request,
             qwen35_suspend_lm_head_request,
             qwen35_suspend_lm_head_min_prompt_tokens,
             qwen_lossy_suffix_request,
@@ -2623,6 +2633,7 @@ class EngineManager:
             qwen35_paged_online_page_native_request,
             qwen35_kv_page_positions,
             qwen35_batched_mlp_request,
+            qwen35_kv_topup_request,
             qwen35_suspend_lm_head_request,
             qwen35_suspend_lm_head_min_prompt_tokens,
             qwen_lossy_suffix_request,
@@ -2730,6 +2741,8 @@ class EngineManager:
         # retry behavior as WeightStore.
         cfg_probe = ModelConfig.from_dir(model_dir)
         mtype = cfg_probe.model_type
+        if qwen35_kv_topup_request == "1" and mtype not in ("qwen3_5", "qwen3_5_moe"):
+            raise RequestValidationError("serial KV top-up requires a Qwen3.5-family target")
         if (glm53_native_fp8_dequant_request == "1"
                 and mtype not in ("glm_moe_dsa", "glm5_next")):
             raise RequestValidationError(
@@ -2863,6 +2876,7 @@ class EngineManager:
                     qwen35_batched_mlp_request == "1")
                 rc.qwen35_serial_kv_reclaim = (
                     os.environ.get("VMODEL_QWEN35_SERIAL_KV_RECLAIM", "0") == "1")
+                rc.qwen35_serial_kv_reclaim_topup = (qwen35_kv_topup_request == "1")
                 rc.qwen35_serial_verify_suspend_lm_head = (
                     qwen35_suspend_lm_head_request == "1")
                 rc.qwen35_serial_verify_suspend_lm_head_min_prompt_tokens = (
@@ -9722,6 +9736,7 @@ def _cache_phase_telemetry(name: str, phase_result: dict) -> dict:
                 "qwen_mtp_kda_factor_head_active_released_bytes",
                 "qwen_mtp_used", "qwen35_serial_verify_suspend_lm_head",
                 "qwen35_serial_kv_reclaim_enabled", "qwen35_serial_kv_reclaim",
+                "qwen35_serial_kv_reclaim_topup_enabled",
                 "qwen35_serial_verify_suspend_lm_head_min_prompt_tokens",
                 "qwen35_serial_verify_suspend_lm_head_request_active",
                 "qwen35_serial_verify_head_restore_calls",
@@ -10558,6 +10573,7 @@ def _vision_protocol_timing(result: dict) -> dict:
         "qwen35_serial_verify_exact_page_admission",
         "qwen35_serial_verify_batched_mlp",
         "qwen35_serial_kv_reclaim_enabled",
+        "qwen35_serial_kv_reclaim_topup_enabled",
         "qwen35_serial_verify_suspend_lm_head",
         "qwen35_serial_verify_suspend_lm_head_min_prompt_tokens",
         "qwen35_serial_verify_suspend_lm_head_request_active",

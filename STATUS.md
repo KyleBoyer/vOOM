@@ -1,5 +1,66 @@
 # STATUS — 2026-09-08 UTC (current corrections first; dated chronology below is history)
 
+## 2026-09-08 UTC: bounded exact serial-KV top-up is opt-in and mechanism-gated
+
+After the user's additional app cleanup, a fresh30.0315s performance preflight
+passes: available6.4309 ->6.5699GB, zero swap growth/churn,16 known-transcoder
+observations. This is healthier launch headroom, not completed serving pressure
+or a causal speedup attribution. Plex/Tdarr/user apps and model data are untouched.
+
+Added `qwen35-serial-kv-reclaim-topup`, extending the existing one-pass recovery
+with ONLY `VMODEL_QWEN35_SERIAL_KV_RECLAIM_TOPUP=1`. It remains explicit/default-off.
+A refused Qwen serial reservation gets at most ONE additional exact closed-page
+spill only after the first spill produces positive logical AND observed Metal
+release and still leaves a deficit. Its size comes from ANOTHER fresh live
+snapshot, not a captured4.7MB pad. The original governor still owns the one final
+ordinary reserve; no physical/logical allocation credit, reduced margin or loop.
+Current-layer pages, tails, recurrent state and fixed256MB KV budget stay intact.
+No progress, aliases, exhausted candidates and I/O errors cannot bypass admission.
+
+RuntimeConfig/YAML/server configuration, engine identity, ordinary/MTP completion
+and both protocol exports carry the explicit flag. The server rejects malformed
+values, missing parent recovery and non-Qwen targets. v2 recovery records retain
+both spill passes plus the intervening fresh check; v1 stays the one-pass control.
+Both captured drivers now require matching profile/config flags, every phase's
+top-up flag and v2 records, exact aggregate arithmetic and chronological raw-log
+coverage. Empty traces prove only inactive configuration, never released memory.
+
+Selected strict no-real-MLX suite522 PASS11.90s;127 profiles validate. Controls
+exercise multiple byte scales, between-pass active-memory movement, aliases,
+no candidates, fresh-zero deficit, two-pass hard limit, partial I/O failures,
+strict opt-in/dependency, retained v1 compatibility and corrupted witnesses.
+
+Supervised `huihui_serial_kv_topup_integration_20260908` passes74 actual-MLX tests
+in1.79s. A controlled device-ceiling decrease makes one-pass recovery refuse;
+the new second pass admits with the ordinary real governor, while aliases and
+exhausted-memory controls still refuse. Exact BF16 full history, SDPA output,
+rollback257, protected current layer/tails and recurrent identity pass.
+This uses synthetic activations and a TEST-ONLY ceiling/settle control, not
+natural host pressure or model tokens. The unchanged separate5046-token/16-attention
+geometry probe releases138,412,032B logical AND Metal in0.055135s, versus0B
+Metal with retained aliases; its16 history hashes match an independent NumPy
+integer-to-BF16 oracle. That geometry timing is NOT the second-spill timing.
+
+Driver3.2368s/parent5.5338s; true Metal peak285,589,582B, minimum sampled available
+6,346,801,152B, swap-out294,912B/net growth0. Root/external minima
+21,424,082,944B/100,237,795,328B; fast tier62,512,074,752B.
+All791 dirty-source/start-end/fresh manifest entries, result/log/preflight
+hashes, independent history oracle, pressure and process receipts verified
+BEFORE edits; PIDs61633/61637 gone, session47293 drained exit0.
+Base commita8cde0f; tree
+c34daa5c6b1ba1383790ca8c7c69d9632febde6f17fb6e8cfdd0f75783ae51b8;
+result7287a0bb33513751f73f9f6c15b971702a0011d9fc40f32500c5cad5cbb5bae5;
+receipt758f3da707b10ea608a9dbe51260308c3a778114616d64a5decfcb29dad82447;
+logae1f62497d7212d9e840503253f6466acdcbda2732206a5567f2d6036a1cf531;
+preflightb538a78754592c7e27ff5ed0bfc5b550c84ccb1f656b84dbddfdb2d2e46b840c.
+
+No real serving result from the new top-up option yet. Next: fresh preflight
+and original small captured shapes, then the real full-workflow/saved-continuation
+gate with only this declared profile delta. Saved-continuation currently requires
+identical source profiles: do not silently weaken that provenance check to
+compare the new overlay. Full harness completion, model-only Plex score, large
+actual output and under90s remain OPEN; no default promotion or new speed claim.
+
 ## 2026-09-08 UTC: real continuation KV recovery frees69.2MB, but live admission still refuses
 
 `huihui_saved_continuation_isolated_20260908` on clean/pushed

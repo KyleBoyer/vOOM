@@ -1,0 +1,10 @@
+schema: voom.runtime-profile.v1
+name: qwen35-serial-kv-reclaim-topup
+description: Explicit bounded second exact KV spill after observed physical progress.
+extends:
+  - qwen35-serial-kv-reclaim
+notes:
+  - "At most one additional spill, sized only from a fresh live deficit after first-pass logical and physical progress. Both preserve current-layer pages, tails, recurrent state and the fixed KV budget. Admission always requires an ordinary governor reservation; no physical/logical byte credit, reduced margin or unbounded retry."
+  - "Experimental, no default promotion. Require v2 per-pass log witnesses, exact state/alias/error controls and real request gates. The parent one-pass profile remains the comparison control."
+settings:
+  VMODEL_QWEN35_SERIAL_KV_RECLAIM_TOPUP: true

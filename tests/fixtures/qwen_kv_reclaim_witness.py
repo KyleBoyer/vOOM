@@ -16,10 +16,78 @@ def _seconds(value):
     return type(value) in (int, float) and math.isfinite(value) and value >= 0
 
 
+def validate_config(config, env):
+    """Selected recovery profiles must opt into all matching evidence gates."""
+    for flag, setting in (
+            ('require_serial_kv_reclaim', 'VMODEL_QWEN35_SERIAL_KV_RECLAIM'),
+            ('require_serial_kv_reclaim_topup', 'VMODEL_QWEN35_SERIAL_KV_RECLAIM_TOPUP')):
+        assert type(config.get(flag, False)) is bool
+        assert env.get(setting, '0') in ('0', '1')
+        assert config.get(flag, False) is (env.get(setting, '0') == '1')
+    assert not config.get('require_serial_kv_reclaim_topup', False) or config.get('require_serial_kv_reclaim', False)
+
+
+def _valid_snapshot(sample, incoming, margin):
+    return (isinstance(sample, dict) and all(_integer(sample.get(k)) for k in (
+        'metal_active_bytes', 'system_available_bytes', 'ceiling_bytes', 'deficit_bytes'))
+        and sample['deficit_bytes'] == max(0,
+            sample['metal_active_bytes'] + incoming + margin - sample['ceiling_bytes']))
+
+
+def _valid_topup(row):
+    """Reconcile both spill passes without equating physical and host deltas."""
+    if row.get('topup_enabled') is not True:
+        return False
+    passes = row.get('reclaim_passes')
+    if not isinstance(passes, list) or not 1 <= len(passes) <= 2 or 'topup_check' not in row:
+        return False
+    for part in passes:
+        if not isinstance(part, dict) or not all(_integer(part.get(k)) for k in (
+                'requested_bytes', 'logical_before_bytes', 'logical_after_bytes',
+                'logical_reclaimed_bytes', 'spill_pages')):
+            return False
+        if (not all(_seconds(part.get(k)) for k in ('spill_seconds', 'reclaim_seconds'))
+                or part['reclaim_seconds'] < part['spill_seconds'] - 1e-6
+                or type(part.get('metal_active_released_bytes')) is not int):
+            return False
+        if not all(_valid_snapshot(part.get(k), row['incoming_bytes'], row['margin_bytes'])
+                   for k in ('before', 'after_reclaim')):
+            return False
+        if (part['requested_bytes'] != part['before']['deficit_bytes']
+                or part['logical_reclaimed_bytes'] != part['logical_before_bytes'] - part['logical_after_bytes']
+                or (part['logical_reclaimed_bytes'] > 0) != (part['spill_pages'] > 0)
+                or (part['requested_bytes'] == 0 and part['logical_reclaimed_bytes'] != 0)
+                or part['metal_active_released_bytes'] != part['before']['metal_active_bytes'] - part['after_reclaim']['metal_active_bytes']):
+            return False
+    first, last = passes[0], passes[-1]
+    if (first['before'] != row['before'] or last['after_reclaim'] != row['after_reclaim']
+            or first['logical_before_bytes'] != row['logical_before_bytes']
+            or last['logical_after_bytes'] != row['logical_after_bytes']):
+        return False
+    for key in ('logical_reclaimed_bytes', 'spill_pages', 'spill_seconds', 'reclaim_seconds'):
+        total = sum(p[key] for p in passes)
+        if key.endswith('seconds'):
+            if not math.isclose(row[key], total, rel_tol=1e-12, abs_tol=1e-6):
+                return False
+        elif row[key] != total:
+            return False
+    eligible = (first['logical_reclaimed_bytes'] > 0
+        and first['metal_active_released_bytes'] > 0 and first['after_reclaim']['deficit_bytes'] > 0)
+    check = row['topup_check']
+    if not eligible:
+        return check is None and len(passes) == 1
+    if not _valid_snapshot(check, row['incoming_bytes'], row['margin_bytes']):
+        return False
+    if not check['deficit_bytes']:
+        return len(passes) == 1
+    return (len(passes) == 2 and last['before'] == check
+        and last['logical_before_bytes'] == first['logical_after_bytes'])
+
+
 def _valid_record(row, budget):
     if not isinstance(row, dict):
         return False
-    if (row.get('schema') != 'voom.qwen35-serial-kv-reclaim.v1'
+    if (row.get('schema') not in ('voom.qwen35-serial-kv-reclaim.v1', 'voom.qwen35-serial-kv-reclaim.v2')
             or row.get('outcome') != 'admitted'
             or row.get('reservation_retried') is not True or 'error_type' in row):
         return False
@@ -50,7 +118,9 @@ def _valid_record(row, budget):
         and (released > 0) == (row['spill_pages'] > 0)
         and (row['requested_bytes'] > 0 or released == 0)
         and row['metal_active_released_bytes'] == row['before']['metal_active_bytes']
-            - row['after_reclaim']['metal_active_bytes'])
+            - row['after_reclaim']['metal_active_bytes']
+        and (_valid_topup(row) if row['schema'].endswith('.v2') else not any(
+            k in row for k in ('topup_enabled', 'topup_check', 'reclaim_passes'))))
 
 
 def valid_trace(value, *, budget_bytes):
@@ -82,7 +152,7 @@ def valid_trace(value, *, budget_bytes):
     return True
 
 
-def phase_checks(response, timing, *, budget_bytes):
+def phase_checks(response, timing, *, budget_bytes, topup_required=False):
     phases = response.get('vmodel_cache_phases')
     valid = isinstance(phases, list) and bool(phases)
     key = 'qwen35_serial_kv_reclaim'
@@ -93,7 +163,12 @@ def phase_checks(response, timing, *, budget_bytes):
             and (not require_budget or (
                 type(value.get('paged_kv_budget_bytes')) is int
                 and value['paged_kv_budget_bytes'] == budget_bytes)) and key in value
-            and valid_trace(value[key], budget_bytes=budget_bytes))
+            and valid_trace(value[key], budget_bytes=budget_bytes)
+            and (not topup_required or (
+                type(value.get(key + '_topup_enabled')) is int
+                and value[key + '_topup_enabled'] == 1
+                and all(r.get('schema') == 'voom.qwen35-serial-kv-reclaim.v2'
+                    for r in value[key].get('records', [])))))
     complete = valid and all(witnessed(phase) for phase in phases)
     # The existing protocol carries KV budget on phases, not flat timing.
     # Keep every phase's budget mandatory; compare flat trace/flag separately.
@@ -102,7 +177,7 @@ def phase_checks(response, timing, *, budget_bytes):
             and timing[key] == phases[-1][key]))
 
 
-def log_coverage(responses, log_text, *, budget_bytes):
+def log_coverage(responses, log_text, *, budget_bytes, topup_required=False):
     """Require exact chronological event identity across every hidden/public phase."""
     prefix = '[qwen35-serial-kv-reclaim] '
     try:
@@ -111,7 +186,8 @@ def log_coverage(responses, log_text, *, budget_bytes):
         expected = []
         for response in responses:
             timing = response.get('vmodel_timing', {})
-            if not all(phase_checks(response, timing, budget_bytes=budget_bytes).values()):
+            if not all(phase_checks(response, timing, budget_bytes=budget_bytes,
+                    topup_required=topup_required).values()):
                 raise ValueError('incomplete phases')
             for phase in response['vmodel_cache_phases']:
                 expected.extend(phase['qwen35_serial_kv_reclaim'].get('records', []))
