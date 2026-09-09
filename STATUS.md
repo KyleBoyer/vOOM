@@ -33,13 +33,44 @@ pre-fetch refusal, prefetch safety, failure paths, default neutrality, protocol
 coverage and real governor logic with controlled samples. Selected strict
 no-real-MLX suite704 PASS13.75s;129 profiles validate; diff check passes.
 
-Pure cache ordering shows14 units transient before post-fetch eviction versus
-8 with pretrim (whole3-unit victim pages); this is NOT measured Metal or
-Huihui memory savings. A fresh-preflight, supervised tiny BF16 real-Metal
-ordering/logit gate is prepared next; it is not full model/harness proof.
-Do not promote the candidate or claim speed/pressure/quality improvement yet.
-No model job was running when these changes were made. Existing guardrails,
-full-answer/Plex/held-out/large-context and under90s requirements stay open.
+The supervised tiny real-Metal follow-up now independently passes on clean/
+pushed714cb65a5654a899a4999e1917a8b000978ca27b. Actual StreamingEngine head
+getter, WeightCache and live MemoryGovernor; synthetic1024x2048 BF16 head4MiB,
+three3MiB body pages and1MiB pin under the same10MiB cache budget. Before head
+load all arms have10,485,792B active Metal. Baseline materialization peaks at
+14,680,098B; BOTH pre-admit arms at8,388,642B, exactly6,291,456B lower because
+two whole3MiB LRU pages are released first. All three1024-logit output byte
+hashes are identical590b84db247da44be657bea58d0b366cc95597df56d17b1eaefc53dbc4e0973e;
+each fetches once and zero-copy restores the exact head. Both candidates call
+the ordinary governor once for4,194,304B with unchanged400MB margin and5.6GB
+host reserve, with no refusal/error. Raw admission rows match final counters.
+This demonstrates real physical ordering for a TINY SYNTHETIC head, NOT a
+6MiB/43% saving on Huihui, released-weight/full-state/token equivalence, a Plex
+score or completed-harness pressure/latency improvement.
+
+Case wall8.2928/2.2820/1.9422ms, measured child work12.6468ms, parent2.4243s.
+Later arms share process/kernel warm-up; these times are NOT a speedup claim.
+Never-reset whole-process Metal peak14,680,098B. Short endpoint available
+6.5962 ->6.5639GB, swap unchanged; this is not full-window performance pressure
+qualification. Fresh30.0309s preflight passes6.7317 ->6.6385GB, zero swap growth/
+churn and16 known-transcoder samples. Root/external parent minima20,618,379,264B/
+100,414,541,824B. All802 start/end/fresh source entries, raw rows, result/log/
+preflight hashes and physical/logit calculations independently verified BEFORE
+these documentation edits. PIDs79196/79201 gone; session30116 drained exit0;
+no timeout/signal/source drift. Private verification artifact:
+logs/huihui_head_pre_admit_metal_20260909.verified.json.
+Tree915f0b70e456c52c3aac078193683047fdea8c316fb9186f7876a7f55e3ec96f;
+result577851484529031d686a5d377e011cd300aa1db812c4e3378c21b49c651dae62;
+receiptd0c663bc8d65960caad91d4f5acfa427aefc742820dd85ed98b8bd652d9c6a64;
+logf63f0331fdce9e7c02a6d433248c4112d2026b9b79fb173f6165214b2011436e;
+preflightb54366d920f37b06b6f9e24e67ce603a3e3c319a04c6df5e95c647aa27711ffa.
+
+No MLX/model job remains. Next qualify actual Huihui head/projection and matched
+captured-request controls with the new start/complete phase records; use the
+same activation state/constraint, not the explained warm-workflow mismatch.
+Keep candidate opt-in. Do not infer full-model savings from toy geometry or
+weaken reserve/pressure gates to pass. Existing full-answer/Plex/held-out/large-
+context and under90s requirements stay OPEN.
 
 
 ## 2026-09-09 UTC: bounded pre-generation constraint/activation provenance added
