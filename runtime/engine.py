@@ -1299,6 +1299,9 @@ class RuntimeConfig:
     # projection, released before each multi-position target-trunk sweep, then
     # the verifier's demand-loaded head is re-pinned without a second read.
     qwen35_serial_verify_suspend_lm_head: bool = False
+    # Exact, opt-in prefetch pause / dead-LRU trim / ordinary governor reserve
+    # BEFORE a dormant phase head is demand-loaded, rather than post-fetch LRU.
+    qwen35_phase_head_pre_admit: bool = False
     # Content-blind activation boundary for the explicit head lifecycle.
     # 8192 is the measured production candidate. Lower values are useful only
     # for composed experiments (for example a wider exact verifier that needs
@@ -1720,6 +1723,7 @@ class RuntimeConfig:
             qwen35_serial_kv_reclaim_topup=run.get("qwen35_serial_kv_reclaim_topup", False),
             qwen35_serial_verify_suspend_lm_head=run.get(
                 "qwen35_serial_verify_suspend_lm_head", False),
+            qwen35_phase_head_pre_admit=run.get("qwen35_phase_head_pre_admit", False),
             qwen35_serial_verify_suspend_lm_head_min_prompt_tokens=run.get(
                 "qwen35_serial_verify_suspend_lm_head_min_prompt_tokens",
                 QWEN35_PHASE_HEAD_MIN_PROMPT_TOKENS),
@@ -2625,6 +2629,7 @@ class StreamingEngine:
         self._qwen35_serial_verify_head_restore_s = 0.0
         self._qwen35_lm_head_pin_suspended = False
         self._qwen35_lm_head_suspend_request_active = False
+        self._qwen35_phase_head_admission_stats = {}
         self._qwen4_lm_head_pin_suspended = False
         self._qwen4_phase_head_bytes = 0
         self._qwen4_phase_head_suspend_calls = 0
@@ -2725,6 +2730,9 @@ class StreamingEngine:
                 real_name=self.store._real_name.get("lm_head.weight", "lm_head.weight"))
 
         phase_scoped_qwen35_head = bool(
+            self.rc.qwen35_serial_verify_suspend_lm_head)
+        from .qwen_phase_head_admission import validate_policy
+        validate_policy(self.rc.qwen35_phase_head_pre_admit,
             self.rc.qwen35_serial_verify_suspend_lm_head)
         phase_scoped_qwen4_head = bool(self.rc.qwen4_phase_lm_head)
         phase_scoped_glm53_head = bool(self.rc.glm53_phase_lm_head)
@@ -5769,6 +5777,11 @@ class StreamingEngine:
             return self._streamed_lm_head
         if self._lm_head_w is not None:
             return self._lm_head_w
+        if (self._qwen35_lm_head_pin_suspended
+                and getattr(self.rc, "qwen35_phase_head_pre_admit", False) is True
+                and self._qwen35_lm_head_suspend_request_active):
+            from .qwen_phase_head_admission import load_head
+            return load_head(self)
         if (self._qwen4_lm_head_pin_suspended and bool(getattr(
                 self.rc,
                 "qwen4_serial_verify_suspend_lm_head",
@@ -11536,6 +11549,7 @@ class StreamingEngine:
         self._qwen35_serial_verify_head_restore_s = 0.0
         self._qwen35_lm_head_suspend_request_active = False
         self._qwen4_phase_head_suspend_calls = 0
+        self._qwen35_phase_head_admission_stats = {}
         self._qwen4_phase_head_suspend_bytes = 0
         self._qwen4_phase_head_suspend_s = 0.0
         self._qwen4_phase_head_restore_calls = 0
@@ -14303,6 +14317,10 @@ class StreamingEngine:
             kv.rotated_view_nbytes()
             if getattr(kv, "position_free", False) else 0)
         paged_stats = getattr(kv, "stats", None)
+        if getattr(self.rc, "qwen35_phase_head_pre_admit", False) is True:
+            path_stats["qwen35_phase_head_pre_admit_enabled"] = 1
+            path_stats["qwen35_phase_head_admission"] = dict(
+                self._qwen35_phase_head_admission_stats)
         if self.rc.qwen35_serial_kv_reclaim:
             path_stats["qwen35_serial_kv_reclaim_enabled"] = 1
             path_stats["qwen35_serial_kv_reclaim_topup_enabled"] = int(

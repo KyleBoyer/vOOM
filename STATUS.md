@@ -1,5 +1,47 @@
 # STATUS — 2026-09-09 UTC (current corrections first; dated chronology below is history)
 
+## 2026-09-09 UTC: exact head pre-admission candidate closes a pre-fetch lifetime gap
+
+Cold/bootstrap audit found a concrete allocation-order gap: Qwen's dormant
+head went directly through WeightCache.get(), which materializes the new page
+BEFORE evicting over-budget LRU pages. Unlike the existing Qwen4/GLM phase-head
+paths, no exact head reservation preceded this Qwen fetch. The real Huihui
+lease is675,430,400B. This is a code-level hazard, NOT proof that it caused
+the previous4.93GB host-availability dip; that sample occurred later during
+serial verification, after cache contraction, and cannot establish ownership.
+
+Added explicit default-off qwen35-phase-head-pre-admit overlay /
+VMODEL_QWEN35_PHASE_HEAD_PRE_ADMIT=1. Requires the existing phase-head policy
+and its active request-length gate. The actual head getter pauses/joins
+prefetch, trims only evictable LRU to max(0, budget-exact dormant lease bytes),
+asks the ordinary governor to reserve those bytes with its unchanged400MB
+margin, then performs the same fetch and zero-copy pin promotion. Failed
+reservation cannot fetch. A newly requested governor prefetch pause survives
+cleanup. Other profiles/owned heads/inactive requests retain their old path.
+No weight, projection arithmetic, KV/state, sampling, host routing or budget/
+floor change by the helper. Normal governor cache reductions/restoration remain
+authoritative; the new reason uses its established reversible-admission policy.
+
+Bounded per-head records distinguish requested/trimmed bytes, reservation,
+fetch, promotion, refusal/error and wall time; logical trim is explicitly NOT
+physical release. Full-attempt statistics include bootstrap AND following MTP,
+and survive hidden/public and HTTP timing serialization without inventing
+missing legacy fields. Typed config/YAML, both serving engine-cache identities
+and Qwen-only/dependency guards are wired.25 new pure tests include actual
+head-dispatch AST + real WeightCache coordination, exact unchanged head object,
+pre-fetch refusal, prefetch safety, failure paths, default neutrality, protocol
+coverage and real governor logic with controlled samples. Selected strict
+no-real-MLX suite704 PASS13.75s;129 profiles validate; diff check passes.
+
+Pure cache ordering shows14 units transient before post-fetch eviction versus
+8 with pretrim (whole3-unit victim pages); this is NOT measured Metal or
+Huihui memory savings. A fresh-preflight, supervised tiny BF16 real-Metal
+ordering/logit gate is prepared next; it is not full model/harness proof.
+Do not promote the candidate or claim speed/pressure/quality improvement yet.
+No model job was running when these changes were made. Existing guardrails,
+full-answer/Plex/held-out/large-context and under90s requirements stay open.
+
+
 ## 2026-09-09 UTC: bounded pre-generation constraint/activation provenance added
 
 The saved-continuation comparison exposed a concrete missing identity: a

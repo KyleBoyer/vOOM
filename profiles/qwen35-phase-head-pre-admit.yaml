@@ -1,0 +1,8 @@
+schema: voom.runtime-profile.v1
+name: qwen35-phase-head-pre-admit
+description: Experimental exact pre-admission before a dormant Qwen phase head is fetched.
+notes:
+  - "Requires the existing phase-scoped Qwen head and its active prompt-length gate. Pauses prefetch, trims only evictable LRU pages, then asks the unchanged governor for exact suspended-lease bytes BEFORE demand fetch/pin promotion. No model representation, head matmul, KV, cache budget or reserve-floor changes."
+  - "Default-off memory-lifetime experiment, not a measured speed or pressure win. Logical LRU release is not physical headroom credit. Need actual head peak/admission and raw-token/state/quality gates; fail before fetch if ordinary reservation refuses."
+settings:
+  VMODEL_QWEN35_PHASE_HEAD_PRE_ADMIT: true

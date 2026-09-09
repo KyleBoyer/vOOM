@@ -4387,6 +4387,10 @@ class QwenMTPSpeculativeEngine:
             path_stats, "qwen_mtp_draft_reranked_lm_head_",
             draft_rerank_totals)
 
+        if getattr(tgt.rc, "qwen35_phase_head_pre_admit", False) is True:
+            path_stats["qwen35_phase_head_pre_admit_enabled"] = 1
+            path_stats["qwen35_phase_head_admission"] = dict(
+                tgt._qwen35_phase_head_admission_stats)
         request_cache_after = _cache_io_snapshot(tgt)
         _record_cache_io_delta(
             tgt, request_cache_before, path_stats, after=request_cache_after)
