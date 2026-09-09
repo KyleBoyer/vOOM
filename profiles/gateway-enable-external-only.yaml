@@ -1,0 +1,8 @@
+schema: voom.runtime-profile.v1
+name: gateway-enable-external-only
+description: Explicit prompt-only gateway enable-tools description ablation.
+notes:
+  - "The legacy description suggests enabling tools to interpret a previous result, conflicting with the private routing policy's direct-answer option. This candidate limits the description to genuinely remaining external operations. It does not force stopping, inspect hasMore flags, change tool schemas/grammar, render an answer, repair arguments, or change model weights/state."
+  - "Default-off and not lossless: changing model-visible prose may change generated tokens. Requires full-output model-only quality and varied completed/unfinished/multi-action result shapes before any promotion. No measured latency or quality win yet."
+settings:
+  VMODEL_FAST_TOOL_GATEWAY_ENABLE_EXTERNAL_ONLY: true

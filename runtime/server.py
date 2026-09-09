@@ -8414,8 +8414,18 @@ def _hidden_tool_search_pair():
     return wrapped, raw
 
 
-def _hidden_tool_enable_pair():
+def _hidden_gateway_enable_description_policy(value: str = "0") -> str:
+    """An explicit prompt ablation, never a host stopping rule."""
+    if type(value) is not str or value not in ("0", "1"):
+        raise RequestValidationError(
+            "VMODEL_FAST_TOOL_GATEWAY_ENABLE_EXTERNAL_ONLY must be 0 or 1")
+    return "external-only-v1" if value == "1" else "legacy"
+
+
+def _hidden_tool_enable_pair(*, external_only: bool = False):
     """Return the stable gateway-only reuse-current-catalog function."""
+    if type(external_only) is not bool:
+        raise ValueError("external_only must be a boolean")
     raw = {
         "type": "function",
         "name": _HIDDEN_TOOL_ENABLE_NAME,
@@ -8425,6 +8435,14 @@ def _hidden_tool_enable_pair():
             "with corrected arguments, or interpreting a prior tool result. "
             "Use vmodel_search_tools instead when a different capability or "
             "replacement tool may be needed."
+        ) if not external_only else (
+            "Reuse the real tools already enabled only when another external "
+            "operation is necessary, such as unfinished pagination or "
+            "correcting a failed request. Reading, interpreting, filtering, "
+            "or summarizing results already in the conversation does not "
+            "require enabling tools. Answer directly when those results "
+            "suffice; use vmodel_search_tools when a different external "
+            "capability is still needed."
         ),
         "parameters": {
             "type": "object",
@@ -8440,10 +8458,11 @@ def _hidden_tool_enable_pair():
     return wrapped, raw
 
 
-def _hidden_gateway_virtual_pairs():
+def _hidden_gateway_virtual_pairs(*, enable_external_only: bool = False):
     """The decision catalog is exactly these two schemas on every turn."""
     search, search_raw = _hidden_tool_search_pair()
-    enable, enable_raw = _hidden_tool_enable_pair()
+    enable, enable_raw = _hidden_tool_enable_pair(
+        external_only=enable_external_only)
     return [search, enable], [search_raw, enable_raw]
 
 
@@ -12321,6 +12340,7 @@ class Handler(BaseHTTPRequestHandler):
         gateway_execution_context_request = "auto"
         gateway_qwen_moe_top_k_request = "auto"
         gateway_suffix_contract = False
+        gateway_enable_description_profile = "legacy"
         gateway_literal_grounding = False
         gateway_terminal_pagination_synthesis_enabled = False
         gateway_terminal_pagination_synthesis = False
@@ -12336,6 +12356,9 @@ class Handler(BaseHTTPRequestHandler):
         gateway_virtual_tools = []
         gateway_virtual_raw = []
         if gateway_enabled:
+            gateway_enable_description_profile = \
+                _hidden_gateway_enable_description_policy(os.environ.get(
+                    "VMODEL_FAST_TOOL_GATEWAY_ENABLE_EXTERNAL_ONLY", "0"))
             try:
                 gateway_limit = int(os.environ.get(
                     "VMODEL_FAST_TOOL_GATEWAY_LIMIT", "32"))
@@ -12478,7 +12501,8 @@ class Handler(BaseHTTPRequestHandler):
                 else _hidden_gateway_force_reason(msgs)
             )
             gateway_virtual_tools, gateway_virtual_raw = (
-                _hidden_gateway_virtual_pairs())
+                _hidden_gateway_virtual_pairs(enable_external_only=(
+                    gateway_enable_description_profile == "external-only-v1")))
             prompt_catalog = (
                 [] if (gateway_terminal_pagination_synthesis
                        or gateway_deterministic_render is not None)
@@ -12844,6 +12868,8 @@ class Handler(BaseHTTPRequestHandler):
                 "gateway_query_context_profile": (
                     gateway_query_context_profile),
                 "gateway_decision_branch": decision_branch,
+                "gateway_enable_description_profile": (
+                    gateway_enable_description_profile),
                 "gateway_host_routed": int(host_action is not None),
                 "gateway_direct_streaming": bool(
                     decision_stream is not None

@@ -77,6 +77,12 @@ def acceptance(row, response, config, *, initial_action=True):
     witness = t.get('generation_witness') or {}
     before, after = row['pressure_before'], row['pressure_after']
     checks = action_checks(response) if initial_action else {}
+    expected_description = config.get('gateway_enable_description_profile')
+    if expected_description is not None:
+        checks['gateway_enable_description_profile'] = (
+            expected_description in ('legacy', 'external-only-v1')
+            and (response.get('vmodel_tool_selection') or {}).get(
+                'gateway_enable_description_profile') == expected_description)
     if config.get('workflow') == 'saved_budget_extension':
         from tests.fixtures import plex_agent_profile as plex
         checks['terminal_answer_without_pending_calls'] = (
@@ -448,6 +454,11 @@ def run(config):
     env = {}
     profile = apply_runtime_profiles(config['profiles'], environ=env)
     assert profile.profile_digest == config['profile_digest']
+    if config.get('gateway_enable_description_profile') is not None:
+        from runtime.server import _hidden_gateway_enable_description_policy
+        assert config['gateway_enable_description_profile'] == (
+            _hidden_gateway_enable_description_policy(env.get(
+                'VMODEL_FAST_TOOL_GATEWAY_ENABLE_EXTERNAL_ONLY', '0')))
     serial_kv_required = env.get('VMODEL_QWEN35_SERIAL_KV_RECLAIM') == '1'
     from tests.fixtures.qwen_kv_reclaim_witness import validate_config
     validate_config(config, env)

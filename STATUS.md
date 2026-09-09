@@ -1,4 +1,54 @@
-# STATUS — 2026-09-08 UTC (current corrections first; dated chronology below is history)
+# STATUS — 2026-09-09 UTC (current corrections first; dated chronology below is history)
+
+## 2026-09-09 UTC: explicit gateway-description ablation prepared from a concrete routing conflict
+
+The last failed selector did see every final-page result. Its existing
+`vmodel_enable_tools` description nevertheless says to reuse tools for
+"interpreting a prior tool result", while the private decision policy says
+to answer from results unless another external action is required. This is
+a concrete prompt conflict and a hypothesis for repeated enable calls, NOT
+proof that it caused the model's behavior.
+
+Added default-off `gateway-enable-external-only` /
+`VMODEL_FAST_TOOL_GATEWAY_ENABLE_EXTERNAL_ONLY=1`. ONLY that virtual tool's
+description changes: result interpretation/filtering/summarization alone does
+not require enabling tools; unfinished pagination, corrections and genuinely
+remaining external actions still may. There is no hasMore-based stop branch,
+new host routing, answer rendering, argument repair, schema/grammar, output
+budget, sampling, weight/state, cache or memory-setting change. The real-tool
+execution policy is untouched. This changes model-visible prose and is an
+explicit lossy prompt ablation, not a released-BF16 lossless optimization.
+
+Default helper rendering remains byte/token-compatible: both6132/7067-token
+prepared prompts from the prior failed diagnostic still match their complete
+recorded hashes. The candidate selector reconstruction is6146 tokens
+(+14, not a prompt-size speed trick), SHA
+585261feaad8a97bce370b5b15a49106523940381c9ca0b18aaf3546c963252a;
+all five result strings retain exact original multiplicities. This is
+tokenizer-only evidence, not a model result. The default remains legacy.
+Serving metadata now reports `gateway_enable_description_profile`;
+the captured gate can require its exact value on every HTTP.
+
+28 new pure tests cover strict opt-in types, detached/unchanged schemas and
+search tool, legacy default, one-setting profile delta, actual handler wiring/
+metadata, and unchanged completed/unfinished-page routing even with a further
+requested external action. They do NOT prove model behavior on those shapes.
+Selected strict no-real-MLX suite610 PASS12.19s;128 profiles validate.
+
+Next bounded evaluation: a FRESH full legacy captured workflow, not another
+extra-budget continuation. Preserve178616B/134 tools, first wire178694B/hash
+f7c1c60c46e8ed5e88eabe9c43d8bdcc74755561e1b69ed8e5f116f2125ce318,
+same model/max1024/temp0/seed64013, unchanged mixed-page fixture and four-handled-
+round/five-HTTP budget. Candidate profile digest
+2d5af6d447cedc625d8d74674cc73bffa697d2c289af4bc127e7c678d7b36712.
+Only add the description overlay to the existing full-state MXFP4/reassociated/
+Hermes/gateway/top-up stack; require actual external-only-v1 metadata, natural
+completion, model-only answer/rubric, full state/path and unchanged pressure gates.
+Fresh30s preflight, one supervised job, no source edits during measurement.
+Do not claim a speed/quality win or promote a default from pure tests or this
+single fixture. Varied real request shapes and multi-action model evaluation
+remain mandatory afterward; old failed runs and scores stay unchanged.
+
 
 ## 2026-09-08 UTC: extra-budget continuation fails despite clean pressure; prompt visibility verified
 
