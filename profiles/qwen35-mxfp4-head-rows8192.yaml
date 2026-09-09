@@ -1,0 +1,10 @@
+schema: voom.runtime-profile.v1
+name: qwen35-mxfp4-head-rows8192
+description: Smaller bit-verified native Huihui head tiles for tight draft-phase headroom.
+notes:
+  - "Changes only vocabulary rows per block from32768 to8192, reducing the two-copy tile reservation from178257920B to44564480B. Keeps full vocabulary, singleton contractions and all existing safety margins; no request-output cap."
+  - "The32768-row real short probe reached native MTP drafting but refused an allocation by about40MB. This is a bounded lower-workspace experiment, not a speed claim."
+extends:
+  - qwen35-mxfp4-head-rows
+settings:
+  VMODEL_QWEN35_MXFP4_HEAD_ROWS: 8192

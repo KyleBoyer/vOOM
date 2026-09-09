@@ -167,3 +167,12 @@ def test_opt_in_profiles_and_two_engine_keys_and_prompt_identity():
     for name in ('forward_tokens','forward_tokens_serial_positions'):
         method=next(n for n in cls.body if isinstance(n,ast.FunctionDef) and n.name==name)
         assert ast.unparse(method.body[1]).startswith('mxfp4_head_policy.validate_forward(')
+
+
+def test_small_tile_overlay_changes_only_preverified_row_size():
+    before={}; after={}
+    base=['huihui-qwen38-27b-direct-head-rows-audit']
+    apply_runtime_profiles(base,environ=before)
+    apply_runtime_profiles(base+['qwen35-mxfp4-head-rows8192'],environ=after)
+    assert {k:(before.get(k),after.get(k)) for k in set(before)|set(after)
+        if before.get(k)!=after.get(k)}=={'VMODEL_QWEN35_MXFP4_HEAD_ROWS':('32768','8192')}

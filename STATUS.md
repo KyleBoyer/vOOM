@@ -1,5 +1,24 @@
 # STATUS — 2026-09-09 UTC (current corrections first; dated chronology below is history)
 
+## 2026-09-09 UTC: row-streamed head reaches MTP; use smaller proven tile next
+
+Real short capture on93bd548 reaches the ACTUAL native MTP draft_step and
+shared MXFP4StreamedLMHead, then refuses a32768-row reservation: rounded
+active0.50GB + incoming0.18GB + unchanged0.40GB margin projects1.08GB against
+1.04GB live ceiling at6.14GB available. This is25.1009s HTTP to failure, not
+completed output. No blind same-profile rerun or governor-floor relaxation.
+
+The12-sample native pressure gate itself passes: minimum5,476,040,704B,
+zero swap growth and2,179,072B swap-out; all known-transcoder observations
+clear. Source813 start=end=fresh, supervisor/child/server exited, session28017
+drained. No final tokens or Plex score claimed. Artifact:
+logs/huihui_head_rows_tiered_short_20260909.json.
+
+Next is explicit qwen35-mxfp4-head-rows8192: ONLY rows/block changes, from
+32768 to8192, both already proven all-logit exact. Tile admission falls from
+178,257,920B to44,564,480B. Full vocabulary/output budget, target and all
+safety thresholds remain unchanged. Fresh preflight and result required.
+
 ## 2026-09-09 UTC: preserve the existing body-only fast tier with native head rows
 
 Second serving startup onf2ef1cc correctly rejects the initially over-broad
