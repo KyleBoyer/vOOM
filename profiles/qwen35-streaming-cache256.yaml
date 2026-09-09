@@ -1,0 +1,9 @@
+schema: voom.runtime-profile.v1
+name: qwen35-streaming-cache256
+description: Explicit bounded-startup-cache Qwen streaming experiment.
+notes:
+  - "Caps the target weight cache at256MB and disables speculative layer prefetch. Preserves target weights, operator shapes, all prepared state, output budget and existing governor floors/margins. Demand remains authoritative."
+  - "Prior Huihui short captures started with2200MB/two-layer prefetch, reached2.278GB true Metal, and ended with64-80MB cache allowances. Test whether avoiding the initial residency burst improves subsequent-request admission; no causal, speed or quality claim before measurement."
+settings:
+  VMODEL_QWEN35_WEIGHT_CACHE_MB: 256
+  VMODEL_QWEN35_PREFETCH_DEPTH: 0

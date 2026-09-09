@@ -186,3 +186,15 @@ def test_smaller_prefill_overlay_changes_only_tile_ceiling(ceiling):
     apply_runtime_profiles(base+[f'qwen35-prefill-ceiling{ceiling}'],environ=after)
     assert {k:(before.get(k),after.get(k)) for k in set(before)|set(after)
         if before.get(k)!=after.get(k)}=={'VMODEL_QWEN35_PREFILL_CHUNK_CEILING':('128',str(ceiling))}
+
+
+def test_bounded_cache_overlay_changes_only_retention_and_prefetch():
+    before={}; after={}
+    base=['huihui-qwen38-27b-direct-head-rows-audit','qwen35-mxfp4-head-rows8192',
+          'qwen35-prefill-ceiling8']
+    apply_runtime_profiles(base,environ=before)
+    apply_runtime_profiles(base+['qwen35-streaming-cache256'],environ=after)
+    assert {k:(before.get(k),after.get(k)) for k in set(before)|set(after)
+        if before.get(k)!=after.get(k)}=={
+            'VMODEL_QWEN35_WEIGHT_CACHE_MB':('2200','256'),
+            'VMODEL_QWEN35_PREFETCH_DEPTH':('2','0')}

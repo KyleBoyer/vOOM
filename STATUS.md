@@ -1,5 +1,28 @@
 # STATUS — 2026-09-09 UTC (current corrections first; dated chronology below is history)
 
+## 2026-09-09 UTC: allocator relief is a measured negative; bound startup residency next
+
+bd7b152 with host-allocator-relief completes the weather capture in71.569s
+with every reference-token/protocol/completion check. The title fails in50.0s
+at a serial-verifier page reservation, available5.53GB below the unchanged
+5.6GB live reserve. Two complete allocator observations report0 bytes returned
+and no native-footprint reduction; GC collects4 objects. Hook wall0.087902s.
+This is NOT a useful allocator-reclamation or speed result. Keep it off in
+the next candidate; do not infer the title's failure was caused by the hook.
+
+Whole-arm pressure passes59 sampled observations, minimum5,522,374,656B,
+zero swap growth,15,417,344B swap-out; clear known transcoders/alignment.
+All819 source entries start=end=fresh, session59109 drained and owned PIDs gone.
+Artifact: logs/huihui_head8192_prefill8_allocator_short_20260909.json;
+SHA5662584e841fc1635285259c6d330b2835ff600470cbb7201fec7c4b290e43f5.
+
+Next profile qwen35-streaming-cache256 caps startup weight retention256MB
+and disables speculative prefetch, versus2200MB/depth2. Earlier successful
+weather serving had2.278GB true Metal and ended at64-80MB cache allowances;
+this is a hypothesis about avoiding an initial residency burst, not proven
+causality. No new head/math, state, output, sampling, margin or reserve change.
+Require the same two real captured requests and token/pressure gates.
+
 ## 2026-09-09 UTC: stop tile-only trials; instrument unused CPU allocator reclamation
 
 On1e7b63b, head8192/prefill8 again completes the weather capture with all
