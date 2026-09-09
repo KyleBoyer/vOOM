@@ -1,5 +1,55 @@
 # STATUS — 2026-09-09 UTC (current corrections first; dated chronology below is history)
 
+## 2026-09-09 UTC: real-runtime-class numerical oracle ready; launch waits for declared workspace
+
+The existing head oracle now has an explicit --candidate-kind runtime mode on
+0d34649. It instantiates the REAL runtime MXFP4StreamedLMHead, projects the same
+six synthetic BF16 rows via logits_serial_rows(), and compares every vocabulary
+logit against the original native whole-head WeightStore/QTensor reference.
+Default --candidate-kind manual retains the earlier candidate loop; its AST
+was independently compared to b8202f8 and is unchanged.
+
+The runtime candidate uses the exact shared reader; a read witness hashes the
+actual returned bytes and returns those SAME byte objects, without replacing
+matmul, logits or inputs. It checks reader stat identity against the reference,
+complete/failed scan counts and read byte/extent counters, retaining partial
+telemetry on exceptions and closing the descriptor even if telemetry fails.
+Each case labels candidate_kind and records runtime_stats. This distinguishes
+new class evidence from the earlier manual-loop result instead of silently
+relabeling a passed experiment.
+
+An optional content-free block observer now reports loaded/released row bounds
+from the primitive. It has no callback by default; the numerical gate supplies
+the same native/process/pressure observer used by the manual experiment.
+Successful loaded/released boundaries bracket real block ownership. Callback
+errors fail this observed scan; they are not successful completion. Observer
+and byte-hashing overhead are INCLUDED in these diagnostic times. No serving
+selection, profile defaults or model arithmetic changes.
+
+Additional pure checks cover real adapter selection, unchanged returned bytes,
+identity/counter mismatches, no retry, failure cleanup, callback ordering and
+callback failures. Both candidate modes must reject failed/short/stale/disk/
+transcoder preflights before MLX. Runtime mode additionally requires completed
+periodic pressure evidence with minimum available >=6.70GB. Selected strict
+no-real-MLX suite953 PASS15.00s;129 profiles unchanged; diff check clean.
+
+No new model job or preflight was launched: startup available6,572,064,768B
+and post-test/post-push snapshot6,654,984,192B are below the declared6.70GB
+whole-reference prerequisite. The final read-only process inventory is clear,
+but that is not permission to skip the workspace check. User apps are untouched.
+This is a READY oracle, not a numerical pass for the runtime class.
+
+NEXT: after a NEW passing30s preflight with `--sample-memory-window`,
+`--min-stable-available-gb 6.70`, `--min-root-free-gb 10` and
+`--require-no-transcoders`, launch the existing
+tests/fixtures/huihui_mxfp4_head_rows_gate.py WITH `--candidate-kind runtime`
+under the bounded supervisor and a unique run/result name. Preserve source
+freeze and verify all artifacts/metadata/phase counts/bit identities/pressure
+before edits. Then explicit engine/server/profile/cache-identity and complete
+request/phase I/O attribution, followed by matched real short/full harness and
+held-out contexts. Runtime-class logits/state/serving-speed/Plex remain unproven.
+
+
 ## 2026-09-09 UTC: native MXFP4 runtime head primitive staged, not selected by serving
 
 Added runtime/mxfp4_lm_head_stream.py with MXFP4StreamedLMHead, an UNSELECTED
