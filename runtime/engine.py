@@ -1380,6 +1380,7 @@ class RuntimeConfig:
     # full (vocab, hidden) tensor (GLM: ~1.9GB). Bit-identical (only the output/vocab dim is
     # chunked, not the reduction dim). Plain safetensors checkpoints only (not vpack2/packed).
     qwen35_mxfp4_head_rows: int = 0  # explicit native MXFP4 row streaming; 0 preserves old path
+    qwen35_prefill_split_weights: bool = False
     governor: bool = True  # F16: live memory-pressure governor (safety default on)
     # Qwen3-VL preprocessing budget. 0 selects the runtime's exact global-
     # attention safety ceiling; fast mode may choose a smaller quality-gated
@@ -1741,6 +1742,7 @@ class RuntimeConfig:
             embed_rows=run.get("embed_rows", False),
             stream_lm_head=run.get("stream_lm_head", False),
             qwen35_mxfp4_head_rows=run.get("qwen35_mxfp4_head_rows", 0),
+            qwen35_prefill_split_weights=run.get("qwen35_prefill_split_weights", False),
             governor=run.get("governor", True),
             vision_max_patches=run.get("vision_max_patches", 0),
             warm_start=run.get("warm_start", 0),
@@ -2722,6 +2724,9 @@ class StreamingEngine:
 
         self._streamed_lm_head = None
         mxfp4_head_policy.validate(self.rc, self.cfg, self.store)
+        if self.rc.qwen35_prefill_split_weights:
+            from .qwen35_prefill_split import validate as validate_split_prefill
+            validate_split_prefill(self.rc,self.cfg)
         if self.rc.qwen35_mxfp4_head_rows:
             from .mxfp4_lm_head_stream import MXFP4StreamedLMHead
 
@@ -6858,6 +6863,12 @@ class StreamingEngine:
         """
         from .qwen35 import _qwen35_attention_residual, _qwen35_mlp_residual
 
+        if self.rc.qwen35_prefill_split_weights:
+            from .qwen35_prefill_split import sweep
+            return sweep(self,x,kv,offset,tile_width,on_progress,
+                layer_start=layer_start,layer_end=layer_end,profile_path=profile_path,
+                positions3=positions3,boundary_fork_at=boundary_fork_at,
+                boundary_fork_kv=boundary_fork_kv)
         if tile_width <= 0:
             raise ValueError("tile_width must be positive")
         n = self.cfg.num_hidden_layers
@@ -11274,6 +11285,7 @@ class StreamingEngine:
                 f"dead{int(self.rc.final_dead_token_elim)}"
                 f"head{int(self.rc.stream_lm_head)}"
                 f"{mxfp4_head_policy.identity(self.rc.qwen35_mxfp4_head_rows)}"
+                f"{'qwen35-split-prefill-v1' if self.rc.qwen35_prefill_split_weights else ''}"
                 f"tiedhead{int(self.rc.quantize_tied_lm_head)}"
                 f"resident{int(self.rc.resident_fast_decode)}"
                 f"residentprefill{self.rc.resident_fast_prefill_limit}"
@@ -11510,6 +11522,7 @@ class StreamingEngine:
         stop point)."""
         request_t0 = time.perf_counter()
         direct_io_before = _direct_io_snapshot(self)
+        self._qwen35_split_prefill_stats = {}
         mxfp4_head_before = mxfp4_head_policy.snapshot(self)
         qwen4_expert_before = (
             self.store.qwen4_fused_expert_snapshot()
@@ -14573,6 +14586,8 @@ class StreamingEngine:
             path_stats["qwen4_fused_expert_virtual_tensors"] = int(
                 qwen4_expert_after["virtual_tensors"])
         _record_direct_io_delta(self, direct_io_before, path_stats)
+        if self.rc.qwen35_prefill_split_weights:
+            path_stats['qwen35_split_prefill_weights'] = dict(self._qwen35_split_prefill_stats)
         mxfp4_head_policy.publish(self, path_stats, mxfp4_head_before,
                                  mxfp4_head_prefill_after)
         if qwen4_ple_before is not None:

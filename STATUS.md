@@ -1,5 +1,32 @@
 # STATUS — 2026-09-09 UTC (current corrections first; dated chronology below is history)
 
+## 2026-09-09 UTC: explicit split-weight prefill and a reproduced cache-lifetime correction
+
+2621546 accepts cache256/prefetch0 but the first short request still refuses
+a214MB prefill page after21 layers, at6.12GB available. HTTP16.9812s to
+memory-retry abort, NOT completed output. Eight native samples pass: minimum
+6,025,183,232B, zero swap growth,2,015,232B swap-out, clear transcoders/alignment.
+All820 source entries start=end=fresh, session43838 drained and owned PIDs gone.
+Artifact: logs/huihui_head8192_cache256_native_short_20260909.json;
+SHA401263ce10caf8b2f7fba9ea18b1923f5da344ef813f1a55253be0614687ecc4.
+
+New explicit qwen35-prefill-split-weights partitions each dense layer at the
+attention/MLP boundary. Each phase keeps the same tile shapes and original
+operators, processes every prepared prompt position, evaluates outputs and
+retires its weights before the next phase. All64 layer metadata partitions
+are validated before KV mutation. Requires dense native-head Huihui, governor,
+layer-stationary execution and prefetch off; rejects vision/boundary forks.
+No request-size shortcut, state truncation, safety-floor/margin change or
+automatic selection. Separate engine/prompt identities and structured phase
+counts distinguish actual execution. Arithmetic equivalence remains unproven
+until the real-request token/state gates; pure schedule tests are not that proof.
+
+The ownership audit also reproduces an independent WeightCache.discard bug:
+its local WeightPage still owns tensors during _clear_device_cache. A weakref
+test fails before the change. Drop only that retired local reference before
+allocator clearing/file invalidation; preserve caller-owned tensors, pins and
+missing-page semantics. This fixes ordering, not a measured memory/speed claim.
+
 ## 2026-09-09 UTC: native streaming cache needs a scoped configuration guard
 
 The cache256 trial on19e1797 is rejected at startup in0.1215s by the old

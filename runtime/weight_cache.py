@@ -460,6 +460,10 @@ class WeightCache:
                 self._remove_page_locked(key)
                 self.stats.evictions += 1
                 removed = True
+        # The removed page's local owner must die before clearing allocator
+        # storage or invalidating its file mappings. Consumer-held references
+        # remain untouched; this only drops our retired cache-page reference.
+        del page
         # The explicit consumer boundary warrants a clear even when ordinary
         # budget pressure removed the page first: evaluated MLX graph/cache
         # state can outlive the WeightPage object itself.

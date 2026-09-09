@@ -1680,6 +1680,11 @@ class EngineManager:
                 "VMODEL_QWEN35_MXFP4_HEAD_ROWS", "0"))
         except ValueError as error:
             raise RequestValidationError(str(error)) from error
+        qwen35_split_prefill_request = os.environ.get('VMODEL_QWEN35_PREFILL_SPLIT_WEIGHTS','0')
+        if qwen35_split_prefill_request not in ('0','1'):
+            raise RequestValidationError('VMODEL_QWEN35_PREFILL_SPLIT_WEIGHTS must be 0 or 1')
+        if qwen35_split_prefill_request == '1' and not qwen35_mxfp4_head_rows:
+            raise RequestValidationError('split prefill requires the explicit native MXFP4 head')
         if qwen35_head_pre_admit_request not in ("0", "1"):
             raise RequestValidationError("VMODEL_QWEN35_PHASE_HEAD_PRE_ADMIT must be 0 or 1")
         if qwen35_head_pre_admit_request == "1" and qwen35_suspend_lm_head_request != "1":
@@ -2487,6 +2492,7 @@ class EngineManager:
             qwen35_suspend_lm_head_request,
             qwen35_head_pre_admit_request,
             qwen35_mxfp4_head_rows,
+            qwen35_split_prefill_request,
             qwen35_suspend_lm_head_min_prompt_tokens,
             qwen_lossy_suffix_request,
             qwen_hot_kv_request,
@@ -2651,6 +2657,7 @@ class EngineManager:
             qwen35_suspend_lm_head_request,
             qwen35_head_pre_admit_request,
             qwen35_mxfp4_head_rows,
+            qwen35_split_prefill_request,
             qwen35_suspend_lm_head_min_prompt_tokens,
             qwen_lossy_suffix_request,
             qwen_hot_kv_request,
@@ -2903,6 +2910,7 @@ class EngineManager:
                     qwen35_suspend_lm_head_request == "1")
                 rc.qwen35_phase_head_pre_admit = (qwen35_head_pre_admit_request == "1")
                 configure_mxfp4_head(rc, qwen35_mxfp4_head_rows)
+                rc.qwen35_prefill_split_weights = (qwen35_split_prefill_request == '1')
                 rc.qwen35_serial_verify_suspend_lm_head_min_prompt_tokens = (
                     qwen35_suspend_lm_head_min_prompt_tokens)
                 rc.qwen_mixed_depth_endpoint_persist = (
@@ -9802,6 +9810,7 @@ def _cache_phase_telemetry(name: str, phase_result: dict) -> dict:
                 "qwen35_serial_kv_reclaim_topup_enabled",
                 "qwen35_phase_head_pre_admit_enabled", "qwen35_phase_head_admission",
                 "qwen35_mxfp4_head_io",
+                "qwen35_split_prefill_weights",
                 "qwen35_serial_verify_suspend_lm_head_min_prompt_tokens",
                 "qwen35_serial_verify_suspend_lm_head_request_active",
                 "qwen35_serial_verify_head_restore_calls",
@@ -10973,6 +10982,7 @@ def _vision_protocol_timing(result: dict) -> dict:
         "qwen35_serial_kv_reclaim",
         "qwen35_phase_head_admission",
         "qwen35_mxfp4_head_io",
+        "qwen35_split_prefill_weights",
         "tool_call_text_witness",
         "qwen4_mtp_idle_head_memory_witness",
         "qwen4_post_generation_memory_witness",

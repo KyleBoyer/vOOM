@@ -1,0 +1,9 @@
+schema: voom.runtime-profile.v1
+name: qwen35-prefill-split-weights
+description: Experimental dense Huihui attention/MLP prefill weight lifetime split.
+notes:
+  - "Needs native MXFP4 head rows and prefetch off. Retains every prepared prompt position, per-phase tile shapes, recurrence and original attention/MLP operators. No vision or boundary-fork support in this experiment."
+  - "Fetch each attention and MLP phase separately and retire its weights before admitting the next. Full prompt hidden states are retained; this is not suffix truncation. Ordinary400MB margin and live5600MB reserve remain unchanged."
+  - "Explicit/default-off. Validate actual target tokens/state and pressure before any speed or lossless claim; changing independent operation order is not numerical proof by itself."
+settings:
+  VMODEL_QWEN35_PREFILL_SPLIT_WEIGHTS: true
