@@ -1,5 +1,55 @@
 # STATUS — 2026-09-09 UTC (current corrections first; dated chronology below is history)
 
+## 2026-09-09 UTC: exact MXFP4 row oracle staged; real-head run deferred before MLX
+
+The next bounded experiment is a quantized-head ROW reader, not another run
+of the rejected whole-head pre-admission profile. Added experiment-only
+tests/fixtures/mxfp4_head_rows.py and huihui_mxfp4_head_rows_gate.py on
+5c80ec54598ed7da684137c00822d37f57bae55e. Nothing is connected to serving or
+selected by a runtime profile. The reader preserves the existing U32 packed
+MXFP4 values and U8 group scales verbatim; it neither dequantizes, requantizes,
+shortlists vocabulary nor changes the existing target representation.
+
+Pure checks cover exact row extents/tails, hidden/32 scale correspondence,
+physical dtypes, bounds/alignment/overlap, bias rejection, same-shard safe
+filenames, a 16MiB header cap, short reads/EOF, descriptor cleanup, source
+mutation and fresh preflight before any MLX/model payload. The proposed real
+oracle uses the ordinary WeightStore/QTensor whole head as its reference and
+six deterministic SYNTHETIC normalized BF16 activation rows. Each position
+keeps Qwen's (1,1,5120) matmul shape. Candidate scans use 8192/32768/65536
+vocabulary rows, including final partial blocks; all 248320 logits per input
+must be byte-identical, not merely argmax-equal. Resident component content
+hashes must match every streamed packed/scales scan. Array-geometry equality
+and actual memory savings are NOT yet proven.
+
+Per-arm read/upload/projection/wall counters, component/logit hashes, sampled
+active/allocator/system/swap/transcoder observations and a never-reset whole
+Metal peak are instrumented. Later arms share process/kernel/file-cache state;
+even a successful run would be an isolated actual-head/synthetic-input gate,
+not full-model tokens/state, request latency, Plex quality, released BF16 or
+a serving speed result. Thirty-one new pure tests pass; selected strict
+no-real-MLX suite 831 PASS in 13.87s. Existing 129 profiles are unchanged.
+
+The real-head job was NOT launched. Its declared conservative oracle workspace
+reserves 2 * 675,430,400B for the whole reference plus host staging, in addition
+to the unchanged 400MB margin and 5.6GB host reserve. The diagnostic-only launch
+minimum is therefore 7.36GB available; ordinary serving/preflight defaults
+were not changed. A fresh 30.0312s preflight returned DEFERRED_PRECONDITION:
+available 6,630,293,504B -> 6,482,542,592B, zero swap growth/out, 16 clear
+known-transcoder observations. Root/external free 20,999,155,712B /
+100,413,247,488B. No model payload or MLX array was loaded, no GPU timing or
+logit comparison exists, and no user app/data was changed.
+Artifact: logs/huihui_mxfp4_head_rows_20260909.preflight.json.
+
+No model job remains. Run this oracle only after a fresh passing preflight
+for its declared workspace; if headroom stays insufficient, audit the actual
+reference loader/staging lifetime or projection-state ownership rather than
+blindly retrying or weakening the runtime reserve. Do not wire row streaming
+into MTP/target paths until actual-geometry numerical and captured-token gates
+pass. The prior head-pre-admission failure, full-harness/Plex/held-out long
+context, large-output and under90s requirements remain open.
+
+
 ## 2026-09-09 UTC: real short-capture head pre-admission fails safely; reporting bug repaired
 
 The new opt-in head pre-admission candidate is NOT qualified on Huihui yet.
