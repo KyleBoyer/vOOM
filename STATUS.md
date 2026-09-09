@@ -1,5 +1,21 @@
 # STATUS — 2026-09-09 UTC (current corrections first; dated chronology below is history)
 
+## 2026-09-09 UTC: first serving probe catches dense default-policy conflict
+
+The initial head-row HTTP candidate on4155fb6 failed before generation:
+dense RuntimeConfig defaults quant_lm_head=True even when the optional
+environment request is0. The new native-head guard rejected that incompatible
+policy in0.4147s HTTP; this is time to failure, not serving speed. No completed
+response, model witness or pressure qualification. Saved original request identity
+matches the control. Supervisor and all813 start/end/fresh source entries were
+verified before edits, session33383 drained and server/child/parent PIDs gone.
+
+Fixed NEW-config native selection to explicitly exclude the default head
+transform, leaving disabled selection unchanged. Explicit conflicting head
+quantization requests still reject. The packed head pair/source guards remain.
+Four new pure cases cover every enabled row size and disabled policy retention.
+Next attempt needs a new preflight/result name; no failed artifact is reused.
+
 ## 2026-09-09 UTC: actual runtime head passes; explicit serving integration staged
 
 The runtime-class oracle now PASSES on clean 5d9a91c. Run

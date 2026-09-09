@@ -24,6 +24,18 @@ def identity(rows):
     return f'+native-mxfp4-head-rows-v1-{rows}' if rows else ''
 
 
+def configure(rc, rows):
+    """Set native placement on a NEW config before engine/cache construction.
+
+    Dense fast RuntimeConfig defaults quant_lm_head to True even when the
+    corresponding optional environment request is zero. Native selection
+    explicitly excludes that transform; disabled mode keeps the old policy.
+    """
+    rc.qwen35_mxfp4_head_rows = parse_rows(rows)
+    if rc.qwen35_mxfp4_head_rows:
+        rc.quant_lm_head = False
+
+
 def validate(rc, cfg, store):
     rows = parse_rows(rc.qwen35_mxfp4_head_rows)
     if not rows:

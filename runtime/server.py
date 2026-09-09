@@ -1674,7 +1674,7 @@ class EngineManager:
                 "VMODEL_QWEN35_SERIAL_VERIFY_SUSPEND_LM_HEAD must be 0 or 1")
         qwen35_head_pre_admit_request = os.environ.get(
             "VMODEL_QWEN35_PHASE_HEAD_PRE_ADMIT", "0")
-        from .qwen_mxfp4_head_policy import parse_rows
+        from .qwen_mxfp4_head_policy import parse_rows, configure as configure_mxfp4_head
         try:
             qwen35_mxfp4_head_rows = parse_rows(os.environ.get(
                 "VMODEL_QWEN35_MXFP4_HEAD_ROWS", "0"))
@@ -2759,6 +2759,8 @@ class EngineManager:
         mtype = cfg_probe.model_type
         if qwen35_mxfp4_head_rows and mtype != "qwen3_5":
             raise RequestValidationError("native MXFP4 head rows require dense Huihui Qwen")
+        if qwen35_mxfp4_head_rows and qwen_quant_lm_head_request == "1":
+            raise RequestValidationError("native MXFP4 head rows conflict with head quantization")
         if qwen35_head_pre_admit_request == "1" and mtype not in ("qwen3_5", "qwen3_5_moe"):
             raise RequestValidationError("phase-head pre-admission requires a Qwen3.5-family target")
         if qwen35_kv_topup_request == "1" and mtype not in ("qwen3_5", "qwen3_5_moe"):
@@ -2900,7 +2902,7 @@ class EngineManager:
                 rc.qwen35_serial_verify_suspend_lm_head = (
                     qwen35_suspend_lm_head_request == "1")
                 rc.qwen35_phase_head_pre_admit = (qwen35_head_pre_admit_request == "1")
-                rc.qwen35_mxfp4_head_rows = qwen35_mxfp4_head_rows
+                configure_mxfp4_head(rc, qwen35_mxfp4_head_rows)
                 rc.qwen35_serial_verify_suspend_lm_head_min_prompt_tokens = (
                     qwen35_suspend_lm_head_min_prompt_tokens)
                 rc.qwen_mixed_depth_endpoint_persist = (

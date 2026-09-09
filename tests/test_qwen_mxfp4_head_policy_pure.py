@@ -81,6 +81,16 @@ def test_no_governor_fails_and_disabled_policy_does_not_touch_source():
     policy.validate(NS(qwen35_mxfp4_head_rows=0),None,None)
 
 
+@pytest.mark.parametrize('rows',policy.ROWS)
+def test_new_config_native_selection_excludes_default_dense_head_transform(rows):
+    rc=NS(quant_lm_head=True)
+    policy.configure(rc,rows)
+    assert rc.qwen35_mxfp4_head_rows==rows
+    assert rc.quant_lm_head is (rows==0)
+    source=(ROOT/'runtime/server.py').read_text()
+    assert 'configure_mxfp4_head(rc, qwen35_mxfp4_head_rows)' in source
+
+
 @pytest.mark.parametrize('serial,width,passes',[(False,1,True),(False,2,False),
     (True,1,True),(True,64,True),(True,65,False),(True,0,False)])
 def test_forward_window_guards(serial,width,passes):
