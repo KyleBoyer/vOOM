@@ -1,5 +1,89 @@
 # STATUS — 2026-09-09 UTC (current corrections first; dated chronology below is history)
 
+## 2026-09-09 UTC: saved continuation verifies phase logging, but pressure and comparison contract block a speed claim
+
+`huihui_saved_phase_witness_20260909` on clean/pushed
+ab9e7fc9f2b3ca28b62c20954c760d656ecabc5a is independently verified **FAIL**
+only on the driver's whole-run pressure gate. The single HTTP naturally
+completes in **457.4292s**; driver457.7616s / parent460.3559s. This is the
+exact saved SECOND HTTP (179931B, 134 original tools) reconstructed from the
+original178616B capture, the prior exact first model call and unchanged first
+synthetic fixture page. Original model/max1024/temp0/seed64013 overrides and
+the explicit full-state MXFP4/reassociated-prefill/Hermes/gateway/top-up profile
+are unchanged. The fresh server intentionally omits first-HTTP process/cache
+history, INCLUDING activated-tool state. Not a full workflow, live Plex,
+full-schema model computation, released BF16 or a completed-answer grade.
+No additional tool is executed; final_plex_score remains null.
+
+Both newly added [gateway-phase-complete] records are available, correctly
+ordered before later serving work, and match every bounded scalar/hash field
+of the actual response phases and opaque request ID. Hidden/public prompts
+are5060/5878 tokens, outputs34/56, max1024 with natural grammar termination,
+cold per-phase KV and cached0; full prepared state is retained. Public
+prepared/raw token IDs and text hashes exactly match the prior HTTP2 reference.
+
+IMPORTANT comparison correction: hidden prepared IDs also match, but hidden
+output differs34 vs16 tokens (search vs enable). This is NOT evidence of a
+numerical regression or observer-induced nondeterminism. Actual response
+metadata witnesses activated-tool count0 in the fresh server versus1 in the
+reference, both with force_reason=tool-result-pagination. Pure replay of
+_hidden_gateway_decision_choice plus inspected serving wiring yields
+specific:vmodel_search_tools versus specific:vmodel_enable_tools. Thus the
+constrained-generation contracts differ despite identical prompt IDs; direct
+applied-constraint telemetry was not recorded. No whole-generation equivalence
+or logging-overhead claim follows. Capture/temperature/seed equality alone
+cannot establish a comparable generation; phase constraint and activation
+provenance must be recorded and matched too.
+
+Hidden prefill108.9477s / decode86.0784s; public137.9381s /121.6192s.
+Totals prefill246.8858s /decode207.6976s, 90 raw output tokens,
+445,889,822,464B logical weight reads (not physical disk traffic).
+Engine-reported first token332.9669s is not independently measured wire SSE
+TTFT. Public MTP accepts39/66 proposals. Hidden/public KV reload1.4640/4.0738s
+and spill0.0238/0.0518s. All per-HTTP state/path/head/factor/output checks pass;
+zero retries, serial-admission refusals or recovery/top-up attempts.
+The ordinary paged cache is used; unused emergency recovery is not a win.
+
+226 native/known-transcoder samples: min available4,932,714,496B fails the
+unchanged5.3GB performance qualification, despite terminal6,787,710,976B.
+Max footprint4,108,291,744B / sampled compressed605,716,480B; max Metal
+2,856,342,380B. Whole HTTP swap-out12,681,216B, periodic11,681,792B and net0
+pass the swap limits; they do not erase the available-memory failure. No known
+transcoders observed, not general host-idle or causal swap attribution.
+Fresh30.0382s preflight passed6.6492 ->6.5454GB with zero growth/churn;
+closing the user's extra apps did not establish healthy whole-request pressure.
+Root/external free minima20,638,339,072B /100,285,366,272B, internal tier
+62,512,074,752B. Governor5.6GB reserve,400MB page margin and256MB BF16 KV unchanged.
+The historical400.0556s reference has different activation/constraint/history;
+neither the57.3736s difference nor public-only latency is a logging-cost estimate.
+
+All796 start/end/fresh source-manifest entries, model metadata, profile/capture/
+wire/reference/response/log identities, response checks, both exact log
+projections, public equivalence, hidden contract difference, pressure and zero
+recovery coverage verified BEFORE edits. No timeout/signal/spawn/child-result
+error or source drift. PIDs74340/74344/74346 gone; session1548 drained exit1;
+server-15 is ordinary cleanup. Private verification artifact:
+logs/huihui_saved_phase_witness_20260909.verified.json.
+Tree f70a8500f9f59c240f2c244a8ae2d5106cc6656e1d8ad8e5c0b168c88b000c07;
+result24ec306c522c7006bbb72d1d2f5241c164113dad8eccc294fe5459f63c13705a;
+receiptf0dacbffd7c687a482e22be66a957eb9ca2baab069eec23a529da24f351beed2;
+response19460a1daf828780ace1e9b198e0ccb1e802dc0e68a3af4384c0918bd3e2edfe;
+server57ff40f55b816a9e4433390fdf28fbd912e92a4c6f8585d59c3d23361dda2a11;
+parentlog97a4e62f9979556b74bd04a43d0b2ca96ae261760d5998ad843c33a9901af63d;
+preflight4f51ebcefeadb309d2c1742883f5e64570f2fefb4314ef7e6900abfb87282cc9.
+
+No model job remains. Do not repeat this isolated continuation as a lossless
+comparison to a warm workflow or rerun description-only/budget extensions.
+Next bound the applied-constraint/activation provenance, then investigate cold
+bootstrap/head lifetime and exact reuse with comparable generation contracts.
+Keep lossless-versus-explicit-lossy labels and existing safety gates intact.
+Full-answer model-only quality, held-out tools/domains/long context and under90s
+are still OPEN. This follow-up records measured evidence; no runtime default
+or optimization is promoted. Selected strict no-real-MLX suite638 PASS12.35s;
+128 profiles validate; git diff --check passes. Private artifacts and the
+machine-local benchmark ledger remain ignored, not force-added to git.
+
+
 ## 2026-09-09 UTC: description ablation fails third HTTP; exact KV top-up cannot restore host headroom
 
 `huihui_plex_enable_external_20260909` on clean/pushed
