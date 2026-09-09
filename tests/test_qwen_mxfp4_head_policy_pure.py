@@ -198,3 +198,19 @@ def test_bounded_cache_overlay_changes_only_retention_and_prefetch():
         if before.get(k)!=after.get(k)}=={
             'VMODEL_QWEN35_WEIGHT_CACHE_MB':('2200','256'),
             'VMODEL_QWEN35_PREFETCH_DEPTH':('2','0')}
+
+
+@pytest.mark.parametrize('rows',policy.ROWS)
+@pytest.mark.parametrize('value',[True,255,256,1499,1500,8500,8501])
+def test_small_cache_requires_native_streamed_head_and_keeps_upper_bound(rows,value):
+    allowed=type(value) is int and (256 if rows else 1500)<=value<=8500
+    if allowed:
+        policy.validate_cache_mb(value,rows)
+    else:
+        with pytest.raises(ValueError,match='WEIGHT_CACHE_MB'):
+            policy.validate_cache_mb(value,rows)
+
+
+def test_dense_server_uses_native_cache_guard():
+    source=(ROOT/'runtime/server.py').read_text()
+    assert source.count('validate_cache_mb(rc.max_weight_cache_mb, qwen35_mxfp4_head_rows)')==1

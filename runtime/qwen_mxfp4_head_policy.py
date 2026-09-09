@@ -36,6 +36,19 @@ def configure(rc, rows):
         rc.quant_lm_head = False
 
 
+def validate_cache_mb(value, rows):
+    """A streamed native head no longer requires the historical whole-head cache.
+
+    This is a retention-capacity bound, not a system-available reserve or a
+    permission to allocate. Native source/pin guards and live governor still
+    run before payload work. Leave every disabled-mode bound unchanged.
+    """
+    minimum = 256 if parse_rows(rows) else 1500
+    if type(value) is not int or not minimum <= value <= 8500:
+        raise ValueError(
+            f'VMODEL_QWEN35_WEIGHT_CACHE_MB must be in [{minimum}, 8500]')
+
+
 def validate(rc, cfg, store):
     rows = parse_rows(rc.qwen35_mxfp4_head_rows)
     if not rows:

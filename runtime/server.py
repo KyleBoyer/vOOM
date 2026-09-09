@@ -4255,10 +4255,8 @@ class EngineManager:
                         raise ValueError(
                             "VMODEL_QWEN35_WEIGHT_CACHE_MB must be an "
                             "integer") from error
-                    if not 1500 <= rc.max_weight_cache_mb <= 8500:
-                        raise ValueError(
-                            "VMODEL_QWEN35_WEIGHT_CACHE_MB must be in "
-                            "[1500, 8500]")
+                    from .qwen_mxfp4_head_policy import validate_cache_mb
+                    validate_cache_mb(rc.max_weight_cache_mb, qwen35_mxfp4_head_rows)
                 # F95 (2026-07-21): off by default now, per explicit user
                 # choice -- durable persistence bakes ONE chunk size into
                 # its on-disk format for the whole store, incompatible with

@@ -1,5 +1,19 @@
 # STATUS — 2026-09-09 UTC (current corrections first; dated chronology below is history)
 
+## 2026-09-09 UTC: native streaming cache needs a scoped configuration guard
+
+The cache256 trial on19e1797 is rejected at startup in0.1215s by the old
+dense-Qwen[1500,8500]MB cache-capacity validation, before model generation.
+No timing/quality/pressure result. All820 source entries start=end=fresh;
+session64101 drained and owned processes exited.
+
+Allow256..8500MB ONLY with explicitly selected native row-streamed head,
+which no longer pins the whole675MB head. Disabled selection keeps the exact
+old1500..8500MB range. Existing engine/source/pin guards remain authoritative;
+this reduces retention capacity, not the5600MB live-available reserve,400MB
+ordinary admission margin or any performance threshold. Pure boundary tests
+cover every row selection, both ranges, booleans and oversized values.
+
 ## 2026-09-09 UTC: allocator relief is a measured negative; bound startup residency next
 
 bd7b152 with host-allocator-relief completes the weather capture in71.569s
