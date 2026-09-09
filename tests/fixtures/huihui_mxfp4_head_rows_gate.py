@@ -7,7 +7,9 @@ request, Plex score, hidden-state proof, cold-storage or serving speed result.
 
 import argparse
 import hashlib
+import importlib.metadata
 import json
+import os
 from pathlib import Path
 import sys
 import time
@@ -21,18 +23,43 @@ METADATA = {
 }
 
 
+def native_reference_reservation_bytes(store, head_bytes, mlx_version):
+    """Audited MLX 0.32 native load reads into the shared destination itself.
+
+    No second full host buffer is created by this narrow WeightStore path.
+    Small hash/input/logit buffers remain covered by the unchanged 400MB
+    governor margin. Other loaders/representations require a new audit.
+    """
+    if type(head_bytes) is not int or head_bytes != 675430400 or mlx_version != '0.32.0':
+        raise ValueError('reference workspace requires the audited version/geometry')
+    for name in ('vpack2', 'packed', 'gguf', 'fast_dirs', '_raw_fast_tier_manifest',
+                 'k3_scale_sidecar', 'bf16_nf12_sidecar', '_ct_int4_aux',
+                 '_ct_mxfp4_aux', '_glm53_fp8_aux', '_dsv4_aux',
+                 '_qwen4_fused_expert_slices'):
+        if getattr(store, name, True):
+            raise ValueError('reference workspace requires native raw MXFP4: '+name)
+    aux = store._quant_aux.get('lm_head.weight')
+    if (aux is None or (aux.bits, aux.group_size, aux.mode,
+            aux.scales, aux.biases) != (4, 32, 'mxfp4', 'lm_head.scales', None)):
+        raise ValueError('reference workspace requires the unchanged native head pair')
+    return head_bytes
+
+
 def run(preflight, result_path):
     pre = json.loads(preflight.read_text())
     assert pre['passed'] and pre['sample_seconds'] >= 30 and pre['known_transcoders']['passed']
     assert 0 <= time.monotonic() - pre['end']['monotonic_s'] < 120
     assert pre['end']['root_free_bytes'] >= 10_000_000_000 and not result_path.exists()
+    assert not any(key.startswith('VMODEL_') for key in os.environ)
     for name, expected in METADATA.items():
         assert hashlib.sha256((MODEL/name).read_bytes()).hexdigest() == expected
     # This is the first possible MLX import/array or model payload read.
     import mlx.core as mx
     import numpy as np
     import psutil
+    import resource
     from runtime.host_activity_witness import sample_known_transcoders, summarize_known_transcoders
+    from runtime.process_memory_witness import sample_self_memory
     from runtime.model_loader import WeightStore
     from runtime.pressure import MemoryGovernor
     from runtime.quant import QTensor, matmul
@@ -45,6 +72,8 @@ def run(preflight, result_path):
         preflight_sha256=hashlib.sha256(preflight.read_bytes()).hexdigest())
     started = time.perf_counter()
     store = WeightStore(MODEL)
+    store._ensure_raw_fast_tier_loaded()
+    assert store.dir.resolve() == MODEL.resolve()
     cache = WeightCache(store, 1024**2)
     governor = MemoryGovernor(cache, critical_available=5_600_000_000,
         floor_bytes=1024**2, metal_limit=8_500_000_000)
@@ -57,6 +86,8 @@ def run(preflight, result_path):
             allocator_cache_bytes=int(mx.get_cache_memory()),
             system_available_bytes=psutil.virtual_memory().available,
             swap_used_bytes=swap.used, swap_out_bytes=swap.sout,
+            process=sample_self_memory(),
+            darwin_process_rss_peak_bytes=resource.getrusage(resource.RUSAGE_SELF).ru_maxrss,
             known_transcoders=sample_known_transcoders())
         observations.append(value)
         return value
@@ -85,9 +116,13 @@ def run(preflight, result_path):
         assert head_bytes == 675430400
         document.update(head_bytes=head_bytes, head_shape=[reader.vocab, reader.hidden],
             component_extents=[vars(e) for e in reader.extents], source_stat=list(reader.identity))
-        # Include a whole host staging copy in the reference admission. This
-        # conservative oracle reserve is NOT a change to serving policy.
-        governor.reserve(2 * head_bytes, reason='mxfp4-head-row-oracle')
+        version = importlib.metadata.version('mlx')
+        incoming = native_reference_reservation_bytes(store, head_bytes, version)
+        document['reference_admission'] = dict(incoming_bytes=incoming,
+            margin_bytes=400000000, host_reserve_bytes=5600000000, mlx_version=version,
+            loader='audited-native-mx-load-shared-destination',
+            separate_whole_host_staging_bytes=0)
+        governor.reserve(incoming, reason='mxfp4-head-row-oracle')
         rng = np.random.default_rng(64013)
         raw_inputs = rng.standard_normal((1, 6, reader.hidden)).astype(np.float32)
         raw_inputs /= np.sqrt(np.mean(raw_inputs**2, axis=-1, keepdims=True))
@@ -186,6 +221,7 @@ def run(preflight, result_path):
     finally:
         if reader is not None:
             reader.close()
+        store.close()
         observe('after')
         document.update(wall_seconds=time.perf_counter()-started, observations=observations,
             whole_process_metal_peak=int(mx.get_peak_memory()),
@@ -200,6 +236,8 @@ def run(preflight, result_path):
             o['known_transcoders'] for o in observations)
         if not document['known_transcoders']['passed']:
             document['failures'].append('known-transcoder observation gate')
+        if not all(o['process']['available'] for o in observations):
+            document['failures'].append('native process observation coverage')
         if (p['minimum_observed_available_bytes'] < 5_300_000_000
                 or max(p['swap_growth_bytes'], p['swap_out_growth_bytes']) > 16_000_000
                 or not 0 < document['whole_process_metal_peak'] <= 8_500_000_000):

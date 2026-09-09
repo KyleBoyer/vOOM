@@ -1,5 +1,43 @@
 # STATUS — 2026-09-09 UTC (current corrections first; dated chronology below is history)
 
+## 2026-09-09 UTC: native-loader audit corrects the diagnostic reference workspace
+
+The earlier 7.36GB oracle launch requirement counted a second whole host copy
+that the selected native reference loader does not create. Local WeightStore
+fetch selects/evaluates only the packed head and scale tensors and wraps those
+same arrays in QTensor. The MLX v0.32.0 implementation allocates the output once
+and passes its destination pointer directly to the file reader; the reader's
+pread workers fill that destination rather than first building another complete
+payload. [Load implementation](https://raw.githubusercontent.com/ml-explore/mlx/v0.32.0/mlx/backend/common/load.cpp),
+[file reader](https://raw.githubusercontent.com/ml-explore/mlx/v0.32.0/mlx/io/load.cpp).
+Safetensors uses this CPU Load primitive on Metal, whose allocator supplies
+shared storage accessible to the GPU. [Safetensors loader](https://raw.githubusercontent.com/ml-explore/mlx/v0.32.0/mlx/io/safetensors.cpp),
+[Metal allocator](https://raw.githubusercontent.com/ml-explore/mlx/v0.32.0/mlx/backend/metal/allocator.cpp).
+
+Accordingly, the UNWIRED oracle now declares the actual 675,430,400B reference,
+with the existing 400MB margin covering its small input/logit/hash-row scratch.
+The 5.6GB host reserve and 8.5GB Metal cap are unchanged. Its diagnostic
+preflight minimum is 6.70GB, rounded above 5.6GB + 675,430,400B + 400MB;
+ordinary governor admission still observes current conditions after imports and
+can refuse. This corrects an unsupported test-workspace double count, not a
+runtime safety-floor reduction or a demonstrated speed/memory win.
+
+Fail-closed guards limit this accounting to MLX 0.32.0, the pinned head size,
+the exact native MXFP4 weight/scales pair, and a raw no-overlay/no-conversion
+WeightStore. Packed/GGUF, fast tiers, alternative scale/FP8/CT/NF12/virtual
+loaders, missing fields, another version/geometry or biases cannot inherit it.
+Observations now also include native current-process footprint/compression and
+Darwin's never-reset process RSS peak. Eighteen added pure cases (49 in module)
+pass; selected strict no-real-MLX suite849 PASS13.82s;129 profiles unchanged.
+Installed library identity1876795e05b3434925e745fbf6e9f0c8c0446b666224c9d881609ab353e94e51;
+version metadata0.32.0, no direct_url build provenance. Source inspection is
+not a reproducible-build claim; real numerical/lifetime measurements remain
+required. No runtime integration, vocabulary restriction, serving change or
+additional weight approximation. Next try the staged actual-head oracle only
+after its new fresh passing preflight; never rerun the already rejected
+whole-model pre-admission profile as if this accounting audit fixed it.
+
+
 ## 2026-09-09 UTC: exact MXFP4 row oracle staged; real-head run deferred before MLX
 
 The next bounded experiment is a quantized-head ROW reader, not another run

@@ -3,6 +3,7 @@
 import json
 import os
 import struct
+from types import SimpleNamespace
 
 import pytest
 
@@ -141,3 +142,50 @@ def test_numeric_gate_requires_fresh_full_preflight_before_mlx_or_weights(tmp_pa
     with pytest.raises(AssertionError):
         gate.run(path, tmp_path/'result.json')
     assert not (tmp_path/'result.json').exists()
+
+
+def native_store():
+    return SimpleNamespace(vpack2=None, packed={}, gguf=None, fast_dirs=[],
+        _raw_fast_tier_manifest={}, k3_scale_sidecar=None, bf16_nf12_sidecar=None,
+        _ct_int4_aux={}, _ct_mxfp4_aux={}, _glm53_fp8_aux={}, _dsv4_aux={},
+        _qwen4_fused_expert_slices={}, _quant_aux={'lm_head.weight':
+            SimpleNamespace(bits=4, group_size=32, mode='mxfp4',
+                scales='lm_head.scales', biases=None)})
+
+
+def test_native_reference_budget_does_not_count_a_nonexistent_whole_host_copy():
+    from tests.fixtures.huihui_mxfp4_head_rows_gate import native_reference_reservation_bytes
+    assert native_reference_reservation_bytes(native_store(), 675430400, '0.32.0') == 675430400
+
+
+@pytest.mark.parametrize('name', ['vpack2', 'packed', 'gguf', 'fast_dirs',
+    '_raw_fast_tier_manifest', 'k3_scale_sidecar', 'bf16_nf12_sidecar',
+    '_ct_int4_aux', '_ct_mxfp4_aux', '_glm53_fp8_aux', '_dsv4_aux',
+    '_qwen4_fused_expert_slices'])
+def test_other_loaders_do_not_inherit_native_reference_budget(name):
+    from tests.fixtures.huihui_mxfp4_head_rows_gate import native_reference_reservation_bytes
+    store = native_store()
+    setattr(store, name, True)
+    with pytest.raises(ValueError, match='native raw'):
+        native_reference_reservation_bytes(store, 675430400, '0.32.0')
+    delattr(store, name)
+    with pytest.raises(ValueError, match='native raw'):
+        native_reference_reservation_bytes(store, 675430400, '0.32.0')
+
+
+@pytest.mark.parametrize('change', ['version', 'size', 'bias', 'bits', 'missing'])
+def test_reference_budget_is_version_geometry_and_representation_pinned(change):
+    from tests.fixtures.huihui_mxfp4_head_rows_gate import native_reference_reservation_bytes
+    store, size, version = native_store(), 675430400, '0.32.0'
+    if change == 'version':
+        version = 'unknown'
+    elif change == 'size':
+        size -= 1
+    elif change == 'bias':
+        store._quant_aux['lm_head.weight'].biases = 'lm_head.biases'
+    elif change == 'bits':
+        store._quant_aux['lm_head.weight'].bits = 8
+    else:
+        store._quant_aux.clear()
+    with pytest.raises(ValueError):
+        native_reference_reservation_bytes(store, size, version)
