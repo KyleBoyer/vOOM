@@ -7,7 +7,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from tests.fixtures import mxfp4_head_rows as rows
+from runtime import mxfp4_head_rows as rows
 
 
 def header():

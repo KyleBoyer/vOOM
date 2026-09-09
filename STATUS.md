@@ -1,5 +1,58 @@
 # STATUS — 2026-09-09 UTC (current corrections first; dated chronology below is history)
 
+## 2026-09-09 UTC: native MXFP4 runtime head primitive staged, not selected by serving
+
+Added runtime/mxfp4_lm_head_stream.py with MXFP4StreamedLMHead, an UNSELECTED
+primitive derived from the existing streamed-head interface. There is no engine
+constructor branch, server option or profile selecting it yet. The successful
+ba8c0b9 actual-head gate below is still the manual reference/candidate experiment,
+NOT a numerical pass for this newly factored runtime class.
+
+Moved the proven raw reader from tests/fixtures/mxfp4_head_rows.py to
+runtime/mxfp4_head_rows.py; its executable AST is byte-for-byte equivalent
+after excluding the changed module docstring. Updated both importing tests/
+fixture call sites; no duplicate reader or old production dependency on tests.
+The moved reader retains native MXFP4 metadata, bounds, exact short-read,
+source-stat and descriptor guards without importing MLX.
+
+The primitive restricts construction to MLX0.32.0, the tested248320x5120 head,
+and explicit8192/32768/65536 row blocks. It requires a reservation callback;
+each tile reserves2x its packed-plus-scale bytes before reading, retaining the
+ordinary governor's unchanged reserve/margin. Constructor errors close the
+reader. Full-vocabulary projections keep evaluated(1,1,5120) matmul calls;
+ordinary logits accepts only a singleton, and serial logits accepts1..64
+positions. This is a projection-window bound, NOT a max-output-token limit.
+Closed sources, unsupported dtype/rank/geometry and shortlist requests fail
+closed. No silent batched contraction, head pin or whole-head fetch is added.
+
+Separate evaluated block-call frames release successful block weight owners
+before the next reservation. Cumulative telemetry records scan attempts,
+completed/failed scans, successful read extents/bytes, reservations and separate
+read/upload/projection/scan times. Failed scans are not reported as completed
+and are not retried here. Successful extent counts are not physical partial-I/O
+accounting after a read error. This telemetry still needs serving-wrapper
+attribution because these reads bypass WeightStore's existing counters.
+
+Twenty-nine symbolic-array tests execute the actual class control flow with
+no MLX: exact read ranges/tails/counts, singleton shapes across1/6/64 positions,
+weak-reference retirement of successful block arrays before the next admission,
+failure/no-retry counters, invalid backends/shapes, source cleanup and repeated
+scans. Selected strict no-real-MLX suite930 PASS14.71s; moved-reader module52
+PASS;129 runtime profiles unchanged. Symbolic ownership is NOT physical GPU/
+host memory or numerical evidence. No new model job or preflight was launched.
+
+NEXT: add/run a bounded actual-runtime-class all-logit gate against the same
+native whole-head reference after a NEW passing periodic30s/6.70GB/no-transcoder
+preflight. Only then wire explicit engine/server/profile selection and distinct
+cache identities, with incompatible phase-head/rerank/overlay modes rejected.
+Current phase-head validation explicitly disallows a streamed head: do not
+silently inherit that profile or pretend its pin-release witness applies.
+Audit target/MTP shared-head dispatch and expose complete scan byte/time deltas
+in request/phase telemetry, then matched real short captures and full harness.
+No serving latency, full-state equivalence, model-only Plex score or under90s
+claim is added by this primitive.
+
+
 ## 2026-09-09 UTC: actual MXFP4 head row-tiling passes every logit; serving integration still pending
 
 The staged head-only oracle finally ran after a fresh passing PERIODIC30s

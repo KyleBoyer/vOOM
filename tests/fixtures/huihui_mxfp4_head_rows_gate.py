@@ -64,7 +64,7 @@ def run(preflight, result_path):
     from runtime.pressure import MemoryGovernor
     from runtime.quant import QTensor, matmul
     from runtime.weight_cache import WeightCache
-    from tests.fixtures.mxfp4_head_rows import HeadRows
+    from runtime.mxfp4_head_rows import HeadRows
     from tests.fixtures.qwen4_hot_boundary_http_probe import _atomic_write_private
 
     document = dict(schema='voom.huihui-mxfp4-head-rows-gate.v1', passed=False,

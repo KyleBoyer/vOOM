@@ -1,4 +1,4 @@
-"""Experiment-only raw MXFP4 row ranges; no MLX and no serving integration."""
+"""Shared exact native MXFP4 head row reader; no MLX or serving selection."""
 
 from dataclasses import dataclass
 import json
