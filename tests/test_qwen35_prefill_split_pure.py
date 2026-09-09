@@ -1,5 +1,6 @@
 """Split scheduler topology/ownership/guards with fake operations, no real MLX."""
 import ast
+import json
 import sys
 from pathlib import Path
 from types import SimpleNamespace as NS, ModuleType
@@ -124,6 +125,53 @@ def test_failure_discards_current_phase_without_retry(monkeypatch,failure):
     assert not loaded
     assert sum(ev[0]=='get' for ev in events)<=1
     assert events[-1][0]=='discard'
+
+
+@pytest.mark.parametrize('failure,stage,tile_start',[
+    ('reserve','admission',None),('compute','compute',0)])
+def test_failure_witness_matches_original_exception_and_stderr(monkeypatch,capsys,failure,stage,tile_start):
+    e,events,loaded=fake_engine(monkeypatch,failure)
+    with pytest.raises((RuntimeError,MemoryError)) as caught:
+        split.sweep(e,np.ones((1,3,1)),{},0,2)
+    witness=e._qwen35_split_prefill_stats['last_phase_failure']
+    assert witness==dict(sweep=1,layer=0,phase='attention',stage=stage,
+        tile_start=tile_start,tile_width=2,positions=3,declared_page_bytes=100,
+        error_type=type(caught.value).__name__)
+    assert e._qwen35_split_prefill_stats['phase_failures']==1
+    assert json.loads(capsys.readouterr().err.split('] ',1)[1])==witness
+    assert not loaded
+
+
+def test_fetch_failure_preserves_exception_and_bounded_retry_context(monkeypatch,capsys):
+    e,events,loaded=fake_engine(monkeypatch)
+    original=OSError('synthetic read failure')
+    calls=0
+    real_get=e.cache.get
+    def get(key,ns):
+        nonlocal calls
+        calls+=1
+        if key.endswith(':mlp'):raise original
+        return real_get(key,ns)
+    e.cache.get=get
+    for tile in (2,1):
+        with pytest.raises(OSError) as caught:
+            split.sweep(e,np.ones((1,3,1)),{},0,tile)
+        assert caught.value is original and not loaded
+    stats=e._qwen35_split_prefill_stats
+    assert calls==4 and stats['phase_failures']==2
+    witness=stats['last_phase_failure']
+    assert witness['phase']=='mlp' and witness['stage']=='fetch'
+    assert witness['sweep']==2 and witness['tile_width']==1 and witness['tile_start'] is None
+    assert len(capsys.readouterr().err.splitlines())==2
+
+
+def test_diagnostic_sink_failure_does_not_mask_original_refusal(monkeypatch):
+    e,events,loaded=fake_engine(monkeypatch,'reserve')
+    def broken_print(*a,**kw):raise OSError('closed stderr')
+    monkeypatch.setattr('builtins.print',broken_print)
+    with pytest.raises(MemoryError,match='admission'):
+        split.sweep(e,np.ones((1,3,1)),{},0,2)
+    assert not loaded and e._qwen35_split_prefill_stats['phase_failures']==1
 
 
 def test_complete_layout_plan_checked_before_state_or_payload(monkeypatch):

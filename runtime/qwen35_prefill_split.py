@@ -6,6 +6,8 @@ vision, boundary-fork or prefetch path is admitted by this initial experiment.
 """
 from __future__ import annotations
 
+import json
+import sys
 import time
 
 
@@ -80,6 +82,7 @@ def sweep(engine,x,kv,offset,tile_width,on_progress=None,*,layer_start=0,layer_e
         for phase,names,incoming in phases:
             key=f'qwen35-prefill-split:{layer}:{phase}'
             w=None
+            stage='admission'; tile_start=None
             try:
                 started=time.perf_counter()
                 # No prefetch is allowed to repopulate a retired phase.
@@ -87,6 +90,7 @@ def sweep(engine,x,kv,offset,tile_width,on_progress=None,*,layer_start=0,layer_e
                 engine.cache.trim_to(engine.cache.pinned_bytes)
                 engine.cache.prepare_for(incoming)
                 engine.governor.reserve(incoming,reason='qwen-prefill-layer-page')
+                stage='fetch'
                 w=engine.cache.get(key,names)
                 weight_s+=time.perf_counter()-started
                 engine._note_true_peak()
@@ -94,7 +98,9 @@ def sweep(engine,x,kv,offset,tile_width,on_progress=None,*,layer_start=0,layer_e
                 mx.reset_peak_memory()
                 tiles=[]; xt=yt=None
                 started=time.perf_counter()
+                stage='compute'
                 for pos in range(0,total,tile_width):
+                    tile_start=pos
                     end=min(pos+tile_width,total)
                     if engine._layer_transient:
                         signature=engine._transient_layer_signature(layer)
@@ -130,6 +136,23 @@ def sweep(engine,x,kv,offset,tile_width,on_progress=None,*,layer_start=0,layer_e
                 engine._note_true_peak()
                 stats[phase+'_phases']=stats.get(phase+'_phases',0)+1
                 stats['maximum_declared_phase_page_bytes']=max(stats.get('maximum_declared_phase_page_bytes',0),incoming)
+            except Exception as exc:
+                # Bounded scalar context survives a failed sweep/retry. The
+                # original exception and safety decision remain authoritative;
+                # do not retain tensors, prompts, or traceback objects here.
+                stats['phase_failures']=stats.get('phase_failures',0)+1
+                failure=dict(sweep=stats['sweeps'],layer=layer,phase=phase,
+                    stage=stage,tile_start=tile_start,tile_width=tile_width,
+                    positions=total,declared_page_bytes=incoming,
+                    error_type=type(exc).__name__)
+                stats['last_phase_failure']=failure
+                # Failed HTTP requests may not publish final path_stats.
+                try:
+                    print('[qwen35-split-prefill-failure] '+json.dumps(failure,sort_keys=True),
+                          file=sys.stderr,flush=True)
+                except Exception:
+                    pass  # A diagnostic sink must never mask the refusal.
+                raise
             finally:
                 # The evaluated phase outputs survive, not its weight owner.
                 # discard also clears allocator cache after dropping residency.

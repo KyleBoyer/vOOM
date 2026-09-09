@@ -1,5 +1,23 @@
 # STATUS — 2026-09-09 UTC (current corrections first; dated chronology below is history)
 
+## 2026-09-09 UTC: bounded split-prefill failure diagnostics; no new model run
+
+The failed second request currently identifies a page refusal without naming
+the split phase/layer. The opt-in split scheduler now records a bounded scalar
+last-failure witness: sweep, layer, attention/MLP phase, admission/fetch/compute
+stage, tile position/width, full position count and declared incoming bytes.
+It also emits that context to stderr because failed HTTP calls may omit final
+path_stats. Retries increment a counter and replace the single last witness;
+no tensors, prompts or traceback objects are stored in these statistics.
+The original exception is re-raised, cleanup is preserved, and diagnostic-sink
+errors do not mask the refusal. No allocation threshold, math or retry changes.
+
+Selected strict no-real-MLX suite: 1105 PASS in15.54s, including admission,
+compute and second-phase fetch failures, bounded retry context, original
+exception identity, cleanup and a failed stderr sink. No model payload was
+loaded and no new speed, memory or quality result is claimed. ChatGPT and its
+helpers stay open. No model job is running; the readiness blocker below remains.
+
 ## 2026-09-09 UTC: split prefill preserves real tool tokens at0.583GB Metal; readiness still blocked
 
 ddbe6d7 runs the actual new scheduler on the real weather capture: all64
