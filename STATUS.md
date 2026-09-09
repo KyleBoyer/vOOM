@@ -1,5 +1,53 @@
 # STATUS — 2026-09-09 UTC (current corrections first; dated chronology below is history)
 
+## 2026-09-09 UTC: bounded pre-generation constraint/activation provenance added
+
+The saved-continuation comparison exposed a concrete missing identity: a
+5060-token prompt could be byte-identical while process-local tool activation
+changed the required hidden catalog call. Added default-off
+[gateway-generation-start] under the EXISTING generation-witness flag.
+Immediately before each actual hidden/public _engine_generate call, it reads
+the exact serving tool-choice argument and the same configured constraint
+object subsequently passed to generation. It emits only choice kind/hash,
+prior activation-name hash/count, force-reason hash, requested parallel flag,
+and plain constraint profile/stop/completed scalars with the opaque request ID
+and phase. Host-rendered/routed branches do not emit a fake generation start.
+
+Records are bounded to4096 output characters; activation input is bounded to
+64 names of512 characters. No raw tool names/reason text, schema, prompt,
+answer, token IDs, matcher operations, masks, tensors, KV, evaluation, cache
+clearing, routing, sampling, retry or memory-policy changes. Unknown types/
+profiles and malformed or excessive inputs are unavailable. Disabled mode
+does not inspect the constraint; broken observers/sinks cannot fail serving.
+Completed-phase logs and API response formats remain unchanged.
+
+compare_observed_controls rejects missing, malformed, inconsistent or capped
+evidence. It explicitly labels even an exact match as NOT proof of full
+generation-contract equivalence: schema/mask, prompt/state, sampler, weights
+and arithmetic identity still require independent checks. Start evidence is
+not generation/request completion. This does not retroactively recover missing
+historical fields or make the previous pressure-failing replay a pass.
+
+41 new pure tests cover the actual cold-versus-activated choice-policy split,
+bounded/content-free/detached records, no-constraint and JSON/tool modes,
+invalid types/hashes/identities, missing evidence, disabled/broken sinks, and
+execution of both actual serving-boundary AST fragments with a failing synthetic
+generator: logging precedes generation and the original constraint is passed
+unchanged, with no fabricated completion. Selected strict no-real-MLX suite
+679 PASS12.41s;128 profiles validate; git diff --check passes. These are pure
+tests, NOT live model/logging-overhead, throughput, model quality or held-out
+generalization proof. No MLX/model job was launched; no defaults promoted.
+
+Next audit cold bootstrap/head lifetime before another expensive replay; pair
+any exact memory lever with matching choice/activation and full prompt/state/
+raw-token witnesses, using the new start records on that measured run. Do not
+rerun the failed description-only workflow or saved continuation merely to
+reproduce an already-explained constraint difference. Existing5.6GB reserve,
+400MB page margin,256MB BF16 KV,8.5GB Metal ceiling and fresh30s preflight remain.
+Full model-only answer/Plex score, varied real tools/prompts/long contexts and
+under90s are still OPEN.
+
+
 ## 2026-09-09 UTC: saved continuation verifies phase logging, but pressure and comparison contract block a speed claim
 
 `huihui_saved_phase_witness_20260909` on clean/pushed

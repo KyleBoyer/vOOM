@@ -7726,6 +7726,17 @@ def _release_qwen4_idle_request_state(engine) -> None:
             pass
 
 
+def _emit_gateway_generation_start(request_id, phase, **controls) -> None:
+    if os.environ.get("VMODEL_GENERATION_WITNESS", "0").strip() != "1":
+        return
+    try:
+        from .gateway_constraint_witness import emit_start
+        emit_start(request_id, phase, **controls)
+    except Exception:
+        # Observation must never mutate, skip, or retry the following generation.
+        pass
+
+
 def _emit_gateway_phase_completion(request_id, phase) -> None:
     if os.environ.get("VMODEL_GENERATION_WITNESS", "0").strip() != "1":
         return
@@ -12816,6 +12827,11 @@ class Handler(BaseHTTPRequestHandler):
                     _HiddenDecisionStream(engine.cfg.model_type, on_token)
                     if on_token is not None else None
                 )
+                _emit_gateway_generation_start(rid, "gateway_decision",
+                    tool_choice=gateway_decision_choice,
+                    activation_names=gateway_activated_names,
+                    force_reason=gateway_force_reason,
+                    constraint=gateway_constraint, allow_parallel=False)
                 decision = _engine_generate(engine,
                     prompt, max_output_tokens, stop=stop,
                     on_token=(
@@ -13083,6 +13099,11 @@ class Handler(BaseHTTPRequestHandler):
                     },
                 }
             else:
+                _emit_gateway_generation_start(rid, "gateway_execution",
+                    tool_choice="required",
+                    activation_names=gateway_activated_names,
+                    force_reason=gateway_force_reason,
+                    constraint=self._constraint, allow_parallel=False)
                 result = _engine_generate(engine,
                     prompt, max_output_tokens, stop=stop,
                     on_progress=on_progress, sampling=self._sampling,
