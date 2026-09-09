@@ -54,6 +54,11 @@ class Prefetcher:
         if self.paused or self._closing.is_set():
             return False
         with self._lock:
+            # A producer may have passed the fast check before a lifetime
+            # transition paused us. Serialize admission with that pause so an
+            # already-returned idle barrier cannot be followed by a late hint.
+            if self.paused or self._closing.is_set():
+                return False
             # _scheduled contains queued AND active keys (removed only after a
             # worker finishes), making this an atomic no-backlog gate without
             # relying on Queue.empty() races.
@@ -130,7 +135,8 @@ class Prefetcher:
         page producer that is still evaluating after the trim could otherwise
         repopulate the just-freed residency while an auxiliary model loads.
         """
-        self.paused = True
+        with self._lock:
+            self.paused = True
         deadline = time.monotonic() + max(0.0, float(timeout_s))
         while True:
             with self._lock:

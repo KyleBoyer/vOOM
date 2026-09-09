@@ -1,5 +1,49 @@
 # STATUS — 2026-09-09 UTC (current corrections first; dated chronology below is history)
 
+## 2026-09-09 UTC: prefetch pause/admission race reproduced and repaired; model gate still deferred
+
+A read-only lifetime audit found a separate coordination defect: schedule()
+checked paused only BEFORE acquiring its admission lock. A producer that had
+passed that check could be descheduled, let pause_and_wait_idle() return with
+no accepted work, then enqueue a new weight load after the idle barrier. That
+violates the barrier used before head reload/cache reclamation. This is a
+reproduced interleaving, NOT attribution of the prior Huihui admission failure.
+
+The barrier now sets paused under the same lock used for accepted-work
+registration, and schedule() rechecks pause/closing under that lock. Earlier
+accepted work still drains; subsequent hints are rejected until explicit resume.
+No model arithmetic, memory floor, cache budget, profile or speculative policy
+is changed. This does not make arbitrary concurrent external unpauses safe or
+constitute a complete shutdown/concurrent-close audit.
+
+Deterministic thread/event tests park a scheduler after its fast check and
+before admission. The old code fails by returning True for that late hint;
+both ordinary and idle-only schedules now return False. Additional cases cover
+draining active work, explicit resume and a timeout that leaves prefetch paused.
+Selected strict no-real-MLX suite860 PASS13.85s;400 repeated new race/drain/timeout
+cases PASS2.9701s;129 profiles validate unchanged; diff check clean. An initial
+attempt to include test_qwen_pin_prefetch_policy.py was rejected at collection
+by the no-MLX import guard; that MLX-dependent module was NOT run or counted.
+These are concurrency/safety proofs, not physical-memory or request-speed proof.
+
+No model job launched. After the user's app closures, the fresh30.0371s check
+still deferred at6,609,354,752 ->6,615,384,064B versus6.70GB required, with
+zero new swap use/out and16 clear known-transcoder samples. Artifact:
+logs/huihui_head_rows_after_app_close_20260909.preflight.json,
+SHAe7166d87ceb781e854eaec262cbf2d302448bea8a7a82119de9e88393f00299e.
+The following heartbeat snapshot remained6,599,032,832B, so it did not repeat
+the same failing preflight or relax any reserve. Root/external free21.39/100.41GB;
+Plex and all user apps/data unchanged. The engine already deletes its local
+last-layer weights after evaluated outputs, before the head load; that tempting
+retention hypothesis is rejected by source inspection, not patched redundantly.
+
+Next: the staged actual675MB MXFP4-head all-logit row-tiling oracle after a NEW
+fresh passing6.70GB/30s preflight, then actual-token/state and matched real-capture
+qualification before runtime integration or any speed claim. The rejected head
+pre-admission profile remains default-off; this race fix does not qualify it.
+Full-harness/Plex/held-out contexts/large-output/under90s remain open.
+
+
 ## 2026-09-09 UTC: native unpadded-head header supported; numerical follow-up still deferred
 
 The first revised-workspace run, huihui_mxfp4_head_rows_native_20260909 on
