@@ -1,5 +1,32 @@
 # STATUS — 2026-09-09 UTC (current corrections first; dated chronology below is history)
 
+## 2026-09-09 UTC: native-head serving completes both short captures; one prefill retry
+
+On e8d69ed, head8192/prefill32 produces correct weather-tool and title outputs
+in57.2982s and79.4316s HTTP respectively. Both original request shapes retain
+their all-phase raw-token, text and protocol identity against the historical
+completed control, with max-output1024 and natural23/2 output tokens. No real
+tools executed. These short outputs are NOT sustained-output or Plex proof.
+
+The weather arm passes every check, prefill-layer sweep17.7300s and
+decode39.0606s. MTP accepts17/20 proposals and avoids17 target sweeps. Actual
+head telemetry records26 complete scans, zero failures,17,561,190,400B
+successful head reads and9.590729s head-scan time; these include warmed reads,
+not physical uncached disk traffic. This is not a matched serving-speed A/B.
+
+The second, non-streaming request safely retries32->8 before first generation
+after a layer27 page refusal. It completes correctly, but the strict arm FAILS
+only captured_title:no_retry. Whole-arm pressure passes:67 native samples,
+minimum5,419,941,888B, zero swap growth and9,371,648B swap-out; clear known
+transcoders and valid alignment. True peaks2,277,685,556B /575,802,640B.
+All815 source entries start=end=fresh; session4951 drained and owned PIDs gone.
+Artifact: logs/huihui_head_rows8192_prefill32_short_20260909.json,
+SHA e8ee74779f0d952072592d56001ae981e7cc573df88dedd5859cda7de01a9e77.
+
+Next explicit prefill-ceiling8 skips the discarded larger attempt; only the
+tile ceiling changes. Safety thresholds stay unchanged. Require a new fresh
+server/preflight and actual checks; no full-harness readiness claim yet.
+
 ## 2026-09-09 UTC: smaller head trial stops earlier in prefill; explicit32 next
 
 The8192-row trial onf519465 does NOT reach its new head reservation. It

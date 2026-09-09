@@ -178,10 +178,11 @@ def test_small_tile_overlay_changes_only_preverified_row_size():
         if before.get(k)!=after.get(k)}=={'VMODEL_QWEN35_MXFP4_HEAD_ROWS':('32768','8192')}
 
 
-def test_smaller_prefill_overlay_changes_only_tile_ceiling():
+@pytest.mark.parametrize('ceiling',[8,32])
+def test_smaller_prefill_overlay_changes_only_tile_ceiling(ceiling):
     before={}; after={}
     base=['huihui-qwen38-27b-direct-head-rows-audit','qwen35-mxfp4-head-rows8192']
     apply_runtime_profiles(base,environ=before)
-    apply_runtime_profiles(base+['qwen35-prefill-ceiling32'],environ=after)
+    apply_runtime_profiles(base+[f'qwen35-prefill-ceiling{ceiling}'],environ=after)
     assert {k:(before.get(k),after.get(k)) for k in set(before)|set(after)
-        if before.get(k)!=after.get(k)}=={'VMODEL_QWEN35_PREFILL_CHUNK_CEILING':('128','32')}
+        if before.get(k)!=after.get(k)}=={'VMODEL_QWEN35_PREFILL_CHUNK_CEILING':('128',str(ceiling))}

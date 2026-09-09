@@ -1,0 +1,8 @@
+schema: voom.runtime-profile.v1
+name: qwen35-prefill-ceiling8
+description: Explicit low-workspace Qwen prefill tiles without a discarded larger attempt.
+notes:
+  - "Changes only the prefill tile ceiling to8. Every prepared prompt position, request output budget, memory floor and margin is retained."
+  - "The real non-streaming title recovered at8 after a32-tile admission refusal and retained its reference tokens. Broader retry-free quality/performance qualification remains required; no automatic selection or lossless claim."
+settings:
+  VMODEL_QWEN35_PREFILL_CHUNK_CEILING: 8
