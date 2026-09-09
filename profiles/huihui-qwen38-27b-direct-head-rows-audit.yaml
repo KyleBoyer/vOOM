@@ -1,0 +1,6 @@
+schema: voom.runtime-profile.v1
+name: huihui-qwen38-27b-direct-head-rows-audit
+description: Experimental full-state direct Hermes Huihui with bounded native head rows.
+extends:
+  - huihui-qwen38-27b-hermes-factors-headroom-audit
+  - qwen35-mxfp4-head-rows

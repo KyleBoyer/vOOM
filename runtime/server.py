@@ -1674,6 +1674,12 @@ class EngineManager:
                 "VMODEL_QWEN35_SERIAL_VERIFY_SUSPEND_LM_HEAD must be 0 or 1")
         qwen35_head_pre_admit_request = os.environ.get(
             "VMODEL_QWEN35_PHASE_HEAD_PRE_ADMIT", "0")
+        from .qwen_mxfp4_head_policy import parse_rows
+        try:
+            qwen35_mxfp4_head_rows = parse_rows(os.environ.get(
+                "VMODEL_QWEN35_MXFP4_HEAD_ROWS", "0"))
+        except ValueError as error:
+            raise RequestValidationError(str(error)) from error
         if qwen35_head_pre_admit_request not in ("0", "1"):
             raise RequestValidationError("VMODEL_QWEN35_PHASE_HEAD_PRE_ADMIT must be 0 or 1")
         if qwen35_head_pre_admit_request == "1" and qwen35_suspend_lm_head_request != "1":
@@ -2480,6 +2486,7 @@ class EngineManager:
             qwen35_kv_topup_request,
             qwen35_suspend_lm_head_request,
             qwen35_head_pre_admit_request,
+            qwen35_mxfp4_head_rows,
             qwen35_suspend_lm_head_min_prompt_tokens,
             qwen_lossy_suffix_request,
             qwen_hot_kv_request,
@@ -2643,6 +2650,7 @@ class EngineManager:
             qwen35_kv_topup_request,
             qwen35_suspend_lm_head_request,
             qwen35_head_pre_admit_request,
+            qwen35_mxfp4_head_rows,
             qwen35_suspend_lm_head_min_prompt_tokens,
             qwen_lossy_suffix_request,
             qwen_hot_kv_request,
@@ -2749,6 +2757,8 @@ class EngineManager:
         # retry behavior as WeightStore.
         cfg_probe = ModelConfig.from_dir(model_dir)
         mtype = cfg_probe.model_type
+        if qwen35_mxfp4_head_rows and mtype != "qwen3_5":
+            raise RequestValidationError("native MXFP4 head rows require dense Huihui Qwen")
         if qwen35_head_pre_admit_request == "1" and mtype not in ("qwen3_5", "qwen3_5_moe"):
             raise RequestValidationError("phase-head pre-admission requires a Qwen3.5-family target")
         if qwen35_kv_topup_request == "1" and mtype not in ("qwen3_5", "qwen3_5_moe"):
@@ -2890,6 +2900,7 @@ class EngineManager:
                 rc.qwen35_serial_verify_suspend_lm_head = (
                     qwen35_suspend_lm_head_request == "1")
                 rc.qwen35_phase_head_pre_admit = (qwen35_head_pre_admit_request == "1")
+                rc.qwen35_mxfp4_head_rows = qwen35_mxfp4_head_rows
                 rc.qwen35_serial_verify_suspend_lm_head_min_prompt_tokens = (
                     qwen35_suspend_lm_head_min_prompt_tokens)
                 rc.qwen_mixed_depth_endpoint_persist = (
@@ -9790,6 +9801,7 @@ def _cache_phase_telemetry(name: str, phase_result: dict) -> dict:
                 "qwen35_serial_kv_reclaim_enabled", "qwen35_serial_kv_reclaim",
                 "qwen35_serial_kv_reclaim_topup_enabled",
                 "qwen35_phase_head_pre_admit_enabled", "qwen35_phase_head_admission",
+                "qwen35_mxfp4_head_io",
                 "qwen35_serial_verify_suspend_lm_head_min_prompt_tokens",
                 "qwen35_serial_verify_suspend_lm_head_request_active",
                 "qwen35_serial_verify_head_restore_calls",
@@ -10960,6 +10972,7 @@ def _vision_protocol_timing(result: dict) -> dict:
         "generation_witness",
         "qwen35_serial_kv_reclaim",
         "qwen35_phase_head_admission",
+        "qwen35_mxfp4_head_io",
         "tool_call_text_witness",
         "qwen4_mtp_idle_head_memory_witness",
         "qwen4_post_generation_memory_witness",

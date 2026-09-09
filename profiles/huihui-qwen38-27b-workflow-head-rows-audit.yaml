@@ -1,0 +1,8 @@
+schema: voom.runtime-profile.v1
+name: huihui-qwen38-27b-workflow-head-rows-audit
+description: Experimental model-only full-workflow Huihui with bounded native head rows.
+notes:
+  - "The original HTTP request is preserved; the existing gateway still compacts the prepared catalog/prompt. Target MXFP4 and reassociated prefill remain lossy. No deterministic host routing or answer renderer."
+extends:
+  - huihui-qwen38-27b-full-workflow-lifetime-audit
+  - qwen35-mxfp4-head-rows

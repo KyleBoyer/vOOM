@@ -1,0 +1,14 @@
+schema: voom.runtime-profile.v1
+name: qwen35-mxfp4-head-rows
+description: Experimental exact native-MXFP4 output-head row streaming for Huihui.
+notes:
+  - "Preserves the selected MXFP4 head bytes, full vocabulary and singleton contractions; not released-BF16 lossless. Explicit 32768 vocabulary rows per block. Never a request-output-token cap."
+  - "Replaces the whole-head pin/phase lease, retaining ordinary governor floors and margins. Rejects source overlays, reranking, load-time head quantization and grammar jump-forward. No default promotion."
+  - "All-logit runtime-class oracle passed on six synthetic rows; end-to-end tokens/state, complete real harness and Plex scoring still require separate validation. Head reads are separately attributed in qwen35_mxfp4_head_io."
+settings:
+  VMODEL_QWEN35_MXFP4_HEAD_ROWS: 32768
+  VMODEL_QWEN35_PIN_LM_HEAD: false
+  VMODEL_QWEN35_QUANT_LM_HEAD: false
+  VMODEL_QWEN35_SERIAL_VERIFY_SUSPEND_LM_HEAD: false
+  VMODEL_QWEN35_PHASE_HEAD_PRE_ADMIT: false
+  VMODEL_GRAMMAR_JUMP_FORWARD_LOSSY: false

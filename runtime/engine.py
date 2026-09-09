@@ -35,6 +35,7 @@ from .model_loader import WeightStore
 from .prefetcher import Prefetcher
 from .sampler import SamplingParams, sample
 from .weight_cache import WeightCache
+from . import qwen_mxfp4_head_policy as mxfp4_head_policy
 
 
 _HYBRID_RECURRENT_MODEL_TYPES = frozenset({
@@ -1378,6 +1379,7 @@ class RuntimeConfig:
     stream_lm_head: bool = False  # F02: block-streamed lm_head matmul, never materializes the
     # full (vocab, hidden) tensor (GLM: ~1.9GB). Bit-identical (only the output/vocab dim is
     # chunked, not the reduction dim). Plain safetensors checkpoints only (not vpack2/packed).
+    qwen35_mxfp4_head_rows: int = 0  # explicit native MXFP4 row streaming; 0 preserves old path
     governor: bool = True  # F16: live memory-pressure governor (safety default on)
     # Qwen3-VL preprocessing budget. 0 selects the runtime's exact global-
     # attention safety ceiling; fast mode may choose a smaller quality-gated
@@ -1738,6 +1740,7 @@ class RuntimeConfig:
                 "adaptive_chunk_escalate_growth_cap", False),
             embed_rows=run.get("embed_rows", False),
             stream_lm_head=run.get("stream_lm_head", False),
+            qwen35_mxfp4_head_rows=run.get("qwen35_mxfp4_head_rows", 0),
             governor=run.get("governor", True),
             vision_max_patches=run.get("vision_max_patches", 0),
             warm_start=run.get("warm_start", 0),
@@ -2718,7 +2721,16 @@ class StreamingEngine:
             self._embed_rows = EmbedRows(self._model_dir, self.store, self.cfg.hidden_size)
 
         self._streamed_lm_head = None
-        if (self.rc.stream_lm_head and not self.cfg.tie_word_embeddings
+        mxfp4_head_policy.validate(self.rc, self.cfg, self.store)
+        if self.rc.qwen35_mxfp4_head_rows:
+            from .mxfp4_lm_head_stream import MXFP4StreamedLMHead
+
+            # Constructor reads metadata only. The callback resolves the live
+            # governor at projection time, after engine initialization.
+            self._streamed_lm_head = MXFP4StreamedLMHead(
+                self.store.dir, reserve=self._reserve_mxfp4_head_tile,
+                block_rows=self.rc.qwen35_mxfp4_head_rows)
+        elif (self.rc.stream_lm_head and not self.cfg.tie_word_embeddings
                 and not self.store.is_quantized("lm_head.weight")
                 and self.store.has("lm_head.weight")
                 and not self.store.vpack2 and not self.store.packed
@@ -5768,6 +5780,11 @@ class StreamingEngine:
             # runtime/afmoe.py's module docstring.
             result = result * (self.cfg.hidden_size ** 0.5)
         return result
+
+    def _reserve_mxfp4_head_tile(self, incoming, *, reason):
+        if self.governor is None:
+            raise RuntimeError('native MXFP4 head lost its memory governor')
+        self.governor.reserve(incoming, reason=reason)
 
     def _lm_head_weight(self):
         if self.cfg.tie_word_embeddings:
@@ -10177,6 +10194,8 @@ class StreamingEngine:
         iterable of layer indices to capture hidden states from (F62 DSpark
         prep) — populates self._tap_hidden, has NO effect on the returned
         logits/tokens (see tests/test_f62_hidden_taps.py)."""
+        mxfp4_head_policy.validate_forward(
+            self.rc.qwen35_mxfp4_head_rows, len(tokens), serial=False)
         x = self._embed(list(tokens))
         x = self._sweep(x, kv, offset=kv.offset, tap_layers=tap_layers)
         self._h_window = x  # trunk states for ALL fed positions (F32: rollback needs mid-window states)
@@ -10254,6 +10273,8 @@ class StreamingEngine:
         every layer instead, but keep the loop layer-major so a streamed target
         fetches each layer only once for the complete verify window.
         """
+        mxfp4_head_policy.validate_forward(
+            self.rc.qwen35_mxfp4_head_rows, len(tokens), serial=True)
         # Never leave a prior verifier's large recurrent snapshots resident.
         # A successful caller must consume the desired endpoint immediately.
         self.consume_serial_kda_endpoint(None)
@@ -11252,6 +11273,7 @@ class StreamingEngine:
                 f"k3longdmlp{self._k3_dense_mlp_long_tile_size}"
                 f"dead{int(self.rc.final_dead_token_elim)}"
                 f"head{int(self.rc.stream_lm_head)}"
+                f"{mxfp4_head_policy.identity(self.rc.qwen35_mxfp4_head_rows)}"
                 f"tiedhead{int(self.rc.quantize_tied_lm_head)}"
                 f"resident{int(self.rc.resident_fast_decode)}"
                 f"residentprefill{self.rc.resident_fast_prefill_limit}"
@@ -11488,6 +11510,7 @@ class StreamingEngine:
         stop point)."""
         request_t0 = time.perf_counter()
         direct_io_before = _direct_io_snapshot(self)
+        mxfp4_head_before = mxfp4_head_policy.snapshot(self)
         qwen4_expert_before = (
             self.store.qwen4_fused_expert_snapshot()
             if self.cfg.model_type == "qwen4_exp" else None)
@@ -13462,6 +13485,7 @@ class StreamingEngine:
             constraint is not None and constraint.completed)
         prompt_endpoint_logits = logits
         prefill_cache_after = _cache_io_snapshot(self)
+        mxfp4_head_prefill_after = mxfp4_head_policy.snapshot(self)
         prefill_s = (time.perf_counter() - t0
                      + path_stats["tool_pic_prefill_s"])
         self._set_finegrained_fp8_direct_phase("decode")
@@ -14549,6 +14573,8 @@ class StreamingEngine:
             path_stats["qwen4_fused_expert_virtual_tensors"] = int(
                 qwen4_expert_after["virtual_tensors"])
         _record_direct_io_delta(self, direct_io_before, path_stats)
+        mxfp4_head_policy.publish(self, path_stats, mxfp4_head_before,
+                                 mxfp4_head_prefill_after)
         if qwen4_ple_before is not None:
             qwen4_ple_after = self._qwen4_ple_rows.telemetry()
             for key in (

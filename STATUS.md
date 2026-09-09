@@ -1,5 +1,50 @@
 # STATUS — 2026-09-09 UTC (current corrections first; dated chronology below is history)
 
+## 2026-09-09 UTC: actual runtime head passes; explicit serving integration staged
+
+The runtime-class oracle now PASSES on clean 5d9a91c. Run
+huihui_runtime_head_rows_ready_20260909 exercises the actual
+MXFP4StreamedLMHead against the native whole-head reference: all 1,489,920
+BF16 logits match bit-for-bit at 8192/32768/65536 vocabulary rows, with
+matching packed/scales hashes. Six synthetic activation rows, not real model
+hidden states or a quality result. Each head scan reads675,430,400B with
+62/16/8 extents and31/8/4 reservations;44 total, zero refusals.
+
+Instrumented row-arm walls1.023267/0.508036/0.450406s include hashing and
+observation; reference0.484270s excludes later component hashing. Shared
+process/file/kernel warmth means these are NOT controlled serving timings.
+Sampled active Metal25.199/91.554/179.896MB versus675.496MB loaded reference;
+whole-process true peak684,441,632B. Minimum available6,929,514,496B,
+zero swap-usage growth and638,976B swap-out;90 clear host/native observations.
+Fresh periodic preflight30.031747s, minimum7,088,652,288B, zero swap growth/out.
+Supervisor4.917049s / child2.797372s, exit0. PIDs10712/10718 gone,
+session62518 drained, all808 source entries start=end=fresh before edits.
+Private independent verification: logs/huihui_runtime_head_rows_ready_20260909.verified.json.
+Result SHA f1df3a3d9825b50a22cb42db9e41fb8515cad65f5fe069ac43d8e728c40e5eea.
+
+Added explicit VMODEL_QWEN35_MXFP4_HEAD_ROWS (0/off default;8192/32768/65536).
+Engine resolves this before persistent pinning; each tile still calls the live
+governor with the ordinary margin. Guards reject unsupported geometry, absent
+governor, pinned/phase/reranked/requantized heads, source overlays and grammar
+jump-forward. Non-singleton ordinary forwards and >64 serial windows fail
+BEFORE trunk/KV mutation.64 is a projection-window bound, not request output.
+Flat MTP shares the head; native/selective trees remain disallowed for this
+initial profile. Separate engine and prompt identities prevent silent reuse.
+
+qwen35_mxfp4_head_io includes whole-request/prefill/decode and MTP draft/target
+counters, plus WeightStore+head bytes; these are successful returned reads,
+not physical uncached disk traffic. Protocol and hidden-phase summaries retain
+the structured counters. New direct/workflow audit profiles select32768 rows
+and replace the old phase lease; no defaults promoted. Selected strict
+no-real-MLX suite1002 PASS14.78s;132 profiles validate.
+
+NEXT: matched fresh-server real short captures, same max1024/temp0/seed64013,
+original transport/input/tools and all-phase token witnesses; then full
+captured harness/model-only Plex and held-out long/output validation.
+Serving integration is not yet real-request qualified. Target MXFP4 and
+reassociated prefill remain distinct from released-BF16 lossless.
+
+
 ## 2026-09-09 UTC: periodic preflight catches a real interior-only memory refusal
 
 The ready runtime-class oracle was NOT launched. A changed initial snapshot

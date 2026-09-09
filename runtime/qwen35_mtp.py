@@ -68,6 +68,7 @@ from typing import Iterable, Mapping, Sequence
 
 import mlx.core as mx
 from . import quant
+from . import qwen_mxfp4_head_policy as mxfp4_head_policy
 from .kv_cache import KVCache
 from .qwen35 import (_apply_partial_rope, _full_attention, _linear, _moe,
                      _swiglu, final_logits, qwen35_rms_norm)
@@ -1644,6 +1645,10 @@ class QwenMTPSpeculativeEngine:
                 "_note_true_peak",
             )):
                 raise ValueError("compact Qwen rollback requires serial factor support")
+        if getattr(target.rc, 'qwen35_mxfp4_head_rows', 0):
+            if (native_tree_width or selective_tree_margin or not callable(
+                    getattr(target, 'forward_tokens_serial_positions', None))):
+                raise ValueError('native MXFP4 head requires flat serial Qwen MTP')
         self.target = target
         self.drafter = drafter if drafter is not None else QwenMTPDrafter(target)
         self.proposal_source = str(getattr(
@@ -1951,6 +1956,8 @@ class QwenMTPSpeculativeEngine:
         request_t0 = time.perf_counter()
         request_cache_before = _cache_io_snapshot(tgt)
         request_direct_io_before = _direct_io_snapshot(tgt)
+        request_mxfp4_head_before = mxfp4_head_policy.snapshot(tgt)
+        draft_mxfp4_head_totals = {}
         draft_head_detach_before = (
             int(getattr(self.drafter, "_head_host_detach_calls", 0)),
             int(getattr(self.drafter, "_head_host_detach_bytes", 0)),
@@ -2031,6 +2038,7 @@ class QwenMTPSpeculativeEngine:
                 bootstrap_budget_restored),
         })
         decode_cache_before = _cache_io_snapshot(tgt)
+        decode_mxfp4_head_before = mxfp4_head_policy.snapshot(tgt)
         bootstrap_stats.update(self._stage_drafter_after_target_prefill())
         drafter_request_prefill_s = 0.0
         begin_draft_request = getattr(self.drafter, "begin_request", None)
@@ -2655,6 +2663,7 @@ class QwenMTPSpeculativeEngine:
                 selective_branch_tokens: list[int] = []
                 selective_branch_kv = None
                 draft_rerank_before = _reranked_head_telemetry_snapshot(tgt)
+                draft_mxfp4_head_before = mxfp4_head_policy.snapshot(tgt)
                 draft_started = time.perf_counter()
                 try:
                     # A preceding target sweep may have left the external AR
@@ -3098,6 +3107,8 @@ class QwenMTPSpeculativeEngine:
                     draft_rerank_before,
                     _reranked_head_telemetry_snapshot(tgt),
                 )
+                mxfp4_head_policy.accumulate(draft_mxfp4_head_totals,
+                    draft_mxfp4_head_before, mxfp4_head_policy.snapshot(tgt))
 
                 proposed += len(draft_tokens)
                 round_draft_widths.append(len(draft_tokens))
@@ -4401,6 +4412,8 @@ class QwenMTPSpeculativeEngine:
             tgt, decode_cache_before, path_stats, prefix="decode_",
             after=request_cache_after)
         _record_direct_io_delta(tgt, request_direct_io_before, path_stats)
+        mxfp4_head_policy.publish(tgt, path_stats, request_mxfp4_head_before,
+            decode_mxfp4_head_before, draft=draft_mxfp4_head_totals)
 
         # The bootstrap result only observed the first target token. Publish
         # the complete paged-cache lifetime before the server profile releases
