@@ -118,6 +118,21 @@ def generation_phase_checks(response):
                 all_phase_generation_witness=valid and all(witnessed(p) for p in phases))
 
 
+def matching_generation_witness(row, reference_row):
+    """Missing failure timing is not identity evidence or a driver exception.
+
+    This only checks presence/equality; the all-phase checks still validate the
+    witness fields and natural completion independently.
+    """
+    def witness(value):
+        timing = value.get('timing')
+        return timing.get('generation_witness') if isinstance(timing, dict) else None
+
+    current, previous = witness(row), witness(reference_row)
+    return (isinstance(current, dict) and current.get('available') is True
+            and current == previous)
+
+
 def qwen_scalar_factor_path(t):
     """Actual flat scalar rollback observations, not just a configured switch."""
     return (type(t.get('qwen_mtp_compact_kda_rollback_enabled')) is int
@@ -300,8 +315,7 @@ def run(config):
                     ref = reference['cases'][index]
                     checks.update(
                         same_effective_request=metadata['request_sha256'] == ref['row']['request_sha256'],
-                        finite_greedy_tokens_and_text=row.get('timing', {}).get('generation_witness')
-                            == ref['row'].get('timing', {}).get('generation_witness'),
+                        finite_greedy_tokens_and_text=matching_generation_witness(row, ref['row']),
                         protocol_output=row.get('output_sha256') == ref['row'].get('output_sha256'),
                         canonical_calls=row.get('function_call_canonical_sha256')
                             == ref['row'].get('function_call_canonical_sha256'))

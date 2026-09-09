@@ -4,6 +4,9 @@ import copy
 import hashlib
 import io
 import json
+from dataclasses import dataclass
+from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -194,6 +197,109 @@ def completed_phase(count=2, reason='eos'):
             generated_token_count=count, prepared_prompt_token_count=7,
             generated_token_ids_sha256='a'*64, prepared_prompt_token_ids_sha256='b'*64,
             engine_text_sha256='c'*64))
+
+
+@pytest.mark.parametrize('timing', [None, {}, 'invalid',
+    {'generation_witness': None}, {'generation_witness': {}},
+    {'generation_witness': {'available': False}}])
+def test_missing_failure_witness_neither_crashes_nor_matches(timing):
+    missing = {'timing': timing}
+    valid = {'timing': {'generation_witness': completed_phase()['generation_witness']}}
+    assert not gate.matching_generation_witness(missing, valid)
+    assert not gate.matching_generation_witness(valid, missing)
+    assert not gate.matching_generation_witness(missing, missing)
+
+
+def test_reference_witness_still_requires_exact_available_identity():
+    row = {'timing': {'generation_witness': completed_phase()['generation_witness']}}
+    reference = copy.deepcopy(row)
+    assert gate.matching_generation_witness(row, reference)
+    reference['timing']['generation_witness']['generated_token_ids_sha256'] = 'd'*64
+    assert not gate.matching_generation_witness(row, reference)
+
+
+@pytest.mark.parametrize('terminal_available', [True, False])
+def test_failed_request_with_null_timing_retains_case_and_stops_without_retry(
+        tmp_path, monkeypatch, terminal_available):
+    # Exercise the actual driver, not just its comparator. No server/model is
+    # started, and only transport/setup are stubbed; acceptance remains real.
+    for key in list(gate.os.environ):
+        if key.startswith('VMODEL_'):
+            monkeypatch.delenv(key)
+    case = {**capture(tmp_path, dict(model='old', stream=True,
+        input=[dict(role='user', content='Weather in Tokyo?')], tools=[])),
+        'name': 'weather', 'kind': 'weather_tool', 'city': 'Tokyo', 'stream': True,
+        'response': str(tmp_path/'failed.response.json')}
+    second = {**case, 'name': 'not_attempted', 'response': str(tmp_path/'unattempted.json')}
+    config = dict(model='test', cases=[case, second], profiles=['test'],
+        profile_digest='digest', source_commit='source', port=1234,
+        require_all_phase_completion=True, result=str(tmp_path/'result.json'),
+        server_log=str(tmp_path/'server.log'), preflight=str(tmp_path/'preflight.json'),
+        reference=str(tmp_path/'reference.json'))
+    Path(config['preflight']).write_text(json.dumps(dict(passed=True, sample_seconds=30,
+        end=dict(monotonic_s=gate.time.monotonic(), root_free_bytes=20_000_000_000))))
+    reference_response = tmp_path/'reference.response.json'
+    reference_response.write_text(json.dumps(dict(status='completed', output=[weather()],
+        vmodel_cache_phases=[completed_phase()])))
+    metadata = gate.prepare_case(case, config['model'])[2]
+    reference_row = dict(request_sha256=metadata['request_sha256'],
+        timing={'generation_witness': completed_phase()['generation_witness']},
+        output_sha256='a'*64, function_call_canonical_sha256=['b'*64])
+    reference_case = dict(row=reference_row, response_path=str(reference_response),
+        response_sha256=gate.sha(reference_response))
+    Path(config['reference']).write_text(json.dumps(dict(cases=[reference_case]*2)))
+    monkeypatch.setattr(gate.subprocess, 'check_output', lambda *a, **k: 'source\n')
+    monkeypatch.setattr(gate, 'apply_runtime_profiles',
+        lambda *a, **k: SimpleNamespace(profile_digest='digest'))
+    monkeypatch.setattr(gate, '_port_is_free', lambda port: True)
+    server = SimpleNamespace(pid=777, returncode=None)
+    def spawn(*args, **kwargs):
+        kwargs['stdout'].write(native()+'\n')
+        kwargs['stdout'].flush()
+        return server
+    monkeypatch.setattr(gate.subprocess, 'Popen', spawn)
+    monkeypatch.setattr(gate, '_wait_ready', lambda *a: dict(
+        vmodel_runtime_profile_digest='digest', vmodel_runtime_profiles=['test']))
+    monkeypatch.setattr(gate, '_stop_server', lambda proc: setattr(proc, 'returncode', -15))
+    @dataclass
+    class Pressure:
+        available_bytes: int = 6_000_000_000
+        swap_used_bytes: int = 0
+        swap_out_bytes: int = 0
+    monkeypatch.setattr(gate, '_pressure', Pressure)
+    failed = dict(status='failed', output=[], error=dict(code='server_memory_error',
+        message='unsafe reservation refused before allocation'))
+    calls = []
+    def post(url, payload, **kwargs):
+        calls.append(payload)
+        if terminal_available:
+            kwargs['response_observer'](failed)
+        value = valid_row()
+        value.update(timing=None, usage=None, response_status='failed', wall_seconds=1.25,
+            error=failed['error'], streamed_text_matches_final=True,
+            output_sha256='f'*64, function_call_canonical_sha256=[])
+        return value
+    monkeypatch.setattr(gate, '_post', post)
+    assert gate.run(config) == 1
+    result = json.loads(Path(config['result']).read_text())
+    assert not result['passed'] and len(calls) == 1 and len(result['cases']) == 1
+    assert not any(f.startswith('driver_error:') for f in result['failures'])
+    saved = result['cases'][0]
+    assert saved['row']['error'] == failed['error'] and saved['row']['timing'] is None
+    assert saved['row']['wall_seconds'] == 1.25
+    assert saved['row']['request_sha256'] == metadata['request_sha256']
+    for key in ('completed', 'finite_greedy_tokens_and_text',
+                'all_phase_token_identity', 'all_phase_generation_witness'):
+        assert saved['checks'][key] is False
+    assert 'not every case completed' in result['failures']
+    assert result['server_returncode'] == -15
+    assert not Path(second['response']).exists()
+    if terminal_available:
+        assert json.loads(Path(case['response']).read_text()) == failed
+        assert saved['response_sha256'] == gate.sha(case['response'])
+        assert Path(case['response']).stat().st_mode & 0o777 == 0o600
+    else:
+        assert saved['response_sha256'] is None and not Path(case['response']).exists()
 
 
 @pytest.mark.parametrize('bad', [dict(output_tokens=1024, termination_reason='length'),

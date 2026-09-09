@@ -1,5 +1,86 @@
 # STATUS — 2026-09-09 UTC (current corrections first; dated chronology below is history)
 
+## 2026-09-09 UTC: real short-capture head pre-admission fails safely; reporting bug repaired
+
+The new opt-in head pre-admission candidate is NOT qualified on Huihui yet.
+A fresh same-commit control/candidate experiment on clean, pushed 4012d2a
+preserved the original 359B streaming weather and 487B nonstreaming title
+captures, with only the declared model/max1024/temp0/seed64013 request
+overrides. The ONLY effective candidate configuration delta was
+VMODEL_QWEN35_PHASE_HEAD_PRE_ADMIT=1. Both use the explicit MXFP4,
+reassociated-prefill, Hermes, scalar-factor, full prepared-state, phase-head
+and fixed 256MB BF16 KV profile; NOT released-BF16 lossless or the full
+134-tool/Plex harness. Separate fresh server processes, no prompt-cache reuse;
+file-cache/host state was not forced cold or matched.
+
+Control huihui_head_pre_admit_control_short_20260909 completes weather/title
+in 42.0566s / 11.9425s HTTP, with 111/23 and 92/2 input/output tokens,
+natural grammar/EOS termination under max1024. All case checks and complete
+prepared/raw token/text witnesses match the historical reference. Engine
+first-token 8.1791s / 6.8805s (NOT wire TTFT), suffix-prefill 8.1782s / 6.7190s,
+decode 31.3044s / 4.9825s; logical reads 90,087,817,920B / 27,459,548,160B.
+Per-request true Metal peaks 2,294,352,873B / 1,313,317,928B. Nevertheless
+the CONTROL FAILS whole-run pressure: 26 samples, minimum available
+5,272,961,024B below the unchanged 5.3GB qualification threshold. Whole HTTP
+swap-out 3,342,336B, net growth 0; driver 54.3391s / parent 56.2903s.
+These short outputs are not a full-answer Plex grade or large-output proof.
+
+Candidate huihui_head_pre_admit_candidate_short_20260909 FAILS on weather
+before completion; title is not attempted. Its actual first 675,430,400B
+head loads and promotes once after an exact reservation, but the SECOND
+reservation, during MTP serial factor verification, refuses BEFORE fetch.
+Each call logically trims 197,776,384B of evictable cache; physical release
+remains unmeasured. Admission durations 1.0371s / 1.8900s. The final error's
+rounded observations are active 0.46GB, incoming 0.68GB, margin 0.40GB,
+projected 1.54GB versus ceiling 1.44GB at available 6.58GB. Preserve the
+ordinary 5.6GB reserve and 400MB margin; do not bypass this refusal.
+Ten periodic samples independently fail pressure at 4,960,370,688B available;
+that earlier minimum is not the final reservation sample. Periodic swap-out
+1,998,848B, net growth 0. Driver 21.6089s / parent 23.9287s are times to
+FAILURE, not a faster completed request. No completed candidate phase,
+raw-output identity, model quality or whole-state equivalence is available.
+
+The failed terminal response was durably saved, but the comparison driver
+then dereferenced timing=None and lost the in-memory case row before writing
+its result. Fixed only that reporting path: absent/null/nonmapping timing or
+missing/unavailable witnesses cannot crash the comparator or count as an
+identity match. Nine new pure cases include the actual driver with failed SSE
+and absent-terminal responses: preserve the failure, request/hash/wall row,
+stop before the second case, do not retry, and retain fail-closed completion
+and token checks. Both cases independently reproduce the old AttributeError
+in an in-memory negative control. Module 96 PASS; selected strict no-real-MLX
+suite 800 PASS in 13.85s; 129 profiles validate. No serving, sampling,
+representation, retry, safety-floor or default change in this follow-up.
+Archived failed artifacts remain unchanged; lost timings/tokens are not invented.
+
+Both runs had fresh passing 30s preflights and known-transcoder isolation.
+Preflight endpoint availability differed materially: control 6,604,554,240B
+versus candidate 7,643,840,512B; do not attribute differences to app cleanup or
+head ordering alone. Root/external minima stayed above 20.627GB / 100.414GB,
+fast tier 62,512,074,752B; Plex/Tdarr untouched. All 802 start/end/fresh source
+entries, configuration/request/model metadata, terminal/result/log identities,
+raw head rows and failures were independently verified BEFORE source edits.
+PIDs 81407/81411/81413 and 81613/81617/81619 gone; sessions 64081/27366 drained
+exit1; server -15 is normal cleanup. No timeout, signal or source drift.
+
+Private joint verification: logs/huihui_head_pre_admit_short_20260909.verified.json.
+Measured tree b1351b35f9d5cdaf4b1f95f40384220e568adcc192e112fd80fa1f4a79f671b6.
+Control result 9da3ff7129d4e5ce76bcb55003e0c45dc9aac79529add444290a659faff7c663;
+candidate result 0270d79004a034cb665eb34c55458e396369fa1a35eda7367b9ded74f0ab54e2;
+failed terminal 5d2cfaa5d6f95e6f6d4ecb120374980cf71c2b743ce4f5dd3c0805d6dd293881.
+Receipt/preflight/log hashes are in that private verification artifact.
+
+No model job remains. Stop blind reruns or larger-harness promotion of this
+candidate. Next audit exact quantized head row streaming and live scalar-factor
+ownership at projection, then require actual geometry/all-logit and token gates.
+Existing raw BF16 StreamedLMHead explicitly excludes quantized heads: switching
+its flag alone cannot serve this MXFP4 head, and tiled kernel geometry still
+needs numerical proof. The new gateway start/complete observers are not exercised
+by these direct requests (zero gateway records); their live hidden/public
+coverage gate remains separate. Full model-only Plex, held-out long contexts,
+large outputs and under90s remain OPEN.
+
+
 ## 2026-09-09 UTC: exact head pre-admission candidate closes a pre-fetch lifetime gap
 
 Cold/bootstrap audit found a concrete allocation-order gap: Qwen's dormant
