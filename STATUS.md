@@ -1,5 +1,30 @@
 # STATUS — 2026-09-09 UTC (current corrections first; dated chronology below is history)
 
+## 2026-09-09 UTC: periodic preflight catches a real interior-only memory refusal
+
+The ready runtime-class oracle was NOT launched. A changed initial snapshot
+above6.70GB with no known transcoder justified one fresh preflight on clean/
+pushed f7ce4a0. Its30.028156s/18-point window starts6,781,386,752B and ends
+6,722,928,640B, but dips to6,673,596,416B:26,403,584B below the unchanged6.70GB
+whole-reference minimum. Sixteen process inventories are clear; swap growth0,
+swap-out933,888B, root minimum21,330,956,288B and external end99,703,324,672B.
+Largest observed gap2.035455s. No same-interval retry or reserve relaxation.
+
+Unlike the earlier diagnostic, endpoint-only evaluation of THIS saved window
+would pass. Independently recomputing the periodic evidence correctly defers;
+the endpoint minimum overstates the observed minimum by49,332,224B. This verifies
+the new sampler's practical distinction, not a prevented crash or a model-speed
+result. No MLX/model payload was loaded and serving/apps remain unchanged.
+
+Artifact: logs/huihui_runtime_head_rows_20260909.preflight.json;
+SHA98f2b46734527ccaf379f890a3755b0feca9f0e081b6e3dfb9b61182128a5611.
+Independent verification: logs/huihui_runtime_head_rows_20260909.preflight.verified.json.
+Session57243 drained exit1; source HEAD/cleanliness verified before these notes.
+The runtime-class all-logit gate below remains ready. Use a NEW unique run and
+fresh passing periodic preflight, then --candidate-kind runtime; do not reuse
+this failed preflight or relabel the prior manual-loop pass as runtime evidence.
+
+
 ## 2026-09-09 UTC: real-runtime-class numerical oracle ready; launch waits for declared workspace
 
 The existing head oracle now has an explicit --candidate-kind runtime mode on
