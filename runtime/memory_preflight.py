@@ -67,16 +67,17 @@ def evaluate(
     min_root_free_bytes: int,
     max_swap_growth_bytes: int,
     max_swap_out_growth_bytes: int,
+    intermediate: tuple[PressureSnapshot, ...] = (),
 ) -> dict:
-    """Return a structured admission decision for two pressure samples."""
-    swap_growth = max(0, end.swap_used_bytes - start.swap_used_bytes)
-    swap_out_growth = max(0, end.swap_out_bytes - start.swap_out_bytes)
-    root_ok = min(start.root_free_bytes, end.root_free_bytes) >= min_root_free_bytes
-    clean_swap = min(start.swap_free_bytes, end.swap_free_bytes) >= (
-        min_clean_swap_free_bytes)
+    """Evaluate endpoints plus any explicitly sampled intermediate observations."""
+    points = (start, *intermediate, end)
+    swap_growth = max(p.swap_used_bytes for p in points) - start.swap_used_bytes
+    swap_out_growth = max(p.swap_out_bytes for p in points) - start.swap_out_bytes
+    available_min = min(p.system_available_bytes for p in points)
+    root_ok = min(p.root_free_bytes for p in points) >= min_root_free_bytes
+    clean_swap = min(p.swap_free_bytes for p in points) >= min_clean_swap_free_bytes
     stable_stale_swap = (
-        min(start.system_available_bytes, end.system_available_bytes)
-        >= min_stable_available_bytes
+        available_min >= min_stable_available_bytes
         and swap_growth <= max_swap_growth_bytes
         and swap_out_growth <= max_swap_out_growth_bytes
     )
@@ -85,8 +86,7 @@ def evaluate(
     if not root_ok:
         reasons.append("root_free_below_minimum")
     if not clean_swap and not stable_stale_swap:
-        if min(start.system_available_bytes, end.system_available_bytes) < (
-                min_stable_available_bytes):
+        if available_min < min_stable_available_bytes:
             reasons.append("system_available_below_stable_swap_minimum")
         if swap_growth > max_swap_growth_bytes:
             reasons.append("swap_usage_growing")
@@ -107,6 +107,51 @@ def evaluate(
         "swap_out_growth_bytes": swap_out_growth,
         "reasons": reasons,
     }
+
+
+def sample_pressure_window(seconds, *, sample, activity=None,
+                           clock=time.monotonic, sleep=time.sleep):
+    """Bounded two-second observations, not continuous or atomic coverage.
+
+    No MLX, pressure responses, or process controls. Errors/caps cannot certify
+    a stable window, even when the endpoints happen to be healthy.
+    """
+    if (type(seconds) not in (int, float) or not math.isfinite(seconds)
+            or not 0 <= seconds <= 3600):
+        raise ValueError("pressure window must be finite and in 0..3600 seconds")
+    result = dict(complete=False, reason=None, snapshots=[], activity=[])
+    started = clock()
+    previous = started
+    for _ in range(1802):
+        try:
+            point = sample()
+            if (not isinstance(point, PressureSnapshot)
+                    or type(point.monotonic_s) not in (int, float)
+                    or not math.isfinite(point.monotonic_s)
+                    or point.monotonic_s < previous
+                    or any(type(value) is not int or value < 0 for key, value
+                           in asdict(point).items() if key != "monotonic_s")):
+                result['reason'] = 'invalid-pressure-sample'
+                return result
+            result['snapshots'].append(point)
+            if activity is not None:
+                result['activity'].append(activity())
+            now = clock()
+            if not math.isfinite(now) or now < point.monotonic_s:
+                result['reason'] = 'invalid-pressure-clock'
+                return result
+            previous = now
+            remaining = seconds - (now - started)
+            if remaining <= 0:
+                result['complete'] = True
+                return result
+            sleep(min(2.0, remaining))
+        except Exception as error:
+            result['reason'] = 'pressure-sampling-error'
+            result['error_type'] = type(error).__name__
+            return result
+    result['reason'] = 'pressure-sample-limit'
+    return result
 
 
 def _atomic_json(path: Path, value: dict) -> None:
@@ -137,12 +182,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-swap-out-growth-mb", type=float, default=16.0)
     parser.add_argument("--require-no-transcoders", action="store_true",
         help="Also defer if ffmpeg/HandBrakeCLI is observed anywhere in the sample window; read-only, not a general host-idle proof.")
+    parser.add_argument("--sample-memory-window", action="store_true",
+        help="Also sample pressure every two seconds and reject observed interior pressure; endpoints-only behavior is otherwise preserved.")
     args = parser.parse_args()
     if args.sample_seconds < 0:
         parser.error("sample-seconds must be nonnegative")
-    if args.require_no_transcoders and (not math.isfinite(args.sample_seconds)
-                                      or args.sample_seconds > 3600):
-        parser.error("transcoder sampling window must be finite and at most 3600 seconds")
+    if (args.require_no_transcoders or args.sample_memory_window) and (
+            not math.isfinite(args.sample_seconds) or args.sample_seconds > 3600):
+        parser.error("sampling window must be finite and at most 3600 seconds")
     for name, value in vars(args).items():
         if name.endswith(("_gb", "_mb")) and value < 0:
             parser.error(f"{name.replace('_', '-')} must be nonnegative")
@@ -153,7 +200,15 @@ def main() -> int:
     args = parse_args()
     start = capture(args.workspace)
     host_activity = None
-    if args.require_no_transcoders:
+    pressure_window = None
+    if getattr(args, 'sample_memory_window', False):
+        from .host_activity_witness import sample_known_transcoders, summarize_known_transcoders
+        pressure_window = sample_pressure_window(args.sample_seconds,
+            sample=lambda: capture(args.workspace),
+            activity=sample_known_transcoders if args.require_no_transcoders else None)
+        if args.require_no_transcoders:
+            host_activity = summarize_known_transcoders(pressure_window['activity'])
+    elif args.require_no_transcoders:
         from .host_activity_witness import sample_transcoder_window
         host_activity = sample_transcoder_window(args.sample_seconds)
     elif args.sample_seconds:
@@ -167,7 +222,13 @@ def main() -> int:
         min_root_free_bytes=int(args.min_root_free_gb * 1e9),
         max_swap_growth_bytes=int(args.max_swap_growth_mb * 1e6),
         max_swap_out_growth_bytes=int(args.max_swap_out_growth_mb * 1e6),
+        intermediate=tuple(pressure_window['snapshots']) if pressure_window else (),
     )
+    if pressure_window is not None and not pressure_window['complete']:
+        decision['passed'] = False
+        decision['verdict'] = 'DEFERRED_PRECONDITION'
+        decision['admission_path'] = 'none'
+        decision['reasons'].append('pressure_window_unavailable')
     if host_activity is not None and not host_activity['passed']:
         decision['passed'] = False
         decision['verdict'] = 'DEFERRED_PRECONDITION'
@@ -190,6 +251,19 @@ def main() -> int:
     }
     if host_activity is not None:
         result['known_transcoders'] = host_activity
+    if pressure_window is not None:
+        points = (start, *pressure_window['snapshots'], end)
+        result['pressure_window'] = dict(
+            schema='voom.preflight-pressure-window.v1',
+            scope='two-second sampled observations, not continuous or atomic coverage',
+            complete=pressure_window['complete'], reason=pressure_window['reason'],
+            error_type=pressure_window.get('error_type'),
+            interval_seconds=2.0,
+            sample_count=len(points), samples=[asdict(p) for p in points],
+            minimum_available_bytes=min(p.system_available_bytes for p in points),
+            minimum_root_free_bytes=min(p.root_free_bytes for p in points),
+            peak_swap_used_bytes=max(p.swap_used_bytes for p in points),
+            maximum_swap_out_bytes=max(p.swap_out_bytes for p in points))
     _atomic_json(args.result, result)
     print(json.dumps(result, indent=2, sort_keys=True))
     return 0 if decision["passed"] else 1
