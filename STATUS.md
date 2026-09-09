@@ -1,5 +1,54 @@
 # STATUS — 2026-09-09 UTC (current corrections first; dated chronology below is history)
 
+## 2026-09-09 UTC: opt-in periodic preflight pressure evidence verified on the host
+
+The previous memory preflight observes only its START/END pressure snapshots;
+its sixteen in-window process inventories do not also observe available memory.
+Do not call that continuous or throughout-window memory proof. Added explicit
+--sample-memory-window on86a1734: bounded two-second PressureSnapshots, plus
+the original endpoints, with raw scalar samples, minima/maxima, timestamps and
+completion/error coverage. Known-transcoder sampling remains separately gated
+by --require-no-transcoders. No process control, MLX import or model I/O.
+
+When selected, the SAME clean-swap/stable-stale-swap/root thresholds apply over
+all observed points; an interior dip or transient swap-usage peak cannot be
+erased by a healthy final endpoint. Both admission alternatives must each hold
+over the sampled window, not alternate opportunistically. Invalid observations,
+backward clocks, sampling errors and the1802-sample cap fail closed. Sampling
+is not continuous or atomic, and can miss activity between polls. The flag is
+opt-in: legacy CLI defaults and existing endpoint-only artifacts are unchanged.
+Runtime governor floors, budgets, model arithmetic and profiles are untouched.
+
+Selected strict no-real-MLX suite901 PASS14.22s, including41 memory-preflight
+cases;129 profiles unchanged. The actual old3ec56d6 evaluate() function was
+extracted/executed as a negative control: all four healthy-endpoint/interior-
+pressure cases pass its endpoint check but fail the new sampled check (available
+memory, swap use, swap out and root free). Additional tests exercise the real CLI,
+transcoder veto, clean-swap policy, boundaries, caps, bad values and errors.
+
+The first REAL host diagnostic on clean/pushed86a1734 is safely DEFERRED; no
+model job launched. logs/huihui_pressure_window_20260909.preflight.json records
+30.0274s,18 pressure points including endpoints and16 process inventories.
+Available memory starts6,652,133,376B, ends6,813,171,712B, but dips to
+6,581,567,488B between them:70,565,888B below the endpoint-only minimum and
+below the declared6.70GB oracle prerequisite. This is NOT a demonstrated
+old-pass/new-fail host case; the old start endpoint would also defer.
+Largest observed pressure gap2.0339s; net/peak-relative-to-start swap growth0,
+swap-out1,998,848B. Three distinct Plex Transcoder PID/start identities also
+veto isolation; Plex is untouched and system pressure is not attributed to it.
+Root minimum21,351,346,176B; external end100,252,020,736B.
+
+Independently recomputed all extrema, growth, ordering, duration, identity counts
+and admission reasons; result SHA553bf0a68528c215988e6070dad92c3af92260f72a8935630f2d23af43a1e788.
+Session20730 drained exit1; source HEAD/cleanliness verified before doc edits.
+Private verification: logs/huihui_pressure_window_20260909.verified.json.
+Next actual-head row oracle requires a NEW passing30s preflight, now selecting
+`--sample-memory-window`, `--min-stable-available-gb 6.70`,
+`--min-root-free-gb 10` and `--require-no-transcoders`.
+Do not launch off the healthy final endpoint or repeat this busy interval.
+No actual-head/model-speed/Plex/long-context/large-output/under90s claim yet.
+
+
 ## 2026-09-09 UTC: prefetch pause/admission race reproduced and repaired; model gate still deferred
 
 A read-only lifetime audit found a separate coordination defect: schedule()
