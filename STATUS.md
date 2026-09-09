@@ -1,5 +1,20 @@
 # STATUS — 2026-09-09 UTC (current corrections first; dated chronology below is history)
 
+## 2026-09-09 UTC: preserve the existing body-only fast tier with native head rows
+
+Second serving startup onf2ef1cc correctly rejects the initially over-broad
+fast_dirs guard in0.3126s HTTP, before generation. Source/receipt/PIDs verified;
+no completed output or pressure qualification. Read-only inspection of the
+actual MTP-quant fast-tier manifest finds193 body tensor entries and ZERO
+head entries. Raw WeightStore dispatch selects overlay names individually.
+
+Narrowed the source guard to preserve this existing body-only placement, while
+still rejecting an overlay of EITHER lm_head.weight or lm_head.scales, aliased
+head names, unresolved manifest metadata, packed loaders and representation
+overlays. No head source changes or new copies. Regression tests cover body-only
+tiers, both partial-head overlays, aliases and unresolved metadata. The native
+head still reads the same checkpoint pair tested by the numerical oracle.
+
 ## 2026-09-09 UTC: first serving probe catches dense default-policy conflict
 
 The initial head-row HTTP candidate on4155fb6 failed before generation:

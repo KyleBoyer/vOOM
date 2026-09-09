@@ -53,12 +53,21 @@ def validate(rc, cfg, store):
     # Resolve lazy fast-tier policy before inspecting it; the row reader must
     # not silently bypass a selected representation or source overlay.
     store._ensure_raw_fast_tier_loaded()
-    for flag in ('vpack2', 'packed', 'gguf', 'fast_dirs', '_raw_fast_tier_manifest',
+    for flag in ('vpack2', 'packed', 'gguf',
                  'k3_scale_sidecar', 'bf16_nf12_sidecar', '_ct_int4_aux',
                  '_ct_mxfp4_aux', '_glm53_fp8_aux', '_dsv4_aux',
                  '_qwen4_fused_expert_slices'):
         if getattr(store, flag, True):
             raise ValueError('native MXFP4 head conflicts with source overlay '+flag)
+    manifest = getattr(store, '_raw_fast_tier_manifest', None)
+    if not isinstance(manifest, dict):
+        raise ValueError('native MXFP4 head needs resolved fast-tier metadata')
+    # Raw WeightStore overlays select individual tensor names, not entire
+    # shards. A body-only fast tier cannot change the head's source. Preserve
+    # that useful independent-device placement, but reject either head member.
+    for name in ('lm_head.weight', 'lm_head.scales'):
+        if name in manifest or store._real_name.get(name, name) != name:
+            raise ValueError('native MXFP4 head conflicts with head source overlay')
     aux = store._quant_aux.get('lm_head.weight')
     if (aux is None or (aux.bits, aux.group_size, aux.mode, aux.scales, aux.biases)
             != (4, 32, 'mxfp4', 'lm_head.scales', None)):

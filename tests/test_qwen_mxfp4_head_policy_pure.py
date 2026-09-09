@@ -21,7 +21,7 @@ def fixture():
     cfg = NS(model_type='qwen3_5', num_experts=0, tie_word_embeddings=False,
              hidden_size=5120, vocab_size=248320)
     store = NS(vpack2=None, packed=None, gguf=None, fast_dirs=[],
-        _raw_fast_tier_manifest=None, k3_scale_sidecar=None, bf16_nf12_sidecar=None,
+        _raw_fast_tier_manifest={}, _real_name={}, k3_scale_sidecar=None, bf16_nf12_sidecar=None,
         _ct_int4_aux={}, _ct_mxfp4_aux={}, _glm53_fp8_aux={}, _dsv4_aux={},
         _qwen4_fused_expert_slices={}, _ensure_raw_fast_tier_loaded=lambda:None,
         _quant_aux={'lm_head.weight':NS(bits=4,group_size=32,mode='mxfp4',
@@ -50,8 +50,8 @@ def test_incompatible_modes_fail(flag):
     with pytest.raises(ValueError,match=flag): policy.validate(rc,cfg,store)
 
 
-@pytest.mark.parametrize('flag',['vpack2','packed','gguf','fast_dirs',
-    '_raw_fast_tier_manifest','k3_scale_sidecar','bf16_nf12_sidecar',
+@pytest.mark.parametrize('flag',['vpack2','packed','gguf',
+    'k3_scale_sidecar','bf16_nf12_sidecar',
     '_ct_int4_aux','_ct_mxfp4_aux','_glm53_fp8_aux','_dsv4_aux','_qwen4_fused_expert_slices'])
 def test_source_overlay_cannot_be_silently_bypassed(flag):
     rc,cfg,store=fixture(); setattr(store,flag,object())
@@ -60,12 +60,28 @@ def test_source_overlay_cannot_be_silently_bypassed(flag):
 
 def test_lazy_overlay_is_resolved_and_missing_metadata_fails_closed():
     rc,cfg,store=fixture()
-    store._ensure_raw_fast_tier_loaded=lambda:setattr(store,'_raw_fast_tier_manifest',{'path':'overlay'})
+    store._ensure_raw_fast_tier_loaded=lambda:setattr(store,'_raw_fast_tier_manifest',{'lm_head.scales':{}})
     with pytest.raises(ValueError,match='overlay'): policy.validate(rc,cfg,store)
     rc,cfg,store=fixture(); del store._ct_int4_aux
     with pytest.raises(ValueError,match='overlay'): policy.validate(rc,cfg,store)
     rc,cfg,store=fixture(); store._quant_aux={}
     with pytest.raises(ValueError,match='packed head pair'): policy.validate(rc,cfg,store)
+
+
+@pytest.mark.parametrize('name',['lm_head.weight','lm_head.scales'])
+def test_head_overlay_rejected_but_body_only_fast_tier_is_preserved(name):
+    rc,cfg,store=fixture(); store.fast_dirs=['internal-body-tier']
+    store._raw_fast_tier_manifest={'model.layers.0.mlp.up_proj.weight':{'file':'page'}}
+    policy.validate(rc,cfg,store)
+    store._raw_fast_tier_manifest[name]={}
+    with pytest.raises(ValueError,match='head source overlay'): policy.validate(rc,cfg,store)
+    store._raw_fast_tier_manifest={}; store._real_name[name]='aliased.'+name
+    with pytest.raises(ValueError,match='head source overlay'): policy.validate(rc,cfg,store)
+
+
+def test_unresolved_fast_tier_metadata_cannot_certify_native_head():
+    rc,cfg,store=fixture(); store._raw_fast_tier_manifest=None
+    with pytest.raises(ValueError,match='resolved'): policy.validate(rc,cfg,store)
 
 
 @pytest.mark.parametrize('key,value',[('model_type','qwen3_5_moe'),('num_experts',1),
