@@ -47,9 +47,11 @@ def layout(header, data_start, file_bytes):
             raise ValueError('invalid MXFP4 head shape or offsets')
         start, stop = offsets
         rows, columns = shape
+        # File offsets need not have dtype alignment: native MLX safetensors
+        # may have an unpadded JSON header. pread returns copied bytes, and
+        # mx.array supplies the destination alignment; this is not mmap/view.
         if (start < 0 or stop - start != rows * columns * itemsize
-                or data_start + stop > file_bytes
-                or (data_start + start) % itemsize):
+                or data_start + stop > file_bytes):
             raise ValueError('invalid MXFP4 head byte extent')
         result.append(Extent(name, dtype, rows, columns,
             data_start + start, columns * itemsize))

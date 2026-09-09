@@ -44,9 +44,9 @@ def test_bad_physical_layout_rejected(component, key, value):
         rows.layout(value_header, 128, 230)
 
 
-def test_overlap_bias_unaligned_and_truncated_file_rejected():
+def test_bias_and_truncated_file_rejected():
     for value, start, size in [(dict(header(), **{'lm_head.biases': {}}), 128, 230),
-                              (header(), 129, 231), (header(), 128, 229)]:
+                              (header(), 128, 229)]:
         with pytest.raises(ValueError):
             rows.layout(value, start, size)
 
@@ -65,22 +65,24 @@ def test_exact_pread_retries_short_reads_and_rejects_eof(monkeypatch):
         rows.pread_exact(7, 4, 10)
 
 
-def make_source(tmp_path):
+def make_source(tmp_path, data_start_mod4=0):
     q = dict(bits=4, group_size=32, mode='mxfp4')
     (tmp_path/'config.json').write_text(json.dumps(dict(quantization=q, quantization_config=q)))
     mapping = {key:'head.safetensors' for key in header()}
     (tmp_path/'model.safetensors.index.json').write_text(json.dumps(dict(weight_map=mapping)))
     encoded = json.dumps(header()).encode()
-    encoded += b' ' * ((-len(encoded)) % 8)
+    encoded += b' ' * ((data_start_mod4 - 8 - len(encoded)) % 4)
     payload = bytes(range(102))
     (tmp_path/'head.safetensors').write_bytes(struct.pack('<Q',len(encoded))+encoded+payload)
     return payload
 
 
-def test_actual_row_reader_consumes_only_declared_ranges_and_closes(tmp_path):
-    payload = make_source(tmp_path)
+@pytest.mark.parametrize('data_start_mod4', [0, 1, 2, 3])
+def test_actual_row_reader_consumes_only_declared_ranges_and_closes(tmp_path, data_start_mod4):
+    payload = make_source(tmp_path, data_start_mod4)
     source = rows.HeadRows(tmp_path)
     fd = source.fd
+    assert source.extents[0].offset % 4 == data_start_mod4
     assert source.read_component(0, 1, 3) == payload[32:96]
     assert source.read_component(1, 2, 3) == payload[100:102]
     source.check_unchanged()
