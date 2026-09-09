@@ -1,5 +1,41 @@
 # STATUS — 2026-09-09 UTC (current corrections first; dated chronology below is history)
 
+## 2026-09-09 UTC: split prefill preserves real tool tokens at0.583GB Metal; readiness still blocked
+
+ddbe6d7 runs the actual new scheduler on the real weather capture: all64
+attention phases and64MLP phases complete, maximum declared page149,162,496B.
+All reference-token/text/protocol, full-state, natural-completion, MTP factor,
+KV-reclaim and pressure checks pass. HTTP78.8566s, decode40.8558s,23 natural
+output tokens under max1024; true Metal peak582,974,736B. The26 native head
+scans complete with no failures and17,561,190,400 successful raw read bytes;
+prefill+decode and target+draft counters independently reconcile. No tools run.
+This validates one real request's token stream, not all recurrent tensor bits,
+released-BF16 lossless, broad equivalence, or a matched latency improvement.
+
+The subsequent non-streaming title STILL fails in70.611s: after an8->1 retry,
+a149MB phase page plus the unchanged400MB margin cannot fit at6.12GB available.
+No final title output. Do not call this repeated-request or full-harness ready.
+The first successful split call is slower than the historical57.2982s ordinary
+prefill tool call; the useful measured result is bounded workspace and correct
+tokens, not faster serving. The historical maximum2.278GB and current0.583GB
+are different scheduling/cache arms and host conditions, not an isolated cause.
+
+Whole-arm pressure passes73 native samples: minimum5,841,092,608B, zero swap
+growth,7,389,184B swap-out and clear known-transcoder/alignment coverage.
+Source824 start=end=fresh; session9902 drained, owned server/child/parent gone.
+Artifact: logs/huihui_split_prefill_head8192_short_20260909.json;
+SHA b5dbe27e9a05d54c57625677ee32de8dffcc2781007f95b4773b548cb653249a.
+Selected strict no-real-MLX regression suite1101 PASS15.68s;138 profiles valid.
+
+No model job is running. All experimental controls remain opt-in. No completed
+full134-tool/Plex score or long/sustained-output qualification is claimed.
+The original full-workflow configuration is prepared in session state but was
+NOT launched. Do not rerun the same arm under unchanged headroom. User-facing
+handoff requests permission to close the still-running ChatGPT app; leave
+Plex/Tdarr and all other apps alone without new authority. A meaningful host
+headroom change plus a fresh30s periodic preflight is required for another
+qualification attempt; preserve5600MB/400MB/256MB KV and all pressure gates.
+
 ## 2026-09-09 UTC: explicit split-weight prefill and a reproduced cache-lifetime correction
 
 2621546 accepts cache256/prefetch0 but the first short request still refuses
