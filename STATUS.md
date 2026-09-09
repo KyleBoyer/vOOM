@@ -1,5 +1,26 @@
 # STATUS — 2026-09-09 UTC (current corrections first; dated chronology below is history)
 
+## 2026-09-09 UTC: smaller head trial stops earlier in prefill; explicit32 next
+
+The8192-row trial onf519465 does NOT reach its new head reservation. It
+refuses the layer27 full-attention/dense page while prefilling111 positions
+at tile128: active324,040,168B + estimated207,665,204B page + unchanged400MB
+margin exceeds the live ceiling. The strict driver aborts on the logged
+prefill retry instead of silently counting a recovered run as retry-free.
+HTTP10.8348s is time to failure, not generation speed or a head result.
+
+Five periodic native samples pass the pressure gate: minimum6,004,965,376B,
+zero swap growth,1,802,240B swap-out and clear known-transcoder inventories.
+All814 source entries start=end=fresh, session48906 drained and all owned
+processes exited. Artifact: logs/huihui_head_rows8192_short_20260909.json.
+
+Read-only lifetime audit confirms prefill ALREADY deletes each layer's local
+weight owner; no duplicate lifetime fix is justified. Next explicit overlay
+qwen35-prefill-ceiling32 changes ONLY the tile ceiling128->32, preserving
+all prepared prompt state, full vocabulary, max-output1024 and safety floors.
+Different operator shapes need actual token/quality validation. Not a speed,
+lossless, completed harness, long-output or Plex-score claim.
+
 ## 2026-09-09 UTC: row-streamed head reaches MTP; use smaller proven tile next
 
 Real short capture on93bd548 reaches the ACTUAL native MTP draft_step and

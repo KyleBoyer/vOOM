@@ -1,0 +1,8 @@
+schema: voom.runtime-profile.v1
+name: qwen35-prefill-ceiling32
+description: Explicit smaller Qwen prefill tiles for constrained serving memory.
+notes:
+  - "Changes only the prefill tile ceiling to32. Keeps every prepared prompt position, request output budget, and existing memory floors and margins."
+  - "Operator shapes can change floating-point results; require actual generated-token and quality checks. This is not a lossless or speed claim. No automatic selection."
+settings:
+  VMODEL_QWEN35_PREFILL_CHUNK_CEILING: 32
