@@ -1,5 +1,51 @@
 # STATUS — 2026-09-09 UTC (current corrections first; dated chronology below is history)
 
+## 2026-09-09 UTC: native unpadded-head header supported; numerical follow-up still deferred
+
+The first revised-workspace run, huihui_mxfp4_head_rows_native_20260909 on
+clean/pushed 53d70d0, reached the real checkpoint header but stopped before
+any head reservation/payload/projection: the new experimental reader incorrectly
+required U32 FILE offsets to be aligned. The actual MLX-written shard has a
+2587-byte JSON header, data start2595 and head weight/scales absolute offsets
+265393699 /223041059 (both mod4=3). Both extents, U32[248320,640] and
+U8[248320,160], have valid sizes/bounds and total675430400B in a901092899B
+shard. There is no evidence of checkpoint corruption. Native MLX serialization
+writes its JSON length/content directly without requiring alignment padding.
+[MLX safetensors writer](https://raw.githubusercontent.com/ml-explore/mlx/v0.32.0/mlx/io/safetensors.cpp).
+
+This is a copied pread reader, not an mmap typed view: the destination array,
+not its file offset, needs dtype alignment. Removed only the incorrect
+absolute-file-offset test; dtype/shape/group, bounds/overlap/size, mutation,
+short-read and backend checks remain. Actual synthetic file tests now cover
+all four byte-offset residues with exact returned ranges and descriptor cleanup.
+The actual checkpoint is untouched. Fix564fea4 is pushed; module52 PASS,
+selected strict no-real-MLX suite852 PASS13.84s. No serving integration.
+
+The first run's parent2.5188s / child0.0256s are header-failure times, NOT
+head throughput. Zero reservations, zero logit cases, only32B MLX initialization
+peak; available6,893,289,472B, zero swap growth/out, two clear native/isolation
+samples. Fresh preceding30.0408s preflight passed6.9323 ->6.9488GB. All805
+start/end/fresh source entries, installed-library/model metadata, artifact
+hashes, physical header extents and PID completion independently verified
+BEFORE edits. PIDs84991/84995 gone; session31871 drained exit1; no timeout,
+signal or source drift. Private verification:
+logs/huihui_mxfp4_head_rows_native_20260909.verified.json.
+Result93b3770ecd566610aac320907a1a08bdea05e24920a3a4064fdfd4f0c22148af;
+tree79865214e3a33e4ef5681a7e657ad018508bde602a1a57008bcbfb39ec7ea347.
+
+The corrected numerical job was NOT launched. Its separate fresh30.0357s
+preflight deferred below the diagnostic6.70GB minimum:6,622,937,088B ->
+6,545,653,760B, net swap growth0, swap-out49,152B,16 clear known-transcoder
+samples. Root/external free21,406,584,832B /100,411,990,016B. Artifact:
+logs/huihui_mxfp4_head_rows_unaligned_20260909.preflight.json. Keep the ordinary
+5.6GB reserve/400MB margin and wait for the declared workspace; no additional
+same-condition retry this run and no user-app changes. No actual head-logit
+comparison or real head-memory/speed improvement is claimed yet. Next run the
+corrected oracle after a fresh passing preflight, then inspect all-logit and
+component identities before considering runtime wiring or larger requests.
+Full-harness/Plex/model-state/long-context/large-output/under90s remain open.
+
+
 ## 2026-09-09 UTC: native-loader audit corrects the diagnostic reference workspace
 
 The earlier 7.36GB oracle launch requirement counted a second whole host copy
