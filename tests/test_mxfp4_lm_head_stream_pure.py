@@ -197,3 +197,36 @@ def test_closed_descriptor_and_shortlist_never_load_payload():
     with pytest.raises(ValueError, match='closed'):
         head.logits(Array((1,1,5120)))
     assert events == []
+
+
+def test_optional_observer_sees_live_tile_then_successful_owner_release():
+    cls, reserve, _, live, _ = primitive()
+    seen = []
+    def observe(phase, start, stop):
+        seen.append((phase, start, stop))
+        alive = sum(ref() is not None for ref in live)
+        assert alive == (2 if phase == 'loaded' else 0)
+    head = cls(ROOT, reserve=reserve, block_rows=65536, observe=observe)
+    head.logits_serial_rows(Array((1, 6, 5120)))
+    assert seen == [(phase, s, min(248320, s+65536))
+        for s in range(0, 248320, 65536) for phase in ('loaded', 'released')]
+
+
+def test_invalid_observer_is_rejected_before_source_open():
+    cls, reserve, _, _, readers = primitive()
+    with pytest.raises(ValueError, match='observer'):
+        cls(ROOT, reserve=reserve, observe=True)
+    assert readers == []
+
+
+@pytest.mark.parametrize('stage', ['loaded', 'released'])
+def test_observer_failure_does_not_become_a_completed_scan(stage):
+    cls, reserve, _, _, _ = primitive()
+    def observe(phase, start, stop):
+        if phase == stage:
+            raise OSError('observer failed')
+    head = cls(ROOT, reserve=reserve, observe=observe)
+    with pytest.raises(OSError, match='observer failed'):
+        head.logits(Array((1, 1, 5120)))
+    assert head.failed_scan_calls == 1 and head.completed_scan_calls == 0
+    head.close()

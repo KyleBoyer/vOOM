@@ -45,11 +45,53 @@ def native_reference_reservation_bytes(store, head_bytes, mlx_version):
     return head_bytes
 
 
-def run(preflight, result_path):
+def runtime_candidate(activations, block_rows, governor, observe, document, source_identity):
+    """Exercise the actual runtime primitive with content-preserving witnesses.
+
+    Observer cost and byte hashing are included in timing. No replacement
+    matmul, injected results, fixture arithmetic or whole-head materialization.
+    """
+    from runtime.mxfp4_lm_head_stream import MXFP4StreamedLMHead
+
+    hashes = [hashlib.sha256(), hashlib.sha256()]
+    head = MXFP4StreamedLMHead(MODEL, reserve=governor.reserve, block_rows=block_rows,
+        observe=lambda phase, start, stop: observe(f'rows{block_rows}:{start}:{phase}'))
+    try:
+        assert head._reader.identity == source_identity
+        native_read = head._reader.read_component
+        observed_bytes = observed_extents = 0
+        def witnessed_read(index, start, stop):
+            nonlocal observed_bytes, observed_extents
+            raw = native_read(index, start, stop)
+            hashes[index].update(raw)
+            observed_bytes += len(raw)
+            observed_extents += 1
+            return raw
+        head._reader.read_component = witnessed_read
+        result = head.logits_serial_rows(activations)
+        stats = head.full_scan_telemetry()
+        assert stats['full_scan_calls'] == stats['completed_scan_calls'] == 1
+        assert stats['failed_scan_calls'] == 0
+        assert stats['full_bytes_read'] == observed_bytes
+        assert stats['full_read_extents'] == observed_extents
+        return result, hashes, stats
+    finally:
+        try:
+            document['runtime_candidate_last_stats'] = head.full_scan_telemetry()
+        finally:
+            head.close()
+
+
+def run(preflight, result_path, candidate_kind='manual'):
+    assert candidate_kind in ('manual', 'runtime')
     pre = json.loads(preflight.read_text())
     assert pre['passed'] and pre['sample_seconds'] >= 30 and pre['known_transcoders']['passed']
     assert 0 <= time.monotonic() - pre['end']['monotonic_s'] < 120
     assert pre['end']['root_free_bytes'] >= 10_000_000_000 and not result_path.exists()
+    if candidate_kind == 'runtime':
+        window = pre.get('pressure_window', {})
+        assert window.get('complete') is True
+        assert window.get('minimum_available_bytes', 0) >= 6_700_000_000
     assert not any(key.startswith('VMODEL_') for key in os.environ)
     for name, expected in METADATA.items():
         assert hashlib.sha256((MODEL/name).read_bytes()).hexdigest() == expected
@@ -69,6 +111,7 @@ def run(preflight, result_path):
 
     document = dict(schema='voom.huihui-mxfp4-head-rows-gate.v1', passed=False,
         scope=__doc__, metadata_sha256=METADATA, cases=[], failures=[],
+        candidate_kind=candidate_kind,
         preflight_sha256=hashlib.sha256(preflight.read_bytes()).hexdigest())
     started = time.perf_counter()
     store = WeightStore(MODEL)
@@ -166,32 +209,41 @@ def run(preflight, result_path):
             hashes = [hashlib.sha256(), hashlib.sha256()]
             read_bytes = read_extents = 0
             read_seconds = project_seconds = 0.0
-            for start in range(0, reader.vocab, block_rows):
-                stop = min(reader.vocab, start+block_rows)
-                block_bytes = (stop-start) * sum(e.row_bytes for e in reader.extents)
-                governor.reserve(2 * block_bytes, reason='mxfp4-head-row-block')
-                arrays = []
-                r0 = time.perf_counter()
-                for index, extent in enumerate(reader.extents):
-                    raw = reader.read_component(index, start, stop)
-                    hashes[index].update(raw)
-                    read_bytes += len(raw)
-                    read_extents += 1
-                    host = np.frombuffer(raw, dtype='<u4' if index == 0 else 'u1')
-                    array = mx.array(host.reshape(stop-start, extent.columns))
-                    mx.eval(array)
-                    arrays.append(array)
-                    del raw, host, array
-                read_seconds += time.perf_counter()-r0
-                head = QTensor(arrays[0], arrays[1], None, 4, 32, 'mxfp4')
-                observe(f'rows{block_rows}:{start}:loaded')
-                p0 = time.perf_counter()
-                block_logits = project_serial(head, activations)
-                project_seconds += time.perf_counter()-p0
-                chunks.append(block_logits)
-                del head, arrays, block_logits
-                observe(f'rows{block_rows}:{start}:released')
-            tiled = mx.concatenate(chunks, axis=-1)
+            runtime_stats = None
+            if candidate_kind == 'runtime':
+                tiled, hashes, runtime_stats = runtime_candidate(
+                    activations, block_rows, governor, observe, document, reader.identity)
+                read_bytes = runtime_stats['full_bytes_read']
+                read_extents = runtime_stats['full_read_extents']
+                read_seconds = (runtime_stats['full_read_ns'] + runtime_stats['upload_ns']) / 1e9
+                project_seconds = runtime_stats['projection_ns'] / 1e9
+            else:
+                for start in range(0, reader.vocab, block_rows):
+                    stop = min(reader.vocab, start+block_rows)
+                    block_bytes = (stop-start) * sum(e.row_bytes for e in reader.extents)
+                    governor.reserve(2 * block_bytes, reason='mxfp4-head-row-block')
+                    arrays = []
+                    r0 = time.perf_counter()
+                    for index, extent in enumerate(reader.extents):
+                        raw = reader.read_component(index, start, stop)
+                        hashes[index].update(raw)
+                        read_bytes += len(raw)
+                        read_extents += 1
+                        host = np.frombuffer(raw, dtype='<u4' if index == 0 else 'u1')
+                        array = mx.array(host.reshape(stop-start, extent.columns))
+                        mx.eval(array)
+                        arrays.append(array)
+                        del raw, host, array
+                    read_seconds += time.perf_counter()-r0
+                    head = QTensor(arrays[0], arrays[1], None, 4, 32, 'mxfp4')
+                    observe(f'rows{block_rows}:{start}:loaded')
+                    p0 = time.perf_counter()
+                    block_logits = project_serial(head, activations)
+                    project_seconds += time.perf_counter()-p0
+                    chunks.append(block_logits)
+                    del head, arrays, block_logits
+                    observe(f'rows{block_rows}:{start}:released')
+                tiled = mx.concatenate(chunks, axis=-1)
             mx.eval(tiled)
             actual = bits(tiled)
             assert read_bytes == head_bytes and [h.hexdigest() for h in hashes] == resident_hashes
@@ -201,6 +253,7 @@ def run(preflight, result_path):
             left_float, right_float = left.view(np.float32), right.view(np.float32)
             finite = bool(np.isfinite(left_float).all())
             case = dict(block_rows=block_rows, tail_rows=reader.vocab % block_rows,
+                candidate_kind=candidate_kind, runtime_stats=runtime_stats,
                 wall_seconds=time.perf_counter()-t0, read_and_upload_seconds=read_seconds,
                 projection_seconds=project_seconds, read_bytes=read_bytes, read_extents=read_extents,
                 component_sha256=[h.hexdigest() for h in hashes], logits_compared=int(actual.size),
@@ -252,5 +305,6 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--preflight', type=Path, required=True)
     parser.add_argument('--result', type=Path, required=True)
+    parser.add_argument('--candidate-kind', choices=('manual', 'runtime'), default='manual')
     args = parser.parse_args()
-    raise SystemExit(run(args.preflight, args.result))
+    raise SystemExit(run(args.preflight, args.result, args.candidate_kind))

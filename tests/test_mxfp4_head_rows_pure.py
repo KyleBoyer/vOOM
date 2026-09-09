@@ -125,10 +125,12 @@ def test_open_fails_closed_on_unsupported_or_oversized_source(tmp_path, change):
 
 
 @pytest.mark.parametrize('change', ['failed', 'short', 'stale', 'transcoder', 'disk'])
-def test_numeric_gate_requires_fresh_full_preflight_before_mlx_or_weights(tmp_path, change):
+@pytest.mark.parametrize('candidate_kind', ['manual', 'runtime'])
+def test_numeric_gate_requires_fresh_full_preflight_before_mlx_or_weights(tmp_path, change, candidate_kind):
     from tests.fixtures import huihui_mxfp4_head_rows_gate as gate
     pre = dict(passed=True, sample_seconds=30, known_transcoders={'passed': True},
-        end=dict(monotonic_s=gate.time.monotonic(), root_free_bytes=20_000_000_000))
+        end=dict(monotonic_s=gate.time.monotonic(), root_free_bytes=20_000_000_000),
+        pressure_window=dict(complete=True, minimum_available_bytes=7_000_000_000))
     if change == 'failed':
         pre['passed'] = False
     elif change == 'short':
@@ -142,7 +144,7 @@ def test_numeric_gate_requires_fresh_full_preflight_before_mlx_or_weights(tmp_pa
     path = tmp_path/'preflight.json'
     path.write_text(json.dumps(pre))
     with pytest.raises(AssertionError):
-        gate.run(path, tmp_path/'result.json')
+        gate.run(path, tmp_path/'result.json', candidate_kind)
     assert not (tmp_path/'result.json').exists()
 
 

@@ -26,11 +26,13 @@ class MXFP4StreamedLMHead(StreamedLMHead):
     logits, or make the existing phase-scoped whole-head lease compatible.
     """
 
-    def __init__(self, model_dir, *, reserve, block_rows=32768):
+    def __init__(self, model_dir, *, reserve, block_rows=32768, observe=None):
         if type(block_rows) is not int or block_rows not in (8192, 32768, 65536):
             raise ValueError('MXFP4 head requires an explicitly tested row size')
         if not callable(reserve):
             raise ValueError('MXFP4 head requires an ordinary governor reservation callback')
+        if observe is not None and not callable(observe):
+            raise ValueError('MXFP4 head observer must be callable or None')
         if importlib.metadata.version('mlx') != '0.32.0':
             raise ValueError('MXFP4 head requires the tested MLX 0.32.0 backend')
         self.model_dir = Path(model_dir).resolve()
@@ -42,6 +44,7 @@ class MXFP4StreamedLMHead(StreamedLMHead):
             self.row_bytes = sum(e.row_bytes for e in self._reader.extents)
             self.block_rows = block_rows
             self._reserve = reserve
+            self._observe = observe
             self.name = self.real_name = 'lm_head.weight'
             self.path = self._reader.path
             for name in ('full_scan_calls', 'full_read_extents', 'full_bytes_read',
@@ -97,6 +100,8 @@ class MXFP4StreamedLMHead(StreamedLMHead):
                 self.upload_ns += time.perf_counter_ns() - t0
             del raw, host, value
         head = QTensor(arrays[0], arrays[1], None, 4, 32, 'mxfp4')
+        if self._observe is not None:
+            self._observe('loaded', start, stop)
         t0 = time.perf_counter_ns()
         try:
             values = []
@@ -122,8 +127,10 @@ class MXFP4StreamedLMHead(StreamedLMHead):
             mx.eval(h)
             chunks = []
             for start in range(0, self.vocab, self.block_rows):
-                chunks.append(self._project_block(
-                    h, start, min(self.vocab, start+self.block_rows)))
+                stop = min(self.vocab, start+self.block_rows)
+                chunks.append(self._project_block(h, start, stop))
+                if self._observe is not None:
+                    self._observe('released', start, stop)
             result = mx.concatenate(chunks, axis=-1)
             mx.eval(result)
             self._reader.check_unchanged()
