@@ -370,6 +370,12 @@ def run(config):
                 if not document['serial_kv_reclaim_coverage']['passed']:
                     failures.append('serial KV recovery event/phase coverage gate')
             isolation = document['native_pressure'].get('known_transcoders')
+            if profile_env.get('VMODEL_HOST_ALLOCATOR_RELIEF') == '1':
+                from runtime.host_allocator_relief import summarize
+                document['host_allocator_relief'] = summarize(
+                    Path(config['server_log']).read_text(), expected_count=len(rows))
+                if not document['host_allocator_relief']['passed']:
+                    failures.append('host allocator relief coverage gate')
             if ((host_activity_required or isolation is not None)
                     and not (isolation or {}).get('passed')):
                 failures.append('known-transcoder isolation gate')

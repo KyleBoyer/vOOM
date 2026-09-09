@@ -11425,6 +11425,8 @@ class Handler(BaseHTTPRequestHandler):
             # already running (see PriorityLock's docstring).
             INFER_LOCK.acquire(priority=len(parsed[0]))
             try:
+                from .host_allocator_relief import run_if_enabled
+                run_if_enabled()
                 return self._do_post_locked()
             finally:
                 INFER_LOCK.release()

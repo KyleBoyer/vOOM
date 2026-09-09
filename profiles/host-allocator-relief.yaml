@@ -1,0 +1,8 @@
+schema: voom.runtime-profile.v1
+name: host-allocator-relief
+description: Experimental serialized request-boundary CPU allocator reclamation.
+notes:
+  - "Before each inference HTTP under INFER_LOCK, collect unreachable Python objects and invoke Darwin malloc_zone_pressure_relief(NULL,0). Frees only unused process allocator storage; no model/cache/state mutation, memory-floor reduction or MLX operation."
+  - "Content-free before/after native-process observations and allocator-reported bytes are logged. Overhead is included in HTTP wall time. Require actual token, completion and pressure checks; native reported bytes are not physical-memory attribution or a speed result."
+settings:
+  VMODEL_HOST_ALLOCATOR_RELIEF: true

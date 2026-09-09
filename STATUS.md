@@ -1,5 +1,35 @@
 # STATUS — 2026-09-09 UTC (current corrections first; dated chronology below is history)
 
+## 2026-09-09 UTC: stop tile-only trials; instrument unused CPU allocator reclamation
+
+On1e7b63b, head8192/prefill8 again completes the weather capture with all
+reference-token/protocol/completion checks in59.2042s. The second title FAILS
+in7.7584s: the207-214MB layer-page admission cannot fit even after8->1 retry.
+Shrinking token tiles does not shrink these weight pages. No tile1 rerun.
+Whole-arm pressure passes32 native samples, minimum5,842,960,384B, zero swap
+growth,5,095,424B swap-out, clear known transcoders. Source816 start=end=fresh,
+session21488 drained and all owned processes exited. Artifact:
+logs/huihui_head_rows8192_prefill8_short_20260909.json;
+SHA2698091de108e99925667ccb3597efd9e4497e79e9583dcff13e3b0577ced4a6.
+
+The title refusal shows only5-26MB active Metal but roughly0.95-1.03GB native
+process footprint, including435MB internal compressed ledger. These overlapping
+views do NOT identify a leak, live buffer owner or process-attributed swap.
+Native MTP already releases its round weights; source inspection does not
+justify adding a duplicate sidecar unload. Next is an explicit process-level
+experiment, host-allocator-relief, before each inference HTTP under INFER_LOCK:
+collect unreachable Python objects, then Darwin malloc_zone_pressure_relief
+(NULL,0). Apple documents this as best-effort release of unused allocator
+storage, not live allocations. No MLX operation, model/cache mutation or safety
+threshold change. Before/after-GC/after-relief native samples and API-reported
+bytes are logged; both captured drivers require complete coverage when selected.
+HTTP wall includes the hook. Default off; true request/token/pressure gates next.
+
+Selected strict no-real-MLX tests1023 PASS15.44s;136 profiles validate. An actual
+CPU-only fresh-process ABI smoke passes and reports0 bytes released in0.000975s;
+that is availability proof, not useful model-process reclamation or a speed win.
+Primary ABI: https://github.com/apple-oss-distributions/libmalloc/blob/main/include/malloc/malloc.h
+
 ## 2026-09-09 UTC: native-head serving completes both short captures; one prefill retry
 
 On e8d69ed, head8192/prefill32 produces correct weather-tool and title outputs

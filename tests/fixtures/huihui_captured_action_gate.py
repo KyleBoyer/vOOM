@@ -545,6 +545,13 @@ def run(config):
             document['failures'].append('whole_run_pressure')
         if not document['native_pressure'].get('known_transcoders', {}).get('passed'):
             document['failures'].append('known_transcoder_isolation')
+        if env.get('VMODEL_HOST_ALLOCATOR_RELIEF') == '1':
+            from runtime.host_allocator_relief import summarize
+            document['host_allocator_relief'] = summarize(
+                Path(config['server_log']).read_text(), expected_count=(
+                    len(document.get('workflow_http', [])) if workflow == 'plex' else 1))
+            if not document['host_allocator_relief']['passed']:
+                document['failures'].append('host_allocator_relief_coverage')
         if serial_kv_required:
             document['serial_kv_reclaim_coverage'] = serial_recovery_coverage(config, document)
             if not document['serial_kv_reclaim_coverage']['passed']:
