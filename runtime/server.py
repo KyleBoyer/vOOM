@@ -7726,6 +7726,17 @@ def _release_qwen4_idle_request_state(engine) -> None:
             pass
 
 
+def _emit_gateway_phase_completion(request_id, phase) -> None:
+    if os.environ.get("VMODEL_GENERATION_WITNESS", "0").strip() != "1":
+        return
+    try:
+        from .gateway_phase_witness import emit_completion
+        emit_completion(request_id, phase)
+    except Exception:
+        # Diagnostic imports/sinks cannot alter the already generated output.
+        pass
+
+
 def _attach_generation_witness(prompt, result: dict) -> None:
     """Opt-in hashes of engine output before protocol parsing/normalization.
 
@@ -12814,6 +12825,7 @@ class Handler(BaseHTTPRequestHandler):
                     constraint=gateway_constraint)
                 decision_cache_phase = _cache_phase_telemetry(
                     "gateway_decision", decision)
+                _emit_gateway_phase_completion(rid, decision_cache_phase)
                 decision_content, calls = _parse_request_tool_calls(
                     decision["text"], prompt_tools, engine.cfg.model_type,
                     allow_parallel=False)
@@ -13078,6 +13090,7 @@ class Handler(BaseHTTPRequestHandler):
                     expert_top_k=gateway_execution_expert_top_k)
             execution_cache_phase = _cache_phase_telemetry(
                 "gateway_execution", result)
+            _emit_gateway_phase_completion(rid, execution_cache_phase)
             _execution_content, execution_calls = _parse_request_tool_calls(
                 result["text"], prompt_tools, engine.cfg.model_type,
                 allow_parallel=False)

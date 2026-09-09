@@ -1,5 +1,100 @@
 # STATUS — 2026-09-09 UTC (current corrections first; dated chronology below is history)
 
+## 2026-09-09 UTC: description ablation fails third HTTP; exact KV top-up cannot restore host headroom
+
+`huihui_plex_enable_external_20260909` on clean/pushed
+0606b3967f0fb2413e7a6436e5a764f6a3a6f713 is independently verified **FAIL**.
+Same original178616B/134-tool capture, first wire178694B, only the established
+model/max1024/temp0/seed64013 HTTP overrides, unchanged synthetic mixed two-page
+fixture and four-handled-round/five-HTTP budget. The ONLY effective setting
+delta is the explicit external-only enable description. Full-prepared-state
+MXFP4/reassociated-prefill/Hermes/gateway/top-up stack remains lossy; not live
+Plex, released BF16 or full-schema model computation.
+
+HTTP1 **448.8314s** returns all@0; HTTP2 **400.0556s** returns movie@0.
+Both naturally complete all hidden/public phases under max1024. Their public
+prepared/raw token and text witnesses match the prior full-workflow reference
+exactly. Hidden input is4781/5060 (+14 each); outputs39/16 versus prior41/16.
+The first hidden query changed, so this is not whole-workflow token equivalence.
+Both completed HTTPs prove external-only-v1 metadata and all required state/
+path/head/factor/recovery witnesses. First HTTP fails swap-out; second passes
+all per-HTTP checks. The historical timing differences are NOT a speed claim.
+
+HTTP3 **323.9296s** fails with `server_memory_error` in public MTP verification,
+not output truncation. It reached the real-tool execution path after the final
+synthetic page; no direct-answer improvement was observed at that opportunity.
+Its exact hidden output/timing/phase hashes were not preserved by the failed
+response and must remain unavailable. Logs report rendered5331/6252-token
+hidden/public prompts; those counts are NOT complete failed-phase token/state
+witnesses. Durable SSE progress contains one64-layer completion record, not
+separate full coverage for both phases. No final answer, Plex fixture result,
+rubric, or model-only Plex score exists. Driver1173.2024s /parent1175.1261s,
+about19.6min to FAILURE, not a completed-workflow latency.
+
+At layer24/offset6258, width5 serial verification requests204,872,132B scratch.
+System available5,462,982,656B is already below the unchanged5.6GB reserve.
+One exact recovery actually fires:196+24 closed BF16 KV pages spill in two
+passes, reclaiming230,686,720 logical bytes and observing230,785,024B less
+active Metal (692,005,160 ->461,220,136B). Logical KV falls255,057,920 ->
+24,371,200B; spill0.133554s, recovery wall2.013804s. Available memory remains
+5,462,982,656B at all recorded recovery snapshots, so the live ceiling follows
+active Metal downward and the204,872,132B deficit does NOT disappear. The
+ordinary retried reservation refuses safely. Logical/Metal release is not
+system-available credit. No prefill retry or relaxed reserve/budget is used.
+Raw recovery math verifies, but successful phase-coverage gate correctly fails
+because the failing phase has no final phase artifact. Do not relabel this
+refused recovery as an admission, speed or completed-state proof.
+
+580 native samples: min available5,204,819,968B, max footprint3,514,502,792B,
+max sampled compressed720,683,008B. Periodic swap-out39,387,136B;
+whole three-HTTP swap-out42,745,856B, net growth524,288B: strict pressure FAIL.
+580 known-transcoder samples pass, not general host-idle or swap attribution.
+Fresh30.0375s preflight passed with6.5574 ->6.5909GB and zero swap growth/churn.
+Root/external free minima20,626,890,752B/100,033,937,408B; internal tier
+62,512,074,752B. Only the FIRST TWO completed HTTPs have complete phase totals:
+prefill483.0113s, decode362.8351s,178 raw output tokens,
+858,250,534,912B logical weight reads (not physical), max Metal2,552,244,900B.
+These are NOT totals/peaks for the failed third HTTP or whole model workflow.
+
+All794 source start/end/fresh manifests, config/profile/model/capture/wire,
+three response/progress hashes, reconstructed request/page sequence, every
+per-HTTP check, partial reference equivalence, refusal/recovery math, and
+negative pressure/coverage checks verified BEFORE edits. No source drift,
+timeout, signal, spawn or child-result error. PIDs70412/70416/70418 gone;
+session61933 drained exit1; server-15 is ordinary cleanup.
+Tree c36f665c19823ce7a1d3b061483bc7a5d2dc1f79c7a131474537c2a8a2e6d1f0;
+result3f4d8c54e98efb78bb2ada91439b255326fbb11ffe6ea0612f36a6a66f19722a;
+receiptda7c0f99248dfee1a97396985d7561f71d1e04fcef9f6644a47baab875d1f6ab;
+parentlog4662a4d9d3f66e12e26176ce45a28304003a05c068b9e1aac77b7d360e325737;
+serverfa4aecdc8b45063245e6e2a5f209df4e1f4155954754e593a361365672ac7ad9;
+preflight12e9a030dc1ad0667efd53772792fcb8cc9b626a525717f8a31262bdc97b890d.
+
+After verification, added bounded completed-generation logging under the
+EXISTING explicit generation-witness flag. `[gateway-phase-complete]` emits
+one flushed, content-free record immediately after each actual hidden/public
+phase snapshot, before protocol parsing or the next generation can fail.
+It contains an opaque server request ID, allowlisted scalar metrics, natural
+versus capped termination and prepared/raw ID/text HASHES; never raw prompts,
+tokens, answers, arguments, tensors or KV. No new eval/synchronization, model/
+routing/cache/default/pressure change. A completed generation is explicitly NOT
+a completed request; no record for a failed phase is synthesized. Missing,
+invalid, size-capped or broken-sink records cannot satisfy external coverage gates.
+This adds diagnostic I/O inside HTTP wall time and needs measured serving
+coverage/equivalence before an overhead or operational-proof claim.
+
+28 new pure cases cover bounded/content-free snapshots, malformed metrics and
+hashes, detached inputs, disabled behavior, broken sinks, natural/capped labels,
+real server-hook ordering and a completed hidden log surviving a later failed
+SSE response without a fake public completion. Offline projection of four
+archived completed phases preserves every exported field (1341..1346B/record);
+it does not recover the old missing phase. Selected strict no-real-MLX suite
+638 PASS12.40s;128 profiles validate. No new model job remains or was launched.
+Keep description ablation opt-in/unproven; do not rerun it or another budget
+extension without a new hypothesis. Next prioritize failed-phase observability
+and exact lifetime/reuse levers under the same safety gates. Full-answer
+quality, held-out functions/long context and under90s remain OPEN.
+
+
 ## 2026-09-09 UTC: explicit gateway-description ablation prepared from a concrete routing conflict
 
 The last failed selector did see every final-page result. Its existing
