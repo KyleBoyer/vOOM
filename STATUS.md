@@ -1,5 +1,69 @@
 # STATUS — 2026-09-09 UTC (current corrections first; dated chronology below is history)
 
+## 2026-09-09 UTC: actual MXFP4 head row-tiling passes every logit; serving integration still pending
+
+The staged head-only oracle finally ran after a fresh passing PERIODIC30s
+preflight, on clean/pushed ba8c0b9. All three vocabulary-row sizes preserve
+EVERY output bit: 1,489,920 BF16 logits each (six SYNTHETIC normalized activation
+rows,248320 vocabulary entries), zero unequal logits, zero maximum difference,
+all finite. Each position retains the native(1,1,5120) contraction shape.
+Every candidate's packed U32 and U8 scale content hashes match the actual
+675,430,400B native WeightStore/QTensor head. No requantization, shortlist,
+tolerance or serving wiring; this is exact relative to the explicit MXFP4
+profile, NOT released-BF16 lossless, real captured activations or model quality.
+
+Reference fetch/projection/loaded-observation interval0.483445s, native fetch
+0.410698s; reference component hashing happens afterward. The candidate walls
+below INCLUDE their raw-byte hashing, per-block observers and final assembly.
+All arms share one process and later arms have earlier file/kernel warming.
+These unlike intervals are NOT a controlled serving-speed comparison.
+
+| Vocabulary rows/block | Instrumented arm wall (s) | Read/upload/hash (s) | Projection (s) | Maximum sampled active Metal (MB decimal) |
+| --- | ---: | ---: | ---: | ---: |
+| 8192 | 1.330690 | 0.295930 | 0.132211 | 25.199 |
+| 32768 | 0.541010 | 0.295409 | 0.080260 | 91.554 |
+| 65536 | 0.455789 | 0.315525 | 0.057412 | 179.896 |
+
+Native whole-head loaded active Metal is675.496MB. The candidate values are
+sampled loaded/released boundaries, NOT separately measured true arm peaks.
+The never-reset TRUE peak for the entire process, including the reference,
+is684,441,632B. Native process observations also cover all90 stages. After
+reference release, active Metal drops to65,568B while system available drops
+to6,037,880,832B: do not turn logical/device release into host-RAM credit.
+Overall minimum available6,037,880,832B, zero swap growth/out,90 clear known-
+transcoder observations;44 ordinary governor reservations, zero refusals.
+The full oracle takes3.134771s child /5.993287s parent. These are diagnostic
+times, not a request, Plex workflow, TTFT or tokens-per-second measurement.
+
+Fresh preflight30.031957s:18 pressure observations, minimum7,279,099,904B,
+end7,329,218,560B, zero swap growth,917,504B swap-out,16 clear process inventories.
+The model job has no concurrent known transcoder and does not modify Plex.
+Both PIDs96026/96032 are gone, session24475 drained exit0, no running receipt,
+timeout, signal, result error or source drift. Independently verified all805
+start/end/FRESH source entries BEFORE documentation edits, artifacts, pinned
+model metadata, real header extents/stat identity, installed library hash,
+all case/phase coverage and pressure arithmetic. Reproduced the synthetic
+BF16 input hash independently with CPU round-to-nearest-even bit conversion.
+
+Run: huihui_head_rows_window_20260909. Private verification:
+logs/huihui_head_rows_window_20260909.verified.json.
+Result54c359d5fff75465b566ccc16f3ff03f4af30496cd2ada9c1453c6e9d53c5d82;
+treea8c2176ac207434efc4ee3250066ec76b253fbad981f6205fdeee423121be7c6;
+preflight59ade3f2f54bc057562da7f82bb01631bc2b36e6dcad97d7b5cb53df1dde0f9b.
+All-logit SHAda7bb6d9d438532aea16605d8ad94675d4aed318ef08ff662e4782b88b383099.
+
+NEXT: audit and implement an explicit opt-in native-MXFP4 head-row serving
+path shared by target and serial MTP verification, with exact shape/backend/
+representation guards and ordinary per-tile reservations. No whole-head pin
+or hidden full materialization may survive that path. Preserve full-vocabulary
+logits and one-position contraction shapes. Verify isolated runtime dispatch
+against this native reference, then matched fresh short streaming/nonstreaming
+captures with unchanged raw token/state witnesses and clean pressure before
+full captured harness/Plex and held-out long-context/large-output runs.
+Do not promote a default, reuse a model cache identity silently, or claim
+under90s/full-output/model-only Plex success from this local projection gate.
+
+
 ## 2026-09-09 UTC: opt-in periodic preflight pressure evidence verified on the host
 
 The previous memory preflight observes only its START/END pressure snapshots;
