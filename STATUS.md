@@ -30,10 +30,12 @@ Selected strict no-real-MLX regression suite1101 PASS15.68s;138 profiles valid.
 No model job is running. All experimental controls remain opt-in. No completed
 full134-tool/Plex score or long/sustained-output qualification is claimed.
 The original full-workflow configuration is prepared in session state but was
-NOT launched. Do not rerun the same arm under unchanged headroom. User-facing
-handoff requests permission to close the still-running ChatGPT app; leave
-Plex/Tdarr and all other apps alone without new authority. A meaningful host
-headroom change plus a fresh30s periodic preflight is required for another
+NOT launched. Do not rerun the same arm under unchanged headroom. The user
+explicitly requires ChatGPT to remain open: its bundled Codex helpers are part
+of this working app, not separate apps to close. Leave ChatGPT, Plex/Tdarr and
+all other apps open; optimize within that baseline. A meaningful host
+headroom change or a new evidence-backed memory improvement, plus a fresh30s
+periodic preflight, is required for another
 qualification attempt; preserve5600MB/400MB/256MB KV and all pressure gates.
 
 ## 2026-09-09 UTC: explicit split-weight prefill and a reproduced cache-lifetime correction
