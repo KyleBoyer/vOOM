@@ -1,4 +1,24 @@
-# STATUS — 2026-09-09 UTC (current corrections first; dated chronology below is history)
+# STATUS — 2026-09-14 UTC (current corrections first; dated chronology below is history)
+
+## 2026-09-14 UTC: wrap-up preview configuration; readiness is NOT complete
+
+User wants to wrap up and begin manual harness use. Added one explicit
+huihui-qwen38-27b-harness-preview composition, byte-for-byte equal in resolved
+settings to the September9 measured split arm; no new runtime/default changes.
+docs/huihui_harness_preview.md records launch, model alias, localhost URL,
+actual short-request evidence, overrides and unresolved repeated-request,
+full134-tool/Plex, long-context/output and vision limits. It is not a production
+or quality certification.183 selected no-real-MLX tests PASS2.51s;139 profiles
+validate. ChatGPT and Plex remain open; no apps were stopped.
+
+Fresh30.0379s periodic preflight DEFERRED_PRECONDITION against the conservative
+6.70GB reattempt threshold: minimum available6,660,931,584B, zero swap growth/out,
+18 pressure samples and16 clear known-transcoder samples, minimum root free
+22,027,493,376B. No model job launched, no new timing/quality result.
+Artifact logs/huihui_handoff_20260914.preflight.json. No model server is running.
+The runtime5600MB reserve,400MB margin and256MB KV budget remain unchanged.
+Do not resume unchanged-headroom experiments merely because a heartbeat fires;
+the user requested wrap-up rather than another open-ended optimization round.
 
 ## 2026-09-09 UTC: bounded split-prefill failure diagnostics; no new model run
 

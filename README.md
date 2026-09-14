@@ -119,6 +119,10 @@ storage — this is not required to run the project.
 
 ## Run
 
+For the current uncensored Huihui setup and its unresolved readiness limits,
+see [Huihui harness preview](docs/huihui_harness_preview.md). It is an explicit
+experimental profile, not the default or a completed full-harness qualification.
+
 ```bash
 # Start the tracked OpenAI/Anthropic-compatible server. Runtime defaults choose
 # the bounded cache/prefetch profile for the requested local model.

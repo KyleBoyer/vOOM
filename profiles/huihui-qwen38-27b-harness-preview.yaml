@@ -1,0 +1,19 @@
+schema: voom.runtime-profile.v1
+name: huihui-qwen38-27b-harness-preview
+description: Opt-in local text/tool preview; repeated-request and full-harness readiness not yet qualified.
+notes:
+  - "Convenience composition of the measured September 9 split-prefill arm, not a new optimization or a production-ready/default profile. One short tool request passed; the following title request failed memory admission."
+  - "Selected all-MXFP4 target, reassociated prefill and explicit Hermes tool convention are not released-BF16 lossless. All prepared prompt state is retained; hidden gateway and host answer rendering stay disabled."
+  - "Preserves5600MB governor reserve, ordinary400MB admission margin and256MB exact conventional KV paging. Head rows8192 and prefill tiles8 are internal dimensions, not output-token limits."
+  - "Text and small tool catalogs only as an unqualified preview; vision, full134-tool workflows, long context/output and repeated-request reliability remain unqualified. A passing host preflight is not a model-quality or performance pass."
+extends:
+  - huihui-qwen38-27b-direct-head-rows-audit
+  - generation-witness
+  - host-activity-witness
+  - governor-reclamation-witness
+  - qwen35-serial-kv-reclaim
+  - qwen35-serial-kv-reclaim-topup
+  - qwen35-mxfp4-head-rows8192
+  - qwen35-prefill-ceiling8
+  - qwen35-streaming-cache256
+  - qwen35-prefill-split-weights
