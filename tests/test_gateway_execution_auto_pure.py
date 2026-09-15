@@ -93,3 +93,11 @@ def test_profile_changes_only_explicit_policy():
     apply_runtime_profiles(base, environ=before)
     apply_runtime_profiles(base + ['gateway-execution-auto'], environ=after)
     assert after == {**before, policy.FLAG: '1'}
+
+
+def test_terminal_diagnostic_profile_only_enables_existing_opt_in():
+    before = {}; after = {}
+    base = ['huihui-qwen38-27b-workflow-head-rows-audit']
+    apply_runtime_profiles(base, environ=before)
+    apply_runtime_profiles(base + ['gateway-terminal-synthesis-audit'], environ=after)
+    assert after == {**before, 'VMODEL_FAST_TOOL_GATEWAY_TERMINAL_PAGINATION_SYNTHESIS': '1'}

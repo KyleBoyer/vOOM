@@ -1,5 +1,25 @@
 # STATUS — 2026-09-14 UTC (current corrections first; dated chronology below is history)
 
+## 2026-09-15 UTC: voluntary execution auto avoids abstention but still loops
+
+huihui_execution_auto_plex_20260915 on19f9dc1: completed calls550.3023s,
+436.5832s,183.6344s. First required-action phase has identical target-token
+hashes to the finite control; new execution-auto flag correctly inactive.
+Follow-ups correctly activate auto/no-private-abstention, but model chooses
+all offset10 after ten rows/hasMoreFalse, then all offset0 after empty exhaustion.
+Quality FAIL; stopped owned driver cleanly during fourth request instead of
+repeating this cycle.1240.4269s is incomplete parent time, no final Plex score.
+Third complete call passes all per-turn checks; whole pressure FAIL:
+63,733,760B sampled swap-out, zero growth, min4.748GB, footprint peak2.323GB.
+Source/embedded/artifact/PID verification passed; result SHA
+ec3d6506259d6e0f7e7e67793f7c4fb12d5e186ded588025b9ae597ae2c7996a.
+
+Captured system instructions were inspected: they permit normal answers, not
+tool-only output. Next diagnostic selects the existing default-off terminal
+pagination synthesis path, full context, same finite raw rows and unchanged
+rubric. It is NOT host answer rendering, but narrows tool availability from an
+explicit terminal contract and needs separate multi-action qualification.
+
 ## 2026-09-15 UTC: finite Plex terminates but quality fails; gateway trap isolated
 
 huihui_finite_media_plex_20260915 on693fd21 completed two HTTP turns in

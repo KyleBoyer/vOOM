@@ -1,0 +1,8 @@
+schema: voom.runtime-profile.v1
+name: gateway-terminal-synthesis-audit
+description: Explicit diagnostic model synthesis after a completed pagination contract.
+notes:
+  - "Existing default-off protocol/intent path, not a host answer renderer. Requires explicit requested pagination and terminal hasMore flags; model still filters and authors the answer from all retained results."
+  - "Not general harness-ready: multi-action requests can need more actions after retrieval. Audit auto client choice only, no structured output. Do not promote without heterogeneous multi-action quality/authority tests."
+settings:
+  VMODEL_FAST_TOOL_GATEWAY_TERMINAL_PAGINATION_SYNTHESIS: true
