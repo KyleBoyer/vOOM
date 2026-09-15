@@ -1,5 +1,20 @@
 # STATUS — 2026-09-14 UTC (current corrections first; dated chronology below is history)
 
+## 2026-09-15 UTC: focused continuation confirms loop, not missing history
+
+huihui_inline_empty_page_20260915 ond22b78e returns offset0 after the actual
+offset10 empty result:108.7358s,40 output tokens,2248/2364 prompt tokens reused.
+No final answer; inline path NOT promoted. Whole pressure PASS:10,027,008B
+swap-out, zero growth, min5.369GB, footprint1.594GB, no sampled transcoders.
+Sources/artifact hashes/stopped PIDs verified; result SHA
+9568f074905e56bcae9495c883b5dd783cdb0518fc1297745d13144e511f99ac.
+CPU-only reconstruction through the actual normalization/rendering helpers
+matches the recorded2364-token prompt hash exactly. All ten records, both data
+pages and the empty offset10 result are present. The no-thinking generation
+scaffold already contains closed think tags. Do not hide this failure with
+output stripping or claim tool history vanished. Reasoning-enabled generation
+is the next quality diagnostic, not a speed or readiness claim.
+
 ## 2026-09-15 UTC: clarified inline prompt fixes held-out format; focused Plex continues
 
 huihui_inline_final_corpus_20260915 on23a669a: inventory84.5921s and
