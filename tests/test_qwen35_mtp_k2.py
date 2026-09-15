@@ -231,6 +231,30 @@ def test_decode_progress_does_not_change_target_tokens_or_endpoint(temperature, 
     assert outcomes[0] == outcomes[1]
 
 
+@pytest.mark.parametrize('temperature', [0.0, 1.0])
+@pytest.mark.parametrize('accepted', [0, 1, 2])
+def test_private_keepalive_preserves_native_tokens_and_endpoint(temperature, accepted, monkeypatch):
+    from runtime.server import _private_decode_keepalive
+    outcomes = []
+    for flag in ('0', '1'):
+        monkeypatch.setenv('VMODEL_FAST_TOOL_GATEWAY_BUFFER_DECISION', flag)
+        mx.random.seed(64013)
+        # This finite fake drafter supports one round; stop naturally on its
+        # authoritative reject/bonus token for every accepted-prefix length.
+        target = _Target(accepted, eos=(6, 7, 8))
+        engine = QwenMTPSpeculativeEngine(target, max_prompt_tokens=8,
+            min_output_tokens=2, plain_warmup_tokens=0, adaptive_stop=False, depth=2)
+        engine.drafter = _RecurrentDrafter()
+        events = []
+        result = engine.generate('x', 4, sampling=SamplingParams(temperature=temperature),
+            on_token=_private_decode_keepalive(events.append))
+        outcomes.append((result['tokens'], result['text'], target.last_kv.offset,
+                         target.endpoint_requests, target.serial_calls))
+        assert bool(events) == (flag == '1')
+        assert all(event == {'phase': 'private_decode'} for event in events)
+    assert outcomes[0] == outcomes[1]
+
+
 @pytest.mark.parametrize("terminal", [False, True])
 @pytest.mark.parametrize("prompt_history", [0, 2])
 def test_cached_logits_without_hidden_seed_feed_catchup_once(

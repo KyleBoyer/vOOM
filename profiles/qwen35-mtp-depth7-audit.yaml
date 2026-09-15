@@ -1,0 +1,8 @@
+schema: voom.runtime-profile.v1
+name: qwen35-mtp-depth7-audit
+description: Explicit seven-step native MTP proposal chain, with unchanged target verification.
+notes:
+  - "Changes only proposal depth. Requires the packed-MTP model alias and fresh actual memory/quality gates; old long-context wins used a different approximate target schedule."
+  - "Default remains four. Earlier seven-step runs failed memory admission. Test against the current full-state, paged, split-MLP/head-row configuration without lowering any safety threshold."
+settings:
+  VMODEL_QWEN_MTP_DEPTH: 7

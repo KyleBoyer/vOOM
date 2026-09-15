@@ -6,7 +6,7 @@ import json
 
 import pytest
 
-from runtime.server import Handler, _HiddenDecisionStream, RequestValidationError, _parse_request_tool_calls, _hidden_tool_enable_pair
+from runtime.server import Handler, _HiddenDecisionStream, RequestValidationError, _parse_request_tool_calls, _hidden_tool_enable_pair, _private_decode_keepalive
 from runtime.profiles import apply_runtime_profiles
 
 
@@ -57,7 +57,17 @@ def test_profile_only_adds_buffer_policy():
     assert after=={**before,'VMODEL_FAST_TOOL_GATEWAY_BUFFER_DECISION':'1'}
 
 
-def test_buffered_direct_answer_is_flushed_once_by_real_sse_writer():
+def test_deep_chain_audit_changes_only_depth():
+    before={};after={};base=['huihui-qwen38-27b-workflow-head-rows-audit']
+    apply_runtime_profiles(base,environ=before)
+    apply_runtime_profiles(base+['qwen35-mtp-depth7-audit'],environ=after)
+    assert before['VMODEL_QWEN_MTP_DEPTH']=='4'
+    assert after=={**before,'VMODEL_QWEN_MTP_DEPTH':'7'}
+
+
+@pytest.mark.parametrize('progress_events', [False, True])
+def test_buffered_direct_answer_is_flushed_once_by_real_sse_writer(monkeypatch, progress_events):
+    monkeypatch.setenv('VMODEL_FAST_TOOL_GATEWAY_BUFFER_DECISION', '1')
     handler=Handler.__new__(Handler)
     handler.wfile=io.BytesIO()
     handler.send_response=lambda *a:None
@@ -72,14 +82,40 @@ def test_buffered_direct_answer_is_flushed_once_by_real_sse_writer():
             role='assistant',status='completed',content=[dict(type='output_text',text=body,annotations=[])])])
     def generate(_emit,_progress):
         # The private direct-answer decision was buffered: no token callback.
+        tick = _private_decode_keepalive(_progress)
+        tick('PRIVATE PLANNING MUST NOT LEAK')
+        tick('<tool_call>PRIVATE ACTION</tool_call>')
         return dict(text=text,tokens=[1,2],prompt_tokens=3,path_stats={})
     tool,_=_hidden_tool_enable_pair()
     # Hidden gateway decisions exist only with tools; the ordinary tool-free
     # generator keeps its normal token callback and is not buffered by this flag.
     handler._stream_responses('prompt',1024,[],engine,[tool],
         build,'resp_test','model',1,None,1,None,[], 'msg_test','auto',False,
-        generate_fn=generate)
-    events=[json.loads(line[6:]) for line in handler.wfile.getvalue().decode().splitlines()
+        generate_fn=generate, progress_events=progress_events)
+    wire=handler.wfile.getvalue().decode()
+    assert wire.count(': private_decode\n\n') == 2
+    assert 'PRIVATE' not in wire
+    events=[json.loads(line[6:]) for line in wire.splitlines()
             if line.startswith('data: {')]
     assert ''.join(e['delta'] for e in events if e['type']=='response.output_text.delta')==text
     assert sum(e['type']=='response.completed' for e in events)==1
+
+
+def test_private_keepalive_disabled_and_disconnect_propagates(monkeypatch):
+    monkeypatch.delenv('VMODEL_FAST_TOOL_GATEWAY_BUFFER_DECISION', raising=False)
+    assert _private_decode_keepalive(lambda _:pytest.fail('disabled')) is None
+    monkeypatch.setenv('VMODEL_FAST_TOOL_GATEWAY_BUFFER_DECISION', '1')
+    assert _private_decode_keepalive(None) is None
+    def disconnected(_):
+        raise BrokenPipeError('closed')
+    with pytest.raises(BrokenPipeError):
+        _private_decode_keepalive(disconnected)('never public')
+
+
+def test_actual_hidden_generation_calls_wire_private_progress():
+    tree=ast.parse(Path('runtime/server.py').read_text())
+    fn=next(n for n in ast.walk(tree) if isinstance(n,ast.FunctionDef) and n.name=='run_hidden_gateway')
+    calls=[n for n in ast.walk(fn) if isinstance(n,ast.Call)
+           and isinstance(n.func,ast.Name) and n.func.id=='_engine_generate']
+    callbacks=[ast.unparse(k.value) for n in calls for k in n.keywords if k.arg=='on_token']
+    assert sum('_private_decode_keepalive(on_progress)' in c for c in callbacks)==2

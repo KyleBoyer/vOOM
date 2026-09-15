@@ -56,13 +56,16 @@ arithmetic results correct, but took887.48s and failed cumulative swap-out.
 Do not treat that as qualified sustained-output performance.
 
 The full134-tool HTTP capture uses a different gateway profile, which compacts
-the model-side catalog/prompt. Its finite synthetic Plex-response run completed
-in1043.37s but returned a fixed gateway abstention instead of the requested list:
-legacy rubric63/100, quality FAIL, cumulative swap-out61.62MB, pressure FAIL.
-This was not live Plex, not an unmodified tool-result replay, and not full49K
-all-schema model execution. The host-abstention authorship audit is now stricter.
-The new `gateway-execution-auto` policy is a separate default-off experiment;
-it is not included in this direct preview.
+the model-side catalog/prompt. With explicit `gateway-buffered-decision` plus
+`gateway-execution-auto`, original temperature1 and finite synthetic Plex results,
+the latest workflow completed naturally in2287.04s (38.12min),438 final tokens.
+Its matching list has exactly the four eligible titles and correctly explains
+all six exclusions. The unchanged legacy rubric is75/100/FAIL (it counts excluded
+titles in explanations and requires multiple pages); single-page exhaustion is
+not pagination proof. Pressure also FAILS:120.95MB sampled swap-out. This was
+not live Plex, not an unmodified tool-result replay, and not full49K all-schema
+model execution. These gateway policies remain default-off experiments and
+are not included in this direct preview. Full readiness remains unqualified.
 
 Selected MXFP4 weights, reassociated prefill and Hermes tool convention are
 approximations relative to released BF16. Exact cache/token and native-head

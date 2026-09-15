@@ -7929,6 +7929,23 @@ def _release_qwen4_unretained_endpoint(engine, result) -> None:
         pass
 
 
+def _private_decode_keepalive(on_progress):
+    """Discard private text; keep opt-in buffered Responses streams alive.
+
+    Invoked on the inference thread at existing accepted-text callbacks. No
+    timer, concurrent socket writer, token-count claim, or model-text exposure.
+    It cannot promise a heartbeat while an individual compute operation stalls.
+    """
+    if (on_progress is None or os.environ.get(
+            'VMODEL_FAST_TOOL_GATEWAY_BUFFER_DECISION', '0') != '1'):
+        return None
+
+    def tick(_private_text):
+        on_progress({'phase': 'private_decode'})
+
+    return tick
+
+
 def _engine_generate(engine, *args, expert_top_k: int = 0, **kwargs):
     """Use fail-slow prefill retry when the concrete engine supports it.
 
@@ -12903,7 +12920,8 @@ class Handler(BaseHTTPRequestHandler):
                     prompt, max_output_tokens, stop=stop,
                     on_token=(
                         decision_stream.feed
-                        if decision_stream is not None else None),
+                        if decision_stream is not None else
+                        _private_decode_keepalive(on_progress)),
                     on_progress=on_progress, sampling=self._sampling,
                     constraint=gateway_constraint)
                 decision_cache_phase = _cache_phase_telemetry(
@@ -13186,6 +13204,7 @@ class Handler(BaseHTTPRequestHandler):
                     constraint=self._constraint, allow_parallel=False)
                 result = _engine_generate(engine,
                     prompt, max_output_tokens, stop=stop,
+                    on_token=_private_decode_keepalive(on_progress),
                     on_progress=on_progress, sampling=self._sampling,
                     constraint=self._constraint,
                     expert_top_k=gateway_execution_expert_top_k)
@@ -13514,6 +13533,13 @@ class Handler(BaseHTTPRequestHandler):
             # reset proxy/client idle timers during a long cold prefill, before
             # the first generated token exists.
             try:
+                if progress.get('phase') == 'private_decode':
+                    # Private decisions/execution may be buffered for minutes.
+                    # SSE comments keep the connection alive without exposing
+                    # planning text or inventing public content/progress counts.
+                    self.wfile.write(b': private_decode\n\n')
+                    self.wfile.flush()
+                    return
                 if progress.get("phase") == "memory_retry":
                     done = int(progress.get("completed_retries", 0))
                     total = int(progress.get("total_retries", 0))

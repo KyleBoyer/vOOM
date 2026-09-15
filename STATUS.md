@@ -1,5 +1,35 @@
 # STATUS — 2026-09-14 UTC (current corrections first; dated chronology below is history)
 
+## 2026-09-15 UTC: repaired gateway returns correct finite answer; strict gates still fail
+
+huihui_buffer_auto_temp1_finite_20260915 onad74685 combined explicit buffered
+decision/execution-auto at captured temperature1. Original134-tool HTTP input
+retained; gateway compaction and finite synthetic results explicitly unchanged.
+HTTP644.1497s/1642.488s, workflow2287.0358s (38.12min),438 final output tokens,
+natural completion, all protocol/authorship/state checks pass. The69-token
+private action previously discarded now reaches execution; final outcome is
+model_answer with no host rendering/routing/grounding/terminal synthesis.
+
+Manual semantic inspection: matching table and final list contain exactly the
+four eligible titles, and six excluded titles are correctly labeled with reasons.
+The unchanged legacy rubric is75/100/FAIL: it counts explained exclusions as
+present and awards no multi-page points for a single exhausted ten-row page.
+Do not relabel this100/100 or multi-page proof. Whole pressure FAIL:120,946,688B
+sampled swap-out, zero growth, min4.575GB, footprint2.390GB;1130 observations,
+no sampled transcoders. Source start=end=fresh, embedded result, all artifact
+hashes and stopped PIDs verified. Result SHA
+64241f6c4973325b26315e09bb9c2025ac2425b407368c1c827f3a47a9353418.
+
+Private generation was silent during long decode. Buffered mode now forwards
+content-free private_decode progress at accepted-text callbacks; Responses
+writes raw SSE comments, not model text or invented token counts. No timer or
+second socket writer; a stalled individual operation can still be silent.
+511 pure tests and70 native MTP tests pass. Callback off/on gives identical
+greedy/stochastic tokens and endpoints for every two-draft accepted prefix;
+native source/log/stopped-PID proof verified. Real transport proof follows.
+Separate depth7-only audit overlay is staged for current-memory-layout testing;
+it does not inherit the old lossy long-context schedule or change defaults.
+
 ## 2026-09-15 UTC: captured sampling exposes discarded private tool action
 
 huihui_capture_temp1_finite_20260915 on4e7a5bc preserved original temperature1,
