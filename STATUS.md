@@ -22,7 +22,7 @@ Next explicit KV64-only overlay spills the SAME exact full-attention pages
 earlier; no target math, context length, KV quantization, online attention or
 safety reserve change. The full-action fixture now checks selected64/128/256MB
 against both environment and every phase witness instead of hardcoding256MB.
-239 pure tests pass. Actual long-decode qualification remains open.
+240 pure tests pass. Actual long-decode qualification remains open.
 
 ## 2026-09-15 UTC: held-out gateway answers and real private keepalives PASS
 
