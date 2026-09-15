@@ -1,5 +1,16 @@
 # STATUS — 2026-09-14 UTC (current corrections first; dated chronology below is history)
 
+## 2026-09-15 UTC: mixed target head metadata compatibility
+
+huihui_mixed_posttool_20260915 stopped before generation: the row reader required
+whole-model MXFP4 declarations, rejecting the mixed model's explicit MXFP4 head.
+No inference/quality result exists. Source/artifact hashes and stopped PIDs verified.
+The reader now accepts an explicitly declared native MXFP4 head independently
+of body precision, rejects conflicting/ambiguous head declarations, and retains
+all physical-layout, same-shard, bias-free and descriptor-identity checks.
+91 row-reader pure regressions pass. No target bytes or arithmetic changed;
+the higher-fidelity target itself remains lossy and unqualified for the harness.
+
 ## 2026-09-15 UTC: KV64 completes two-page workflow, but quality is rejected
 
 huihui_kv64_page5b_20260915 on2303503 completes3 HTTP turns in

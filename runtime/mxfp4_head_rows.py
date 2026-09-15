@@ -82,14 +82,45 @@ def pread_exact(fd, size, offset):
     return b''.join(pieces)
 
 
+def validate_head_quantization(config):
+    """Require explicit native head metadata, independent of body precision."""
+    expected = dict(bits=4, group_size=32, mode='mxfp4')
+
+    def exact(value):
+        return (isinstance(value, dict) and value == expected
+                and type(value.get('bits')) is int
+                and type(value.get('group_size')) is int)
+
+    def resolved(value):
+        if exact(value):
+            return True
+        if not isinstance(value, dict):
+            return False
+        # Do not guess precedence for alternate head/tensor override names.
+        if any(isinstance(key, str) and key.startswith('lm_head')
+               and key != 'lm_head' for key in value):
+            return False
+        return exact(value.get('lm_head'))
+
+    if not isinstance(config, dict):
+        raise ValueError('row experiment requires explicit native MXFP4 head configuration')
+    quantization = config.get('quantization')
+    # Preserve the legacy global declaration contract. Mixed models must
+    # explicitly declare the head; absence of a second declaration is then OK.
+    mixed = isinstance(quantization, dict) and 'lm_head' in quantization
+    if (not resolved(quantization)
+            or (not mixed and 'quantization_config' not in config)
+            or ('quantization_config' in config
+                and not resolved(config['quantization_config']))):
+        raise ValueError('row experiment requires explicit native MXFP4 head configuration')
+
+
 class HeadRows:
     """One read-only descriptor, strict native MXFP4 layout, bounded header."""
     def __init__(self, directory):
         directory = Path(directory).resolve()
         config = json.loads((directory/'config.json').read_text())
-        expected = dict(bits=4, group_size=32, mode='mxfp4')
-        if config.get('quantization') != expected or config.get('quantization_config') != expected:
-            raise ValueError('row experiment requires explicit native MXFP4 configuration')
+        validate_head_quantization(config)
         mapping = json.loads((directory/'model.safetensors.index.json').read_text())['weight_map']
         shard = mapping.get('lm_head.weight')
         if (not isinstance(shard, str) or not shard or Path(shard).name != shard

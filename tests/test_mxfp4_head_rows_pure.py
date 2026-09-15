@@ -104,6 +104,61 @@ def test_mutation_is_not_silently_read(tmp_path):
         source.close()
 
 
+@pytest.mark.parametrize('secondary', ['absent', 'global', 'mixed'])
+def test_mixed_precision_body_keeps_explicit_native_head_reader(tmp_path, secondary):
+    payload = make_source(tmp_path)
+    q = dict(bits=4, group_size=32, mode='mxfp4')
+    mixed = dict(bits=8, group_size=32, mode='mxfp8', lm_head=q,
+                 **{'model.layers.0.self_attn.q_proj': False})
+    config = dict(quantization=mixed)
+    if secondary != 'absent':
+        config['quantization_config'] = q if secondary == 'global' else mixed
+    (tmp_path/'config.json').write_text(json.dumps(config))
+    source = rows.HeadRows(tmp_path)
+    try:
+        assert source.read_component(0, 0, 3) == payload[:96]
+        assert source.read_component(1, 0, 3) == payload[96:]
+    finally:
+        source.close()
+
+
+@pytest.mark.parametrize('bad', [None, False, [], {},
+    dict(bits=8, group_size=32, mode='mxfp4'),
+    dict(bits=4, group_size=64, mode='mxfp4'),
+    dict(bits=4, group_size=32, mode='affine'),
+    dict(bits=4.0, group_size=32, mode='mxfp4'),
+    dict(bits=4, group_size=32.0, mode='mxfp4'),
+    dict(bits=4, group_size=32, mode='mxfp4', extra=True)])
+@pytest.mark.parametrize('location', ['head', 'secondary'])
+def test_mixed_head_missing_malformed_or_conflicting_metadata_rejected(bad, location):
+    q = dict(bits=4, group_size=32, mode='mxfp4')
+    config = dict(quantization=dict(q, lm_head=q))
+    if location == 'head':
+        config['quantization']['lm_head'] = bad
+    else:
+        config['quantization_config'] = bad
+    with pytest.raises(ValueError, match='explicit native MXFP4 head'):
+        rows.validate_head_quantization(config)
+
+
+@pytest.mark.parametrize('location', ['quantization', 'quantization_config'])
+@pytest.mark.parametrize('key', ['lm_head.weight', 'lm_head.scales', 'lm_head_other'])
+def test_ambiguous_head_override_rejected(location, key):
+    q = dict(bits=4, group_size=32, mode='mxfp4')
+    config = dict(quantization=dict(q, lm_head=q), quantization_config=q.copy())
+    config[location][key] = q
+    with pytest.raises(ValueError):
+        rows.validate_head_quantization(config)
+
+
+@pytest.mark.parametrize('config', [None, [], {},
+    {'quantization': dict(bits=4, group_size=32, mode='mxfp4')},
+    {'quantization': dict(bits=4, group_size=32, mode='mxfp4', other=False)}])
+def test_missing_explicit_head_does_not_broaden_legacy_contract(config):
+    with pytest.raises(ValueError):
+        rows.validate_head_quantization(config)
+
+
 @pytest.mark.parametrize('change', ['path', 'split', 'bias', 'mode', 'large_header'])
 def test_open_fails_closed_on_unsupported_or_oversized_source(tmp_path, change):
     make_source(tmp_path)
