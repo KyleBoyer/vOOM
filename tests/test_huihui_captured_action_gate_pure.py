@@ -489,6 +489,13 @@ def test_missing_host_action_provenance_is_not_model_only_proof():
     assert not checks['model_authored_output']
 
 
+@pytest.mark.parametrize('outcome', ['no_suitable_tool', 'invalid_or_incomplete_tool_call'])
+def test_fixed_gateway_abstention_text_is_not_model_authored(outcome):
+    observed = selection()
+    observed['gateway_execution_outcome'] = outcome
+    assert not gate.model_authored_output(dict(vmodel_tool_selection=observed))
+
+
 @pytest.mark.parametrize('branch', ['direct', 'tool'])
 def test_direct_model_branch_precedes_execution_only_host_transforms(branch):
     observed = dict(gateway_phase='direct', gateway_host_routed=0,

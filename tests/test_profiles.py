@@ -27,19 +27,21 @@ from runtime.profiles import (
 ROOT = Path(__file__).resolve().parent.parent
 
 
-def test_huihui_preview_is_only_the_measured_split_arm_composition():
+def test_huihui_preview_is_only_the_measured_september15_composition():
     catalog = discover_runtime_profiles((ROOT / 'profiles',))
     measured = (
         'huihui-qwen38-27b-direct-head-rows-audit', 'generation-witness',
         'host-activity-witness', 'governor-reclamation-witness',
         'qwen35-serial-kv-reclaim', 'qwen35-serial-kv-reclaim-topup',
-        'qwen35-mxfp4-head-rows8192', 'qwen35-prefill-ceiling8',
+        'qwen35-mxfp4-head-rows8192', 'qwen35-prefill-ceiling32',
         'qwen35-streaming-cache256', 'qwen35-prefill-split-weights',
+        'qwen35-prefill-split-mlp', 'qwen35-reserve4500-audit',
+        'xgrammar-cpu-only', 'admission-pause', 'qwen35-paged-prefix-cache',
     )
     _, expected = resolve_runtime_profiles(measured, catalog)
     _, actual = resolve_runtime_profiles(('huihui-qwen38-27b-harness-preview',), catalog)
     assert actual == expected
-    assert actual['VMODEL_QWEN35_MIN_AVAILABLE_MB'] == '5600'
+    assert actual['VMODEL_QWEN35_MIN_AVAILABLE_MB'] == '4500'
     assert actual['VMODEL_QWEN35_KV_MAX_MB'] == '256'
     assert actual['VMODEL_FAST_TOOL_GATEWAY'] == '0'
 

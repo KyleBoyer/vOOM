@@ -13100,13 +13100,23 @@ class Handler(BaseHTTPRequestHandler):
                     gateway_abstention_enabled,
                     gateway_abstention_reason,
                     gateway_force_reason)
-            execution_policy = (
+            from . import gateway_execution_auto
+            try:
+                execution_auto = gateway_execution_auto.enabled(
+                    os.environ.get(gateway_execution_auto.FLAG, '0'),
+                    client_choice=tool_choice, force_reason=gateway_force_reason,
+                    structured_output=self._structured_output,
+                    abstention_available=execution_abstention_enabled)
+            except ValueError as error:
+                raise RequestValidationError(str(error)) from error
+            execution_choice = 'auto' if execution_auto else 'required'
+            execution_policy = (gateway_execution_auto.POLICY if execution_auto else
                 _HIDDEN_GATEWAY_REAL_TOOL_POLICY
                 if execution_abstention_enabled
                 else _HIDDEN_GATEWAY_REQUIRED_REAL_TOOL_POLICY)
             execution_messages = _prepend_system_content(
                 internal_messages, execution_policy)
-            if execution_abstention_enabled:
+            if execution_abstention_enabled and not execution_auto:
                 abstain_tool, abstain_raw = _hidden_tool_abstain_pair()
                 execution_tools = [*selected_tools, abstain_tool]
                 execution_raw = [*selected_raw, abstain_raw]
@@ -13133,7 +13143,7 @@ class Handler(BaseHTTPRequestHandler):
                     relevant_parameter_messages=(
                         msgs if gateway_suffix_contract else None))
             self._constraint = _configure_constraint(
-                engine, self._structured_output, prompt_tools, "required",
+                engine, self._structured_output, prompt_tools, execution_choice,
                 False)
             pagination_call = (
                 _hidden_gateway_pagination_call(msgs, selected_tools)
@@ -13158,7 +13168,7 @@ class Handler(BaseHTTPRequestHandler):
                 }
             else:
                 _emit_gateway_generation_start(rid, "gateway_execution",
-                    tool_choice="required",
+                    tool_choice=execution_choice,
                     activation_names=gateway_activated_names,
                     force_reason=gateway_force_reason,
                     constraint=self._constraint, allow_parallel=False)
@@ -13245,6 +13255,11 @@ class Handler(BaseHTTPRequestHandler):
                 result["text"] = _HIDDEN_GATEWAY_ABSTAIN_TEXT
             elif real_calls:
                 execution_outcome = "real_tool"
+            elif execution_auto and gateway_execution_auto.plain_answer(
+                    _execution_content, execution_calls):
+                # Keep the original generated text and witness. No host answer,
+                # post-filtering, retry, or synthetic abstention replacement.
+                execution_outcome = "model_answer"
             else:
                 # Required structured generation can still hit a very small
                 # output limit before closing its marker. Never expose that
@@ -13283,11 +13298,12 @@ class Handler(BaseHTTPRequestHandler):
                     gateway_call_name == _HIDDEN_TOOL_ENABLE_NAME),
                 "gateway_catalog_action": gateway_call_name,
                 "gateway_activated_tools": len(selected_tools),
-                "gateway_execution_choice_required": True,
+                "gateway_execution_choice_required": not execution_auto,
+                "gateway_execution_auto": int(execution_auto),
                 "gateway_real_tool_required": (
-                    not execution_abstention_enabled),
+                    not execution_abstention_enabled and not execution_auto),
                 "gateway_abstention_available": (
-                    execution_abstention_enabled),
+                    execution_abstention_enabled and not execution_auto),
                 "gateway_abstention_policy_reason": (
                     execution_abstention_reason),
                 "gateway_execution_outcome": execution_outcome,

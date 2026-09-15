@@ -1,5 +1,32 @@
 # STATUS — 2026-09-14 UTC (current corrections first; dated chronology below is history)
 
+## 2026-09-15 UTC: finite Plex terminates but quality fails; gateway trap isolated
+
+huihui_finite_media_plex_20260915 on693fd21 completed two HTTP turns in
+554.8723s/488.4858s (67/74 raw output tokens); workflow1043.371s. Original
+134-tool HTTP capture retained, explicit synthetic-finite-media-v1 tool results
+(NOT legacy fixture or live Plex). First call all/PG13/TVY7/lte/limit500/offset0.
+Second model selected the private abstention; gateway replaced its generated
+text with a fixed failure sentence. Legacy rubric63/100, zero eligible titles,
+quality FAIL. This is NOT a model-authored answer despite the old audit passing
+that check. Authorship audit now rejects both host-replaced abstention outcomes.
+
+Native pressure FAIL:61,620,224B sampled swap-out, zero growth, minimum available
+4,765,728,768B, peak footprint2,249,524,760B. Cached decision reused4781 tokens;
+execution catalog changed and missed. Sources start=end=fresh, embedded result,
+result/log/server hashes and stopped PIDs verified. Result SHA
+6381a2e8ff1f704bfd1f44576762ed50fc2c6c3e6c26ebecf38549c9349297d2.
+
+The gateway's voluntary enable was followed by required-tool-or-abstention
+execution even when supplied results could support an answer. New explicit
+gateway-execution-auto permits model-authored answer OR real tool only for
+auto client choice, no forced external action and no structured output. No
+host terminal detector/filter/answer/retry; required/specific behavior unchanged.
+Default OFF; changes prompt/grammar, not a lossless-equivalence claim.501 pure
+regressions pass including actual server output branch and authority boundaries;
+real model validation pending. Updated small-catalog preview composition/docs
+to measured September15 settings; still not full-harness qualified.
+
 ## 2026-09-15 UTC: fifth-call refusal no longer reproduced; legacy fixture mismatch
 
 huihui_page_owner_plex_20260915 on db26691 completed six HTTP calls:

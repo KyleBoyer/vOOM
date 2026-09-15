@@ -1,11 +1,11 @@
 schema: voom.runtime-profile.v1
 name: huihui-qwen38-27b-harness-preview
-description: Opt-in local text/tool preview; repeated-request and full-harness readiness not yet qualified.
+description: Opt-in measured local text/small-tool profile; full Plex readiness is not qualified.
 notes:
-  - "Convenience composition of the measured September 9 split-prefill arm, not a new optimization or a production-ready/default profile. One short tool request passed; the following title request failed memory admission."
+  - "September15 composition of the measured short/held-out/restart arms, not a new optimization. Two short captures and held-out inventory/calendar tool calls completed; exact restarted prefix reuse preserved target tokens."
   - "Selected all-MXFP4 target, reassociated prefill and explicit Hermes tool convention are not released-BF16 lossless. All prepared prompt state is retained; hidden gateway and host answer rendering stay disabled."
-  - "Preserves5600MB governor reserve, ordinary400MB admission margin and256MB exact conventional KV paging. Head rows8192 and prefill tiles8 are internal dimensions, not output-token limits."
-  - "Text and small tool catalogs only as an unqualified preview; vision, full134-tool workflows, long context/output and repeated-request reliability remain unqualified. A passing host preflight is not a model-quality or performance pass."
+  - "User-approved4500MB live reserve after30s5500MB launch gate; ordinary400MB margin and256MB exact conventional KV paging preserved. Head rows8192 and prefill tiles32 are not output-token limits."
+  - "Direct text and small tool catalogs only. Full134-tool Plex workflow failed quality;569-token JSON was correct but slow and failed cumulative swap-out. Vision and long-context readiness remain unqualified."
 extends:
   - huihui-qwen38-27b-direct-head-rows-audit
   - generation-witness
@@ -14,6 +14,11 @@ extends:
   - qwen35-serial-kv-reclaim
   - qwen35-serial-kv-reclaim-topup
   - qwen35-mxfp4-head-rows8192
-  - qwen35-prefill-ceiling8
+  - qwen35-prefill-ceiling32
   - qwen35-streaming-cache256
   - qwen35-prefill-split-weights
+  - qwen35-prefill-split-mlp
+  - qwen35-reserve4500-audit
+  - xgrammar-cpu-only
+  - admission-pause
+  - qwen35-paged-prefix-cache

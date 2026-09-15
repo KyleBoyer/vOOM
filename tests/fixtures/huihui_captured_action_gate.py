@@ -57,6 +57,11 @@ def action_checks(response):
 
 def model_authored_output(response):
     selection = response.get('vmodel_tool_selection') or {}
+    if selection.get('gateway_execution_outcome') in (
+            'no_suitable_tool', 'invalid_or_incomplete_tool_call'):
+        # Both branches replace generated text with a fixed host explanation.
+        # Positive raw model-token counts do not prove public-text authorship.
+        return False
     flags = ('gateway_pagination_host_routed',
         'gateway_initial_pagination_defaults_applied', 'gateway_literal_arguments_grounded')
     if selection.get('gateway_deterministic_policy_rendered') != 0:

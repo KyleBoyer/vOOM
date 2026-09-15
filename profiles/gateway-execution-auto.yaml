@@ -1,0 +1,8 @@
+schema: voom.runtime-profile.v1
+name: gateway-execution-auto
+description: Experimental model-authored answer or tool choice after voluntary catalog activation.
+notes:
+  - "Default off. Only auto client choice, no forced external action, no structured output. Required/specific client requests retain the existing required-tool behavior."
+  - "No host answer, terminal detector, row filtering, argument repair or generation retry. Changes the prepared prompt/grammar and needs heterogeneous quality qualification; not a lossless token-equivalence claim."
+settings:
+  VMODEL_FAST_TOOL_GATEWAY_EXECUTION_AUTO: true
