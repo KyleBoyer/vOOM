@@ -10568,7 +10568,23 @@ class StreamingEngine:
                         self, "_dspark_expert_prefetch_depth", 0)),
                 )
             page_prepare_t0 = time.perf_counter()
-            self._prepare_serial_verify_layer_page(layer)
+            try:
+                self._prepare_serial_verify_layer_page(layer)
+            except MemoryError:
+                # This page is still unallocated and no current-layer state
+                # has changed. Exact closed-KV spill can recover headroom
+                # here just as at the subsequent compute-scratch admission.
+                recovered = False
+                if qwen_family:
+                    from .qwen_kv_reclaim import recover_serial_kv_admission
+                    recovered = recover_serial_kv_admission(
+                        self, kv, mx, layer=layer, positions=verifier_positions,
+                        offset=offset, reservation_kind="layer-page")
+                if not recovered:
+                    raise
+                # Recheck ordinary cache preparation/admission immediately
+                # before fetching. Logical eviction never buys allocation.
+                self._prepare_serial_verify_layer_page(layer)
             if qwen_family:
                 self._qwen35_serial_verify_page_prepare_s += (
                     time.perf_counter() - page_prepare_t0)
@@ -14688,6 +14704,8 @@ class StreamingEngine:
         if (((self.rc.release_paged_kv_after_generate and self.rc.max_kv_mb)
                 or force_adaptive_paged)
                 and not retain_internal_paged_kv):
+            from .request_state import detach_released_kv_slots
+            detach_released_kv_slots(self, kv)
             self.last_kv = None
             self._release_kv(kv)
             mx.clear_cache()

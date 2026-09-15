@@ -185,6 +185,13 @@ def acceptance(row, response, config, *, initial_action=True):
     return checks
 
 
+def tool_round_budget(config):
+    value = config.get('max_tool_rounds', 4)
+    if type(value) is not int or not 1 <= value <= 8:
+        raise ValueError('max_tool_rounds must be an integer in [1, 8]')
+    return value
+
+
 def run_plex_workflow(config, request, document):
     """Retain the legacy fixed two-page rubric, with immutable HTTP receipts.
 
@@ -195,10 +202,12 @@ report those independently of actual final-title errors, never repair a score.
     from tests.fixtures import plex_agent_profile as plex
 
     base = copy.deepcopy(request)
+    max_tool_rounds = tool_round_budget(config)
+    document['max_tool_rounds'] = max_tool_rounds
     receipts = document['workflow_http'] = []
     def recording_post(url, current, timeout):
         index = len(receipts) + 1
-        assert 1 <= index <= 5
+        assert 1 <= index <= max_tool_rounds + 1
         assert current['tools'] == base['tools']
         assert current['input'][:len(base['input'])] == base['input']
         assert {k: v for k, v in current.items() if k != 'input'} == {
@@ -256,7 +265,7 @@ report those independently of actual final-title errors, never repair a score.
     # No production code, page contents or model-authored response is changed.
     with patch.object(plex, '_post', recording_post):
         result = plex.run_profile(request, f'http://127.0.0.1:{config["port"]}/v1/responses',
-            timeout=1800, max_tool_rounds=4)
+            timeout=1800, max_tool_rounds=max_tool_rounds)
     document['plex'] = result
     if prefix_cache_enabled(config):
         # An enabled flag is not observed reuse. Preserve the unchanged
@@ -525,7 +534,7 @@ def run(config):
     workflow = config.get('workflow', 'initial_action')
     assert workflow in ('initial_action', 'plex', 'saved_continuation', 'saved_budget_extension')
     if workflow == 'plex':
-        for index in range(1, 6):
+        for index in range(1, tool_round_budget(config) + 2):
             assert not Path(config['result']).with_suffix(f'.turn{index}.progress.json').exists()
             assert not Path(config['response']).with_name(
                 Path(config['response']).stem + f'.turn{index}.json').exists()

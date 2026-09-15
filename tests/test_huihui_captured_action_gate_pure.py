@@ -74,6 +74,14 @@ def test_prefix_audit_is_explicit_full_state_only():
         require_full_prompt_state=True, require_paged_kv=True)) is True
 
 
+def test_tool_round_budget_retains_historical_default_and_is_bounded():
+    assert gate.tool_round_budget({}) == 4
+    assert gate.tool_round_budget({'max_tool_rounds': 8}) == 8
+    for value in (0, 9, True, '8', None):
+        with pytest.raises(ValueError, match='max_tool_rounds'):
+            gate.tool_round_budget({'max_tool_rounds': value})
+
+
 @pytest.mark.parametrize('cached,valid', [(0, True), (20, True), (-1, False),
     (101, False), (True, False), (None, False)])
 def test_prefix_audit_checks_accounting_without_relaxing_other_gates(cached, valid):

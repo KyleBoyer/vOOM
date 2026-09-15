@@ -69,7 +69,8 @@ def _top_up_once(row, kv, governor, metal, layer, spills_before, spill_s_before)
         row['before']['metal_active_bytes'] - row['after_reclaim']['metal_active_bytes'])
 
 
-def recover_serial_kv_admission(target, kv, metal, *, layer, positions, offset):
+def recover_serial_kv_admission(target, kv, metal, *, layer, positions, offset,
+                                reservation_kind="transient"):
     """Return True ONLY after a fresh ordinary reservation succeeds.
 
     The caller already attempted normal admission and retains its MemoryError.
@@ -78,6 +79,8 @@ def recover_serial_kv_admission(target, kv, metal, *, layer, positions, offset):
     bounded attempt with one ordinary reservation. An additional explicit
     top-up option permits at most two spills, never a loop or lowered threshold.
     """
+    if reservation_kind not in ("transient", "layer-page"):
+        raise ValueError("unknown serial KV recovery reservation kind")
     if getattr(getattr(target, "rc", None), "qwen35_serial_kv_reclaim", False) is not True:
         return False
     if getattr(target.cfg, "model_type", None) not in ("qwen3_5", "qwen3_5_moe"):
@@ -88,6 +91,14 @@ def recover_serial_kv_admission(target, kv, metal, *, layer, positions, offset):
     if governor is None or not isinstance(kv, PagedKVCache):
         return False
     incoming, margin = target._layer_transient, target._layer_transient_margin
+    if reservation_kind == "layer-page":
+        incoming = int(target._layer_fetch_bytes_estimate(layer) or 0)
+        if incoming <= 0:
+            return False
+        margin = (target._layer_transient_margin if getattr(
+            target.rc, "qwen35_serial_verify_exact_page_admission", False)
+            else 400_000_000)
+    reservation_reason = "serial-verify-" + reservation_kind
     stats = getattr(target, "_qwen35_serial_kv_reclaim_stats", None)
     if stats is None:
         stats = target._qwen35_serial_kv_reclaim_stats = {}
@@ -96,6 +107,7 @@ def recover_serial_kv_admission(target, kv, metal, *, layer, positions, offset):
     row = dict(schema="voom.qwen35-serial-kv-reclaim.v1", layer=layer,
                verifier_positions=positions, start_offset=offset,
                incoming_bytes=incoming, margin_bytes=margin,
+               reservation_reason=reservation_reason,
                kv_budget_bytes=kv.max_bytes, logical_before_bytes=kv.nbytes(),
                logical_reclaimed_bytes=0, metal_active_released_bytes=None,
                outcome="error", reservation_retried=False)
@@ -124,7 +136,7 @@ def recover_serial_kv_admission(target, kv, metal, *, layer, positions, offset):
             return False
         row["reservation_retried"] = True
         try:
-            governor.reserve(incoming, margin=margin, reason="serial-verify-transient")
+            governor.reserve(incoming, margin=margin, reason=reservation_reason)
         except MemoryError:
             row["outcome"] = "refused"
             return False

@@ -83,3 +83,20 @@ def release_generation_state(owner) -> None:
     owner._h_window = None
     owner._h_last = None
     owner._provisional = None
+
+
+def detach_released_kv_slots(owner, state) -> int:
+    """Remove only hot-slot owners of the endpoint about to be released.
+
+    A paged endpoint cannot remain a usable RAM prefix after release() empties
+    its attention pages. Keeping its slot also retains attached recurrent
+    state unnecessarily. Durable journal records and independent forks remain
+    untouched; object identity, never token text or shape, selects the slots.
+    """
+    slots = getattr(owner, "_hot_prompt_slots", None)
+    if slots is None:
+        return 0
+    retained = [slot for slot in slots if getattr(slot, "kv", None) is not state]
+    removed = len(slots) - len(retained)
+    owner._hot_prompt_slots = retained
+    return removed

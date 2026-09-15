@@ -1190,6 +1190,18 @@ def test_paged_bootstrap_restores_phase_budget_then_releases_endpoint():
         max_kv_mb=768, release_paged_kv_after_generate=True)
     target.governor = Governor()
     target.released_kv = None
+    independent = SimpleNamespace(kv=_TargetKV(), tokens=(1,))
+    original_generate = target.generate
+
+    def generate_with_retained_endpoint(*args, **kwargs):
+        result = original_generate(*args, **kwargs)
+        target._hot_prompt_slots = [independent, SimpleNamespace(
+            kv=target.last_kv, tokens=(1, 2, 3), logits=mx.zeros((16,)))]
+        return result
+
+    target.generate = generate_with_retained_endpoint
+    # The list is replaced by bootstrap and release; resolve it at append time.
+    target._append_hot_prompt_slot = lambda slot: target._hot_prompt_slots.append(slot)
 
     def release_kv(kv):
         target.released_kv = kv
@@ -1214,6 +1226,8 @@ def test_paged_bootstrap_restores_phase_budget_then_releases_endpoint():
     assert target.last_kv is None
     assert target.released_kv is target.bootstrap_kv
     assert target.bootstrap_kv.released is True
+    assert target._hot_prompt_slots == [independent]
+    assert independent.kv.released is False
     assert result["path_stats"][
         "qwen_mtp_paged_bootstrap_budget_restored_bytes"] == 2_100_000_000
 

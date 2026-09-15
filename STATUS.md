@@ -1,5 +1,40 @@
 # STATUS — 2026-09-14 UTC (current corrections first; dated chronology below is history)
 
+## 2026-09-15 UTC: full captured cache trial reaches four calls, fifth safely refuses
+
+huihui_paged_plex_20260915 on35a673e retained original134-tool HTTP capture,
+gateway-prepared full state and the unchanged synthetic mixed-page fixture.
+Completed calls took654.1486s/195.8005s/454.9761s/232.3258s, emitting67/56/55/58
+tokens naturally. Second-turn wall improves from prior uncached605.1221s;
+third from623.6379s. Changed execution tool catalog on turn3 limited reuse.
+Decision prefix hits4781/5060,5060/5331,5331/5601,5601/5874; execution hits
+5599/5878,6252/6522,6522/6795. No full-workflow latency or final score exists.
+
+Turn5 failed after118.5929s before a serial-verification weight-page allocation:
+active0.62GB + incoming0.21GB > live0.81GB ceiling, available4.69GB. Original
+memory guard preserved. All completed-call checks pass except swap-out on
+turns1/3/4; whole-arm sampled swap-out103,841,792B, zero swap growth,
+minimum available4.510GB, peak process footprint2.417GB. Parent1656.2679s is
+incomplete workflow time. Sources start=end=fresh, embedded result and all
+artifact hashes checked; owned processes stopped. Result SHA
+49c18a2e9bef83409b3ae22351922337aa3d9575718824f68d226b9879ec712d.
+
+Follow-up robustness fix extends existing bounded exact KV reclamation from
+compute-scratch refusal to the earlier weight-page admission, prices the actual
+page and its SAME margin, and rechecks the original admission before fetching.
+No logical-byte credit, threshold reduction or retry loop.103 pure policy/hook
+tests and108 real-MLX paging/MTP tests pass (controlled pressure, synthetic KV,
+bit-identical readback/SDPA). Also detach only identity-matched hot slots before
+releasing their paged endpoint so stale slots cannot retain its recurrent state;
+independent forks and durable cache files are untouched. Real serving replay of
+these latest changes remains pending. No reliable full harness readiness claim.
+Follow-up combined real-MLX gate huihui_page_owner_mlx_20260915 passes111 tests
+in2.60s, including the actual MTP wrapper releasing its endpoint while retaining
+an independent fork. Source/log hashes and stopped PIDs checked. The next full
+replay explicitly allows8 tool-result rounds (historical default4 unchanged);
+separate movie/show pagination otherwise risks exhausting the test driver before
+a final answer. Original HTTP prompt/catalog and synthetic page rubric unchanged.
+
 ## 2026-09-15 UTC: cached native-MTP crash fixed; held-out and restart proofs
 
 An exact disk prefix hit restored KV/logits but no MTP trunk hidden seed.

@@ -56,6 +56,50 @@ def run(engine, kv, metal):
         engine, kv, metal, layer=3, positions=5, offset=5046)
 
 
+def page_hook():
+    tree = ast.parse(Path('runtime/engine.py').read_text())
+    cls = next(n for n in tree.body if isinstance(n, ast.ClassDef)
+               and n.name == 'StreamingEngine')
+    method = next(n for n in cls.body if isinstance(n, ast.FunctionDef)
+                  and n.name == 'forward_tokens_serial_positions')
+    node = next(n for n in ast.walk(method) if isinstance(n, ast.Try)
+        and any(isinstance(c, ast.Call) and isinstance(c.func, ast.Attribute)
+                and c.func.attr == '_prepare_serial_verify_layer_page'
+                for c in ast.walk(ast.Module(body=n.body, type_ignores=[]))))
+    fn = ast.parse('def invoke(self, layer, verifier_positions, offset, kv, qwen_family=True): pass').body[0]
+    fn.body = [node]
+    namespace = {'__package__': 'runtime', 'mx': object()}
+    module = ast.fix_missing_locations(ast.Module(body=[fn], type_ignores=[]))
+    exec(compile(module, 'runtime/engine.py', 'exec'), namespace)
+    return namespace['invoke']
+
+
+@pytest.mark.parametrize('recovered', [True, False])
+def test_actual_page_hook_rechecks_once_or_preserves_original_error(monkeypatch, recovered):
+    calls = []
+    original = MemoryError('page not admitted')
+    def prepare(layer):
+        calls.append(('prepare', layer))
+        if len(calls) == 1:
+            raise original
+    def recover(*args, **kwargs):
+        calls.append(('recover', kwargs))
+        return recovered
+    monkeypatch.setattr(recovery, 'recover_serial_kv_admission', recover)
+    engine = SimpleNamespace(_prepare_serial_verify_layer_page=prepare)
+    invoke = page_hook()
+    if recovered:
+        invoke(engine, 3, 5, 6795, object())
+        assert calls[-1] == ('prepare', 3)
+    else:
+        with pytest.raises(MemoryError) as error:
+            invoke(engine, 3, 5, 6795, object())
+        assert error.value is original
+    assert calls[1] == ('recover', dict(layer=3, positions=5, offset=6795,
+                                      reservation_kind='layer-page'))
+    assert len(calls) == (3 if recovered else 2)
+
+
 @pytest.mark.parametrize("enabled", [False, None, 1, "1", "auto"])
 def test_only_explicit_boolean_true_enables_and_disabled_does_not_read(enabled):
     engine = SimpleNamespace(rc=SimpleNamespace(qwen35_serial_kv_reclaim=enabled))
@@ -88,6 +132,36 @@ def test_content_independent_live_deficit_protected_layer_and_fresh_reserve(setu
     assert row["outcome"] == "admitted" and row["reservation_retried"] is True
     assert stats["attempts"] == stats["admitted"] == row["spill_pages"] == 1
     assert kv.max_bytes == 256_000_000
+
+
+@pytest.mark.parametrize('exact,margin', [(True, 20), (False, 400_000_000)])
+def test_weight_page_recovery_prices_page_not_compute_scratch(setup, exact, margin):
+    engine, kv, metal, calls = setup
+    engine.rc.qwen35_serial_verify_exact_page_admission = exact
+    engine._layer_fetch_bytes_estimate = lambda layer: 210 if layer == 3 else None
+    assert recovery.recover_serial_kv_admission(
+        engine, kv, metal, layer=3, positions=5, offset=6795,
+        reservation_kind='layer-page')
+    assert calls == [('spill', 100 + 210 + margin - 150, 3),
+        ('reserve', 210, dict(margin=margin, reason='serial-verify-layer-page'))]
+    record = engine._qwen35_serial_kv_reclaim_stats['records'][0]
+    assert record['incoming_bytes'] == 210
+    assert record['reservation_reason'] == 'serial-verify-layer-page'
+
+
+def test_weight_page_without_estimate_cannot_claim_recovery(setup):
+    engine, kv, metal, calls = setup
+    engine._layer_fetch_bytes_estimate = lambda layer: 0
+    assert not recovery.recover_serial_kv_admission(
+        engine, kv, metal, layer=3, positions=5, offset=6795,
+        reservation_kind='layer-page')
+    assert not calls
+
+
+def test_unknown_reservation_cannot_select_a_looser_margin(setup):
+    with pytest.raises(ValueError, match='reservation kind'):
+        recovery.recover_serial_kv_admission(*setup[:3], layer=3,
+            positions=5, offset=6795, reservation_kind='unlimited')
 
 
 def test_aliases_never_turn_logical_reclamation_into_admission(setup):

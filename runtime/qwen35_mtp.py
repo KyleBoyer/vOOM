@@ -4506,6 +4506,8 @@ class QwenMTPSpeculativeEngine:
             int(getattr(rc, "max_kv_mb", 0) or 0) > 0
             and bool(getattr(rc, "release_paged_kv_after_generate", False)))
         if release_internal_paged_kv:
+            from .request_state import detach_released_kv_slots
+            detach_released_kv_slots(tgt, kv)
             tgt.last_kv = None
             release_kv = getattr(tgt, "_release_kv", None)
             if callable(release_kv):

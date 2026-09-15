@@ -16,6 +16,7 @@ from runtime.kda_state import KDAStateCache
 from runtime.kv_paged import PagedKVCache
 from tests.test_governor_reserve_pure import make_governor
 from tests.test_qwen35_serial_refusal_pure import hook, target as refusal_target
+from tests.test_qwen_kv_reclaim_pure import page_hook
 
 
 def _values(layer, start, width):
@@ -30,7 +31,8 @@ def _bits(value):
 
 @pytest.mark.parametrize("mode", ["disabled", "recover", "aliases",
     "one_pass_moving", "topup_moving", "topup_aliases", "topup_exhausted"])
-def test_real_hook_exact_pages_and_governor_recheck(tmp_path, monkeypatch, mode):
+@pytest.mark.parametrize("reservation_kind", ["transient", "layer-page"])
+def test_real_hook_exact_pages_and_governor_recheck(tmp_path, monkeypatch, mode, reservation_kind):
     kv = PagedKVCache(8, 256_000_000, tmp_path, page_positions=256, resident_pages=1)
     kv.kda_cache = KDAStateCache(8)
     kv.kda_cache.set_state(0, mx.full((1, 2, 3, 3), 0.125))
@@ -75,6 +77,13 @@ def test_real_hook_exact_pages_and_governor_recheck(tmp_path, monkeypatch, mode)
             return released
         monkeypatch.setattr(kv, "reclaim_closed_pages", moving_reclaim)
     invoke, _ = hook()
+    if reservation_kind == 'layer-page':
+        invoke = page_hook()
+        engine.rc.qwen35_serial_verify_exact_page_admission = True
+        engine._layer_fetch_bytes_estimate = lambda layer: engine._layer_transient
+        engine._prepare_serial_verify_layer_page = lambda layer: governor.reserve(
+            engine._layer_transient, margin=engine._layer_transient_margin,
+            reason='serial-verify-layer-page')
     invoke.__globals__["mx"] = mx
     try:
         if mode in ("recover", "topup_moving"):
@@ -83,7 +92,8 @@ def test_real_hook_exact_pages_and_governor_recheck(tmp_path, monkeypatch, mode)
             assert row["outcome"] == "admitted" and row["reservation_retried"]
             assert row["logical_reclaimed_bytes"] >= 2_100_000
             assert row["metal_active_released_bytes"] >= 2_100_000
-            assert governor.reservation_calls == 2 and governor.reservation_failures == 1
+            assert governor.reservation_calls == (3 if reservation_kind == 'layer-page' else 2)
+            assert governor.reservation_failures == 1
             if mode == "topup_moving":
                 from tests.fixtures.qwen_kv_reclaim_witness import valid_trace
                 assert len(row['reclaim_passes']) == 2
