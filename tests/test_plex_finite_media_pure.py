@@ -3,7 +3,7 @@ import copy
 import pytest
 
 from tests.fixtures.plex_agent_profile import SYNTHETIC_PAGES
-from tests.fixtures.plex_finite_media import respond
+from tests.fixtures.plex_finite_media import respond, PAGE5_PROFILE
 
 
 def call(**args):
@@ -41,3 +41,17 @@ def test_page_limit_clamped_and_raw_ratings_not_filtered_by_mock():
     page = respond(call(limit=999, ratingOperator='lte', movieRatingValue='PG-13'), SYNTHETIC_PAGES)
     assert page['limit'] == 500
     assert any(row['contentRating'] == 'R' for row in page['media'])
+
+
+def test_explicit_server_cap_requires_real_pagination_without_changing_records():
+    first=respond(call(mediaType='all',limit=500,offset=0),SYNTHETIC_PAGES,profile=PAGE5_PROFILE)
+    second=respond(call(mediaType='all',limit=500,offset=first['returned']),SYNTHETIC_PAGES,profile=PAGE5_PROFILE)
+    assert first['limit']==second['limit']==5
+    assert first['hasMore'] is True and second['hasMore'] is False
+    assert first['returned']==second['returned']==5
+    whole=respond(call(mediaType='all',limit=500),SYNTHETIC_PAGES)
+    assert first['media']+second['media']==whole['media']
+    assert first['total']==second['total']==10
+    assert not respond(call(offset=10),SYNTHETIC_PAGES,profile=PAGE5_PROFILE)['media']
+    with pytest.raises(ValueError):
+        respond(call(),SYNTHETIC_PAGES,profile='invented')

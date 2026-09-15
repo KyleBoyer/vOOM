@@ -1081,7 +1081,7 @@ def run_export_terminal_profile(request: dict, export_calls: list[dict],
 def run_profile(request: dict, url: str, timeout: float,
                 max_tool_rounds: int, tool_result_profile: str = 'legacy') -> dict:
     from tests.fixtures import plex_finite_media
-    if tool_result_profile not in ('legacy', plex_finite_media.PROFILE):
+    if tool_result_profile not in ('legacy', *plex_finite_media.PROFILES):
         raise ValueError('unknown tool-result fixture profile')
     pressure_before = _pressure()
     turns = []
@@ -1123,7 +1123,7 @@ def run_profile(request: dict, url: str, timeout: float,
         call = plex_calls[0]
         page = (SYNTHETIC_PAGES[min(page_index, len(SYNTHETIC_PAGES) - 1)]
                 if tool_result_profile == 'legacy'
-                else plex_finite_media.respond(call, SYNTHETIC_PAGES))
+                else plex_finite_media.respond(call, SYNTHETIC_PAGES, profile=tool_result_profile))
         _append_call_and_result(request, call, page)
         turns[-1]["handled_call_count"] = 1
         # A forced choice governs the planning turn only. Keeping it on every

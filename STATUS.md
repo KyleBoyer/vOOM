@@ -1,5 +1,26 @@
 # STATUS — 2026-09-14 UTC (current corrections first; dated chronology below is history)
 
+## 2026-09-15 UTC: held-out gateway answers and real private keepalives PASS
+
+huihui_posttool_20260915 on82de933 PASS. Synthetic inventory/calendar post-tool
+requests retain5/9 tools, system versus system+developer, streaming/nonstreaming,
+temperature1/0.4, and optional top_p0.92/top_k20. Exact JSON answers naturally
+complete12 tokens each in76.0617s/62.9456s,617/663 uncached prepared tokens.
+Actual buffered gateway/authorship/state/protocol gates pass. Streaming client
+observed11 private keepalive comments; maximum complete-line gap6.685635s.
+This is actual transport evidence, not timer configuration or TCP packet timing.
+Whole pressure PASS:7,421,952B swap-out, zero growth, min5.345GB, footprint1.531GB,
+no sampled transcoders. Sources, embedded result, hashes and stopped PIDs
+verified. Result SHA
+2ab9fbf644f469a1b2aedd66442186ea74fc7807aa335c34a73003822c86e38b.
+
+Next full captured workflow uses explicit synthetic-finite-media-page5-v1:
+same ten raw records and envelope, server clamps returned limit to5 so two
+distinct nonempty pages are necessary even when model requests500. This changes
+tool-result pagination, NOT the HTTP capture/prompts/catalog or scoring rubric.
+Original finite profile/default remains unchanged. Do not compare its latency
+as an isolated optimization or infer live Plex behavior from the synthetic cap.
+
 ## 2026-09-15 UTC: cached depth4 held-out pass; transport corpus staged
 
 huihui_relief_heldout_20260915 ond98e9fc PASS: inventory72.5961s/calendar91.3949s,

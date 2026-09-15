@@ -9,9 +9,13 @@ by this mock: filtersApplied=False makes that limitation explicit to the model.
 import copy
 
 PROFILE = 'synthetic-finite-media-v1'
+PAGE5_PROFILE = 'synthetic-finite-media-page5-v1'
+PROFILES = (PROFILE, PAGE5_PROFILE)
 
 
-def respond(call, source_pages):
+def respond(call, source_pages, *, profile=PROFILE):
+    if profile not in PROFILES:
+        raise ValueError('unknown finite media profile')
     if call.get('name') != 'plugin__plex__plex_list_library_media':
         raise ValueError('finite media fixture only supports the media endpoint')
     args = call.get('arguments')
@@ -26,7 +30,7 @@ def respond(call, source_pages):
         if type(value) not in (int, float) or not float(value).is_integer() or value < minimum:
             raise ValueError('invalid ' + name)
         return int(value)
-    limit = min(500, integer('limit', 100, 1))
+    limit = min(5 if profile == PAGE5_PROFILE else 500, integer('limit', 100, 1))
     offset = integer('offset', 0, 0)
     # Fail visibly if an unsupported query needs semantics this finite catalog
     # cannot provide, rather than silently claiming the filter was applied.

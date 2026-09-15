@@ -277,10 +277,10 @@ its different tool results must not be labeled a legacy-workflow speed win.
     with patch.object(plex, '_post', recording_post):
         fixture_kwargs = {}
         if config.get('tool_result_profile') is not None:
-            from tests.fixtures.plex_finite_media import PROFILE
-            if config['tool_result_profile'] != PROFILE:
+            from tests.fixtures.plex_finite_media import PROFILES
+            if config['tool_result_profile'] not in PROFILES:
                 raise ValueError('unknown explicit tool-result fixture profile')
-            fixture_kwargs['tool_result_profile'] = PROFILE
+            fixture_kwargs['tool_result_profile'] = config['tool_result_profile']
         result = plex.run_profile(request, f'http://127.0.0.1:{config["port"]}/v1/responses',
             timeout=1800, max_tool_rounds=max_tool_rounds, **fixture_kwargs)
     document['plex'] = result
