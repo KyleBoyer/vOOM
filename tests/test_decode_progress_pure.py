@@ -44,6 +44,37 @@ def test_output_failure_is_not_a_generation_failure(monkeypatch):
     p.record(2,2,0,0,final=True)
 
 
+def test_costs_use_measured_plain_baseline_and_include_elapsed_overhead(monkeypatch, capsys):
+    monkeypatch.setattr(progress.time, 'perf_counter', lambda: 120.0)
+    p = progress.DecodeProgress(100.0, 1024)
+    p.record(8, 5, 8, 4, plain_seconds=6.0, plain_sweeps=3,
+             draft_seconds=4.0, verifier_seconds=7.0, speculative_rounds=2,
+             rollback_seconds=1.0, adaptive_disabled=True)
+    c = json.loads(capsys.readouterr().out.removeprefix(progress.PREFIX))['costs']
+    assert c['measured_plain_seconds_per_token'] == 2.0
+    assert c['estimated_plain_equivalent_seconds'] == 14.0
+    assert c['estimated_net_seconds_including_overhead'] == -6.0
+    assert c['adaptive_disabled'] is True
+    assert c['rollback_seconds'] == 1.0
+    assert 'not an A/B speed proof' in c['scope']
+
+
+def test_costs_do_not_invent_plain_baseline(monkeypatch, capsys):
+    monkeypatch.setattr(progress.time, 'perf_counter', lambda: 120.0)
+    p = progress.DecodeProgress(100.0, 1024)
+    p.record(4, 1, 4, 3, verifier_seconds=2.0, speculative_rounds=1)
+    c = json.loads(capsys.readouterr().out.removeprefix(progress.PREFIX))['costs']
+    assert c['measured_plain_seconds_per_token'] is None
+    assert c['estimated_net_seconds_including_overhead'] is None
+
+
+@pytest.mark.parametrize('invalid', [-1.0, float('nan'), float('inf'), 'bad'])
+def test_bad_cost_telemetry_disables_observer_not_generation(invalid):
+    p = progress.DecodeProgress(0, 1024)
+    p.record(4, 1, 4, 2, draft_seconds=invalid)
+    assert p.failed
+
+
 def test_real_hook_is_after_committed_endpoint_and_before_terminal_break():
     tree = ast.parse(Path('runtime/qwen35_mtp.py').read_text())
     fn = next(n for n in ast.walk(tree) if isinstance(n,ast.FunctionDef) and n.name=='generate')
@@ -56,6 +87,12 @@ def test_real_hook_is_after_committed_endpoint_and_before_terminal_break():
                 and ast.unparse(n.test)=='terminal_round'
                 and isinstance(n.body[0],ast.Break))
     assert call.lineno < stop.lineno
+    bindings = {k.arg: ast.unparse(k.value) for k in call.keywords}
+    assert bindings['plain_seconds'] == 'plain_round_s'
+    assert bindings['plain_sweeps'] == 'plain_timed_sweeps'
+    assert bindings['draft_seconds'] == 'draft_round_s'
+    assert bindings['verifier_seconds'] == 'verifier_round_s'
+    assert bindings['rollback_seconds'] == 'kda_factor_restore_s'
     assert 'DecodeProgress(decode_t0, max_tokens) if report_decode_progress else None' in src
 
 

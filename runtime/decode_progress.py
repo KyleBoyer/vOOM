@@ -1,5 +1,6 @@
 """Default-off scalar-only MTP progress. No arrays, text, token IDs or RNG."""
 import json
+import math
 import os
 import time
 
@@ -21,7 +22,10 @@ class DecodeProgress:
         self.maximum = maximum
         self.failed = False
 
-    def record(self, emitted, sweeps, proposed, accepted, *, final=False):
+    def record(self, emitted, sweeps, proposed, accepted, *, final=False,
+               plain_seconds=0.0, plain_sweeps=0, draft_seconds=0.0,
+               verifier_seconds=0.0, speculative_rounds=0,
+               rollback_seconds=0.0, adaptive_disabled=False):
         if self.failed:
             return
         now = time.perf_counter()
@@ -36,8 +40,27 @@ class DecodeProgress:
             draft_accepted=int(accepted), terminal_round=bool(final),
             scope='accepted token count includes bootstrap and possible EOS; not request completion or quality proof')
         try:
+            durations = [float(x) for x in (plain_seconds, draft_seconds,
+                                            verifier_seconds, rollback_seconds)]
+            if any(not math.isfinite(x) or x < 0 for x in durations):
+                raise ValueError('invalid diagnostic duration')
+            baseline = (durations[0] / plain_sweeps if plain_sweeps > 0 else None)
+            row['costs'] = dict(
+                schema='voom.mtp-progress-costs.v1',
+                plain_seconds=durations[0], plain_timed_sweeps=int(plain_sweeps),
+                draft_seconds=durations[1], verifier_seconds=durations[2],
+                rollback_seconds=durations[3],
+                speculative_rounds=int(speculative_rounds),
+                adaptive_disabled=bool(adaptive_disabled),
+                measured_plain_seconds_per_token=baseline,
+                estimated_plain_equivalent_seconds=(
+                    max(0, emitted - 1) * baseline if baseline is not None else None),
+                estimated_net_seconds_including_overhead=(
+                    max(0, emitted - 1) * baseline - (now - self.started)
+                    if baseline is not None else None),
+                scope='same-request timed plain sweeps only; extrapolated counterfactual, not an A/B speed proof; verifier and rollback timers may overlap')
             print(PREFIX + json.dumps(row, sort_keys=True, allow_nan=False), flush=True)
-        except OSError:
+        except (OSError, ValueError, TypeError, OverflowError):
             # Diagnostic output failure must not authorize a retry or alter tokens.
             self.failed = True
         self.last_reported = now

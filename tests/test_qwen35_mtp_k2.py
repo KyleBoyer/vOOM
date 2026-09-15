@@ -228,6 +228,10 @@ def test_decode_progress_does_not_change_target_tokens_or_endpoint(temperature, 
             assert records[-1]['terminal_round']
             assert records[-1]['accepted_output_tokens_including_bootstrap'] == len(result['tokens'])
             assert records[-1]['target_decode_sweeps'] == result['path_stats']['qwen_mtp_target_sweeps']
+            costs = records[-1]['costs']
+            assert costs['draft_seconds'] == result['path_stats']['qwen_mtp_draft_round_s']
+            assert costs['verifier_seconds'] == result['path_stats']['qwen_mtp_verifier_round_s']
+            assert costs['measured_plain_seconds_per_token'] is None
     assert outcomes[0] == outcomes[1]
 
 

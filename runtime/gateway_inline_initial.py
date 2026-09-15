@@ -15,6 +15,18 @@ POLICY = (
 )
 
 
+def decision_choice(client_choice, force_reason):
+    """Eligible auto requests may choose any supplied real or discovery tool.
+
+    Keep the existing external-action obligation, but do not force a private
+    search when real functions have already been made available. This helper
+    must only be called after candidates() has admitted the initial path.
+    """
+    if client_choice != 'auto' or force_reason not in (None, 'external-action-imperative'):
+        raise ValueError('ineligible initial inline decision authority')
+    return 'required' if force_reason is not None else 'auto'
+
+
 def candidates(value, *, messages, tools, raw_tools, client_choice, force_reason,
                structured_output, host_route, terminal_synthesis, buffered,
                activated_names):

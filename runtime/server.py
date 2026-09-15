@@ -12722,6 +12722,8 @@ class Handler(BaseHTTPRequestHandler):
         gateway_decision_choice = (
             "none" if (gateway_terminal_pagination_synthesis
                        or gateway_deterministic_render is not None) else
+            inline_initial_policy.decision_choice(tool_choice, gateway_force_reason)
+            if gateway_inline_initial else
             _hidden_gateway_decision_choice(
                 tool_choice, gateway_force_reason,
                 bool(gateway_activated_names))

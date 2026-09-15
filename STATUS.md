@@ -1,5 +1,36 @@
 # STATUS — 2026-09-14 UTC (current corrections first; dated chronology below is history)
 
+## 2026-09-15 UTC: initial action constraint defect found; cost instrumentation added
+
+Revised initial instruction passes the unchanged synthetic calendar request:
+huihui_inline_initial_calendar_20260915 on1c9ecaa,167.0991s/49 tokens, exact
+arguments, no search, all checks PASS. Whole swap-out12,238,848B, zero growth,
+native min5.426GB. Result SHA
+53ad2b73bf1937d2b8fbdb604bc1571b4f8a9c83c31f23e2e945698a0a45fb76.
+
+Full original134-tool HTTP replay huihui_inline_initial_full_20260915 on1c9ecaa
+retains temperature1/max1024 and finite five-item synthetic Plex pages.
+Its8479-token initial prompt prefills346.1017s; interrupted owned driver after
+445.8783s once pressure failed, without a completed first response or score.
+Native swap-out18,808,832B, zero growth, min5.179GB, footprint1.984GB.
+Result SHA6ea8738da0b479e9d8facf2d19ad750ccb2e7125b16d18d372d681e82af1d7ac.
+Both runs have source/artifact hashes and stopped process ownership verified.
+
+The full replay exposes a wiring defect absent from the non-imperative held-out
+cases: the initial real catalog still received the old forced-private-search
+constraint. The opt-in path now preserves required external action while letting
+the model choose any supplied real/discovery function; no host function choice,
+arguments, answer, or extra authority. Actual server-assignment regression added.
+This is a candidate fix, not a successful full-workflow or latency result.
+
+Default-off decode progress now reports existing scalar draft/verifier/rollback
+timers and measured plain-sweep costs during incomplete generations. Its net-time
+estimate includes elapsed overhead and explicitly is not an A/B speed proof;
+missing plain measurements remain null.552 pure tests and70 native tiny-model
+tests passed before the constraint fix, including greedy/stochastic observer
+token/endpoint identity. No new inference, array evaluation or RNG in logging.
+Full Plex readiness and sub90s remain unqualified; no serving process promoted.
+
 ## 2026-09-15 UTC: initial inline corpus partial regression, not promoted
 
 huihui_inline_initial_heldout_20260915 oned818e8: unchanged synthetic inventory

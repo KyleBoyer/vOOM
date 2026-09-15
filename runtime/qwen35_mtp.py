@@ -3834,7 +3834,12 @@ class QwenMTPSpeculativeEngine:
             catchup_tok = emitted[-1] if terminal_round else next_catchup_tok
             if decode_progress is not None:
                 decode_progress.record(len(emitted), target_decode_sweeps,
-                    proposed, accepted, final=terminal_round)
+                    proposed, accepted, final=terminal_round,
+                    plain_seconds=plain_round_s, plain_sweeps=plain_timed_sweeps,
+                    draft_seconds=draft_round_s, verifier_seconds=verifier_round_s,
+                    speculative_rounds=speculative_rounds,
+                    rollback_seconds=kda_factor_restore_s,
+                    adaptive_disabled=adaptive_disabled)
             if terminal_round:
                 break
             # Retained per-layer/KDA midpoints changed the break-even math:

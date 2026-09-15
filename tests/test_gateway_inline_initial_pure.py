@@ -88,6 +88,38 @@ def test_profile_only_opts_in_and_actual_wiring():
     assert 'first output' in policy.POLICY and 'Do not invent external results' in policy.POLICY
 
 
+@pytest.mark.parametrize('reason,expected', [(None,'auto'),
+    ('external-action-imperative','required')])
+def test_initial_constraint_allows_real_actions_instead_of_forcing_search(reason, expected):
+    tree=ast.parse(Path('runtime/server.py').read_text())
+    assignment=next(n for n in ast.walk(tree) if isinstance(n,ast.Assign)
+        and any(isinstance(t,ast.Name) and t.id=='gateway_decision_choice' for t in n.targets))
+    def hidden(choice,force,activated):
+        return 'specific:vmodel_search_tools' if force is not None else choice
+    scope=dict(gateway_terminal_pagination_synthesis=False,
+        gateway_deterministic_render=None,gateway_inline_initial=True,
+        inline_initial_policy=policy,tool_choice='auto',gateway_force_reason=reason,
+        gateway_enabled=True,gateway_activated_names=(),_hidden_gateway_decision_choice=hidden)
+    code=compile(ast.fix_missing_locations(ast.Module(body=[assignment],type_ignores=[])),
+                 '<actual gateway choice>','exec')
+    exec(code,scope)
+    assert scope['gateway_decision_choice']==expected
+    scope['gateway_inline_initial']=False
+    exec(code,scope)
+    assert scope['gateway_decision_choice']==hidden('auto',reason,False)
+    scope.update(gateway_inline_initial=True,gateway_terminal_pagination_synthesis=True)
+    exec(code,scope)
+    assert scope['gateway_decision_choice']=='none'
+
+
+@pytest.mark.parametrize('choice,reason', [('required',None),('none',None),
+    ('specific:read_inventory',None),('auto','tool-result-pagination'),
+    ('auto','client-required')])
+def test_initial_decision_rejects_authority_expansion(choice,reason):
+    with pytest.raises(ValueError):
+        policy.decision_choice(choice,reason)
+
+
 @pytest.mark.parametrize('selection,passed', [({},False),
     ({'gateway_inline_initial':1,'gateway_inline_active':1,'gateway_inline_active_tools':4,
       'gateway_search_rounds':0,'gateway_host_routed':0},True),
