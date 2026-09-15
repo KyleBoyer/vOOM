@@ -1,0 +1,10 @@
+schema: voom.runtime-profile.v1
+name: qwen35-plain-target-audit
+description: Explicit ordinary target generation for higher-fidelity readiness diagnostics.
+notes:
+  - "Disables native MTP and its serial-verifier-only KV recovery flags; no draft sidecar is loaded. Target weights, full context and existing governor remain authoritative."
+  - "Not a speed optimization. Use to separate target-model readiness/quality from proposal-side memory cost. No safety floors are reduced."
+settings:
+  VMODEL_QWEN_MTP_SPECULATIVE: false
+  VMODEL_QWEN35_SERIAL_KV_RECLAIM: false
+  VMODEL_QWEN35_SERIAL_KV_RECLAIM_TOPUP: false
