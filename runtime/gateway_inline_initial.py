@@ -2,6 +2,17 @@
 from .toolcalls import pinned_tool_indices, rank_tool_indices
 
 FLAG = 'VMODEL_FAST_TOOL_GATEWAY_INLINE_INITIAL'
+POLICY = (
+    'The supplied real functions are available now. When the user requests a '
+    'lookup or action involving external state, obtain it by calling the appropriate '
+    'real function immediately as your first output, with no surrounding prose. '
+    'Use vmodel_search_tools instead only when none of the supplied real functions '
+    'can perform the requested operation. Do not enable functions already supplied. '
+    'Do not invent external results, supply example results as real data, or promise '
+    'to call a function later. If no external information or action is needed, '
+    'answer normally from the conversation and stable knowledge. Preserve the '
+    'caller instructions and exact requested identifiers, arguments and output format.'
+)
 
 
 def candidates(value, *, messages, tools, raw_tools, client_choice, force_reason,

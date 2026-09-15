@@ -12675,6 +12675,7 @@ class Handler(BaseHTTPRequestHandler):
                 decision_source_messages,
                 (_HIDDEN_GATEWAY_TERMINAL_PAGINATION_POLICY
                  if gateway_terminal_pagination_synthesis
+                 else inline_initial_policy.POLICY if gateway_inline_initial
                  else inline_active_policy.POLICY if gateway_inline_active
                  else _HIDDEN_GATEWAY_DECISION_POLICY))
         else:

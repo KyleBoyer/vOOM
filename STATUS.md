@@ -1,5 +1,21 @@
 # STATUS — 2026-09-14 UTC (current corrections first; dated chronology below is history)
 
+## 2026-09-15 UTC: initial inline corpus partial regression, not promoted
+
+huihui_inline_initial_heldout_20260915 oned818e8: unchanged synthetic inventory
+request completes126.6208s, exact requested arguments, observed direct real call
+without search and per-request safety PASS. Calendar remains in first generation
+past171 tokens (old direct answer45); stopped owned driver after499.0031s once
+whole pressure failed. No completed calendar answer or causal content diagnosis.
+Native swap-out36,683,776B/zero growth, min5.472GB, footprint1.403GB,
+no sampled transcoders. Sources/artifact hashes/stopped PIDs verified; result SHA
+83af52aece0a49bc2338084f1627df8903aa2da8b8b946218b6db2f41367d36b.
+
+The initial path had reused the post-tool answer-oriented policy. A separate
+initial-call-first instruction is now staged (no host action selection);541 pure
+tests pass. Retest failing calendar first before full captured workflow. Catalog
+and prompt changes remain opt-in, lossy, unqualified for default promotion.
+
 ## 2026-09-15 UTC: mixed full replay rejected; initial inline catalog staged
 
 huihui_mixed_full_page5_20260915 on73109d0 preserved original134-tool HTTP

@@ -84,6 +84,8 @@ def test_profile_only_opts_in_and_actual_wiring():
     assert 'gateway_inline_active = gateway_inline_active or gateway_inline_initial' in source
     assert "'gateway_inline_initial': int(gateway_inline_initial)" in source
     assert 'prompt_catalog = [*gateway_virtual_tools, *gateway_initial_tools]' in source
+    assert 'inline_initial_policy.POLICY if gateway_inline_initial' in source
+    assert 'first output' in policy.POLICY and 'Do not invent external results' in policy.POLICY
 
 
 @pytest.mark.parametrize('selection,passed', [({},False),
