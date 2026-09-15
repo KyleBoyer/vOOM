@@ -1,5 +1,19 @@
 # STATUS — 2026-09-14 UTC (current corrections first; dated chronology below is history)
 
+## 2026-09-15 UTC: deeper draft chain is not a general speed win
+
+huihui_depth7_heldout_20260915 on7f0a9ac completed inventory114.9387s and
+calendar107.4290s,40/45 naturally completed tokens. Exact greedy tokens, full
+phase witnesses, protocol and arguments match saved depth4 controls. These
+are unchanged synthetic held-out requests, not Plex. Earlier uncached depth4
+100.8570s/106.7766s is faster/no worse; no promotion. Per-request checks pass,
+whole-arm pressure fails17,121,280B sampled swap-out (limit16MB),10,027,008B
+swap growth, min5.265GB, footprint1.581GB, no sampled transcoders. Source,
+embedded result, artifact hashes and stopped PIDs verified. Result SHA
+1f21cbf23d9efef1875af71012d1ddb56f756e724c307786606c74435b8b3688.
+Depth4 remains the general path. Next experiment adds only existing unused
+host-allocator relief at request boundaries, with no safety-floor change.
+
 ## 2026-09-15 UTC: repaired gateway returns correct finite answer; strict gates still fail
 
 huihui_buffer_auto_temp1_finite_20260915 onad74685 combined explicit buffered
