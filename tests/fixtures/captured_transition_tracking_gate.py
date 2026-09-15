@@ -243,6 +243,15 @@ def row_checks(row, response, case, config):
             and t['direct_io_pread_bytes'] > 0
             and type(t.get('direct_io_fd_hits')) is int
             and t['direct_io_fd_hits'] > 0)
+    if config.get('require_factor_base_disk') is True:
+        spill = t.get('qwen_mtp_kda_base_spill') or {}
+        checks['factor_base_disk_used_and_closed'] = (
+            type(spill.get('rounds')) is int and spill['rounds'] > 0
+            and spill.get('closed') == spill['rounds']
+            and type(spill.get('bytes_written')) is int and spill['bytes_written'] > 0
+            and spill.get('snapshot_resident_bytes_peak') == 0
+            and type(spill.get('logical_bytes_peak')) is int
+            and 0 < spill['logical_bytes_peak'] <= 512_000_000)
     if 'minimum_output_tokens' in case:
         minimum = case['minimum_output_tokens']
         if type(minimum) is not int or not 1 <= minimum < 1024:

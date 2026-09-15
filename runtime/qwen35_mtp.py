@@ -68,6 +68,7 @@ from typing import Iterable, Mapping, Sequence
 
 import mlx.core as mx
 from . import quant
+from .qwen_mtp_base_spill import managed_bases
 from . import qwen_mxfp4_head_policy as mxfp4_head_policy
 from .kv_cache import KVCache
 from .qwen35 import (_apply_partial_rope, _full_attention, _linear, _moe,
@@ -1473,7 +1474,8 @@ def _capture_qwen_serial_factors(target, tokens, kv):
         raise ValueError("compact Qwen rollback requires plain scalar recurrence")
     if source.spill_enabled or source.factor_capture_active:
         raise ValueError("compact Qwen rollback requires idle resident KDA state")
-    base = source.fork()
+    from .qwen_mtp_base_spill import create_base, has_state, base_bytes
+    base = create_base(source, target)
     factors = None
     try:
         logits = target.forward_tokens_serial_positions(
@@ -1485,7 +1487,7 @@ def _capture_qwen_serial_factors(target, tokens, kv):
         print(
             "[qwen-mtp-scalar-factor-failure] "
             f"verify_positions={len(tokens)} "
-            f"base_logical_bytes={base.nbytes()} "
+            f"base_logical_bytes={base_bytes(base)} "
             f"live_state_logical_bytes={source.nbytes()} "
             f"factor_layers={sum(bool(steps) for steps in captured)} "
             f"factor_steps={sum(len(steps) for steps in captured)} "
@@ -1505,7 +1507,7 @@ def _capture_qwen_serial_factors(target, tokens, kv):
         raise RuntimeError("serial Qwen verifier omitted complete KDA factors")
     active_layers = 0
     for layer, steps in enumerate(factors.steps):
-        if base.state(layer) is not None or source.state(layer) is not None:
+        if has_state(base, layer) or source.state(layer) is not None:
             active_layers += 1
             if len(steps) != len(tokens):
                 raise RuntimeError(
@@ -1911,6 +1913,7 @@ class QwenMTPSpeculativeEngine:
         })
         return result
 
+    @managed_bases
     def generate(self, prompt, max_tokens: int = 64, on_token=None,
                  stop=None, on_progress=None,
                  sampling: SamplingParams | None = None,
@@ -1921,6 +1924,7 @@ class QwenMTPSpeculativeEngine:
         if isinstance(max_tokens, bool) or not isinstance(max_tokens, int) or max_tokens <= 0:
             raise ValueError("max_tokens must be a positive integer")
         tgt = self.target
+        tgt._qwen_mtp_base_spill_stats = {}
         prepared_ids = getattr(prompt, "token_ids", None)
         ids = (list(prepared_ids) if prepared_ids is not None
                else list(tgt.tokenizer.encode(prompt).ids))
@@ -3174,8 +3178,10 @@ class QwenMTPSpeculativeEngine:
                                 kda_factor_rounds += 1
                                 kda_factor_bytes_peak = max(
                                     kda_factor_bytes_peak, round_factors.nbytes())
+                                from .qwen_mtp_base_spill import base_bytes
                                 kda_factor_base_bytes_peak = max(
-                                    kda_factor_base_bytes_peak, round_factor_base.nbytes())
+                                    kda_factor_base_bytes_peak,
+                                    base_bytes(round_factor_base))
                             else:
                                 spec_logits = tgt.forward_tokens_serial_positions(
                                     verify_tokens,
@@ -3708,6 +3714,8 @@ class QwenMTPSpeculativeEngine:
                 # Full acceptance uses the already-computed live endpoint;
                 # strict prefixes use plain scalar replay above. Neither path
                 # retains factors or the base into the next drafting round.
+                from .qwen_mtp_base_spill import close_base
+                close_base(round_factor_base)
                 round_factors = round_factor_base = None
                 retained_prefix = None
 
@@ -3992,6 +4000,7 @@ class QwenMTPSpeculativeEngine:
             # bytes freed. The shared base is reported separately.
             "qwen_mtp_kda_factor_bytes_peak": kda_factor_bytes_peak,
             "qwen_mtp_kda_factor_base_bytes_peak": kda_factor_base_bytes_peak,
+            "qwen_mtp_kda_base_spill": dict(getattr(tgt, "_qwen_mtp_base_spill_stats", {})),
             "qwen_mtp_kda_factor_restore_s": kda_factor_restore_s,
             "qwen_mtp_kda_factor_head_releases": kda_factor_head_releases,
             "qwen_mtp_kda_factor_head_cache_released_bytes": kda_factor_head_cache_bytes,

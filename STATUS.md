@@ -1,5 +1,26 @@
 # STATUS — 2026-09-14 UTC (current corrections first; dated chronology below is history)
 
+## 2026-09-15 UTC: direct uncached audit refused at verifier head; exact base spill staged
+
+huihui_nocache_heldout_20260915 on7626149: first held-out request fails78.5107s
+at ordinary mxfp4-head-row-block admission; no completed answer or speed result.
+Available4.90GB, active0.37GB, incoming0.04GB, margin0.40GB, projected0.82GB
+exceeds dynamic ceiling0.77GB. Retained rollback base153,944,064B, live state
+same logical size, factors26,634,240B. No retry of partially advanced endpoint.
+Whole sampled pressure passes (5,783,552B swap-out, zero growth, min4.691GB),
+but does not waive instantaneous admission. No completed applied-I/O witness.
+Source/artifact hashes/stopped PIDs verified; result SHA
+d12c93c00ea44e89bf9ec9dc25adfa3163aae6344990fcc814026d74d416aa83.
+
+Next opt-in factor-base disk snapshot preserves raw recurrent/conv bytes with
+checksummed bounded reload, generation-owned cleanup and ordinary admission.
+No target arithmetic/weight change; native prefix/token, memory and wall gates
+are pending. Native snapshot/rollback/MTP/fixture regressions214/214 PASS in
+huihui_base_disk_native_20260915 (fresh preflight, source/log/PID verified).
+Includes raw-byte prefixes0..5 at48x128x128 FP32 geometry, two seeds, exact
+BF16/FP16 convolution histories, corruption/admission failures and cleanup.
+This is NOT readiness, default promotion or a latency claim.
+
 ## 2026-09-15 UTC: reasoning derives right titles but still selects another tool call
 
 huihui_reasoning_synthesis_20260915 on86d4540: direct focused continuation,

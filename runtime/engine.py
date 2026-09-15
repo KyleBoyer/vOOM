@@ -2623,6 +2623,7 @@ class StreamingEngine:
         self._qwen35_serial_verify_page_reserve_s = 0.0
         self._qwen35_serial_verify_reserve_s = 0.0
         self._qwen35_serial_kv_reclaim_stats = {}
+        self._qwen_mtp_base_spill_stats = {}
         self._qwen35_serial_verify_weight_wait_s = 0.0
         self._qwen35_serial_verify_linear_layer_compute_s = 0.0
         self._qwen35_serial_verify_full_layer_compute_s = 0.0

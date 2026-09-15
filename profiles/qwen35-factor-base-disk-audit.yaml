@@ -1,0 +1,9 @@
+schema: voom.runtime-profile.v1
+name: qwen35-factor-base-disk-audit
+description: Experimental exact ephemeral disk snapshot for scalar-factor rollback bases.
+notes:
+  - "Default off. Writes the immutable pre-verifier recurrent base to private Workspace NVMe files; live target state, model weights, factors and recurrence remain unchanged."
+  - "Checksums every reload, reserves a full restored endpoint plus bounded scratch, and deletes only its owned temporary snapshot. No allocation credit from logical spill bytes."
+  - "Requires native prefix/state and greedy token equivalence plus actual memory and latency gates before promotion."
+settings:
+  VMODEL_QWEN_MTP_FACTOR_BASE_DISK: true

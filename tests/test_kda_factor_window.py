@@ -11,7 +11,8 @@ from runtime.kda_state import _native_fused_kda_factor_step
 
 @pytest.mark.parametrize('seed', [64013, 91703])
 @pytest.mark.parametrize('populated', [False, True])
-def test_qwen_scalar_factors_match_every_serial_prefix_at_huihui_geometry(seed, populated):
+@pytest.mark.parametrize('disk_base', [False, True])
+def test_qwen_scalar_factors_match_every_serial_prefix_at_huihui_geometry(seed, populated, disk_base, tmp_path):
     """Existing scalar factor path, not the Kimi per-key/native fused path.
 
     Installed Huihui config has 48 expanded value heads and 128x128 FP32
@@ -52,18 +53,33 @@ def test_qwen_scalar_factors_match_every_serial_prefix_at_huihui_geometry(seed, 
     window = live.finish_factor_capture(positions)
     assert window is not None and not live.factor_capture_active
     assert window.nbytes() < (positions - 1) * initial.nbytes / 10
+    owned = None
+    if disk_base and populated:
+        from runtime.qwen_mtp_base_spill import DiskFactorBase
+        from unittest.mock import Mock
+        owned = DiskFactorBase(base, Mock(), {}, tmp_path)
     for count in range(positions + 1):
-        restored = window.commit_prefix(base, count, native_fused=False)
+        restored = window.commit_prefix(owned or base, count, native_fused=False)
         assert restored.state(1) is None and restored.conv_history(1) is None
-        if count == 0:
+        if count == 0 and owned is None:
             assert restored.state(0) is base.state(0)
             assert restored.conv_history(0) is base.conv_history(0)
-        else:
+        elif count:
             assert restored.state(0).dtype == mx.float32
             assert bool(mx.array_equal(restored.state(0), endpoints[count - 1]).item())
             assert bool(mx.array_equal(restored.conv_history(0)[0], histories[count - 1][0]).item())
+        expected = base if count == 0 else window.commit_prefix(base, count)
+        for value, reference in ((restored.state(0), expected.state(0)),
+                (restored.conv_history(0)[0] if restored.conv_history(0) else None,
+                 expected.conv_history(0)[0] if expected.conv_history(0) else None)):
+            if reference is None:
+                assert value is None
+            else:
+                assert KDAStateCache._array_payload(value) == KDAStateCache._array_payload(reference)
     assert base.state(0) is (initial if populated else None)
     assert base.conv_history(0) is (initial_history if populated else None)
+    if owned is not None:
+        owned.close()
 
 
 def _advance(state, gate, key, value, beta):
