@@ -1,5 +1,16 @@
 # STATUS — 2026-09-14 UTC (current corrections first; dated chronology below is history)
 
+## 2026-09-15 UTC: first disk-base request reached completion but serializer failed
+
+huihui_base_disk_heldout_20260915 onc398d80 generated its first held-out response
+then failed99.7628s when protocol timing tried int() on the new dictionary metric.
+No successful HTTP answer or equivalence pass. Correcting the metric export to
+the structured allowlist and adding actual protocol tests before repeating.
+Whole swap-out8,208,384B, zero swap growth; native min5.534GB,
+footprint1.294GB; pressure passes and no sampled transcoders.
+Source/artifact hashes/stopped PIDs verified; result SHA
+2552ed9e56fb1b39f8bc0ed1dc6fa68d7fb5e47a994f61962d43bf2bdae6517f.
+
 ## 2026-09-15 UTC: direct uncached audit refused at verifier head; exact base spill staged
 
 huihui_nocache_heldout_20260915 on7626149: first held-out request fails78.5107s

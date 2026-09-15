@@ -10501,7 +10501,6 @@ def _vision_protocol_timing(result: dict) -> dict:
         "qwen_mtp_kda_factor_restores",
         "qwen_mtp_kda_factor_bytes_peak",
         "qwen_mtp_kda_factor_base_bytes_peak",
-        "qwen_mtp_kda_base_spill",
         "qwen_mtp_kda_factor_head_releases",
         "qwen_mtp_kda_factor_head_cache_released_bytes",
         "qwen_mtp_kda_factor_head_active_released_bytes",
@@ -11019,6 +11018,7 @@ def _vision_protocol_timing(result: dict) -> dict:
     for key in (
         "generation_witness",
         "qwen35_serial_kv_reclaim",
+        "qwen_mtp_kda_base_spill",
         "qwen35_phase_head_admission",
         "qwen35_mxfp4_head_io",
         "qwen35_split_prefill_weights",
