@@ -1,0 +1,8 @@
+schema: voom.runtime-profile.v1
+name: admission-pause
+description: Experimental bounded wait at already-refused reversible allocation boundaries.
+notes:
+  - "Same live reserve, ordinary margin and Metal ceiling. Up to5s per event and30s total per governor lifetime, never reset by generation retries. No model operation during the pause."
+  - "Stop on reserve breach or16MB observed swap growth/out; require the unchanged allocation predicate afterward. Content-free pause receipts include all added wall time. Not a speed claim."
+settings:
+  VMODEL_ADMISSION_PAUSE: true

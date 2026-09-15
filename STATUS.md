@@ -1,5 +1,25 @@
 # STATUS — 2026-09-14 UTC (current corrections first; dated chronology below is history)
 
+## 2026-09-15 UTC: lean serving footprint reduced; bounded admission pause candidate
+
+huihui_lean_grammar_short_20260914 on d872c69 failed first weather prefill at
+layer26 attention admission (64,711,383B). No answer or speed/quality pass.
+Native footprint peaked614,040,752B; minimum system available5,605,015,552B,
+zero swap growth and1,196,032B sampled swap-out. The log shows available memory
+moving7.98GB ->5.61GB across two seconds while process footprint stays below
+0.615GB. This is not attribution to another app. Parent13.7940s is failure time.
+Source start=end=fresh, result=embedded and all result/log/server hashes verified;
+all owned processes gone. Result SHA
+df9abdc3199264a85d62073deb5a5fba8ba7bb41b4e3327ec5fdbfe39e323f4b.
+
+Explicit admission-pause adds up to5s at a refused reversible allocation and
+30s TOTAL per governor lifetime (not reset by retries/generations). It performs
+no model computation, preserves the original reserve/margin/ceiling predicate,
+stops on reserve breach or16MB swap growth/out and records added wall time.
+This is a robustness candidate, not a latency win; no serving result yet.
+A separate lean grammar initialization-only allocator relief check reclaimed
+zero reported bytes; not wired into serving. All user apps remain open.
+
 ## 2026-09-14 UTC: continuous work requested; scheduler deleted; lean grammar proof
 
 User explicitly rejects scheduled30-minute cycles and requests continued work

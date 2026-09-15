@@ -94,6 +94,8 @@ class MemoryGovernor:
         metal_limit: int | None = None,
     ):
         self.cache = cache
+        from .admission_pause import AdmissionPause
+        self._admission_pause = AdmissionPause.from_environment()
         self.prefetcher = prefetcher
         self.poll_s = poll_s
         self.warn = warn_available
@@ -375,6 +377,13 @@ class MemoryGovernor:
                 mx.clear_cache()
             active, available, ceiling, projected = sample()
             resample_attempts += 1
+
+        pause = getattr(self, '_admission_pause', None)
+        if projected > ceiling and pause is not None and reversible_admission:
+            recovered = pause.wait(sample, critical=self.critical, reason=reason,
+                                   clear_cache=mx.clear_cache)
+            if recovered is not None:
+                active, available, ceiling, projected = sample()
 
         # Eviction may still be insufficient because pinned/current tensors and
         # the operation's own scratch are not reclaimable cache pages. Refuse at
