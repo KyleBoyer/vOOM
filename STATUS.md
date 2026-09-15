@@ -1,5 +1,39 @@
 # STATUS — 2026-09-14 UTC (current corrections first; dated chronology below is history)
 
+## 2026-09-14 UTC: approved5300MB test executed; overnight follow-up active
+
+huihui_reserve5300_short_20260914 on04fbd37 passes30.023s periodic preflight
+(minimum6,095,978,496B, zero swap growth,2,818,048B swap-out, clear transcoders).
+The first weather call still refuses at layer27/mlp_gate_up: declared page
+99,445,248B, available5.74GB, unchanged400MB margin and authorized5300MB reserve.
+No completed answer. Parent15.8868s is failure time, not an inference speed.
+Native pressure passes6 samples: minimum5,714,280,448B, zero swap growth,
+1,605,632B observed swap-out, maximum footprint986,089,080B, clear transcoders.
+Source start=end=fresh, result=embedded, child/log/server-log hashes checked;
+session14106 drained and owned parent/child/server all gone. Result SHA
+fb13a24fb78caa614ba663c30744b620db151ad7571c570546e63c45e2ff9858.
+Host headroom was lower than the5600MB arm, so this is not a controlled A/B.
+
+No model job is currently running. Do not repeat the same arm at unchanged
+headroom or lower reserve/margin/pressure thresholds further. The approved
+5300MB overlay alone changes only VMODEL_QWEN35_MIN_AVAILABLE_MB;102 selected
+pure tests pass1.73s and141 profiles validate. Defaults/preview unchanged.
+
+Active thread heartbeat: finish-huihui-harness-readiness-overnight, every30min.
+User explicitly requested overnight work toward actual harness readiness.
+Prioritize a bounded memory-lifetime fix or meaningful natural headroom change,
+then consecutive short captures -> complete original134-tool workflow ->
+held-out domains/tools and meaningful output. Do not call synthetic host-rendered
+scores or gateway-compacted prompt lengths full-schema model intelligence.
+
+Concrete next memory lever to evaluate, NOT implemented: spill completed
+recurrent layers during prefill using exact local FP32/BF16 state transport,
+then safely materialize before speculative forks. Do not blindly enable generic
+KDA spill: fork currently omits spilled metadata, and enabling spill without a
+state/fork/rollback gate would silently lose context. A prefill-only design
+must reserve the final restore, preserve failure cleanup, and have raw-bit
+state and actual token gates before use. All apps remain open.
+
 ## 2026-09-14 UTC: user explicitly approves5300MB reserve test and overnight work
 
 The user approved testing the existing5.3GB live free-memory reserve in place
