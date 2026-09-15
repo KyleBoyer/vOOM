@@ -44,6 +44,19 @@ def test_bad_capture_hash_rejected(tmp_path):
         gate.prepare_case(case, 'model')
 
 
+def test_posttool_corpus_varies_transport_roles_sampling_and_tools():
+    from tests.fixtures.gateway_posttool_corpus import corpus
+    cases=corpus()
+    assert [len(r['tools']) for _,r in cases]==[5,9]
+    assert [r['stream'] for _,r in cases]==[True,False]
+    assert [r['temperature'] for _,r in cases]==[1.0,0.4]
+    for case,request in cases:
+        assert request['input'][-1]['type']=='function_call_output'
+        assert case['expected_json']['ids']
+        assert all(gate.semantic_checks(dict(output=[message(json.dumps(case['expected_json']))]),case).values())
+        assert not all(gate.semantic_checks(dict(output=[message('{"ids": []}')]),case).values())
+
+
 @pytest.mark.parametrize('temperature', [0, 0.4, 1])
 def test_explicit_capture_temperature_preserves_sampling_fields(tmp_path, temperature):
     source = dict(input=[{'role':'user','content':'same'}], tools=[], stream=True,
@@ -431,7 +444,39 @@ def test_client_observer_gets_actual_terminal_without_altering_wire_or_summary(m
     row = replay._post('http://127.0.0.1/test', wire, 1, stream,
                        response_observer=lambda r: observed.append(copy.deepcopy(r)))
     assert observed == summarized == [terminal]
-    assert row == {'unchanged_summary': True}
+    assert row['unchanged_summary'] is True
+    assert row['transport_observation']['private_decode_keepalive_count'] == 0
+    assert row['transport_observation']['sse_line_count'] == (2 if stream else 0)
+
+
+def test_private_comments_count_without_leaking_into_deltas(monkeypatch):
+    body=(b': private_decode\n\n: private_decode\n\n'
+        b'data: {"type":"response.completed","response":{"status":"completed"}}\n\n')
+    monkeypatch.setattr(replay.urllib.request,'urlopen',lambda *a,**k:io.BytesIO(body))
+    clocks=iter(range(20))
+    monkeypatch.setattr(replay.time,'perf_counter',lambda:next(clocks))
+    def summary(response,**kwargs):
+        assert kwargs['deltas']==[] and kwargs['progress']==[]
+        return {}
+    monkeypatch.setattr(replay,'_summary',summary)
+    row=replay._post('http://127.0.0.1/test',b'{}',1,True)
+    assert row['transport_observation']['private_decode_keepalive_count']==2
+    assert row['transport_observation']['maximum_observed_line_gap_seconds']==1
+
+
+@pytest.mark.parametrize('transport', [{}, {'private_decode_keepalive_count':0},
+    {'private_decode_keepalive_count':1,'maximum_observed_line_gap_seconds':46}])
+def test_buffered_gateway_gate_requires_actual_transport_evidence(transport):
+    row=valid_row();row['transport_observation']=transport
+    config=dict(profiles=['test'],profile_digest='digest',require_buffered_gateway=True)
+    case=dict(kind='short_title',topic='node',stream=True)
+    response=dict(output=[message('NodeJS Joke')],vmodel_tool_selection={
+        'hidden_tool_gateway':True,'gateway_decision_buffered':1,
+        'gateway_deterministic_policy_rendered':0,'gateway_host_routed':0,
+        'gateway_phase':'direct','gateway_decision_branch':'direct'})
+    checks=gate.row_checks(row,response,case,config)
+    assert checks['buffered_gateway_used']
+    assert not (checks['private_decode_keepalive_observed'] and checks['stream_idle_bound'])
 
 
 def test_incomplete_sse_does_not_invent_a_terminal_observation(monkeypatch):

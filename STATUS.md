@@ -1,5 +1,24 @@
 # STATUS — 2026-09-14 UTC (current corrections first; dated chronology below is history)
 
+## 2026-09-15 UTC: cached depth4 held-out pass; transport corpus staged
+
+huihui_relief_heldout_20260915 ond98e9fc PASS: inventory72.5961s/calendar91.3949s,
+40/45 tokens, exact reference output and arguments. Full prompt cache restored;
+not cold-prefill or isolated allocator-speed evidence. Native whole-run pressure
+PASS:6,373,376B swap-out, zero growth, min5.275GB, footprint1.455GB; no sampled
+transcoders. Two allocator-boundary records valid,0 reported bytes released,
+30 unreachable objects collected,0.01565s overhead. No causal improvement claim.
+Source, embedded result, artifact hashes and stopped PIDs verified. Result SHA
+04cf71cd77c157550cc8eb068781d704ac3854fa3341f04de99e66b2b6d810d3.
+
+Next synthetic post-tool corpus varies5/9 tools, streaming/nonstreaming,
+system/developer roles, temperature1/0.4 and optional sampling fields. Exact JSON
+oracles never enter model answers. Driver explicitly preserves supplied sampling,
+requires actual buffered gateway/authorship, and observes content-free SSE
+private-decode comments plus maximum client-visible complete-line gaps. Missing
+transport evidence fails; no inference from merely enabled settings. This is
+not real captured traffic or full Plex/general-context qualification.
+
 ## 2026-09-15 UTC: deeper draft chain is not a general speed win
 
 huihui_depth7_heldout_20260915 on7f0a9ac completed inventory114.9387s and

@@ -568,13 +568,23 @@ def _post(
     deltas: list[str] = []
     response_value = None
     aborted_on_memory_retry = False
+    private_decode_keepalive_count = 0
+    sse_line_count = 0
+    last_line_at = started
+    maximum_line_gap = 0.0
     try:
         with urllib.request.urlopen(request, timeout=timeout) as response:
             if not stream:
                 response_value = json.loads(response.read())
             else:
                 for raw_line in response:
+                    now = time.perf_counter()
+                    maximum_line_gap = max(maximum_line_gap, now - last_line_at)
+                    last_line_at = now
+                    sse_line_count += 1
                     line = raw_line.decode("utf-8").strip()
+                    if line == ': private_decode':
+                        private_decode_keepalive_count += 1
                     if line.startswith(": "):
                         # The server emits privacy-safe SSE comments for long
                         # prefill even when the captured request did not opt in
@@ -707,7 +717,7 @@ def _post(
         }
     if response_observer is not None:
         response_observer(response_value)
-    return _summary(
+    summary = _summary(
         response_value, wall_s=time.perf_counter() - started,
         events=events, progress=progress, deltas=deltas,
         expected_function_call_name=expected_function_call_name,
@@ -719,6 +729,13 @@ def _post(
         expected_output_text_terms=expected_output_text_terms,
         expected_output_text_any_terms=expected_output_text_any_terms,
         score_plex_profile=score_plex_profile)
+    summary['transport_observation'] = dict(
+        schema='voom.replay-transport-observation.v1',
+        scope='client-observed complete SSE line gaps including first line; not TCP packet timing or continuous server liveness',
+        sse_line_count=sse_line_count,
+        private_decode_keepalive_count=private_decode_keepalive_count,
+        maximum_observed_line_gap_seconds=round(maximum_line_gap, 6) if stream else None)
+    return summary
 
 
 def _write(path: Path | None, value: dict) -> None:

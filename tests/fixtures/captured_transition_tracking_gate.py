@@ -212,6 +212,19 @@ def row_checks(row, response, case, config):
         actual_swap_out=after['swap_out_bytes'] - before['swap_out_bytes'] <= 16_000_000)
     if case.get('stream'):
         checks['stream_final_equal'] = row.get('streamed_text_matches_final') is True
+    if config.get('require_buffered_gateway') is True:
+        from tests.fixtures.huihui_captured_action_gate import model_authored_output
+        selection = response.get('vmodel_tool_selection') or {}
+        checks['buffered_gateway_used'] = (selection.get('hidden_tool_gateway') is True
+            and selection.get('gateway_decision_buffered') == 1)
+        checks['model_authored_without_suppressed_action'] = model_authored_output(response)
+        if case.get('stream'):
+            transport = row.get('transport_observation') or {}
+            checks['private_decode_keepalive_observed'] = (
+                transport.get('private_decode_keepalive_count', 0) > 0)
+            checks['stream_idle_bound'] = (
+                type(transport.get('maximum_observed_line_gap_seconds')) in (int, float)
+                and transport['maximum_observed_line_gap_seconds'] <= 45)
     if 'minimum_output_tokens' in case:
         minimum = case['minimum_output_tokens']
         if type(minimum) is not int or not 1 <= minimum < 1024:
@@ -313,7 +326,8 @@ def run(config):
     history = config.get('history')
     if history is not None:
         assert sha(history) == config['history_sha256']
-    prepared = [prepare_case(c, config['model']) for c in config['cases']]
+    prepared = [prepare_case(c, config['model'], preserve_temperature=
+        config.get('preserve_capture_temperature', False)) for c in config['cases']]
     reference = json.loads(Path(config['reference']).read_text()) if config.get('reference') else None
     reference_indices = config.get('reference_indices', list(range(len(config['cases']))))
     if reference:
@@ -327,7 +341,10 @@ def run(config):
         profiles=config['profiles'], profile_digest=config['profile_digest'],
         history_sha256_before=config.get('history_sha256') if history is not None else None,
         history_checked=history is not None, generated_tools_executed=False,
-        scope='Small captured shapes, original tools/input/stream/reasoning; only model/max1024/temp0/seed64013 overrides. Not full harness/Plex/large-context or full-state equivalence.',
+        scope=('Small saved request shapes, original tools/input/stream/reasoning; '
+            'model/max1024/seed64013 overrides; temperature '
+            + ('preserved from request' if config.get('preserve_capture_temperature') else 'overridden to0')
+            + '. Synthetic cases are not real traffic. Not full harness/Plex/large-context or full-state equivalence.'),
         reference_sha256=sha(config['reference']) if reference else None,
         reference_indices=reference_indices if reference else None)
     started = time.perf_counter()
