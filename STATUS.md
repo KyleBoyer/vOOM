@@ -1,5 +1,45 @@
 # STATUS — 2026-09-14 UTC (current corrections first; dated chronology below is history)
 
+## 2026-09-15 UTC: two short captures PASS; full uncached workflow remains unqualified
+
+All runs below used d13f7b7 and the explicitly approved4500MB live/whole-arm
+floor plus5500MB launch gate. All owned processes stopped; source start=end=
+fresh, result=embedded and result/log/server hashes independently checked.
+
+huihui_ready4500_short_20260915: weather52.0449s (111input/23output), title22.3814s
+(92input/2output), both naturally complete under max1024 with byte-identical
+reference tokens/protocol and no retries. Native minimum available5.4096GB,
+peak footprint1.4276GB, zero swap growth,15,630,336B sampled swap-out; PASS.
+Result SHA0f4baf7c6dedd7724f4e345af108d2664167e9310f1fc4d7bcaeda2f8d1a56c2.
+
+huihui_ready4500_tile32_short_20260915: same captures PASS46.2079s/17.6708s,
+same reference tokens and all checks. Native min5.3097GB, peak footprint1.339GB,
+zero swap growth,4,341,760B sampled swap-out. Result SHA
+5f367ca8be214c4758fbe27f00c0f03755b7df8cecb8c533175af6fb00e9876a.
+Both short arms preserve captured input/tools/stream, with model/max1024/temp0/
+seed64013 overrides; fresh processes with no prompt reuse, not cold-disk proof.
+
+Full original178616B/134-tool HTTP workflow still uses gateway-compacted model
+prompts. Tile8 initial4781-token prefill323.9214s; stopped after decision selected
+the Plex tool and another5599-token prefill began (454.5937s parent). No score.
+Tile32 initial prefill187.7158s. Three complete HTTP tool turns took634.2384s,
+605.1221s,623.6379s. Calls were mediaType all, movie, show, each offset0/limit500.
+The legacy mixed-page fixture is not an independent-media pagination proof.
+No final answer/score: stopped cleanly after fourth decision entered another
+6522-token execution prompt, before the40-minute parent deadline. Parent2255.9076s
+is incomplete workflow time, not a completed latency. All completed-turn checks
+pass except cumulative swap-out. Native min4.9411GB, footprint peak2.3077GB,
+zero swap growth but89,096,192B sampled swap-out => pressure FAIL. Result SHA
+18d12cbe987e9a67679a060de4db76cb57efbf2da200c0e5c9d6e82a9b140038.
+
+Next candidate qwen35-paged-prefix-cache enables the existing disk-only exact
+hybrid boundary cache, disables incompatible fused boundary/scaffold prefill,
+and explicitly caps a new project-local namespace at8 checkpoint leaves/4096MB.
+No serving proof yet. First run tiny paged-state persistence tests, then the
+real weather/title/weather repeat with independently pinned reference indices
+0/1/0 and a required positive repeat cache hit. Do not re-enable host rendering,
+host routing, approximate suffix state or change swap/answer-quality gates.
+
 ## 2026-09-15 UTC: user authorizes5500MB launch /4500MB runtime trial
 
 User approves the proposed thresholds and requests continued execution without

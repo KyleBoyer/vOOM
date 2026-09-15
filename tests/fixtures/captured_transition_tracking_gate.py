@@ -192,6 +192,14 @@ def row_checks(row, response, case, config):
         actual_swap_out=after['swap_out_bytes'] - before['swap_out_bytes'] <= 16_000_000)
     if case.get('stream'):
         checks['stream_final_equal'] = row.get('streamed_text_matches_final') is True
+    if 'expected_min_cached_tokens' in case:
+        expected = case['expected_min_cached_tokens']
+        if type(expected) is not int or expected < 0:
+            raise ValueError('expected cache lower bound must be a nonnegative integer')
+        cached = usage.get('input_tokens_details', {}).get('cached_tokens')
+        checks['expected_cache_reuse'] = type(cached) is int and cached >= expected
+    if case.get('require_cache_miss') is True:
+        checks['expected_cache_miss'] = usage.get('input_tokens_details', {}).get('cached_tokens') == 0
     if config.get('require_all_phase_completion', False):
         checks.update(generation_phase_checks(response))
     if config.get('require_qwen_factors', False):
@@ -281,8 +289,12 @@ def run(config):
         assert sha(history) == config['history_sha256']
     prepared = [prepare_case(c, config['model']) for c in config['cases']]
     reference = json.loads(Path(config['reference']).read_text()) if config.get('reference') else None
+    reference_indices = config.get('reference_indices', list(range(len(config['cases']))))
     if reference:
-        assert len(reference['cases']) == len(config['cases'])
+        assert len(reference_indices) == len(config['cases'])
+        assert all(type(i) is int and 0 <= i < len(reference['cases']) for i in reference_indices)
+        if 'reference_indices' not in config:
+            assert len(reference['cases']) == len(config['cases'])
     rows, failures = [], []
     document = dict(schema='voom.captured-transition-tracking-arm.v1', passed=False,
         cases=rows, failures=failures, source_commit=config['source_commit'],
@@ -290,7 +302,8 @@ def run(config):
         history_sha256_before=config.get('history_sha256') if history is not None else None,
         history_checked=history is not None, generated_tools_executed=False,
         scope='Small captured shapes, original tools/input/stream/reasoning; only model/max1024/temp0/seed64013 overrides. Not full harness/Plex/large-context or full-state equivalence.',
-        reference_sha256=sha(config['reference']) if reference else None)
+        reference_sha256=sha(config['reference']) if reference else None,
+        reference_indices=reference_indices if reference else None)
     started = time.perf_counter()
     with open(config['server_log'], 'x') as log:
         command = [sys.executable, '-m', 'runtime.server', '--port', str(config['port'])]
@@ -318,7 +331,7 @@ def run(config):
                 response = terminal[0] if terminal else {}
                 checks = row_checks(row, response, case, config)
                 if reference:
-                    ref = reference['cases'][index]
+                    ref = reference['cases'][reference_indices[index]]
                     checks.update(
                         same_effective_request=metadata['request_sha256'] == ref['row']['request_sha256'],
                         finite_greedy_tokens_and_text=matching_generation_witness(row, ref['row']),

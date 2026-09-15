@@ -1,0 +1,14 @@
+schema: voom.runtime-profile.v1
+name: qwen35-paged-prefix-cache
+description: Experimental disk-backed full-state prefix reuse for bounded Huihui serving.
+notes:
+  - "Requires the existing256MB paged KV profile. Saves complete exact hybrid states, not truncated context. Disables fused boundary/scaffold prefill to use the existing explicit durable boundary path."
+  - "New cache namespace under the project volume, eight checkpoint leaves and4096MB configured retention limit. No model files or existing cache namespaces are removed."
+  - "Must pass cold/repeated/changed-request token and state checks before harness use. A cache hit is not proof of answer correctness."
+settings:
+  VMODEL_QWEN35_HOT_KV: true
+  VMODEL_QWEN35_PAGED_KV_PERSIST: true
+  VMODEL_QWEN35_FUSED_BOUNDARY_SCAFFOLD_PREFILL: false
+  VMODEL_QWEN35_HOT_KV_PERSIST_DIR: .kv_prompts/huihui-harness-candidate
+  VMODEL_QWEN35_HOT_KV_PERSIST_MAX_CHECKPOINTS: 8
+  VMODEL_QWEN35_HOT_KV_PERSIST_MAX_MB: 4096

@@ -1556,6 +1556,8 @@ class EngineManager:
             "VMODEL_QWEN35_HOT_KV_PERSIST_DIR", "").strip()
         qwen_hot_kv_request = os.environ.get(
             "VMODEL_QWEN35_HOT_KV", "1").strip()
+        from .qwen_paged_persist_policy import request_identity as paged_identity
+        qwen_paged_persist_identity = paged_identity(os.environ)
         if qwen_hot_kv_request not in ("0", "1"):
             raise RequestValidationError(
                 "VMODEL_QWEN35_HOT_KV must be 0 or 1")
@@ -2503,6 +2505,7 @@ class EngineManager:
             qwen_lossy_suffix_request,
             qwen_hot_kv_request,
             qwen_hot_kv_persist_dir_request,
+            qwen_paged_persist_identity,
             qwen_mixed_depth_persist_request,
             qwen_mixed_depth_endpoint_request,
             qwen_quant_lm_head_request,
@@ -2669,6 +2672,7 @@ class EngineManager:
             qwen_lossy_suffix_request,
             qwen_hot_kv_request,
             qwen_hot_kv_persist_dir_request,
+            qwen_paged_persist_identity,
             qwen_mixed_depth_persist_request,
             qwen_mixed_depth_endpoint_request,
             qwen_quant_lm_head_request,
@@ -4430,6 +4434,12 @@ class EngineManager:
                                 "boundary/scaffold prefill")
                         rc.hot_prompt_kv = True
                         rc.paged_kv_persist = True
+                        from .qwen_paged_persist_policy import limits as paged_limits
+                        (rc.hot_prompt_kv_persist_max_checkpoints,
+                         rc.hot_prompt_kv_persist_max_mb) = paged_limits(
+                            os.environ,
+                            default_checkpoints=rc.hot_prompt_kv_persist_max_checkpoints,
+                            default_max_mb=rc.hot_prompt_kv_persist_max_mb)
                     else:
                         # Historical single-request paged profile: no durable
                         # state and no in-memory hot cache.
