@@ -1,5 +1,51 @@
 # STATUS — 2026-09-14 UTC (current corrections first; dated chronology below is history)
 
+## 2026-09-15 UTC: exact disk-base cached passes; BF16 proposal comparison; Plex still unqualified
+
+All runs below use2e1c3a5, fresh30s admission,4.5GB available floor,8.5GB Metal
+ceiling and16MB whole-arm swap gates. Original output cap1024; no user apps
+closed. Each source/artifact hash and stopped supervisor/driver/server PID
+verified before subsequent work. None is a live Plex or original full-harness
+replay. Default-off disk-base overlay is not globally promoted.
+
+- huihui_base_disk_cached_c_20260915: fresh-server exact308/315-token prompt
+  restoration. Inventory72.3647s/calendar91.6459s,40/45 tokens, exact reference
+  tokens/arguments and all checks PASS. Whole swap-out9,142,272B, zero growth;
+  native min5.622GB, footprint1.367GB. Result SHA
+  4d67df103dce9ac00e161bab8c866f610da2caedf1d278675a96c4ce73172167.
+- huihui_plex_answer_only_20260915: explicit focused synthetic continuation,
+  same prior page history but tool_choice:none, which renders934 uncached
+  tokens without the tool catalog.151.3461s/45 tokens. Omits eligible ALPHA_G
+  and adds JSON fences: genuine quality FAIL, no cleanup. Whole swap-out
+  16,515,072B/zero growth FAIL; min5.420GB, footprint1.301GB. Result SHA
+  6fd21a7614d0742beef7b43fff722a63c1f955c69a4df37dd69243ae98c5d086.
+- huihui_mixed_mtp_answer_only_20260915: same focused answer-only case with
+  existing mixed attention8bit/last4BF16 target and BF16 native MTP.314.0534s,
+  934 uncached input/52 output tokens. All four correct titles, but JSON fences
+  fail exact format; no stripping. Whole swap-out20,971,520B/zero growth FAIL;
+  min4.902GB, footprint1.886GB. No replacement promotion. Result SHA
+  a7b00092b739e813c0b0cadc3eda9ba1ab737a45ee78637c8e447df0645a4b44.
+- huihui_bf16_draft_heldout_20260915: all1765 non-MTP tensors resolve to the
+  same underlying file objects as compact MTP alias; only proposal sidecar
+  differs. Native released-BF16 sidecar849,398,784B actually loads/releases
+  each round. Uncached inventory107.2098s/calendar98.7242s, identical target
+  tokens/arguments. Acceptance29/41 and35/37. Whole pressure PASS11,485,184B
+  swap-out/zero growth, min5.159GB, footprint1.650GB. Strict aggregate FAIL
+  solely same_effective_request: intentional alias change, not hidden as an
+  identical HTTP request. Result SHA
+  57107d588bf47c4aec0259c93cbeda25b634a589f7b5ca775d18674b9c8dfbc0.
+- huihui_bf16_draft_cached_20260915: same BF16-sidecar alias, fresh server,
+  cached308/315 input tokens, unchanged held-out requests/reference tokens.
+  Inventory87.2903s/calendar86.5137s,40/45 output tokens, all checks PASS.
+  Whole swap-out10,125,312B/zero growth; min5.150GB, footprint1.650GB.
+  Both small synthetic calls under90s, NOT full Plex or a universal speedup.
+  Result SHA239176558c205b5723752ab0340d64f57aafd1b7e9480419ae9944d3edf82c08.
+
+Grammar string jumps remain off: known argument-fidelity risk and explicit
+incompatibility with current row-head profile. No guard removed to claim speed.
+Full captured-workflow quality/safety and sub90s remain unqualified. No serving
+process left running or scheduled automation created.
+
 ## 2026-09-15 UTC: disk-base held-out equivalence passes; pressure narrowly fails
 
 huihui_base_disk_heldout_b_20260915 onf84345c: unchanged synthetic held-out

@@ -72,3 +72,38 @@ approximations relative to released BF16. Exact cache/token and native-head
 checks are relative to the selected representation, not released-BF16 lossless.
 Vision, long contexts, full-workflow quality and sub90-second end-to-end latency
 remain unqualified. No server-running claim is implied by this document.
+
+## Latest exact memory experiment (September15)
+
+The explicit `qwen35-factor-base-disk-audit` overlay stores immutable speculative
+rollback snapshots on Workspace NVMe, checksum-verifies reloads, and deletes its
+owned snapshots at generation exit. It removes approximately154MB of retained
+rollback arrays during verification; logical bytes are never admission credit.
+Full-geometry prefix0..5 raw-byte gates pass. It stays opt-in and is not included
+in the preview default: full-workflow pressure/quality have not passed.
+
+Measured inventory/calendar calls (synthetic three-tool held-out requests,
+max1024/temp0/seed64013, full prompt state) with this overlay:
+
+| Proposal sidecar | Uncached prompt | Cached prompt, fresh server |
+|---|---|---|
+| Compact MXFP4 |100.10s /106.03s |72.36s /91.65s |
+| BF16 |107.21s /98.72s |87.29s /86.51s |
+
+Both cached runs preserve exact greedy tokens and pass whole-run pressure.
+Compact uncached narrowly fails the16MB cumulative swap-out gate. BF16 uncached
+passes pressure and exact tokens, but the strict identical-request check fails
+because the intentionally different model alias selects that sidecar. All target
+tensor file objects are shared; this does not make the target lossless versus
+the BF16 release. These are not cold-storage or full134-tool workflow timings.
+
+The BF16 sidecar uses alias
+`lossy-Huihui-Qwen3.8-27B-abliterated-mlx-all-mxfp4`; the compact sidecar uses
+the existing `-mtpquant` alias. Neither is a universal winner. Keep the native
+memory limits and ordinary admission margin; no uncached-direct-I/O or grammar
+jump-forward promotion follows from these measurements.
+
+A separate answer-only Plex diagnostic still omitted one eligible title on the
+compact target. The mixed attention8bit/last4BF16 target recovered all four but
+failed requested JSON formatting and pressure, taking314.05s. No output repair,
+grader weakening, new full-workflow score, or harness-ready claim was applied.
