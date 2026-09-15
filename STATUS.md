@@ -1,5 +1,22 @@
 # STATUS — 2026-09-14 UTC (current corrections first; dated chronology below is history)
 
+## 2026-09-15 UTC: mixed plain target rejected; inline catalog diagnostic staged
+
+huihui_mixed_posttool_b_20260915 on a139ef8 passed model/head loading but was
+stopped after627.02s without a complete first answer. First private decision:
+17 tokens,217.9193s decode,265.9304s engine total,334.252GB logical store reads.
+No MTP, mixed-a8-last4 target,64MB exact KV. Native pressure FAIL:31,031,296B
+swap-out, zero growth, min5.107GB, footprint1.629GB; no sampled transcoders.
+No quality score or readiness claim. All sources/artifact hashes/stopped PIDs
+verified; result SHA35162a19870811e5643eeea736c48cfec930f4f5ab2123067b4e58cb551dd97b.
+
+New default-off gateway-inline-active-audit exposes an already selected small
+real catalog alongside private search on eligible post-tool auto continuations.
+The model still chooses answers/actions; no host selection or answer repair.
+Required/forced/structured/host-route/terminal-synthesis paths stay unchanged.
+It changes the prompt/catalog and is NOT lossless or promoted. Actual cross-domain
+and full captured-workflow proof are still required.
+
 ## 2026-09-15 UTC: mixed target head metadata compatibility
 
 huihui_mixed_posttool_20260915 stopped before generation: the row reader required

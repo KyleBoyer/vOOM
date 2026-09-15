@@ -12425,6 +12425,7 @@ class Handler(BaseHTTPRequestHandler):
         )
         gateway_initial_tools = []
         gateway_initial_raw = []
+        gateway_inline_active = False
         gateway_pinned = 0
         gateway_force_reason = None
         gateway_activation_key = ""
@@ -12600,6 +12601,21 @@ class Handler(BaseHTTPRequestHandler):
             gateway_virtual_tools, gateway_virtual_raw = (
                 _hidden_gateway_virtual_pairs(enable_external_only=(
                     gateway_enable_description_profile == "external-only-v1")))
+            from . import gateway_inline_active as inline_active_policy
+            try:
+                gateway_inline_active = inline_active_policy.enabled(
+                    os.environ.get(inline_active_policy.FLAG, '0'),
+                    messages=msgs, tools=gateway_initial_tools,
+                    raw_tools=gateway_initial_raw, client_choice=tool_choice,
+                    force_reason=gateway_force_reason,
+                    structured_output=self._structured_output,
+                    host_route=gateway_host_route,
+                    terminal_synthesis=(gateway_terminal_pagination_synthesis
+                        or gateway_deterministic_render is not None),
+                    buffered=os.environ.get(
+                        'VMODEL_FAST_TOOL_GATEWAY_BUFFER_DECISION', '0'))
+            except ValueError as error:
+                raise RequestValidationError(str(error)) from error
             prompt_catalog = (
                 [] if (gateway_terminal_pagination_synthesis
                        or gateway_deterministic_render is not None)
@@ -12608,6 +12624,9 @@ class Handler(BaseHTTPRequestHandler):
                 [] if (gateway_terminal_pagination_synthesis
                        or gateway_deterministic_render is not None)
                 else gateway_virtual_raw)
+            if gateway_inline_active:
+                prompt_catalog = [*gateway_virtual_tools, *gateway_initial_tools]
+                prompt_raw_catalog = [*gateway_virtual_raw, *gateway_initial_raw]
             if gateway_terminal_pagination_synthesis:
                 try:
                     (gateway_terminal_context_profile,
@@ -12637,6 +12656,7 @@ class Handler(BaseHTTPRequestHandler):
                 decision_source_messages,
                 (_HIDDEN_GATEWAY_TERMINAL_PAGINATION_POLICY
                  if gateway_terminal_pagination_synthesis
+                 else inline_active_policy.POLICY if gateway_inline_active
                  else _HIDDEN_GATEWAY_DECISION_POLICY))
         else:
             gateway_limit = 0
@@ -12677,7 +12697,8 @@ class Handler(BaseHTTPRequestHandler):
                     # small catalog is already selected, so preserve semantic
                     # contrasts just as post-retrieval execution does.
                     preserve_tool_parameter_prose=(
-                        not gateway_enabled and len(prompt_catalog) <= 4))
+                        gateway_inline_active
+                        or (not gateway_enabled and len(prompt_catalog) <= 4)))
         gateway_decision_choice = (
             "none" if (gateway_terminal_pagination_synthesis
                        or gateway_deterministic_render is not None) else
@@ -12983,6 +13004,9 @@ class Handler(BaseHTTPRequestHandler):
                 "gateway_decision_branch": decision_branch,
                 "gateway_enable_description_profile": (
                     gateway_enable_description_profile),
+                "gateway_inline_active": int(gateway_inline_active),
+                "gateway_inline_active_tools": (
+                    len(gateway_initial_tools) if gateway_inline_active else 0),
                 "gateway_host_routed": int(host_action is not None),
                 "gateway_direct_streaming": bool(
                     decision_stream is not None

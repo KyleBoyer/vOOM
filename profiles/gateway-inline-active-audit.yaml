@@ -1,0 +1,9 @@
+schema: voom.runtime-profile.v1
+name: gateway-inline-active-audit
+description: Experimental one-pass small active catalog after a tool result.
+notes:
+  - "Default off. Changes the model prompt and allowed catalog, not lossless target-token equivalence. No host answer, selected action or request-content predicate."
+  - "Only auto, buffered, non-forced post-tool continuations with one to four aligned real schemas; structured, required, terminal-synthesis and host-route paths remain unchanged."
+  - "Private search remains available for a different capability. Needs actual multi-domain and full captured workflow proof before promotion."
+settings:
+  VMODEL_FAST_TOOL_GATEWAY_INLINE_ACTIVE: true

@@ -225,6 +225,13 @@ def row_checks(row, response, case, config):
             checks['stream_idle_bound'] = (
                 type(transport.get('maximum_observed_line_gap_seconds')) in (int, float)
                 and transport['maximum_observed_line_gap_seconds'] <= 45)
+    if config.get('require_inline_active') is True:
+        selection = response.get('vmodel_tool_selection') or {}
+        checks['inline_active_catalog_used'] = (
+            type(selection.get('gateway_inline_active')) is int
+            and selection['gateway_inline_active'] == 1
+            and type(selection.get('gateway_inline_active_tools')) is int
+            and 1 <= selection['gateway_inline_active_tools'] <= 4)
     if 'minimum_output_tokens' in case:
         minimum = case['minimum_output_tokens']
         if type(minimum) is not int or not 1 <= minimum < 1024:

@@ -175,7 +175,7 @@ def test_actual_server_callsite_controls_are_observed_before_failed_generation(m
                 assert keywords['activation_names'] == 'gateway_activated_names'
                 assert keywords['allow_parallel'] == 'False'
                 assert keywords['tool_choice'] == (
-                    'gateway_decision_choice' if phase == 'gateway_decision' else "'required'")
+                    'gateway_decision_choice' if phase == 'gateway_decision' else 'execution_choice')
                 constraint = controls()['constraint']; original = vars(constraint).copy()
                 calls = []
                 def fail_engine(*a, **kw):
@@ -187,7 +187,8 @@ def test_actual_server_callsite_controls_are_observed_before_failed_generation(m
                     gateway_activated_names=['private_prior_tool'], gateway_force_reason='tool-result-pagination',
                     gateway_constraint=constraint, self=SimpleNamespace(_constraint=constraint, _sampling=None),
                     engine=object(), prompt='PRIVATE PROMPT', max_output_tokens=1024, stop=[],
-                    decision_stream=None, on_progress=None, gateway_execution_expert_top_k=0)
+                    decision_stream=None, on_progress=None, gateway_execution_expert_top_k=0,
+                    execution_choice='required', _private_decode_keepalive=lambda progress: None)
                 fragment = ast.fix_missing_locations(ast.Module(body=[item,following],type_ignores=[]))
                 with pytest.raises(RuntimeError, match='synthetic generation failure'):
                     exec(compile(fragment,'<actual-serving-boundary>','exec'),namespace)
