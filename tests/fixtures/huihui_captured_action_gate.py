@@ -539,7 +539,8 @@ def run(config):
     if config.get('require_full_prompt_state', False):
         assert env['VMODEL_QWEN35_LOSSY_SUFFIX_PREFILL'] == 'off'
     if config.get('require_paged_kv', False):
-        assert env['VMODEL_QWEN35_KV_MAX_MB'] == '256'
+        assert int(env['VMODEL_QWEN35_KV_MAX_MB']) * 1_000_000 == config.get(
+            'serial_kv_budget_bytes', 256_000_000)
         assert env.get('VMODEL_QWEN35_PAGED_ONLINE_ATTENTION', '0') == '0'
         assert env.get('VMODEL_QWEN35_PAGED_ONLINE_PAGE_NATIVE', '0') == '0'
         assert env.get('VMODEL_QWEN35_PAGED_KV_PERSIST', '0') == ('1' if cache_audit else '0')

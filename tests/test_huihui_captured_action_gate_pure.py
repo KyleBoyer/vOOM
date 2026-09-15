@@ -156,6 +156,23 @@ def test_smaller_paged_budget_changes_only_residency_and_requires_matching_witne
                                 serial_kv_budget_bytes=64_000_000)['paged_kv_witness']
 
 
+def test_all_launch_budget_assertions_accept_declared_smaller_profile():
+    import ast
+    tree=ast.parse(Path(gate.__file__).read_text())
+    fn=next(n for n in tree.body if isinstance(n,ast.FunctionDef) and n.name=='run')
+    checks=[n for n in ast.walk(fn) if isinstance(n,ast.Assert)
+            and 'VMODEL_QWEN35_KV_MAX_MB' in ast.unparse(n)]
+    assert len(checks)==2
+    module=compile(ast.fix_missing_locations(ast.Module(body=checks,type_ignores=[])),
+                   '<actual launch budget checks>','exec')
+    for mb in (64,128,256):
+        exec(module,{'env':{'VMODEL_QWEN35_KV_MAX_MB':str(mb)},
+                     'config':{'serial_kv_budget_bytes':mb*1_000_000}})
+    with pytest.raises(AssertionError):
+        exec(module,{'env':{'VMODEL_QWEN35_KV_MAX_MB':'256'},
+                     'config':{'serial_kv_budget_bytes':64_000_000}})
+
+
 def test_compact_factors_audit_changes_only_flat_mtp_rollback_storage():
     base, factors = {}, {}
     apply_runtime_profiles(['huihui-qwen38-27b-full-state-paged256-audit'], environ=base)
