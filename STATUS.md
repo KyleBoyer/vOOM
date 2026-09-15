@@ -1,5 +1,39 @@
 # STATUS — 2026-09-14 UTC (current corrections first; dated chronology below is history)
 
+## 2026-09-15 UTC: initial constraint fix passes two domains; full replay still fails
+
+Once the forced-private-search defect is fixed, two synthetic held-out requests
+reworded to trigger external-action-imperative (schemas unchanged) both pass:
+huihui_inline_imperative_20260915 on ce376ae, inventory106.1409s/37 tokens and
+calendar112.2491s/42 tokens. Exact real calls/arguments, no search, natural
+completion, disk-base cleanup and all whole-run gates PASS. Native swap-out
+11,829,248B, zero growth, min5.408GB, footprint1.398GB. Result SHA
+d3c978ef0efdf393f9d590317a1b34c21bcb59a48afabf4e7ab2342af28e011c.
+These are altered synthetic user prompts, not unmodified real traffic.
+
+huihui_inline_fixed_c128_full_20260915 on the same source replays the original
+134-tool HTTP capture at temperature1/max1024 with finite five-item synthetic
+Plex fixture pages. Tile ceiling128 replaces32; every prepared position remains.
+Initial8479-token prefill234.1510s versus prior346.1017s at tile32 (different
+source/constraint/host state, NOT a paired lossless A/B). First real call completes
+461.2506s/74 tokens, no search/retry. It selects plex_list_library with a Kids
+library-section exclusion rather than the requested /Kids/ root-folder exclusion.
+The finite-media driver rejects this unsupported function and ends461.6077s;
+there is NO final answer or Plex score. Do not silently substitute its arguments
+or count the unexecuted library call as a complete workflow.
+
+Pressure also FAILS: native swap-out22,134,784B, zero growth, min5.284GB,
+footprint1.644GB. Draft13.790s versus verifier193.182s/27 sweeps;47/108 draft
+tokens accepted. No plain baseline was measured, so cost estimates remain null.
+Result SHA004924138f29410a1156d4ee9695ad0fbc2aad754951bc2a7cdbfbfc3736956d.
+Sources/artifact hashes and stopped supervisor/driver/server verified for both
+runs. No profile promotion or serving endpoint. Full readiness remains blocked
+by real-workflow argument fidelity, sustained pressure and end-to-end latency.
+
+The search-forced witness now reports the actual specific-search constraint,
+not merely a non-null action reason; direct required-real-tool decisions are no
+longer mislabeled as forced discovery. Actual-expression regression added.
+
 ## 2026-09-15 UTC: initial action constraint defect found; cost instrumentation added
 
 Revised initial instruction passes the unchanged synthetic calendar request:

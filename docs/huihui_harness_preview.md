@@ -4,6 +4,14 @@ September15: short text/tool requests and exact cached restarts work. **Full
 Plex harness readiness is not qualified.** This explicit profile is a measured
 small-catalog preview, not a claim that all optimizations or quality gates pass.
 
+Latest correction: the opt-in initial catalog can now call supplied real tools
+on explicit-action requests instead of being constrained to private search.
+Two synthetic reworded inventory/calendar requests pass at106.14s/112.25s.
+The full134-tool capture still fails: larger tiles reduce initial prefill to
+234.15s, but its first call takes461.25s, uses the wrong exclusion field, and
+fails cumulative swap-out. No final Plex score or complete workflow follows.
+Neither initial-inline nor larger-tile experiments are promoted into this preview.
+
 ## Connection
 
 - Base URL: `http://127.0.0.1:8077/v1`

@@ -120,6 +120,18 @@ def test_initial_decision_rejects_authority_expansion(choice,reason):
         policy.decision_choice(choice,reason)
 
 
+@pytest.mark.parametrize('choice,expected', [('required',0),('auto',0),
+    ('specific:vmodel_search_tools',1),('specific:vmodel_enable_tools',0)])
+def test_search_forced_witness_reports_constraint_not_intent(choice,expected):
+    tree=ast.parse(Path('runtime/server.py').read_text())
+    expression=next(value for node in ast.walk(tree) if isinstance(node,ast.Dict)
+        for key,value in zip(node.keys,node.values)
+        if isinstance(key,ast.Constant) and key.value=='gateway_search_forced')
+    actual=eval(compile(ast.Expression(expression),'<actual search witness>','eval'),
+        dict(gateway_decision_choice=choice,_HIDDEN_TOOL_SEARCH_NAME='vmodel_search_tools'))
+    assert actual==expected
+
+
 @pytest.mark.parametrize('selection,passed', [({},False),
     ({'gateway_inline_initial':1,'gateway_inline_active':1,'gateway_inline_active_tools':4,
       'gateway_search_rounds':0,'gateway_host_routed':0},True),

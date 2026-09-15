@@ -13019,7 +13019,8 @@ class Handler(BaseHTTPRequestHandler):
                     decision.get("prompt_tokens", prompt_tokens)),
                 "gateway_decision_output_tokens": len(decision.get("tokens", ())),
                 "gateway_search_rounds": 0,
-                "gateway_search_forced": int(gateway_force_reason is not None),
+                "gateway_search_forced": int(
+                    gateway_decision_choice == f"specific:{_HIDDEN_TOOL_SEARCH_NAME}"),
                 "gateway_force_reason": gateway_force_reason,
                 "gateway_query_context_profile": (
                     gateway_query_context_profile),
