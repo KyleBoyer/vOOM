@@ -12429,6 +12429,7 @@ class Handler(BaseHTTPRequestHandler):
         gateway_initial_tools = []
         gateway_initial_raw = []
         gateway_inline_active = False
+        gateway_inline_initial = False
         gateway_pinned = 0
         gateway_force_reason = None
         gateway_activation_key = ""
@@ -12605,7 +12606,21 @@ class Handler(BaseHTTPRequestHandler):
                 _hidden_gateway_virtual_pairs(enable_external_only=(
                     gateway_enable_description_profile == "external-only-v1")))
             from . import gateway_inline_active as inline_active_policy
+            from . import gateway_inline_initial as inline_initial_policy
             try:
+                initial_candidates = inline_initial_policy.candidates(
+                    os.environ.get(inline_initial_policy.FLAG, '0'),
+                    messages=msgs, tools=all_tools, raw_tools=all_raw_tools,
+                    client_choice=tool_choice, force_reason=gateway_force_reason,
+                    structured_output=self._structured_output,
+                    host_route=gateway_host_route,
+                    terminal_synthesis=(gateway_terminal_pagination_synthesis
+                        or gateway_deterministic_render is not None),
+                    buffered=os.environ.get('VMODEL_FAST_TOOL_GATEWAY_BUFFER_DECISION', '0'),
+                    activated_names=gateway_activated_names)
+                if initial_candidates is not None:
+                    gateway_initial_tools, gateway_initial_raw, gateway_pinned = initial_candidates
+                    gateway_inline_initial = True
                 gateway_inline_active = inline_active_policy.enabled(
                     os.environ.get(inline_active_policy.FLAG, '0'),
                     messages=msgs, tools=gateway_initial_tools,
@@ -12617,6 +12632,7 @@ class Handler(BaseHTTPRequestHandler):
                         or gateway_deterministic_render is not None),
                     buffered=os.environ.get(
                         'VMODEL_FAST_TOOL_GATEWAY_BUFFER_DECISION', '0'))
+                gateway_inline_active = gateway_inline_active or gateway_inline_initial
             except ValueError as error:
                 raise RequestValidationError(str(error)) from error
             prompt_catalog = (
@@ -13008,6 +13024,7 @@ class Handler(BaseHTTPRequestHandler):
                 "gateway_enable_description_profile": (
                     gateway_enable_description_profile),
                 "gateway_inline_active": int(gateway_inline_active),
+                "gateway_inline_initial": int(gateway_inline_initial),
                 "gateway_inline_active_tools": (
                     len(gateway_initial_tools) if gateway_inline_active else 0),
                 "gateway_host_routed": int(host_action is not None),

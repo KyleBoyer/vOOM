@@ -1,0 +1,9 @@
+schema: voom.runtime-profile.v1
+name: gateway-inline-initial-audit
+description: Opt-in initial real-tool availability alongside private search.
+notes:
+  - "For eligible auto initial user turns only. Up to four existing tools are ranked using the latest user message, with exact schemas and pinned-name protection. Search remains available."
+  - "Never selects or executes an action, substitutes arguments, or writes an answer. Required/specific choices, tool history, structured output and host routing retain existing behavior."
+  - "Prompt/catalog change, not lossless or default-on. Requires heterogeneous quality and full captured-workflow validation."
+settings:
+  VMODEL_FAST_TOOL_GATEWAY_INLINE_INITIAL: true

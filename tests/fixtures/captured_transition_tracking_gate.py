@@ -232,6 +232,15 @@ def row_checks(row, response, case, config):
             and selection['gateway_inline_active'] == 1
             and type(selection.get('gateway_inline_active_tools')) is int
             and 1 <= selection['gateway_inline_active_tools'] <= 4)
+    if config.get('require_inline_initial') is True:
+        selection = response.get('vmodel_tool_selection') or {}
+        checks['inline_initial_direct_used'] = (
+            type(selection.get('gateway_inline_initial')) is int
+            and selection['gateway_inline_initial'] == 1
+            and selection.get('gateway_inline_active') == 1
+            and 1 <= selection.get('gateway_inline_active_tools', 0) <= 4
+            and selection.get('gateway_search_rounds') == 0
+            and selection.get('gateway_host_routed') == 0)
     if config.get('require_direct_nocache') is True:
         checks['direct_nocache_applied'] = (
             t.get('direct_io_nocache_enabled') == 1

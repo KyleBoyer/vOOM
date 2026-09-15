@@ -1,5 +1,30 @@
 # STATUS — 2026-09-14 UTC (current corrections first; dated chronology below is history)
 
+## 2026-09-15 UTC: mixed full replay rejected; initial inline catalog staged
+
+huihui_mixed_full_page5_20260915 on73109d0 preserved original134-tool HTTP
+capture, temperature1, max1024 and finite five-item raw Plex fixture pages.
+Mixed attention8bit/last4BF16 plus BF16 MTP,64MB exact KV and disk rollback
+bases. Gateway4781-token first prefill171.1891s; stopped owned driver after
+507.8786s without a completed first action because whole pressure already
+failed. Native swap-out32,587,776B, zero growth, min4.925GB, footprint1.998GB,
+no sampled transcoders. No final answer/score. Source/artifact hashes and all
+stopped PIDs verified; result SHA
+bc34a33e27d64cabe63ba1a12ccfaa75d49e37ac89a5dfc4a5ebb8af3d56fa4a.
+
+Actual934-token focused answer prompt reconstruction confirms developer format
+instruction and all four eligible records are present. No dropped-message fix
+is justified. Initial captured force reason is external-action-imperative.
+
+New gateway-inline-initial-audit is default off. On eligible auto initial user
+turns it exposes up to four latest-user lexical candidates, full schema/prose,
+alongside private search. Real model still chooses actions/arguments or search;
+no host invocation/answer, authority expansion, hardcoded provider or answer.
+Explicit pins protected; existing tool history/activation, required/specific
+choice, structured output, host-route and terminal paths unchanged.
+541 pure policy/protocol/fixture tests PASS; actual corpus/full workflow pending.
+This changes prompt/catalog and is NOT lossless or an automatic default.
+
 ## 2026-09-15 UTC: exact disk-base cached passes; BF16 proposal comparison; Plex still unqualified
 
 All runs below use2e1c3a5, fresh30s admission,4.5GB available floor,8.5GB Metal
