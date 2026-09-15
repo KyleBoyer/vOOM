@@ -10532,6 +10532,7 @@ def _vision_protocol_timing(result: dict) -> dict:
         "qwen_mtp_plain_decode_sweeps",
         "qwen_mtp_plain_timed_sweeps",
         "qwen_mtp_warmup_decode_sweeps",
+        "qwen_mtp_hidden_seed_decode_sweeps",
         "qwen_mtp_serial_verify_rounds",
         "qwen_mtp_verifier_input_positions",
         "qwen_mtp_verifier_committed_positions",

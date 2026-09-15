@@ -2277,6 +2277,7 @@ class QwenMTPSpeculativeEngine:
         plain_decode_sweeps = 0
         plain_timed_sweeps = 0
         warmup_decode_sweeps = 0
+        hidden_seed_decode_sweeps = 0
         warmup_remaining = self.plain_warmup_tokens
         adaptive_disabled = False
         adaptive_disabled_ever = False
@@ -2585,10 +2586,18 @@ class QwenMTPSpeculativeEngine:
                     ] + [authoritative_logits]
                     next_catchup_tok = next_free
             elif (
-                warmup_remaining
+                h_last is None
+                or warmup_remaining
                 or (adaptive_disabled and adaptive_cooldown_remaining > 0)
             ):
                 plain_started = time.perf_counter()
+                # An exact prefix hit can restore KV + next-token logits
+                # without the trunk hidden row needed by native MTP. Feed
+                # the already-sampled catchup token exactly once through the
+                # ordinary target. Its row seeds subsequent proposals; never
+                # reuse another request's hidden state or replay the prompt.
+                if h_last is None:
+                    hidden_seed_decode_sweeps += 1
                 self._suspend_drafter_for_target_verification()
                 plain_logits = tgt.forward_tokens([catchup_tok], kv)
                 round_history_input_tokens = [int(catchup_tok)]
@@ -3777,7 +3786,11 @@ class QwenMTPSpeculativeEngine:
                         commit_draft_inputs(committed_inputs)
             if (prompt_history_active
                     and not terminal_round
-                    and round_history_input_tokens):
+                    and round_history_input_tokens
+                    and round_history_entry_hidden is not None):
+                # A cache-hit seed-recovery round has no preceding hidden
+                # row to pair with its first input. Omit this optional draft
+                # history block, rather than inventing a target hidden row.
                 history_count = len(round_history_input_tokens)
                 if history_count == 1:
                     committed_hidden = round_history_entry_hidden
@@ -4063,6 +4076,7 @@ class QwenMTPSpeculativeEngine:
             "qwen_mtp_plain_decode_sweeps": plain_decode_sweeps,
             "qwen_mtp_plain_timed_sweeps": plain_timed_sweeps,
             "qwen_mtp_warmup_decode_sweeps": warmup_decode_sweeps,
+            "qwen_mtp_hidden_seed_decode_sweeps": hidden_seed_decode_sweeps,
             "qwen_mtp_serial_verify_rounds": serial_verify_rounds,
             "qwen_mtp_verifier_input_positions": verifier_input_positions,
             "qwen_mtp_verifier_committed_positions": (

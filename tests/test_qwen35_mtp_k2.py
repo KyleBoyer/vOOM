@@ -114,6 +114,8 @@ class _Target:
         self.accepted_prefix = accepted_prefix
         self.tokenizer = _Tokenizer()
         self.cfg = SimpleNamespace(num_experts=0, eos_token_ids=tuple(eos))
+        from runtime.engine import RuntimeConfig
+        self.rc = RuntimeConfig()
         self.store = _Store()
         self.cache = SimpleNamespace(
             stats=SimpleNamespace(
@@ -201,6 +203,54 @@ class _RecurrentDrafter:
         logits = mx.full((16,), -100.0).at[proposal].add(200.0)
         next_hidden = mx.array([[[1000.0 + step]]])
         return logits, next_hidden
+
+
+@pytest.mark.parametrize("terminal", [False, True])
+@pytest.mark.parametrize("prompt_history", [0, 2])
+def test_cached_logits_without_hidden_seed_feed_catchup_once(
+    terminal, prompt_history,
+):
+    class CachedTarget(_Target):
+        def generate(self, *args, **kwargs):
+            result = super().generate(*args, **kwargs)
+            self._h_last = self._h_window = None
+            self.plain_calls = []
+            return result
+
+        def forward_tokens(self, tokens, kv):
+            assert tokens == [4]
+            assert kv.offset == 3
+            self.plain_calls.append(list(tokens))
+            kv.offset += 1
+            kv.lengths[0] += 1
+            self._h_last = self._h_window = mx.array([[[40.0]]])
+            return mx.full((1, 16), -100.0).at[
+                0, 6 if terminal else 4].add(200.0)
+
+    target = CachedTarget(2, eos=(6,) if terminal else ())
+    engine = QwenMTPSpeculativeEngine(
+        target, max_prompt_tokens=8, min_output_tokens=2,
+        plain_warmup_tokens=0, adaptive_stop=False, depth=2,
+        prompt_history_tokens=prompt_history,
+        prompt_history_min_prompt_tokens=1)
+    drafter = _RecurrentDrafter()
+    engine.drafter = drafter
+    streamed = []
+
+    result = engine.generate("x", 5, on_token=streamed.append)
+
+    assert result["tokens"] == ([4, 6] if terminal else [4, 4, 10, 11, 8])
+    assert "".join(streamed) == target.tokenizer.decode(result["tokens"])
+    assert target.plain_calls == [[4]]
+    assert target.last_kv.offset == (4 if terminal else 7)
+    assert result["termination_reason"] == ("eos" if terminal else "length")
+    assert result["path_stats"]["qwen_mtp_hidden_seed_decode_sweeps"] == 1
+    assert result["path_stats"]["qwen_mtp_warmup_decode_sweeps"] == 0
+    if terminal:
+        assert drafter.calls == []
+    else:
+        assert drafter.calls[0] == {"hidden": 40.0, "token": 4, "offset": 3}
+        assert target.serial_calls == [[4, 10, 11]]
 
 
 class _WideTarget(_Target):

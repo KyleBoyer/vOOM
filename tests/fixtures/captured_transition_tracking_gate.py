@@ -84,6 +84,22 @@ def semantic_checks(response, case):
                 'topic_present': case['topic'].casefold() in text.casefold(),
                 'plain_single_line': bool(text) and '\n' not in text
                     and not any(c in text for c in ('"', '`', '#', '*'))}
+    if case['kind'] == 'exact_tool':
+        arguments = None
+        if len(calls) == 1:
+            try:
+                arguments = json.loads(calls[0].get('arguments', ''))
+            except (ValueError, TypeError):
+                pass
+        return {'one_requested_call': len(calls) == 1
+                    and calls[0].get('name') == case['tool_name'],
+                'exact_arguments': arguments == case['arguments']}
+    if case['kind'] == 'exact_json':
+        try:
+            value = json.loads(text)
+        except (ValueError, TypeError):
+            return {'no_tool_call': not calls, 'exact_json': False}
+        return {'no_tool_call': not calls, 'exact_json': value == case['expected_json']}
     raise ValueError('unknown semantic check')
 
 
@@ -192,6 +208,12 @@ def row_checks(row, response, case, config):
         actual_swap_out=after['swap_out_bytes'] - before['swap_out_bytes'] <= 16_000_000)
     if case.get('stream'):
         checks['stream_final_equal'] = row.get('streamed_text_matches_final') is True
+    if 'minimum_output_tokens' in case:
+        minimum = case['minimum_output_tokens']
+        if type(minimum) is not int or not 1 <= minimum < 1024:
+            raise ValueError('minimum output token count must be in [1, 1023]')
+        count = usage.get('output_tokens')
+        checks['minimum_actual_output'] = type(count) is int and count >= minimum
     if 'expected_min_cached_tokens' in case:
         expected = case['expected_min_cached_tokens']
         if type(expected) is not int or expected < 0:

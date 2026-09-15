@@ -35,6 +35,8 @@ class _Engine:
         self._model_dir = path
         self.tokenizer = _Tokenizer(ids)
         self.cfg = SimpleNamespace(num_experts=0, eos_token_ids=())
+        from runtime.engine import RuntimeConfig
+        self.rc = RuntimeConfig()
         self.store = _Store()
         self.effective_max_position_embeddings = 0
         self.rope_profile = "test"
@@ -1704,6 +1706,8 @@ def test_forward_tokens_serial_positions_excludes_hybrid_model_types():
 
     engine = object.__new__(StreamingEngine)
     engine.cfg = SimpleNamespace(num_experts=8, model_type="gpt_oss")
+    from runtime.engine import RuntimeConfig
+    engine.rc = RuntimeConfig()
     try:
         engine.forward_tokens_serial_positions([1, 2], kv=None)
         raised = False

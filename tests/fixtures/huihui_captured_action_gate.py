@@ -72,6 +72,16 @@ def model_authored_output(response):
     return all(selection.get(key) == 0 for key in flags)
 
 
+def prefix_cache_enabled(config):
+    value = config.get('allow_exact_prefix_reuse', False)
+    if type(value) is not bool:
+        raise ValueError('allow_exact_prefix_reuse must be an explicit boolean')
+    if value and not (config.get('require_full_prompt_state') is True
+                      and config.get('require_paged_kv') is True):
+        raise ValueError('prefix reuse audit requires full-state paged KV')
+    return value
+
+
 def acceptance(row, response, config, *, initial_action=True):
     from tests.fixtures.huihui_memory_policy import available_floor
     t, usage = row.get('timing') or {}, row.get('usage') or {}
@@ -120,13 +130,19 @@ def acceptance(row, response, config, *, initial_action=True):
             and not any(event.get('phase') == 'memory_retry'
                 for event in row.get('prefill_progress', []) if isinstance(event, dict))
             and int(t.get('memory_prefill_retries') or 0) == 0,
-        no_prompt_reuse=usage.get('input_tokens_details', {}).get('cached_tokens') == 0,
         metal=type(t.get('true_peak_metal_bytes')) in (int, float)
             and 0 < t['true_peak_metal_bytes'] <= 8_500_000_000,
         terminal_available=after['available_bytes'] >= available_floor(config),
         swap_used=after['swap_used_bytes'] - before['swap_used_bytes'] <= 16_000_000,
         actual_swap_out=after['swap_out_bytes'] - before['swap_out_bytes'] <= 16_000_000,
         stream_matches=row.get('streamed_text_matches_final') is True)
+    cached = usage.get('input_tokens_details', {}).get('cached_tokens')
+    if prefix_cache_enabled(config):
+        checks['valid_cached_token_accounting'] = (
+            type(cached) is int and type(usage.get('input_tokens')) is int
+            and 0 <= cached <= usage['input_tokens'])
+    else:
+        checks['no_prompt_reuse'] = cached == 0
     if config.get('require_full_prompt_state', False):
         phases = response.get('vmodel_cache_phases')
         valid = isinstance(phases, list) and bool(phases) and all(
@@ -242,6 +258,14 @@ report those independently of actual final-title errors, never repair a score.
         result = plex.run_profile(request, f'http://127.0.0.1:{config["port"]}/v1/responses',
             timeout=1800, max_tool_rounds=4)
     document['plex'] = result
+    if prefix_cache_enabled(config):
+        # An enabled flag is not observed reuse. Preserve the unchanged
+        # quality rubric and require actual reuse in a completed HTTP turn.
+        observed = [r['row'].get('usage', {}).get(
+            'input_tokens_details', {}).get('cached_tokens', 0) for r in receipts]
+        document['observed_cached_tokens_by_turn'] = observed
+        if not any(type(count) is int and count > 0 for count in observed):
+            document['failures'].append('no_observed_prefix_reuse')
     # Planning points (and vacuous exclusion points on empty text) are not
     # a completed-answer grade. Retain the unchanged rubric diagnostically,
     # but never label it final while tool calls or the final answer are pending.
@@ -471,7 +495,15 @@ def run(config):
         assert config['serial_kv_budget_bytes'] == 256_000_000
     assert env['VMODEL_FAST_TOOL_GATEWAY_DETERMINISTIC_POLICY'] == '0'
     assert env['VMODEL_FAST_TOOL_GATEWAY_HOST_ROUTE'] == '0'
-    assert env['VMODEL_QWEN35_HOT_KV'] == '0'
+    cache_audit = prefix_cache_enabled(config)
+    assert env['VMODEL_QWEN35_HOT_KV'] == ('1' if cache_audit else '0')
+    if cache_audit:
+        assert config.get('workflow') == 'plex'
+        assert env.get('VMODEL_QWEN35_FUSED_BOUNDARY_SCAFFOLD_PREFILL') == '0'
+        assert env.get('VMODEL_QWEN35_HOT_KV_PERSIST_DIR')
+        from runtime.qwen_paged_persist_policy import limits
+        limits(env, default_checkpoints=64, default_max_mb=0)
+        assert int(env.get('VMODEL_QWEN35_HOT_KV_PERSIST_MAX_MB', '0')) > 0
     assert env['VMODEL_QWEN35_MIXED_DEPTH_HOT_KV_PERSIST'] == '0'
     if config.get('require_full_prompt_state', False):
         assert env['VMODEL_QWEN35_LOSSY_SUFFIX_PREFILL'] == 'off'
@@ -479,7 +511,7 @@ def run(config):
         assert env['VMODEL_QWEN35_KV_MAX_MB'] == '256'
         assert env.get('VMODEL_QWEN35_PAGED_ONLINE_ATTENTION', '0') == '0'
         assert env.get('VMODEL_QWEN35_PAGED_ONLINE_PAGE_NATIVE', '0') == '0'
-        assert env.get('VMODEL_QWEN35_PAGED_KV_PERSIST', '0') == '0'
+        assert env.get('VMODEL_QWEN35_PAGED_KV_PERSIST', '0') == ('1' if cache_audit else '0')
         assert env['VMODEL_QWEN35_FP8_KV_CACHE'] == '0'
     assert env['VMODEL_GENERATION_WITNESS'] == env['VMODEL_HOST_ACTIVITY_WITNESS'] == '1'
     if config.get('require_qwen_factors', False):

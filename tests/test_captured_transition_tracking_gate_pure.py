@@ -86,6 +86,40 @@ def test_reasoning_is_not_used_as_visible_answer():
     assert not all(gate.semantic_checks(response, dict(kind='short_title', topic='node')).values())
 
 
+@pytest.mark.parametrize('name,args,ok', [
+    ('lookup_stock', {'sku': 'A7', 'limit': 3}, True),
+    ('get_weather', {'sku': 'A7', 'limit': 3}, False),
+    ('lookup_stock', {'sku': 'B2', 'limit': 3}, False),
+    ('lookup_stock', '{bad', False)])
+def test_generic_tool_checker_never_repairs_arguments(name, args, ok):
+    output = [dict(type='function_call', name=name,
+                   arguments=json.dumps(args) if isinstance(args, dict) else args)]
+    case = dict(kind='exact_tool', tool_name='lookup_stock',
+                arguments={'sku': 'A7', 'limit': 3})
+    assert all(gate.semantic_checks(dict(output=output), case).values()) is ok
+
+
+@pytest.mark.parametrize('text,expected,ok', [
+    ('{"items":[1,2]}', {'items': [1, 2]}, True),
+    ('{"items":[2,1]}', {'items': [1, 2]}, False),
+    ('```json\n{"items":[1,2]}\n```', {'items': [1, 2]}, False),
+    ('not json', None, False)])
+def test_exact_json_requires_actual_visible_json(text, expected, ok):
+    checks = gate.semantic_checks(dict(output=[message(text)]),
+        dict(kind='exact_json', expected_json=expected))
+    assert all(checks.values()) is ok
+
+
+@pytest.mark.parametrize('count,minimum,expected', [(4, 100, False), (100, 100, True)])
+def test_long_output_gate_counts_actual_tokens_not_allowance(count, minimum, expected):
+    row = valid_row()
+    row['usage']['output_tokens'] = count
+    checks = gate.row_checks(row, {},
+        dict(kind='short_title', topic='node', minimum_output_tokens=minimum),
+        dict(profiles=['test'], profile_digest='digest'))
+    assert checks['minimum_actual_output'] is expected
+
+
 def valid_row():
     return dict(http_status=200, response_status='completed', error=None, backend='voom',
         usage={'output_tokens': 4}, runtime_profiles=['test'], runtime_profile_digest='digest',

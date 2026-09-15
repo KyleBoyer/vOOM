@@ -1,5 +1,52 @@
 # STATUS — 2026-09-14 UTC (current corrections first; dated chronology below is history)
 
+## 2026-09-15 UTC: cached native-MTP crash fixed; held-out and restart proofs
+
+An exact disk prefix hit restored KV/logits but no MTP trunk hidden seed.
+Native MTP now feeds the already-sampled catchup token once through the ordinary
+target, then resumes verified proposals. Missing optional draft-history rows
+are omitted, never fabricated. The recovery sweep has explicit HTTP telemetry.
+92 MTP adapter/endpoint tests pass, including missing-seed recovery with/without
+history and terminal EOS. Old test doubles were updated to include RuntimeConfig.
+
+huihui_seed_recovery_real_20260915: cold weather54.7486s, cold title31.9506s,
+same-server weather repeat39.7400s (111 cached /23 output). All answers match
+the earlier SAME boundary-schedule cold controls exactly. Whole-arm pressure
+passes. Overall FAIL is retained: first two were incorrectly expected to hit
+old caches, which correctly invalidate when runtime source changes. This parent
+omitted child-result embedding; source/log/server hashes and stopped PIDs were
+independently checked. Result SHA
+e8d9c6fa7433d706e008bc17ba4db41ee0d00cb433592d1df0a08d99f3f73ad5.
+The older fused-schedule title differed; this is not proof of equivalence across
+prefill schedules or released BF16 weights.
+
+huihui_heldout_long_20260915: NEW synthetic requests, not modified Plex captures.
+Inventory three-tool/developer request308 input/40 output:100.8570s, exact call
+and arguments, all checks PASS. Calendar three-tool/system+developer request315/
+45:106.7766s, exact call/arguments, PASS. Streaming JSON arithmetic99/569:
+887.4759s, all24 squares correct, valid JSON and natural completion under
+max1024, no retries. Long-output quality PASS but pressure FAIL:51,331,072B
+cumulative sampled swap-out; zero swap growth, minimum available5.309GB,
+peak process footprint1.532GB. Not a reliable long-output readiness pass.
+Result SHA f9ed0e6231d25a3980e868ee88a7322f1720fe524614b3bc276a34529942722e.
+
+Without intervening runtime edits, huihui_heldout_restart_20260915 PASS:
+fresh server restores inventory308 cached tokens and calendar315 cached tokens,
+same cold-reference token/text/protocol/phase hashes, naturally completed40/45
+output tokens in73.2736s/93.4970s. Each records one hidden-seed recovery sweep.
+Whole-arm pressure PASS:minimum available5.402GB, footprint1.442GB, zero swap
+growth,6,291,456B sampled swap-out. Result SHA
+92ef96c994e99ac43ecbe060ff6c4b1745a06f7b6158f3717eef7603a6984cae.
+Both held-out envelopes have identical start/end/fresh sources, embedded results,
+verified result/log/server hashes and stopped owned processes. OS file-cache
+state was uncontrolled; none of these is a cold-storage measurement.
+
+Next: explicitly allow exact prefix reuse in the captured Plex workflow gate,
+requiring full-state paged KV, valid cache accounting and observed positive
+reuse while preserving the original catalog, model-only outputs, existing
+rubric and memory/termination checks. Defaults remain uncached. No full Plex
+completion/score or under90-second full-harness claim yet.
+
 ## 2026-09-15 UTC: two short captures PASS; full uncached workflow remains unqualified
 
 All runs below used d13f7b7 and the explicitly approved4500MB live/whole-arm

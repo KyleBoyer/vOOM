@@ -63,6 +63,35 @@ def row():
         pressure_after=dict(available_bytes=6_000_000_000, swap_used_bytes=0, swap_out_bytes=0))
 
 
+def test_prefix_audit_is_explicit_full_state_only():
+    assert gate.prefix_cache_enabled({}) is False
+    for value in ('1', 1, None):
+        with pytest.raises(ValueError, match='boolean'):
+            gate.prefix_cache_enabled({'allow_exact_prefix_reuse': value})
+    with pytest.raises(ValueError, match='full-state'):
+        gate.prefix_cache_enabled({'allow_exact_prefix_reuse': True})
+    assert gate.prefix_cache_enabled(dict(allow_exact_prefix_reuse=True,
+        require_full_prompt_state=True, require_paged_kv=True)) is True
+
+
+@pytest.mark.parametrize('cached,valid', [(0, True), (20, True), (-1, False),
+    (101, False), (True, False), (None, False)])
+def test_prefix_audit_checks_accounting_without_relaxing_other_gates(cached, valid):
+    r = row()
+    r['usage'].update(input_tokens=100, input_tokens_details={'cached_tokens': cached})
+    config = dict(profiles=['audit'], profile_digest='digest',
+        allow_exact_prefix_reuse=True, require_full_prompt_state=True,
+        require_paged_kv=True)
+    checks = gate.acceptance(r, {}, config)
+    assert 'no_prompt_reuse' not in checks
+    assert checks['valid_cached_token_accounting'] is valid
+    assert checks['completed'] is False
+    assert checks['full_prompt_state'] is False
+    assert 'actual_swap_out' in checks
+    del config['allow_exact_prefix_reuse']
+    assert 'no_prompt_reuse' in gate.acceptance(r, {}, config)
+
+
 def test_full_state_audit_changes_only_the_mixed_depth_switch():
     base, full = {}, {}
     apply_runtime_profiles(['huihui-qwen38-27b-fast-agent-model-only-audit'], environ=base)
