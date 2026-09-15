@@ -496,6 +496,13 @@ def test_fixed_gateway_abstention_text_is_not_model_authored(outcome):
     assert not gate.model_authored_output(dict(vmodel_tool_selection=observed))
 
 
+def test_suppressed_model_catalog_action_is_not_a_completion_proof():
+    observed = dict(gateway_phase='direct', gateway_host_routed=0,
+        gateway_decision_branch='direct', gateway_deterministic_policy_rendered=0,
+        gateway_late_catalog_action_suppressed=1)
+    assert not gate.model_authored_output(dict(vmodel_tool_selection=observed))
+
+
 @pytest.mark.parametrize('branch', ['direct', 'tool'])
 def test_direct_model_branch_precedes_execution_only_host_transforms(branch):
     observed = dict(gateway_phase='direct', gateway_host_routed=0,

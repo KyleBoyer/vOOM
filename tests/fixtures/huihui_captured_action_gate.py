@@ -62,6 +62,10 @@ def model_authored_output(response):
         # Both branches replace generated text with a fixed host explanation.
         # Positive raw model-token counts do not prove public-text authorship.
         return False
+    if selection.get('gateway_late_catalog_action_suppressed', 0) != 0:
+        # The model's action was discarded after public prose. A witnessed
+        # completed private call cannot certify a completed public answer.
+        return False
     flags = ('gateway_pagination_host_routed',
         'gateway_initial_pagination_defaults_applied', 'gateway_literal_arguments_grounded')
     if selection.get('gateway_deterministic_policy_rendered') != 0:

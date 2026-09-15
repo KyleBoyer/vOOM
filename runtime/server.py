@@ -12881,9 +12881,18 @@ class Handler(BaseHTTPRequestHandler):
                 decision_cache_phase = _cache_phase_telemetry(
                     "gateway_decision", decision)
             else:
+                # Buffering the private routing decision permits a valid
+                # catalog action after explanatory prose, exactly as the
+                # non-streaming path already does. Nothing has been sent that
+                # would need to be retracted. Default-off until corpus proof.
+                buffer_decision = os.environ.get(
+                    'VMODEL_FAST_TOOL_GATEWAY_BUFFER_DECISION', '0')
+                if buffer_decision not in ('0', '1'):
+                    raise RequestValidationError(
+                        'VMODEL_FAST_TOOL_GATEWAY_BUFFER_DECISION must be 0 or 1')
                 decision_stream = (
                     _HiddenDecisionStream(engine.cfg.model_type, on_token)
-                    if on_token is not None else None
+                    if on_token is not None and buffer_decision == '0' else None
                 )
                 _emit_gateway_generation_start(rid, "gateway_decision",
                     tool_choice=gateway_decision_choice,
@@ -12960,6 +12969,9 @@ class Handler(BaseHTTPRequestHandler):
                 "gateway_direct_streaming": bool(
                     decision_stream is not None
                     and decision_stream.branch == "direct"),
+                "gateway_decision_buffered": int(
+                    os.environ.get('VMODEL_FAST_TOOL_GATEWAY_BUFFER_DECISION', '0') == '1'
+                    and host_action is None),
                 "gateway_terminal_pagination_synthesis": int(
                     gateway_terminal_pagination_synthesis),
                 "gateway_terminal_pagination_synthesis_enabled": int(

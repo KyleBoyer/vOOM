@@ -1,0 +1,8 @@
+schema: voom.runtime-profile.v1
+name: gateway-buffered-decision
+description: Experimental buffered private decision, preserving valid catalog actions after prose.
+notes:
+  - "Makes streaming use the existing non-streaming private-decision behavior. A valid model-selected catalog action is not discarded merely because planning prose preceded it. No prose is retracted; the private decision is buffered from the outset."
+  - "Default off. Can delay direct-answer streaming/TTFT. No host routing, invented call, retry or answer renderer. Execution remains separately governed by client choice and explicit execution policy."
+settings:
+  VMODEL_FAST_TOOL_GATEWAY_BUFFER_DECISION: true

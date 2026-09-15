@@ -1,5 +1,28 @@
 # STATUS — 2026-09-14 UTC (current corrections first; dated chronology below is history)
 
+## 2026-09-15 UTC: captured sampling exposes discarded private tool action
+
+huihui_capture_temp1_finite_20260915 on4e7a5bc preserved original temperature1,
+134 tools/input/stream; explicit model/max1024/seed64013 overrides and finite
+synthetic tool results remain. HTTP633.3667s/279.18s, workflow912.5598s;
+legacy63/100, no eligible titles, quality FAIL. Model generated planning prose
+then a valid private catalog action, which the streaming gateway suppressed.
+This is NOT a completed model answer despite response.completed. New audit
+rejects gateway_late_catalog_action_suppressed, not just host replacements.
+Whole pressure FAIL:44,793,856B swap-out, zero growth, min4.907GB, footprint
+2.154GB; no sampled transcoders. Sources/embedded result/hashes/stopped PIDs
+verified. Result SHA
+34b55d7d671cf641d3378f6d40cf58fa2601228d9fb3f59bc84449c2e2cfbed7.
+
+New default-off gateway-buffered-decision makes private streaming decisions
+follow existing non-streaming behavior: buffer before emitting any prose, retain
+valid subsequent model-selected catalog actions. No retraction, invented action,
+host answer, or retry. Direct-answer TTFT may increase.507 pure tests pass,
+including actual parser/selection and final SSE delta flushing. Next model trial
+combines this with separately tested execution-auto at captured temperature1;
+this is a combined gateway correctness experiment, not isolated speed or
+lossless token-equivalence proof. Full harness readiness still unqualified.
+
 ## 2026-09-15 UTC: terminal greedy synthesis incomplete; captured temperature differs
 
 huihui_terminal_finite_plex_20260915 on56e5803 restored4781 decision and5599
