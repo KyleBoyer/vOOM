@@ -232,6 +232,17 @@ def row_checks(row, response, case, config):
             and selection['gateway_inline_active'] == 1
             and type(selection.get('gateway_inline_active_tools')) is int
             and 1 <= selection['gateway_inline_active_tools'] <= 4)
+    if config.get('require_direct_nocache') is True:
+        checks['direct_nocache_applied'] = (
+            t.get('direct_io_nocache_enabled') == 1
+            and t.get('direct_io_fd_cache_enabled') == 1
+            and type(t.get('direct_io_fd_nocache_applied_total')) is int
+            and t['direct_io_fd_nocache_applied_total'] > 0
+            and t['direct_io_fd_nocache_applied_total'] == t.get('direct_io_fd_cached')
+            and type(t.get('direct_io_pread_bytes')) is int
+            and t['direct_io_pread_bytes'] > 0
+            and type(t.get('direct_io_fd_hits')) is int
+            and t['direct_io_fd_hits'] > 0)
     if 'minimum_output_tokens' in case:
         minimum = case['minimum_output_tokens']
         if type(minimum) is not int or not 1 <= minimum < 1024:

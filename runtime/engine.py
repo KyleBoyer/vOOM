@@ -619,6 +619,8 @@ def _record_direct_io_delta(
         after.get("fd_cache_enabled", 0))
     stats["direct_io_nocache_enabled"] = int(
         getattr(getattr(engine, "store", None), "_direct_fd_nocache", False))
+    stats["direct_io_fd_nocache_applied_total"] = int(
+        after.get("fd_nocache_applied", 0))
 
 
 def _record_cache_io_delta(

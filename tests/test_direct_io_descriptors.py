@@ -120,4 +120,38 @@ def test_direct_io_request_delta_preserves_policy_and_physical_counts():
         "direct_io_fd_cached": 1,
         "direct_io_fd_cache_enabled": 1,
         "direct_io_nocache_enabled": 1,
+        "direct_io_fd_nocache_applied_total": 3,
     }
+
+
+def test_nocache_is_separate_measured_policy_and_preserves_bytes(tmp_path, monkeypatch):
+    from runtime import uncached_io
+    path=tmp_path/'weights.bin'
+    path.write_bytes(bytes(range(128)))
+    seen=[]
+    monkeypatch.setattr(uncached_io,'set_darwin_nocache',lambda fd: seen.append(fd) or True)
+    store=_bare_store()
+    store._direct_fd_nocache=True
+    try:
+        with store._direct_reader(path) as (fd,size):
+            assert size==128 and store._pread_exact(fd,32,11)==bytes(range(11,43))
+        with store._direct_reader(path) as (fd,size):
+            assert store._pread_exact(fd,7,70)==bytes(range(70,77))
+        assert seen==[fd]
+        assert store.direct_io_snapshot()['fd_nocache_applied']==1
+        assert store.direct_io_snapshot()['fd_hits']==1
+    finally:
+        store.close()
+
+
+def test_unsupported_nocache_does_not_claim_applied_policy(tmp_path,monkeypatch):
+    from runtime import uncached_io
+    path=tmp_path/'weights.bin'; path.write_bytes(b'unchanged')
+    monkeypatch.setattr(uncached_io,'set_darwin_nocache',lambda fd:False)
+    store=_bare_store(); store._direct_fd_nocache=True
+    try:
+        with store._direct_reader(path) as (fd,size):
+            assert store._pread_exact(fd,size,0)==b'unchanged'
+        assert store.direct_io_snapshot()['fd_nocache_applied']==0
+    finally:
+        store.close()

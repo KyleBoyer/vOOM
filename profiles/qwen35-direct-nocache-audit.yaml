@@ -1,0 +1,10 @@
+schema: voom.runtime-profile.v1
+name: qwen35-direct-nocache-audit
+description: Exact direct-range descriptor reuse and Darwin uncached-read experiment.
+notes:
+  - "Default off. Reuses read-only WeightStore descriptors and requests F_NOCACHE for that direct-range path. Does not alter bytes, model arithmetic, KV precision or safety floors."
+  - "Not every model read uses this path: streamed head rows and other loaders retain their own policies. Require actual applied-descriptor/pread witnesses, not just enabled flags."
+  - "May hurt repeated page reuse. Needs greedy token/phase equivalence and measured full-run pressure/latency before promotion."
+settings:
+  VMODEL_DIRECT_FD_CACHE: true
+  VMODEL_DIRECT_IO_NOCACHE: true

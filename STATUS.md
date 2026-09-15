@@ -1,5 +1,24 @@
 # STATUS — 2026-09-14 UTC (current corrections first; dated chronology below is history)
 
+## 2026-09-15 UTC: reasoning derives right titles but still selects another tool call
+
+huihui_reasoning_synthesis_20260915 on86d4540: direct focused continuation,
+reasoning medium,2019 uncached prompt tokens,449 generated tokens,1123.0695s.
+The analysis correctly classifies all ten records and names exactly four eligible
+titles, then the final channel calls offset15 rather than answering. No JSON
+answer/Plex completion; raw reasoning also appears in output_text (Qwen reasoning
+channel support is not qualified). Do not silently strip malformed output.
+Pressure FAIL72,794,112B swap-out, zero growth, min5.294GB, footprint1.635GB,
+no sampled transcoders. Source/artifact hashes/stopped PIDs verified; result SHA
+ee58700622992b0b87166162fc80e4e098a8f3706b8f6461dcde22b21def5588.
+CPU-only actual installed auto-tool grammar accepts the recorded reasoning prefix,
+all29 tokens of the correct final JSON and EOS. It did not force that extra call.
+
+Next direct-range uncached-I/O audit is exact bytes/arithmetic and default off.
+Applied-descriptor and actual pread witnesses are mandatory; no claim that other
+loaders/head-row reads become uncached. Both draft aliases share the same1765
+non-MTP target tensor file objects; BF16 proposal-only comparison remains queued.
+
 ## 2026-09-15 UTC: focused continuation confirms loop, not missing history
 
 huihui_inline_empty_page_20260915 ond22b78e returns offset0 after the actual

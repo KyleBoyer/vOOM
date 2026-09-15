@@ -10201,6 +10201,7 @@ def _vision_protocol_timing(result: dict) -> dict:
         "direct_io_fd_cached",
         "direct_io_fd_cache_enabled",
         "direct_io_fd_nocache_applied",
+        "direct_io_fd_nocache_applied_total",
         "direct_io_nocache_enabled",
         "direct_io_pread_calls",
         "direct_io_pread_requested_bytes",
