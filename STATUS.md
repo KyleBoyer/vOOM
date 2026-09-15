@@ -1,5 +1,22 @@
 # STATUS — 2026-09-14 UTC (current corrections first; dated chronology below is history)
 
+## 2026-09-15 UTC: inline active catalog first corpus is NOT promoted
+
+huihui_inline_posttool_20260915 on808ee17: inventory83.6311s passes exact JSON;
+calendar83.9884s chooses correct IDs but emits JSON twice separated by an
+unmatched closing thinking marker. Exact JSON FAIL; no output cleanup or score
+waiver. Both use inline active catalogs and retain all prompt state. Whole native
+pressure PASS:7,831,552B swap-out, zero growth, min5.423GB, footprint1.459GB,
+no sampled transcoders. Slower than prior76.0617s/62.9456s controls; no speed win.
+Source/artifact hashes and stopped PIDs verified; result SHA
+0fdf93d3f45ab3ffc71c4fa52086b5a84a425eae3430bf798c145b66daa1d5e7.
+
+Next explicit prompt experiment clarifies final-answer-only channel/format
+behavior; no parser stripping. Focused Plex synthesis adds unchanged captured
+user text and one actual schema, but short synthetic system/developer instructions,
+JSON format, pre-supplied two-page fixture and temperature0. It is NOT the full
+capture, live Plex, a workflow score or a comparable full-workflow latency.
+
 ## 2026-09-15 UTC: mixed plain target rejected; inline catalog diagnostic staged
 
 huihui_mixed_posttool_b_20260915 on a139ef8 passed model/head loading but was

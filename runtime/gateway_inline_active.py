@@ -8,7 +8,9 @@ POLICY = (
     'operation is necessary, call an available real tool directly. Use '
     'vmodel_search_tools only if a different capability is needed. Do not enable '
     'tools that are already available, repeat completed operations, invent external '
-    'facts, or promise to perform an action later.'
+    'facts, or promise to perform an action later. Your answer is user-visible: '
+    'return the requested final answer once, without private analysis or thinking '
+    'channel markers. Follow the output format requested by the user.'
 )
 
 

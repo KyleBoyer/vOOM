@@ -118,3 +118,29 @@ def test_actual_fixture_requires_observed_inline_catalog(selection,passed):
     exec(compile(ast.fix_missing_locations(ast.Module(body=[branch],type_ignores=[])),
                  '<actual inline gate>','exec'),env)
     assert env['checks']['inline_active_catalog_used'] is passed
+
+
+def test_focused_plex_case_preserves_user_schema_and_unfiltered_pages():
+    from tests.fixtures.plex_synthesis_case import build
+    from tests.fixtures.plex_agent_profile import PLEX_MEDIA_TOOL
+    from tests.fixtures.captured_transition_tracking_gate import semantic_checks
+    original=dict(input=[dict(role='system',content='not retained in focused case'),
+                        dict(role='user',content='original user text')],
+        tools=[dict(type='function',name=PLEX_MEDIA_TOOL,parameters={'type':'object'}),
+               dict(type='function',name='unrelated',parameters={'type':'object'})])
+    before=copy.deepcopy(original)
+    case,request=build(original)
+    assert original==before and request['tools']==[original['tools'][0]]
+    assert [m for m in request['input'] if m.get('role')=='user']==[original['input'][1]]
+    pages=[json.loads(m['output']) for m in request['input']
+           if m.get('type')=='function_call_output']
+    assert [p['hasMore'] for p in pages]==[True,False]
+    assert [p['offset'] for p in pages]==[0,5]
+    assert all(p['filtersApplied'] is False for p in pages)
+    assert sum(len(p['media']) for p in pages)==10
+    assert any(r['title']=='JULIET_TVPG' for p in pages for r in p['media'])
+    def response(value):
+        return dict(output=[dict(type='message',content=[dict(type='output_text',text=json.dumps(value))])])
+    assert all(semantic_checks(response(case['expected_json']),case).values())
+    bad={'titles':case['expected_json']['titles']+['JULIET_TVPG']}
+    assert not semantic_checks(response(bad),case)['exact_json']
