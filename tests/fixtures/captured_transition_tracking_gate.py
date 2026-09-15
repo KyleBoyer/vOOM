@@ -163,6 +163,7 @@ def qwen_all_prompt_phase_head_path(t):
 
 
 def row_checks(row, response, case, config):
+    from tests.fixtures.huihui_memory_policy import available_floor
     t, usage = row.get('timing') or {}, row.get('usage') or {}
     witness = t.get('generation_witness') or {}
     before, after = row['pressure_before'], row['pressure_after']
@@ -186,7 +187,7 @@ def row_checks(row, response, case, config):
             and int(t.get('memory_prefill_retries') or 0) == 0,
         metal=type(t.get('true_peak_metal_bytes')) in (int, float)
             and 0 < t['true_peak_metal_bytes'] <= 8_500_000_000,
-        terminal_available=after['available_bytes'] >= 5_300_000_000,
+        terminal_available=after['available_bytes'] >= available_floor(config),
         swap_used=after['swap_used_bytes'] - before['swap_used_bytes'] <= 16_000_000,
         actual_swap_out=after['swap_out_bytes'] - before['swap_out_bytes'] <= 16_000_000)
     if case.get('stream'):
@@ -214,7 +215,9 @@ def row_checks(row, response, case, config):
     return checks
 
 
-def native_pressure_summary(log_text):
+def native_pressure_summary(log_text, *, minimum_available_bytes=5_300_000_000):
+    from tests.fixtures.huihui_memory_policy import available_floor
+    minimum_available_bytes = available_floor({'minimum_available_bytes': minimum_available_bytes})
     records = [json.loads(line[len('[process-memory] '):]) for line in log_text.splitlines()
                if line.startswith('[process-memory] ')]
     if not records or not all(r.get('process', {}).get('available') is True for r in records):
@@ -226,7 +229,8 @@ def native_pressure_summary(log_text):
         maximum_compressed_bytes=max(r['process']['internal_compressed_ledger_bytes'] for r in records),
         swap_used_growth_bytes=max(r['system_swap_used_bytes'] for r in records)-first['system_swap_used_bytes'],
         actual_swap_out_growth_bytes=max(r['system_swap_out_bytes'] for r in records)-first['system_swap_out_bytes'])
-    result['passed'] = (result['minimum_available_bytes'] >= 5_300_000_000
+    result['required_minimum_available_bytes'] = minimum_available_bytes
+    result['passed'] = (result['minimum_available_bytes'] >= minimum_available_bytes
         and result['swap_used_growth_bytes'] <= 16_000_000
         and result['actual_swap_out_growth_bytes'] <= 16_000_000)
     if any('known_transcoders' in r for r in records):
@@ -258,6 +262,8 @@ def run(config):
     profile_env = {}
     profiles = apply_runtime_profiles(config['profiles'], environ=profile_env)
     assert profiles.profile_digest == config['profile_digest']
+    from tests.fixtures.huihui_memory_policy import validate as validate_memory
+    required_available = validate_memory(config, profile_env, pre)
     host_activity_required = profile_env.get('VMODEL_HOST_ACTIVITY_WITNESS') == '1'
     reclamation_required = profile_env.get('VMODEL_GOVERNOR_RECLAMATION_WITNESS') == '1'
     serial_kv_required = profile_env.get('VMODEL_QWEN35_SERIAL_KV_RECLAIM') == '1'
@@ -351,7 +357,7 @@ def run(config):
             if history is not None and document['history_sha256_after'] != config['history_sha256']:
                 failures.append('saved transition history changed')
             try:
-                document['native_pressure'] = native_pressure_summary(Path(config['server_log']).read_text())
+                document['native_pressure'] = native_pressure_summary(Path(config['server_log']).read_text(), minimum_available_bytes=required_available)
             except (ValueError, TypeError, KeyError):
                 document['native_pressure'] = {'available': False, 'passed': False}
             if not document['native_pressure']['passed']:

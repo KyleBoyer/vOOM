@@ -1,0 +1,8 @@
+schema: voom.runtime-profile.v1
+name: qwen35-reserve4500-audit
+description: User-approved4500MB live reserve with5500MB launch qualification.
+notes:
+  - "September15 user approval: launch with30s available>=5.5GB; runtime/whole-arm available>=4.5GB. Keep400MB ordinary margin,8.5GB Metal ceiling and16MB swap growth/out guards."
+  - "Explicit experiment; unchanged answer quality and natural completion checks."
+settings:
+  VMODEL_QWEN35_MIN_AVAILABLE_MB: 4500

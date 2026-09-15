@@ -1,5 +1,14 @@
 # STATUS — 2026-09-14 UTC (current corrections first; dated chronology below is history)
 
+## 2026-09-15 UTC: user authorizes5500MB launch /4500MB runtime trial
+
+User approves the proposed thresholds and requests continued execution without
+repeated permission prompts. Explicit qwen35-reserve4500-audit changes the live
+reserve only; replay configs record4500MB whole-arm/terminal available floor,
+and validate the matching profile plus30s5500MB launch proof. Historical test
+defaults remain5300MB.400MB ordinary margin,8.5GB Metal ceiling,16MB swap guards,
+natural completion/token/quality gates stay unchanged. Keep all user apps open.
+
 ## 2026-09-15 UTC: lean serving footprint reduced; bounded admission pause candidate
 
 Next candidate's fresh30.034s preflight, huihui_lean_pause_short_20260915,

@@ -73,6 +73,7 @@ def model_authored_output(response):
 
 
 def acceptance(row, response, config, *, initial_action=True):
+    from tests.fixtures.huihui_memory_policy import available_floor
     t, usage = row.get('timing') or {}, row.get('usage') or {}
     witness = t.get('generation_witness') or {}
     before, after = row['pressure_before'], row['pressure_after']
@@ -122,7 +123,7 @@ def acceptance(row, response, config, *, initial_action=True):
         no_prompt_reuse=usage.get('input_tokens_details', {}).get('cached_tokens') == 0,
         metal=type(t.get('true_peak_metal_bytes')) in (int, float)
             and 0 < t['true_peak_metal_bytes'] <= 8_500_000_000,
-        terminal_available=after['available_bytes'] >= 5_300_000_000,
+        terminal_available=after['available_bytes'] >= available_floor(config),
         swap_used=after['swap_used_bytes'] - before['swap_used_bytes'] <= 16_000_000,
         actual_swap_out=after['swap_out_bytes'] - before['swap_out_bytes'] <= 16_000_000,
         stream_matches=row.get('streamed_text_matches_final') is True)
@@ -454,6 +455,8 @@ def run(config):
     env = {}
     profile = apply_runtime_profiles(config['profiles'], environ=env)
     assert profile.profile_digest == config['profile_digest']
+    from tests.fixtures.huihui_memory_policy import validate as validate_memory
+    required_available = validate_memory(config, env, pre)
     if config.get('gateway_enable_description_profile') is not None:
         from runtime.server import _hidden_gateway_enable_description_policy
         assert config['gateway_enable_description_profile'] == (
@@ -538,7 +541,7 @@ def run(config):
             document['server_returncode'] = server.returncode
         try:
             document['server_log_sha256'] = sha(config['server_log'])
-            document['native_pressure'] = native_pressure_summary(Path(config['server_log']).read_text())
+            document['native_pressure'] = native_pressure_summary(Path(config['server_log']).read_text(), minimum_available_bytes=required_available)
         except (OSError, ValueError, TypeError, KeyError):
             document['native_pressure'] = dict(available=False, passed=False)
         if not document['native_pressure'].get('passed'):
