@@ -1,5 +1,29 @@
 # STATUS — 2026-09-14 UTC (current corrections first; dated chronology below is history)
 
+## 2026-09-15 UTC: disk-base held-out equivalence passes; pressure narrowly fails
+
+huihui_base_disk_heldout_b_20260915 onf84345c: unchanged synthetic held-out
+inventory/calendar requests, greedy, max1024, full target prompt state, uncached
+308/315 tokens. HTTP100.0996s/106.0332s;40/45 generated tokens. Exact arguments,
+all-phase token identity versus saved reference, natural termination and all
+per-request checks PASS. Disk bases retain zero Metal array bytes; logical base
+153,944,064B.11/12 snapshots,6/8 reloads, all closed; write+reload2.23s/2.66s.
+No causal speed claim; selected target remains lossy versus released BF16.
+Whole pressure FAIL:16,269,312B swap-out (limit16MB), zero growth; native
+min5.472GB, footprint1.358GB, no sampled transcoders. Not promoted.
+Source/artifact hashes/stopped PIDs verified; result SHA
+f23ba63bae4619c38cb23a888b456992ed4ee27b285c1757ee4324b7108c1ddd.
+
+huihui_base_disk_nocache_20260915 combines exact disk bases and direct F_NOCACHE;
+first cached inventory request fails69.6525s at ordinary head admission:
+active0.22GB, incoming0.04GB, margin0.40GB, projected0.66GB>ceiling0.65GB,
+available4.94GB. No retry, completed answer or applied-I/O proof. Whole pressure
+7,421,952B swap-out/zero growth; native min4.765GB, footprint1.178GB.
+Source/artifact hashes/stopped PIDs verified; result SHA
+c1d23ac420c5e3a6e57e9eda2278b9c0615e2f769e46b6e0be2ed7c61231ec2e.
+Direct uncached reads NOT promoted. Fresh cached-only repeat deferred by the
+5.5GB launch gate; no runtime waiver or user app termination.
+
 ## 2026-09-15 UTC: first disk-base request reached completion but serializer failed
 
 huihui_base_disk_heldout_20260915 onc398d80 generated its first held-out response
