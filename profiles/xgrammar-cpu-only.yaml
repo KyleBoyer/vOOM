@@ -1,0 +1,8 @@
+schema: voom.runtime-profile.v1
+name: xgrammar-cpu-only
+description: Experimental NumPy mask and raw-tokenizer facade over pinned native XGrammar.
+notes:
+  - "Uses the same installed C++ grammar compiler/matcher with upstream grammar/compiler modules, avoiding PyTorch and duplicate Transformers tokenizer initialization. Requires fresh process and xgrammar0.2.3/tvm-ffi0.1.12; unsupported versions fail closed."
+  - "Must pass full-vocabulary metadata/decoded-token and stepwise mask/fork/rollback equivalence, then real captured-token/quality/pressure gates. Not a new grammar or a default."
+settings:
+  VMODEL_XGRAMMAR_CPU_ONLY: true

@@ -1,5 +1,27 @@
 # STATUS — 2026-09-14 UTC (current corrections first; dated chronology below is history)
 
+## 2026-09-14 UTC: continuous work requested; scheduler deleted; lean grammar proof
+
+User explicitly rejects scheduled30-minute cycles and requests continued work
+in this task. Deleted finish-huihui-harness-readiness-overnight; do not recreate
+a scheduler. Keep working directly with one model job at a time.
+
+New opt-in xgrammar-cpu-only uses the same installed C++ grammar compiler and
+upstream grammar/compiler Python modules under a private namespace, with
+NumPy DLPack masks and the engine's existing raw tokenizer. It avoids PyTorch
+and duplicate AutoTokenizer initialization. Pinned xgrammar0.2.3/tvm-ffi0.1.12;
+unsupported versions or already-loaded heavy backend fail closed. TVM's
+optional torch import is suppressed during serialized initialization only and
+the import table is restored. No model/grammar acceptance algorithm replaced.
+
+Fresh-process native CPU oracles (no MLX/weights) independently agree on all
+248320 decoded vocab entries, metadata/special IDs and all106 token positions
+across8 JSON/tool cases, including every complete mask, fork and rollback.
+CPU facade peak RSS371,572,736B/wall0.7181s versus stock797,327,360B/2.6092s.
+This is a grammar initialization/probe result, NOT a serving-memory or end-to-
+end speed claim. Both result files are logs/xgrammar_{cpu,stock}_oracle_20260914.json.
+No real captured serving result yet; validate before promotion.
+
 ## 2026-09-14 UTC: approved5300MB test executed; overnight follow-up active
 
 huihui_reserve5300_short_20260914 on04fbd37 passes30.023s periodic preflight

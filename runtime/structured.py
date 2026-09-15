@@ -201,6 +201,12 @@ def _grammar_compatible_schema(schema: dict) -> dict:
 
 
 def _xgrammar():
+    mode=os.environ.get('VMODEL_XGRAMMAR_CPU_ONLY','0')
+    if mode not in ('0','1'):
+        raise StructuredDecodingUnavailable('VMODEL_XGRAMMAR_CPU_ONLY must be 0 or 1')
+    if mode=='1':
+        from .xgrammar_cpu import backend
+        return backend()
     try:
         import xgrammar as xgr
     except ImportError as error:  # pragma: no cover - exercised on minimal installs
@@ -238,6 +244,14 @@ def _compiler(engine):
         return compiler
     xgr = _xgrammar()
     try:
+        if os.environ.get('VMODEL_XGRAMMAR_CPU_ONLY','0')=='1':
+            info=xgr.TokenizerInfo.from_engine(engine)
+            max_threads=int(os.environ.get('VMODEL_XGRAMMAR_MAX_THREADS','4'))
+            if not 1<=max_threads<=64:
+                raise ValueError('VMODEL_XGRAMMAR_MAX_THREADS must be between 1 and 64')
+            compiler=xgr.GrammarCompiler(info,max_threads=max_threads,cache_enabled=True)
+            engine._xgrammar_compiler=compiler
+            return compiler
         from transformers import AutoTokenizer
         from .tiktoken_convert import has_tiktoken_tokenizer
 
