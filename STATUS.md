@@ -1,5 +1,20 @@
 # STATUS — 2026-09-14 UTC (current corrections first; dated chronology below is history)
 
+## 2026-09-15 UTC: clarified inline prompt fixes held-out format; focused Plex continues
+
+huihui_inline_final_corpus_20260915 on23a669a: inventory84.5921s and
+calendar64.2853s pass exact JSON, natural completion, actual inline catalog and
+per-request safety checks. Focused Plex179.4793s emits an actual media call for
+all/limit500/offset10, not a final answer. The strict single-response synthesis
+gate FAILS; this is an unhandled continuation, not a completed wrong-title answer.
+No full workflow score. Whole pressure FAIL:24,330,240B swap-out, zero growth,
+min5.350GB, footprint1.690GB, no sampled transcoders. Sources/artifact hashes and
+stopped PIDs verified; result SHA
+9c6e46d0ea89bace70144e4485061eea63506ef52ab7279c2e3e0cb46f424ffe.
+Next diagnostic supplies the exact model-requested offset10 empty fixture page
+in a fresh server, preserving the focused request otherwise. It cannot retroactively
+pass the original three-case run or qualify original-capture performance.
+
 ## 2026-09-15 UTC: inline active catalog first corpus is NOT promoted
 
 huihui_inline_posttool_20260915 on808ee17: inventory83.6311s passes exact JSON;
