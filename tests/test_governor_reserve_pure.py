@@ -570,6 +570,47 @@ def test_cache_target_is_fitted_to_sampled_live_headroom():
     assert gov.prefetcher.paused
 
 
+def test_pause_result_never_substitutes_for_fresh_governor_admission():
+    module, mx = load_pressure(100_000_000)
+    gov = make_governor(module, mx, cache_max=256_000_000, floor=64_000_000)
+    gov.critical = 5_300_000_000
+    gov.cache.total_bytes = 0
+    module.psutil = types.SimpleNamespace(
+        virtual_memory=lambda: types.SimpleNamespace(available=5_700_000_000))
+    module.time = types.SimpleNamespace(sleep=lambda _: None)
+    calls = []
+    def optimistic_receipt(*args, **kwargs):
+        calls.append(kwargs)
+        return (100_000_000, 9_000_000_000, 3_800_000_000, 600_000_000)
+    gov._admission_pause = types.SimpleNamespace(wait=optimistic_receipt)
+    try:
+        gov.reserve(100_000_000, reason='qwen-prefill-layer-page')
+    except MemoryError:
+        pass
+    else:
+        raise AssertionError('pause receipt bypassed fresh allocation predicate')
+    assert len(calls) == 1 and calls[0]['critical'] == 5_300_000_000
+    assert gov.reservation_failures == 1
+
+
+def test_pause_can_recover_without_changing_original_margin_or_reserve():
+    module, mx = load_pressure(100_000_000)
+    gov = make_governor(module, mx, cache_max=256_000_000, floor=64_000_000)
+    gov.critical = 5_300_000_000
+    gov.cache.total_bytes = 0
+    available = [5_700_000_000]
+    module.psutil = types.SimpleNamespace(
+        virtual_memory=lambda: types.SimpleNamespace(available=available[0]))
+    module.time = types.SimpleNamespace(sleep=lambda _: None)
+    def recover(sample, **kwargs):
+        available[0] = 5_800_000_000
+        return sample()
+    gov._admission_pause = types.SimpleNamespace(wait=recover)
+    gov.reserve(100_000_000, reason='qwen-prefill-layer-page')
+    assert gov.critical == 5_300_000_000 and gov.reservation_failures == 0
+    assert gov.cache.max_bytes == 256_000_000
+
+
 def _run_all():
     tests = [v for k, v in sorted(globals().items())
              if k.startswith("test_") and callable(v)]

@@ -2,6 +2,15 @@
 
 ## 2026-09-15 UTC: lean serving footprint reduced; bounded admission pause candidate
 
+Next candidate's fresh30.034s preflight, huihui_lean_pause_short_20260915,
+DEFERRED: minimum available5,647,499,264B <unchanged6GB launch threshold;
+zero swap growth,49,152B swap-out, clear known transcoders,22.064GB root free.
+No model job launched. Later read-only sample remains5.786GB.309 selected pure
+tests pass8.35s and143 profiles validate; admission-pause lacks a real model
+result. Further model testing requires naturally recovered host headroom or
+new explicit user authority; do not lower launch/live/quality thresholds or
+close apps automatically. Scheduler remains deleted; no model server running.
+
 huihui_lean_grammar_short_20260914 on d872c69 failed first weather prefill at
 layer26 attention admission (64,711,383B). No answer or speed/quality pass.
 Native footprint peaked614,040,752B; minimum system available5,605,015,552B,
