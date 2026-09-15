@@ -1,5 +1,36 @@
 # STATUS — 2026-09-14 UTC (current corrections first; dated chronology below is history)
 
+## 2026-09-15 UTC: fifth-call refusal no longer reproduced; legacy fixture mismatch
+
+huihui_page_owner_plex_20260915 on db26691 completed six HTTP calls:
+650.2530s/196.4613s/456.4702s/232.5071s/225.9860s/241.2739s, output
+67/56/55/58/57/59 tokens, all natural. The formerly failing fifth call passes
+all per-turn checks; it requests show offset500. Sixth requests movie offset1000.
+No real weight-page recovery event occurred, so no physical attribution of the
+improvement to that hook is claimed. Whole-arm pressure still FAILS:
+103,481,344B sampled swap-out, zero swap growth, min available4.923GB,
+peak footprint2.445GB. Stopped the owned driver cleanly during turn7 after
+confirming the legacy fixture repeats a nonempty final page for every offset.
+2154.3156s is incomplete time, NOT completed workflow latency/score. Sources,
+embedded result, all artifact hashes and stopped PIDs verified. Result SHA
+7c78db8a90425a66949f6c815964a14a44e84f9a7014b17c4304371e044682eb.
+
+Saved real Kai export independently reread:265312B, SHA
+8ac72dcd3d92b91c3a9d6c69e846c3bd440b74c5d17942ba135a8fde74420220,
+421 rows over offsets0/100/200/300/400. Envelope is total/returned/limit/offset/
+hasMore/media; legacy test instead supplied movies/series/movieHasMore/
+seriesHasMore. This mismatch can confound pagination/termination behavior;
+it does NOT excuse every model failure. Real export lacks root-path evidence.
+
+Explicit synthetic-finite-media-v1 fixture uses that observed envelope with
+the original synthetic catalog's root evidence, query-isolated offset/limit
+slicing and empty exhausted pages. Ratings/locations remain unfiltered in the
+mock (filtersApplied=False), so the model must still reject inappropriate rows.
+Original HTTP capture/catalog and old rubric unchanged; legacy fixture remains
+the default.175 regression tests PASS. Upcoming numbers use DIFFERENT tool
+results and cannot be compared as a legacy-workflow latency improvement. A
+one-page finite catalog does not prove pagination or earn its rubric points.
+
 ## 2026-09-15 UTC: full captured cache trial reaches four calls, fifth safely refuses
 
 huihui_paged_plex_20260915 on35a673e retained original134-tool HTTP capture,

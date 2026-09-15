@@ -1,0 +1,52 @@
+"""Finite, query-isolated synthetic catalog in the observed media envelope.
+
+Unlike the legacy mixed two-page queue, offset/limit index actual records and
+exhausted queries return no rows. Synthetic rootFolderPath fields deliberately
+exercise the user's root predicate; the real Kai export lacked root evidence.
+No model response is rewritten and no rating/location filtering is performed
+by this mock: filtersApplied=False makes that limitation explicit to the model.
+"""
+import copy
+
+PROFILE = 'synthetic-finite-media-v1'
+
+
+def respond(call, source_pages):
+    if call.get('name') != 'plugin__plex__plex_list_library_media':
+        raise ValueError('finite media fixture only supports the media endpoint')
+    args = call.get('arguments')
+    if not isinstance(args, dict):
+        raise ValueError('media arguments must be an object')
+    kind = args.get('mediaType') or 'all'
+    if kind not in ('all', 'movie', 'show'):
+        raise ValueError('invalid media type')
+    def integer(name, default, minimum):
+        value = args.get(name)
+        value = default if value is None else value
+        if type(value) not in (int, float) or not float(value).is_integer() or value < minimum:
+            raise ValueError('invalid ' + name)
+        return int(value)
+    limit = min(500, integer('limit', 100, 1))
+    offset = integer('offset', 0, 0)
+    # Fail visibly if an unsupported query needs semantics this finite catalog
+    # cannot provide, rather than silently claiming the filter was applied.
+    for name in ('query', 'sectionId', 'sectionName', 'year', 'minYear', 'maxYear'):
+        if args.get(name) is not None:
+            raise ValueError('unsupported finite-catalog filter: ' + name)
+    rows = []
+    for page in source_pages:
+        for media_type, key in (('movie', 'movies'), ('show', 'series')):
+            if kind not in ('all', media_type):
+                continue
+            for source in page[key]:
+                row = copy.deepcopy(source)
+                row['type'] = media_type
+                row['sectionName'] = row.pop('plexLibrarySectionName')
+                rows.append(row)
+    # Stable order does not depend on previous calls or which query ran first.
+    rows.sort(key=lambda row: (row['title'], row['type']))
+    selected = rows[offset:offset + limit]
+    return dict(total=len(rows), returned=len(selected), limit=limit, offset=offset,
+        hasMore=offset + len(selected) < len(rows), media=selected,
+        filtersApplied=False,
+        notice='Synthetic raw catalog. Rating and root-location filters are NOT applied; verify every returned record against the user criteria.')

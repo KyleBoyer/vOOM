@@ -193,11 +193,13 @@ def tool_round_budget(config):
 
 
 def run_plex_workflow(config, request, document):
-    """Retain the legacy fixed two-page rubric, with immutable HTTP receipts.
+    """Retain the legacy rubric, with immutable HTTP receipts.
 
 The synthetic mixed-page queue is not live Plex or independent movie/show
 pagination. Its unchanged rubric has known separate-media strategy limitations;
 report those independently of actual final-title errors, never repair a score.
+An explicit finite-media fixture uses the observed media response envelope;
+its different tool results must not be labeled a legacy-workflow speed win.
 """
     from tests.fixtures import plex_agent_profile as plex
 
@@ -264,8 +266,14 @@ report those independently of actual final-title errors, never repair a score.
     # Scope this observer to one synchronous, single-server fixture call.
     # No production code, page contents or model-authored response is changed.
     with patch.object(plex, '_post', recording_post):
+        fixture_kwargs = {}
+        if config.get('tool_result_profile') is not None:
+            from tests.fixtures.plex_finite_media import PROFILE
+            if config['tool_result_profile'] != PROFILE:
+                raise ValueError('unknown explicit tool-result fixture profile')
+            fixture_kwargs['tool_result_profile'] = PROFILE
         result = plex.run_profile(request, f'http://127.0.0.1:{config["port"]}/v1/responses',
-            timeout=1800, max_tool_rounds=max_tool_rounds)
+            timeout=1800, max_tool_rounds=max_tool_rounds, **fixture_kwargs)
     document['plex'] = result
     if prefix_cache_enabled(config):
         # An enabled flag is not observed reuse. Preserve the unchanged
