@@ -1,5 +1,29 @@
 # STATUS — 2026-09-14 UTC (current corrections first; dated chronology below is history)
 
+## 2026-09-15 UTC: KV64 completes two-page workflow, but quality is rejected
+
+huihui_kv64_page5b_20260915 on2303503 completes3 HTTP turns in
+252.9571s/191.4363s/836.1009s, total1280.9007s (21.35min),305 final tokens.
+First decision/execution restore4781/5599 exact prompt tokens; this is NOT cold
+latency or isolated residency-speed proof. Actual phase budget64MB throughout.
+At temperature1 the first sampled call omits rating arguments (all/limit500/
+offset0), unlike prior cold control. No seeded token-equivalence claim.
+
+Pagination and natural/protocol completion pass, but final answer incorrectly
+includes JULIET_TVPG. This is a genuine semantic failure, not just the legacy
+rubric's explained-exclusion issue. Legacy51/100/FAIL; do NOT promote. Pressure
+also FAILS113,262,592B sampled swap-out; zero growth, min4.535GB, footprint
+1.813GB, no sampled transcoders. Private keepalive counts78/55/304 and max
+client-observed line gaps14.826s/7.454s/7.484s. Sources/embedded result/artifact
+hashes/stopped PIDs verified. Result SHA
+e22cc2655b80eb4a4e2b37e1703af13567639cc4d82b53b7415899b1d66027db.
+
+The first KV64 launch stopped at an obsolete fixture assertion before model
+load; no child result or inference existed. Launch-budget regressions now cover
+both actual assertions,241 pure tests pass. The available23.082GB mixed-a8-last4
+target is the next higher-fidelity diagnostic; it is still lossy, not BF16 proof.
+Full harness readiness remains unqualified and no server is left running.
+
 ## 2026-09-15 UTC: actual page transition passes; long answer hits preserved memory guard
 
 huihui_buffer_page5_20260915 onf8449da: first HTTP609.7546s/67 tokens,
