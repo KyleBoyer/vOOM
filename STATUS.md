@@ -1,5 +1,26 @@
 # STATUS — 2026-09-14 UTC (current corrections first; dated chronology below is history)
 
+## 2026-09-14 UTC: MLP split real run still refused; no readiness claim
+
+huihui_mlp_split_short_20260914 on322c91f passes the normal30.016s periodic
+preflight (minimum6,374,899,712B; zero swap growth/out; clear transcoders), then
+fails the first weather request at layer40/mlp_down admission. Refused page is
+49,717,248B, not the former149MB combined MLP; available6.04GB with unchanged
+5600MB reserve and400MB margin is still insufficient. No final answer and no
+latency/quality pass. Parent51.3759s is time to failure, not completed inference.
+Whole-arm pressure passes23 samples: minimum6,000,066,560B, zero swap growth,
+1,654,784B swap-out, maximum footprint1,074,710,208B; no known transcoders.
+Source start=end=fresh, child file=embedded, result/log/server-log hashes checked;
+session18358 drained and owned parent/child/server all gone. Result SHA
+5aa03aa8b8e1c124047ad957cc0baa8a02f4d83b4defbe45bd4d44aa4f977a56.
+
+Do not enable the generic KDA disk spill on this speculative path: inspection
+shows KDAStateCache.fork does not copy spilled metadata. That needs an exact
+fork/rollback proof before use. No recurrent spill changes made. No model job
+or harness server remains running. The preview profile stays unchanged.
+The earlier5300MB reserve composition is a possible controlled next experiment,
+but this turn has not changed the5600MB serving reserve or400MB margin.
+
 ## 2026-09-14 UTC: user resumes harness readiness; smaller MLP page candidate
 
 Explicit qwen35-prefill-split-mlp splits the149MB dense MLP phase into gate/up
