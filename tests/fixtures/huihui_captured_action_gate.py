@@ -176,7 +176,7 @@ def acceptance(row, response, config, *, initial_action=True):
         checks['paged_kv_witness'] = valid and all(
             phase.get('kv_layout') == 'paged'
             and type(phase.get('paged_kv_budget_bytes')) is int
-            and phase.get('paged_kv_budget_bytes') == 256_000_000
+            and phase.get('paged_kv_budget_bytes') == config.get('serial_kv_budget_bytes', 256_000_000)
             and type(phase.get('hybrid_recurrent_cache_attached')) is int
             and phase['hybrid_recurrent_cache_attached'] == 1
             and all(type(phase.get(key)) is int and phase[key] > 0
@@ -522,7 +522,8 @@ def run(config):
     if serial_kv_required:
         assert config.get('require_paged_kv') is True
         assert type(config.get('serial_kv_budget_bytes')) is int
-        assert config['serial_kv_budget_bytes'] == 256_000_000
+        assert config['serial_kv_budget_bytes'] in (64_000_000, 128_000_000, 256_000_000)
+        assert config['serial_kv_budget_bytes'] == int(env['VMODEL_QWEN35_KV_MAX_MB']) * 1_000_000
     assert env['VMODEL_FAST_TOOL_GATEWAY_DETERMINISTIC_POLICY'] == '0'
     assert env['VMODEL_FAST_TOOL_GATEWAY_HOST_ROUTE'] == '0'
     cache_audit = prefix_cache_enabled(config)

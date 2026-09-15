@@ -1,5 +1,29 @@
 # STATUS — 2026-09-14 UTC (current corrections first; dated chronology below is history)
 
+## 2026-09-15 UTC: actual page transition passes; long answer hits preserved memory guard
+
+huihui_buffer_page5_20260915 onf8449da: first HTTP609.7546s/67 tokens,
+continuation188.8611s/39 tokens, model-selected all/limit500/offset5 after the
+server returned five rows/hasMoreTrue. Second page exhausted normally; no
+host pagination action. Final HTTP fails with server_memory_error after
+1340.6308s and more than465 partial tokens, not a completed answer or score.
+Parent2142.7297s/workflow2139.6744s is incomplete time. Raw SSE remains correct:
+471 private keepalives, max client-observed line gap9.164893s, response.failed.
+
+Exact current-layer admission refused170.681MB verifier scratch; closed-page
+reclamation released225.575MB Metal but a fresh system sample was4.314GB,
+below the preserved4.5GB reserve. No threshold waiver or mutated-state retry.
+Periodic min4.478GB, sampled swap-out104,398,848B, zero growth, peak footprint
+2.136GB, no sampled transcoders. Sources/embedded result/artifact hashes/stopped
+PIDs verified. Result SHA
+7f300e945ca0ba06ba9fc93aaf9f8acb3bb3f356eba7f8e09125ed54cdd9b01d.
+
+Next explicit KV64-only overlay spills the SAME exact full-attention pages
+earlier; no target math, context length, KV quantization, online attention or
+safety reserve change. The full-action fixture now checks selected64/128/256MB
+against both environment and every phase witness instead of hardcoding256MB.
+239 pure tests pass. Actual long-decode qualification remains open.
+
 ## 2026-09-15 UTC: held-out gateway answers and real private keepalives PASS
 
 huihui_posttool_20260915 on82de933 PASS. Synthetic inventory/calendar post-tool

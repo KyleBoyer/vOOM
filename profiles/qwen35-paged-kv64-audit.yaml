@@ -1,0 +1,8 @@
+schema: voom.runtime-profile.v1
+name: qwen35-paged-kv64-audit
+description: Explicit exact full-attention KV resident budget of64MB.
+notes:
+  - "Only residency changes: exact pages spill on Workspace NVMe. No KV quantization, context truncation, online attention, target math or safety-threshold change."
+  - "The resident DeltaNet companion and current-operation working set remain separately charged. A configured budget is not a physical RAM guarantee. Compare actual tokens, page I/O and whole-run pressure; no default promotion."
+settings:
+  VMODEL_QWEN35_KV_MAX_MB: 64

@@ -142,6 +142,20 @@ def paged_phase():
         qwen35_paged_online_attention=0, qwen35_paged_online_page_native=0)
 
 
+def test_smaller_paged_budget_changes_only_residency_and_requires_matching_witness():
+    base={};small={}
+    parent=['huihui-qwen38-27b-workflow-head-rows-audit']
+    apply_runtime_profiles(parent,environ=base)
+    apply_runtime_profiles(parent+['qwen35-paged-kv64-audit'],environ=small)
+    assert small=={**base,'VMODEL_QWEN35_KV_MAX_MB':'64'}
+    p=paged_phase();p['paged_kv_budget_bytes']=64_000_000
+    checks=full_state_checks([p],require_paged_kv=True,serial_kv_budget_bytes=64_000_000)
+    assert checks['paged_kv_witness']
+    assert not full_state_checks([p],require_paged_kv=True)['paged_kv_witness']
+    assert not full_state_checks([paged_phase()],require_paged_kv=True,
+                                serial_kv_budget_bytes=64_000_000)['paged_kv_witness']
+
+
 def test_compact_factors_audit_changes_only_flat_mtp_rollback_storage():
     base, factors = {}, {}
     apply_runtime_profiles(['huihui-qwen38-27b-full-state-paged256-audit'], environ=base)
