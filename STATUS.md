@@ -1,5 +1,16 @@
 # STATUS — 2026-09-14 UTC (current corrections first; dated chronology below is history)
 
+## 2026-09-14 UTC: user explicitly approves5300MB reserve test and overnight work
+
+The user approved testing the existing5.3GB live free-memory reserve in place
+of5.6GB and continuing overnight until harness-ready. This supersedes older
+wrap-up/5600MB-only instructions below, but does NOT authorize lowering the
+400MB ordinary margin,8.5GB Metal ceiling or acceptance pressure/quality gates.
+ChatGPT, its bundled Codex helpers, Plex and other user apps remain open.
+qwen35-reserve5300-audit is an explicit one-key overlay, not a new default.
+First run the two real short captures with the MLP split, max1024 and unchanged
+token/transport/whole-arm checks; only then advance to full captured workflow.
+
 ## 2026-09-14 UTC: MLP split real run still refused; no readiness claim
 
 huihui_mlp_split_short_20260914 on322c91f passes the normal30.016s periodic

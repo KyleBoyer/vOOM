@@ -1,0 +1,8 @@
+schema: voom.runtime-profile.v1
+name: qwen35-reserve5300-audit
+description: User-authorized September14 re-test of the existing5300MB Huihui live reserve.
+notes:
+  - "Changes only the live available-memory reserve from5600 to5300MB when layered on the headroom/preview profiles. This is explicitly authorized testing, not a default promotion or permission to reduce acceptance thresholds."
+  - "Keep ordinary400MB admission margin,8.5GB Metal ceiling,256MB conventional KV budget and unchanged whole-arm swap/pressure/quality checks. Real repeated requests and full harness still need qualification."
+settings:
+  VMODEL_QWEN35_MIN_AVAILABLE_MB: 5300

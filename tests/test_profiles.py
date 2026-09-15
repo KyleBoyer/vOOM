@@ -44,6 +44,14 @@ def test_huihui_preview_is_only_the_measured_split_arm_composition():
     assert actual['VMODEL_FAST_TOOL_GATEWAY'] == '0'
 
 
+def test_authorized_reserve5300_changes_only_available_reserve():
+    catalog = discover_runtime_profiles((ROOT / 'profiles',))
+    base=('huihui-qwen38-27b-harness-preview','qwen35-prefill-split-mlp')
+    _, before=resolve_runtime_profiles(base,catalog)
+    _, after=resolve_runtime_profiles(base+('qwen35-reserve5300-audit',),catalog)
+    assert after=={**before,'VMODEL_QWEN35_MIN_AVAILABLE_MB':'5300'}
+
+
 def test_no_transition_tracking_overlay_changes_only_explicit_history_policy():
     catalog = discover_runtime_profiles((ROOT / 'profiles',))
     base = 'qwen38-flash-next-uncensored-fp8-exact-pipeline-hot-kv-aligned-compact-fused'
