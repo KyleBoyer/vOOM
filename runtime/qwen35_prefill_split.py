@@ -7,6 +7,8 @@ vision, boundary-fork or prefetch path is admitted by this initial experiment.
 from __future__ import annotations
 
 import json
+from pathlib import Path
+import shutil
 import sys
 import time
 
@@ -31,6 +33,24 @@ def partition(names, layer):
     return attention,mlp
 
 
+def partition_mlp(names, layer):
+    prefix=f'model.layers.{layer}.'
+    gate_up=[]; down=[]
+    for name in names:
+        suffix=name.removeprefix(prefix)
+        if suffix=='post_attention_layernorm.weight' or suffix.startswith(('mlp.gate_proj.','mlp.up_proj.')):
+            gate_up.append(name)
+        elif suffix.startswith('mlp.down_proj.'):
+            down.append(name)
+        else:
+            raise ValueError('unsupported split MLP tensor category')
+    required=[prefix+'post_attention_layernorm.weight',prefix+'mlp.gate_proj.weight',
+              prefix+'mlp.up_proj.weight',prefix+'mlp.down_proj.weight']
+    if not all(name in names for name in required):
+        raise ValueError('split MLP requires complete gate/up/down projections')
+    return gate_up,down
+
+
 def validate(rc,cfg,*,positions3=None,boundary_fork_at=None,boundary_fork_kv=None):
     if (cfg.model_type!='qwen3_5' or cfg.num_experts or cfg.hidden_size!=5120
             or cfg.vocab_size!=248320 or not rc.governor
@@ -44,6 +64,19 @@ def validate(rc,cfg,*,positions3=None,boundary_fork_at=None,boundary_fork_kv=Non
 def sweep(engine,x,kv,offset,tile_width,on_progress=None,*,layer_start=0,layer_end=None,
           profile_path='layer_stationary_qwen35',positions3=None,
           boundary_fork_at=None,boundary_fork_kv=None):
+    spools=[]
+    try:
+        return _sweep(engine,x,kv,offset,tile_width,on_progress,layer_start=layer_start,
+            layer_end=layer_end,profile_path=profile_path,positions3=positions3,
+            boundary_fork_at=boundary_fork_at,boundary_fork_kv=boundary_fork_kv,spools=spools)
+    finally:
+        for spool in spools:
+            spool.close()
+
+
+def _sweep(engine,x,kv,offset,tile_width,on_progress=None,*,layer_start=0,layer_end=None,
+          profile_path='layer_stationary_qwen35',positions3=None,
+          boundary_fork_at=None,boundary_fork_kv=None,spools):
     # Validate the complete metadata plan BEFORE any recurrent/KV mutation.
     validate(engine.rc,engine.cfg,positions3=positions3,boundary_fork_at=boundary_fork_at,
              boundary_fork_kv=boundary_fork_kv)
@@ -52,9 +85,23 @@ def sweep(engine,x,kv,offset,tile_width,on_progress=None,*,layer_start=0,layer_e
     if tile_width<=0 or total<=0 or not 0<=layer_start<layer_end<=n:
         raise ValueError('invalid split prefill range or tile')
     plans=[]
+    split_mlp=getattr(engine.rc,'qwen35_prefill_split_mlp',False)
+    spool_root=None
+    if split_mlp:
+        spool_root=Path(engine.rc.kv_spill_dir).resolve()
+        # One current-layer carrier, exact 16-bit values; never retain a
+        # context-sized gate/up activation array in unified memory.
+        required=int(x.shape[0])*total*int(engine.cfg.intermediate_size)*2
+        if not spool_root.is_dir() or shutil.disk_usage(spool_root).free < required+1_000_000_000:
+            raise OSError('split MLP needs an existing local spool root and free carrier space')
     for layer in range(layer_start,layer_end):
         phases=[]
-        for phase,names in zip(('attention','mlp'),partition(engine._layer_names(layer),layer)):
+        attention,mlp=partition(engine._layer_names(layer),layer)
+        pieces=[('attention',attention),('mlp',mlp)]
+        if split_mlp:
+            gate_up,down=partition_mlp(mlp,layer)
+            pieces=[('attention',attention),('mlp_gate_up',gate_up),('mlp_down',down)]
+        for phase,names in pieces:
             incoming=engine._layer_fetch_bytes_estimate(layer,names)
             if type(incoming) is not int or incoming<=0:
                 raise ValueError('split prefill requires complete physical page estimates')
@@ -63,6 +110,10 @@ def sweep(engine,x,kv,offset,tile_width,on_progress=None,*,layer_start=0,layer_e
 
     import mlx.core as mx
     from .qwen35 import _qwen35_attention_residual, _qwen35_mlp_residual
+    if split_mlp:
+        from .qwen35 import qwen35_rms_norm
+        from .layer_runner import _linear
+        from .activation_spool import DiskBacked16BitTileSpool
     from .engine import (_layer_transient_for_positions, _remaining_layer_transient_reserve,
                          _recurring_layer_transient_reserve_margin, _resident_adjusted_transient)
 
@@ -76,6 +127,7 @@ def sweep(engine,x,kv,offset,tile_width,on_progress=None,*,layer_start=0,layer_e
     if profiler is not None:
         profiler.begin_sweep(total,path=profile_path+'_split_weights')
     for layer,phases in plans:
+        spool=None
         engine._select_layer_transient(total,layer)
         cache_before=profiler.cache_snapshot(engine.cache) if profiler is not None else None
         weight_s=compute_s=0.0; transient=0
@@ -96,7 +148,7 @@ def sweep(engine,x,kv,offset,tile_width,on_progress=None,*,layer_start=0,layer_e
                 engine._note_true_peak()
                 active_before=mx.get_active_memory()
                 mx.reset_peak_memory()
-                tiles=[]; xt=yt=None
+                tiles=[]; xt=yt=h=gate=up=None
                 started=time.perf_counter()
                 stage='compute'
                 for pos in range(0,total,tile_width):
@@ -119,14 +171,40 @@ def sweep(engine,x,kv,offset,tile_width,on_progress=None,*,layer_start=0,layer_e
                             chunked_delta_prefill=engine.rc.qwen_chunked_delta_prefill,
                             compiled_delta_prefill=engine.rc.qwen_compiled_delta_prefill,
                             native_fused_delta_prefill=engine.rc.qwen_native_fused_delta_prefill)
+                    elif phase=='mlp_gate_up':
+                        prefix=f'model.layers.{layer}'
+                        h=qwen35_rms_norm(xt,w[prefix+'.post_attention_layernorm.weight'],engine.cfg.rms_norm_eps)
+                        gate=_linear(h,w,prefix+'.mlp.gate_proj')
+                        up=_linear(h,w,prefix+'.mlp.up_proj')
+                        yt=mx.sigmoid(gate)*gate*up
+                    elif phase=='mlp_down':
+                        h=spool.load(pos//tile_width)
+                        yt=xt+_linear(h,w,f'model.layers.{layer}.mlp.down_proj')
                     else:
                         yt=_qwen35_mlp_residual(xt,w,f'model.layers.{layer}',engine.cfg,layer,
                             engine._get_experts,iter_expert_batches=engine._iter_expert_batches,profile=profiler)
                     mx.eval(yt)
-                    tiles.append(yt)
-                x=tiles[0] if len(tiles)==1 else mx.concatenate(tiles,axis=1)
-                mx.eval(x)
-                tiles.clear(); xt=yt=None
+                    if phase=='mlp_gate_up':
+                        if spool is None:
+                            spool=DiskBacked16BitTileSpool(spool_root,
+                                shape=(int(yt.shape[0]),total,int(yt.shape[2])),
+                                spans=[(s,min(s+tile_width,total)) for s in range(0,total,tile_width)],
+                                dtype=yt.dtype)
+                            spools.append(spool)
+                        spool.store(pos//tile_width,yt)
+                    else:
+                        tiles.append(yt)
+                    xt=yt=h=gate=up=None
+                if phase!='mlp_gate_up':
+                    x=tiles[0] if len(tiles)==1 else mx.concatenate(tiles,axis=1)
+                    mx.eval(x)
+                tiles.clear()
+                if phase=='mlp_down':
+                    for metric,value in spool.stats().items():
+                        name='mlp_spool_'+metric
+                        stats[name]=stats.get(name,0)+value
+                    spool.close();spools.remove(spool);spool=None
+                    stats['mlp_phases']=stats.get('mlp_phases',0)+1
                 elapsed=time.perf_counter()-started
                 compute_s+=elapsed
                 if profiler is not None and profiler.sync_substeps:

@@ -1681,6 +1681,11 @@ class EngineManager:
         except ValueError as error:
             raise RequestValidationError(str(error)) from error
         qwen35_split_prefill_request = os.environ.get('VMODEL_QWEN35_PREFILL_SPLIT_WEIGHTS','0')
+        qwen35_split_mlp_request = os.environ.get('VMODEL_QWEN35_PREFILL_SPLIT_MLP','0')
+        if qwen35_split_mlp_request not in ('0','1'):
+            raise RequestValidationError('VMODEL_QWEN35_PREFILL_SPLIT_MLP must be 0 or 1')
+        if qwen35_split_mlp_request == '1' and qwen35_split_prefill_request != '1':
+            raise RequestValidationError('split MLP requires split-weight prefill')
         if qwen35_split_prefill_request not in ('0','1'):
             raise RequestValidationError('VMODEL_QWEN35_PREFILL_SPLIT_WEIGHTS must be 0 or 1')
         if qwen35_split_prefill_request == '1' and not qwen35_mxfp4_head_rows:
@@ -2493,6 +2498,7 @@ class EngineManager:
             qwen35_head_pre_admit_request,
             qwen35_mxfp4_head_rows,
             qwen35_split_prefill_request,
+            qwen35_split_mlp_request,
             qwen35_suspend_lm_head_min_prompt_tokens,
             qwen_lossy_suffix_request,
             qwen_hot_kv_request,
@@ -2658,6 +2664,7 @@ class EngineManager:
             qwen35_head_pre_admit_request,
             qwen35_mxfp4_head_rows,
             qwen35_split_prefill_request,
+            qwen35_split_mlp_request,
             qwen35_suspend_lm_head_min_prompt_tokens,
             qwen_lossy_suffix_request,
             qwen_hot_kv_request,
@@ -2911,6 +2918,7 @@ class EngineManager:
                 rc.qwen35_phase_head_pre_admit = (qwen35_head_pre_admit_request == "1")
                 configure_mxfp4_head(rc, qwen35_mxfp4_head_rows)
                 rc.qwen35_prefill_split_weights = (qwen35_split_prefill_request == '1')
+                rc.qwen35_prefill_split_mlp = (qwen35_split_mlp_request == '1')
                 rc.qwen35_serial_verify_suspend_lm_head_min_prompt_tokens = (
                     qwen35_suspend_lm_head_min_prompt_tokens)
                 rc.qwen_mixed_depth_endpoint_persist = (

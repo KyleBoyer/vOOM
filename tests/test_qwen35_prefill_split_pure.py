@@ -32,6 +32,60 @@ def test_partition_disjoint_complete_and_preserves_name_order():
     assert a==names(2)[:2] and m==names(2)[2:]
 
 
+def dense_names(layer):
+    p=f'model.layers.{layer}.'
+    return names(layer)[:2]+[p+'post_attention_layernorm.weight']+[
+        p+'mlp.'+projection+'.weight' for projection in ('gate_proj','up_proj','down_proj')]
+
+
+def test_mlp_partition_complete_disjoint():
+    mlp=dense_names(0)[2:]
+    a,b=split.partition_mlp(mlp,0)
+    assert a+b==mlp and len(a)==3 and len(b)==1
+    with pytest.raises(ValueError):split.partition_mlp(mlp[:-1],0)
+    with pytest.raises(ValueError):split.partition_mlp(mlp+['unknown'],0)
+
+
+@pytest.mark.parametrize('fail_down',[False,True])
+def test_split_mlp_spools_all_tiles_and_cleans_up(monkeypatch,tmp_path,fail_down):
+    e,events,loaded=fake_engine(monkeypatch)
+    e.rc.qwen35_prefill_split_mlp=True;e.rc.kv_spill_dir=str(tmp_path)
+    e.cfg.intermediate_size=1;e.cfg.rms_norm_eps=1e-6
+    e._layer_names=dense_names
+    q=sys.modules['runtime.qwen35'];q.qwen35_rms_norm=lambda x,*a:x
+    sys.modules['mlx.core'].sigmoid=lambda x:1/(1+np.exp(-x))
+    linear=ModuleType('runtime.layer_runner')
+    def project(x,w,name):
+        assert name+'.weight' in w
+        if name.endswith('down_proj') and fail_down:raise RuntimeError('down failed')
+        return x*2 if name.endswith('up_proj') else x
+    linear._linear=project;monkeypatch.setitem(sys.modules,'runtime.layer_runner',linear)
+    created=[]
+    class Spool:
+        def __init__(self,root,**kwargs):self.values={};self.closed=False;created.append(self)
+        def store(self,i,x):self.values[i]=x.copy()
+        def load(self,i):return self.values[i].copy()
+        def stats(self):return {'bytes_written':sum(x.nbytes for x in self.values.values()),'bytes_read':sum(x.nbytes for x in self.values.values())}
+        def close(self):assert not self.closed;self.closed=True
+    module=ModuleType('runtime.activation_spool');module.DiskBacked16BitTileSpool=Spool
+    monkeypatch.setitem(sys.modules,'runtime.activation_spool',module)
+    x=np.arange(3,dtype=float).reshape(1,3,1)
+    if fail_down:
+        with pytest.raises(RuntimeError,match='down failed'):split.sweep(e,x,{},0,2)
+    else:
+        out=split.sweep(e,x,{},0,2)
+        expected=x
+        for layer in range(2):
+            expected=expected+layer+1
+            expected=expected+(1/(1+np.exp(-expected)))*expected*(expected*2)
+        assert np.array_equal(out,expected)
+        stats=e._qwen35_split_prefill_stats
+        assert stats['mlp_gate_up_phases']==stats['mlp_down_phases']==stats['mlp_phases']==2
+        assert stats['mlp_spool_bytes_written']==stats['mlp_spool_bytes_read']==48
+    assert not loaded and created and all(s.closed for s in created)
+    assert all(sorted(s.values)==[0,1] for s in created)
+
+
 @pytest.mark.parametrize('bad',[[],names(0)+names(0),names(1),
     ['model.layers.0.unknown.weight'],names(0)[:2]])
 def test_unknown_or_partial_layout_rejects(bad):
@@ -196,4 +250,23 @@ def test_profile_keys_and_structured_protocol_witness():
           and isinstance(n.value,ast.Tuple) and any(isinstance(x,ast.Name) and x.id=='qwen35_mxfp4_head_rows' for x in n.value.elts)]
     assert len(keys)==2
     assert all(sum(isinstance(x,ast.Name) and x.id=='qwen35_split_prefill_request' for x in n.value.elts)==1 for n in keys)
+    assert all(sum(isinstance(x,ast.Name) and x.id=='qwen35_split_mlp_request' for x in n.value.elts)==1 for n in keys)
     assert "'qwen35-split-prefill-v1' if self.rc.qwen35_prefill_split_weights else ''" in Path('runtime/engine.py').read_text()
+    assert "'qwen35-split-mlp-spool-v1' if self.rc.qwen35_prefill_split_mlp else ''" in Path('runtime/engine.py').read_text()
+
+
+def test_split_mlp_profile_only_enables_explicit_new_switch():
+    before={};after={}
+    apply_runtime_profiles(['huihui-qwen38-27b-harness-preview'],environ=before)
+    apply_runtime_profiles(['huihui-qwen38-27b-harness-preview','qwen35-prefill-split-mlp'],environ=after)
+    assert after=={**before,'VMODEL_QWEN35_PREFILL_SPLIT_MLP':'1'}
+
+
+def test_spool_capacity_failure_precedes_any_state_or_payload(monkeypatch,tmp_path):
+    e,events,loaded=fake_engine(monkeypatch)
+    e.rc.qwen35_prefill_split_mlp=True;e.rc.kv_spill_dir=str(tmp_path)
+    e.cfg.intermediate_size=1
+    monkeypatch.setattr(split.shutil,'disk_usage',lambda p:NS(free=0))
+    with pytest.raises(OSError,match='carrier space'):
+        split.sweep(e,np.ones((1,3,1)),{},0,2)
+    assert not events and not loaded

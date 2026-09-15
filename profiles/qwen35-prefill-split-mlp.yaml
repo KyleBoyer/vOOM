@@ -1,0 +1,8 @@
+schema: voom.runtime-profile.v1
+name: qwen35-prefill-split-mlp
+description: Opt-in dense Huihui gate/up versus down prefill pages with exact disk activation transport.
+notes:
+  - "Requires split-weight prefill, native head rows, prefetch off and an existing local KV spill directory. All prepared positions and original tile dimensions remain; intermediate 16-bit activations are spooled as raw bits then reloaded for down projection."
+  - "Reduces simultaneous MLP weight residency, adds local disk I/O. No target-weight, output-budget, reserve or admission-margin changes. Not a lossless or speed claim until actual block/token/pressure gates pass. Disabled by default."
+settings:
+  VMODEL_QWEN35_PREFILL_SPLIT_MLP: true

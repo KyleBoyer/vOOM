@@ -1,5 +1,21 @@
 # STATUS — 2026-09-14 UTC (current corrections first; dated chronology below is history)
 
+## 2026-09-14 UTC: user resumes harness readiness; smaller MLP page candidate
+
+Explicit qwen35-prefill-split-mlp splits the149MB dense MLP phase into gate/up
+and down pages. The original gate/up expression is evaluated at the same tile
+shape, stored as raw16-bit activations in the existing F_NOCACHE local disk
+spool, then reloaded for the original down projection and residual. Only one
+layer's carrier exists; space/layout checks precede KV mutation, all prepared
+positions remain, and success/failure cleanup is covered by pure tests.
+Separate engine/prompt identities; off by default, preview profile unchanged.
+Spool I/O and gate/up/down phase counts are published with split-prefill stats.
+No real-token/state/latency claim yet. Selected409 pure tests pass8.59s before
+the final identity/capacity assertions. Fresh preflight is still mandatory.
+This is a new physically smaller page candidate, not a retry of the unchanged
+failed arm. The normal6.0GB stable-swap preflight threshold may be used for this
+candidate; runtime5600MB reserve,400MB margin and all pressure gates stay fixed.
+
 ## 2026-09-14 UTC: wrap-up preview configuration; readiness is NOT complete
 
 User wants to wrap up and begin manual harness use. Added one explicit

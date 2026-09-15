@@ -1381,6 +1381,7 @@ class RuntimeConfig:
     # chunked, not the reduction dim). Plain safetensors checkpoints only (not vpack2/packed).
     qwen35_mxfp4_head_rows: int = 0  # explicit native MXFP4 row streaming; 0 preserves old path
     qwen35_prefill_split_weights: bool = False
+    qwen35_prefill_split_mlp: bool = False
     governor: bool = True  # F16: live memory-pressure governor (safety default on)
     # Qwen3-VL preprocessing budget. 0 selects the runtime's exact global-
     # attention safety ceiling; fast mode may choose a smaller quality-gated
@@ -1743,6 +1744,7 @@ class RuntimeConfig:
             stream_lm_head=run.get("stream_lm_head", False),
             qwen35_mxfp4_head_rows=run.get("qwen35_mxfp4_head_rows", 0),
             qwen35_prefill_split_weights=run.get("qwen35_prefill_split_weights", False),
+            qwen35_prefill_split_mlp=run.get("qwen35_prefill_split_mlp", False),
             governor=run.get("governor", True),
             vision_max_patches=run.get("vision_max_patches", 0),
             warm_start=run.get("warm_start", 0),
@@ -2724,6 +2726,8 @@ class StreamingEngine:
 
         self._streamed_lm_head = None
         mxfp4_head_policy.validate(self.rc, self.cfg, self.store)
+        if self.rc.qwen35_prefill_split_mlp and not self.rc.qwen35_prefill_split_weights:
+            raise ValueError('split MLP requires split-weight prefill')
         if self.rc.qwen35_prefill_split_weights:
             from .qwen35_prefill_split import validate as validate_split_prefill
             validate_split_prefill(self.rc,self.cfg)
@@ -11286,6 +11290,7 @@ class StreamingEngine:
                 f"head{int(self.rc.stream_lm_head)}"
                 f"{mxfp4_head_policy.identity(self.rc.qwen35_mxfp4_head_rows)}"
                 f"{'qwen35-split-prefill-v1' if self.rc.qwen35_prefill_split_weights else ''}"
+                f"{'qwen35-split-mlp-spool-v1' if self.rc.qwen35_prefill_split_mlp else ''}"
                 f"tiedhead{int(self.rc.quantize_tied_lm_head)}"
                 f"resident{int(self.rc.resident_fast_decode)}"
                 f"residentprefill{self.rc.resident_fast_prefill_limit}"
