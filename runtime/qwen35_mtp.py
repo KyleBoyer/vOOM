@@ -1916,6 +1916,8 @@ class QwenMTPSpeculativeEngine:
                  sampling: SamplingParams | None = None,
                  constraint=None) -> dict:
         sampling = sampling or SamplingParams()
+        from .decode_progress import DecodeProgress, enabled as decode_progress_enabled
+        report_decode_progress = decode_progress_enabled()
         if isinstance(max_tokens, bool) or not isinstance(max_tokens, int) or max_tokens <= 0:
             raise ValueError("max_tokens must be a positive integer")
         tgt = self.target
@@ -2477,6 +2479,8 @@ class QwenMTPSpeculativeEngine:
             return False
 
         decode_t0 = time.perf_counter()
+        decode_progress = (DecodeProgress(decode_t0, max_tokens)
+                           if report_decode_progress else None)
         while (len(emitted) < max_tokens and catchup_tok not in eos
                and not grammar_completed
                and stop_text is None):
@@ -3820,6 +3824,9 @@ class QwenMTPSpeculativeEngine:
             # continue from that uncommitted value (the old behavior leaked
             # post-EOS template tokens such as ``user`` into the response).
             catchup_tok = emitted[-1] if terminal_round else next_catchup_tok
+            if decode_progress is not None:
+                decode_progress.record(len(emitted), target_decode_sweeps,
+                    proposed, accepted, final=terminal_round)
             if terminal_round:
                 break
             # Retained per-layer/KDA midpoints changed the break-even math:

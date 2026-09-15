@@ -205,6 +205,32 @@ class _RecurrentDrafter:
         return logits, next_hidden
 
 
+@pytest.mark.parametrize('temperature', [0.0, 1.0])
+def test_decode_progress_does_not_change_target_tokens_or_endpoint(temperature, monkeypatch, capsys):
+    import json
+    from runtime.decode_progress import FLAG, PREFIX
+    outcomes = []
+    for value in ('0', '1'):
+        monkeypatch.setenv(FLAG, value)
+        mx.random.seed(64013)
+        target = _Target(2)
+        engine = QwenMTPSpeculativeEngine(target, max_prompt_tokens=8,
+            min_output_tokens=2, plain_warmup_tokens=0, adaptive_stop=False, depth=2)
+        engine.drafter = _RecurrentDrafter()
+        result = engine.generate('x', 4, sampling=SamplingParams(temperature=temperature))
+        outcomes.append((result['tokens'], result['text'], target.last_kv.offset,
+                         target.endpoint_requests, target.serial_calls))
+        records = [json.loads(line.removeprefix(PREFIX))
+                   for line in capsys.readouterr().out.splitlines() if line.startswith(PREFIX)]
+        if value == '0':
+            assert records == []
+        else:
+            assert records[-1]['terminal_round']
+            assert records[-1]['accepted_output_tokens_including_bootstrap'] == len(result['tokens'])
+            assert records[-1]['target_decode_sweeps'] == result['path_stats']['qwen_mtp_target_sweeps']
+    assert outcomes[0] == outcomes[1]
+
+
 @pytest.mark.parametrize("terminal", [False, True])
 @pytest.mark.parametrize("prompt_history", [0, 2])
 def test_cached_logits_without_hidden_seed_feed_catchup_once(

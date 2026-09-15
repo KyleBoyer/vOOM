@@ -1,0 +1,8 @@
+schema: voom.runtime-profile.v1
+name: decode-progress-witness
+description: Default-off scalar-only native MTP decode progress at completed round boundaries.
+notes:
+  - "Reports accepted output count, target sweeps and draft acceptance at most once per30s plus terminal round. No prompt, generated text, token IDs, tensor evaluation, sampling or admission changes."
+  - "Not request-completion proof; an exception may leave only a partial progress record. Does not cover ordinary fallback generation or prefill."
+settings:
+  VMODEL_DECODE_PROGRESS_WITNESS: true

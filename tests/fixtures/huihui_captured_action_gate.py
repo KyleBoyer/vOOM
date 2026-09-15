@@ -334,7 +334,11 @@ def prepare_request(config):
     """
     from tests.fixtures import plex_agent_profile as plex
 
-    request, wire, metadata = prepare_case(config['case'], config['model'])
+    preserve_temperature = config.get('preserve_capture_temperature', False)
+    if preserve_temperature and config.get('workflow') != 'plex':
+        raise ValueError('captured-temperature audit currently requires full Plex workflow')
+    request, wire, metadata = prepare_case(config['case'], config['model'],
+        preserve_temperature=preserve_temperature)
     if config.get('workflow') == 'saved_budget_extension':
         return prepare_budget_extension(config, request, metadata)
     if config.get('workflow', 'initial_action') != 'saved_continuation':
@@ -563,7 +567,7 @@ def run(config):
         failures=[], source_commit=config['source_commit'])
     if workflow == 'plex':
         document.update(schema='voom.huihui-captured-plex.v1',
-            scope='Model-only capped-five-response Plex workflow: original134-tool HTTP catalog/history/stream; model/max1024/temp0/seed64013 overrides. Existing lossy gateway prepares a smaller catalog/prompt. Legacy synthetic mixed two-page fixture and unchanged rubric, with known separate-media strategy limitations. No live tool execution, host rendering, full-schema model replay or BF16 proof.')
+            scope=f'Bounded Plex workflow, at most {tool_round_budget(config)+1} HTTP responses: original134-tool HTTP catalog/history/stream; model/max1024/seed64013 overrides; temperature {request.get("temperature")} ({"preserved from capture" if config.get("preserve_capture_temperature") else "greedy override"}). Existing lossy gateway prepares a smaller catalog/prompt. Tool results: {config.get("tool_result_profile", "legacy synthetic mixed two-page fixture")}; unchanged legacy rubric. No live tool execution, host answer rendering, full-schema model replay or BF16 proof.')
     elif workflow == 'saved_continuation':
         document.update(schema='voom.huihui-saved-continuation.v1',
             scope='Diagnostic fresh-server replay of the exact saved second HTTP, reconstructed from the original134-tool capture plus the exact first model call and unchanged synthetic first page. First HTTP process/cache history is intentionally omitted. Same model/max1024/temp0/seed64013 and explicit lossy gateway preparation. No live tools, complete-workflow timing, Plex score, full-schema model replay or BF16 proof.')

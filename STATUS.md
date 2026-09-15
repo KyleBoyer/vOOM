@@ -1,5 +1,34 @@
 # STATUS — 2026-09-14 UTC (current corrections first; dated chronology below is history)
 
+## 2026-09-15 UTC: terminal greedy synthesis incomplete; captured temperature differs
+
+huihui_terminal_finite_plex_20260915 on56e5803 restored4781 decision and5599
+execution tokens across a server restart. First HTTP238.974s,67 output tokens,
+same target-token hashes as prior controls. Timing is NOT isolated: a Plex
+Transcoder started during this run (detected in final native witness). Final
+tool-free synthesis prefills in148.1748s but remained in decode when stopped
+cleanly at1550.3062s parent time. No terminal answer, no final score. Pressure
+FAIL:103,038,976B swap-out, zero growth, min4.852GB, footprint2.413GB. Sources,
+embedded results, hashes and stopped PIDs verified. Result SHA
+0816760e8e96892f4d9169bd1d98a32055f4b2fff0e0d6c8495414bb0bad07c2.
+
+Important actual-request gap: original capture temperature is1, not the0
+forced by these greedy comparison fixtures. Saved model generation_config.json
+also declares do_sample=true/temperature1/top_k20/top_p0.95; that does not imply
+those omitted fields are the serving API defaults. Explicit new fixture option
+preserves the capture temperature (and existing other sampling fields) while
+still overriding model/max1024/seed64013. Original default greedy fixture is
+unchanged. Next full test uses captured temperature1, not claimed token-equal
+to greedy. It keeps the finite synthetic tool results explicitly labeled.
+
+Default-off decode-progress-witness now logs scalar accepted-token counts,
+target sweeps and draft acceptance at completed MTP round boundaries every30s
+plus terminal round. No text/token IDs/tensor evaluation/RNG or admission change.
+246 pure regressions and94 native MTP tests pass, including enabled/disabled
+observer A/B with identical greedy AND stochastic tokens/endpoints. Native test
+gate source/log/PID proof verified. No model server currently running; full
+harness readiness remains unqualified. All user apps remain open.
+
 ## 2026-09-15 UTC: voluntary execution auto avoids abstention but still loops
 
 huihui_execution_auto_plex_20260915 on19f9dc1: completed calls550.3023s,

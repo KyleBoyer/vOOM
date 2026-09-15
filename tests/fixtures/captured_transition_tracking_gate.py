@@ -34,7 +34,9 @@ def sha(path):
         return hashlib.file_digest(f, 'sha256').hexdigest()
 
 
-def prepare_case(case, model):
+def prepare_case(case, model, *, preserve_temperature=False):
+    if type(preserve_temperature) is not bool:
+        raise ValueError('preserve_temperature must be an explicit boolean')
     raw = Path(case['capture']).read_bytes()
     if len(raw) != case['bytes'] or hashlib.sha256(raw).hexdigest() != case['sha256']:
         raise ValueError('capture identity mismatch')
@@ -44,7 +46,9 @@ def prepare_case(case, model):
     if bool(source.get('stream')) != bool(case.get('stream')):
         raise ValueError('case streaming expectation disagrees with captured transport')
     request = dict(source)
-    request.update(model=model, max_output_tokens=1024, temperature=0.0, seed=64013)
+    request.update(model=model, max_output_tokens=1024, seed=64013)
+    if not preserve_temperature:
+        request['temperature'] = 0.0
     payload = json.dumps(request, ensure_ascii=False, separators=(',', ':')).encode()
     metadata = _request_wire_metadata(payload, raw)
     if not set(metadata['request_changed_fields']) <= {'model', 'max_output_tokens', 'temperature', 'seed'}:

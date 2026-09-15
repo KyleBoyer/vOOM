@@ -44,6 +44,19 @@ def test_bad_capture_hash_rejected(tmp_path):
         gate.prepare_case(case, 'model')
 
 
+@pytest.mark.parametrize('temperature', [0, 0.4, 1])
+def test_explicit_capture_temperature_preserves_sampling_fields(tmp_path, temperature):
+    source = dict(input=[{'role':'user','content':'same'}], tools=[], stream=True,
+        temperature=temperature, top_p=0.92, top_k=20)
+    case = {**capture(tmp_path,source),'stream':True}
+    request,wire,metadata = gate.prepare_case(case,'new',preserve_temperature=True)
+    assert request == {**source,'model':'new','max_output_tokens':1024,'seed':64013}
+    assert json.loads(wire) == request
+    assert 'temperature' not in metadata['request_changed_fields']
+    with pytest.raises(ValueError,match='boolean'):
+        gate.prepare_case(case,'new',preserve_temperature=1)
+
+
 @pytest.mark.parametrize('extra', [{'messages': []}, {'max_tokens': 60}])
 def test_no_silent_chat_conversion(tmp_path, extra):
     with pytest.raises(ValueError, match='native Responses'):
