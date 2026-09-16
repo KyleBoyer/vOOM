@@ -2,6 +2,16 @@
 
 ## 2026-09-16 UTC: full concise policy regresses; Darwin swap counter correction
 
+Predicate experiment huihui_predicate_heldout_20260916 on91a5255: initial
+path/label calls pass independently123.8076/92.2857s with exact arguments.
+Saved terminal path case FAILS133.9808s: model repeats offset0 despite explicit
+hasMore=false, instead of returning requested filtered JSON. No repair/promotion.
+Whole actual swap-out/used growth0, min5.304GB,173 native samples;27,639,808B
+Pageouts separately. Sources/artifacts/stopped PIDs verified; SHA
+7f8eb5a8ef8648fa10f9b9489e3a6eb121b9347106a4d42bdc47ef065a58aa5c.
+Candidate explicitly respects tool-reported exhaustion even on a short page and
+keeps filtering/formatting local; no host-forced terminal answer or tool choice.
+
 Fresh native-counter gate huihui_actual_swap_heldout_20260916 on63c7db6 PASS:
 three unchanged saved inventory/calendar cases89.6975/64.7272/73.7829s,
 every greedy token matches prior decode-prefetch reference.112 periodic samples,
