@@ -2,6 +2,23 @@
 
 ## 2026-09-16 UTC: full concise policy regresses; Darwin swap counter correction
 
+Mixed target attempts onb8451d9: huihui_mixed_predicate_20260916 fails before
+inference0.8049s because its demand-cache BF16 draft layout is not the explicit
+sidecar layout required by draft/head release. Safety guard retained, SHA
+2f2d506b76b72991ae9b21e28c5eb11181b21dc1cf8dadbfc09a24e32d183407.
+Retry without that optional overlay completes the first saved final case in
+298.2594s but calls the correct excludePath filter again, rather than answering.
+Stopped remaining suite after this failed first case (signal2); no complete-suite
+claim. Actual swap/used growth0, min5.112GB. Sources/artifacts/stopped PIDs
+verified; SHA9b03921d1e141e118a8b39b3c1d88bde4c4185a9e727095f97c0c3835a878b10.
+Read-only inspection of local kai-plugin-plex a0c33c7 confirms real list_library
+applies filters BEFORE pagination, unlike the explicit raw filtersApplied=false
+stress fixture. A repeated correctly filtered lookup is inefficient, not itself
+a wrong final answer; these single-turn tests do not establish live-loop failure.
+The old capture still advertises advanced fields; current plugin advertises a
+simplified schema but retains backward-compatible execution. No Kai files,
+services, credentials, or live library data were modified/accessed.
+
 Original capture huihui_predicate_full_20260916 on2a78ab3 FAILS at first HTTP:
 457.0059s/80 tokens, prefill240.4688s, original134 tools/temp1/max1024.
 Again uses excludePlexLibrarySectionName=Kids, not requested root path.
