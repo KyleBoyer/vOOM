@@ -97,6 +97,9 @@ def acceptance(row, response, config, *, initial_action=True):
     witness = t.get('generation_witness') or {}
     before, after = row['pressure_before'], row['pressure_after']
     checks = action_checks(response) if initial_action else {}
+    if config.get('require_inline_conversation') is True:
+        from runtime.gateway_inline_conversation import applied
+        checks['inline_conversation_direct_used'] = applied(response.get('vmodel_tool_selection'))
     expected_description = config.get('gateway_enable_description_profile')
     if expected_description is not None:
         checks['gateway_enable_description_profile'] = (

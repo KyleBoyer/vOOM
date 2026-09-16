@@ -97,6 +97,7 @@ def test_initial_constraint_allows_real_actions_instead_of_forcing_search(reason
     def hidden(choice,force,activated):
         return 'specific:vmodel_search_tools' if force is not None else choice
     scope=dict(gateway_terminal_pagination_synthesis=False,
+        gateway_inline_conversation=False,
         gateway_deterministic_render=None,gateway_inline_initial=True,
         inline_initial_policy=policy,tool_choice='auto',gateway_force_reason=reason,
         gateway_enabled=True,gateway_activated_names=(),_hidden_gateway_decision_choice=hidden)

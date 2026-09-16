@@ -225,6 +225,9 @@ def row_checks(row, response, case, config):
             checks['stream_idle_bound'] = (
                 type(transport.get('maximum_observed_line_gap_seconds')) in (int, float)
                 and transport['maximum_observed_line_gap_seconds'] <= 45)
+    if config.get('require_inline_conversation') is True:
+        from runtime.gateway_inline_conversation import applied
+        checks['inline_conversation_direct_used'] = applied(response.get('vmodel_tool_selection'))
     if config.get('require_inline_active') is True:
         selection = response.get('vmodel_tool_selection') or {}
         checks['inline_active_catalog_used'] = (

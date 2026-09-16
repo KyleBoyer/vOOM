@@ -7,6 +7,18 @@ from tests.fixtures.plex_agent_profile import SYNTHETIC_PAGES
 from tests.fixtures.plex_finite_media import respond, PAGE5_PROFILE, PLEX_PROFILE
 
 
+@pytest.mark.parametrize('endpoint,step', [('plugin__plex__plex_list_library',3),
+    ('plugin__plex__plex_list_library_media',5)])
+def test_coverage_rejects_skipped_and_repeated_pages(endpoint, step):
+    from tests.fixtures.plex_finite_media import coverage
+    def page(offset):
+        return respond(dict(name=endpoint, arguments=dict(offset=offset, limit=100)),
+            SYNTHETIC_PAGES, profile=PLEX_PROFILE)
+    assert not coverage([page(0), page(0)], SYNTHETIC_PAGES)['passed']
+    assert not coverage([page(0), page(100)], SYNTHETIC_PAGES)['passed']
+    assert coverage([page(0), page(step)], SYNTHETIC_PAGES)['passed']
+
+
 def call(**args):
     return dict(name='plugin__plex__plex_list_library_media', arguments=args)
 

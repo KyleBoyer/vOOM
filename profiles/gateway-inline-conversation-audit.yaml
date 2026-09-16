@@ -1,0 +1,9 @@
+schema: voom.runtime-profile.v1
+name: gateway-inline-conversation-audit
+description: Explicit stable real-tool catalog and policy across initial and matched tool-result turns.
+notes:
+  - "At most four latest-user lexical candidates, unmodified schemas, plus private search. Matched continuations retain the identical catalog and instruction; out-of-catalog actions fall back to ordinary discovery."
+  - "Model selects every call, argument, page offset and answer. No host execution or output repair. This changes the prepared prompt and is not lossless. Original HTTP catalog/history remain intact."
+  - "Experimental and default off; do not combine with initial/active inline profiles. Require varied-domain multi-turn and full captured-workflow proof before promotion."
+settings:
+  VMODEL_FAST_TOOL_GATEWAY_INLINE_CONVERSATION: true

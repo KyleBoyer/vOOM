@@ -14,6 +14,24 @@ PLEX_PROFILE = 'synthetic-finite-plex-v1'
 PROFILES = (PROFILE, PAGE5_PROFILE, PLEX_PROFILE)
 
 
+def coverage(pages, source_pages):
+    """Independent complete-catalog evidence; no rubric or model repair."""
+    expected = {(kind, row['title']) for page in source_pages
+                for kind, key in (('movie', 'movies'), ('show', 'series'))
+                for row in page[key]}
+    observed = set()
+    for page in pages:
+        if 'media' in page:
+            observed.update((row['type'], row['title']) for row in page['media'])
+        else:
+            observed.update((kind, row['title'])
+                for kind, key in (('movie', 'movies'), ('show', 'series'))
+                for row in page[key])
+    return dict(passed=observed == expected, expected_rows=len(expected),
+                observed_rows=len(observed), missing_rows=len(expected-observed),
+                unexpected_rows=len(observed-expected))
+
+
 def respond(call, source_pages, *, profile=PROFILE):
     if profile not in PROFILES:
         raise ValueError('unknown finite media profile')

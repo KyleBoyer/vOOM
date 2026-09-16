@@ -1,5 +1,26 @@
 # STATUS — 2026-09-14 UTC (current corrections first; dated chronology below is history)
 
+## 2026-09-16 UTC: full replay still fails; stable conversation catalog under test
+
+huihui_draft_head_dual_full_20260915 on a1c4a92 ended after 1247.268s,
+without a final answer or Plex score. First HTTP463.036s, second716.905s,
+third66.913s failed ordinary head admission. First prefill234.218s/8479 tokens.
+Second turn rediscovered tools and repeated offset0; full execution history was
+retained (omitted_chars0), so do not blame dropped history. Native swap-out
+70,647,808B FAIL, zero swap growth, minimum4.854GB. Fresh launch minimum7.082GB
+is a host-state confound. Result SHA
+b9f7dafda3e5afeaac00468f4e95b52ebd647b2dceabdcb04a638b22114c2f6e.
+Sources, artifact hashes and stopped owned processes verified. No signal was
+sent: the driver had already ended when a bounded stop was considered.
+
+New gateway-inline-conversation-audit is opt-in: same latest-user ranked four
+real schemas and policy on initial/matched follow-up turns; private search stays
+available. Model authors every argument, page and final answer. Malformed or
+out-of-catalog history falls back. This is a prompt-changing experiment, NOT
+lossless. Finite fixtures now independently require every raw catalog row to
+have been returned; a skipped-page answer cannot pass merely by naming the
+four eligible records. Existing rubric unchanged.345 focused pure tests PASS.
+
 ## 2026-09-16 UTC: exact draft/head lifetime gate passes; full replay remains pending
 
 The original catalog has two valid listing functions, but the previous finite

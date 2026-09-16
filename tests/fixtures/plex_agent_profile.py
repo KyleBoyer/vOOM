@@ -1089,6 +1089,7 @@ def run_profile(request: dict, url: str, timeout: float,
     final_text = ""
     final_reasoning = ""
     page_index = 0
+    delivered_pages = []
     protocol_failures = []
     started = time.perf_counter()
     for turn_index in range(max_tool_rounds + 1):
@@ -1125,6 +1126,7 @@ def run_profile(request: dict, url: str, timeout: float,
                 if tool_result_profile == 'legacy'
                 else plex_finite_media.respond(call, SYNTHETIC_PAGES, profile=tool_result_profile))
         _append_call_and_result(request, call, page)
+        delivered_pages.append(page)
         turns[-1]["handled_call_count"] = 1
         # A forced choice governs the planning turn only. Keeping it on every
         # follow-up request would make a compliant model call forever even
@@ -1146,11 +1148,15 @@ def run_profile(request: dict, url: str, timeout: float,
     }
     visible_passed = all(visible_ineligible_absent.values())
     rubric["scope"] = "terminal_answer"
+    catalog_coverage = (plex_finite_media.coverage(delivered_pages, SYNTHETIC_PAGES)
+        if tool_result_profile != 'legacy' else None)
     return {
         "gate": "plex-agent-profile-v2",
         "model": request.get("model"),
         "passed": (rubric["passed"] and completion["passed"]
-                   and visible_passed and not protocol_failures),
+                   and visible_passed and not protocol_failures
+                   and (catalog_coverage is None or catalog_coverage['passed'])),
+        "catalog_coverage": catalog_coverage,
         "completion": completion,
         "protocol_failures": protocol_failures,
         "tool_results_source": ("synthetic_two_page_fixture"

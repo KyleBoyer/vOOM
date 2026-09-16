@@ -12432,6 +12432,7 @@ class Handler(BaseHTTPRequestHandler):
         gateway_initial_raw = []
         gateway_inline_active = False
         gateway_inline_initial = False
+        gateway_inline_conversation = False
         gateway_pinned = 0
         gateway_force_reason = None
         gateway_activation_key = ""
@@ -12609,7 +12610,23 @@ class Handler(BaseHTTPRequestHandler):
                     gateway_enable_description_profile == "external-only-v1")))
             from . import gateway_inline_active as inline_active_policy
             from . import gateway_inline_initial as inline_initial_policy
+            from . import gateway_inline_conversation as inline_conversation_policy
             try:
+                conversation_value = os.environ.get(inline_conversation_policy.FLAG, '0')
+                if conversation_value == '1' and (
+                        os.environ.get(inline_initial_policy.FLAG, '0') != '0'
+                        or os.environ.get(inline_active_policy.FLAG, '0') != '0'):
+                    raise ValueError('conversation inline policy cannot be combined with other inline policies')
+                conversation_candidates = inline_conversation_policy.candidates(
+                    conversation_value, messages=msgs, tools=all_tools, raw_tools=all_raw_tools,
+                    client_choice=tool_choice, force_reason=gateway_force_reason,
+                    structured_output=self._structured_output, host_route=gateway_host_route,
+                    terminal_synthesis=(gateway_terminal_pagination_synthesis
+                        or gateway_deterministic_render is not None),
+                    buffered=os.environ.get('VMODEL_FAST_TOOL_GATEWAY_BUFFER_DECISION', '0'))
+                if conversation_candidates is not None:
+                    gateway_initial_tools, gateway_initial_raw, gateway_pinned = conversation_candidates
+                    gateway_inline_conversation = True
                 initial_candidates = inline_initial_policy.candidates(
                     os.environ.get(inline_initial_policy.FLAG, '0'),
                     messages=msgs, tools=all_tools, raw_tools=all_raw_tools,
@@ -12635,6 +12652,7 @@ class Handler(BaseHTTPRequestHandler):
                     buffered=os.environ.get(
                         'VMODEL_FAST_TOOL_GATEWAY_BUFFER_DECISION', '0'))
                 gateway_inline_active = gateway_inline_active or gateway_inline_initial
+                gateway_inline_active = gateway_inline_active or gateway_inline_conversation
             except ValueError as error:
                 raise RequestValidationError(str(error)) from error
             prompt_catalog = (
@@ -12677,6 +12695,7 @@ class Handler(BaseHTTPRequestHandler):
                 decision_source_messages,
                 (_HIDDEN_GATEWAY_TERMINAL_PAGINATION_POLICY
                  if gateway_terminal_pagination_synthesis
+                 else inline_conversation_policy.POLICY if gateway_inline_conversation
                  else inline_initial_policy.POLICY if gateway_inline_initial
                  else inline_active_policy.POLICY if gateway_inline_active
                  else _HIDDEN_GATEWAY_DECISION_POLICY))
@@ -12724,6 +12743,8 @@ class Handler(BaseHTTPRequestHandler):
         gateway_decision_choice = (
             "none" if (gateway_terminal_pagination_synthesis
                        or gateway_deterministic_render is not None) else
+            inline_conversation_policy.decision_choice(tool_choice, gateway_force_reason)
+            if gateway_inline_conversation else
             inline_initial_policy.decision_choice(tool_choice, gateway_force_reason)
             if gateway_inline_initial else
             _hidden_gateway_decision_choice(
@@ -13031,6 +13052,7 @@ class Handler(BaseHTTPRequestHandler):
                     gateway_enable_description_profile),
                 "gateway_inline_active": int(gateway_inline_active),
                 "gateway_inline_initial": int(gateway_inline_initial),
+                "gateway_inline_conversation": int(gateway_inline_conversation),
                 "gateway_inline_active_tools": (
                     len(gateway_initial_tools) if gateway_inline_active else 0),
                 "gateway_host_routed": int(host_action is not None),
