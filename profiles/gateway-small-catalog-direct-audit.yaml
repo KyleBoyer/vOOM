@@ -1,0 +1,9 @@
+schema: voom.runtime-profile.v1
+name: gateway-small-catalog-direct-audit
+description: Explicit content-blind direct path for catalogs of at most four tools.
+notes:
+  - "Uses the existing minimum-catalog setting, not a new routing heuristic. All real schemas and caller tool-choice controls stay intact; no private discovery tools are added below five real tools."
+  - "Large catalogs, including the 134-tool capture, keep the existing gateway. No default change. Requalify the historical developer/two-tool regression, saved continuations and sustained output before promotion."
+  - "Changes the model prompt for small catalogs; this is not token-identical or released-weight lossless. Never repair a model-authored action or answer."
+settings:
+  VMODEL_FAST_TOOL_GATEWAY_MIN_TOOLS: 5

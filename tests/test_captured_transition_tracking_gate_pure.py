@@ -85,6 +85,24 @@ def message(text):
     return dict(type='message', content=[dict(type='output_text', text=text)])
 
 
+@pytest.mark.parametrize('change,ok', [({},True),({'hidden_tool_gateway':True},False),
+    ({'requested':True},False),({'selected':1},False),({'lossy_shortlist':True},False),
+    ({'schema_profile':'compact-no-nested-prose'},False)])
+def test_direct_catalog_requires_observed_complete_prose_and_no_gateway(change,ok):
+    selection=dict(requested=2,selected=2,lossy_shortlist=False,
+        schema_profile='selected-full-prose-compact-json')
+    checks=gate.row_checks(valid_row(),dict(vmodel_tool_selection={**selection,**change}),
+        dict(kind='short_title',topic='node',require_direct_catalog=True,expected_tool_count=2),
+        dict(profiles=['test'],profile_digest='digest'))
+    assert checks['complete_direct_catalog'] is ok
+
+
+def test_small_catalog_profile_is_only_explicit_content_blind_threshold():
+    from runtime.profiles import apply_runtime_profiles
+    env={};apply_runtime_profiles(['gateway-small-catalog-direct-audit'],environ=env)
+    assert env=={'VMODEL_FAST_TOOL_GATEWAY_MIN_TOOLS':'5'}
+
+
 def weather(city='Tokyo', name='get_weather'):
     return dict(type='function_call', name=name, arguments=json.dumps({'city': city}))
 

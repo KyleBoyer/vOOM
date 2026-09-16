@@ -215,6 +215,16 @@ def row_checks(row, response, case, config):
         actual_swap_out=after['swap_out_bytes'] - before['swap_out_bytes'] <= 16_000_000)
     if case.get('stream'):
         checks['stream_final_equal'] = row.get('streamed_text_matches_final') is True
+    if case.get('require_direct_catalog') is True:
+        selection = response.get('vmodel_tool_selection') or {}
+        count = case.get('expected_tool_count')
+        checks['complete_direct_catalog'] = (type(count) is int and count > 0
+            and selection.get('hidden_tool_gateway') is not True
+            and type(selection.get('requested')) is int
+            and type(selection.get('selected')) is int
+            and selection['requested'] == selection['selected'] == count
+            and selection.get('lossy_shortlist') is False
+            and selection.get('schema_profile') == 'selected-full-prose-compact-json')
     if config.get('require_buffered_gateway') is True:
         from tests.fixtures.huihui_captured_action_gate import model_authored_output
         selection = response.get('vmodel_tool_selection') or {}

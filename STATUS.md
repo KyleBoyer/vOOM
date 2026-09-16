@@ -2,6 +2,25 @@
 
 ## 2026-09-16 UTC: full concise policy regresses; Darwin swap counter correction
 
+huihui_anyorder_concise_full_retry_20260916 onfe9c2ee completes2004.7383s;
+HTTP634.9684/289.4495/1079.9442s, final313 tokens. Original134-tool capture,
+temperature1/max1024; synthetic raw finite Plex pages, not live Plex. Both calls
+use exact root/rating predicates, offsets0->3, full10-row coverage. All four
+eligible records appear in the matching table, but excluded titles are narrated
+and unrated title is called "not excluded" in an uncertainty section. Unchanged
+legacy85/100 FAIL. All per-HTTP/protocol checks PASS. Whole native memory PASS:
+990 samples, minimum4.937GB, actual swap-out/used growth0, footprint1.981GB;
+121,438,208B Pageouts separately. This changes BOTH prefill tile64->32 and
+cache512/prefetch1->cache256/prefetch0 plus concise prompt, so memory/timing
+differences are not a causal cache-only A/B. Slower than the1653s predecessor;
+concise policy not promoted. Sources/artifacts/stopped PIDs verified, SHA
+0088ce4203a4edc28ef4eb52b8685afba59d3c6ad8f2917a26c5c3132c15f9f0.
+The preceding non-retry wrapper failed before inference because this driver's
+--config-json takes JSON text, not a path; corrected invocation has its own ID.
+Next explicit small-catalog bypass uses the already-existing count threshold5;
+test the historical developer/two-tool shape and saved path continuation, plus
+sustained JSON output. No defaults, weights, floors, grader or argument repair.
+
 Any-order plus concise held-out run huihui_anyorder_concise_heldout_20260916
 on4680975: support exact JSON105.5742s and inventory next-page call115.5136s
 PASS. Saved path-filter terminal case561.0459s FAIL: a private search followed
