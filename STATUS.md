@@ -2,6 +2,14 @@
 
 ## 2026-09-16 UTC: new support-domain test rejects the first concise policy
 
+Revised policy on00a8f0a passes the EXACT same saved support case at temp1:
+huihui_concise_support_retry_20260916,97.2713s/18 tokens, raw exact JSON,
+no private search, useful prefetch, natural completion, no host output cleanup.
+Whole swap-out4,767,744B, zero growth, min5.276GB, footprint1.601GB. All gates
+PASS; source/artifact/stopped-PID verification complete. SHA
+422a0c7a4eadb6908d66d7de04694060781e03cfe0ceaf14b7d486f7e2e0b363.
+686 pure regression tests PASS. Full original capture qualification remains pending.
+
 huihui_concise_heldout_20260916 on95796de: inventory90.2568s/calendar75.2027s
 pass; new five-tool support case temp1 FAILS373.6258s. Correct IDs RQ-71/RQ-18
 are present, but extra prose, orphan think-close and JSON fences violate the
