@@ -2,6 +2,24 @@
 
 ## 2026-09-16 UTC: full concise policy regresses; Darwin swap counter correction
 
+**Ordering fix confirmed on original capture.** huihui_anyorder_full_20260916
+onf1e360a completes1653.277s, three HTTP463.9809/212.3506/976.5569s;
+both model-authored calls now use excludeRootFolderPath=/Kids/, offsets0->3.
+No prompt experiment/host repair; actual required and auto grammars permit the
+natural field order. Original134 tools/temp1/max1024, synthetic raw finite pages.
+All4 eligible titles are correctly included and all6 excluded correctly explained;
+legacy85/100 FAIL because rejected-title names occur in explanations. Keep score
+unchanged. Full catalog coverage and all per-HTTP/protocol checks pass.
+Whole memory FAIL: min4.425GB below4.5GB, despite0 actual swap/used growth across
+816 samples. Pageouts129,187,840B are separately labeled. Footprint2.105GB,
+compressed514MB. SHA
+c2a3170addaa89b8b8cd6c841ddb50664733d87bf33a1661353505cc34a8bb16;
+all source/artifact/stopped-PID verification complete.736 regression tests plus
+9 isolated native compiler checks passed (one unavailable tokenizer skipped).
+Next explicit candidate returns to cache256/no speculative weight prefetch for
+headroom and retests the concise-results overlay with the corrected decoder.
+No reduced memory floor, output budget, changed rubric, or ready claim.
+
 **Root cause found: declared-order tool grammar masks the correct field.**
 Installed XGrammar0.2.3 defaults any_order=False. Actual compiled capture:
 mediaType,excludeRootFolderPath,ratingOperator,movieRatingValue,showRatingValue
