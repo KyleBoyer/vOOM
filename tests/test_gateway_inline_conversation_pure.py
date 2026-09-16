@@ -97,7 +97,8 @@ def test_concise_policy_explicit_general_and_default_neutral():
     assert env=={policy.CONCISE_FLAG:'1'}
 
 
-def test_concise_contract_survives_optional_search_without_changing_authority():
+@pytest.mark.parametrize('predicate',['0','1'])
+def test_concise_contract_survives_optional_search_without_changing_authority(predicate):
     tree=ast.parse(Path('runtime/server.py').read_text())
     branch=next(n for n in ast.walk(tree) if isinstance(n,ast.If)
         and ast.unparse(n.test)=='gateway_inline_conversation'
@@ -105,11 +106,24 @@ def test_concise_contract_survives_optional_search_without_changing_authority():
             and x.target.id=='execution_policy' for x in n.body))
     for active in (False,True):
         env=dict(gateway_inline_conversation=active,inline_conversation_policy=policy,
-            conversation_concise_value='1',execution_policy='BASE',execution_choice='auto')
+            conversation_concise_value='1',conversation_predicate_value=predicate,execution_policy='BASE',execution_choice='auto')
         exec(compile(ast.fix_missing_locations(ast.Module(body=[branch],type_ignores=[])),
             '<actual execution suffix>','exec'),env)
         assert env['execution_choice']=='auto'
-        assert env['execution_policy']=='BASE'+(policy.concise_suffix('1') if active else '')
+        assert env['execution_policy']=='BASE'+(policy.concise_suffix('1')+policy.predicate_suffix(predicate) if active else '')
+
+
+def test_predicate_guidance_is_generic_opt_in_and_keeps_old_prompts():
+    assert policy.prompt_policy()==policy.POLICY
+    assert policy.prompt_policy('1')==policy.POLICY+policy.concise_suffix('1')
+    text=policy.predicate_suffix('1')
+    assert 'label condition is not a path condition' in text
+    assert 'do not narrow results by a different attribute' in text
+    assert not any(x in text for x in ('Plex','Kids','PG-13','ALPHA','score'))
+    for bad in ('auto',None,True,1):
+        with pytest.raises(ValueError):policy.predicate_suffix(bad)
+    env={};apply_runtime_profiles(['gateway-exact-predicates-audit'],environ=env)
+    assert env=={policy.PREDICATE_FLAG:'1'}
 
 
 @pytest.mark.parametrize('change', [{}, {'gateway_inline_conversation':True},

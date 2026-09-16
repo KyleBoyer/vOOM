@@ -2,6 +2,18 @@
 
 ## 2026-09-16 UTC: full concise policy regresses; Darwin swap counter correction
 
+Fresh native-counter gate huihui_actual_swap_heldout_20260916 on63c7db6 PASS:
+three unchanged saved inventory/calendar cases89.6975/64.7272/73.7829s,
+every greedy token matches prior decode-prefetch reference.112 periodic samples,
+zero actual swap-out and zero used growth,14,974,976B distinct Pageouts,
+minimum available5.333GB, footprint1.594GB. Complete source/artifact/stopped-PID
+verification; SHA8eeeff8f6134c27421690cadb37d58efb5fb4331ca73f590065bf326ddc1f22d.
+345 pure tests and separately compiled native SDK ABI PASS. This certifies the
+measurement path, not full Plex readiness. Next opt-in prompt experiment binds
+predicates to their exact semantic fields; independent counterbalanced path vs
+label cases and a stricter capture-argument oracle forbid the previous proxy
+filter. No host argument correction or changes to the legacy Plex score.
+
 huihui_concise_prefetch_full_20260916 on30589c3 FAILS:1961.6487s total,
 HTTP457.7844/210.0966/1293.3846s,80/77/418 tokens, original134-tool capture
 temp1/max1024 with explicit synthetic finite Plex results (not live Plex).

@@ -1,0 +1,5 @@
+schema: voom.runtime-profile.v1
+name: gateway-exact-predicates-audit
+description: Explicit prompt-changing field-semantics experiment; never host argument repair.
+settings:
+  VMODEL_FAST_TOOL_GATEWAY_EXACT_PREDICATES: true

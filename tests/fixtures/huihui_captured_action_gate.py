@@ -97,6 +97,10 @@ def acceptance(row, response, config, *, initial_action=True):
     witness = t.get('generation_witness') or {}
     before, after = row['pressure_before'], row['pressure_after']
     checks = action_checks(response) if initial_action else {}
+    if config.get('require_exact_capture_predicates') is True:
+        from tests.fixtures.plex_agent_profile import response_calls
+        from tests.fixtures.plex_argument_fidelity import check
+        checks['exact_capture_predicates'] = check(response_calls(response))['passed']
     if config.get('require_actual_swap_counters') is True:
         from runtime.system_swap import http_identity
         checks['actual_swap_counter_identity'] = http_identity(before,after)

@@ -7,6 +7,7 @@ from . import gateway_inline_initial as initial
 
 FLAG = 'VMODEL_FAST_TOOL_GATEWAY_INLINE_CONVERSATION'
 CONCISE_FLAG = 'VMODEL_FAST_TOOL_GATEWAY_CONCISE_RESULTS'
+PREDICATE_FLAG = 'VMODEL_FAST_TOOL_GATEWAY_EXACT_PREDICATES'
 POLICY = (
     'The supplied real functions are available now, alongside private catalog search. '
     'Read the complete conversation to distinguish pending work from completed work. '
@@ -43,8 +44,25 @@ def concise_suffix(value='0'):
         'Still inspect every required page and apply every criterion before answering.')
 
 
-def prompt_policy(value='0'):
-    return POLICY + concise_suffix(value)
+def predicate_suffix(value='0'):
+    if value not in ('0', '1'):
+        raise ValueError(PREDICATE_FLAG + ' must be 0 or 1')
+    if value == '0':
+        return ''
+    return (
+        ' Bind each requested condition to the schema field with that exact meaning. '
+        'A folder-path substring is not a collection name, label or identifier, even '
+        'when their words overlap. A label condition is not a path condition either. '
+        'Use the appropriate field and preserve literal path separators. Do not add '
+        'a proxy filter or infer that different attributes are equivalent. If no '
+        'exact filter is supported, retrieve enough raw data and check the requested '
+        'attribute locally; do not narrow results by a different attribute. '
+        'When evaluating returned records, apply all conditions independently to '
+        'each record across every page; a qualifying record must not be omitted.')
+
+
+def prompt_policy(value='0', predicate_value='0'):
+    return POLICY + concise_suffix(value) + predicate_suffix(predicate_value)
 
 
 def candidates(value, *, messages, tools, raw_tools, client_choice, force_reason,
