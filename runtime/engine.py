@@ -3169,7 +3169,8 @@ class StreamingEngine:
         workers = (self.rc.prefetch_workers or
                    (2 if self.store.packed else 1))
         self.prefetcher = (
-            Prefetcher(self.cache, page_size_hint=layer_bytes, workers=workers)
+            Prefetcher(self.cache, page_size_hint=layer_bytes, workers=workers,
+                       serial_verify_only=self.rc.qwen35_prefill_split_weights)
             if self.rc.prefetch_depth and self._resident_moe_layers is None
             else None
         )
@@ -10668,7 +10669,8 @@ class StreamingEngine:
                         layer + 1,
                         min(layer + 1 + self.rc.prefetch_depth, n)):
                     self.prefetcher.schedule(
-                        self._layer_key(nxt), self._layer_names(nxt))
+                        self._layer_key(nxt), self._layer_names(nxt),
+                        phase='serial_verify')
 
             layer_compute_t0 = time.perf_counter()
             active_before = mx.get_active_memory()

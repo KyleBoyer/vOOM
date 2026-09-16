@@ -92,11 +92,33 @@ def test_unknown_or_partial_layout_rejects(bad):
     with pytest.raises(ValueError):split.partition(bad,0)
 
 
-@pytest.mark.parametrize('key,value',[('prefetch_depth',1),('governor',False),
+@pytest.mark.parametrize('key,value',[('prefetch_depth',2),('governor',False),
     ('qwen35_mxfp4_head_rows',0),('layer_stationary_prefill',False)])
 def test_runtime_guard_rejects_unsafe_or_unqualified_config(key,value):
     rc,cfg=config();setattr(rc,key,value)
     with pytest.raises(ValueError):split.validate(rc,cfg)
+
+
+def test_split_prefill_drains_decode_worker_before_state_or_weight_changes(monkeypatch):
+    e,events,loaded=fake_engine(monkeypatch)
+    e.rc.prefetch_depth=1
+    e.prefetcher=NS(serial_verify_only=True,paused=True,
+        wait_idle=lambda:events.append(('drained',)))
+    x=np.arange(3,dtype=float).reshape(1,3,1)
+    split.sweep(e,x,{},0,2)
+    assert events[0]==('drained',) and e.prefetcher.paused is True
+    assert not loaded
+
+
+@pytest.mark.parametrize('mode',['missing','unsafe','timeout'])
+def test_decode_prefetch_boundary_fails_before_any_model_work(monkeypatch,mode):
+    e,events,loaded=fake_engine(monkeypatch)
+    e.rc.prefetch_depth=1
+    def drain(): raise TimeoutError('still busy')
+    e.prefetcher=None if mode=='missing' else NS(serial_verify_only=mode!='unsafe',wait_idle=drain)
+    with pytest.raises((ValueError,TimeoutError)):
+        split.sweep(e,np.ones((1,2,1)),{},0,2)
+    assert not events and not loaded
 
 
 @pytest.mark.parametrize('key,value',[('model_type','qwen4_exp'),('num_experts',1),

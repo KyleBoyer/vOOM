@@ -17,10 +17,14 @@ from .weight_cache import WeightCache
 
 
 class Prefetcher:
-    def __init__(self, cache: WeightCache, page_size_hint: int = 0, workers: int = 1):
+    def __init__(self, cache: WeightCache, page_size_hint: int = 0, workers: int = 1,
+                 *, serial_verify_only: bool = False):
         """workers=1 for raw safetensors (the disk is serial). For packed stores,
         workers=2 overlaps one thread's zstd decode with the other's disk read."""
         self.cache = cache
+        if type(serial_verify_only) is not bool:
+            raise ValueError('serial_verify_only must be bool')
+        self.serial_verify_only = serial_verify_only
         self.page_size_hint = page_size_hint  # bytes; used for budget check before size is known
         self._q: "queue.Queue[tuple[str, list[str], int] | None]" = (
             queue.Queue()
@@ -43,6 +47,7 @@ class Prefetcher:
         *,
         only_if_idle: bool = False,
         page_size_hint: int | None = None,
+        phase: str | None = None,
     ) -> bool:
         """Schedule one hint and report whether it was accepted.
 
@@ -51,6 +56,8 @@ class Prefetcher:
         spare slot, so the hint is dropped instead of competing with known work.
         Demand remains authoritative regardless of this advisory check.
         """
+        if self.serial_verify_only and phase != 'serial_verify':
+            return False
         if self.paused or self._closing.is_set():
             return False
         with self._lock:
@@ -137,6 +144,15 @@ class Prefetcher:
         """
         with self._lock:
             self.paused = True
+        self.wait_idle(timeout_s)
+
+    def wait_idle(self, timeout_s: float = 15.0) -> None:
+        """Drain accepted work without changing the governor's pause state.
+
+        Caller must already prohibit new producers. Split prefill uses this
+        under the serving lock with serial_verify_only admission: it cannot
+        submit eligible work until the subsequent serial verifier runs.
+        """
         deadline = time.monotonic() + max(0.0, float(timeout_s))
         while True:
             with self._lock:

@@ -32,6 +32,27 @@ class BlockingCache:
             self.second_loaded.set()
 
 
+@pytest.mark.parametrize('paused',[False,True])
+def test_serial_phase_filter_and_drain_preserve_governor_pause(paused):
+    cache=BlockingCache()
+    prefetcher=Prefetcher(cache,page_size_hint=100,serial_verify_only=True)
+    try:
+        assert not prefetcher.schedule('startup',['a'])
+        assert not prefetcher.schedule('prefill',['b'],phase='prefill')
+        assert not prefetcher._scheduled and not cache.loaded
+        assert prefetcher.schedule('verify',['c'],phase='serial_verify')
+        assert cache.started.wait(timeout=2)
+        prefetcher.paused=paused
+        with pytest.raises(TimeoutError): prefetcher.wait_idle(timeout_s=0)
+        assert prefetcher.paused is paused
+        cache.release.set()
+        prefetcher.wait_idle()
+        assert prefetcher.paused is paused and cache.loaded==['verify']
+        assert not prefetcher.schedule('new-prefill',['d'])
+    finally:
+        cache.release.set();prefetcher.close()
+
+
 def test_idle_only_speculation_does_not_build_a_backlog():
     cache = BlockingCache()
     prefetcher = Prefetcher(cache, page_size_hint=100, workers=1)

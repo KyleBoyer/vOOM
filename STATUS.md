@@ -2,6 +2,16 @@
 
 ## 2026-09-16 UTC: complete real-capture replay paginates and classifies; strict gates fail
 
+Initial prefetch attempt huihui_prefetch1_heldout_20260916 on2f9ee8d is a
+configuration FAIL before model load (0.3561s), not a speed result: split prefill
+forbids all prefetch. Artifacts/source/stopped PIDs verified; SHA
+9dcc313c63d41d8c6792ba77217dea8758eab23c8548b4f9211e417119750eef.
+Candidate now restricts split-prefill engines to one serial-verifier-only
+prefetch worker: all startup/prefill/ordinary hints are rejected, prefill drains
+accepted work before state changes, governor pause is never reset. Unknown
+worker mode or drain timeout fails before model work.562 pure/regression tests
+PASS, including actual sole call-site AST gate. Full inference proof pending.
+
 huihui_conversation_full_20260916 on5a65ad9:1585.039s total, three HTTP turns
 489.4028/250.0202/845.2221s,80/77/260 tokens. Original134-tool capture temp1,
 max1024; explicit finite synthetic Plex results, no live tools. Complete raw

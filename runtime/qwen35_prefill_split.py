@@ -2,7 +2,8 @@
 
 Each phase retains all prompt positions and the original per-tile operators.
 Only independent MLP work moves after the attention tile sequence. No expert,
-vision, boundary-fork or prefetch path is admitted by this initial experiment.
+vision, boundary-fork or prefill prefetch path is admitted. A one-layer decode
+prefetcher may exist only with serial-verifier-only admission and an idle barrier.
 """
 from __future__ import annotations
 
@@ -54,9 +55,9 @@ def partition_mlp(names, layer):
 def validate(rc,cfg,*,positions3=None,boundary_fork_at=None,boundary_fork_kv=None):
     if (cfg.model_type!='qwen3_5' or cfg.num_experts or cfg.hidden_size!=5120
             or cfg.vocab_size!=248320 or not rc.governor
-            or not rc.qwen35_mxfp4_head_rows or rc.prefetch_depth
+            or not rc.qwen35_mxfp4_head_rows or rc.prefetch_depth not in (0,1)
             or not rc.layer_stationary_prefill):
-        raise ValueError('split prefill requires native-head dense Huihui, governor and no prefetch')
+        raise ValueError('split prefill requires native-head dense Huihui, governor and at most one decode-only prefetch')
     if positions3 is not None or boundary_fork_at is not None or boundary_fork_kv is not None:
         raise ValueError('split prefill does not yet support vision or boundary forks')
 
@@ -66,6 +67,13 @@ def sweep(engine,x,kv,offset,tile_width,on_progress=None,*,layer_start=0,layer_e
           boundary_fork_at=None,boundary_fork_kv=None):
     spools=[]
     try:
+        prefetcher = getattr(engine, 'prefetcher', None)
+        if engine.rc.prefetch_depth:
+            if prefetcher is None or prefetcher.serial_verify_only is not True:
+                raise ValueError('split prefill requires serial-verifier-only prefetch admission')
+            # Drain any accepted work before retiring weight owners or changing
+            # recurrent state. Never resume a governor-paused worker here.
+            prefetcher.wait_idle()
         return _sweep(engine,x,kv,offset,tile_width,on_progress,layer_start=layer_start,
             layer_end=layer_end,profile_path=profile_path,positions3=positions3,
             boundary_fork_at=boundary_fork_at,boundary_fork_kv=boundary_fork_kv,spools=spools)
