@@ -228,6 +228,10 @@ def row_checks(row, response, case, config):
     if config.get('require_inline_conversation') is True:
         from runtime.gateway_inline_conversation import applied
         checks['inline_conversation_direct_used'] = applied(response.get('vmodel_tool_selection'))
+    if config.get('require_useful_weight_prefetch') is True:
+        checks['useful_weight_prefetch_observed'] = all(
+            type(t.get(k)) in (int, float) and t[k] > 0 for k in (
+                'weight_prefetch_useful_bytes', 'weight_prefetch_useful_load_s'))
     if config.get('require_inline_active') is True:
         selection = response.get('vmodel_tool_selection') or {}
         checks['inline_active_catalog_used'] = (

@@ -1,0 +1,9 @@
+schema: voom.runtime-profile.v1
+name: qwen35-prefetch1-cache512-audit
+description: Bounded single-layer prefetch with a512MB target cache, explicit experiment.
+notes:
+  - "Existing one-worker prefetch only schedules after current-page and scratch admission, and refuses hints that do not fit. All ordinary safety floors and margins remain unchanged."
+  - "Compared with cache256/prefetch0, this increases potential residency by256MB. Require actual useful-prefetch counters, exact greedy held-out outputs and whole-run memory gates. No default promotion or speed claim."
+settings:
+  VMODEL_QWEN35_WEIGHT_CACHE_MB: 512
+  VMODEL_QWEN35_PREFETCH_DEPTH: 1

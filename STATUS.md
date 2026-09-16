@@ -1,5 +1,27 @@
 # STATUS — 2026-09-14 UTC (current corrections first; dated chronology below is history)
 
+## 2026-09-16 UTC: complete real-capture replay paginates and classifies; strict gates fail
+
+huihui_conversation_full_20260916 on5a65ad9:1585.039s total, three HTTP turns
+489.4028/250.0202/845.2221s,80/77/260 tokens. Original134-tool capture temp1,
+max1024; explicit finite synthetic Plex results, no live tools. Complete raw
+catalog coverage10/10, model-authored offset0->3, no search, no retry, natural
+final answer. Prefix reuse8563/8908 tokens; prefill235.6335/18.9095/17.8232s.
+Final answer correctly identifies all four eligible rows and explains all six
+exclusions, but unchanged legacy rubric85/100 and visible-output gate FAIL
+because it names those rejected rows. Do not report100 or rewrite the grader.
+First two calls still substitute library-section exclusion for requested root
+exclusion; final answer manually checks actual raw root paths correctly.
+
+Whole-run memory FAIL: native76,890,112B swap-out, zero growth, min5.067GB,
+footprint1.897GB. No head refusal this run. Final decode826.334s includes
+744.880s verification,60.550s drafting;104 sweeps,155 accepted of416 proposals.
+Target weight-wait449.512s dominates; current prefetch0 has no useful prefetch.
+Sources, all artifacts and stopped owned processes verified; result SHA
+8c58c60b1fcea8633110ce3f5a1ef72b60ee95f0ad5f7c04cda5a7ea83db536b.
+NOT harness-ready. Next isolated experiment is existing bounded single-layer
+prefetch/cache512, with exact held-out token and observed-usefulness gates.
+
 ## 2026-09-16 UTC: full replay still fails; stable conversation catalog under test
 
 huihui_conversation_heldout_20260916 on5b63078 passes all three synthetic saved
