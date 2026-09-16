@@ -2,6 +2,18 @@
 
 ## 2026-09-16 UTC: full concise policy regresses; Darwin swap counter correction
 
+Any-order plus concise held-out run huihui_anyorder_concise_heldout_20260916
+on4680975: support exact JSON105.5742s and inventory next-page call115.5136s
+PASS. Saved path-filter terminal case561.0459s FAIL: a private search followed
+by another correctly filtered lookup and prose instead of requested JSON.
+Direct conversation tools were available; no forced-tool or thinking-prefix
+bug was found. Do not promote this as a general pass. Cache256/no prefetch
+passes whole-run pressure:386 native samples, minimum5.279GB, actual swap/used
+growth0;51,625,984B Pageouts separately. Source/artifact/stopped-PID verification
+complete, SHA09d6cf234f1beaef8404b5b34f9b69a4d4f3699d200f1dad5fb28b106fd99266.
+Next measure the complete original capture with that memory configuration and
+concise policy; keep the held-out failure visible regardless of the Plex score.
+
 **Ordering fix confirmed on original capture.** huihui_anyorder_full_20260916
 onf1e360a completes1653.277s, three HTTP463.9809/212.3506/976.5569s;
 both model-authored calls now use excludeRootFolderPath=/Kids/, offsets0->3.
