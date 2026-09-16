@@ -1,0 +1,9 @@
+schema: voom.runtime-profile.v1
+name: tool-argument-any-order-audit
+description: Opt-in arbitrary JSON key order for model-authored tool calls.
+notes:
+  - "XGrammar default declaration order masks valid earlier-declared fields after later fields are emitted. This changes decoding support, not weights, prompts, values or host argument selection."
+  - "Upstream any_order grammar does not enforce required-key presence or uniqueness. Existing authoritative schema validation and strict duplicate-key rejection must pass before any tool call is exposed. Invalid output remains invalid, never repaired."
+  - "Default off until native compiler, multi-domain and original-capture gates pass. Not a byte-identical-token/lossless claim versus the old constrained decoder."
+settings:
+  VMODEL_TOOL_ARGUMENT_ANY_ORDER: true

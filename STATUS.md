@@ -2,6 +2,30 @@
 
 ## 2026-09-16 UTC: full concise policy regresses; Darwin swap counter correction
 
+**Root cause found: declared-order tool grammar masks the correct field.**
+Installed XGrammar0.2.3 defaults any_order=False. Actual compiled capture:
+mediaType,excludeRootFolderPath,ratingOperator,movieRatingValue,showRatingValue
+is accepted; mediaType,ratingOperator,movieRatingValue,showRatingValue,
+excludeRootFolderPath is REJECTED, whereas the same prefix plus later-declared
+excludePlexLibrarySectionName is accepted. Both model variants naturally emit
+rating fields first. This is decoder support restriction, not established model
+inability or absent tool prose. No weight load needed for the reproduction.
+Candidate opt-in tool-argument-any-order-audit uses upstream arbitrary order in
+required and auto tool grammars. Upstream omits required/uniqueness enforcement
+in that mode: authoritative full argument-schema validation remains mandatory,
+and strict JSON decoding now rejects duplicate keys at every nesting level.
+No field/value repair or prompt rewrite.9 native compiler/token-mask/fork/rollback
+tests pass, including every three-field permutation and the actual capture;
+full inference and default promotion remain pending.
+
+Mixed full capture huihui_mixed_capture_20260916 on7dc53f7 FAILS first HTTP
+693.8359s/67 tokens, prefill248.368s. Still emits excludePlexLibrarySectionName,
+now with /Kids/ literal. Strict gate stops before tool execution; no final score.
+Actual swap/used growth0,342 native samples, min4.732GB, footprint2.123GB;
+41,828,352B Pageouts separately. Source/artifact/stopped-PID verification done;
+SHAae6bc7a5249f8c0bd20b22260563db39caf52f3b2fdeb19ea83b4740621c82e5.
+This slower target is not promoted; fix the constraint with the compact target.
+
 Mixed target attempts onb8451d9: huihui_mixed_predicate_20260916 fails before
 inference0.8049s because its demand-cache BF16 draft layout is not the explicit
 sidecar layout required by draft/head release. Safety guard retained, SHA

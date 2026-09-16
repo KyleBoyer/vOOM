@@ -69,7 +69,14 @@ def _reject_json_constant(value: str):
 
 
 def _strict_json_loads(value):
-    return json.loads(value, parse_constant=_reject_json_constant)
+    def unique(pairs):
+        result = {}
+        for key, item in pairs:
+            if key in result:
+                raise ValueError('duplicate JSON object key')
+            result[key] = item
+        return result
+    return json.loads(value, parse_constant=_reject_json_constant, object_pairs_hook=unique)
 
 
 def _search_words(value) -> list[str]:
