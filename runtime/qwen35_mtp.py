@@ -1274,7 +1274,15 @@ class QwenMTPDrafter:
         change target correctness, but would silently degrade later q."""
         eng = self.engine
         cfg = eng.cfg
+        release_before_head = getattr(self, '_head_release_enabled', False)
+        if release_before_head and weights is None:
+            raise ValueError('draft/head release requires the round-owned weight mapping')
         w = weights if weights is not None else self._weights()
+        if release_before_head and not w:
+            started = time.perf_counter()
+            w.update(self.prepare_request_weights())
+            self._head_release_stats['reloads'] += 1
+            self._head_release_stats['reload_s'] += time.perf_counter() - started
         e = eng._embed([last_token])  # (1, 1, hidden), row-paged when enabled
         e = qwen35_rms_norm(e, w["mtp.pre_fc_norm_embedding.weight"], cfg.rms_norm_eps)
         hn = qwen35_rms_norm(h_last, w["mtp.pre_fc_norm_hidden.weight"], cfg.rms_norm_eps)
@@ -1298,6 +1306,22 @@ class QwenMTPDrafter:
             mlp = _moe(
                 h, w, "mtp.layers.0", cfg, 0, self._get_experts)
         x = residual + self._project_branch(mlp)
+        final_norm = w['mtp.norm.weight']
+        if release_before_head:
+            # Evaluated recurrent output and attention KV retain their exact
+            # values. Retire intermediate graph owners before clearing BOTH
+            # the caller mapping and representation-specific weight cache.
+            mx.eval(x)
+            del e, hn, residual, h, attn, mlp
+            started = time.perf_counter()
+            before = int(mx.get_active_memory())
+            released = self.release_request_weights(w)
+            stats = self._head_release_stats
+            stats['releases'] += 1
+            stats['logical_released_bytes'] += int(released['resident_bytes'])
+            stats['observed_active_released_bytes'] += max(
+                0, before - int(mx.get_active_memory()))
+            stats['release_s'] += time.perf_counter() - started
         shared_head = eng._lm_head_weight()
         # The same physical output head serves both target verification and
         # MTP proposals. Promotion evidence is target-only: mark this one
@@ -1305,7 +1329,7 @@ class QwenMTPDrafter:
         # hidden states toward its 1,000-position gate.
         with quant.reranked_lm_head_capture_scope(shared_head, "mtp-draft"):
             logits = final_logits(
-                x, w["mtp.norm.weight"], shared_head, cfg.rms_norm_eps)
+                x, final_norm, shared_head, cfg.rms_norm_eps)
         mx.eval(logits, x)
         logits = self._detach_head_logits_for_verification(logits)
         # qwen35.final_logits already removes batch/sequence axes and returns
@@ -1921,6 +1945,8 @@ class QwenMTPSpeculativeEngine:
         sampling = sampling or SamplingParams()
         from .decode_progress import DecodeProgress, enabled as decode_progress_enabled
         report_decode_progress = decode_progress_enabled()
+        from .qwen_mtp_draft_lifetime import configure as configure_draft_lifetime
+        configure_draft_lifetime(self.drafter, self.target, QwenMTPDrafter)
         if isinstance(max_tokens, bool) or not isinstance(max_tokens, int) or max_tokens <= 0:
             raise ValueError("max_tokens must be a positive integer")
         tgt = self.target
@@ -3937,6 +3963,8 @@ class QwenMTPSpeculativeEngine:
                 drafter_telemetry = dict(drafter_telemetry_fn())
         total_s = time.perf_counter() - request_t0
         path_stats = bootstrap_stats
+        if getattr(self.drafter, '_head_release_enabled', False):
+            path_stats['qwen_mtp_draft_head_lifetime'] = dict(self.drafter._head_release_stats)
         plain_equivalent_sweeps = max(0, len(emitted) - 1)
         target_sweeps_avoided = max(
             0, plain_equivalent_sweeps - target_decode_sweeps)

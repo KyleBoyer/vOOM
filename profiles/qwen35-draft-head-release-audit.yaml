@@ -1,0 +1,8 @@
+schema: voom.runtime-profile.v1
+name: qwen35-draft-head-release-audit
+description: Experimental exact native sidecar weight lifetime split before draft head projection.
+notes:
+  - "Evaluate the draft hidden state, release consumed native draft weights, then use the unchanged full-vocabulary head. Reload identical weights before the next draft step. Target math, KV, sampling and ordinary admission margin are unchanged."
+  - "Default off. Requires native dense Qwen MTP with explicit sidecar representation and row-streamed head; no AR/dFlash/MoE fallback. Require real greedy tokens and full-run memory/time evidence."
+settings:
+  VMODEL_QWEN_MTP_RELEASE_DRAFT_BEFORE_HEAD: true
