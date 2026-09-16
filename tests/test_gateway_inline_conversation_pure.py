@@ -88,11 +88,28 @@ def test_concise_policy_explicit_general_and_default_neutral():
     concise=policy.prompt_policy('1')
     assert concise.startswith(policy.POLICY)
     assert 'unless the user asks' in concise and 'every required page' in concise
+    assert policy.concise_suffix('0') == ''
+    assert 'no preamble or Markdown fences' in concise
     assert not any(s in concise for s in ('Plex','ALPHA','PG-13','TV-Y7','score'))
     for invalid in ('auto',True,1,None):
         with pytest.raises(ValueError):policy.prompt_policy(invalid)
     env={};apply_runtime_profiles(['gateway-concise-results-audit'],environ=env)
     assert env=={policy.CONCISE_FLAG:'1'}
+
+
+def test_concise_contract_survives_optional_search_without_changing_authority():
+    tree=ast.parse(Path('runtime/server.py').read_text())
+    branch=next(n for n in ast.walk(tree) if isinstance(n,ast.If)
+        and ast.unparse(n.test)=='gateway_inline_conversation'
+        and any(isinstance(x,ast.AugAssign) and isinstance(x.target,ast.Name)
+            and x.target.id=='execution_policy' for x in n.body))
+    for active in (False,True):
+        env=dict(gateway_inline_conversation=active,inline_conversation_policy=policy,
+            conversation_concise_value='1',execution_policy='BASE',execution_choice='auto')
+        exec(compile(ast.fix_missing_locations(ast.Module(body=[branch],type_ignores=[])),
+            '<actual execution suffix>','exec'),env)
+        assert env['execution_choice']=='auto'
+        assert env['execution_policy']=='BASE'+(policy.concise_suffix('1') if active else '')
 
 
 @pytest.mark.parametrize('change', [{}, {'gateway_inline_conversation':True},

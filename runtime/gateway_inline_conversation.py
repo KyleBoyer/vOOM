@@ -26,16 +26,25 @@ POLICY = (
 )
 
 
-def prompt_policy(value='0'):
+def concise_suffix(value='0'):
     if value not in ('0', '1'):
         raise ValueError(CONCISE_FLAG + ' must be 0 or 1')
     if value == '0':
-        return POLICY
-    return POLICY + (
+        return ''
+    return (
+        ' Filtering, comparing, sorting and formatting data already returned '
+        'are local reasoning tasks, not missing external capabilities. Perform '
+        'them directly; search for tools only when additional external information '
+        'or action is genuinely necessary. When the caller requests JSON-only '
+        'output, emit one JSON value with no preamble or Markdown fences.'
         ' For a request to list matching records, return the matching records and '
         'essential caveats only. Do not enumerate rejected records or narrate routine '
         'pagination unless the user asks for exclusions, an audit, or an explanation. '
         'Still inspect every required page and apply every criterion before answering.')
+
+
+def prompt_policy(value='0'):
+    return POLICY + concise_suffix(value)
 
 
 def candidates(value, *, messages, tools, raw_tools, client_choice, force_reason,

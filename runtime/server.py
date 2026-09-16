@@ -12613,8 +12613,9 @@ class Handler(BaseHTTPRequestHandler):
             from . import gateway_inline_conversation as inline_conversation_policy
             try:
                 conversation_value = os.environ.get(inline_conversation_policy.FLAG, '0')
+                conversation_concise_value = os.environ.get(inline_conversation_policy.CONCISE_FLAG, '0')
                 conversation_prompt_policy = inline_conversation_policy.prompt_policy(
-                    os.environ.get(inline_conversation_policy.CONCISE_FLAG, '0'))
+                    conversation_concise_value)
                 if conversation_value == '1' and (
                         os.environ.get(inline_initial_policy.FLAG, '0') != '0'
                         or os.environ.get(inline_active_policy.FLAG, '0') != '0'):
@@ -13218,6 +13219,8 @@ class Handler(BaseHTTPRequestHandler):
                 _HIDDEN_GATEWAY_REAL_TOOL_POLICY
                 if execution_abstention_enabled
                 else _HIDDEN_GATEWAY_REQUIRED_REAL_TOOL_POLICY)
+            if gateway_inline_conversation:
+                execution_policy += inline_conversation_policy.concise_suffix(conversation_concise_value)
             execution_messages = _prepend_system_content(
                 internal_messages, execution_policy)
             if execution_abstention_enabled and not execution_auto:

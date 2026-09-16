@@ -1,5 +1,20 @@
 # STATUS — 2026-09-14 UTC (current corrections first; dated chronology below is history)
 
+## 2026-09-16 UTC: new support-domain test rejects the first concise policy
+
+huihui_concise_heldout_20260916 on95796de: inventory90.2568s/calendar75.2027s
+pass; new five-tool support case temp1 FAILS373.6258s. Correct IDs RQ-71/RQ-18
+are present, but extra prose, orphan think-close and JSON fences violate the
+unchanged JSON-only oracle. Unnecessary private search adds a second phase.
+Whole swap-out30,720,000B FAIL, zero growth, native min5.204GB. No promotion.
+Source/artifact/stopped-PID verification complete; SHA
+62c2d49cb93d92f998a7f03764715f04bc066189be9471a4506297149d599598.
+Inspection finds caller instructions retained, but concise guidance applied
+only to discovery and disappeared after optional search. Candidate carries the
+same generic formatting guidance into execution, without changing tool choice,
+and states that filtering already-returned data is local reasoning, not a reason
+to find another tool. No stripping fences/prose, no oracle or argument repair.
+
 ## 2026-09-16 UTC: decode-only prefetch passes exact held-out tokens and pressure
 
 huihui_decode_prefetch_heldout_20260916 on89f3e19: three saved synthetic histories
