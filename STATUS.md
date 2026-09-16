@@ -1,5 +1,32 @@
 # STATUS — 2026-09-14 UTC (current corrections first; dated chronology below is history)
 
+## 2026-09-16 UTC: full concise policy regresses; Darwin swap counter correction
+
+huihui_concise_prefetch_full_20260916 on30589c3 FAILS:1961.6487s total,
+HTTP457.7844/210.0966/1293.3846s,80/77/418 tokens, original134-tool capture
+temp1/max1024 with explicit synthetic finite Plex results (not live Plex).
+Coverage10/10 and offset0->3 pass, but final omits CHARLIE_TVY:81.25/100,
+a genuine quality failure. Concise overlay also fails to shorten the answer.
+Do not promote. Result SHA09c80ec8dd7228b3af61214a8919421e67ace3a52b506696f612eb32ec1f12fb;
+source/artifact/stopped-PID checks completed before subsequent source edits.
+Minimum available4.823GB, zero net swap-used growth. One of969 host-inventory
+samples failed with SystemError (no known transcoders listed); unknown is not
+a clean isolation proof. Its failure remains recorded, not waived.
+
+Measurement correction: installed psutil7.2.2 Darwin sin/sout equal vm_stat
+Pageins/Pageouts, NOT compressor Swapins/Swapouts. Historical entries calling
+these values actual swap-out are mislabeled proxy measurements; preserve the
+artifacts/verdicts, do not retroactively pass them. The full run's98,582,528B
+is Pageouts. Actual Swapouts stayed5662445 at spot checks AFTER HTTP1, but
+there is no start-of-run sample, hence no whole-run actual-swap proof.
+New source-labeled HOST_VM_INFO64 REV1 reader independently matches compiled
+SDK ABI:152 bytes/count38, swapins offset112, swapouts120. Fresh qualification
+requires native preflight, HTTP endpoints and every periodic witness record.
+Missing/short/inconsistent evidence fails;16MB actual-swap/usage gates and
+4.5GB runtime/5.5GB launch floors are unchanged. Governor retains its existing
+conservative psutil paging response. Native qualification and full harness
+readiness remain pending; no serving endpoint or readiness claim.
+
 ## 2026-09-16 UTC: new support-domain test rejects the first concise policy
 
 Revised policy on00a8f0a passes the EXACT same saved support case at temp1:

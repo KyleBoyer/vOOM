@@ -27,6 +27,7 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 
 import psutil
+from .system_swap import swap_memory
 
 
 @dataclass(frozen=True)
@@ -40,11 +41,14 @@ class PressureSnapshot:
     swap_out_bytes: int
     root_free_bytes: int
     workspace_free_bytes: int
+    swap_counter_source: str = 'legacy-unqualified'
+    page_in_bytes: int | None = None
+    page_out_bytes: int | None = None
 
 
 def capture(workspace: Path) -> PressureSnapshot:
     virtual = psutil.virtual_memory()
-    swap = psutil.swap_memory()
+    swap = swap_memory()
     return PressureSnapshot(
         monotonic_s=time.monotonic(),
         system_available_bytes=int(virtual.available),
@@ -55,6 +59,8 @@ def capture(workspace: Path) -> PressureSnapshot:
         swap_out_bytes=int(swap.sout),
         root_free_bytes=int(shutil.disk_usage("/").free),
         workspace_free_bytes=int(shutil.disk_usage(workspace).free),
+        swap_counter_source=swap.source,
+        page_in_bytes=swap.page_in_bytes,page_out_bytes=swap.page_out_bytes,
     )
 
 
@@ -130,7 +136,11 @@ def sample_pressure_window(seconds, *, sample, activity=None,
                     or not math.isfinite(point.monotonic_s)
                     or point.monotonic_s < previous
                     or any(type(value) is not int or value < 0 for key, value
-                           in asdict(point).items() if key != "monotonic_s")):
+                           in asdict(point).items() if key not in
+                           ("monotonic_s", "swap_counter_source", "page_in_bytes", "page_out_bytes"))
+                    or not isinstance(point.swap_counter_source, str)
+                    or any(value is not None and (type(value) is not int or value < 0)
+                           for value in (point.page_in_bytes, point.page_out_bytes))):
                 result['reason'] = 'invalid-pressure-sample'
                 return result
             result['snapshots'].append(point)

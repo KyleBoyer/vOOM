@@ -10,6 +10,11 @@ def available_floor(config):
 
 def validate(config, env, preflight):
     floor = available_floor(config)
+    if config.get('require_actual_swap_counters') is True:
+        from runtime.system_swap import SOURCE, FLAG
+        assert env.get(FLAG)=='1'
+        points=[preflight['start'],*preflight['pressure_window']['samples'],preflight['end']]
+        assert all(p.get('swap_counter_source')==SOURCE for p in points)
     if floor == 4_500_000_000:
         assert 'qwen35-reserve4500-audit' in config['profiles']
         assert env.get('VMODEL_QWEN35_MIN_AVAILABLE_MB') == '4500'

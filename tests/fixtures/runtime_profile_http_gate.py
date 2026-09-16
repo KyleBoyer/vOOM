@@ -33,6 +33,7 @@ sys.path.insert(0, str(ROOT))
 from runtime.profiles import (discover_runtime_profiles,
                               resolve_runtime_profiles,
                               runtime_profile_dirs)
+from runtime.system_swap import swap_memory
 
 
 @dataclass(frozen=True)
@@ -40,15 +41,18 @@ class Pressure:
     available_bytes: int
     swap_used_bytes: int
     swap_out_bytes: int
+    swap_counter_source: str = 'legacy-unqualified'
+    page_out_bytes: int | None = None
 
 
 def _pressure() -> Pressure:
     memory = psutil.virtual_memory()
-    swap = psutil.swap_memory()
+    swap = swap_memory()
     return Pressure(
         available_bytes=int(memory.available),
         swap_used_bytes=int(swap.used),
         swap_out_bytes=int(swap.sout),
+        swap_counter_source=swap.source,page_out_bytes=swap.page_out_bytes,
     )
 
 

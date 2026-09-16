@@ -1,0 +1,10 @@
+schema: voom.runtime-profile.v1
+name: darwin-actual-swap-witness
+description: Observe actual Darwin compressor swap separately from page-in/page-out activity.
+notes:
+  - "Native HOST_VM_INFO64 REV1 swapins/swapouts, with source and page-size metadata. Missing/short native data fails qualification."
+  - "Does not alter governor decisions or safety thresholds. Its legacy psutil paging response remains conservative; new qualification measures actual swap activity and retains paging diagnostics separately."
+extends:
+  - process-memory-witness
+settings:
+  VMODEL_ACTUAL_SWAP_WITNESS: true

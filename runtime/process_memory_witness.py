@@ -241,6 +241,11 @@ class GovernorProcessMemoryObserver:
         }
         if alignment is not None:
             row["reclamation_alignment"] = alignment
+        # Preserve the governor's existing conservative paging response.
+        # Qualification separately observes actual Darwin swap counters.
+        if os.environ.get('VMODEL_ACTUAL_SWAP_WITNESS', '0') == '1':
+            from .system_swap import sample_native_counters
+            row['actual_swap_counters'] = sample_native_counters()
         if self.host_activity_sample is not None:
             try:
                 row['known_transcoders'] = self.host_activity_sample()

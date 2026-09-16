@@ -97,6 +97,9 @@ def acceptance(row, response, config, *, initial_action=True):
     witness = t.get('generation_witness') or {}
     before, after = row['pressure_before'], row['pressure_after']
     checks = action_checks(response) if initial_action else {}
+    if config.get('require_actual_swap_counters') is True:
+        from runtime.system_swap import http_identity
+        checks['actual_swap_counter_identity'] = http_identity(before,after)
     if config.get('require_inline_conversation') is True:
         from runtime.gateway_inline_conversation import applied
         checks['inline_conversation_direct_used'] = applied(response.get('vmodel_tool_selection'))
@@ -615,7 +618,8 @@ def run(config):
             document['server_returncode'] = server.returncode
         try:
             document['server_log_sha256'] = sha(config['server_log'])
-            document['native_pressure'] = native_pressure_summary(Path(config['server_log']).read_text(), minimum_available_bytes=required_available)
+            document['native_pressure'] = native_pressure_summary(Path(config['server_log']).read_text(), minimum_available_bytes=required_available,
+                require_actual_swap_counters=config.get('require_actual_swap_counters',False))
         except (OSError, ValueError, TypeError, KeyError):
             document['native_pressure'] = dict(available=False, passed=False)
         if not document['native_pressure'].get('passed'):

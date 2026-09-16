@@ -188,6 +188,9 @@ def row_checks(row, response, case, config):
     witness = t.get('generation_witness') or {}
     before, after = row['pressure_before'], row['pressure_after']
     checks = dict(semantic_checks(response, case))
+    if config.get('require_actual_swap_counters') is True:
+        from runtime.system_swap import http_identity
+        checks['actual_swap_counter_identity'] = http_identity(before,after)
     checks.update(
         completed=row.get('http_status') == 200 and row.get('response_status') == 'completed'
             and not row.get('error'),
@@ -309,7 +312,8 @@ def row_checks(row, response, case, config):
     return checks
 
 
-def native_pressure_summary(log_text, *, minimum_available_bytes=5_300_000_000):
+def native_pressure_summary(log_text, *, minimum_available_bytes=5_300_000_000,
+                            require_actual_swap_counters=False):
     from tests.fixtures.huihui_memory_policy import available_floor
     minimum_available_bytes = available_floor({'minimum_available_bytes': minimum_available_bytes})
     records = [json.loads(line[len('[process-memory] '):]) for line in log_text.splitlines()
@@ -317,12 +321,24 @@ def native_pressure_summary(log_text, *, minimum_available_bytes=5_300_000_000):
     if not records or not all(r.get('process', {}).get('available') is True for r in records):
         return {'available': False, 'passed': False}
     first = records[0]
+    native = None
+    if require_actual_swap_counters or any('actual_swap_counters' in r for r in records):
+        from runtime.system_swap import summarize_native
+        native = summarize_native([r.get('actual_swap_counters',{}) for r in records])
+        if not native['available']:
+            return dict(available=False,passed=False,native_swap_counters=native)
     result = dict(available=True, samples=len(records),
         minimum_available_bytes=min(r['system_available_bytes'] for r in records),
         maximum_footprint_bytes=max(r['process']['physical_footprint_bytes'] for r in records),
         maximum_compressed_bytes=max(r['process']['internal_compressed_ledger_bytes'] for r in records),
         swap_used_growth_bytes=max(r['system_swap_used_bytes'] for r in records)-first['system_swap_used_bytes'],
         actual_swap_out_growth_bytes=max(r['system_swap_out_bytes'] for r in records)-first['system_swap_out_bytes'])
+    result['swap_counter_source'] = 'legacy-psutil-proxy-unqualified'
+    if native is not None:
+        result['legacy_psutil_out_growth_bytes'] = result['actual_swap_out_growth_bytes']
+        result['actual_swap_out_growth_bytes'] = native['swap_out_growth_bytes']
+        result['native_swap_counters'] = native
+        result['swap_counter_source'] = native['source']
     result['required_minimum_available_bytes'] = minimum_available_bytes
     result['passed'] = (result['minimum_available_bytes'] >= minimum_available_bytes
         and result['swap_used_growth_bytes'] <= 16_000_000
@@ -460,7 +476,8 @@ def run(config):
             if history is not None and document['history_sha256_after'] != config['history_sha256']:
                 failures.append('saved transition history changed')
             try:
-                document['native_pressure'] = native_pressure_summary(Path(config['server_log']).read_text(), minimum_available_bytes=required_available)
+                document['native_pressure'] = native_pressure_summary(Path(config['server_log']).read_text(), minimum_available_bytes=required_available,
+                    require_actual_swap_counters=config.get('require_actual_swap_counters',False))
             except (ValueError, TypeError, KeyError):
                 document['native_pressure'] = {'available': False, 'passed': False}
             if not document['native_pressure']['passed']:

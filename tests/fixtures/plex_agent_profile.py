@@ -386,12 +386,15 @@ def score_actual_export(final_text: str, export_calls: list[dict]) -> dict:
 
 
 def _pressure() -> dict[str, int]:
+    from runtime.system_swap import swap_memory
     memory = psutil.virtual_memory()
-    swap = psutil.swap_memory()
+    swap = swap_memory()
     return {
         "available_bytes": int(memory.available),
         "swap_used_bytes": int(swap.used),
         "swap_out_bytes": int(swap.sout),
+        "swap_counter_source": swap.source,
+        "page_out_bytes": swap.page_out_bytes,
     }
 
 
