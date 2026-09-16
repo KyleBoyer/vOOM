@@ -10,13 +10,16 @@ import copy
 
 PROFILE = 'synthetic-finite-media-v1'
 PAGE5_PROFILE = 'synthetic-finite-media-page5-v1'
-PROFILES = (PROFILE, PAGE5_PROFILE)
+PLEX_PROFILE = 'synthetic-finite-plex-v1'
+PROFILES = (PROFILE, PAGE5_PROFILE, PLEX_PROFILE)
 
 
 def respond(call, source_pages, *, profile=PROFILE):
     if profile not in PROFILES:
         raise ValueError('unknown finite media profile')
-    if call.get('name') != 'plugin__plex__plex_list_library_media':
+    library = (profile == PLEX_PROFILE
+               and call.get('name') == 'plugin__plex__plex_list_library')
+    if not library and call.get('name') != 'plugin__plex__plex_list_library_media':
         raise ValueError('finite media fixture only supports the media endpoint')
     args = call.get('arguments')
     if not isinstance(args, dict):
@@ -30,13 +33,31 @@ def respond(call, source_pages, *, profile=PROFILE):
         if type(value) not in (int, float) or not float(value).is_integer() or value < minimum:
             raise ValueError('invalid ' + name)
         return int(value)
-    limit = min(5 if profile == PAGE5_PROFILE else 500, integer('limit', 100, 1))
+    cap = 3 if library else 5 if profile in (PAGE5_PROFILE, PLEX_PROFILE) else 500
+    limit = min(cap, integer('limit', 100, 1))
     offset = integer('offset', 0, 0)
     # Fail visibly if an unsupported query needs semantics this finite catalog
     # cannot provide, rather than silently claiming the filter was applied.
     for name in ('query', 'sectionId', 'sectionName', 'year', 'minYear', 'maxYear'):
         if args.get(name) is not None:
             raise ValueError('unsupported finite-catalog filter: ' + name)
+    if library:
+        # Separate movie/series streams share the caller's offset, matching
+        # the library endpoint's two has-more witnesses. This explicit fixture
+        # has a three-record cap PER TYPE, not the media endpoint's combined
+        # five-record cap. No filtering, call/argument repair or shared cursor.
+        result = dict(limit=limit, offset=offset, filtersApplied=False,
+            notice='Synthetic raw catalog. Rating, root-location and library-section filters are NOT applied; verify every returned record against the user criteria.')
+        for media_type, key, singular in (('movie', 'movies', 'movie'),
+                                         ('show', 'series', 'series')):
+            rows = [copy.deepcopy(row) for page in source_pages for row in page[key]]
+            rows = sorted(rows, key=lambda row: row['title']) if kind in ('all', media_type) else []
+            selected = rows[offset:offset + limit]
+            result[key] = selected
+            result[singular + 'Total'] = len(rows)
+            result[singular + 'Returned'] = len(selected)
+            result[singular + 'HasMore'] = offset + len(selected) < len(rows)
+        return result
     rows = []
     for page in source_pages:
         for media_type, key in (('movie', 'movies'), ('show', 'series')):

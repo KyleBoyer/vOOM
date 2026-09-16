@@ -1,9 +1,10 @@
 import copy
+import json
 
 import pytest
 
 from tests.fixtures.plex_agent_profile import SYNTHETIC_PAGES
-from tests.fixtures.plex_finite_media import respond, PAGE5_PROFILE
+from tests.fixtures.plex_finite_media import respond, PAGE5_PROFILE, PLEX_PROFILE
 
 
 def call(**args):
@@ -55,3 +56,66 @@ def test_explicit_server_cap_requires_real_pagination_without_changing_records()
     assert not respond(call(offset=10),SYNTHETIC_PAGES,profile=PAGE5_PROFILE)['media']
     with pytest.raises(ValueError):
         respond(call(),SYNTHETIC_PAGES,profile='invented')
+
+
+@pytest.mark.parametrize('kind', ['all', 'movie', 'show'])
+def test_dual_endpoint_library_has_exact_finite_independent_streams(kind):
+    source=copy.deepcopy(SYNTHETIC_PAGES)
+    def request(offset):
+        return dict(name='plugin__plex__plex_list_library',
+            arguments=dict(mediaType=kind,limit=100,offset=offset,
+                excludePlexLibrarySectionName='Kids',movieRatingValue='PG-13'))
+    recovered={'movies':[], 'series':[]}
+    for offset in (0,3,6):
+        page=respond(request(offset),source,profile=PLEX_PROFILE)
+        assert page['limit']==3 and page['offset']==offset
+        assert page['filtersApplied'] is False
+        for media_type,key,prefix in [('movie','movies','movie'),('show','series','series')]:
+            expected=sorted([r for p in source for r in p[key]],key=lambda r:r['title']) if kind in ('all',media_type) else []
+            assert page[key]==expected[offset:offset+3]
+            assert page[prefix+'Total']==len(expected)
+            assert page[prefix+'Returned']==len(page[key])
+            assert page[prefix+'HasMore']==(offset+len(page[key])<len(expected))
+            recovered[key].extend(page[key])
+        respond(call(mediaType='all'),source,profile=PLEX_PROFILE)
+    assert source==SYNTHETIC_PAGES
+    if kind!='show':
+        # An erroneous section predicate is not repaired or silently applied.
+        assert any(r['contentRating']=='R' for r in recovered['movies'])
+        assert any('/Kids/' in r['rootFolderPath'] for r in recovered['movies'])
+
+
+def test_old_profiles_still_reject_library_and_new_profile_rejects_mutation():
+    library=dict(name='plugin__plex__plex_list_library',arguments={})
+    with pytest.raises(ValueError):
+        respond(library,SYNTHETIC_PAGES,profile=PAGE5_PROFILE)
+    with pytest.raises(ValueError):
+        respond(dict(name='plugin__plex__plex_move_media',arguments={}),
+                SYNTHETIC_PAGES,profile=PLEX_PROFILE)
+    assert respond(call(),SYNTHETIC_PAGES,profile=PLEX_PROFILE)==respond(
+        call(),SYNTHETIC_PAGES,profile=PAGE5_PROFILE)
+
+
+def test_real_workflow_appends_library_results_and_keeps_grader(monkeypatch):
+    from tests.fixtures import plex_agent_profile as fixture
+    responses=[{'status':'completed','output':[dict(type='function_call',
+        name=fixture.PLEX_TOOL,call_id='page'+str(offset),arguments=json.dumps(dict(
+            mediaType='all',offset=offset,limit=3,excludeRootFolderPath='/Kids/',
+            ratingOperator='lte',movieRatingValue='PG-13',showRatingValue='TV-Y7')))]}
+        for offset in (0,3)]
+    responses.append({'status':'completed','output':[dict(type='message',content=[
+        dict(type='output_text',text='ALPHA_G BRAVO_PG13 CHARLIE_TVY DELTA_TVY7')])]})
+    seen=[]
+    def post(url,request,timeout):
+        seen.append(copy.deepcopy(request));return responses[len(seen)-1],1.0
+    monkeypatch.setattr(fixture,'_post',post)
+    monkeypatch.setattr(fixture,'_pressure',lambda:{})
+    result=fixture.run_profile(dict(model='fake',input=[],tools=[]),'unused',1,4,
+                              tool_result_profile=PLEX_PROFILE)
+    assert result['passed'] and result['rubric']['score']==100
+    assert [t['handled_call_count'] for t in result['turns']]==[1,1,0]
+    first=json.loads(seen[1]['input'][-1]['output'])
+    second=json.loads(seen[2]['input'][-1]['output'])
+    assert first['movieHasMore'] and first['seriesHasMore']
+    assert not second['movieHasMore'] and not second['seriesHasMore']
+    assert len(first['movies'])==3 and len(second['movies'])==2
