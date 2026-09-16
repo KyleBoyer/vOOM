@@ -269,6 +269,8 @@ its different tool results must not be labeled a legacy-workflow speed win.
         print(json.dumps(dict(plex_turn=index, wall_seconds=row.get('wall_seconds'),
             output_tokens=(row.get('usage') or {}).get('output_tokens'),
             checks=checks)), flush=True)
+        if config.get('require_exact_capture_predicates') is True and not checks['exact_capture_predicates']:
+            raise RuntimeError('Model-authored call substitutes or adds a restrictive predicate; fixture will not execute it')
         if not checks['completed'] or not checks['not_output_capped'] or not checks['model_authored_output']:
             raise RuntimeError('Plex turn did not naturally complete with model-authored output')
         if config.get('require_all_phase_completion', False) and not all(

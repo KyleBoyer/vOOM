@@ -58,13 +58,7 @@ def predicate_suffix(value='0'):
         'exact filter is supported, retrieve enough raw data and check the requested '
         'attribute locally; do not narrow results by a different attribute. '
         'When evaluating returned records, apply all conditions independently to '
-        'each record across every page; a qualifying record must not be omitted. '
-        'Honor explicit pagination completion metadata: hasMore=false means that '
-        'query is exhausted, even when fewer rows than the requested limit were '
-        'returned. Do not repeat a completed query merely to confirm its row count. '
-        'Once all required queries are exhausted, filtering and formatting their '
-        'returned data are local reasoning, not additional tool operations. Return '
-        'the requested answer directly in the requested format.')
+        'each record across every page; a qualifying record must not be omitted.')
 
 
 def prompt_policy(value='0', predicate_value='0'):

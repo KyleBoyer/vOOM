@@ -2,6 +2,20 @@
 
 ## 2026-09-16 UTC: full concise policy regresses; Darwin swap counter correction
 
+Exhaustion-text retry huihui_predicate_exhaustion_20260916 ondb3707c is rejected:
+the same first terminal case completed588.977s/177 tokens with long reasoning
+and another offset0 call, despite identifying the two correct records in prose.
+Actual gateway force_reason is null, so this is NOT a forced-tool constraint.
+Owned driver was interrupted after that completed failed first case; remaining
+cases are unqualified, wrapper signal2 (not a naturally completed suite).
+All owned PIDs stopped; source/artifact hashes verified. Result SHA
+0a70db43602540e98670268b0a696effb5329f5846e65c336c7e2ed063ab94c0.
+Whole actual swap/used growth0. Revert the additional exhaustion text to the
+prior explicit predicate experiment; no default changed. Full replay now stops
+before executing a fixture call if the new independent predicate gate fails,
+while preserving the raw HTTP receipt. This saves wasted later decode and does
+not repair arguments, alter tool results, or turn an invalid call into success.
+
 Predicate experiment huihui_predicate_heldout_20260916 on91a5255: initial
 path/label calls pass independently123.8076/92.2857s with exact arguments.
 Saved terminal path case FAILS133.9808s: model repeats offset0 despite explicit
