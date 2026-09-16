@@ -2,6 +2,17 @@
 
 ## 2026-09-16 UTC: full concise policy regresses; Darwin swap counter correction
 
+Original capture huihui_predicate_full_20260916 on2a78ab3 FAILS at first HTTP:
+457.0059s/80 tokens, prefill240.4688s, original134 tools/temp1/max1024.
+Again uses excludePlexLibrarySectionName=Kids, not requested root path.
+Independent argument gate stops before fixture execution; no final Plex score.
+Actual swap/used growth0,225 native samples, min5.089GB, footprint1.921GB;
+Pageouts14,860,288B distinct. Source/artifact/stopped-PID verification complete;
+SHAebb2dc171aef4b91f8e6c801717b0db99a13bc8abbcf167b0fd7af0e156581fe.
+Prompt changes have not solved the failure; next test uses the existing higher-
+precision attention8bit/last4BF16 target with BF16 MTP. Not lossless relative to
+released BF16, not a default promotion, and no new checkpoint download needed.
+
 Exhaustion-text retry huihui_predicate_exhaustion_20260916 ondb3707c is rejected:
 the same first terminal case completed588.977s/177 tokens with long reasoning
 and another offset0 call, despite identifying the two correct records in prose.
