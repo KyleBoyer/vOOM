@@ -62,8 +62,21 @@ def test_fixture_requires_applied_release_not_only_flag(change,expected):
     from tests.test_captured_transition_tracking_gate_pure import valid_row
     row=valid_row()
     row['timing']['qwen_mtp_draft_head_lifetime']=dict(enabled=1,releases=8,reloads=6,
-        logical_released_bytes=8000,observed_active_released_bytes=7990,**{})
+        logical_released_bytes=8000,observed_active_released_bytes=7990)
     row['timing']['qwen_mtp_draft_head_lifetime'].update(change)
     checks=row_checks(row,{},dict(kind='short_title',topic='node'),
         dict(profiles=['test'],profile_digest='digest',require_draft_head_release=True))
     assert checks['draft_head_weights_released_and_reloaded'] is expected
+
+@pytest.mark.parametrize('phases,expected',[(None,False),([],False),([{}],False),
+    ([{'qwen_mtp_draft_head_lifetime':dict(enabled=1,releases=4,reloads=3,
+        logical_released_bytes=100,observed_active_released_bytes=90)}],True)])
+def test_full_workflow_requires_every_phase(phases,expected):
+    tree=ast.parse(Path('tests/fixtures/huihui_captured_action_gate.py').read_text())
+    branch=next(n for n in ast.walk(tree) if isinstance(n,ast.If)
+        and ast.unparse(n.test)=="config.get('require_draft_head_release') is True")
+    scope=dict(config={'require_draft_head_release':True},checks={},
+               response={'vmodel_cache_phases':phases})
+    exec(compile(ast.fix_missing_locations(ast.Module(body=[branch],type_ignores=[])),
+                 '<actual full workflow acceptance>','exec'),scope)
+    assert scope['checks']['all_phase_draft_head_release'] is expected

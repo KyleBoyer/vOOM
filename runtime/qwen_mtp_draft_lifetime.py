@@ -4,6 +4,15 @@ import os
 FLAG = 'VMODEL_QWEN_MTP_RELEASE_DRAFT_BEFORE_HEAD'
 
 
+def applied(stats):
+    """Scalar evidence gate shared by short-request and full-workflow audits."""
+    return (isinstance(stats, dict)
+        and type(stats.get('enabled')) is int and stats['enabled'] == 1
+        and all(type(stats.get(k)) is int and stats[k] > 0 for k in (
+            'releases', 'reloads', 'logical_released_bytes',
+            'observed_active_released_bytes')))
+
+
 def configure(drafter, target, native_type, environ=None):
     value = (os.environ if environ is None else environ).get(FLAG, '0')
     if value not in ('0', '1'):

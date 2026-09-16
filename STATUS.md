@@ -1,5 +1,44 @@
 # STATUS — 2026-09-14 UTC (current corrections first; dated chronology below is history)
 
+## 2026-09-16 UTC: exact draft/head lifetime gate passes; full replay remains pending
+
+The original catalog has two valid listing functions, but the previous finite
+fixture supported media only. New explicit synthetic-finite-plex-v1 supports
+library too, with three rows PER TYPE and independent offset/hasMore streams;
+media retains its five-row combined cap. Same ten raw records, no applied
+filters/argument repair, unchanged grader.177 fixture/regression tests PASS.
+
+huihui_dual_nocache_full_20260915 on3dd30c8: original134-tool capture temp1,
+max1024, tile128; failed289.8194s during native MTP draft-head admission after
+236.4855s prefill. No answer/score. Pressure passes12,746,752B swap-out,
+zero growth, min4.739GB but does not waive instantaneous admission. Result SHA
+79ee842d2e3349bb2b9bfb97519ff6fcc3725ab879fe0e3ab924999fcb14ac65.
+
+New qwen35-draft-head-release-audit evaluates the draft endpoint then clears
+consumed native MTP weights before the unchanged full-vocabulary head. Same
+weights reload for the next draft step. Default off; ordinary margin/floors
+unchanged, no retry of advanced KV.112 native tests PASS (tiny actual BF16 and
+MXFP4 draft math, four-step logits/hidden/KV/RNG exactness, head failure cleanup
+and existing MTP regressions).521 pure/protocol/fixture tests PASS after fixing
+both telemetry exports. This is not a full-model release-BF16 lossless claim.
+
+huihui_draft_head_nocache_heldout_20260915 on30cf22b: unchanged synthetic
+inventory/calendar, max1024/temp0,121.3470s/153.6524s,40/45 tokens. All saved
+target tokens/arguments match, direct F_NOCACHE17 descriptors and actual draft
+release/reload witnessed. Per-request checks pass, WHOLE-ARM pressure FAILS
+18,038,784B swap-out (native17,432,576B), zero growth, min4.736GB.
+Result SHA58441246d15c0ab8eca3ec8ad03f0b1761c298abd97207e8386d1d7afabf980e.
+
+huihui_draft_head_normal_heldout_20260915 same source: normal reads with exact
+fresh-server308/315-token prefix restores.75.4207s/96.1607s,40/45 tokens,
+every reference token and all gates PASS. Whole swap-out14,073,856B, zero growth,
+native min5.247GB, footprint1.361GB. Actual37/49 weight releases and27/36
+reloads; summed observed active release7.654GB/9.924GB (NOT peak RAM saved).
+Result SHA6568a9850ee19df827b451ab55151461dd5d80d5fa2da3ee791e6bc47d5b47c7.
+All source/artifact hashes and stopped owned PIDs verified. No whole-workflow
+speed/quality or readiness claim; uncached reads not promoted. Full workflow
+now requires an applied draft-release witness on every phase when requested.
+
 ## 2026-09-15 UTC: initial constraint fix passes two domains; full replay still fails
 
 Once the forced-private-search defect is fixed, two synthetic held-out requests

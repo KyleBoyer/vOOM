@@ -262,12 +262,9 @@ def row_checks(row, response, case, config):
             and type(spill.get('logical_bytes_peak')) is int
             and 0 < spill['logical_bytes_peak'] <= 512_000_000)
     if config.get('require_draft_head_release') is True:
-        lifetime = t.get('qwen_mtp_draft_head_lifetime') or {}
-        checks['draft_head_weights_released_and_reloaded'] = (
-            type(lifetime.get('enabled')) is int and lifetime['enabled'] == 1
-            and all(type(lifetime.get(k)) is int and lifetime[k] > 0 for k in (
-                'releases', 'reloads', 'logical_released_bytes',
-                'observed_active_released_bytes')))
+        from runtime.qwen_mtp_draft_lifetime import applied
+        checks['draft_head_weights_released_and_reloaded'] = applied(
+            t.get('qwen_mtp_draft_head_lifetime'))
     if 'minimum_output_tokens' in case:
         minimum = case['minimum_output_tokens']
         if type(minimum) is not int or not 1 <= minimum < 1024:

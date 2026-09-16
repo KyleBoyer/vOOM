@@ -191,6 +191,13 @@ def acceptance(row, response, config, *, initial_action=True):
             phases = response.get('vmodel_cache_phases')
             checks[key] = (isinstance(phases, list) and bool(phases)
                 and all(isinstance(phase, dict) and predicate(phase) for phase in phases))
+    if config.get('require_draft_head_release') is True:
+        from runtime.qwen_mtp_draft_lifetime import applied
+        phases = response.get('vmodel_cache_phases')
+        checks['all_phase_draft_head_release'] = (
+            isinstance(phases, list) and bool(phases)
+            and all(isinstance(p, dict) and applied(p.get('qwen_mtp_draft_head_lifetime'))
+                    for p in phases))
     return checks
 
 
