@@ -2,6 +2,17 @@
 
 ## 2026-09-16 UTC: full replay still fails; stable conversation catalog under test
 
+huihui_conversation_heldout_20260916 on5b63078 passes all three synthetic saved
+histories: inventory next-page98.1931s/30 tokens (exact offset2), inventory final
+74.4169s/21 tokens (exact three-SKU JSON,806 cached tokens), calendar final
+79.2695s/11 tokens (exact two-title JSON, nonstreaming). Initial saved histories
+are fixture-authored, not live/model-generated earlier turns; no full-workflow
+or real-traffic claim. Same generic conversation policy, no search or host routing.
+Whole swap-out11,649,024B, zero growth; native min5.403GB, footprint1.434GB.
+All gates PASS; source/artifact hashes and stopped PIDs verified. Result SHA
+8fc7b00cd87598c3951152d10f22354b36821ee17889f398ef7fb0f242aa150c.
+737 pure regression tests PASS. Serving default remains unchanged.
+
 huihui_draft_head_dual_full_20260915 on a1c4a92 ended after 1247.268s,
 without a final answer or Plex score. First HTTP463.036s, second716.905s,
 third66.913s failed ordinary head admission. First prefill234.218s/8479 tokens.
