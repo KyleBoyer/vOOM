@@ -1,0 +1,8 @@
+schema: voom.runtime-profile.v1
+name: gateway-concise-results-audit
+description: Explicit concise matching-record answers for the conversation-inline gateway.
+notes:
+  - "Return requested matches and essential caveats without an unrequested rejected-record audit. All pages and predicates must still be inspected; user requests for explanations override concision."
+  - "Prompt-changing, not lossless. Used only with gateway-inline-conversation-audit. No token cap, host rendering, answer repair, schema replacement or grader changes."
+settings:
+  VMODEL_FAST_TOOL_GATEWAY_CONCISE_RESULTS: true

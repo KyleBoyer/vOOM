@@ -1,5 +1,20 @@
 # STATUS — 2026-09-14 UTC (current corrections first; dated chronology below is history)
 
+## 2026-09-16 UTC: decode-only prefetch passes exact held-out tokens and pressure
+
+huihui_decode_prefetch_heldout_20260916 on89f3e19: three saved synthetic histories
+88.3727/64.4916/72.8065s versus prior98.1931/74.4169/79.2695s. Every greedy
+phase token, public text and call matches; all gates PASS. Useful prefetched
+pages504/567/378, zero wasted/oversized; measured hidden-I/O lower bounds
+8.972/9.970/6.509s. Cache hit shapes0/806/0 match control, but host state differs
+(launch min6.181GB vs5.735GB); not isolated hardware causality or full-harness
+speed proof. Whole swap-out14,565,376B, zero growth, native min5.278GB,
+footprint1.615GB. Sources/artifact hashes/stopped PIDs verified; result SHA
+7e8815d4814a7b7ecad47662de62d8aa766ffbd6ffa187091cf960bdfa4c64ed.
+No default promotion. Next optional concise-results policy is generic to list
+requests, preserves required page/filter inspection and user-requested audits,
+and changes no grader/output budget. It is prompt-changing, NOT lossless.
+
 ## 2026-09-16 UTC: complete real-capture replay paginates and classifies; strict gates fail
 
 Initial prefetch attempt huihui_prefetch1_heldout_20260916 on2f9ee8d is a

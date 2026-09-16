@@ -12613,6 +12613,8 @@ class Handler(BaseHTTPRequestHandler):
             from . import gateway_inline_conversation as inline_conversation_policy
             try:
                 conversation_value = os.environ.get(inline_conversation_policy.FLAG, '0')
+                conversation_prompt_policy = inline_conversation_policy.prompt_policy(
+                    os.environ.get(inline_conversation_policy.CONCISE_FLAG, '0'))
                 if conversation_value == '1' and (
                         os.environ.get(inline_initial_policy.FLAG, '0') != '0'
                         or os.environ.get(inline_active_policy.FLAG, '0') != '0'):
@@ -12695,7 +12697,7 @@ class Handler(BaseHTTPRequestHandler):
                 decision_source_messages,
                 (_HIDDEN_GATEWAY_TERMINAL_PAGINATION_POLICY
                  if gateway_terminal_pagination_synthesis
-                 else inline_conversation_policy.POLICY if gateway_inline_conversation
+                 else conversation_prompt_policy if gateway_inline_conversation
                  else inline_initial_policy.POLICY if gateway_inline_initial
                  else inline_active_policy.POLICY if gateway_inline_active
                  else _HIDDEN_GATEWAY_DECISION_POLICY))

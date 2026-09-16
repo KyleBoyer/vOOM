@@ -78,9 +78,21 @@ def test_profile_and_wiring():
     apply_runtime_profiles(['gateway-inline-conversation-audit'], environ=env)
     assert env == {policy.FLAG:'1'}
     src = ast.unparse(ast.parse(Path('runtime/server.py').read_text()))
-    assert 'inline_conversation_policy.POLICY if gateway_inline_conversation' in src
+    assert 'conversation_prompt_policy if gateway_inline_conversation' in src
     assert "'gateway_inline_conversation': int(gateway_inline_conversation)" in src
     assert 'gateway_inline_active = gateway_inline_active or gateway_inline_conversation' in src
+
+
+def test_concise_policy_explicit_general_and_default_neutral():
+    assert policy.prompt_policy()==policy.prompt_policy('0')==policy.POLICY
+    concise=policy.prompt_policy('1')
+    assert concise.startswith(policy.POLICY)
+    assert 'unless the user asks' in concise and 'every required page' in concise
+    assert not any(s in concise for s in ('Plex','ALPHA','PG-13','TV-Y7','score'))
+    for invalid in ('auto',True,1,None):
+        with pytest.raises(ValueError):policy.prompt_policy(invalid)
+    env={};apply_runtime_profiles(['gateway-concise-results-audit'],environ=env)
+    assert env=={policy.CONCISE_FLAG:'1'}
 
 
 @pytest.mark.parametrize('change', [{}, {'gateway_inline_conversation':True},

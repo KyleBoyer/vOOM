@@ -6,6 +6,7 @@ pagination decision and final answer; private search remains available.
 from . import gateway_inline_initial as initial
 
 FLAG = 'VMODEL_FAST_TOOL_GATEWAY_INLINE_CONVERSATION'
+CONCISE_FLAG = 'VMODEL_FAST_TOOL_GATEWAY_CONCISE_RESULTS'
 POLICY = (
     'The supplied real functions are available now, alongside private catalog search. '
     'Read the complete conversation to distinguish pending work from completed work. '
@@ -23,6 +24,18 @@ POLICY = (
     'When no external operation is needed, answer normally from the conversation and '
     'stable knowledge. Preserve all caller instructions and exact requested identifiers.'
 )
+
+
+def prompt_policy(value='0'):
+    if value not in ('0', '1'):
+        raise ValueError(CONCISE_FLAG + ' must be 0 or 1')
+    if value == '0':
+        return POLICY
+    return POLICY + (
+        ' For a request to list matching records, return the matching records and '
+        'essential caveats only. Do not enumerate rejected records or narrate routine '
+        'pagination unless the user asks for exclusions, an audit, or an explanation. '
+        'Still inspect every required page and apply every criterion before answering.')
 
 
 def candidates(value, *, messages, tools, raw_tools, client_choice, force_reason,
