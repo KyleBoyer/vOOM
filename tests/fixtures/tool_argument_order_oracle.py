@@ -26,6 +26,62 @@ def tool():
                     'excludeLabel':dict(type='string')},required=['maximum'],additionalProperties=False))
 
 
+@pytest.mark.parametrize('order',['0','1'])
+def test_native_orphan_closer_exclusion_preserves_data_prose_parallel_and_eos(engine,monkeypatch,order):
+    from runtime.structured import GrammarConstraint
+    from runtime.toolcalls import parse_tool_calls
+    monkeypatch.setenv('VMODEL_TOOL_ARGUMENT_ANY_ORDER',order)
+    value='code } </tool_call> and <tool_call> inside data'
+    args=dict(excludePath=value,maximum=2)
+    payload='<tool_call>'+json.dumps(dict(name='list_assets',arguments=args))+'</tool_call>'
+    for flag in ('0','1'):
+        monkeypatch.setenv('VMODEL_TOOL_STRICT_MARKERS',flag)
+        c=GrammarConstraint.tools(engine,[tool()],required=False,allow_parallel=True)
+        assert not c.completed
+        assert c.matcher.fork().accept_string('</tool_call>')==(flag=='0')
+        assert c.matcher.accept_string('Before '+payload+' Between '+payload+' After')
+        assert c.matcher.fork().accept_string('</tool_call>')==(flag=='0')
+        assert c.matcher.accept_token(next(iter(engine.cfg.eos_token_ids)))
+        assert c.is_terminated()
+    content,calls=parse_tool_calls('Before '+payload+' After','qwen3_5',allowed_names=['list_assets'])
+    assert content=='Before  After' and len(calls)==1
+    assert json.loads(calls[0]['function']['arguments'])==args
+
+
+@pytest.mark.parametrize('order',['0','1'])
+def test_strict_closer_actual_token_mask_fork_and_rollback(engine,monkeypatch,order):
+    from runtime.structured import GrammarConstraint
+    from runtime.xgrammar_cpu import backend
+    import numpy as np
+    monkeypatch.setenv('VMODEL_TOOL_ARGUMENT_ANY_ORDER',order)
+    monkeypatch.setenv('VMODEL_TOOL_STRICT_MARKERS','1')
+    c=GrammarConstraint.tools(engine,[tool()],required=False,allow_parallel=True)
+    text='<tool_call>'+json.dumps(dict(name='list_assets',arguments=dict(maximum=2)))+'</tool_call>'
+    mask=backend().allocate_token_bitmask(1,engine.cfg.vocab_size)
+    for token in engine.tokenizer.encode(text,add_special_tokens=False).ids:
+        c.matcher.fill_next_token_bitmask(mask)
+        assert (np.asarray(mask).view(np.uint32)[0,token//32] >> (token%32))&1
+        assert c.matcher.fork().accept_token(token)
+        assert c.matcher.accept_token(token)
+        c.matcher.rollback(1);assert c.matcher.accept_token(token)
+    probe=c.matcher.fork();blocked=False
+    for token in engine.tokenizer.encode('</tool_call>',add_special_tokens=False).ids:
+        probe.fill_next_token_bitmask(mask)
+        if not (np.asarray(mask).view(np.uint32)[0,token//32] >> (token%32))&1:
+            blocked=True;break
+        assert probe.accept_token(token)
+    assert blocked
+
+
+def test_required_tools_keep_their_existing_termination_with_strict_markers(engine,monkeypatch):
+    from runtime.structured import GrammarConstraint
+    monkeypatch.setenv('VMODEL_TOOL_STRICT_MARKERS','1')
+    c=GrammarConstraint.tools(engine,[tool()],required=True,allow_parallel=False)
+    assert c.matcher.accept_string('<tool_call>'+json.dumps(dict(
+        name='list_assets',arguments=dict(maximum=2)))+'</tool_call>')
+    assert c.stop_on_complete and c.matcher.is_completed()
+
+
 def test_actual_compiler_reproduces_and_fixes_out_of_order_field(engine,monkeypatch):
     from runtime.structured import GrammarConstraint
     for required,flag in itertools.product((True,False),('0','1')):

@@ -2,6 +2,32 @@
 
 ## 2026-09-16 UTC: full concise policy regresses; Darwin swap counter correction
 
+huihui_small_catalog_long_retry_20260916 on4236960: sustained JSON913.0135s,
+569 actual tokens, all24 squares correct, natural completion, ALL prompt/token/
+text witness hashes identical to the September15 reference. Whole native memory
+PASS:631 samples, minimum5.3695GB, actual swap-out/used growth0, footprint1.425GB;
+60,948,480B Pageouts separately. Path saved-final case250.7917s still FAILS
+immediate JSON (correct filter lookup plus prose). Developer/workspace112.6274s
+selects list_files(path=.), but exposes an orphan </tool_call> as visible prose.
+Its old semantic receipt passes; independent inspection rejects that as a
+protocol failure. Do not promote the bypass. Source/artifact/stopped PIDs verified,
+SHA57eb9d1d5c6efc4710c50d3f29e7a2f49842f02306b74307eec526188515f90f.
+The first non-retry wrapper failed before inference on JSON-text/path confusion;
+its log and stopped PIDs were checked, then a new preflight/ID used.
+
+Candidate protocol fix: opt-in tool-strict-markers-audit excludes unmatched
+closers only from free text in native auto grammar, not from JSON data or valid
+parallel call blocks. No output stripping, argument repair or stop-policy change.
+Also reproduce/fix regex parsing of valid argument strings containing
+"} </tool_call>" using strict JSON-aware boundary parsing; invalid blocks remain
+visible and cannot be repaired/salvaged as nested calls. Strict duplicate-key and
+nonfinite-value rejection remain.616 selected tests pass, one unavailable
+tokenizer skipped;14 native compiler tests cover masks, forks, rollback, literal
+data, ordinary prose, parallel calls and EOS. Actual leaking request replay next.
+September30 independent review added nested-block depth tracking: malformed
+outer blocks cannot salvage a second nested call; a later valid sibling remains
+parseable. Its regression is included above. No production default changed.
+
 huihui_anyorder_concise_full_retry_20260916 onfe9c2ee completes2004.7383s;
 HTTP634.9684/289.4495/1079.9442s, final313 tokens. Original134-tool capture,
 temperature1/max1024; synthetic raw finite Plex pages, not live Plex. Both calls

@@ -68,15 +68,18 @@ def _reject_json_constant(value: str):
     raise ValueError(f"non-finite JSON constant is not allowed: {value}")
 
 
+def _unique_json_pairs(pairs):
+    result = {}
+    for key, item in pairs:
+        if key in result:
+            raise ValueError('duplicate JSON object key')
+        result[key] = item
+    return result
+
+
 def _strict_json_loads(value):
-    def unique(pairs):
-        result = {}
-        for key, item in pairs:
-            if key in result:
-                raise ValueError('duplicate JSON object key')
-            result[key] = item
-        return result
-    return json.loads(value, parse_constant=_reject_json_constant, object_pairs_hook=unique)
+    return json.loads(value, parse_constant=_reject_json_constant,
+                      object_pairs_hook=_unique_json_pairs)
 
 
 def _search_words(value) -> list[str]:
@@ -1537,7 +1540,51 @@ def tools_preamble(tools: list[dict]) -> str:
     )
 
 
-_HERMES_RE = re.compile(r"<tool_call>\s*(\{.*?\})\s*</tool_call>", re.S)
+_HERMES_START_RE = re.compile(r"<tool_call>\s*")
+_HERMES_END_RE = re.compile(r"\s*</tool_call>")
+
+
+def _hermes_objects(text):
+    """Parse JSON boundaries before protocol boundaries; never repair data.
+
+    A valid argument string can contain ``} </tool_call>``. A non-greedy
+    regex terminates inside that string. Invalid candidate blocks are skipped
+    through their unquoted closing marker, not searched for nested calls.
+    """
+    decoder = json.JSONDecoder(parse_constant=_reject_json_constant,
+                               object_pairs_hook=_unique_json_pairs)
+    position = 0
+    while (opening := _HERMES_START_RE.search(text, position)) is not None:
+        try:
+            obj, end = decoder.raw_decode(text, opening.end())
+            closing = _HERMES_END_RE.match(text, end)
+            if closing is None:
+                raise ValueError('missing tool-call closing marker')
+        except ValueError:
+            quoted = escaped = False
+            depth = 1
+            position = len(text)
+            for index in range(opening.end(), len(text)):
+                char = text[index]
+                if quoted:
+                    if escaped:
+                        escaped = False
+                    elif char == '\\':
+                        escaped = True
+                    elif char == '"':
+                        quoted = False
+                elif char == '"':
+                    quoted = True
+                elif text.startswith('<tool_call>', index):
+                    depth += 1
+                elif text.startswith('</tool_call>', index):
+                    depth -= 1
+                    if depth == 0:
+                        position = index + len('</tool_call>')
+                        break
+            continue
+        position = closing.end()
+        yield opening.start(), position, obj
 # harmony: '<|channel|>commentary to=functions.NAME ... <|message|>{...}<|call|>'
 # decoded text may keep or strip the special-token glyphs — match both.
 # The trailing alternation must stop at the NEXT call too (lookahead), not
@@ -1587,15 +1634,10 @@ def parse_tool_calls(text: str, model_type: str, *,
         for m in _HARMONY_RE.finditer(text):
             if mk(m.group(1), m.group(2)):
                 spans.append(m.span())
-    for m in _HERMES_RE.finditer(text):
-        obj_raw = m.group(1)
-        try:
-            obj = _strict_json_loads(obj_raw)
-        except (TypeError, ValueError, json.JSONDecodeError):
-            continue
+    for start, end, obj in _hermes_objects(text):
         if isinstance(obj, dict) and "name" in obj:
             if mk(obj["name"], json.dumps(obj.get("arguments", {}))):
-                spans.append(m.span())
+                spans.append((start, end))
     # xLAM-2 and a few other function-calling specialists are trained to emit
     # a bare top-level JSON array rather than Hermes markers. Accept only when
     # the *entire* response is a non-empty array of exact call-shaped objects;

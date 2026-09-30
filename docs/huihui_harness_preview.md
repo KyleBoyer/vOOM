@@ -1,16 +1,23 @@
 # Huihui harness preview
 
-September15: short text/tool requests and exact cached restarts work. **Full
+September16: short text/tool requests, sustained JSON and exact cached restarts work. **Full
 Plex harness readiness is not qualified.** This explicit profile is a measured
 small-catalog preview, not a claim that all optimizations or quality gates pass.
 
-Latest correction: the opt-in initial catalog can now call supplied real tools
-on explicit-action requests instead of being constrained to private search.
-Two synthetic reworded inventory/calendar requests pass at106.14s/112.25s.
-The full134-tool capture still fails: larger tiles reduce initial prefill to
-234.15s, but its first call takes461.25s, uses the wrong exclusion field, and
-fails cumulative swap-out. No final Plex score or complete workflow follows.
-Neither initial-inline nor larger-tile experiments are promoted into this preview.
+Latest correction: an opt-in arbitrary-order argument grammar fixes the root-path
+versus library-label error. The original134-tool/temp1 request with synthetic raw
+Plex pages completes in2004.74s, with correct offsets0->3 and all four eligible
+matches, but legacy85/100/FAIL (excluded titles appear in explanations; unrated
+wording is ambiguous). Native memory passes: minimum4.94GB and zero actual swap
+growth. It is not live Plex or a latency win. A fresh569-token JSON test passes
+all24 arithmetic results in913.01s with exact prior prompt/output-token/text
+hashes, minimum5.37GB and zero actual swap growth. These experiments are NOT
+promoted into the preview profile below. A small-catalog workspace replay also
+revealed a stray protocol marker; its grammar/parser correction is being tested.
+
+Historical swap-out numbers below used psutil's Darwin Pageouts proxy, not actual
+Swapouts. Keep their original verdicts; only fresh native-counter runs above
+establish actual swap behavior. See STATUS.md for immutable run identities.
 
 ## Connection
 

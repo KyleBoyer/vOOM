@@ -1,0 +1,8 @@
+schema: voom.runtime-profile.v1
+name: tool-strict-markers-audit
+description: Opt-in native grammar exclusion of orphan tool-call closers in free text.
+notes:
+  - "Keeps ordinary text, parallel calls and schema-valid JSON string data legal. Rejects unmatched closing protocol markers outside real tool blocks; no post-generation text stripping or argument repair."
+  - "Decoder-support restriction, not a token-identical/lossless claim. Qualify actual compiler masks/forks/rollback and the real leaking workspace request before promotion. Default off."
+settings:
+  VMODEL_TOOL_STRICT_MARKERS: true

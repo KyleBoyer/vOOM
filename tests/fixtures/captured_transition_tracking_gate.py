@@ -188,6 +188,10 @@ def row_checks(row, response, case, config):
     witness = t.get('generation_witness') or {}
     before, after = row['pressure_before'], row['pressure_after']
     checks = dict(semantic_checks(response, case))
+    if any(isinstance(item, dict) and item.get('type') == 'function_call'
+           for item in response.get('output', [])):
+        checks['no_visible_protocol_marker_leak'] = not any(
+            marker in visible_text(response) for marker in ('<tool_call>', '</tool_call>'))
     if config.get('require_actual_swap_counters') is True:
         from runtime.system_swap import http_identity
         checks['actual_swap_counter_identity'] = http_identity(before,after)

@@ -372,6 +372,10 @@ class GrammarConstraint:
         if order not in ('0', '1'):
             raise ValueError('VMODEL_TOOL_ARGUMENT_ANY_ORDER must be 0 or 1')
         any_order = order == '1'
+        markers = os.environ.get('VMODEL_TOOL_STRICT_MARKERS', '0')
+        if markers not in ('0', '1'):
+            raise ValueError('VMODEL_TOOL_STRICT_MARKERS must be 0 or 1')
+        strict_markers = markers == '1'
         schema = _grammar_compatible_schema(
             tool_call_json_schema(tools, specific_name))
         compiler = _compiler(engine)
@@ -383,16 +387,21 @@ class GrammarConstraint:
         else:
             # Auto mode permits ordinary text but dispatches into a strict
             # argument schema as soon as the model starts a tool-call marker.
-            grammar = (xgr.Grammar.from_structural_tag(dict(type='structural_tag',
-                format=dict(type='triggered_tags',triggers=['<tool_call>'],tags=[
-                    dict(begin='<tool_call>',content=dict(type='json_schema',
-                        json_schema=schema,any_order=True),end='</tool_call>')],
-                    at_least_one=False,stop_after_first=False))) if any_order else
-                xgr.Grammar.from_structural_tag(
-                [xgr.StructuralTagItem(
-                    begin="<tool_call>", schema=schema, end="</tool_call>")],
-                ["<tool_call>"],
-            ))
+            if any_order or strict_markers:
+                grammar = xgr.Grammar.from_structural_tag(dict(
+                    type='structural_tag', format=dict(
+                        type='triggered_tags', triggers=['<tool_call>'],
+                        tags=[dict(begin='<tool_call>', content=dict(
+                            type='json_schema', json_schema=schema,
+                            any_order=any_order), end='</tool_call>')],
+                        at_least_one=False, stop_after_first=False,
+                        excludes=['</tool_call>'] if strict_markers else [])))
+            else:
+                grammar = xgr.Grammar.from_structural_tag(
+                    [xgr.StructuralTagItem(
+                        begin="<tool_call>", schema=schema, end="</tool_call>")],
+                    ["<tool_call>"],
+                )
             compiled = compiler.compile_grammar(grammar)
             profile = "auto_tool_schema"
         return cls(
