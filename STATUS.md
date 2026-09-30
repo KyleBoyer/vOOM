@@ -2,6 +2,15 @@
 
 ## 2026-09-30: protocol qualification, not a readiness pass
 
+Private-tail diagnostic huihui_private_tail_20260930 onf605db7 identifies
+repeated identical valid list_files(path=.) calls, not leading prose. Deliberately
+interrupted after observing repetition; no completed verdict. Sources/artifacts/
+stopped PIDs verified, SHA358ae340e9a47666f56846a21e1d345c4a42fe0af2468d6926d7fb7fd7882251.
+Next explicit tool-serial-turns-audit restricts generation to zero/one tool call
+per turn, even when the client permits parallel batching. Further calls require
+new turns/results. This trades parallel batching for bounded tool turns; it is
+not lossless and never drops already-generated calls or repairs answers.
+
 Complete-turn huihui_complete_turn_20260930 on795aab0 was also interrupted
 after continuation regression, not a natural completion/quality verdict.
 Sources/artifacts/stopped PIDs verified, SHA

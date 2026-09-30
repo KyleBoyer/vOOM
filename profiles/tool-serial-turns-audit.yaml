@@ -1,0 +1,10 @@
+schema: voom.runtime-profile.v1
+name: tool-serial-turns-audit
+description: Explicit one-tool-call-per-turn grammar; serialize tool workflows without output repair.
+notes:
+  - "Restricts each model turn to zero or one tool call even if the client allows parallel calls. Subsequent tool calls require new turns with tool results. Ordinary no-tool answers remain legal."
+  - "Tradeoff: no parallel call batching. Decoding-support restriction, not lossless. Never parses several calls and drops extras; the grammar prevents generation of additional calls. Default off and requires complete-turn grammar."
+extends:
+  - tool-complete-turn-audit
+settings:
+  VMODEL_TOOL_SERIAL_TURNS: true

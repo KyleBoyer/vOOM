@@ -379,6 +379,13 @@ class GrammarConstraint:
         turn = os.environ.get('VMODEL_TOOL_COMPLETE_TURN', '0')
         if turn not in ('0', '1'):
             raise ValueError('VMODEL_TOOL_COMPLETE_TURN must be 0 or 1')
+        serial = os.environ.get('VMODEL_TOOL_SERIAL_TURNS', '0')
+        if serial not in ('0', '1'):
+            raise ValueError('VMODEL_TOOL_SERIAL_TURNS must be 0 or 1')
+        if serial == '1':
+            if turn != '1':
+                raise ValueError('VMODEL_TOOL_SERIAL_TURNS requires VMODEL_TOOL_COMPLETE_TURN')
+            allow_parallel = False
         schema = _grammar_compatible_schema(
             tool_call_json_schema(tools, specific_name))
         compiler = _compiler(engine)

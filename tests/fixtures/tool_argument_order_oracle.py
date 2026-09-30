@@ -134,6 +134,18 @@ def test_complete_tool_turn_preserves_prose_data_parallel_masks_and_eos(engine,m
         branch=c.matcher.fork();assert branch.accept_token(token) and branch.is_terminated()
 
 
+def test_explicit_serial_turns_restrict_generation_not_parsed_output(engine,monkeypatch):
+    from runtime.structured import GrammarConstraint
+    monkeypatch.setenv('VMODEL_TOOL_COMPLETE_TURN','1')
+    monkeypatch.setenv('VMODEL_TOOL_SERIAL_TURNS','1')
+    c=GrammarConstraint.tools(engine,[tool()],required=False,allow_parallel=True)
+    text='<tool_call>'+json.dumps(dict(name='list_assets',arguments=dict(maximum=2)))+'</tool_call>\n'
+    assert c.matcher.accept_string(text)
+    assert not c.matcher.fork().accept_string('<tool_call>')
+    for token in engine.cfg.eos_token_ids:
+        assert c.matcher.fork().accept_token(token)
+
+
 def test_actual_compiler_reproduces_and_fixes_out_of_order_field(engine,monkeypatch):
     from runtime.structured import GrammarConstraint
     for required,flag in itertools.product((True,False),('0','1')):

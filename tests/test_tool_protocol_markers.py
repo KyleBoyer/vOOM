@@ -89,3 +89,12 @@ def test_complete_turn_profile_explicit_and_invalid_values_rejected(monkeypatch)
         monkeypatch.setenv('VMODEL_TOOL_COMPLETE_TURN',bad)
         with pytest.raises(ValueError,match='VMODEL_TOOL_COMPLETE_TURN'):
             GrammarConstraint.tools(None,[],required=False)
+
+
+def test_serial_turns_require_explicit_complete_turn_and_valid_flag(monkeypatch):
+    from runtime.structured import GrammarConstraint
+    monkeypatch.delenv('VMODEL_TOOL_COMPLETE_TURN',raising=False)
+    for bad in ('auto','true','2','', '1'):
+        monkeypatch.setenv('VMODEL_TOOL_SERIAL_TURNS',bad)
+        with pytest.raises(ValueError,match='VMODEL_TOOL_SERIAL_TURNS'):
+            GrammarConstraint.tools(None,[],required=False)
