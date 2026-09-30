@@ -376,6 +376,9 @@ class GrammarConstraint:
         if markers not in ('0', '1'):
             raise ValueError('VMODEL_TOOL_STRICT_MARKERS must be 0 or 1')
         strict_markers = markers == '1'
+        turn = os.environ.get('VMODEL_TOOL_COMPLETE_TURN', '0')
+        if turn not in ('0', '1'):
+            raise ValueError('VMODEL_TOOL_COMPLETE_TURN must be 0 or 1')
         schema = _grammar_compatible_schema(
             tool_call_json_schema(tools, specific_name))
         compiler = _compiler(engine)
@@ -387,7 +390,22 @@ class GrammarConstraint:
         else:
             # Auto mode permits ordinary text but dispatches into a strict
             # argument schema as soon as the model starts a tool-call marker.
-            if any_order or strict_markers:
+            if turn == '1':
+                body = dict(type='json_schema', json_schema=schema,
+                            any_order=any_order)
+                whitespace = dict(type='regex', pattern='[ \\t\\r\\n]*')
+                tail = []
+                if allow_parallel:
+                    tail.append(dict(type='star', content=dict(type='sequence',
+                        elements=[whitespace, dict(type='tag', begin='<tool_call>',
+                            content=body, end='</tool_call>')])))
+                grammar = xgr.Grammar.from_structural_tag(dict(
+                    type='structural_tag', format=dict(type='dispatch',
+                        rules=[('<tool_call>', dict(type='sequence', elements=[
+                            body, dict(type='const_string', value='</tool_call>'),
+                            *tail, whitespace]))], loop=False,
+                        excludes=['</tool_call>'])))
+            elif any_order or strict_markers:
                 grammar = xgr.Grammar.from_structural_tag(dict(
                     type='structural_tag', format=dict(
                         type='triggered_tags', triggers=['<tool_call>'],

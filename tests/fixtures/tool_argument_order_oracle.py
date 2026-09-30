@@ -103,6 +103,37 @@ def test_both_released_eos_tokens_allowed_after_workspace_call(engine,monkeypatc
         assert branch.accept_token(token) and branch.is_terminated()
 
 
+@pytest.mark.parametrize('parallel',[False,True])
+def test_complete_tool_turn_preserves_prose_data_parallel_masks_and_eos(engine,monkeypatch,parallel):
+    from runtime.structured import GrammarConstraint
+    from runtime.xgrammar_cpu import backend
+    import numpy as np
+    monkeypatch.setenv('VMODEL_TOOL_COMPLETE_TURN','1')
+    monkeypatch.setenv('VMODEL_TOOL_ARGUMENT_ANY_ORDER','1')
+    c=GrammarConstraint.tools(engine,[tool()],required=False,allow_parallel=parallel)
+    assert not c.completed and not c.stop_on_complete
+    prose=c.matcher.fork();assert prose.accept_string('Ordinary answer.')
+    for token in engine.cfg.eos_token_ids:
+        assert prose.fork().accept_token(token)
+    text='Before <tool_call>'+json.dumps(dict(name='list_assets',arguments=dict(
+        maximum=2,excludePath='code } </tool_call> and <tool_call> literal')))+'</tool_call>\n'
+    mask=backend().allocate_token_bitmask(1,engine.cfg.vocab_size)
+    for token in engine.tokenizer.encode(text,add_special_tokens=False).ids:
+        c.matcher.fill_next_token_bitmask(mask)
+        assert (np.asarray(mask).view(np.uint32)[0,token//32] >> (token%32))&1
+        assert c.matcher.fork().accept_token(token)
+        assert c.matcher.accept_token(token)
+        c.matcher.rollback(1);assert c.matcher.accept_token(token)
+    for bad in ('After prose','</tool_call>','</tool_call'):
+        assert not c.matcher.fork().accept_string(bad)
+    next_call='<tool_call>'+json.dumps(dict(name='list_assets',arguments=dict(maximum=3)))+'</tool_call>'
+    assert c.matcher.fork().accept_string(next_call)==parallel
+    c.matcher.fill_next_token_bitmask(mask)
+    for token in engine.cfg.eos_token_ids:
+        assert (np.asarray(mask).view(np.uint32)[0,token//32] >> (token%32))&1
+        branch=c.matcher.fork();assert branch.accept_token(token) and branch.is_terminated()
+
+
 def test_actual_compiler_reproduces_and_fixes_out_of_order_field(engine,monkeypatch):
     from runtime.structured import GrammarConstraint
     for required,flag in itertools.product((True,False),('0','1')):

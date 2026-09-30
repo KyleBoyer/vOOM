@@ -2,6 +2,17 @@
 
 ## 2026-09-30: protocol qualification, not a readiness pass
 
+Guidance-only follow-up huihui_protocol_guidance_20260930 on4f38d3e also
+rejected/interrupted(signal2), last109 accepted tokens/182.4342s decode; no
+terminal answer or quality verdict, remaining cases unrun. Sources/artifacts/
+stopped PIDs verified; SHA74120cf363800bacf0c8bd4514e6a58e55a32c950da8270ab5c1af73c2c2fd4d.
+Next tool-complete-turn-audit uses installed XGrammar dispatch(loop=False):
+ordinary prose before a call, then only whitespace/valid parallel calls/EOS.
+Not stop-after-first, not post-hoc stripping, default off.618 selected tests
+pass (one skipped);17 isolated compiler tests cover ordinary prose, exact
+literal markers in arguments, parallel enabled/disabled, both EOS masks,
+forks/rollback, and rejection of post-call prose/partial orphan closers.
+
 Strict-markers-only huihui_strict_protocol_20260930 on aee30bc is REJECTED:
 the unchanged developer/workspace replay continued beyond186 accepted tokens
 (last progress284.107s decode), versus the old26-token response. The owned

@@ -10,4 +10,4 @@ def test_native_arbitrary_order_and_authoritative_validation():
         'tests/fixtures/tool_argument_order_oracle.py'],cwd=Path(__file__).resolve().parents[1],
         env={**os.environ,'VMODEL_XGRAMMAR_CPU_ONLY':'1'},capture_output=True,text=True,timeout=90)
     assert result.returncode==0,result.stdout+result.stderr
-    assert '15 passed' in result.stdout,result.stdout
+    assert '17 passed' in result.stdout,result.stdout

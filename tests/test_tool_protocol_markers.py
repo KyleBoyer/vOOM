@@ -78,3 +78,14 @@ def test_completion_guidance_is_explicit_preserves_catalog_and_parallel_calls(mo
         monkeypatch.setenv('VMODEL_HERMES_COMPLETION_GUIDANCE',bad)
         with pytest.raises(ValueError,match='VMODEL_HERMES_COMPLETION_GUIDANCE'):
             _tools_system_preamble(tools,compact_json=True)
+
+
+def test_complete_turn_profile_explicit_and_invalid_values_rejected(monkeypatch):
+    from runtime.profiles import apply_runtime_profiles
+    from runtime.structured import GrammarConstraint
+    env={};apply_runtime_profiles(['tool-complete-turn-audit'],environ=env)
+    assert env=={'VMODEL_TOOL_COMPLETE_TURN':'1'}
+    for bad in ('auto','true','2',''):
+        monkeypatch.setenv('VMODEL_TOOL_COMPLETE_TURN',bad)
+        with pytest.raises(ValueError,match='VMODEL_TOOL_COMPLETE_TURN'):
+            GrammarConstraint.tools(None,[],required=False)

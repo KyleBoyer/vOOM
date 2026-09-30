@@ -1,0 +1,8 @@
+schema: voom.runtime-profile.v1
+name: tool-complete-turn-audit
+description: Opt-in grammar allowing only valid call blocks or EOS after the first tool call.
+notes:
+  - "Ordinary no-tool prose and pre-call commentary remain legal. After the first call, only whitespace, further complete calls when parallel calls are enabled, or explicit EOS are legal. Does not stop after the first call."
+  - "Output-support restriction, not lossless/token-identical. No host answer synthesis, output stripping or argument repair. Default off pending native grammar and varied real-generation gates."
+settings:
+  VMODEL_TOOL_COMPLETE_TURN: true
