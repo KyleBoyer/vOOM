@@ -2,6 +2,17 @@
 
 ## 2026-09-30: protocol qualification, not a readiness pass
 
+Complete-turn huihui_complete_turn_20260930 on795aab0 was also interrupted
+after continuation regression, not a natural completion/quality verdict.
+Sources/artifacts/stopped PIDs verified, SHA
+75c2c75dc65373cd2c4cb94306c355de7e50f0e21c51431660b0711e2df67b88.
+Add explicit private accepted-output tail witness at existing30s/final cadence
+to distinguish prose/repeated calls/whitespace on the next run. Last32 accepted
+IDs only, never prompt IDs or API metadata; default off, no decoding/tensor/RNG
+operations.632 selected tests pass (one skipped), plus2 tiny MTP greedy/stochastic
+on/off equivalence checks preserve tokens/endpoints/calls. No profile promotion
+or harness-ready claim.
+
 Guidance-only follow-up huihui_protocol_guidance_20260930 on4f38d3e also
 rejected/interrupted(signal2), last109 accepted tokens/182.4342s decode; no
 terminal answer or quality verdict, remaining cases unrun. Sources/artifacts/

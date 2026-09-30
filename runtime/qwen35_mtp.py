@@ -1945,6 +1945,8 @@ class QwenMTPSpeculativeEngine:
         sampling = sampling or SamplingParams()
         from .decode_progress import DecodeProgress, enabled as decode_progress_enabled
         report_decode_progress = decode_progress_enabled()
+        from .decode_progress import private_enabled as private_decode_enabled
+        private_tail_enabled = private_decode_enabled()
         from .qwen_mtp_draft_lifetime import configure as configure_draft_lifetime
         configure_draft_lifetime(self.drafter, self.target, QwenMTPDrafter)
         if isinstance(max_tokens, bool) or not isinstance(max_tokens, int) or max_tokens <= 0:
@@ -2509,7 +2511,8 @@ class QwenMTPSpeculativeEngine:
             return False
 
         decode_t0 = time.perf_counter()
-        decode_progress = (DecodeProgress(decode_t0, max_tokens)
+        decode_progress = (DecodeProgress(decode_t0, max_tokens,
+                           private_tail_enabled=private_tail_enabled)
                            if report_decode_progress else None)
         while (len(emitted) < max_tokens and catchup_tok not in eos
                and not grammar_completed
@@ -3865,7 +3868,8 @@ class QwenMTPSpeculativeEngine:
                     draft_seconds=draft_round_s, verifier_seconds=verifier_round_s,
                     speculative_rounds=speculative_rounds,
                     rollback_seconds=kda_factor_restore_s,
-                    adaptive_disabled=adaptive_disabled)
+                    adaptive_disabled=adaptive_disabled,
+                    output_token_ids=emitted if private_tail_enabled else None)
             if terminal_round:
                 break
             # Retained per-layer/KDA midpoints changed the break-even math:

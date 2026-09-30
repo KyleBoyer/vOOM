@@ -1,0 +1,9 @@
+schema: voom.runtime-profile.v1
+name: private-decode-tail-audit
+description: Explicit private accepted-output token-tail diagnostics at existing progress cadence.
+notes:
+  - "Sensitive generated content goes only to the ignored private server log, never API metadata. No prompt IDs, decoder calls, tensors, RNG or output repair. Last32 accepted IDs at existing30s/final cadence; off by default."
+extends:
+  - decode-progress-witness
+settings:
+  VMODEL_PRIVATE_DECODE_TOKEN_TAIL: true

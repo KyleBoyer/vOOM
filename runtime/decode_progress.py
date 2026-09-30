@@ -1,10 +1,11 @@
-"""Default-off scalar-only MTP progress. No arrays, text, token IDs or RNG."""
+"""Default-off MTP progress; separately opt-in private accepted-token tails."""
 import json
 import math
 import os
 import time
 
 FLAG = 'VMODEL_DECODE_PROGRESS_WITNESS'
+PRIVATE_FLAG = 'VMODEL_PRIVATE_DECODE_TOKEN_TAIL'
 PREFIX = '[decode-progress] '
 
 
@@ -15,17 +16,29 @@ def enabled(environ=None):
     return value == '1'
 
 
+def private_enabled(environ=None):
+    env = os.environ if environ is None else environ
+    value = env.get(PRIVATE_FLAG, '0')
+    if value not in ('0', '1'):
+        raise ValueError(PRIVATE_FLAG + ' must be 0 or 1')
+    if value == '1' and not enabled(env):
+        raise ValueError(PRIVATE_FLAG + ' requires ' + FLAG)
+    return value == '1'
+
+
 class DecodeProgress:
-    def __init__(self, started, maximum):
+    def __init__(self, started, maximum, *, private_tail_enabled=False):
         self.started = started
         self.last_reported = started - 30
         self.maximum = maximum
         self.failed = False
+        self.private_tail_enabled = private_tail_enabled
 
     def record(self, emitted, sweeps, proposed, accepted, *, final=False,
                plain_seconds=0.0, plain_sweeps=0, draft_seconds=0.0,
                verifier_seconds=0.0, speculative_rounds=0,
-               rollback_seconds=0.0, adaptive_disabled=False):
+               rollback_seconds=0.0, adaptive_disabled=False,
+               output_token_ids=None):
         if self.failed:
             return
         now = time.perf_counter()
@@ -40,6 +53,15 @@ class DecodeProgress:
             draft_accepted=int(accepted), terminal_round=bool(final),
             scope='accepted token count includes bootstrap and possible EOS; not request completion or quality proof')
         try:
+            if self.private_tail_enabled and output_token_ids is not None:
+                tail = list(output_token_ids[-32:])
+                if len(output_token_ids) != emitted or any(type(t) is not int or t < 0 for t in tail):
+                    raise ValueError('invalid accepted output token tail')
+                row['private_output_tail'] = dict(
+                    schema='voom.private-accepted-output-tail.v1',
+                    start_output_token_index=emitted-len(tail),
+                    end_output_token_index_exclusive=emitted, token_ids=tail,
+                    sensitivity='PRIVATE generated content; no prompt token IDs')
             durations = [float(x) for x in (plain_seconds, draft_seconds,
                                             verifier_seconds, rollback_seconds)]
             if any(not math.isfinite(x) or x < 0 for x in durations):

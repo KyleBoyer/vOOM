@@ -208,10 +208,11 @@ class _RecurrentDrafter:
 @pytest.mark.parametrize('temperature', [0.0, 1.0])
 def test_decode_progress_does_not_change_target_tokens_or_endpoint(temperature, monkeypatch, capsys):
     import json
-    from runtime.decode_progress import FLAG, PREFIX
+    from runtime.decode_progress import FLAG, PREFIX, PRIVATE_FLAG
     outcomes = []
-    for value in ('0', '1'):
+    for value,private in (('0','0'),('1','0'),('1','1')):
         monkeypatch.setenv(FLAG, value)
+        monkeypatch.setenv(PRIVATE_FLAG, private)
         mx.random.seed(64013)
         target = _Target(2)
         engine = QwenMTPSpeculativeEngine(target, max_prompt_tokens=8,
@@ -232,7 +233,11 @@ def test_decode_progress_does_not_change_target_tokens_or_endpoint(temperature, 
             assert costs['draft_seconds'] == result['path_stats']['qwen_mtp_draft_round_s']
             assert costs['verifier_seconds'] == result['path_stats']['qwen_mtp_verifier_round_s']
             assert costs['measured_plain_seconds_per_token'] is None
-    assert outcomes[0] == outcomes[1]
+            if private=='1':
+                assert records[-1]['private_output_tail']['token_ids']==result['tokens'][-32:]
+            else:
+                assert all('private_output_tail' not in r for r in records)
+    assert outcomes[0] == outcomes[1] == outcomes[2]
 
 
 @pytest.mark.parametrize('temperature', [0.0, 1.0])

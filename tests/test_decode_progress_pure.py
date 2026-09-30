@@ -93,7 +93,8 @@ def test_real_hook_is_after_committed_endpoint_and_before_terminal_break():
     assert bindings['draft_seconds'] == 'draft_round_s'
     assert bindings['verifier_seconds'] == 'verifier_round_s'
     assert bindings['rollback_seconds'] == 'kda_factor_restore_s'
-    assert 'DecodeProgress(decode_t0, max_tokens) if report_decode_progress else None' in src
+    assert 'private_tail_enabled=private_tail_enabled' in src
+    assert bindings['output_token_ids']=='emitted if private_tail_enabled else None'
 
 
 def test_profile_only_adds_observer_flag():
@@ -101,3 +102,34 @@ def test_profile_only_adds_observer_flag():
     apply_runtime_profiles(base,environ=before)
     apply_runtime_profiles(base+['decode-progress-witness'],environ=after)
     assert after=={**before,progress.FLAG:'1'}
+
+
+def test_private_flag_requires_explicit_progress_and_rejects_typos():
+    assert not progress.private_enabled({})
+    assert progress.private_enabled({progress.FLAG:'1',progress.PRIVATE_FLAG:'1'})
+    for env in ({progress.PRIVATE_FLAG:'1'},{progress.PRIVATE_FLAG:'true'},
+                {progress.FLAG:'1',progress.PRIVATE_FLAG:''}):
+        with pytest.raises(ValueError):progress.private_enabled(env)
+
+
+def test_private_tail_only_after_cadence_guard_and_exact_indices(monkeypatch,capsys):
+    clock=[100.0];monkeypatch.setattr(progress.time,'perf_counter',lambda:clock[0])
+    p=progress.DecodeProgress(100,1024,private_tail_enabled=True)
+    p.record(40,1,4,2,output_token_ids=list(range(40)))
+    class Untouchable:
+        def __getitem__(self,key):raise AssertionError('must not inspect IDs')
+    clock[0]=101;p.record(42,2,8,4,output_token_ids=Untouchable())
+    rows=[json.loads(x.removeprefix(progress.PREFIX)) for x in capsys.readouterr().out.splitlines()]
+    assert len(rows)==1
+    tail=rows[0]['private_output_tail']
+    assert tail['token_ids']==list(range(8,40))
+    assert tail['start_output_token_index']==8 and tail['end_output_token_index_exclusive']==40
+    off=progress.DecodeProgress(100,1024)
+    off.record(40,1,4,2,output_token_ids=Untouchable())
+    assert 'private_output_tail' not in capsys.readouterr().out
+
+
+def test_private_invalid_tail_disables_observer_not_generation():
+    p=progress.DecodeProgress(0,1024,private_tail_enabled=True)
+    p.record(4,1,4,2,output_token_ids=[1,2])
+    assert p.failed
