@@ -1,0 +1,8 @@
+schema: voom.runtime-profile.v1
+name: http-context-16k-preview
+description: Explicit HTTP admission cap on prepared prompt plus requested output tokens.
+notes:
+  - "Rejects totals above16384 before streaming; never truncates prompt/output or changes model RoPE. Operator safety bound, not proof that every admitted context has been qualified."
+  - "Separate from the1024-token test output allowance and native MTP fallback threshold. Long-context experiments omit this optional serving overlay. Default server remains unchanged."
+settings:
+  VMODEL_HTTP_MAX_CONTEXT_TOKENS: 16384

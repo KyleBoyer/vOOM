@@ -6805,7 +6805,13 @@ def _active_context_limit(engine) -> int:
         engine.cfg.max_position_embeddings,
     ) or 0)
     runtime_limit = int(getattr(getattr(engine, "rc", None), "context_bound", 0) or 0)
-    limits = [limit for limit in (model_limit, runtime_limit) if limit > 0]
+    configured = os.environ.get('VMODEL_HTTP_MAX_CONTEXT_TOKENS', '0')
+    if not re.fullmatch(r'[0-9]+', configured):
+        raise RequestValidationError('VMODEL_HTTP_MAX_CONTEXT_TOKENS must be a nonnegative integer')
+    # Operator admission limit only: never change the checkpoint's RoPE or
+    # silently truncate input. Existing validation runs before SSE headers.
+    operator_limit = int(configured)
+    limits = [limit for limit in (model_limit, runtime_limit, operator_limit) if limit > 0]
     return min(limits) if limits else 0
 
 

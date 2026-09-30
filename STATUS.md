@@ -2,6 +2,19 @@
 
 ## 2026-09-30: protocol qualification, not a readiness pass
 
+Serial-turn suite huihui_serial_turns_20260930 on374bb61 completed naturally:
+developer/workspace112.6026s/25tokens and literal-marker argument70.0914s/23tokens
+PASS, exact calls and no leaked protocol text. Synthetic filtered continuation
+184.8117s/42tokens returns correct FILE-7/FILE-2 with extra prose, so strict
+JSON-only FAIL remains. Overall FAIL, no answer repair. Native pressure PASS:
+181samples/minimum5.697GB/actualswap0/used0/footprint1.419GB; Pageouts29,032,448B
+separate. Sources/artifacts/stopped PIDs verified, SHA
+95f762145a41e0729d6efb57bc24177b51fc51cc2129de872b3e5a22fe4f186d.
+633selected tests plus18 isolated native compiler gates pass (one skipped).
+Candidate HTTP admission overlay rejects prepared prompt+output above16384,
+without truncation or model-capacity changes; this is a safety cap, NOT a16K
+qualification. Large-context experiments omit it. No serving-default promotion.
+
 Private-tail diagnostic huihui_private_tail_20260930 onf605db7 identifies
 repeated identical valid list_files(path=.) calls, not leading prose. Deliberately
 interrupted after observing repetition; no completed verdict. Sources/artifacts/
