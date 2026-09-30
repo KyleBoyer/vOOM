@@ -1,5 +1,23 @@
 # STATUS — 2026-09-14 UTC (current corrections first; dated chronology below is history)
 
+## 2026-09-30: protocol qualification, not a readiness pass
+
+Strict-markers-only huihui_strict_protocol_20260930 on aee30bc is REJECTED:
+the unchanged developer/workspace replay continued beyond186 accepted tokens
+(last progress284.107s decode), versus the old26-token response. The owned
+driver was interrupted deliberately (signal2); no terminal output or completed
+quality claim, remaining cases unrun.183 native samples, minimum5.749GB,
+actual swap-out growth851968B. Sources, artifacts and stopped PIDs verified;
+result SHA017084e0e41e801838df0152c9629a9030d2c8db68fc50a01080255bf7c0452b.
+Independent review found the canonical Hermes replacement omits the released
+template's before-not-after/no-suffix explanation instruction. Candidate
+hermes-completion-guidance-audit restores that convention explicitly without
+forcing stop-after-first, suppressing parallel calls, repairing arguments or
+stripping text. Default off, prompt change (not lossless).617 selected tests
+pass, one unavailable tokenizer skipped;15 isolated native compiler checks
+include both released EOS token masks after the workspace call/newline.
+Next replay adds only this guidance to the rejected grammar composition.
+
 ## 2026-09-16 UTC: full concise policy regresses; Darwin swap counter correction
 
 huihui_small_catalog_long_retry_20260916 on4236960: sustained JSON913.0135s,

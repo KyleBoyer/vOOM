@@ -82,6 +82,27 @@ def test_required_tools_keep_their_existing_termination_with_strict_markers(engi
     assert c.stop_on_complete and c.matcher.is_completed()
 
 
+def test_both_released_eos_tokens_allowed_after_workspace_call(engine,monkeypatch):
+    from runtime.structured import GrammarConstraint
+    from runtime.xgrammar_cpu import backend
+    import numpy as np
+    monkeypatch.setenv('VMODEL_TOOL_STRICT_MARKERS','1')
+    monkeypatch.setenv('VMODEL_TOOL_ARGUMENT_ANY_ORDER','1')
+    tools=[dict(type='function',name='mastra_workspace_list_files',parameters=dict(
+        type='object',properties=dict(path=dict(type='string')),required=['path']))]
+    c=GrammarConstraint.tools(engine,tools,required=False,allow_parallel=True)
+    assert c.matcher.accept_string('<tool_call>'+json.dumps(dict(
+        name='mastra_workspace_list_files',arguments=dict(path='.')))+'</tool_call>\n')
+    mask=backend().allocate_token_bitmask(1,engine.cfg.vocab_size)
+    c.matcher.fill_next_token_bitmask(mask)
+    for name in ('<|im_end|>','<|endoftext|>'):
+        token=engine.tokenizer.token_to_id(name)
+        assert token in engine.cfg.eos_token_ids
+        assert (np.asarray(mask).view(np.uint32)[0,token//32] >> (token%32))&1
+        branch=c.matcher.fork()
+        assert branch.accept_token(token) and branch.is_terminated()
+
+
 def test_actual_compiler_reproduces_and_fixes_out_of_order_field(engine,monkeypatch):
     from runtime.structured import GrammarConstraint
     for required,flag in itertools.product((True,False),('0','1')):

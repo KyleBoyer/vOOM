@@ -1,0 +1,8 @@
+schema: voom.runtime-profile.v1
+name: hermes-completion-guidance-audit
+description: Opt-in no-suffix tool-turn guidance for the canonical Hermes preamble.
+notes:
+  - "Restores the released Qwen template's before-not-after explanation convention when replacing its XML tool format with canonical Hermes JSON. Retains multiple parallel calls and ordinary no-tool answers."
+  - "Prompt change, not token-identical lossless. No output stripping, argument repair, forced first-call stop or default promotion. Requires actual request and held-out transport qualification."
+settings:
+  VMODEL_HERMES_COMPLETION_GUIDANCE: true

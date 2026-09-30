@@ -6605,6 +6605,15 @@ def _tools_system_preamble(tools: list[dict], *, compact_json: bool) -> str:
     Keep using the learned role delimiters while injecting an explicit system
     message whose JSON-line spans can also participate in tool PIC.
     """
+    completion = os.environ.get('VMODEL_HERMES_COMPLETION_GUIDANCE', '0')
+    if completion not in ('0', '1'):
+        raise ValueError('VMODEL_HERMES_COMPLETION_GUIDANCE must be 0 or 1')
+    guidance = (
+        "If you call tools, optional explanation must come BEFORE the tool calls, "
+        "never after. End your turn after the tool-call block or blocks, with "
+        "no suffix. Multiple independent tool calls may use separate blocks. "
+        "Wait for tool results before reporting their contents.\n"
+    ) if completion == '1' else ''
     if compact_json:
         from jinja2.utils import htmlsafe_json_dumps
 
@@ -6617,7 +6626,7 @@ def _tools_system_preamble(tools: list[dict], *, compact_json: bool) -> str:
         "You have access to the following tools. To call one, respond with\n"
         "<tool_call>\n{\"name\": \"<function-name>\", "
         "\"arguments\": {...}}\n</tool_call>\n"
-        "<tools>\n" + "\n".join(serialized) + "\n</tools>"
+        + guidance + "<tools>\n" + "\n".join(serialized) + "\n</tools>"
     )
 
 

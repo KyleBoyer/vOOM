@@ -61,3 +61,20 @@ def test_valid_call_with_visible_protocol_leak_fails_receipt_gate():
         dict(profiles=['test'],profile_digest='digest'))
     assert checks['one_requested_call'] and checks['exact_arguments']
     assert not checks['no_visible_protocol_marker_leak']
+
+
+def test_completion_guidance_is_explicit_preserves_catalog_and_parallel_calls(monkeypatch):
+    from runtime.server import _tools_system_preamble
+    tools=[dict(type='function',name='inspect',parameters=dict(type='object',properties={}))]
+    monkeypatch.delenv('VMODEL_HERMES_COMPLETION_GUIDANCE',raising=False)
+    original=_tools_system_preamble(tools,compact_json=True)
+    monkeypatch.setenv('VMODEL_HERMES_COMPLETION_GUIDANCE','0')
+    assert _tools_system_preamble(tools,compact_json=True)==original
+    monkeypatch.setenv('VMODEL_HERMES_COMPLETION_GUIDANCE','1')
+    candidate=_tools_system_preamble(tools,compact_json=True)
+    assert candidate.split('<tools>')[1]==original.split('<tools>')[1]
+    assert 'no suffix' in candidate and 'Multiple independent tool calls' in candidate
+    for bad in ('true','auto','2',''):
+        monkeypatch.setenv('VMODEL_HERMES_COMPLETION_GUIDANCE',bad)
+        with pytest.raises(ValueError,match='VMODEL_HERMES_COMPLETION_GUIDANCE'):
+            _tools_system_preamble(tools,compact_json=True)
