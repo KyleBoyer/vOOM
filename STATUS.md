@@ -2,6 +2,13 @@
 
 ## 2026-10-01: faithful synthetic provider integration prepared
 
+Fresh huihui_provider_20261001 preflight FAILS: known Plex Transcoder active
+and available memory dips below5.5GB during the30s window (end5.617GB,
+actual swap growth0). No inference launched. Keep user apps/Plex untouched.
+Independent review additionally closes a provider_contract marker-cleanliness
+gap: an outer receipt already rejected leaked markers, but the standalone
+contract also must fail them.195 provider/continuation/legacy gate tests pass.
+
 New synthetic-real-plex-provider-v1 executes the actual sibling Plex provider
 at a0c33c70ebe419809aa184dee5ff9b24e58543eb (tools.ts SHA
 b2a6d66db3dfe77e7ca1cc67e76f0e8620fd19ce053baf5bc80ad1a2cd58e35a),

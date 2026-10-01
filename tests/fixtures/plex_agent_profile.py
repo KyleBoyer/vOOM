@@ -1176,6 +1176,9 @@ def run_profile(request: dict, url: str, timeout: float,
         from tests.fixtures.plex_real_provider import provenance
         provider_provenance = provenance()
         checks = dict(complete=completion['passed'], protocol=not protocol_failures,
+            clean_tool_turn_text=all(not any(marker in turn['visible_text']
+                for marker in ('<tool_call>','</tool_call>'))
+                for turn in turns if turn['call_names']),
             eligible_source_coverage=catalog_coverage['passed'],
             all_eligible_in_final=all(rubric['eligible_titles_found'].values()),
             all_known_ineligible_absent=visible_passed,

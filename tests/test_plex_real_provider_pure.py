@@ -97,12 +97,13 @@ def test_provider_identity_mismatch_fails_before_execution(monkeypatch):
         provider.respond(call(), SYNTHETIC_PAGES)
 
 
-def test_provider_contract_pass_does_not_relabel_legacy_pagination_failure(monkeypatch):
+@pytest.mark.parametrize('preface,clean',[('Checking now.',True),('</tool_call>',False)])
+def test_provider_contract_pass_does_not_relabel_legacy_pagination_failure(monkeypatch,preface,clean):
     import json
     from tests.fixtures import plex_agent_profile as plex
     args=call(limit=50,offset=0)['arguments']
     first=dict(status='completed',output=[
-        dict(type='message',role='assistant',content=[dict(type='output_text',text='Checking now.')]),
+        dict(type='message',role='assistant',content=[dict(type='output_text',text=preface)]),
         dict(type='function_call',call_id='actual',name=plex.PLEX_TOOL,arguments=json.dumps(args))])
     last=dict(status='completed',output=[dict(type='message',role='assistant',
         content=[dict(type='output_text',text=', '.join(plex.ELIGIBLE_TITLES))])])
@@ -112,7 +113,8 @@ def test_provider_contract_pass_does_not_relabel_legacy_pagination_failure(monke
     monkeypatch.setattr(plex,'_post',post)
     result=plex.run_profile(dict(model='test',input=[],tools=[]),'unused',10,3,
         tool_result_profile=provider.PROFILE)
-    assert result['provider_contract']['passed']
+    assert result['provider_contract']['passed'] is clean
+    assert result['provider_contract']['checks']['clean_tool_turn_text'] is clean
     assert result['rubric']['score']==90 and not result['rubric']['passed']
     assert not result['passed']
     assert result['catalog_coverage']['expected_rows']==4
