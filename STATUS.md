@@ -8,6 +8,10 @@ actual swap growth0). No inference launched. Keep user apps/Plex untouched.
 Independent review additionally closes a provider_contract marker-cleanliness
 gap: an outer receipt already rejected leaked markers, but the standalone
 contract also must fail them.195 provider/continuation/legacy gate tests pass.
+The subsequent single300s continuous idle wait expired with Plex still active;
+huihui_provider_idle_20261001 never launched inference. No recurring task,
+background model server or idle waiter remains. Replay configurations are saved
+privately; regenerate source_commit/fresh preflight before the next attempt.
 
 New synthetic-real-plex-provider-v1 executes the actual sibling Plex provider
 at a0c33c70ebe419809aa184dee5ff9b24e58543eb (tools.ts SHA
