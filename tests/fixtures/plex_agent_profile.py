@@ -969,6 +969,19 @@ def _append_export_history(request: dict, export_calls: list[dict]) -> None:
         _append_call_and_result(request, call, call["result"])
 
 
+def _append_full_response_and_result(request, response, call, page):
+    """Provider-contract replay preserves all model-authored output verbatim."""
+    output = response.get('output')
+    if not isinstance(output, list):
+        raise ValueError('missing actual model output')
+    calls = [x for x in output if isinstance(x, dict) and x.get('type') == 'function_call']
+    if len(calls) != 1 or calls[0].get('call_id') != call.get('call_id'):
+        raise ValueError('actual function-call identity mismatch')
+    request['input'].extend(copy.deepcopy(output))
+    request['input'].append(dict(type='function_call_output', call_id=call['call_id'],
+        output=json.dumps(page, ensure_ascii=False, separators=(',', ':'))))
+
+
 def _response_turn(response: dict, wall: float, turn: int,
                    request: dict) -> dict:
     calls = response_calls(response)
@@ -1128,7 +1141,10 @@ def run_profile(request: dict, url: str, timeout: float,
         page = (SYNTHETIC_PAGES[min(page_index, len(SYNTHETIC_PAGES) - 1)]
                 if tool_result_profile == 'legacy'
                 else plex_finite_media.respond(call, SYNTHETIC_PAGES, profile=tool_result_profile))
-        _append_call_and_result(request, call, page)
+        if tool_result_profile == plex_finite_media.PROVIDER_PROFILE:
+            _append_full_response_and_result(request, response, call, page)
+        else:
+            _append_call_and_result(request, call, page)
         delivered_pages.append(page)
         turns[-1]["handled_call_count"] = 1
         # A forced choice governs the planning turn only. Keeping it on every
@@ -1151,8 +1167,22 @@ def run_profile(request: dict, url: str, timeout: float,
     }
     visible_passed = all(visible_ineligible_absent.values())
     rubric["scope"] = "terminal_answer"
-    catalog_coverage = (plex_finite_media.coverage(delivered_pages, SYNTHETIC_PAGES)
+    catalog_coverage = (plex_finite_media.coverage(delivered_pages, SYNTHETIC_PAGES,
+                        profile=tool_result_profile)
         if tool_result_profile != 'legacy' else None)
+    provider_contract = None
+    provider_provenance = None
+    if tool_result_profile == plex_finite_media.PROVIDER_PROFILE:
+        from tests.fixtures.plex_real_provider import provenance
+        provider_provenance = provenance()
+        checks = dict(complete=completion['passed'], protocol=not protocol_failures,
+            eligible_source_coverage=catalog_coverage['passed'],
+            all_eligible_in_final=all(rubric['eligible_titles_found'].values()),
+            all_known_ineligible_absent=visible_passed,
+            plan=all(value['passed'] for key,value in rubric['checks'].items()
+                if key not in ('paginated_after_has_more','pagination_offset_increased')))
+        provider_contract = dict(passed=all(checks.values()), checks=checks,
+            scope='Synthetic actual-provider contract; legacy score unchanged. Exhaustion uses independent source coverage, not an artificial minimum call count. Not live Plex or raw-result reasoning qualification.')
     return {
         "gate": "plex-agent-profile-v2",
         "model": request.get("model"),
@@ -1160,6 +1190,10 @@ def run_profile(request: dict, url: str, timeout: float,
                    and visible_passed and not protocol_failures
                    and (catalog_coverage is None or catalog_coverage['passed'])),
         "catalog_coverage": catalog_coverage,
+        "provider_contract": provider_contract,
+        "provider_provenance": provider_provenance,
+        "continuation_history_policy": ('full_response_output'
+            if tool_result_profile == plex_finite_media.PROVIDER_PROFILE else 'call_only_legacy'),
         "completion": completion,
         "protocol_failures": protocol_failures,
         "tool_results_source": ("synthetic_two_page_fixture"

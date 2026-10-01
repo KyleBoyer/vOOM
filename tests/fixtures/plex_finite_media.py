@@ -11,11 +11,15 @@ import copy
 PROFILE = 'synthetic-finite-media-v1'
 PAGE5_PROFILE = 'synthetic-finite-media-page5-v1'
 PLEX_PROFILE = 'synthetic-finite-plex-v1'
-PROFILES = (PROFILE, PAGE5_PROFILE, PLEX_PROFILE)
+PROVIDER_PROFILE = 'synthetic-real-plex-provider-v1'
+PROFILES = (PROFILE, PAGE5_PROFILE, PLEX_PROFILE, PROVIDER_PROFILE)
 
 
-def coverage(pages, source_pages):
+def coverage(pages, source_pages, *, profile=None):
     """Independent complete-catalog evidence; no rubric or model repair."""
+    if profile == PROVIDER_PROFILE:
+        from tests.fixtures.plex_real_provider import coverage as provider_coverage
+        return provider_coverage(pages, source_pages)
     expected = {(kind, row['title']) for page in source_pages
                 for kind, key in (('movie', 'movies'), ('show', 'series'))
                 for row in page[key]}
@@ -35,6 +39,9 @@ def coverage(pages, source_pages):
 def respond(call, source_pages, *, profile=PROFILE):
     if profile not in PROFILES:
         raise ValueError('unknown finite media profile')
+    if profile == PROVIDER_PROFILE:
+        from tests.fixtures.plex_real_provider import respond as provider_respond
+        return provider_respond(call, source_pages)
     library = (profile == PLEX_PROFILE
                and call.get('name') == 'plugin__plex__plex_list_library')
     if not library and call.get('name') != 'plugin__plex__plex_list_library_media':

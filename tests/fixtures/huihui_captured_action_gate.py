@@ -97,6 +97,11 @@ def acceptance(row, response, config, *, initial_action=True):
     witness = t.get('generation_witness') or {}
     before, after = row['pressure_before'], row['pressure_after']
     checks = action_checks(response) if initial_action else {}
+    if any(isinstance(x, dict) and x.get('type') == 'function_call'
+           for x in (response.get('output') or [])):
+        from tests.fixtures.captured_transition_tracking_gate import visible_text
+        text = visible_text(response)
+        checks['no_visible_protocol_marker_leak'] = '<tool_call>' not in text and '</tool_call>' not in text
     if config.get('require_exact_capture_predicates') is True:
         from tests.fixtures.plex_agent_profile import response_calls
         from tests.fixtures.plex_argument_fidelity import check

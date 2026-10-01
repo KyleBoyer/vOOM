@@ -1,5 +1,28 @@
 # STATUS — 2026-09-14 UTC (current corrections first; dated chronology below is history)
 
+## 2026-10-01: faithful synthetic provider integration prepared
+
+New synthetic-real-plex-provider-v1 executes the actual sibling Plex provider
+at a0c33c70ebe419809aa184dee5ff9b24e58543eb (tools.ts SHA
+b2a6d66db3dfe77e7ca1cc67e76f0e8620fd19ce053baf5bc80ad1a2cd58e35a),
+with in-memory movie/series clients and Node network/write permissions denied.
+No live Plex calls, coaching fields, result repair or substituted request tools.
+Provider filters before real default50/max200 pagination; ten source rows yield
+four eligible records in ONE page. Independent eligible identity/totals/ranges/
+exhaustion gate is separate from the unchanged legacy rubric, which still scores
+an otherwise perfect single-page answer90/FAIL. A regression explicitly verifies
+that overall legacy verdict stays FAIL even when provider_contract passes.
+The new mode appends the entire actual response.output plus synthetic result;
+older fixtures' call-only continuation remains labeled and unchanged.
+834selected tests PASS, one unavailable tokenizer skipped.13 actual-provider
+tests include genuine default50 pagination with53 eligible movies, restrictive
+query/identity/corrupt-page failures, and no network/client fallback. New named
+huihui-qwen38-27b-serial-harness-candidate composes the measured serial-turn
+settings with full-workflow64MB paging and optional16K HTTP admission cap;
+private token-tail logging is OFF. Full captured replay pending host admission.
+Plex transcoding observed; leave it and user apps running, do not launch a
+competing model job unless the fresh preflight passes.
+
 ## 2026-09-30: protocol qualification, not a readiness pass
 
 Serial-turn suite huihui_serial_turns_20260930 on374bb61 completed naturally:

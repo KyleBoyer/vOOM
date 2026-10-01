@@ -1,5 +1,18 @@
 # Huihui harness preview
 
+October1 update: the explicit `huihui-qwen38-27b-serial-harness-candidate`
+adds the audited protocol/memory settings and serializes tool calls (one per
+turn, no parallel batch). Workspace replay112.60s and literal-marker argument
+70.09s pass cleanly; a filtered continuation184.81s returns correct IDs but
+fails strict JSON-only formatting. All three pass native memory checks. This
+is still a candidate, NOT full harness readiness or a sub90-second workflow.
+Its16384-token HTTP cap covers prepared prompt+requested output and rejects
+oversized requests; it is not a16K context-quality qualification. The older
+preview command below does not select this new experimental composition.
+Full captured provider-contract replay is next when Plex is not transcoding.
+Actual provider code over synthetic data is distinct from live Plex and the
+older raw-result stress fixture; legacy scores are not relabeled.
+
 September16: short text/tool requests, sustained JSON and exact cached restarts work. **Full
 Plex harness readiness is not qualified.** This explicit profile is a measured
 small-catalog preview, not a claim that all optimizations or quality gates pass.

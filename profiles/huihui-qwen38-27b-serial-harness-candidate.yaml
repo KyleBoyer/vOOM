@@ -1,0 +1,41 @@
+schema: voom.runtime-profile.v1
+name: huihui-qwen38-27b-serial-harness-candidate
+description: Explicit serial-tool full-state candidate; broader harness qualification still pending.
+notes:
+  - "Selected all-MXFP4 target, reassociated prefill, compact tool gateway and serial call grammar are approximations/restrictions, not released-BF16 lossless."
+  - "One tool call per model turn; no host repair, answer synthesis, or truncation. Full prepared prompt state and exact paged cache retained. Parallel workflows require successive result turns."
+  - "Workspace and literal-marker tests pass; strict JSON-only natural-language instruction still fails on one continuation. Original full Plex workflow and long contexts remain unqualified for this composition."
+  - "HTTP admission cap16384 includes requested output, not a context-quality claim. Use max_output_tokens1024 or a deliberate client choice; keep long client timeouts and one concurrent request."
+extends:
+  - huihui-qwen38-27b-workflow-head-rows-audit
+  - generation-witness
+  - host-activity-witness
+  - governor-reclamation-witness
+  - qwen35-serial-kv-reclaim
+  - qwen35-serial-kv-reclaim-topup
+  - qwen35-mxfp4-head-rows8192
+  - qwen35-prefill-ceiling32
+  - qwen35-streaming-cache256
+  - qwen35-prefill-split-weights
+  - qwen35-prefill-split-mlp
+  - qwen35-reserve4500-audit
+  - xgrammar-cpu-only
+  - admission-pause
+  - gateway-enable-external-only
+  - qwen35-paged-prefix-cache
+  - decode-progress-witness
+  - gateway-buffered-decision
+  - gateway-execution-auto
+  - qwen35-paged-kv64-audit
+  - qwen35-factor-base-disk-audit
+  - gateway-inline-conversation-audit
+  - host-allocator-relief
+  - qwen35-draft-head-release-audit
+  - darwin-actual-swap-witness
+  - tool-argument-any-order-audit
+  - gateway-concise-results-audit
+  - gateway-small-catalog-direct-audit
+  - tool-strict-markers-audit
+  - hermes-completion-guidance-audit
+  - tool-serial-turns-audit
+  - http-context-16k-preview
