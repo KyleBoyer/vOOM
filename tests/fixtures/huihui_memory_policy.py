@@ -16,7 +16,9 @@ def validate(config, env, preflight):
         points=[preflight['start'],*preflight['pressure_window']['samples'],preflight['end']]
         assert all(p.get('swap_counter_source')==SOURCE for p in points)
     if floor == 4_500_000_000:
-        assert 'qwen35-reserve4500-audit' in config['profiles']
+        from runtime.profiles import apply_runtime_profiles
+        resolved = apply_runtime_profiles(config['profiles'], environ={})
+        assert resolved is not None and 'qwen35-reserve4500-audit' in resolved.resolution_order
         assert env.get('VMODEL_QWEN35_MIN_AVAILABLE_MB') == '4500'
         assert preflight['thresholds']['min_stable_available_bytes'] >= 5_500_000_000
         assert preflight['pressure_window']['minimum_available_bytes'] >= 5_500_000_000

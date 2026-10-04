@@ -3,6 +3,21 @@ from runtime.profiles import apply_runtime_profiles
 from tests.fixtures.huihui_memory_policy import available_floor, validate
 
 
+def test_named_candidate_inherits_authorized_floor_without_weakening_launch_gate():
+    from runtime.profiles import apply_runtime_profiles
+    config=dict(minimum_available_bytes=4_500_000_000,
+        profiles=['huihui-qwen38-27b-serial-harness-candidate'])
+    env={};apply_runtime_profiles(config['profiles'],environ=env)
+    preflight=dict(thresholds=dict(min_stable_available_bytes=5_500_000_000),
+        pressure_window=dict(minimum_available_bytes=5_500_000_000))
+    assert validate(config,env,preflight)==4_500_000_000
+    preflight['pressure_window']['minimum_available_bytes']-=1
+    with pytest.raises(AssertionError):validate(config,env,preflight)
+    preflight['pressure_window']['minimum_available_bytes']+=1
+    env['VMODEL_QWEN35_MIN_AVAILABLE_MB']='4400'
+    with pytest.raises(AssertionError):validate(config,env,preflight)
+
+
 def test_profile_only_changes_authorized_reserve():
     before={};after={}
     apply_runtime_profiles(['huihui-qwen38-27b-harness-preview'],environ=before)

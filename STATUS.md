@@ -1,5 +1,15 @@
 # STATUS — 2026-09-14 UTC (current corrections first; dated chronology below is history)
 
+## 2026-10-04: provider replay resumed
+
+Host preflight now passes with no active transcoder. Initial
+huihui_provider_20261004 fails BEFORE server/model load: memory-policy fixture
+recognized the authorized4500MB profile only when directly listed, not inherited
+by the named candidate. Source/log/stopped wrapper PIDs verified; no inference
+or quality result exists. Validation now resolves profile ancestry while retaining
+the exact4500MB setting and5500MB sampled launch minimum; lower values still
+fail. Fresh retry uses a new run identity and preflight. No memory floor lowered.
+
 ## 2026-10-01: faithful synthetic provider integration prepared
 
 Fresh huihui_provider_20261001 preflight FAILS: known Plex Transcoder active
