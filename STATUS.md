@@ -2,6 +2,14 @@
 
 ## 2026-10-05: provider answer and explicit JSON results; preview only
 
+Serving handoff remains DEFERRED_PRECONDITION after testing: fresh30s admission
+windows huihui_serve_20261005 and huihui_serve_retry_20261005 dip to5.208GB and
+5.304GB available, below the unchanged5.5GB launch minimum. A bounded intervening
+idle observation also stays below admission. No active transcoder, root free
+above20GB; user apps untouched. Port8077 server and smoke request NOT launched.
+No recurring task or idle waiter remains. Use the documented candidate launch
+only after its fresh admission check passes; do not claim the endpoint is online.
+
 Source08357f7, named serial-harness-candidate: the October4 provider replay
 completed its two HTTP turns in632.3552s and1157.8041s (302 final tokens),
 1790.7292s workflow wall. Original134-tool/temp1 capture retained except declared
