@@ -1,5 +1,41 @@
 # STATUS — 2026-09-14 UTC (current corrections first; dated chronology below is history)
 
+## 2026-10-05: provider answer and explicit JSON results; preview only
+
+Source08357f7, named serial-harness-candidate: the October4 provider replay
+completed its two HTTP turns in632.3552s and1157.8041s (302 final tokens),
+1790.7292s workflow wall. Original134-tool/temp1 capture retained except declared
+model/max1024/seed overrides; gateway prepares8726 tokens with a selected catalog,
+not full49K all-schema execution. Actual pinned provider code runs on synthetic
+data, not live Plex. Exact filters, all four eligible titles, no known ineligible
+titles, protocol and provider_contract PASS. Unchanged legacy score90/100/FAIL:
+only its two pagination checks fail; actual provider exhausts this data in one
+page. No rubric changes or answer repair. Prefix reuse0 ->8726 tokens;
+prefill365.1388 ->18.2327s, decode265.6274 ->1137.6871s. These are DIFFERENT
+turns, not a cached/uncached A/B or cold-storage measurement. Native pressure
+PASS:883 samples, minimum4.655GB, actual swap growth0, no known transcoder.
+Child result SHA351dbfa4dcff3c1310b70ad69705c3d8b498add885eab03fcb823071efde1ce4.
+IMPORTANT: outer runner left only running.json; no final envelope or persisted
+starting source manifest survives. Child/response/server-log hashes verified,
+recorded commit matches clean HEAD and all owned PIDs stopped, but wrapper-level
+source/exit verification is INCOMPLETE. Do not fabricate/recover a PASS envelope.
+
+huihui_structured_terminal_20261004 actually ran October5 on the same source:
+asset IDs73.6382s/13tokens and support tickets69.4978s/15tokens, exact JSON PASS.
+Both are explicitly modified terminal requests: text.format=json_schema and
+tool_choice=none; no answer constants in schemas. This does NOT retroactively
+pass the September30 natural-language-only JSON failure. Whole pressure PASS:
+70 samples, minimum4.893GB, actual swap growth0. Full wrapper start/end/current
+source equality, child/log/server hashes and stopped PIDs VERIFIED; result SHA
+e00987b232c2831898630cbc6a2219aba297251e5cce014284763d293268161d.
+
+Runner now persists its starting source manifest before environment discovery
+and child launch; interrupted provenance remains a RUNNING record, not success.
+77 focused regressions PASS, including two launch-provenance tests for the
+tracked tests/fixtures runner;171 runtime profiles validate. The ignored local
+experiments runner has the same narrow persistence fix, not an equivalence claim.
+Full readiness, live Plex, long contexts and sub90-second workflow remain open.
+
 ## 2026-10-04: provider replay resumed
 
 Host preflight now passes with no active transcoder. Initial

@@ -731,6 +731,10 @@ def main() -> int:
     atomic_json(running_path, base)
 
     manifest = source_manifest(args.source_root.resolve())
+    # A lost parent must retain its starting source identity on disk. This is
+    # still RUNNING evidence, not proof of an exit or an unchanged ending tree.
+    base["source_manifest"] = manifest
+    atomic_json(running_path, base)
     environment = environment_snapshot()
     extrema: dict = {}
     timed_out = False
