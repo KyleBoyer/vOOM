@@ -9,3 +9,5 @@ extends:
   - huihui-qwen38-27b-serial-harness-candidate
   - qwen35-plain-target-audit
   - qwen35-prefill-ceiling8
+settings:
+  VMODEL_QWEN35_SPLIT_SINGLE_TOKEN_WEIGHTS: true

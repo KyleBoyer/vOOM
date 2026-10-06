@@ -8,6 +8,9 @@ and speculative rollback, and reduces prefill tiles32 ->8. Target weights and
 full prepared context are unchanged; different prefill shapes still need quality
 checks. Plain decoding may be slower. The live4.5GB reserve,400MB ordinary margin,
 8.5GB Metal ceiling,256MB weight-cache cap and64MB exact-KV cap remain.
+One-token decoding also loads attention, gate/up and down-projection weights
+separately; it no longer needs the whole210MB layer page at once. This path is
+explicitly selected by the low-memory profile, not enabled for other profiles.
 
 From a clean shell without `VMODEL_*` overrides:
 

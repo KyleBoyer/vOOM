@@ -1384,6 +1384,7 @@ class RuntimeConfig:
     qwen35_mxfp4_head_rows: int = 0  # explicit native MXFP4 row streaming; 0 preserves old path
     qwen35_prefill_split_weights: bool = False
     qwen35_prefill_split_mlp: bool = False
+    qwen35_split_single_token_weights: bool = False
     governor: bool = True  # F16: live memory-pressure governor (safety default on)
     # Qwen3-VL preprocessing budget. 0 selects the runtime's exact global-
     # attention safety ceiling; fast mode may choose a smaller quality-gated
@@ -1747,6 +1748,7 @@ class RuntimeConfig:
             qwen35_mxfp4_head_rows=run.get("qwen35_mxfp4_head_rows", 0),
             qwen35_prefill_split_weights=run.get("qwen35_prefill_split_weights", False),
             qwen35_prefill_split_mlp=run.get("qwen35_prefill_split_mlp", False),
+            qwen35_split_single_token_weights=run.get("qwen35_split_single_token_weights", False),
             governor=run.get("governor", True),
             vision_max_patches=run.get("vision_max_patches", 0),
             warm_start=run.get("warm_start", 0),
@@ -2731,6 +2733,9 @@ class StreamingEngine:
         mxfp4_head_policy.validate(self.rc, self.cfg, self.store)
         if self.rc.qwen35_prefill_split_mlp and not self.rc.qwen35_prefill_split_weights:
             raise ValueError('split MLP requires split-weight prefill')
+        if self.rc.qwen35_split_single_token_weights and not (
+                self.rc.qwen35_prefill_split_weights and self.rc.qwen35_prefill_split_mlp):
+            raise ValueError('split single-token weights requires split prefill and MLP')
         if self.rc.qwen35_prefill_split_weights:
             from .qwen35_prefill_split import validate as validate_split_prefill
             validate_split_prefill(self.rc,self.cfg)
@@ -6234,6 +6239,9 @@ class StreamingEngine:
             tap_layers = collector.tap_layers
         self._tap_hidden = {}
         position_count = int(x.shape[1])
+        if getattr(self.rc, 'qwen35_split_single_token_weights', False) and position_count == 1:
+            from .qwen35_prefill_split import single_token_sweep
+            return single_token_sweep(self, x, kv, offset, tap_layers=tap_layers)
         profiler = self._request_profiler
         # Never charge one-position decode for a multi-position prefill
         # high-water, or a smaller retry chunk for a larger prefill's
@@ -11312,6 +11320,7 @@ class StreamingEngine:
                 f"{mxfp4_head_policy.identity(self.rc.qwen35_mxfp4_head_rows)}"
                 f"{'qwen35-split-prefill-v1' if self.rc.qwen35_prefill_split_weights else ''}"
                 f"{'qwen35-split-mlp-spool-v1' if self.rc.qwen35_prefill_split_mlp else ''}"
+                f"{'qwen35-split-single-token-v1' if self.rc.qwen35_split_single_token_weights else ''}"
                 f"tiedhead{int(self.rc.quantize_tied_lm_head)}"
                 f"resident{int(self.rc.resident_fast_decode)}"
                 f"residentprefill{self.rc.resident_fast_prefill_limit}"
@@ -11549,6 +11558,7 @@ class StreamingEngine:
         request_t0 = time.perf_counter()
         direct_io_before = _direct_io_snapshot(self)
         self._qwen35_split_prefill_stats = {}
+        self._qwen35_split_single_token_stats = {}
         mxfp4_head_before = mxfp4_head_policy.snapshot(self)
         qwen4_expert_before = (
             self.store.qwen4_fused_expert_snapshot()
@@ -14614,6 +14624,8 @@ class StreamingEngine:
         _record_direct_io_delta(self, direct_io_before, path_stats)
         if self.rc.qwen35_prefill_split_weights:
             path_stats['qwen35_split_prefill_weights'] = dict(self._qwen35_split_prefill_stats)
+        if self.rc.qwen35_split_single_token_weights:
+            path_stats['qwen35_split_single_token_weights'] = dict(self._qwen35_split_single_token_stats)
         mxfp4_head_policy.publish(self, path_stats, mxfp4_head_before,
                                  mxfp4_head_prefill_after)
         if qwen4_ple_before is not None:

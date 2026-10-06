@@ -82,6 +82,22 @@ def sweep(engine,x,kv,offset,tile_width,on_progress=None,*,layer_start=0,layer_e
             spool.close()
 
 
+def single_token_sweep(engine, x, kv, offset, *, tap_layers=None):
+    """Reuse the bounded phase schedule without changing or advancing KV twice.
+
+    The caller retains ownership of offset advancement and head projection.
+    Explicit tap requests are not silently dropped. Counters are separate from
+    multi-position prefill, including when a one-position prompt uses this path.
+    """
+    if (tuple(x.shape[:2]) != (1, 1) or tap_layers is not None
+            or not engine.rc.qwen35_prefill_split_weights
+            or not engine.rc.qwen35_prefill_split_mlp):
+        raise ValueError('split single-token sweep requires batch1/position1, split MLP and no taps')
+    if not hasattr(engine, '_qwen35_split_single_token_stats'):
+        engine._qwen35_split_single_token_stats = {}
+    return sweep(engine, x, kv, offset, 1, profile_path='qwen35_split_single_token')
+
+
 def _sweep(engine,x,kv,offset,tile_width,on_progress=None,*,layer_start=0,layer_end=None,
           profile_path='layer_stationary_qwen35',positions3=None,
           boundary_fork_at=None,boundary_fork_kv=None,spools):
@@ -130,7 +146,8 @@ def _sweep(engine,x,kv,offset,tile_width,on_progress=None,*,layer_start=0,layer_
         getattr(engine,'_decode_layer_transient',0))
     profiler=engine._request_profiler
     tap=engine._dspark_tap_collector
-    stats=engine._qwen35_split_prefill_stats
+    stats=(engine._qwen35_split_single_token_stats
+           if profile_path=='qwen35_split_single_token' else engine._qwen35_split_prefill_stats)
     stats['sweeps']=stats.get('sweeps',0)+1
     if profiler is not None:
         profiler.begin_sweep(total,path=profile_path+'_split_weights')

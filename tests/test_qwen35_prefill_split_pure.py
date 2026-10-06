@@ -47,9 +47,11 @@ def test_mlp_partition_complete_disjoint():
 
 
 @pytest.mark.parametrize('fail_down',[False,True])
-def test_split_mlp_spools_all_tiles_and_cleans_up(monkeypatch,tmp_path,fail_down):
+@pytest.mark.parametrize('single_token',[False,True])
+def test_split_mlp_spools_all_tiles_and_cleans_up(monkeypatch,tmp_path,fail_down,single_token):
     e,events,loaded=fake_engine(monkeypatch)
     e.rc.qwen35_prefill_split_mlp=True;e.rc.kv_spill_dir=str(tmp_path)
+    e.rc.qwen35_prefill_split_weights=True
     e.cfg.intermediate_size=1;e.cfg.rms_norm_eps=1e-6
     e._layer_names=dense_names
     q=sys.modules['runtime.qwen35'];q.qwen35_rms_norm=lambda x,*a:x
@@ -69,21 +71,48 @@ def test_split_mlp_spools_all_tiles_and_cleans_up(monkeypatch,tmp_path,fail_down
         def close(self):assert not self.closed;self.closed=True
     module=ModuleType('runtime.activation_spool');module.DiskBacked16BitTileSpool=Spool
     monkeypatch.setitem(sys.modules,'runtime.activation_spool',module)
-    x=np.arange(3,dtype=float).reshape(1,3,1)
+    count=1 if single_token else 3
+    x=np.arange(count,dtype=float).reshape(1,count,1)
+    run=lambda: (split.single_token_sweep(e,x,{},7) if single_token else split.sweep(e,x,{},7,2))
     if fail_down:
-        with pytest.raises(RuntimeError,match='down failed'):split.sweep(e,x,{},0,2)
+        with pytest.raises(RuntimeError,match='down failed'):run()
     else:
-        out=split.sweep(e,x,{},0,2)
+        out=run()
         expected=x
         for layer in range(2):
             expected=expected+layer+1
             expected=expected+(1/(1+np.exp(-expected)))*expected*(expected*2)
         assert np.array_equal(out,expected)
-        stats=e._qwen35_split_prefill_stats
+        stats=e._qwen35_split_single_token_stats if single_token else e._qwen35_split_prefill_stats
         assert stats['mlp_gate_up_phases']==stats['mlp_down_phases']==stats['mlp_phases']==2
-        assert stats['mlp_spool_bytes_written']==stats['mlp_spool_bytes_read']==48
+        assert stats['mlp_spool_bytes_written']==stats['mlp_spool_bytes_read']==16*count
+        if single_token:assert e._qwen35_split_prefill_stats=={}
     assert not loaded and created and all(s.closed for s in created)
-    assert all(sorted(s.values)==[0,1] for s in created)
+    assert all(sorted(s.values)==([0] if single_token else [0,1]) for s in created)
+
+
+@pytest.mark.parametrize('shape,taps', [((1,2,1),None),((2,1,1),None),((1,1,1),[0])])
+def test_single_token_rejects_unsupported_shapes_before_state_changes(monkeypatch,shape,taps):
+    e,events,loaded=fake_engine(monkeypatch)
+    e.rc.qwen35_prefill_split_weights=e.rc.qwen35_prefill_split_mlp=True
+    kv={}
+    with pytest.raises(ValueError):split.single_token_sweep(e,np.ones(shape),kv,7,tap_layers=taps)
+    assert not events and not loaded and not kv
+
+
+def test_engine_single_token_dispatch_precedes_whole_layer_fetch(monkeypatch):
+    tree=ast.parse(Path('runtime/engine.py').read_text())
+    method=next(node for cls in tree.body if isinstance(cls,ast.ClassDef) and cls.name=='StreamingEngine'
+                for node in cls.body if isinstance(node,ast.FunctionDef) and node.name=='_sweep')
+    namespace={'mx':NS(array=object),'KVCache':object,'__name__':'runtime.engine','__package__':'runtime'}
+    exec(compile(ast.fix_missing_locations(ast.Module(body=[method],type_ignores=[])), '<single-token-dispatch>', 'exec'),namespace)
+    x=np.ones((1,1,1));kv=object();observed=[]
+    def run(engine,value,state,offset,**kw):
+        observed.append((value,state,offset,kw));return value+5
+    monkeypatch.setattr(split,'single_token_sweep',run)
+    e=NS(rc=NS(qwen35_split_single_token_weights=True),_dspark_tap_collector=None)
+    assert np.array_equal(namespace['_sweep'](e,x,kv,17),x+5)
+    assert observed[0][1] is kv and observed[0][2]==17 and e._tap_hidden=={}
 
 
 @pytest.mark.parametrize('bad',[[],names(0)+names(0),names(1),
@@ -273,8 +302,13 @@ def test_profile_keys_and_structured_protocol_witness():
     assert len(keys)==2
     assert all(sum(isinstance(x,ast.Name) and x.id=='qwen35_split_prefill_request' for x in n.value.elts)==1 for n in keys)
     assert all(sum(isinstance(x,ast.Name) and x.id=='qwen35_split_mlp_request' for x in n.value.elts)==1 for n in keys)
+    assert all(sum(isinstance(x,ast.Name) and x.id=='qwen35_split_single_request' for x in n.value.elts)==1 for n in keys)
     assert "'qwen35-split-prefill-v1' if self.rc.qwen35_prefill_split_weights else ''" in Path('runtime/engine.py').read_text()
     assert "'qwen35-split-mlp-spool-v1' if self.rc.qwen35_prefill_split_mlp else ''" in Path('runtime/engine.py').read_text()
+    assert "'qwen35-split-single-token-v1' if self.rc.qwen35_split_single_token_weights else ''" in Path('runtime/engine.py').read_text()
+    for result in (_cache_phase_telemetry('generation',{'path_stats':{'qwen35_split_single_token_weights':witness}}),
+                   _vision_protocol_timing({'path_stats':{'qwen35_split_single_token_weights':witness}})):
+        assert result['qwen35_split_single_token_weights']==witness
 
 
 def test_split_mlp_profile_only_enables_explicit_new_switch():

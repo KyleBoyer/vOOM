@@ -13,6 +13,17 @@ and occupied ports, then execs the lazy-loading loopback service. No app closure
 or automatic retry task.57 focused configuration/policy regressions PASS;
 actual tool/JSON inference qualification is pending, not a readiness claim.
 
+First real gate huihui_low_memory_20261006 on013c227 rejects the workspace case
+after151.2262s: ordinary decode still fetches an entire210MB layer with400MB
+margin and refuses before allocation (available5.07GB). Native memory PASS,
+minimum4.932GB and actual swap0; no completed response, later cases unrun.
+Full source/artifact/exit/stopped-PID verification PASS; result SHA
+ba867881f083ad0ba75162b083d1a4175a5233bc07bdd805e3cbd72005888101.
+Next repair adds opt-in single-token attention/gate-up/down lifetime splitting,
+reusing the bounded prefill schedule with separate telemetry. No governor margin
+or live reserve change. Exact KV offset ownership stays with the caller;
+unsupported taps/batches reject before work. Cache identity includes the flag.
+
 ## 2026-10-05: provider answer and explicit JSON results; preview only
 
 Serving handoff remains DEFERRED_PRECONDITION after testing: fresh30s admission
