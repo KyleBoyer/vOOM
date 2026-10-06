@@ -1,0 +1,11 @@
+schema: voom.runtime-profile.v1
+name: huihui-qwen38-27b-low-memory-online
+description: Explicit low-memory serial harness candidate with ordinary target decoding.
+notes:
+  - "October5 user request to serve with limited host memory. Launcher samples at least5.0GB available; live4500MB reserve,400MB ordinary margin,8.5GB Metal ceiling and16MB swap guards remain. Startup admission is not an allocation guarantee."
+  - "No proposal sidecar or speculative rollback is loaded. Prefill ceiling8 reduces workspace; cache256MB, exact KV64MB and native head8192 rows are retained. Full prepared context/output budget is unchanged."
+  - "Target remains selected MXFP4, not released-BF16 lossless. Changed prefill shapes require quality checks. May be slower; no full Plex/long-context/latency claim. Requests that cannot reserve safely still fail closed."
+extends:
+  - huihui-qwen38-27b-serial-harness-candidate
+  - qwen35-plain-target-audit
+  - qwen35-prefill-ceiling8

@@ -1,5 +1,18 @@
 # STATUS — 2026-09-14 UTC (current corrections first; dated chronology below is history)
 
+## 2026-10-06: explicit low-memory serving candidate
+
+Following the user's October5 request to come online with limited host memory,
+huihui-qwen38-27b-low-memory-online removes the MTP draft/rollback and reduces
+prefill tiles32 ->8. Selected target weights/full prepared context are retained;
+shape changes are not assumed bit-identical. All live4500MB reserve/400MB margin,
+Metal ceiling and swap guards remain. Only this bounded composition may qualify
+with a sampled5000MB launch minimum instead of5500MB. Original profiles still
+require5500MB. runtime.huihui_serve performs fresh30s admission, rejects overrides
+and occupied ports, then execs the lazy-loading loopback service. No app closure
+or automatic retry task.57 focused configuration/policy regressions PASS;
+actual tool/JSON inference qualification is pending, not a readiness claim.
+
 ## 2026-10-05: provider answer and explicit JSON results; preview only
 
 Serving handoff remains DEFERRED_PRECONDITION after testing: fresh30s admission

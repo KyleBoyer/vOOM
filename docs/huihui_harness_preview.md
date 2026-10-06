@@ -1,5 +1,29 @@
 # Huihui harness preview
 
+## Low-memory serving (October6 candidate)
+
+The explicit `huihui-qwen38-27b-low-memory-online` profile is being qualified
+for hosts below the former5.5GB startup buffer. It removes the proposal sidecar
+and speculative rollback, and reduces prefill tiles32 ->8. Target weights and
+full prepared context are unchanged; different prefill shapes still need quality
+checks. Plain decoding may be slower. The live4.5GB reserve,400MB ordinary margin,
+8.5GB Metal ceiling,256MB weight-cache cap and64MB exact-KV cap remain.
+
+From a clean shell without `VMODEL_*` overrides:
+
+```bash
+cd "/Volumes/Workspace NVME/git/vOOM"
+caffeinate -is .venv/bin/python -m runtime.huihui_serve --port 8077
+```
+
+This launcher samples the host for30seconds and requires5.0GB available,
+10GB root free, stable swap and no known transcoder. It refuses a used port
+without stopping its owner. It then starts the lazy-loading loopback service;
+individual allocations still fail closed if they cannot fit safely. A lower
+startup buffer is not a guarantee that arbitrary large requests will fit.
+Measured qualification and endpoint status are recorded in STATUS.md; the
+older timings below do not qualify this new composition.
+
 October5: use the explicit `huihui-qwen38-27b-serial-harness-candidate` below
 for an experimental harness trial. It serializes tool calls (one per turn).
 Full general-purpose readiness and sub90-second workflow latency are NOT met.

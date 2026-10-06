@@ -20,6 +20,11 @@ def validate(config, env, preflight):
         resolved = apply_runtime_profiles(config['profiles'], environ={})
         assert resolved is not None and 'qwen35-reserve4500-audit' in resolved.resolution_order
         assert env.get('VMODEL_QWEN35_MIN_AVAILABLE_MB') == '4500'
-        assert preflight['thresholds']['min_stable_available_bytes'] >= 5_500_000_000
-        assert preflight['pressure_window']['minimum_available_bytes'] >= 5_500_000_000
+        launch_minimum = 5_500_000_000
+        from runtime.huihui_serve import PROFILE, LAUNCH_AVAILABLE, validate_profile
+        if PROFILE in resolved.resolution_order:
+            validate_profile(env)
+            launch_minimum = LAUNCH_AVAILABLE
+        assert preflight['thresholds']['min_stable_available_bytes'] >= launch_minimum
+        assert preflight['pressure_window']['minimum_available_bytes'] >= launch_minimum
     return floor
