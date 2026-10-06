@@ -2,7 +2,7 @@
 
 ## Low-memory serving (October6 candidate)
 
-The explicit `huihui-qwen38-27b-low-memory-online` profile is being qualified
+The explicit `huihui-qwen38-27b-low-memory-online` profile has passed short tool/JSON tests
 for hosts below the former5.5GB startup buffer. It removes the proposal sidecar
 and speculative rollback, and reduces prefill tiles32 ->8. Target weights and
 full prepared context are unchanged; different prefill shapes still need quality
@@ -24,8 +24,14 @@ This launcher samples the host for30seconds and requires5.0GB available,
 without stopping its owner. It then starts the lazy-loading loopback service;
 individual allocations still fail closed if they cannot fit safely. A lower
 startup buffer is not a guarantee that arbitrary large requests will fit.
-Measured qualification and endpoint status are recorded in STATUS.md; the
-older timings below do not qualify this new composition.
+Measured on October6: workspace tool289.12s, asset JSON138.12s, ticket JSON161.87s;
+all semantic/protocol checks pass. Whole-run minimum4.912GB available, maximum
+process footprint0.932GB, actual swap growth0. Launch minimum was5.670GB, not
+exactly5.0GB. Workspace/asset token hashes match prior runs; ticket JSON is exact
+but its token hash differs. This is a memory/usability profile, not a speed win
+or general lossless proof. Full Plex and long-context qualification remain open.
+Endpoint status is recorded at handoff; this document alone is not a running
+service claim. The older timings below do not qualify this new composition.
 
 October5: use the explicit `huihui-qwen38-27b-serial-harness-candidate` below
 for an experimental harness trial. It serializes tool calls (one per turn).

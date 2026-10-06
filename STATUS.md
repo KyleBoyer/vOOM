@@ -2,6 +2,21 @@
 
 ## 2026-10-06: explicit low-memory serving candidate
 
+Split retry huihui_low_memory_split_20261006 onab54de5 PASSES all three cases:
+workspace289.1196s/25tokens (1265-token prepared prompt), schema asset IDs138.1202s/
+13tokens and tickets161.8650s/17tokens. Workspace and asset full generation
+witnesses match their prior successful runs; ticket JSON is semantically exact
+but its token witness differs from the prior15-token response. No broad lossless
+or speed claim. Split counters show24/12/16 one-position sweeps and maximum99.445MB
+phase pages, rather than the failed ordinary210MB page. Native pressure PASS:
+291 samples, minimum4.912GB available, maximum process footprint0.932GB,
+actual swap growth0, no known transcoder. Launch-window minimum5.670GB: this is
+not a worst-case proof at exactly5.0GB. Full start/end/current source equality,
+artifact hashes and stopped PIDs verified; result SHA
+2f1bfb36845ae6fee9014edb2b0ed758133ace19ed7ddd46edbd828570786ac7.
+470 focused regressions PASS. Endpoint launch/smoke follows fresh admission;
+these three short requests do not qualify the full Plex workflow or long context.
+
 Following the user's October5 request to come online with limited host memory,
 huihui-qwen38-27b-low-memory-online removes the MTP draft/rollback and reduces
 prefill tiles32 ->8. Selected target weights/full prepared context are retained;
