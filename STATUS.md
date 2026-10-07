@@ -1,5 +1,24 @@
 # STATUS — 2026-09-14 UTC (current corrections first; dated chronology below is history)
 
+## 2026-10-07: low-memory service lifetime and actual HTTP smoke
+
+October6 serving smoke on a55b353 completed with exact `42`: HTTP32.73s,
+engine32.2314s, 27 input/3 output tokens with max-output1024. Actual singleton
+split counters show2 sweeps/128 layers, maximum99.445MB phase pages; true Metal
+peak259.199MB. Native samples stayed above5.145GB available with zero actual
+swap growth. Fresh launch minimum5.677GB. Artifacts are
+logs/huihui_online_20261006.{preflight.json,server.log,smoke.response.json}.
+This is an operational smoke, not a full Plex/long-context quality gate.
+The temporary server was no longer running when checked October7; exit cause
+is unknown. No online claim is inferred from yesterday's successful response.
+
+The launcher now supports an explicit --background macOS user-session job
+com.voom.huihui.low-memory, independently of the terminal/chat tool session.
+No recurring retry, KeepAlive, or login/startup installation; an existing job
+or occupied port is not replaced. The child repeats fresh30s admission before
+serving.104 focused pure launcher/profile/split regressions PASS. Managed
+startup and fresh inference still require operational verification after commit.
+
 ## 2026-10-06: explicit low-memory serving candidate
 
 Split retry huihui_low_memory_split_20261006 onab54de5 PASSES all three cases:
