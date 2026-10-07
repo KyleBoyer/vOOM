@@ -19,18 +19,11 @@ cd "/Volumes/Workspace NVME/git/vOOM"
 caffeinate -is .venv/bin/python -m runtime.huihui_serve --port 8077
 ```
 
-To keep it independent of a terminal/chat tool session on macOS instead:
-
-```bash
-.venv/bin/python -m runtime.huihui_serve --background --port 8077
-```
-
-This submits one user-session job, `com.voom.huihui.low-memory`, with no recurring
-retry or login/startup installation. Submission is not readiness: wait for its
-admission result and check the endpoint. Inspect with `launchctl list
-com.voom.huihui.low-memory`; stop explicitly with `launchctl remove
-com.voom.huihui.low-memory`. Existing jobs/occupied ports are not replaced.
-Admission stdout/stderr logs sit beside the chosen `--preflight-result` file.
+Keep that terminal/session open. This is a foreground service, not a login or
+reboot-persistent installation, and has no automatic restart. An October7
+`launchctl submit` attempt failed before execution (`Operation not permitted`)
+and implicitly enabled KeepAlive; that job was removed and the unsupported
+background option reverted. Do not use submission success as endpoint readiness.
 
 This launcher samples the host for30seconds and requires5.0GB available,
 10GB root free, stable swap and no known transcoder. It refuses a used port

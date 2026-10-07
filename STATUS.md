@@ -12,12 +12,15 @@ This is an operational smoke, not a full Plex/long-context quality gate.
 The temporary server was no longer running when checked October7; exit cause
 is unknown. No online claim is inferred from yesterday's successful response.
 
-The launcher now supports an explicit --background macOS user-session job
-com.voom.huihui.low-memory, independently of the terminal/chat tool session.
-No recurring retry, KeepAlive, or login/startup installation; an existing job
-or occupied port is not replaced. The child repeats fresh30s admission before
-serving.104 focused pure launcher/profile/split regressions PASS. Managed
-startup and fresh inference still require operational verification after commit.
+Correction to13b542e: the attempted --background launchctl submit option did
+NOT provide its claimed one-shot semantics. Operational inspection found
+implicit KeepAlive, EX_CONFIG78 and `posix_spawn(/usr/bin/caffeinate): Operation
+not permitted`, before any preflight/server ran. The exact owned job
+com.voom.huihui.low-memory was removed; no retry job remains. Its104 mocked pure
+tests did not establish macOS launch behavior. The unsupported option and those
+misleading mocks are reverted. Use the existing guarded foreground launcher in
+a retained terminal/tool session; it has no restart/login/reboot persistence.
+Fresh admission and inference follow from committed source.
 
 ## 2026-10-06: explicit low-memory serving candidate
 

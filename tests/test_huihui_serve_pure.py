@@ -4,7 +4,6 @@ import pytest
 
 from runtime.huihui_serve import PROFILE, REQUIRED_SETTINGS, validate_preflight, validate_profile
 from runtime.profiles import apply_runtime_profiles
-from runtime import huihui_serve as serving
 from tests.fixtures.huihui_memory_policy import validate
 
 
@@ -40,37 +39,6 @@ def _preflight():
 
 def test_valid_fresh_preflight():
     validate_preflight(_preflight(), now=101)
-
-
-def test_background_is_one_shot_and_preserves_path_arguments(tmp_path, monkeypatch):
-    from types import SimpleNamespace
-    calls=[]
-    monkeypatch.setattr(serving.platform, 'system', lambda:'Darwin')
-    def run(command, **kwargs):
-        calls.append((command,kwargs))
-        return SimpleNamespace(returncode=113 if command[1]=='list' else 0)
-    monkeypatch.setattr(serving.subprocess, 'run', run)
-    result=tmp_path/'path with spaces'/'admission.json'
-    serving.submit_background(8077,result)
-    cmd=calls[-1][0]
-    assert cmd[:4]==['/bin/launchctl','submit','-l',serving.JOB_LABEL]
-    assert cmd[-4:]==['--port','8077','--preflight-result',str(result)]
-    assert '/usr/bin/caffeinate' in cmd and '--background' not in cmd
-    assert not any('KeepAlive' in x or 'StartInterval' in x for x in cmd)
-    assert calls[-1][1]['check'] is True
-
-
-@pytest.mark.parametrize('status',[0,1])
-def test_background_never_replaces_existing_or_unknown_job(tmp_path,monkeypatch,status):
-    from types import SimpleNamespace
-    calls=[]
-    monkeypatch.setattr(serving.platform,'system',lambda:'Darwin')
-    def run(command,**kwargs):
-        calls.append(command);return SimpleNamespace(returncode=status)
-    monkeypatch.setattr(serving.subprocess,'run',run)
-    with pytest.raises((ValueError,RuntimeError)):
-        serving.submit_background(8077,tmp_path/'admission.json')
-    assert len(calls)==1 and calls[0][1]=='list'
 
 
 @pytest.mark.parametrize('field,value', [('passed', False), ('sample_seconds', 29),
